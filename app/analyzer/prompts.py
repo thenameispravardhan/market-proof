@@ -213,6 +213,33 @@ def render_user_prompt(
     return s
 
 
+def append_announcement_context(
+    rendered: str,
+    *,
+    symbol: str,
+    exchange: str,
+    headline: str,
+) -> str:
+    """Ground the user prompt with the wire metadata we actually have.
+
+    The DeepSeek chat API cannot fetch URLs, so a template that only
+    says "Read the PDF at {{pdf_url}}" makes the model invent filing
+    content. Appending the exchange-feed headline gives it real text
+    to analyse; the instruction footer stops it hallucinating beyond
+    that.
+    """
+    return (
+        f"{rendered}\n\n"
+        "Announcement metadata from the exchange feed (authoritative):\n"
+        f"- Company/symbol: {symbol} ({exchange})\n"
+        f"- Headline: {headline}\n\n"
+        "You cannot open URLs. Base your analysis ONLY on the metadata "
+        "above. If it is insufficient for a confident call, say so in "
+        "`reasoning`, use event_type OTHER, and lower `confidence`. "
+        "Never invent facts that are not in the metadata."
+    )
+
+
 def render_system_prompt(
     template: PromptTemplate,
     *,

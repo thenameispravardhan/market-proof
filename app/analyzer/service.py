@@ -39,6 +39,7 @@ from sqlalchemy.orm import Session
 from app.analyzer.deepseek_client import DeepSeekClient, DeepSeekError
 from app.analyzer.prompts import (
     DEFAULT_EVENT_TYPE,
+    append_announcement_context,
     detect_event_type,
     load_default_template,
     load_template,
@@ -251,7 +252,25 @@ class Service:
         # only if the announcement had no PDF.
         pdf_url = announcement.pdf_url or ""
         system = render_system_prompt(template, event_type=template.event_type)
-        user = render_user_prompt(template, pdf_url=pdf_url)
+        user = render_user_prompt(
+            template,
+            pdf_url=pdf_url,
+            extra={
+                "headline": announcement.headline or "",
+                "symbol": announcement.symbol or "",
+                "exchange": announcement.exchange or "",
+            },
+        )
+        if "{{headline}}" not in template.user_template:
+            # Template doesn't place the headline itself — append the
+            # grounding block so the LLM analyses real text instead of
+            # hallucinating from a URL it cannot open.
+            user = append_announcement_context(
+                user,
+                symbol=announcement.symbol or "",
+                exchange=announcement.exchange or "",
+                headline=announcement.headline or "",
+            )
         try:
             ds_result = await self._deepseek.complete(
                 system=system,

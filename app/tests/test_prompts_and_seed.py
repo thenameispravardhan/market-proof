@@ -23,6 +23,7 @@ from sqlalchemy import select
 from app.analyzer.prompts import (
     DEFAULT_EVENT_TYPE,
     EVENT_TYPES,
+    append_announcement_context,
     detect_event_type,
     load_default_template,
     load_template,
@@ -136,6 +137,37 @@ def test_render_user_prompt_keeps_unknown_placeholder():
     out = render_user_prompt(t, pdf_url="https://x/y.pdf")
     assert "https://x/y.pdf" in out
     assert "{{nope}}" in out
+
+
+def test_render_user_prompt_substitutes_headline_via_extra():
+    t = PromptTemplate(
+        event_type="DEFAULT",
+        system_prompt="x",
+        user_template="Analyse: {{headline}} ({{symbol}}/{{exchange}})",
+    )
+    out = render_user_prompt(
+        t,
+        pdf_url="https://x/y.pdf",
+        extra={"headline": "Order win Rs 500 cr", "symbol": "ABC", "exchange": "NSE"},
+    )
+    assert "Order win Rs 500 cr" in out
+    assert "ABC" in out
+    assert "NSE" in out
+
+
+def test_append_announcement_context_grounds_the_prompt():
+    """The LLM cannot fetch the PDF URL; the grounding block must carry
+    the real headline and forbid invention."""
+    out = append_announcement_context(
+        "Read the PDF at https://x/y.pdf.",
+        symbol="RELIANCE",
+        exchange="NSE",
+        headline="Reliance wins Rs 5000 crore order from IOCL",
+    )
+    assert "Reliance wins Rs 5000 crore order from IOCL" in out
+    assert "RELIANCE" in out
+    assert "cannot open URLs" in out
+    assert "Never invent facts" in out
 
 
 def test_render_system_prompt_wraps():
