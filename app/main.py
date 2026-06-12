@@ -180,6 +180,42 @@ app.include_router(core_api.router)
 
 
 # -------------------------------------------------------------------------
+# Static frontend (built by `npm run build` in ./frontend).
+# If the dist/ directory exists, serve it at /; otherwise the API still
+# works and /docs is still useful, but the dashboard is missing.
+# -------------------------------------------------------------------------
+
+
+from pathlib import Path  # noqa: E402
+
+from fastapi.staticfiles import StaticFiles  # noqa: E402
+
+_DIST_DIR = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+if _DIST_DIR.is_dir() and (_DIST_DIR / "index.html").is_file():
+    # Serve assets (JS/CSS/images) at /assets/*.
+    app.mount(
+        "/assets",
+        StaticFiles(directory=str(_DIST_DIR / "assets")),
+        name="frontend-assets",
+    )
+
+    # Catch-all: anything that isn't an API route returns the SPA shell.
+    # The API routers (mounted above) take precedence because they're
+    # matched before this catch-all in Starlette's routing order.
+    @app.get("/", include_in_schema=False)
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def spa_shell(full_path: str = "") -> object:  # noqa: ARG001
+        index = _DIST_DIR / "index.html"
+        if not index.is_file():
+            return {"detail": "frontend not built"}
+        from fastapi.responses import FileResponse
+        return FileResponse(str(index))
+else:
+    log_path_msg = f"no static frontend at {_DIST_DIR} (run scripts/run.sh to build)"
+    print(f"[startup] {log_path_msg}")
+
+
+# -------------------------------------------------------------------------
 # Entrypoint
 # -------------------------------------------------------------------------
 

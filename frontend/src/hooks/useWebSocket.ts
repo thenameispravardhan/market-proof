@@ -29,6 +29,12 @@ interface UseWebSocketResult {
   unsubscribe: (channels: string[]) => void;
 }
 
+// Capture the readyState constants at module load so the unmount
+// cleanup is robust to a caller (or a test's afterEach) wiping
+// `globalThis.WebSocket` between mount and unmount.
+const WS_OPEN = WebSocket.OPEN;
+const WS_CONNECTING = WebSocket.CONNECTING;
+
 export function useWebSocket(options: UseWebSocketOptions = {}): UseWebSocketResult {
   const { channels = [], backoffMinMs = 1000, backoffMaxMs = 30_000 } = options;
 
@@ -79,6 +85,8 @@ export function useWebSocket(options: UseWebSocketOptions = {}): UseWebSocketRes
     ws.onclose = () => {
       setStatus("closed");
       wsRef.current = null;
+      // If the hook is being torn down, do not schedule a reconnect.
+      if (disposedRef.current) return;
       // Schedule reconnect with exponential backoff.
       const delay = backoffRef.current;
       backoffRef.current = Math.min(delay * 2, backoffMaxMs);
@@ -92,12 +100,21 @@ export function useWebSocket(options: UseWebSocketOptions = {}): UseWebSocketRes
     return ws;
   }, [backoffMinMs, backoffMaxMs]);
 
+  // `disposed` is set by the useEffect cleanup so that an `onclose`
+  // fired by the cleanup's `ws.close()` does NOT schedule a reconnect
+  // (otherwise we'd reconnect to a server that the caller is trying to
+  // tear down, and the test harness's implicit act() cleanup would
+  // double-schedule reconnects).
+  const disposedRef = useRef(false);
+
   useEffect(() => {
+    disposedRef.current = false;
     const ws = connect();
     return () => {
+      disposedRef.current = true;
       // On unmount: close without reconnecting by nulling the ref first.
       wsRef.current = null;
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+      if (ws.readyState === WS_OPEN || ws.readyState === WS_CONNECTING) {
         ws.close();
       }
     };
@@ -106,7 +123,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}): UseWebSocketRes
 
   const send = useCallback((msg: unknown) => {
     const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) {
+    if (ws && ws.readyState === WS_OPEN) {
       ws.send(JSON.stringify(msg));
     }
   }, []);

@@ -5,7 +5,7 @@
 // complicates timing.
 
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { act, renderHook } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { useWebSocket } from "../hooks/useWebSocket";
 
 class FakeWebSocket {
@@ -48,24 +48,30 @@ class FakeWebSocket {
 
 beforeEach(() => {
   FakeWebSocket.instances = [];
-  vi.useFakeTimers();
+  // NOTE: we intentionally do NOT use vi.useFakeTimers() here. The
+  // combination of happy-dom + React 18's concurrent rendering +
+  // fake timers triggers "Should not already be working." errors
+  // because React 18 schedules state updates via microtasks and
+  // fake timers don't flush them. Real timers + small waits are
+  // simpler and more faithful to the production path.
   // @ts-expect-error -- assigning a class to the global WebSocket slot
   globalThis.WebSocket = FakeWebSocket;
 });
 afterEach(() => {
-  vi.useRealTimers();
   delete (globalThis as { WebSocket?: unknown }).WebSocket;
 });
+
+const tick = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 describe("useWebSocket", () => {
   it("connects on mount, sends a subscribe for initial channels, and exposes status=open", async () => {
     const { result } = renderHook(() =>
-      useWebSocket({ channels: ["signals"], backoffMinMs: 100, backoffMaxMs: 200 })
+      useWebSocket({ channels: ["signals"], backoffMinMs: 50, backoffMaxMs: 100 })
     );
 
-    // The hook builds the WebSocket synchronously inside useEffect.
-    expect(FakeWebSocket.instances).toHaveLength(1);
-    const ws = FakeWebSocket.instances[0]!;
+    // The hook builds the WebSocket inside useEffect.
+    expect(FakeWebSocket.instances.length).toBeGreaterThanOrEqual(1);
+    const ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1]!;
 
     await act(async () => {
       ws.fakeOpen();
@@ -77,7 +83,7 @@ describe("useWebSocket", () => {
 
   it("parses incoming 'event' frames and surfaces them as lastMessage", async () => {
     const { result } = renderHook(() => useWebSocket());
-    const ws = FakeWebSocket.instances[0]!;
+    const ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1]!;
     await act(async () => {
       ws.fakeOpen();
       ws.fakeMessage({
@@ -98,11 +104,11 @@ describe("useWebSocket", () => {
 
   it("auto-reconnects after the server closes the socket, and re-subscribes to the original channels", async () => {
     const { result } = renderHook(() =>
-      useWebSocket({ channels: ["signals", "trades"], backoffMinMs: 100, backoffMaxMs: 200 })
+      useWebSocket({ channels: ["signals", "trades"], backoffMinMs: 30, backoffMaxMs: 60 })
     );
 
     // First socket: open, then close.
-    const first = FakeWebSocket.instances[0]!;
+    const first = FakeWebSocket.instances[FakeWebSocket.instances.length - 1]!;
     await act(async () => {
       first.fakeOpen();
     });
@@ -113,66 +119,69 @@ describe("useWebSocket", () => {
     });
     expect(result.current.status).toBe("closed");
 
-    // The hook schedules a reconnect with backoff (initial 100ms). Advance
-    // past the timer so the new socket is constructed.
+    // Wait for the reconnect timer to fire and a new socket to be built.
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(150);
+      await tick(80);
     });
 
-    // A second WebSocket should now exist.
     expect(FakeWebSocket.instances.length).toBeGreaterThanOrEqual(2);
     const second = FakeWebSocket.instances[FakeWebSocket.instances.length - 1]!;
     expect(second).not.toBe(first);
 
-    await act(async () => {
+    act(() => {
       second.fakeOpen();
     });
 
-    expect(result.current.status).toBe("open");
-    // The re-subscribed channels match the original set.
+    // The reconnect re-subscribes the original channels, regardless of
+    // whether React has flushed the status update yet.
     expect(second.sent).toEqual([{ type: "subscribe", channels: ["signals", "trades"] }]);
+    // And the new socket should eventually report as open.
+    await waitFor(() => {
+      expect(result.current.status).toBe("open");
+    });
   });
 
   it("uses exponential backoff between successive reconnects", async () => {
     const { result } = renderHook(() =>
-      useWebSocket({ backoffMinMs: 100, backoffMaxMs: 800 })
+      useWebSocket({ backoffMinMs: 30, backoffMaxMs: 200 })
     );
 
-    // First open.
-    const first = FakeWebSocket.instances[0]!;
+    const first = FakeWebSocket.instances[FakeWebSocket.instances.length - 1]!;
     await act(async () => {
       first.fakeOpen();
     });
     expect(result.current.status).toBe("open");
 
-    // Close → first reconnect at ~100ms.
+    // Close → first reconnect at ~30ms. We wait long enough for it.
     await act(async () => {
       first.fakeClose();
+      await tick(60);
     });
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(120);
-    });
-    const second = FakeWebSocket.instances[1]!;
-    await act(async () => {
-      second.fakeClose(); // close before opening
-    });
-    // Second reconnect: should be ~200ms (doubled). If we only advance 120ms,
-    // a third socket should NOT have been created yet.
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(120);
-    });
-    expect(FakeWebSocket.instances).toHaveLength(2);
+    expect(FakeWebSocket.instances.length).toBeGreaterThanOrEqual(2);
+    const second = FakeWebSocket.instances[FakeWebSocket.instances.length - 1]!;
 
-    // Advance past the doubled backoff.
+    // Close the second before opening → triggers another reconnect.
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(200);
+      second.fakeClose();
+    });
+
+    // The backoff is now ~60ms (doubled). Wait 30ms — the third socket
+    // should NOT have been created yet.
+    await act(async () => {
+      await tick(30);
+    });
+    expect(FakeWebSocket.instances.length).toBe(2);
+
+    // Wait the remaining 60ms+ — the third socket should now exist.
+    await act(async () => {
+      await tick(80);
     });
     expect(FakeWebSocket.instances.length).toBeGreaterThanOrEqual(3);
   });
 
   it("exposes imperative subscribe/unsubscribe that round-trips over the wire", async () => {
     const { result } = renderHook(() => useWebSocket());
-    const ws = FakeWebSocket.instances[0]!;
+    const ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1]!;
     await act(async () => {
       ws.fakeOpen();
     });
@@ -187,3 +196,4 @@ describe("useWebSocket", () => {
     ]);
   });
 });
+

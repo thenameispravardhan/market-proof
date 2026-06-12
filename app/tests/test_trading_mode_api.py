@@ -6,6 +6,8 @@ Coverage:
   - POST with `confirm: true` flips to live, writes audit_log.
   - POST with `confirm: false` -> 422.
   - POST with unknown mode -> 422.
+  - POST live without the .i_accept_live_risk sentinel -> 403.
+  - POST live WITH the sentinel (test fixture) -> 200.
   - Settings hot-reload fires on the bus.
   - **Hot-reload of the cached Settings instance**: after the
     POST, `get_settings().TRADING_MODE` returns the new mode
@@ -19,9 +21,26 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from app.api import trading_mode as trading_mode_api
 from app.config import get_settings, reset_settings_cache
 from app.db.models import AuditLog
 from app.services.event_bus import event_bus
+
+
+@pytest.fixture
+def live_risk_acked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pretend the operator created .i_accept_live_risk for this test."""
+    monkeypatch.setattr(trading_mode_api, "_live_risk_ack_present", lambda: True)
+
+
+def test_post_live_without_sentinel_is_403(client: TestClient) -> None:
+    """The .i_accept_live_risk sentinel gate is real — no sentinel, no live flip."""
+    r = client.post(
+        "/api/settings/trading-mode",
+        json={"mode": "live", "confirm": True},
+    )
+    assert r.status_code == 403
+    assert "i_accept_live_risk" in r.json()["detail"]
 
 
 def test_post_without_confirm_rejected(client: TestClient) -> None:
@@ -84,7 +103,7 @@ def test_post_paper_with_confirm_succeeds(client: TestClient) -> None:
         event_bus.unsubscribe("settings.updated", sub)
 
 
-def test_post_live_with_confirm_succeeds(client: TestClient) -> None:
+def test_post_live_with_confirm_succeeds(client: TestClient, live_risk_acked) -> None:
     r = client.post(
         "/api/settings/trading-mode",
         json={"mode": "live", "confirm": True},
@@ -102,7 +121,7 @@ def test_post_live_with_confirm_succeeds(client: TestClient) -> None:
     )
 
 
-def test_effective_field_reflects_new_mode_immediately(client: TestClient) -> None:
+def test_effective_field_reflects_new_mode_immediately(client: TestClient, live_risk_acked) -> None:
     """Defence-in-depth: the response body must include the new
     effective mode, not the stale cached one."""
     # First flip to paper explicitly.

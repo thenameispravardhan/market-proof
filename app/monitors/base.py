@@ -222,13 +222,28 @@ class BaseMonitor:
                 except _RetryableError as e:
                     self._consecutive_failures += 1
                     self._current_backoff = next_backoff(self._current_backoff)
-                    log.warning(
-                        "monitor.retry",
-                        exchange=self.exchange,
-                        failure_count=self._consecutive_failures,
-                        backoff_s=round(self._current_backoff, 2),
-                        error=str(e),
-                    )
+                    # The first few retries are expected (NSE/BSE often
+                    # rate-limit or block bots). Log at DEBUG so an INFO
+                    # runbook read is not flooded with one warning per
+                    # tick. Operators can `LOG_LEVEL=DEBUG` to see them.
+                    # We also promote to WARNING once per 10 consecutive
+                    # failures so long outages are still surfaced.
+                    if self._consecutive_failures % 10 == 0:
+                        log.warning(
+                            "monitor.retry.persistent",
+                            exchange=self.exchange,
+                            failure_count=self._consecutive_failures,
+                            backoff_s=round(self._current_backoff, 2),
+                            error=str(e),
+                        )
+                    else:
+                        log.debug(
+                            "monitor.retry",
+                            exchange=self.exchange,
+                            failure_count=self._consecutive_failures,
+                            backoff_s=round(self._current_backoff, 2),
+                            error=str(e),
+                        )
                     # Sleep for the backoff, but stay cancellable.
                     try:
                         await asyncio.wait_for(

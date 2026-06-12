@@ -15,7 +15,7 @@ export function PromptPreview({ eventType }: { eventType: string | null }) {
   const handleRun = async () => {
     if (!eventType) return;
     try {
-      await preview.mutateAsync({ pdf_url: pdfUrl });
+      await preview.mutateAsync(pdfUrl);
     } catch {
       // surfaced via preview.isError
     }
@@ -65,7 +65,7 @@ export function PromptPreview({ eventType }: { eventType: string | null }) {
                 fontSize: 12.5,
               }}
             >
-              {preview.data.output}
+              {preview.data.rendered_user_template}
             </pre>
           )}
         </>

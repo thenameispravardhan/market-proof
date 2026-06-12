@@ -18,7 +18,9 @@ export default defineConfig({
     sourcemap: false,
   },
   test: {
-    environment: "happy-dom",
+    // jsdom is more battle-tested with React 18's act() and concurrent
+    // rendering than happy-dom — the useWebSocket tests need that.
+    environment: "jsdom",
     setupFiles: ["./tests/setup.ts"],
     globals: true,
     include: ["src/**/*.test.{ts,tsx}"],

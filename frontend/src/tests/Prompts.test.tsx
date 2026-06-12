@@ -26,31 +26,33 @@ describe("Prompts", () => {
   let originalFetch: typeof fetch;
 
   beforeEach(() => {
-    originalFetch = global.fetch;
+    originalFetch = globalThis.fetch;
   });
   afterEach(() => {
-    global.fetch = originalFetch;
+    globalThis.fetch = originalFetch;
     vi.restoreAllMocks();
   });
 
   it("renders the prompts list and selects a row to load it into the editor", async () => {
-    global.fetch = vi.fn(async (input: RequestInfo | URL) => {
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = typeof input === "string" ? input : input.toString();
       if (url.includes("/api/prompts") && !url.includes("/history") && !url.includes("/preview")) {
-        return makeJsonResponse([
-          {
-            id: 1,
-            event_type: "earnings",
-            system_prompt: "You are a financial analyst.",
-            user_template: "Analyse the filing at {{pdf_url}}.",
-            model: "deepseek-chat",
-            temperature: 0.2,
-            max_tokens: 2000,
-            version: 3,
-            updated_at: "2026-06-10T10:00:00Z",
-            updated_by: "ui",
-          },
-        ]);
+        return makeJsonResponse({
+          prompts: [
+            {
+              id: 1,
+              event_type: "earnings",
+              system_prompt: "You are a financial analyst.",
+              user_template: "Analyse the filing at {{pdf_url}}.",
+              model: "deepseek-chat",
+              temperature: 0.2,
+              max_tokens: 2000,
+              version: 3,
+              updated_at: "2026-06-10T10:00:00Z",
+              updated_by: "ui",
+            },
+          ],
+        });
       }
       return makeJsonResponse({ detail: "not found" }, 404);
     }) as unknown as typeof fetch;
@@ -74,39 +76,41 @@ describe("Prompts", () => {
         (screen.getByLabelText("System prompt") as HTMLTextAreaElement).value
       ).toBe("You are a financial analyst.");
     });
-    // The user template hint is visible.
-    expect(screen.getByText(/pdf_url/i)).toBeInTheDocument();
-    // The version chip shows v3.
-    expect(screen.getByText(/v3/)).toBeInTheDocument();
+    // The user template hint is visible (in the help line below the textarea).
+    expect(screen.getAllByText(/pdf_url/i).length).toBeGreaterThan(0);
+    // The version chip shows v3 (the list row and the editor header both show it).
+    expect(screen.getAllByText(/v3/).length).toBeGreaterThan(0);
   });
 
-  it("Save PUTs the edited prompt and bumps the version on the server", async () => {
-    const putCalls: { url: string; body: unknown }[] = [];
-    global.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+  it("Save POSTs the edited prompt and bumps the version on the server", async () => {
+    const postCalls: { url: string; body: unknown }[] = [];
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       const method = (init?.method || "GET").toUpperCase();
       if (url.endsWith("/api/prompts") || (url.includes("/api/prompts") && method === "GET" && !url.includes("/history") && !url.includes("/preview"))) {
         // GET list
         if (method === "GET") {
-          return makeJsonResponse([
-            {
-              id: 1,
-              event_type: "earnings",
-              system_prompt: "OLD system",
-              user_template: "OLD template {{pdf_url}}",
-              model: "deepseek-chat",
-              temperature: 0.2,
-              max_tokens: 2000,
-              version: 3,
-              updated_at: "2026-06-10T10:00:00Z",
-              updated_by: "ui",
-            },
-          ]);
+          return makeJsonResponse({
+            prompts: [
+              {
+                id: 1,
+                event_type: "earnings",
+                system_prompt: "OLD system",
+                user_template: "OLD template {{pdf_url}}",
+                model: "deepseek-chat",
+                temperature: 0.2,
+                max_tokens: 2000,
+                version: 3,
+                updated_at: "2026-06-10T10:00:00Z",
+                updated_by: "ui",
+              },
+            ],
+          });
         }
       }
-      if (url.includes("/api/prompts/earnings") && method === "PUT") {
+      if (url.includes("/api/prompts/earnings") && method === "POST") {
         const body = init?.body ? JSON.parse(init.body as string) : null;
-        putCalls.push({ url, body });
+        postCalls.push({ url, body });
         return makeJsonResponse({
           id: 1,
           event_type: "earnings",
@@ -139,10 +143,10 @@ describe("Prompts", () => {
     await user.click(screen.getByTestId("save-prompt"));
 
     await waitFor(() => {
-      expect(putCalls).toHaveLength(1);
+      expect(postCalls).toHaveLength(1);
     });
-    expect(putCalls[0]!.url).toBe("/api/prompts/earnings");
-    expect(putCalls[0]!.body).toMatchObject({
+    expect(postCalls[0]!.url).toBe("/api/prompts/earnings");
+    expect(postCalls[0]!.body).toMatchObject({
       system_prompt: "NEW system prompt",
       temperature: 0.4,
       model: "deepseek-chat",
@@ -153,7 +157,7 @@ describe("Prompts", () => {
   });
 
   it("shows the empty state when /api/prompts returns 404", async () => {
-    global.fetch = vi.fn(async () => makeJsonResponse({ detail: "not found" }, 404)) as unknown as typeof fetch;
+    globalThis.fetch = vi.fn(async () => makeJsonResponse({ detail: "not found" }, 404)) as unknown as typeof fetch;
 
     const qc = new QueryClient({
       defaultOptions: { queries: { retry: false, refetchInterval: false } },
@@ -165,3 +169,4 @@ describe("Prompts", () => {
     });
   });
 });
+

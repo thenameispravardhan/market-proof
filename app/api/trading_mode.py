@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -41,6 +42,17 @@ from app.db.session import get_db
 from app.services.event_bus import event_bus
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
+
+# Live-trading sentinel: in addition to the body's `confirm: true`,
+# the operator must create a file `.i_accept_live_risk` in the
+# project root to flip TRADING_MODE to `live`. This is a deliberate
+# friction layer — accidental "yes I clicked it" should not equal
+# real money. Paper mode has no such guard.
+_LIVE_RISK_ACK_FILE = ".i_accept_live_risk"
+
+
+def _live_risk_ack_present() -> bool:
+    return (Path(__file__).resolve().parent.parent / _LIVE_RISK_ACK_FILE).is_file()
 
 
 class TradingModeUpdate(BaseModel):
@@ -70,6 +82,19 @@ async def update_trading_mode(
     request: Request,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    # Live-mode sentinel: the operator must explicitly create a
+    # .i_accept_live_risk file in the project root. We refuse live
+    # flips with 403 otherwise. Paper flips are unconditional.
+    if body.mode == "live" and not _live_risk_ack_present():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Refusing to flip to live: create the file "
+                f"'{_LIVE_RISK_ACK_FILE}' in the project root to acknowledge "
+                f"the risk of trading with real money."
+            ),
+        )
+
     actor = (request.headers.get("x-actor") or "ui").strip().lower() or "ui"
     if actor not in {"ui", "api", "system"}:
         actor = "ui"
@@ -122,5 +147,22 @@ async def update_trading_mode(
         "ok": True,
         "mode": body.mode,
         "effective": settings.TRADING_MODE,
+    }
+
+
+@router.get("/live-risk-ack")
+def live_risk_ack_status() -> dict[str, Any]:
+    """Whether the `.i_accept_live_risk` sentinel file is present.
+
+    The dashboard uses this to grey out the live toggle and explain
+    *why* in plain language.
+    """
+    return {
+        "present": _live_risk_ack_present(),
+        "file": _LIVE_RISK_ACK_FILE,
+        "instructions": (
+            f"Create an empty file named '{_LIVE_RISK_ACK_FILE}' in the "
+            f"project root (next to run.sh) to acknowledge live-trading risk."
+        ),
     }
 

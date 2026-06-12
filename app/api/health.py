@@ -1,4 +1,7 @@
-"""GET /health — liveness + dependency status."""
+"""GET /health — liveness + dependency status.
+
+Also exposes `GET /api/version` for dashboard display.
+"""
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
@@ -10,6 +13,12 @@ from app.config import Settings, get_settings
 from app.db.session import get_db
 
 router = APIRouter(tags=["health"])
+
+
+@router.get("/api/version")
+def version() -> dict[str, str]:
+    """Return the app version. Useful for dashboard display and CI checks."""
+    return {"version": __version__}
 
 
 @router.get("/health")

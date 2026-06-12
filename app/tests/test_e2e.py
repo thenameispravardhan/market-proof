@@ -20,7 +20,16 @@ from sqlalchemy.orm import sessionmaker
 
 SQLITE_URL = "sqlite:///:memory:"
 
-engine = create_engine(SQLITE_URL, connect_args={"check_same_thread": False})
+# StaticPool ensures the single in-memory DB is shared across connections;
+# otherwise each new connection gets its own empty DB and the test fails
+# with "no such table: …".
+from sqlalchemy.pool import StaticPool  # noqa: E402
+
+engine = create_engine(
+    SQLITE_URL,
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+)
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
@@ -84,7 +93,7 @@ def _now() -> datetime:
 
 
 def test_health(client):
-    r = client.get("/api/health")
+    r = client.get("/health")
     assert r.status_code == 200
     data = r.json()
     assert data["status"] == "ok"

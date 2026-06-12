@@ -36,3 +36,13 @@ node_modules/
 /.pnp
 .pnp.js
 .yarn/install-state.gz
+
+# Frontend build artifacts
+frontend/dist/
+
+# Local log files (uvicorn output, monitor errors, etc.)
+logs/*.log
+logs/*.err
+
+# Live-trading safety sentinel (operator-created, not committed)
+.i_accept_live_risk

@@ -34,15 +34,15 @@ describe("Dashboard", () => {
   let originalFetch: typeof fetch;
 
   beforeEach(() => {
-    originalFetch = global.fetch;
+    originalFetch = globalThis.fetch;
   });
   afterEach(() => {
-    global.fetch = originalFetch;
+    globalThis.fetch = originalFetch;
     vi.restoreAllMocks();
   });
 
   it("renders all 6 widgets and shows announcement data when the API responds", async () => {
-    global.fetch = makeFetchStub((url) => {
+    globalThis.fetch = makeFetchStub((url) => {
       if (url.includes("/api/announcements/recent")) {
         return makeJsonResponse([
           {
@@ -87,7 +87,7 @@ describe("Dashboard", () => {
   });
 
   it("renders a graceful empty state when each endpoint 404s", async () => {
-    global.fetch = makeFetchStub(() => makeJsonResponse({ detail: "not found" }, 404));
+    globalThis.fetch = makeFetchStub(() => makeJsonResponse({ detail: "not found" }, 404));
 
     const qc = new QueryClient({
       defaultOptions: { queries: { retry: false, refetchInterval: false } },
@@ -95,10 +95,9 @@ describe("Dashboard", () => {
     render(<Dashboard />, { wrapper: wrapper(qc) });
 
     await waitFor(() => {
-      // The Announcements widget should show its empty state text.
-      expect(
-        screen.getByText(/Endpoint not available yet/i)
-      ).toBeInTheDocument();
+      // Each widget that hits a 404 shows its own empty-state copy.
+      const empty = screen.getAllByText(/Endpoint not available yet/i);
+      expect(empty.length).toBeGreaterThan(0);
     });
   });
 
@@ -106,7 +105,7 @@ describe("Dashboard", () => {
     const today = new Date();
     const todayIso = today.toISOString();
 
-    global.fetch = makeFetchStub((url) => {
+    globalThis.fetch = makeFetchStub((url) => {
       if (url.includes("/api/trades")) {
         return makeJsonResponse([
           {
@@ -151,3 +150,5 @@ describe("Dashboard", () => {
     expect(screen.getByText(/Realised P&L \(today\)/)).toBeInTheDocument();
   });
 });
+
+
