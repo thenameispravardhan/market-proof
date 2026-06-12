@@ -49,7 +49,8 @@ def test_parse_bse_falls_back_to_alternate_field_names():
     rows = parse_bse_payload(BSE_FIXTURE_JSON, "https://bse/x")
     tcs = next(r for r in rows if r.company == "532540")
     assert tcs.title == "TCS - Audited Results"
-    # ATTACH_URL is a bare path -> host is prefixed.
+    # ATTACH_URL is a partial path starting with AttachLive/ — we
+    # host-prefix it directly.
     assert tcs.pdf_url == "https://www.bseindia.com/AttachLive/tcs.pdf"
 
 

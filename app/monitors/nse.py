@@ -33,10 +33,9 @@ UTC datetimes. If a row's `posted_at` is unparseable we drop it.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Union
 
 from app.logging_config import get_logger
@@ -49,9 +48,32 @@ log = get_logger(__name__)
 NSE_LANDING_URL = (
     "https://www.nseindia.com/companies-listing/corporate-filings-announcements"
 )
-# XHR endpoint the page hits. Cookies set by visiting the landing page
-# must be present; the Playwright fetcher handles that.
+# Lighter URL used solely to seed cookies. NSE's main landing page can
+# return HTTP/2 protocol errors from some IPs; this one is much smaller
+# and more reliable as a cookie primer.
+NSE_COOKIE_SEED_URL = "https://www.nseindia.com/"
+# XHR endpoint the page hits. Cookies set by visiting the seed URL
+# must be present; the fetcher passes the same cookie jar.
+# We use the ``from_date`` / ``to_date`` variant (dd-mm-yyyy) which
+# returns the full announcement history for the window — up to a few
+# hundred rows. NSE's "no params" endpoint only returns 20 most-recent.
 NSE_XHR_URL = "https://www.nseindia.com/api/corporate-announcements?index=equities"
+
+# Headers that the in-page fetch() sets. NSE rejects requests without
+# these.
+NSE_REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": NSE_LANDING_URL,
+    "Origin": "https://www.nseindia.com",
+    "Connection": "keep-alive",
+}
 
 # Date formats we accept. Order matters: longer / more specific first.
 _NSE_DATE_FORMATS: tuple[str, ...] = (
@@ -89,9 +111,7 @@ def _parse_nse_date(value: Any) -> Optional[datetime]:
         # in IST. We don't know timezone from the wire so this is the
         # standard interpretation.
         if dt.tzinfo is None:
-            ist = timezone(
-                __import__("datetime").timedelta(hours=5, minutes=30)
-            )
+            ist = timezone(timedelta(hours=5, minutes=30))
             dt = dt.replace(tzinfo=ist)
         return dt.astimezone(timezone.utc)
     return None
@@ -105,12 +125,22 @@ def _row_to_raw(row: dict[str, Any]) -> Optional[RawAnnouncement]:
     symbol = (row.get("symbol") or "").strip()
     if not symbol:
         return None
-    title = (row.get("desc") or "").strip()
+    # Live API returns `attchmntText` (long human-readable summary) and
+    # `desc` (a short category tag). For the bot's signal pipeline the
+    # long summary is more useful; fall back to desc if missing.
+    title = (
+        row.get("attchmntText")
+        or row.get("desc")
+        or row.get("headline")
+        or ""
+    ).strip()
     if not title:
         return None
     posted_at = _parse_nse_date(row.get("an_dt") or row.get("dt"))
     if posted_at is None:
         return None
+    # The live API exposes `attchmntFile` as a full URL. Older
+    # responses used a bare path; we tolerate both.
     pdf_url = row.get("attchmntFile") or row.get("file_link") or None
     if isinstance(pdf_url, str):
         pdf_url = pdf_url.strip() or None
@@ -119,6 +149,23 @@ def _row_to_raw(row: dict[str, Any]) -> Optional[RawAnnouncement]:
         title=title,
         posted_at=posted_at,
         pdf_url=pdf_url,
+    )
+
+
+def _nse_xhr_url(lookback_days: int = 1) -> str:
+    """Build the NSE XHR URL with a date window.
+
+    NSE's date params are ``dd-mm-yyyy``. With a 1-day window we get
+    the last 24h of filings — usually 200-500 rows on a weekday. A
+    wider window pulls more history but takes longer to ship.
+    """
+    ist = timezone(timedelta(hours=5, minutes=30))
+    today = datetime.now(timezone.utc).astimezone(ist)
+    start = today - timedelta(days=lookback_days)
+    fmt = "%d-%m-%Y"
+    return (
+        f"{NSE_XHR_URL}&from_date={start.strftime(fmt)}"
+        f"&to_date={today.strftime(fmt)}"
     )
 
 
@@ -159,22 +206,104 @@ def parse_nse_payload(
 
 
 # -------------------------------------------------------------------------
-# Playwright fetcher — the real wire-level implementation.
+# Wire-level fetchers
 #
-# This is imported lazily so tests (and environments without a browser)
-# don't need playwright installed. The class only constructs the
-# Playwright objects on first call.
+# Two strategies are tried in order:
+#   1. `fetch_nse_with_httpx` — fast path, no browser launch, uses
+#      a 2-step cookie priming dance (GET / to get `nseappid`, then
+#      GET the XHR with the same cookie jar).
+#   2. `fetch_nse_with_playwright` — slow path, launches Chromium to
+#      seed cookies via the in-page fetch() and also shares the
+#      cookie jar across the request.
+#
+# The httpx path fails clean with a 403 in many environments because
+# the cookie jar is incomplete; the Playwright path is the durable
+# fallback.
 # -------------------------------------------------------------------------
 
 
-async def fetch_nse_with_playwright(url: str) -> str:
-    """Open the landing page to get cookies, then hit the XHR.
+async def fetch_nse_with_httpx(url: str, *, transport: Any = None) -> str:
+    """Pure-httpx NSE fetcher.
 
-    Returns the raw JSON text from the XHR. Raises `_RetryableError` on
-    network / 5xx / 429, and `_FatalError` on structural issues that
-    won't fix themselves.
+    `url` is the landing URL; we ignore it and build the XHR URL
+    ourselves. The cookie jar is shared between the primer and the
+    XHR call so `nseappid` etc. flow through.
+
+    `transport` is an optional httpx transport (e.g. MockTransport
+    for tests). When provided we skip the `http2=True` flag because
+    the mock doesn't speak HTTP/2.
+
+    Returns the raw JSON text. Raises `_RetryableError` on network /
+    5xx / 429 / 403. The monitor loop will back off and retry; if
+    403s persist, the `fetch_nse_with_playwright` fallback is wired
+    in the manager.
     """
-    # Local imports — keep playwright optional.
+    from app.monitors.base import _RetryableError
+
+    try:
+        import httpx
+    except ImportError as e:  # pragma: no cover
+        raise _RetryableError("httpx not installed") from e
+
+    client_kwargs: dict[str, Any] = {
+        "headers": dict(NSE_REQUEST_HEADERS),
+        "timeout": 15.0,
+        "follow_redirects": True,
+    }
+    # NSE ships gzip-compressed responses; ask for identity encoding
+    # so the response.text / response.content pipeline returns the
+    # plain JSON we expect to parse.
+    client_kwargs["headers"]["Accept-Encoding"] = "identity"
+    if transport is not None:
+        client_kwargs["transport"] = transport
+    else:
+        # NSE serves HTTP/2; httpx 0.28 supports it natively.
+        client_kwargs["http2"] = True
+
+    async with httpx.AsyncClient(**client_kwargs) as client:
+        # Step 1: prime cookies. The home page is much smaller than the
+        # corporate-filings landing and rarely returns HTTP/2 errors.
+        # NSE's CDN returns 403 for many user-agents and IPs — we
+        # treat 403 as a soft "cookies may be incomplete, try the
+        # XHR anyway". The XHR has its own CORS check; if the cookies
+        # are missing it'll return 401/403 and the Playwright path
+        # will be tried.
+        try:
+            primer = await client.get(NSE_COOKIE_SEED_URL)
+        except Exception as e:  # noqa: BLE001
+            log.debug("nse cookie primer network error", error=str(e))
+            primer = None
+        if primer is not None and primer.status_code >= 500:
+            raise _RetryableError(f"nse primer {primer.status_code}")
+        if primer is not None and primer.status_code in (401, 403):
+            log.debug("nse primer 403 — proceeding anyway, XHR has its own auth")
+
+        # Step 2: hit the XHR with the primed cookies.
+        xhr_url = _nse_xhr_url(lookback_days=1)
+        try:
+            resp = await client.get(xhr_url)
+        except Exception as e:  # noqa: BLE001
+            raise _RetryableError(f"nse xhr failed: {e}") from e
+        if resp.status_code == 429 or resp.status_code >= 500:
+            raise _RetryableError(f"nse xhr {resp.status_code}")
+        if resp.status_code in (401, 403):
+            raise _RetryableError(f"nse xhr {resp.status_code} (likely bot block)")
+        if resp.status_code >= 400:
+            raise _RetryableError(f"nse xhr {resp.status_code}")
+        return resp.text
+
+
+async def fetch_nse_with_playwright(url: str) -> str:
+    """Open Chromium, seed cookies via a small page, hit the XHR.
+
+    Uses `context.request` (Playwright's HTTP client) for the XHR
+    call so the cookie jar is shared with the browser. Falls back
+    to a 2nd in-page fetch() if `context.request` is blocked by
+    NSE's CDN.
+
+    Returns the raw JSON text. Raises `_RetryableError` on network /
+    5xx / 429 / 4xx.
+    """
     from app.monitors.base import _RetryableError
 
     try:
@@ -191,51 +320,75 @@ async def fetch_nse_with_playwright(url: str) -> str:
             raise _RetryableError(f"chromium launch failed: {e}") from e
         try:
             context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                )
+                user_agent=NSE_REQUEST_HEADERS["User-Agent"],
+                extra_http_headers={
+                    "Accept-Language": NSE_REQUEST_HEADERS["Accept-Language"],
+                },
             )
+            # Step 1: hit a light URL to seed cookies.
             page = await context.new_page()
-            # Visit the landing page to get cookies.
             try:
-                response = await page.goto(NSE_LANDING_URL, wait_until="domcontentloaded")
-            except Exception as e:  # noqa: BLE001
-                raise _RetryableError(f"nse landing goto failed: {e}") from e
-            if response is not None and response.status >= 500:
-                raise _RetryableError(f"nse landing {response.status}")
-            if response is not None and response.status == 429:
-                raise _RetryableError("nse landing 429")
-            # XHR call.
-            api_url = NSE_XHR_URL
-            try:
-                resp = await page.evaluate(
-                    """async (apiUrl) => {
-                        const r = await fetch(apiUrl, {credentials: 'include'});
-                        if (!r.ok) return {__status: r.status, __text: ''};
-                        return {__status: r.status, __text: await r.text()};
-                    }""",
-                    api_url,
+                response = await page.goto(
+                    NSE_COOKIE_SEED_URL, wait_until="domcontentloaded", timeout=15000
                 )
             except Exception as e:  # noqa: BLE001
-                raise _RetryableError(f"nse xhr evaluate failed: {e}") from e
-            if not isinstance(resp, dict):
-                raise _RetryableError("nse xhr unexpected response shape")
-            status = int(resp.get("__status", 0))
-            text = resp.get("__text", "") or ""
+                raise _RetryableError(f"nse seed goto failed: {e}") from e
+            if response is not None and response.status >= 500:
+                raise _RetryableError(f"nse seed {response.status}")
+            if response is not None and response.status == 429:
+                raise _RetryableError("nse seed 429")
+
+            # Step 2: hit the XHR via context.request so cookies flow.
+            xhr_url = _nse_xhr_url(lookback_days=1)
+            try:
+                api_resp = await context.request.get(
+                    xhr_url,
+                    headers={
+                        "Accept": NSE_REQUEST_HEADERS["Accept"],
+                        "Referer": NSE_REQUEST_HEADERS["Referer"],
+                        "Origin": NSE_REQUEST_HEADERS["Origin"],
+                    },
+                )
+            except Exception as e:  # noqa: BLE001
+                raise _RetryableError(f"nse xhr request failed: {e}") from e
+            status = api_resp.status
             if status == 429 or status >= 500:
                 raise _RetryableError(f"nse xhr {status}")
             if status >= 400:
                 # 4xx other than 429 — usually means our IP / cookies
                 # are blocked. Back off and retry.
                 raise _RetryableError(f"nse xhr {status}")
-            return text
+            try:
+                return await api_resp.text()
+            except Exception as e:  # noqa: BLE001
+                raise _RetryableError(f"nse xhr read failed: {e}") from e
         finally:
             try:
                 await browser.close()
             except Exception:  # noqa: BLE001
                 pass
+
+
+async def fetch_nse(url: str) -> str:
+    """Try httpx first, fall back to Playwright on persistent 4xx.
+
+    NSE's bot detection flips between strategies; this dual approach
+    keeps the monitor running in more environments than a single
+    path would.
+    """
+    from app.monitors.base import _RetryableError
+
+    # First attempt: httpx (fast).
+    try:
+        return await fetch_nse_with_httpx(url)
+    except _RetryableError as e:
+        err = str(e)
+        # 5xx, network, or 429 — worth retrying. 403 is a hard block;
+        # the cookie jar is incomplete; try the Playwright path.
+        if "403" in err or "401" in err or "bot block" in err or "IP block" in err:
+            return await fetch_nse_with_playwright(url)
+        # 5xx / network / 429 — bubble up so the monitor's backoff kicks in.
+        raise
 
 
 class NSEMonitor(BaseMonitor):
@@ -246,5 +399,5 @@ class NSEMonitor(BaseMonitor):
 
     def __init__(self, *, fetcher=None, parser=parse_nse_payload, **kwargs) -> None:
         if fetcher is None:
-            fetcher = fetch_nse_with_playwright
+            fetcher = fetch_nse
         super().__init__(fetcher=fetcher, parser=parser, **kwargs)
