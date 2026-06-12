@@ -1,19 +1,22 @@
-"""`/api/core` — Read-only query endpoints for core data tables.
+"""`/api/core` — Query endpoints for core data tables, plus operator
+triggers to (re)run the analyzer on stored announcements.
 
 Endpoints:
-  GET /api/announcements/recent?limit=N
-  GET /api/analyses/recent?limit=N
-  GET /api/signals/recent?limit=N
-  GET /api/positions
-  GET /api/trades?limit=N
-  GET /api/dashboard/summary
+  GET  /api/announcements/recent?limit=N
+  GET  /api/analyses/recent?limit=N
+  GET  /api/signals/recent?limit=N
+  GET  /api/positions
+  GET  /api/trades?limit=N
+  GET  /api/dashboard/summary
+  POST /api/analyses/run/{announcement_id}   # queue one announcement
+  POST /api/analyses/backfill?limit=N        # queue N most recent unanalyzed
 """
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -27,6 +30,8 @@ from app.db.models import (
 )
 from app.db.session import get_db
 from app.logging_config import get_logger
+from app.monitors.base import CHANNEL_NEW
+from app.services.event_bus import event_bus
 
 log = get_logger(__name__)
 
@@ -179,6 +184,77 @@ def list_trades(
         select(Trade).order_by(Trade.created_at.desc()).limit(limit)
     ).scalars().all()
     return [_ser_trade(t) for t in rows]
+
+
+def _publish_payload(a: Announcement) -> dict[str, Any]:
+    """Build the same `announcements.new` payload the monitors publish,
+    so a re-queued announcement flows through the identical pipeline."""
+    return {
+        "announcement_id": a.id,
+        "exchange": a.exchange,
+        "company": a.symbol,
+        "title": a.headline,
+        "pdf_url": a.pdf_url,
+        "posted_at": a.filed_at.isoformat() if a.filed_at else None,
+    }
+
+
+@router.post("/api/analyses/run/{announcement_id}")
+async def run_analysis(
+    announcement_id: int,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Queue one stored announcement for analysis.
+
+    Publishes `announcements.new` on the in-process event bus; the
+    running analyzer picks it up exactly like a fresh scrape (DeepSeek
+    call → rules engine → risk engine → execution). The analyzer skips
+    announcements that already have an `analyses` row, so re-running
+    is safe and free.
+    """
+    a = db.get(Announcement, announcement_id)
+    if a is None:
+        raise HTTPException(404, f"announcement {announcement_id} not found")
+    already = db.execute(
+        select(func.count()).select_from(Analysis).where(
+            Analysis.announcement_id == announcement_id
+        )
+    ).scalar_one() > 0
+    await event_bus.publish(CHANNEL_NEW, _publish_payload(a))
+    log.info(
+        "analyses.run_queued",
+        announcement_id=announcement_id,
+        already_analyzed=already,
+    )
+    return {
+        "status": "queued",
+        "announcement_id": announcement_id,
+        "already_analyzed": already,
+    }
+
+
+@router.post("/api/analyses/backfill")
+async def backfill_analyses(
+    limit: int = Query(5, ge=1, le=50),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Queue the N most recent announcements that have no analysis yet.
+
+    Each queued announcement costs one DeepSeek call, so the limit is
+    capped at 50 per request.
+    """
+    analyzed = select(Analysis.announcement_id)
+    rows = db.execute(
+        select(Announcement)
+        .where(Announcement.id.not_in(analyzed))
+        .order_by(Announcement.received_at.desc())
+        .limit(limit)
+    ).scalars().all()
+    for a in rows:
+        await event_bus.publish(CHANNEL_NEW, _publish_payload(a))
+    ids = [a.id for a in rows]
+    log.info("analyses.backfill_queued", count=len(ids), announcement_ids=ids)
+    return {"status": "queued", "count": len(ids), "announcement_ids": ids}
 
 
 @router.get("/api/dashboard/summary")
