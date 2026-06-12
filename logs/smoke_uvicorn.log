@@ -1,0 +1,12 @@
+2026-06-12 10:10:51 [info     ] init_db.start                  tables=18
+2026-06-12 10:10:51 [info     ] init_db.done                   tables=18
+2026-06-12 10:10:51 [info     ] init_db.start                  tables=18
+2026-06-12 10:10:51 [info     ] init_db.done                   tables=18
+2026-06-12 10:10:51 [info     ] init_db.start                  tables=18
+2026-06-12 10:10:51 [info     ] init_db.done                   tables=18
+2026-06-12 10:10:51 [info     ] init_db.start                  tables=18
+2026-06-12 10:10:51 [info     ] init_db.done                   tables=18
+2026-06-12 10:10:51 [info     ] init_db.start                  tables=18
+2026-06-12 10:10:51 [info     ] init_db.done                   tables=18
+{"exchange": "NSE", "failure_count": 1, "backoff_s": 2.06, "error": "nse landing goto failed: Page.goto: net::ERR_HTTP2_PROTOCOL_ERROR at https://www.nseindia.com/companies-listing/corporate-filings-announcements\nCall log:\n  - navigating to \"https://www.nseindia.com/companies-listing/corporate-filings-announcements\", waiting until \"domcontentloaded\"\n", "event": "monitor.retry", "timestamp": "2026-06-12T04:40:52.270492Z", "level": "warning", "logger": "app.monitors.base"}
+{"exchange": "BSE", "failure_count": 1, "backoff_s": 1.94, "error": "bse api evaluate failed: Page.evaluate: TypeError: Failed to fetch\n    at eval (eval at evaluate (:234:30), <anonymous>:2:41)\n    at UtilityScript.evaluate (<anonymous>:241:19)\n    at UtilityScript.<anonymous> (<anonymous>:1:44)", "event": "monitor.retry", "timestamp": "2026-06-12T04:40:52.303125Z", "level": "warning", "logger": "app.monitors.base"}

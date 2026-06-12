@@ -1,0 +1,27 @@
+# Web framework
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+websockets==13.1
+python-multipart==0.0.19
+
+# Settings & validation
+pydantic==2.10.3
+pydantic-settings==2.7.0
+
+# ORM & migrations
+SQLAlchemy==2.0.36
+alembic==1.14.0
+
+# Logging
+structlog==24.4.0
+
+# HTTP client (used by future tracks; included now so deps are stable)
+httpx==0.28.1
+
+# Scraping — NSE / BSE monitors (T2). Optional at runtime; the import
+# is lazy so tests + non-scraping envs don't need it.
+playwright==1.49.1
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.24.0

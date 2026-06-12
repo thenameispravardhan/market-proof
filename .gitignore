@@ -1,0 +1,38 @@
+# Build artifacts
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Local data
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Local env
+.env
+.env.local
+.env.*.local
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Runtime / mavis / opencode state (NOT part of the project)
+.mavis/
+.opencode/
+
+node_modules/
+/.pnp
+.pnp.js
+.yarn/install-state.gz
