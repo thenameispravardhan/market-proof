@@ -93,6 +93,21 @@ def test_three_recommendations_round_trip():
         assert a.recommendation == Recommendation(r)
 
 
+def test_enum_fields_are_case_insensitive():
+    """Live DeepSeek responses use inconsistent casing ("buy",
+    "Positive", "buyback"); the schema must normalise, not reject."""
+    a = AnalysisResponse.model_validate(
+        _valid_payload(
+            event_type="buyback",
+            sentiment="Positive",
+            recommendation="buy",
+        )
+    )
+    assert a.event_type == EventType.BUYBACK
+    assert a.sentiment == Sentiment.POSITIVE
+    assert a.recommendation == Recommendation.BUY
+
+
 def test_key_numbers_all_optional():
     a = AnalysisResponse.model_validate(
         _valid_payload(key_numbers={})

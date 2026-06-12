@@ -19,6 +19,7 @@ from fastapi import FastAPI, Request, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app import __version__
+from app.analyzer.service import Service as AnalyzerService
 from app.api import (
     audit_log as audit_log_api,
     backtest,
@@ -72,10 +73,17 @@ async def lifespan(app: FastAPI):
     init_db()
 
     monitor_manager = MonitorManager()
+    analyzer_service = AnalyzerService()
     execution_manager = ExecutionManager()
     notification_manager = NotificationManager()
     webhook_dispatcher = WebhookDispatcher()
     if not settings.TESTING:
+        # T3: start the analyzer before the monitors so its event-bus
+        # subscription is live before the first `announcements.new`
+        # event fires. Without it the pipeline dead-ends at the
+        # announcements table.
+        analyzer_service.start()
+        await analyzer_service.wait_until_ready()
         # Don't start network monitors in test mode — they would
         # hit real exchanges. Tests that need the loop drive
         # `MonitorManager` with stubbed fetchers instead.
@@ -95,14 +103,18 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         if not settings.TESTING:
+            # Stop the producers first so consumers drain cleanly.
+            await monitor_manager.stop()
+            analyzer_service.stop()
             execution_manager.stop()
             notification_manager.stop()
             webhook_dispatcher.stop()
+            await analyzer_service.wait_until_stopped()
             await execution_manager.wait_until_stopped()
             await notification_manager.wait_until_stopped()
             await webhook_dispatcher.wait_until_stopped()
+            await analyzer_service.aclose()
             await webhook_dispatcher.aclose()
-            await monitor_manager.stop()
         log.info("app.shutdown")
 
 

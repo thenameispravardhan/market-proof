@@ -124,6 +124,22 @@ class AnalysisResponse(BaseModel):
             raise ValueError("must be a non-empty string")
         return v.strip()
 
+    # LLMs are unreliable about casing ("buy" vs "BUY"); normalise
+    # before enum validation rather than rejecting the analysis.
+    @field_validator("event_type", "recommendation", mode="before")
+    @classmethod
+    def _upper_enum(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            return v.strip().upper()
+        return v
+
+    @field_validator("sentiment", mode="before")
+    @classmethod
+    def _lower_enum(cls, v: Any) -> Any:
+        if isinstance(v, str):
+            return v.strip().lower()
+        return v
+
     def to_db_columns(self) -> dict[str, Any]:
         """Map the model onto the existing `analyses` DB columns.
 
