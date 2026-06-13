@@ -63,7 +63,11 @@ export function TradeSignals() {
                 <td>
                   <span className={`badge ${statusClass(s.status)}`}>{s.status}</span>
                 </td>
-                <td>{s.rationale ?? "—"}</td>
+                <td>
+                  <div className="cell-clamp" title={s.rationale ?? ""}>
+                    {s.rationale ?? "—"}
+                  </div>
+                </td>
               </tr>
             ))}
           </tbody>
