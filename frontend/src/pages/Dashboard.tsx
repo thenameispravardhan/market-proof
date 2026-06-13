@@ -1,11 +1,9 @@
 // Dashboard page: a trading-mode banner, a summary stat row, then the
 // live widgets in a responsive grid:
-//   - Announcements feed / AI Analysis / Trade Signals
+//   - News Pipeline (unified scrape → analyze → signal table)
 //   - Active Positions (with close controls) / Risk Metrics / P&L chart
 
-import { AnnouncementsFeed } from "../components/dashboard/AnnouncementsFeed";
-import { AIAnalysisPanel } from "../components/dashboard/AIAnalysisPanel";
-import { TradeSignals } from "../components/dashboard/TradeSignals";
+import { NewsPipeline } from "../components/dashboard/NewsPipeline";
 import { ActivePositions } from "../components/dashboard/ActivePositions";
 import { PnLChart } from "../components/dashboard/PnLChart";
 import { RiskMetrics } from "../components/dashboard/RiskMetrics";
@@ -64,9 +62,7 @@ export default function Dashboard() {
       <ModeBanner />
       <StatRow />
       <div className="dashboard-grid">
-        <AnnouncementsFeed />
-        <AIAnalysisPanel />
-        <TradeSignals />
+        <NewsPipeline />
         <ActivePositions />
         <RiskMetrics />
         <PnLChart />

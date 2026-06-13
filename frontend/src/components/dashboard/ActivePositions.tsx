@@ -47,7 +47,7 @@ export function ActivePositions() {
   };
 
   return (
-    <div className="widget" data-testid="active-positions">
+    <div className="widget widget-wide" data-testid="active-positions">
       <h3>
         Active Positions
         {open.length > 0 && (

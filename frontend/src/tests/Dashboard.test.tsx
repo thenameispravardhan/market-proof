@@ -41,7 +41,7 @@ describe("Dashboard", () => {
     vi.restoreAllMocks();
   });
 
-  it("renders all 6 widgets and shows announcement data when the API responds", async () => {
+  it("renders all 4 widgets and shows announcement data when the API responds", async () => {
     globalThis.fetch = makeFetchStub((url) => {
       if (url.includes("/api/announcements/recent")) {
         return makeJsonResponse([
@@ -72,15 +72,13 @@ describe("Dashboard", () => {
     });
     render(<Dashboard />, { wrapper: wrapper(qc) });
 
-    // All six widgets render with their testids.
-    expect(screen.getByTestId("announcements-feed")).toBeInTheDocument();
-    expect(screen.getByTestId("ai-analysis-panel")).toBeInTheDocument();
-    expect(screen.getByTestId("trade-signals")).toBeInTheDocument();
+    // All four widgets render with their testids.
+    expect(screen.getByTestId("news-pipeline")).toBeInTheDocument();
     expect(screen.getByTestId("active-positions")).toBeInTheDocument();
     expect(screen.getByTestId("risk-metrics")).toBeInTheDocument();
     expect(screen.getByTestId("pnl-chart")).toBeInTheDocument();
 
-    // The announcements widget shows the symbol from the mock.
+    // The pipeline widget shows the symbol from the mock.
     await waitFor(() => {
       expect(screen.getByText("RELIANCE")).toBeInTheDocument();
     });

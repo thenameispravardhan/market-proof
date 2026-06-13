@@ -1,7 +1,20 @@
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { useRouter } from "./router";
 import type { TabKey } from "./router";
 import { useWebSocket } from "./hooks/useWebSocket";
+
+// Persisted sidebar open/closed state. Default open. Stored in
+// localStorage so the choice survives reloads.
+const SIDEBAR_KEY = "mavis.sidebarOpen";
+function readSidebarOpen(): boolean {
+  try {
+    const v = localStorage.getItem(SIDEBAR_KEY);
+    if (v === null) return true;
+    return v === "1";
+  } catch {
+    return true;
+  }
+}
 
 // Eager-load pages — the bundle is small enough that lazy() isn't needed,
 // but we lazy-load the backtest/settings pages to keep initial paint fast.
@@ -46,13 +59,33 @@ function PageContent({ tab }: { tab: TabKey }) {
 export default function App() {
   const [tab, navigate] = useRouter();
   const { status } = useWebSocket({ channels: ["signals", "trades", "positions"] });
+  const [sidebarOpen, setSidebarOpen] = useState<boolean>(readSidebarOpen);
+
+  // Persist sidebar state on change.
+  useEffect(() => {
+    try {
+      localStorage.setItem(SIDEBAR_KEY, sidebarOpen ? "1" : "0");
+    } catch {
+      /* localStorage may be unavailable (private mode); ignore */
+    }
+  }, [sidebarOpen]);
+
+  const toggleSidebar = () => setSidebarOpen((v) => !v);
 
   return (
     <div className="app">
-      <nav className="sidebar">
+      <nav className={`sidebar${sidebarOpen ? "" : " collapsed"}`} aria-label="Primary">
         <div className="logo">
-          <span className="logo-icon">🤖</span>
-          <span className="logo-text">TradeBot</span>
+          <button
+            className="sidebar-toggle"
+            onClick={toggleSidebar}
+            aria-label={sidebarOpen ? "Collapse sidebar" : "Expand sidebar"}
+            title={sidebarOpen ? "Collapse sidebar" : "Expand sidebar"}
+            data-testid="sidebar-toggle"
+          >
+            {sidebarOpen ? "◀" : "▶"}
+          </button>
+          {sidebarOpen && <span className="logo-text">TradeBot</span>}
         </div>
         <ul className="nav-list">
           {TABS.map(({ key, label, emoji }) => (
@@ -61,22 +94,37 @@ export default function App() {
                 className={`nav-item${tab === key ? " active" : ""}`}
                 onClick={() => navigate(key)}
                 data-testid={`nav-${key}`}
+                title={label}
               >
                 <span className="nav-emoji">{emoji}</span>
-                <span className="nav-label">{label}</span>
+                {sidebarOpen && <span className="nav-label">{label}</span>}
               </button>
             </li>
           ))}
         </ul>
         <div className="sidebar-footer">
-          <span className={`ws-status ${status}`} title={`WebSocket: ${status}`}>
+          <span
+            className={`ws-status ${status}`}
+            title={`WebSocket: ${status}`}
+          >
             {status === "open" ? "●" : status === "connecting" ? "◌" : "○"}
-            {" "}<span className="nav-label">{status}</span>
+            {sidebarOpen && <span className="nav-label">{status}</span>}
           </span>
         </div>
       </nav>
 
       <main className="content">
+        {!sidebarOpen && (
+          <button
+            className="sidebar-toggle-floating"
+            onClick={toggleSidebar}
+            aria-label="Expand sidebar"
+            title="Expand sidebar"
+            data-testid="sidebar-toggle-floating"
+          >
+            ☰
+          </button>
+        )}
         <Suspense fallback={<div className="empty loading">Loading page…</div>}>
           <PageContent tab={tab} />
         </Suspense>
