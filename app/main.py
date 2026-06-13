@@ -27,6 +27,7 @@ from app.api import (
     core as core_api,
     fyers_callback,
     health,
+    market as market_api,
     notifications as notifications_api,
     positions as positions_api,
     prompts as prompts_api,
@@ -252,6 +253,7 @@ app.include_router(strategies_api.router)
 app.include_router(broker_accounts_api.router)
 app.include_router(audit_log_api.router)
 app.include_router(positions_api.router)
+app.include_router(market_api.router)
 app.include_router(core_api.router)
 
 

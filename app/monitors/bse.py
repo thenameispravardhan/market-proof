@@ -45,7 +45,7 @@ import asyncio
 import json
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional, Union
+from typing import Any, Optional, Union, cast
 
 from app.logging_config import get_logger
 from app.monitors.base import BaseMonitor, RawAnnouncement
@@ -155,11 +155,61 @@ def _normalise_attach(value: Any) -> Optional[str]:
     return f"{BSE_ATTACH_URL_PREFIX}{s}"
 
 
+def _extract_bse_trading_symbol(row: dict[str, Any]) -> Optional[str]:
+    """Best-effort extract of the trading symbol from a BSE row.
+
+    The live BSE response has multiple identifiers:
+      - SCRIP_CD:   the 6-digit numeric BSE scrip code (e.g. 538730)
+      - SLONGNAME:  the long company name (e.g. "Orient Beverages Ltd")
+      - NSURL:      the public stock-share-price URL whose last path
+                    segment IS the trading symbol, e.g.
+                    https://www.bseindia.com/stock-share-price/pds-ltd/pdsl/538730/
+                    -> "pdsl" (lowercased)
+      - COMPANY_NAME / SC_NAME: an older/different endpoint's field
+                    that sometimes carries the long name
+
+    We prefer the trading symbol (NSURL's last segment) because that's
+    what traders recognise. Fall back to the long name, then to the
+    numeric scrip code as a last resort.
+    """
+    # 1. NSURL last path segment, e.g. ".../pds-ltd/pdsl/538730/" -> "pdsl"
+    nsurl = row.get("NSURL") or row.get("nsurl")
+    if isinstance(nsurl, str) and nsurl.strip():
+        parts = [p for p in nsurl.rstrip("/").split("/") if p]
+        if parts:
+            cand = parts[-1].strip()
+            # The last segment is always the numeric scrip code in
+            # some versions; skip it and look at the segment before.
+            if cand.isdigit() and len(parts) >= 2:
+                cand = parts[-2].strip()
+            if cand:
+                return cand.upper()
+    # 2. Long name from the standard live field
+    for k in ("SLONGNAME", "SLongName", "slongname"):
+        v = row.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    # 3. Older endpoints / categorised views
+    for k in (
+        "COMPANY_NAME", "Company_name", "company_name",
+        "SC_NAME", "Sc_name", "sc_name",
+        "LONG_NAME", "SHORT_NAME", "long_name", "short_name",
+    ):
+        v = row.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    # 4. Numeric scrip code (least preferred — operators don't read numbers)
+    scrip = row.get("SCRIP_CD") or row.get("scrip_cd")
+    if scrip is not None:
+        s = str(scrip).strip()
+        if s:
+            return s
+    return None
+
+
 def _row_to_raw(row: dict[str, Any]) -> Optional[RawAnnouncement]:
     """Convert one BSE JSON row to a `RawAnnouncement`, or None to skip."""
-    # SCRIP_CD is an integer in the live response — coerce to string.
-    scrip = row.get("SCRIP_CD") or row.get("scrip_cd")
-    symbol = (str(scrip) if scrip is not None else "").strip()
+    symbol = _extract_bse_trading_symbol(row)
     if not symbol:
         return None
     title = (
@@ -323,7 +373,13 @@ async def fetch_bse_with_httpx(
             if isinstance(result, Exception):
                 log.debug("bse category failed", category=cat, error=str(result))
                 continue
-            cat_name, status, text = result
+            # `asyncio.gather(return_exceptions=True)` types `result` as
+            # `BaseException | T_return`. After the isinstance check
+            # above, the type checker can't narrow it to the tuple
+            # shape, so we cast to make the destructure explicit.
+            cat_name, status, text = cast(
+                tuple[str, int, str], result
+            )
             if status == 429 or status >= 500:
                 raise _RetryableError(f"bse api {status}")
             if status in (401, 403):
@@ -415,7 +471,10 @@ async def fetch_bse_with_playwright(
                 if isinstance(result, Exception):
                     log.debug("bse category failed (playwright)", category=cat, error=str(result))
                     continue
-                cat_name, status, text = result
+                # See the sibling httpx path above for the cast rationale.
+                cat_name, status, text = cast(
+                    tuple[str, int, str], result
+                )
                 if status == 429 or status >= 500:
                     raise _RetryableError(f"bse api {status}")
                 if status >= 400:

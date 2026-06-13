@@ -176,18 +176,30 @@ async def fyers_callback(
 
 
 @router.get("/authorize-url")
-def fyers_authorize_url() -> dict[str, str]:
+def fyers_authorize_url() -> dict[str, Any]:
     """One-shot helper: returns the Fyers authorize URL the operator
     should open in a browser. The `state` is registered for CSRF
-    protection; the callback validates it."""
+    protection; the callback validates it.
+
+    Shape matches what the "Connect Fyers" banner expects:
+        {configured: bool, url: str, state: str, reason: str | None}
+    When creds are missing we return `configured: false` with a clear
+    reason (HTTP 200) so the UI can render the message instead of
+    throwing on a 5xx.
+    """
     import secrets
 
     settings = get_settings()
-    if not settings.FYERS_APP_ID:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="FYERS_APP_ID is not configured",
-        )
+    if not settings.fyers_configured:
+        return {
+            "configured": False,
+            "url": "",
+            "state": "",
+            "reason": (
+                "FYERS_APP_ID / FYERS_SECRET_KEY are not set in .env. "
+                "Add them and restart the backend."
+            ),
+        }
     from app.execution.fyers_auth import build_authorize_url, register_state
 
     state = secrets.token_urlsafe(24)
@@ -197,4 +209,125 @@ def fyers_authorize_url() -> dict[str, str]:
         redirect_uri=settings.FYERS_REDIRECT_URI,
         state=state,
     )
-    return {"url": url, "state": state}
+    return {"configured": True, "url": url, "state": state, "reason": None}
+
+
+# -------------------------------------------------------------------------
+# Status + disconnect — used by the UI "Connect Fyers" banner.
+# -------------------------------------------------------------------------
+
+
+@router.get("/status")
+def fyers_status(db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Report the high-level Fyers connection state for the UI.
+
+    Drives the "Connect Fyers" banner. Three layers of state:
+
+      1. `credentials_set`  — FYERS_APP_ID + FYERS_SECRET_KEY in .env
+      2. `account_present`  — a Fyers broker_accounts row exists in the DB
+      3. `connected`        — that row has a non-empty access_token
+
+    The dashboard's "live data" status bar uses (3); the warning
+    "FYERS NOT CONFIGURED" appears when (3) is false.
+    """
+    settings = get_settings()
+    credentials_set = settings.fyers_configured
+    # Look for a Fyers account whose app_id matches the configured one.
+    # We deliberately require `app_id` to be set on the account row —
+    # the seeded `Paper Account` (broker='fyers', app_id=None) is just
+    # a placeholder for paper-mode trading, NOT a real Fyers integration.
+    account: Optional[BrokerAccount] = None
+    if credentials_set:
+        account = db.execute(
+            select(BrokerAccount)
+            .where(
+                BrokerAccount.broker == "fyers",
+                BrokerAccount.app_id == settings.FYERS_APP_ID,
+                BrokerAccount.app_id.is_not(None),
+                BrokerAccount.enabled == True,  # noqa: E712
+            )
+            .order_by(BrokerAccount.id.asc())
+        ).scalars().first()
+    if account is None:
+        account = db.execute(
+            select(BrokerAccount)
+            .where(
+                BrokerAccount.broker == "fyers",
+                BrokerAccount.app_id.is_not(None),
+                BrokerAccount.enabled == True,  # noqa: E712
+            )
+            .order_by(BrokerAccount.id.asc())
+        ).scalars().first()
+
+    account_present = account is not None
+    has_token = bool(account_present and account.access_token)  # type: ignore[union-attr]
+
+    reason: Optional[str] = None
+    if not credentials_set:
+        reason = (
+            "FYERS_APP_ID / FYERS_SECRET_KEY are not set in .env. "
+            "Add them and restart the backend."
+        )
+    elif not account_present:
+        reason = "Click 'Connect Fyers' to run the OAuth flow."
+    elif not has_token:
+        reason = (
+            "Fyers account is configured but the access token is missing. "
+            "Click 'Connect Fyers' to re-authorise (Fyers tokens expire daily)."
+        )
+
+    return {
+        "connected": credentials_set and account_present and has_token,
+        "credentials_set": credentials_set,
+        "account_present": account_present,
+        "app_id": settings.FYERS_APP_ID or None,
+        "live_mode": settings.is_live,
+        "reason": reason,
+    }
+
+
+@router.post("/disconnect")
+def fyers_disconnect(db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Clear the Fyers access token (and rotate if possible).
+
+    The credentials in .env stay put — this only kills the current
+    OAuth session. The operator can re-authorise via the
+    /authorize-url flow at any time.
+
+    Use case: the access token has expired or you want to force a
+    re-auth. After calling this, the dashboard's status bar will
+    switch back to "FYERS NOT CONFIGURED" and the next signal will
+    skip live routing (paper mode still works).
+    """
+    settings = get_settings()
+    if not settings.fyers_configured:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="FYERS creds are not configured in .env",
+        )
+
+    account: Optional[BrokerAccount] = db.execute(
+        select(BrokerAccount)
+        .where(
+            BrokerAccount.broker == "fyers",
+            BrokerAccount.app_id == settings.FYERS_APP_ID,
+            BrokerAccount.enabled == True,  # noqa: E712
+        )
+        .order_by(BrokerAccount.id.asc())
+    ).scalars().first()
+    if account is None:
+        return {"ok": False, "reason": "no fyers broker account found"}
+
+    account.access_token = None
+    db.add(
+        AuditLog(
+            actor="user",
+            action="fyers.disconnect",
+            target=f"broker_account:{account.id}",
+            before={"has_token": True},
+            after={"has_token": False},
+        )
+    )
+    db.commit()
+    log.info("fyers.disconnect", account_id=account.id, account_name=account.name)
+    return {"ok": True}

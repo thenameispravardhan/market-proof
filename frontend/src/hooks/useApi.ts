@@ -49,6 +49,38 @@ export function useSignals(limit = 20) {
   });
 }
 
+// ---- Market data ----
+
+export interface IndexQuote {
+  key: string;
+  name: string;
+  symbol: string;
+  last_price: number | null;
+  change: number | null;
+  change_pct: number | null;
+}
+
+export interface MarketIndices {
+  ok: boolean;
+  configured: boolean;
+  reason: string | null;
+  indices: IndexQuote[];
+  fetched_at: number | null;
+}
+
+// Polls /api/market/indices. The backend caches for 5s, so a 4s
+// client poll keeps the ticker fresh without thrashing the upstream.
+export function useMarketIndices() {
+  return useQuery<MarketIndices>({
+    queryKey: ["market-indices"],
+    queryFn: () => api.get("/api/market/indices"),
+    refetchInterval: 4000,
+    refetchIntervalInBackground: false,
+    staleTime: 3000,
+  });
+}
+
+
 export function usePositions() {
   return useQuery<Position[]>({
     queryKey: ["positions"],
@@ -310,6 +342,71 @@ export function useTestBrokerAccount() {
   return useMutation({
     mutationFn: (id: number) =>
       api.post<{ ok: boolean; message: string }>(`/api/broker-accounts/${id}/test`, {}),
+  });
+}
+
+// Flip a broker account's `enabled` flag — backs the dashboard
+// Paper / Fyers on-off switches. A disabled account is skipped by the
+// execution manager (signals route to it are blocked).
+export function useToggleBrokerAccount() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
+      api.put<BrokerAccount>(`/api/broker-accounts/${id}`, { enabled }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["broker-accounts"] }),
+  });
+}
+
+// ---- Fyers OAuth ----
+
+export interface FyersStatus {
+  // True if FYERS_APP_ID + FYERS_SECRET_KEY are loaded in .env
+  // AND a Fyers broker account exists in the DB with a valid
+  // access_token. The "fully wired up" state.
+  connected: boolean;
+  // True if creds are in .env but no OAuth has run yet (or token expired).
+  credentials_set: boolean;
+  // True if a Fyers broker account row exists in the DB (regardless of token).
+  account_present: boolean;
+  // The configured app ID (for display), if known.
+  app_id: string | null;
+  // True if TRADING_MODE is currently 'live'.
+  live_mode: boolean;
+  // Reason string when not connected.
+  reason: string | null;
+}
+
+// Polls the Fyers connection status. Used by the "Connect Fyers"
+// banner and the dashboard's status bar.
+export function useFyersStatus() {
+  return useQuery<FyersStatus>({
+    queryKey: ["fyers-status"],
+    queryFn: () => api.get("/api/fyers/status"),
+    refetchInterval: 5000,
+    refetchIntervalInBackground: false,
+  });
+}
+
+// Fetches the OAuth URL and returns it. The caller (UI) opens a
+// popup window with this URL. The popup will redirect to
+// /api/fyers/callback after the user authorises the app.
+export function useFyersAuthorizeUrl() {
+  return useMutation<{ url: string; configured: boolean; reason: string | null }, void>({
+    mutationFn: () => api.get("/api/fyers/authorize-url"),
+  });
+}
+
+// Disconnects Fyers by clearing the access token (and revoking the
+// session server-side if possible). The creds in .env stay put.
+export function useFyersDisconnect() {
+  const qc = useQueryClient();
+  return useMutation<{ ok: boolean; reason?: string }, void>({
+    mutationFn: () => api.post("/api/fyers/disconnect", {}),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["fyers-status"] });
+      qc.invalidateQueries({ queryKey: ["broker-accounts"] });
+      qc.invalidateQueries({ queryKey: ["market-indices"] });
+    },
   });
 }
 

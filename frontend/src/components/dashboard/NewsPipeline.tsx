@@ -16,9 +16,37 @@ import type { Analysis, Announcement, Signal } from "../../types";
 
 function fmtTime(iso?: string | null): string {
   if (!iso) return "—";
-  const d = new Date(iso);
+  // The backend serializes UTC timestamps. Some older rows may not
+  // have a tz suffix on the ISO string; we defensively append `Z`
+  // so the browser parses them as UTC instead of local time.
+  // (SQLite strips tzinfo on read, so without `Z` the JS Date
+  // constructor would treat the value as the browser's local time,
+  // causing a 5h30m skew on Indian clients.)
+  let normalized = iso.trim();
+  if (!/Z$|[+-]\d{2}:?\d{2}$/.test(normalized)) {
+    normalized = normalized + "Z";
+  }
+  const d = new Date(normalized);
   if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleString();
+  // Render the IST components manually for stable column width.
+  // We do this with Intl (timezone-aware) so DST is handled
+  // correctly, even though India does not observe DST.
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Kolkata",
+    day: "2-digit",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(d);
+  const lookup = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+  const day = lookup("day");
+  const mon = (lookup("month") || "").toUpperCase();
+  const hh = lookup("hour");
+  const mm = lookup("minute");
+  const ss = lookup("second");
+  return `${day} ${mon} ${hh}:${mm}:${ss}`;
 }
 
 function fmtPct(v: number | null | undefined): string {
@@ -72,7 +100,9 @@ export function NewsPipeline() {
       (ana.data ?? []).map((a) => [a.announcement_id, a])
     );
     const sigByAna = new Map<number, Signal>(
-      (sig.data ?? []).map((s) => [s.analysis_id ?? -1, s]).filter(([k]) => k !== -1)
+      (sig.data ?? [])
+        .map((s): [number, Signal] => [s.analysis_id ?? -1, s])
+        .filter(([k]) => k !== -1)
     );
     return ann.data.map((a) => {
       const analysis = anaByAnn.get(a.id) ?? null;
@@ -108,7 +138,7 @@ export function NewsPipeline() {
                 <th>Exch</th>
                 <th>Event</th>
                 <th>Headline</th>
-                <th>Filed</th>
+                <th>Processed <span className="meta">(IST)</span></th>
                 <th>AI Sentiment</th>
                 <th>AI Reco</th>
                 <th className="mono">AI Conf</th>
@@ -131,7 +161,9 @@ export function NewsPipeline() {
                   <td className="cell-text" title={a.headline}>
                     {a.headline}
                   </td>
-                  <td className="cell-text mono">{fmtTime(a.filed_at)}</td>
+                  <td className="cell-text mono" title={`Processed: ${a.received_at}`}>
+                    {fmtTime(a.received_at)}
+                  </td>
                   <td>
                     {x ? (
                       <span className={`badge ${sentimentClass(x.sentiment)}`}>

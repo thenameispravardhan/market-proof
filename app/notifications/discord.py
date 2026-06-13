@@ -33,7 +33,9 @@ class DiscordNotifier:
     ) -> None:
         self._owns_client = client is None
         self._client = client
-        self._timeout_s = float(timeout_s)
+        # `timeout_s` is already typed `float`, so the explicit
+        # `float(...)` cast is redundant.
+        self._timeout_s = timeout_s
         self._transport_factory = transport_factory
 
     async def _ensure_client(self) -> httpx.AsyncClient:

@@ -7,6 +7,7 @@ import { NewsPipeline } from "../components/dashboard/NewsPipeline";
 import { ActivePositions } from "../components/dashboard/ActivePositions";
 import { PnLChart } from "../components/dashboard/PnLChart";
 import { RiskMetrics } from "../components/dashboard/RiskMetrics";
+import { AccountToggles } from "../components/dashboard/AccountToggles";
 import { useDashboardSummary, useGlobalSettings } from "../hooks/useApi";
 
 function money(v: number | null | undefined): string {
@@ -45,7 +46,6 @@ function ModeBanner() {
   const mode = data?.global?.TRADING_MODE ?? "paper";
   return (
     <div className={`mode-banner ${mode}`}>
-      <span>{mode === "live" ? "🔴" : "🟢"}</span>
       <span>
         {mode === "live"
           ? "LIVE TRADING — real orders are being placed"
@@ -58,7 +58,10 @@ function ModeBanner() {
 export default function Dashboard() {
   return (
     <div>
-      <h1 className="page-title">Dashboard</h1>
+      <div className="dashboard-head">
+        <h1 className="page-title">Dashboard</h1>
+        <AccountToggles />
+      </div>
       <ModeBanner />
       <StatRow />
       <div className="dashboard-grid">

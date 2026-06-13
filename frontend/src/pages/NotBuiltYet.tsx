@@ -7,6 +7,7 @@ import type { TabKey } from "../router";
 
 const COPY: Record<TabKey, { title: string; why: string }> = {
   dashboard: { title: "Dashboard", why: "Already built." },
+  trades: { title: "Trade History", why: "Already built." },
   prompts: { title: "Prompts", why: "Already built." },
   accounts: { title: "Broker Accounts", why: "Manage Fyers paper/live accounts and OAuth flow." },
   notifications: { title: "Notifications", why: "Telegram / Discord / email / webhook-out channels." },

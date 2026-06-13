@@ -328,6 +328,22 @@ class Manager:
             )
             return {"approved": False, "code": "NO_ROUTING"}
 
+        # The dashboard Paper/Fyers on-off switches flip the account's
+        # `enabled` flag. A disabled account means "don't trade this
+        # account" — block before any order is placed.
+        if not getattr(account, "enabled", True):
+            await asyncio.get_running_loop().run_in_executor(
+                None, _persist_risk_block,
+                self._session_factory, signal, account.id,
+                "ACCOUNT_DISABLED",
+                f"account {account.name!r} is switched off",
+            )
+            await event_bus.publish(
+                CHANNEL_RISK_BLOCKED,
+                {"signal_id": signal.id, "code": "ACCOUNT_DISABLED", "account_id": account.id},
+            )
+            return {"approved": False, "code": "ACCOUNT_DISABLED"}
+
         # Step 2: pick the backend.
         backend = self._backend_for(account)
         if backend is None:

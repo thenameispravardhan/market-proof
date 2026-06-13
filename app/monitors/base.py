@@ -169,9 +169,9 @@ class BaseMonitor:
         # When no explicit interval is passed, `_poll_interval`
         # re-reads the live setting on every loop iteration so a UI
         # change applies on the next tick without a restart.
-        self._poll_interval_fixed: Optional[float] = (
-            float(poll_interval) if poll_interval is not None else None
-        )
+        # `poll_interval` is already typed `Optional[float]`, so the
+        # explicit `float(...)` cast is redundant.
+        self._poll_interval_fixed: Optional[float] = poll_interval
         if source_url is not None:
             self.source_url = source_url
         self._stop_event: asyncio.Event = asyncio.Event()

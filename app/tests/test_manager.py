@@ -180,6 +180,38 @@ def _make_account(
 
 
 @pytest.mark.asyncio
+async def test_disabled_account_blocks_signal(db_session, isolated_db):
+    """The dashboard Paper/Fyers off switch flips account.enabled=False;
+    the manager must block any signal routed to a disabled account."""
+    md = MarketDataBus()
+    md.set_quote_sync("RELIANCE", last_price=2500.0)
+    paper = PaperBackend(market_data=md, session_factory=lambda: db_session)
+    paper.start()
+    try:
+        account = _make_account(db_session, name="off-acct", paper_mode=True)
+        account.enabled = False
+        strat = _make_strategy(
+            db_session, "off-route", config={"broker_account_id": account.id}
+        )
+        sig = _make_signal(db_session, symbol="RELIANCE", action="BUY", strategy_id=strat.id)
+        db_session.commit()
+
+        risk = RiskEngine(market_data=md, portfolio_value=50_000_000.0)
+        mgr = Manager(risk_engine=risk, market_data=md, paper_backend=paper)
+        outcome = await mgr.process_signal(sig.id)
+        assert outcome is not None
+        assert outcome["approved"] is False
+        assert outcome["code"] == "ACCOUNT_DISABLED"
+        # No order was placed.
+        rows = db_session.execute(
+            select(TradeRow).where(TradeRow.symbol == "RELIANCE", TradeRow.status == "filled")
+        ).scalars().all()
+        assert len(rows) == 0
+    finally:
+        await paper.stop()
+
+
+@pytest.mark.asyncio
 async def test_paper_mode_routes_to_paper_backend(db_session, isolated_db):
     md = MarketDataBus()
     md.set_quote_sync("RELIANCE", last_price=2500.0)

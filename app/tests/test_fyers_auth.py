@@ -415,7 +415,11 @@ def test_callback_stores_token_on_matching_account(client: TestClient) -> None:
 def test_authorize_url_endpoint_returns_url_and_state(client: TestClient) -> None:
     import os
     saved = os.environ.get("FYERS_APP_ID")
+    saved_secret = os.environ.get("FYERS_SECRET_KEY")
     os.environ["FYERS_APP_ID"] = "APP-FAKE-AUTH"
+    # OAuth needs the secret too (the callback exchanges the code with
+    # it), so the endpoint only emits a URL when both are configured.
+    os.environ["FYERS_SECRET_KEY"] = "SECRET-FAKE-AUTH"
     from app import config as app_config
     app_config.reset_settings_cache()
     import importlib
@@ -439,6 +443,10 @@ def test_authorize_url_endpoint_returns_url_and_state(client: TestClient) -> Non
             os.environ.pop("FYERS_APP_ID", None)
         else:
             os.environ["FYERS_APP_ID"] = saved
+        if saved_secret is None:
+            os.environ.pop("FYERS_SECRET_KEY", None)
+        else:
+            os.environ["FYERS_SECRET_KEY"] = saved_secret
         app_config.reset_settings_cache()
         importlib.reload(cb_mod)
         importlib.reload(main_mod)

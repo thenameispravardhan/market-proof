@@ -48,6 +48,27 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _iso_utc(dt: Optional[datetime]) -> Optional[str]:
+    """Serialize a datetime as a UTC ISO-8601 string with a `Z` suffix.
+
+    SQLAlchemy's default `DateTime` column strips timezone info on
+    read, so `dt.isoformat()` returns a naive string like
+    `2026-06-13T05:25:18` — and JavaScript's `new Date(...)` will
+    then interpret that in the browser's local timezone, producing
+    a 5h30m shift on Indian clients. By explicitly appending `Z`,
+    we tell the consumer "this is UTC" so they can convert to
+    IST (or anything else) correctly.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        # Naive datetime: we stored everything as UTC, so re-attach
+        # the UTC tzinfo before formatting.
+        dt = dt.replace(tzinfo=timezone.utc)
+    # .isoformat() with +00:00 → swap to 'Z' for cleanliness.
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def _ser_announcement(a: Announcement) -> dict[str, Any]:
     return {
         "id": a.id,
@@ -58,8 +79,8 @@ def _ser_announcement(a: Announcement) -> dict[str, Any]:
         "body": a.body,
         "pdf_url": a.pdf_url,
         "source": a.source,
-        "filed_at": a.filed_at.isoformat() if a.filed_at else None,
-        "received_at": a.received_at.isoformat() if a.received_at else None,
+        "filed_at": _iso_utc(a.filed_at),
+        "received_at": _iso_utc(a.received_at),
     }
 
 
@@ -77,7 +98,7 @@ def _ser_analysis(a: Analysis) -> dict[str, Any]:
         "stake_change_pct": a.stake_change_pct,
         "dividend_per_share": a.dividend_per_share,
         "buyback_value_inr_crore": a.buyback_value_inr_crore,
-        "created_at": a.created_at.isoformat() if a.created_at else None,
+        "created_at": _iso_utc(a.created_at),
     }
 
 
@@ -93,7 +114,7 @@ def _ser_signal(s: Signal) -> dict[str, Any]:
         "position_size_pct": s.position_size_pct,
         "rationale": s.rationale,
         "status": s.status,
-        "created_at": s.created_at.isoformat() if s.created_at else None,
+        "created_at": _iso_utc(s.created_at),
     }
 
 
@@ -106,8 +127,8 @@ def _ser_position(p: Position) -> dict[str, Any]:
         "last_price": p.last_price,
         "unrealized_pnl": p.unrealized_pnl,
         "strategy_id": p.strategy_id,
-        "opened_at": p.opened_at.isoformat() if p.opened_at else None,
-        "updated_at": p.updated_at.isoformat() if p.updated_at else None,
+        "opened_at": _iso_utc(p.opened_at),
+        "updated_at": _iso_utc(p.updated_at),
     }
 
 
@@ -124,8 +145,8 @@ def _ser_trade(t: Trade) -> dict[str, Any]:
         "status": t.status,
         "broker_order_id": t.broker_order_id,
         "pnl": t.pnl,
-        "executed_at": t.executed_at.isoformat() if t.executed_at else None,
-        "created_at": t.created_at.isoformat() if t.created_at else None,
+        "executed_at": _iso_utc(t.executed_at),
+        "created_at": _iso_utc(t.created_at),
     }
 
 
