@@ -13,6 +13,10 @@ const FIELDS: { key: NumField; label: string; min: number; max: number; step: nu
   { key: "MIN_LIQUIDITY_CRORE", label: "Min liquidity (₹ crore)", min: 1, max: 10000, step: 1 },
   { key: "MAX_SIGNALS_PER_DAY", label: "Max signals per day", min: 1, max: 500, step: 1 },
   { key: "POLL_INTERVAL_SECONDS", label: "Poll interval (seconds)", min: 5, max: 3600, step: 5 },
+  { key: "PORTFOLIO_VALUE", label: "Portfolio value (₹)", min: 1000, max: 1e12, step: 10000 },
+  { key: "DEFAULT_SL_PCT", label: "Default stop-loss (%)", min: 0.5, max: 50, step: 0.5 },
+  { key: "DEFAULT_TARGET_RR", label: "Default target R:R", min: 0.5, max: 10, step: 0.5 },
+  { key: "QUOTE_REFRESH_SECONDS", label: "Quote refresh (seconds)", min: 1, max: 600, step: 1 },
 ];
 
 export function GlobalSettings() {

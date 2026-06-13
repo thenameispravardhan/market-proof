@@ -57,6 +57,43 @@ export function usePositions() {
   });
 }
 
+export function useManagedPositions() {
+  return useQuery<import("../types").ManagedPosition[]>({
+    queryKey: ["managed-positions"],
+    queryFn: () => api.get("/api/positions/managed"),
+    refetchInterval: 4000,
+    // Trade manager only runs outside TESTING; tolerate 503.
+    retry: false,
+  });
+}
+
+export function useClosePosition() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (symbol: string) =>
+      api.post(`/api/positions/${encodeURIComponent(symbol)}/close`, {}),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["positions"] });
+      qc.invalidateQueries({ queryKey: ["managed-positions"] });
+      qc.invalidateQueries({ queryKey: ["trades"] });
+      qc.invalidateQueries({ queryKey: ["dashboard-summary"] });
+    },
+  });
+}
+
+export function useCloseAllPositions() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post("/api/positions/close-all", {}),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["positions"] });
+      qc.invalidateQueries({ queryKey: ["managed-positions"] });
+      qc.invalidateQueries({ queryKey: ["trades"] });
+      qc.invalidateQueries({ queryKey: ["dashboard-summary"] });
+    },
+  });
+}
+
 export function useTrades(limit = 200) {
   return useQuery<Trade[]>({
     queryKey: ["trades", limit],

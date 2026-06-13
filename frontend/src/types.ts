@@ -264,4 +264,19 @@ export interface GlobalSettings {
   MIN_LIQUIDITY_CRORE: number;
   MAX_SIGNALS_PER_DAY: number;
   POLL_INTERVAL_SECONDS: number;
+  PORTFOLIO_VALUE: number;
+  DEFAULT_SL_PCT: number;
+  DEFAULT_TARGET_RR: number;
+  QUOTE_REFRESH_SECONDS: number;
+}
+
+export interface ManagedPosition {
+  symbol: string;
+  quantity: number;
+  entry: number;
+  stop_loss: number | null;
+  target: number | null;
+  signal_id: number | null;
+  strategy_id: number | null;
+  opened_at: string;
 }

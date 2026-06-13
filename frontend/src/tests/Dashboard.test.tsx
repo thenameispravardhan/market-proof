@@ -140,14 +140,14 @@ describe("Dashboard", () => {
     });
     render(<Dashboard />, { wrapper: wrapper(qc) });
 
-    // RiskMetrics: open positions count, realised P&L with the formatted INR.
+    // Wait for the RiskMetrics widget to finish loading (its "Hard
+    // rules" metric is the last thing to render). The dashboard also
+    // shows a summary stat row, so some labels appear more than once.
     await waitFor(() => {
-      expect(screen.getByText("Open positions")).toBeInTheDocument();
+      expect(screen.getByText("Hard rules")).toBeInTheDocument();
     });
-    // Hard rules count defaults to 10.
-    expect(screen.getByText("Hard rules")).toBeInTheDocument();
-    // P&L label present, and the rupee amount contains 42.5.
-    expect(screen.getByText(/Realised P&L \(today\)/)).toBeInTheDocument();
+    expect(screen.getAllByText("Open positions").length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/Realised P&L \(today\)/).length).toBeGreaterThan(0);
   });
 });
 
