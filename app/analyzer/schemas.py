@@ -126,11 +126,23 @@ class AnalysisResponse(BaseModel):
 
     # LLMs are unreliable about casing ("buy" vs "BUY"); normalise
     # before enum validation rather than rejecting the analysis.
-    @field_validator("event_type", "recommendation", mode="before")
+    @field_validator("recommendation", mode="before")
     @classmethod
     def _upper_enum(cls, v: Any) -> Any:
         if isinstance(v, str):
             return v.strip().upper()
+        return v
+
+    @field_validator("event_type", mode="before")
+    @classmethod
+    def _event_type_or_other(cls, v: Any) -> Any:
+        """Normalise casing AND map LLM-invented categories (e.g.
+        'FUND_RAISING', 'APPOINTMENT') to OTHER. A novel label
+        shouldn't throw away an otherwise-valid analysis — the
+        sentiment / recommendation are still useful for trading."""
+        if isinstance(v, str):
+            up = v.strip().upper()
+            return up if up in EventType.__members__ else EventType.OTHER.value
         return v
 
     @field_validator("sentiment", mode="before")
@@ -139,6 +151,27 @@ class AnalysisResponse(BaseModel):
         if isinstance(v, str):
             return v.strip().lower()
         return v
+
+    @field_validator("sentiment_score", mode="before")
+    @classmethod
+    def _normalise_score(cls, v: Any) -> Any:
+        """Coerce a fractional sentiment_score onto the -100..100 scale.
+
+        DeepSeek frequently returns the score on a 0..1 (or -1..1) scale
+        despite the prompt — e.g. 0.95 for "very positive". Left as-is
+        that 0.95 looks neutral to the rules engine and suppresses
+        every trade. If the magnitude is <= 1 we treat it as a fraction
+        and scale by 100. Genuine small integer scores (e.g. 5, -12)
+        are outside [-1, 1] and pass through untouched. Exactly 0 stays
+        neutral.
+        """
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return v
+        if f != 0.0 and -1.0 <= f <= 1.0:
+            return f * 100.0
+        return f
 
     def to_db_columns(self) -> dict[str, Any]:
         """Map the model onto the existing `analyses` DB columns.

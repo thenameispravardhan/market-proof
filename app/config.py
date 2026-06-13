@@ -53,6 +53,25 @@ class Settings(BaseSettings):
     MIN_LIQUIDITY_CRORE: float = 5.0
     MAX_SIGNALS_PER_DAY: int = 20
 
+    # ---------- Trading / trade management ----------
+    # Paper-trading starting capital; the risk engine sizes positions
+    # against this when there are no open positions to mark-to-market.
+    PORTFOLIO_VALUE: float = 1_000_000.0
+    # Default stop-loss distance (% of entry) when the analysis
+    # doesn't carry explicit levels, and the reward:risk multiple
+    # used to derive the target from the stop distance.
+    #
+    # NOTE on the 6% default: position notional as a share of the
+    # portfolio works out to (MAX_CAPITAL_RISK_PCT / DEFAULT_SL_PCT).
+    # With the 1% risk and 20% single-position defaults, the stop must
+    # be >= 5% or *every* trade would be blocked by the notional cap.
+    # 6% keeps a high-conviction trade comfortably inside the cap
+    # (~17% notional) while leaving headroom. Operators can tighten it.
+    DEFAULT_SL_PCT: float = 6.0
+    DEFAULT_TARGET_RR: float = 3.0
+    # How often the quote feed refreshes watched symbols (seconds).
+    QUOTE_REFRESH_SECONDS: int = 5
+
     # ---------- Internal ----------
     TESTING: int = 0
     APP_VERSION: str = "0.1.0"
@@ -74,11 +93,30 @@ class Settings(BaseSettings):
             raise ValueError(f"LOG_LEVEL must be one of DEBUG/INFO/WARNING/ERROR/CRITICAL, got {v!r}")
         return v_up
 
-    @field_validator("MAX_CAPITAL_RISK_PCT", "DAILY_MAX_LOSS_PCT", "MAX_SINGLE_POSITION_PCT")
+    @field_validator(
+        "MAX_CAPITAL_RISK_PCT",
+        "DAILY_MAX_LOSS_PCT",
+        "MAX_SINGLE_POSITION_PCT",
+        "DEFAULT_SL_PCT",
+    )
     @classmethod
     def _pct_in_range(cls, v: float) -> float:
         if not (0 < v <= 100):
             raise ValueError("percent value must be in (0, 100]")
+        return v
+
+    @field_validator("PORTFOLIO_VALUE", "DEFAULT_TARGET_RR")
+    @classmethod
+    def _strictly_positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("value must be > 0")
+        return v
+
+    @field_validator("QUOTE_REFRESH_SECONDS")
+    @classmethod
+    def _refresh_positive(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("QUOTE_REFRESH_SECONDS must be >= 1")
         return v
 
     @field_validator("MAX_CONCURRENT_POSITIONS", "MAX_SIGNALS_PER_DAY")

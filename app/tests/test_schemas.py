@@ -108,6 +108,33 @@ def test_enum_fields_are_case_insensitive():
     assert a.recommendation == Recommendation.BUY
 
 
+def test_fractional_sentiment_score_is_scaled():
+    # DeepSeek often returns the score on a 0..1 scale; it must be
+    # lifted onto -100..100 so the rules engine sees a real magnitude.
+    a = AnalysisResponse.model_validate(_valid_payload(sentiment_score=0.95))
+    assert a.sentiment_score == pytest.approx(95.0)
+    b = AnalysisResponse.model_validate(_valid_payload(sentiment_score=-0.8))
+    assert b.sentiment_score == pytest.approx(-80.0)
+    # Genuine -100..100 values pass through unchanged.
+    c = AnalysisResponse.model_validate(_valid_payload(sentiment_score=72))
+    assert c.sentiment_score == pytest.approx(72.0)
+    # Exactly zero stays neutral.
+    d = AnalysisResponse.model_validate(_valid_payload(sentiment_score=0))
+    assert d.sentiment_score == pytest.approx(0.0)
+
+
+def test_unknown_event_type_maps_to_other():
+    # The LLM sometimes invents categories like FUND_RAISING /
+    # APPOINTMENT that aren't in our 15-value enum. These must NOT
+    # reject the whole analysis — they degrade to OTHER, keeping the
+    # (valid) sentiment + recommendation usable for trading.
+    a = AnalysisResponse.model_validate(
+        _valid_payload(event_type="FUND_RAISING", recommendation="HOLD")
+    )
+    assert a.event_type == EventType.OTHER
+    assert a.recommendation == Recommendation.HOLD
+
+
 def test_key_numbers_all_optional():
     a = AnalysisResponse.model_validate(
         _valid_payload(key_numbers={})
@@ -237,9 +264,11 @@ def test_missing_key_numbers_rejected():
 # -- Enum invalid values ------------------------------------------------
 
 
-def test_invalid_event_type_rejected():
-    with pytest.raises(ValidationError):
-        AnalysisResponse.model_validate(_valid_payload(event_type="BOGUS_TYPE"))
+def test_invalid_event_type_coerced_to_other():
+    # Unknown event types degrade to OTHER rather than raising, so a
+    # novel LLM label never throws away a valid analysis.
+    a = AnalysisResponse.model_validate(_valid_payload(event_type="BOGUS_TYPE"))
+    assert a.event_type == EventType.OTHER
 
 
 def test_invalid_sentiment_rejected():

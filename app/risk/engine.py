@@ -602,9 +602,9 @@ class RiskEngine:
         if not rows and self._portfolio_value_override is not None:
             return float(self._portfolio_value_override)
         if not rows:
-            # No positions and no override — fall back to a default
-            # that makes the size math non-zero for tests.
-            return float(get_settings().PORTFOLIO_VALUE if hasattr(get_settings(), "PORTFOLIO_VALUE") else 1_000_000.0)
+            # No positions and no override — size against the
+            # configured starting capital.
+            return float(get_settings().PORTFOLIO_VALUE)
         total = 0.0
         for r in rows:
             last = r.last_price

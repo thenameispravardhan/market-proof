@@ -11,6 +11,7 @@ table holds in-app tweaks made via the UI.
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -18,7 +19,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.config import Settings, get_settings
+from app.config import Settings, get_settings, reset_settings_cache
 from app.db.init import init_db
 from app.db.infra_models import AppSetting
 from app.db.models import AuditLog
@@ -47,7 +48,28 @@ _GLOBAL_KEYS: dict[str, tuple[type, Any]] = {
     "MIN_LIQUIDITY_CRORE": (float, 5.0),
     "MAX_SIGNALS_PER_DAY": (int, 20),
     "POLL_INTERVAL_SECONDS": (int, 5),
+    "PORTFOLIO_VALUE": (float, 1_000_000.0),
+    "DEFAULT_SL_PCT": (float, 6.0),
+    "DEFAULT_TARGET_RR": (float, 3.0),
+    "QUOTE_REFRESH_SECONDS": (int, 5),
 }
+
+
+def apply_overrides_to_env(db: Session) -> None:
+    """Push DB overrides into the process env + reset the Settings cache.
+
+    This is what makes UI edits *effective* without a restart: every
+    component reads `get_settings()`, which is rebuilt from env on the
+    next call after the cache reset. Called on PUT and at startup so
+    overrides survive restarts.
+    """
+    overrides = _read_overrides(db)
+    for key, value in overrides.items():
+        if value is None:
+            continue
+        os.environ[key] = str(value)
+    if overrides:
+        reset_settings_cache()
 
 
 class SettingsUpdate(BaseModel):
@@ -192,6 +214,9 @@ async def update_settings(
             after=new_overrides,
         )
     db.commit()
+
+    # Make the new values effective immediately: env + cache reset.
+    apply_overrides_to_env(db)
 
     # Broadcast for hot reload. Subscribers re-read DB/env on receipt.
     changed = sorted(set(new_overrides) - set(before_overrides)) or sorted(new_overrides.keys())

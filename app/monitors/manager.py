@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 from typing import Optional
 
-from app.config import get_settings
 from app.logging_config import get_logger
 from app.monitors.base import BaseMonitor
 from app.monitors.bse import BSEMonitor, parse_bse_payload
@@ -32,11 +31,13 @@ class MonitorManager:
         nse_monitor: Optional[BaseMonitor] = None,
         bse_monitor: Optional[BaseMonitor] = None,
     ) -> None:
-        settings = get_settings()
+        # Construct with no explicit interval so each monitor follows
+        # the live POLL_INTERVAL_SECONDS setting and picks up UI/API
+        # changes on the next tick (see BaseMonitor._poll_interval).
         if nse_monitor is None:
-            nse_monitor = NSEMonitor(poll_interval=settings.POLL_INTERVAL_SECONDS)
+            nse_monitor = NSEMonitor()
         if bse_monitor is None:
-            bse_monitor = BSEMonitor(poll_interval=settings.POLL_INTERVAL_SECONDS)
+            bse_monitor = BSEMonitor()
         self._nse = nse_monitor
         self._bse = bse_monitor
         self._started = False

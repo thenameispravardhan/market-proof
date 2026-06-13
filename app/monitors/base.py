@@ -166,10 +166,11 @@ class BaseMonitor:
         # `app.db.session.SessionLocal` (which tests may have rebuilt
         # for in-memory SQLite).
         self._session_factory: Callable[[], Session] = session_factory or _default_session_factory
-        settings = get_settings()
-        self._poll_interval = (
-            float(poll_interval) if poll_interval is not None
-            else float(settings.POLL_INTERVAL_SECONDS)
+        # When no explicit interval is passed, `_poll_interval`
+        # re-reads the live setting on every loop iteration so a UI
+        # change applies on the next tick without a restart.
+        self._poll_interval_fixed: Optional[float] = (
+            float(poll_interval) if poll_interval is not None else None
         )
         if source_url is not None:
             self.source_url = source_url
@@ -177,6 +178,19 @@ class BaseMonitor:
         self._task: Optional[asyncio.Task[None]] = None
         self._consecutive_failures = 0
         self._current_backoff = reset_backoff()
+
+    @property
+    def _poll_interval(self) -> float:
+        """Effective poll interval in seconds.
+
+        If the monitor was constructed with an explicit interval that
+        value is fixed; otherwise we follow the live
+        `POLL_INTERVAL_SECONDS` setting so a UI/API change applies on
+        the next loop iteration without restarting the monitor.
+        """
+        if self._poll_interval_fixed is not None:
+            return self._poll_interval_fixed
+        return float(get_settings().POLL_INTERVAL_SECONDS)
 
     # -- lifecycle ------------------------------------------------------
 

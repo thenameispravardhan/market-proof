@@ -172,6 +172,12 @@ class Manager:
         # accounts. Tests can pre-seed this.
         self._paper = paper_backend or PaperBackend(market_data=self._md)
         self._settings_provider = settings_provider or get_settings
+        # Optional quote feed. When set (the real lifespan wires one
+        # in), the manager seeds a live/simulated quote for the symbol
+        # before placing a paper order — so the MARKET fill has a
+        # price — and derives coherent entry/SL/target from it. Tests
+        # leave this None and pre-seed quotes via `set_quote_sync`.
+        self._quote_feed: Optional[Any] = None
         self._stop_event: asyncio.Event = asyncio.Event()
         self._ready_event: asyncio.Event = asyncio.Event()
         self._task: Optional[asyncio.Task[None]] = None
@@ -337,11 +343,41 @@ class Manager:
             )
             return {"approved": False, "code": "NO_BACKEND"}
 
-        # Step 3: compute entry / SL / target. Use parsed rationale
-        # first, then cached quote, then 'no_entry_price' block.
+        # Step 3: compute entry / SL / target.
+        #
+        # When a quote feed is wired in (the real runtime), it is the
+        # source of truth: seed a live/simulated quote for the symbol
+        # so the MARKET order fills, use that as the entry, and derive
+        # SL/target from the configured DEFAULT_SL_PCT / DEFAULT_TARGET_RR.
+        # We persist these coherent levels back onto the signal so the
+        # TradeManager (which reads the rationale) and the UI agree.
+        #
+        # Without a quote feed (tests), fall back to the parsed
+        # rationale levels, then any cached quote.
         entry = levels.get("entry")
         stop_loss = levels.get("stop_loss")
         target = levels.get("target")
+        if self._quote_feed is not None:
+            try:
+                seeded = await self._quote_feed.seed_symbol(signal.symbol)
+            except Exception:  # noqa: BLE001
+                log.exception("execution_manager.quote_seed_failed", symbol=signal.symbol)
+                seeded = None
+            if seeded is not None and seeded > 0:
+                settings = self._settings_provider()
+                sl_pct = float(settings.DEFAULT_SL_PCT) / 100.0
+                rr = float(settings.DEFAULT_TARGET_RR)
+                entry = float(seeded)
+                if signal.action == "BUY":
+                    stop_loss = entry * (1.0 - sl_pct)
+                    target = entry * (1.0 + sl_pct * rr)
+                else:
+                    stop_loss = entry * (1.0 + sl_pct)
+                    target = entry * (1.0 - sl_pct * rr)
+                await asyncio.get_running_loop().run_in_executor(
+                    None, _update_signal_levels,
+                    self._session_factory, signal.id, entry, stop_loss, target, rr,
+                )
         if entry is None:
             quote = await self._md.get_quote(signal.symbol)
             if quote is not None:
@@ -413,11 +449,20 @@ class Manager:
             None, _persist_trade,
             self._session_factory, signal, account.id, result,
         )
+        # The actual fill price is the authoritative entry — prefer it
+        # over the analysis levels so the TradeManager's P&L matches
+        # what we really paid. Fall back to the computed entry.
+        fill_entry = (
+            float(result.average_price)
+            if result.average_price is not None
+            else (float(entry) if entry is not None else None)
+        )
         await event_bus.publish(
             CHANNEL_TRADE_EXECUTED,
             {
                 "signal_id": signal.id,
                 "account_id": account.id,
+                "strategy_id": getattr(strategy, "id", None),
                 "symbol": signal.symbol,
                 "side": side.value,
                 "quantity": int(decision.sizing.qty),
@@ -425,6 +470,10 @@ class Manager:
                 "state": result.state.value,
                 "error": result.error,
                 "backend": getattr(backend, "name", type(backend).__name__),
+                # Coherent trade-management levels (entry = real fill).
+                "entry": fill_entry,
+                "stop_loss": float(stop_loss) if stop_loss is not None else None,
+                "target": float(target) if target is not None else None,
             },
         )
         return {
@@ -482,6 +531,11 @@ class Manager:
     def register_backend(self, broker_account_id: int, backend: TradingBackend) -> None:
         """Inject a backend (e.g. a stub for tests)."""
         self._backends[int(broker_account_id)] = backend
+
+    def attach_quote_feed(self, quote_feed: Any) -> None:
+        """Wire in a QuoteFeed so paper orders get a fill price and
+        coherent entry/SL/target. Called by the lifespan."""
+        self._quote_feed = quote_feed
 
     # -- settings hot-reload -------------------------------------------
 
@@ -560,6 +614,33 @@ def _load_signal_context(
             )
         levels = parse_rationale_levels(signal.rationale)
         return (signal, strategy, account, levels)
+
+
+def _update_signal_levels(
+    session_factory: Callable[[], Session],
+    signal_id: int,
+    entry: float,
+    stop_loss: float,
+    target: float,
+    rr: float,
+) -> None:
+    """Rewrite the signal's rationale with coherent entry/SL/target so
+    the TradeManager and the UI use the real (quote-seeded) levels.
+
+    Preserves any human-readable prefix; replaces only the
+    `entry=.. sl=.. target=.. rr=..` tail (re-appending if absent).
+    """
+    with session_factory() as session:
+        sig = session.get(Signal, signal_id)
+        if sig is None:
+            return
+        base = _RATIONALE_RE.sub("", sig.rationale or "").strip()
+        levels_str = (
+            f"entry={entry:.2f} sl={stop_loss:.2f} "
+            f"target={target:.2f} rr={rr:.2f}"
+        )
+        sig.rationale = (f"{base} {levels_str}").strip() if base else levels_str
+        session.commit()
 
 
 def _persist_risk_block(

@@ -28,6 +28,7 @@ from app.api import (
     fyers_callback,
     health,
     notifications as notifications_api,
+    positions as positions_api,
     prompts as prompts_api,
     rules as rules_api,
     settings_api,
@@ -39,6 +40,8 @@ from app.api import (
 from app.config import get_settings
 from app.db.init import init_db
 from app.execution.manager import Manager as ExecutionManager
+from app.execution.quote_feed import QuoteFeed
+from app.execution.trade_manager import TradeManager
 from app.logging_config import configure_logging, correlation_id_var, get_logger
 from app.monitors.manager import MonitorManager
 from app.notifications.manager import NotificationManager
@@ -72,11 +75,61 @@ async def lifespan(app: FastAPI):
 
     init_db()
 
+    # Apply persisted UI/API setting overrides into the process env and
+    # rebuild the Settings cache so saved tweaks (poll interval, risk
+    # params, portfolio value, trading mode) survive a restart and are
+    # effective before any service reads them.
+    try:
+        from app.api.settings_api import apply_overrides_to_env
+        from app.db.session import SessionLocal
+
+        with SessionLocal() as _s:
+            apply_overrides_to_env(_s)
+        settings = get_settings()
+    except Exception:  # noqa: BLE001
+        log.exception("app.settings_override_apply_failed")
+
+    # Seed the analyzer prompt templates and the default signal rules so
+    # a fresh install analyzes filings and can actually trade in paper
+    # mode without any manual setup. Both seeders are idempotent.
+    try:
+        from app.analyzer.default_rules import (
+            seed_default_paper_account,
+            seed_default_rules,
+        )
+        from app.analyzer.prompts import seed_defaults
+        from app.db.session import SessionLocal
+
+        with SessionLocal() as _s:
+            n_prompts = len(seed_defaults(_s))
+            n_rules = seed_default_rules(_s)
+            acct_seeded = seed_default_paper_account(_s)
+            _s.commit()
+        log.info(
+            "app.seed_defaults",
+            prompts=n_prompts, rules=n_rules, paper_account=acct_seeded,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("app.seed_defaults_failed")
+
     monitor_manager = MonitorManager()
     analyzer_service = AnalyzerService()
     execution_manager = ExecutionManager()
     notification_manager = NotificationManager()
     webhook_dispatcher = WebhookDispatcher()
+    # Quote feed + trade manager share the execution manager's market
+    # data bus and paper backend so entries, exits and P&L all see the
+    # same prices.
+    quote_feed = QuoteFeed(market_data=execution_manager.market_data)
+    trade_manager = TradeManager(
+        market_data=execution_manager.market_data,
+        quote_feed=quote_feed,
+        paper_backend=execution_manager.paper_backend,
+    )
+    execution_manager.attach_quote_feed(quote_feed)
+    # Expose the trade manager so the positions API can close trades.
+    app.state.trade_manager = trade_manager
+    app.state.quote_feed = quote_feed
     if not settings.TESTING:
         # T3: start the analyzer before the monitors so its event-bus
         # subscription is live before the first `announcements.new`
@@ -92,6 +145,12 @@ async def lifespan(app: FastAPI):
         # loop). Tests that need a managed lifecycle drive
         # `ExecutionManager` directly.
         execution_manager.start()
+        # Trade management: the quote feed keeps prices flowing; the
+        # trade manager exits positions on SL / target and computes
+        # realised P&L.
+        quote_feed.start()
+        trade_manager.start()
+        await trade_manager.wait_until_ready()
         # T6: start the notification + outbound webhook managers.
         # Both subscribe to the event bus; the dispatcher POSTs to
         # registered webhook URLs, the notification manager fans
@@ -106,10 +165,14 @@ async def lifespan(app: FastAPI):
             # Stop the producers first so consumers drain cleanly.
             await monitor_manager.stop()
             analyzer_service.stop()
+            trade_manager.stop()
+            quote_feed.stop()
             execution_manager.stop()
             notification_manager.stop()
             webhook_dispatcher.stop()
             await analyzer_service.wait_until_stopped()
+            await trade_manager.wait_until_stopped()
+            await quote_feed.wait_until_stopped()
             await execution_manager.wait_until_stopped()
             await notification_manager.wait_until_stopped()
             await webhook_dispatcher.wait_until_stopped()
@@ -188,6 +251,7 @@ app.include_router(rules_api.router)
 app.include_router(strategies_api.router)
 app.include_router(broker_accounts_api.router)
 app.include_router(audit_log_api.router)
+app.include_router(positions_api.router)
 app.include_router(core_api.router)
 
 
