@@ -146,6 +146,7 @@ class QuoteFeed:
             live = False
         for symbol in list(self._watched.keys()):
             try:
+                simulated = True
                 if live and self._live_quote_fn is not None:
                     price = await self._live_quote_fn(symbol)
                     if price is None or price <= 0:
@@ -153,10 +154,11 @@ class QuoteFeed:
                         price = self._watched.get(symbol)
                     else:
                         self._watched[symbol] = float(price)
+                        simulated = False  # real Fyers price
                 else:
                     price = self._next_paper_price(symbol)
                 if price is not None and price > 0:
-                    await self._publish(symbol, float(price))
+                    await self._publish(symbol, float(price), simulated=simulated)
             except Exception:  # noqa: BLE001
                 log.exception("quote_feed.tick_failed", symbol=symbol)
 
@@ -168,11 +170,15 @@ class QuoteFeed:
         self._watched[symbol] = new_price
         return new_price
 
-    async def _publish(self, symbol: str, price: float) -> None:
+    async def _publish(self, symbol: str, price: float, *, simulated: bool = True) -> None:
         # A simple ADV estimate keeps the liquidity rule happy in paper
         # mode; in live mode the Fyers quote carries real volume.
+        # `simulated` tags paper (synthetic) prices so consumers that need
+        # REAL prices — the Trade page quote — can skip them. The default
+        # is True because every caller except a live Fyers tick is paper.
         await self._md.publish(
             symbol,
             price,
             average_daily_volume_crore=50.0,
+            extra={"simulated": True} if simulated else {"source": "fyers"},
         )

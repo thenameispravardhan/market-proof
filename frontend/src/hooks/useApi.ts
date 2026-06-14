@@ -13,9 +13,16 @@ import type {
   DashboardSummary,
   GlobalSettings,
   NotificationChannel,
+  OptionChainResponse,
+  PendingOrder,
+  PendingOrdersResponse,
+  PlaceOrderRequest,
+  PlaceOrderResponse,
   Position,
   PromptHistoryEntry,
   PromptTemplate,
+  QuoteResponse,
+  SearchResponse,
   Signal,
   SignalRule,
   Strategy,
@@ -370,6 +377,10 @@ export interface FyersStatus {
   account_present: boolean;
   // The configured app ID (for display), if known.
   app_id: string | null;
+  // The configured OAuth Redirect URI (FYERS_REDIRECT_URI). Shown in
+  // the Fyers App Activation card so the operator can copy the exact
+  // value into the Fyers dashboard.
+  redirect_uri: string | null;
   // True if TRADING_MODE is currently 'live'.
   live_mode: boolean;
   // Reason string when not connected.
@@ -396,6 +407,24 @@ export function useFyersAuthorizeUrl() {
   });
 }
 
+// Server identity (public IP, etc.) used by the Trade page to
+// show a copyable IP hint when Fyers rejects with the IP-
+// whitelist error. Cached server-side for 5 min.
+export interface ServerInfo {
+  public_ip: string | null;
+  ip_source: string;
+}
+export function useServerInfo() {
+  return useQuery<ServerInfo>({
+    queryKey: ["server-info"],
+    queryFn: () => api.get("/api/server-info"),
+    // IP is stable across the session; a longer refetch is fine.
+    refetchInterval: 5 * 60_000,
+    refetchIntervalInBackground: false,
+    staleTime: 60_000,
+  });
+}
+
 // Disconnects Fyers by clearing the access token (and revoking the
 // session server-side if possible). The creds in .env stay put.
 export function useFyersDisconnect() {
@@ -407,6 +436,73 @@ export function useFyersDisconnect() {
       qc.invalidateQueries({ queryKey: ["broker-accounts"] });
       qc.invalidateQueries({ queryKey: ["market-indices"] });
     },
+  });
+}
+
+// ---- Fyers / DeepSeek credentials (editable from the UI) ----
+
+export interface FyersCredentials {
+  fyers_app_id: string;
+  fyers_redirect_uri: string;
+  fyers_secret_set: boolean;
+  fyers_secret_masked: string | null;
+  deepseek_key_set: boolean;
+  deepseek_key_masked: string | null;
+}
+
+export interface CredentialsUpdate {
+  fyers_app_id?: string;
+  fyers_secret_key?: string;
+  fyers_redirect_uri?: string;
+  deepseek_api_key?: string;
+}
+
+export function useFyersCredentials() {
+  return useQuery<FyersCredentials>({
+    queryKey: ["fyers-credentials"],
+    queryFn: () => api.get("/api/settings/credentials"),
+  });
+}
+
+export function useUpdateCredentials() {
+  const qc = useQueryClient();
+  return useMutation<FyersCredentials, Error, CredentialsUpdate>({
+    mutationFn: (body) => api.put("/api/settings/credentials", body),
+    onSuccess: () => {
+      // Creds change ripples through status, settings, and the postback
+      // config (the secret is shared) — refresh all of them.
+      qc.invalidateQueries({ queryKey: ["fyers-credentials"] });
+      qc.invalidateQueries({ queryKey: ["fyers-status"] });
+      qc.invalidateQueries({ queryKey: ["settings"] });
+    },
+  });
+}
+
+// ---- Fyers order postback (webhook) config ----
+
+export interface FyersPostbackConfig {
+  public_base_url: string;
+  secret: string | null;
+  path: string;
+  url: string | null;
+  preference: string;
+  configured: boolean;
+  secret_present: boolean;
+}
+
+export function useFyersPostbackConfig() {
+  return useQuery<FyersPostbackConfig>({
+    queryKey: ["fyers-postback-config"],
+    queryFn: () => api.get("/api/fyers/postback/config"),
+  });
+}
+
+export function useUpdateFyersPostbackConfig() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { public_base_url?: string; regenerate_secret?: boolean }) =>
+      api.post<FyersPostbackConfig>("/api/fyers/postback/config", body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["fyers-postback-config"] }),
   });
 }
 
@@ -589,5 +685,129 @@ export function useAuditLog(params?: { action?: string; target?: string; limit?:
     queryKey: ["audit-log", params],
     queryFn: () => api.get(url),
     refetchInterval: 10000,
+  });
+}
+
+// ---- Trade page (manual orders) ----
+
+export function useSearchSymbols(query: string, segment?: string) {
+  const trimmed = query.trim();
+  return useQuery<SearchResponse>({
+    queryKey: ["search-symbols", trimmed, segment],
+    queryFn: () => {
+      const qs = new URLSearchParams();
+      qs.set("q", trimmed);
+      if (segment) qs.set("segment", segment);
+      qs.set("limit", "20");
+      return api.get<SearchResponse>(`/api/search/symbols?${qs.toString()}`);
+    },
+    enabled: trimmed.length >= 1,
+    staleTime: 30_000,
+  });
+}
+
+// Downloads the full NSE/BSE cash scrip master from Fyers and reloads the
+// backend's instrument index, so every listed stock becomes searchable.
+export function useRefreshInstruments() {
+  const qc = useQueryClient();
+  return useMutation<
+    { ok: boolean; instrument_count: number; files: Record<string, unknown> },
+    Error,
+    void
+  >({
+    mutationFn: () => api.post("/api/search/refresh", {}),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["search-symbols"] }),
+  });
+}
+
+export function useOptionChain(
+  symbol: string,
+  underlying: string,
+  expiry?: string | null,
+  strikecount = 12,
+) {
+  return useQuery<OptionChainResponse>({
+    queryKey: ["option-chain", symbol, underlying, expiry, strikecount],
+    queryFn: () => {
+      const qs = new URLSearchParams();
+      // `symbol` (e.g. NSE:RELIANCE-EQ or NSE:NIFTY50-INDEX) is the
+      // authoritative underlying for Fyers; `underlying` (short name) is
+      // the master-fallback key. Pass both.
+      if (symbol) qs.set("symbol", symbol);
+      if (underlying) qs.set("underlying", underlying);
+      if (expiry) qs.set("expiry", expiry);
+      qs.set("strikecount", String(strikecount));
+      return api.get<OptionChainResponse>(`/api/options/chain?${qs.toString()}`);
+    },
+    enabled: symbol.length >= 1 || underlying.length >= 1,
+    // Poll live prices only while there's an actual chain (F&O symbols);
+    // a non-F&O stock returns no strikes, so stop polling after the first.
+    refetchInterval: (q) =>
+      q.state.data && q.state.data.strikes.length > 0 ? 6000 : false,
+    staleTime: 4000,
+  });
+}
+
+export function useQuote(symbol: string) {
+  return useQuery<QuoteResponse>({
+    queryKey: ["order-quote", symbol],
+    queryFn: () => api.get<QuoteResponse>(`/api/orders/quote?symbol=${encodeURIComponent(symbol)}`),
+    enabled: symbol.length >= 1,
+    refetchInterval: 3000, // tight polling so the ticket price stays live
+  });
+}
+
+export function usePendingOrders(accountId?: number | null) {
+  return useQuery<PendingOrdersResponse>({
+    queryKey: ["pending-orders", accountId],
+    queryFn: () => {
+      const qs = new URLSearchParams();
+      if (accountId) qs.set("account_id", String(accountId));
+      qs.set("limit", "50");
+      return api.get<PendingOrdersResponse>(`/api/orders/pending?${qs.toString()}`);
+    },
+    refetchInterval: 5000,
+  });
+}
+
+export function usePlaceOrder() {
+  const qc = useQueryClient();
+  return useMutation<PlaceOrderResponse, Error, PlaceOrderRequest>({
+    mutationFn: (body) => api.post<PlaceOrderResponse>("/api/orders", body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["pending-orders"] });
+      qc.invalidateQueries({ queryKey: ["trades"] });
+    },
+  });
+}
+
+export interface CancelOrderResponse {
+  ok: boolean;
+  broker_order_id: string;
+  /** Optional human-readable reason for the cancel outcome
+   *  (e.g. "cancelled", "broker_rejected_already_gone"). */
+  reason?: string;
+}
+
+export function useCancelOrder() {
+  const qc = useQueryClient();
+  return useMutation<
+    CancelOrderResponse,
+    Error,
+    { account_id: number; broker_order_id: string }
+  >({
+    mutationFn: (body) =>
+      api.post<CancelOrderResponse>("/api/orders/cancel", body),
+    onSuccess: () => {
+      // Invalidate everything that might show a stale view of the
+      // order we just cancelled: the pending list, the full trade
+      // history (status went to "cancelled"), and the open-positions
+      // panel (the cancel might have been a hedge against a position
+      // that was about to flip, or the broker might have already
+      // filled it server-side).
+      qc.invalidateQueries({ queryKey: ["pending-orders"] });
+      qc.invalidateQueries({ queryKey: ["trades"] });
+      qc.invalidateQueries({ queryKey: ["positions"] });
+    },
   });
 }

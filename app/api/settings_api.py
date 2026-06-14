@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -27,6 +29,13 @@ from app.db.session import get_db
 from app.services.event_bus import event_bus
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
+
+# The project .env — the durable home for credentials. The credentials
+# editor writes here so the file stays the single source of truth, AND
+# pushes the values into the live process (os.environ + cache reset) so
+# the change takes effect without a restart. Module-level so tests can
+# monkeypatch it to a temp path.
+_ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
 
 
 # Make sure the table exists before the first request hits the endpoint.
@@ -223,3 +232,130 @@ async def update_settings(
     await event_bus.publish("settings.updated", {"changed_keys": changed})
 
     return get_settings_endpoint(db=db, settings=settings)
+
+
+# -------------------------------------------------------------------------
+# Credentials (Fyers + DeepSeek) — editable from the UI, hot-applied.
+# -------------------------------------------------------------------------
+
+# Secret-valued keys are never returned to the client; only a masked
+# preview + a "set" flag.
+_SECRET_CRED_KEYS = ("FYERS_SECRET_KEY", "DEEPSEEK_API_KEY")
+
+
+def _mask_secret(value: Optional[str]) -> Optional[str]:
+    """`••••••Hc` — confirm WHICH secret is stored without revealing it."""
+    if not value:
+        return None
+    tail = value[-2:] if len(value) >= 4 else ""
+    return "•" * max(4, len(value) - len(tail)) + tail
+
+
+def _upsert_env_vars(updates: dict[str, str]) -> None:
+    """Insert/replace `KEY=value` lines in the project .env, preserving the
+    rest of the file. Creates .env if missing; backs up to .env.bak first."""
+    text = _ENV_PATH.read_text(encoding="utf-8") if _ENV_PATH.exists() else ""
+    if _ENV_PATH.exists():
+        try:
+            (_ENV_PATH.parent / ".env.bak").write_text(text, encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+    for key, value in updates.items():
+        line = f"{key}={value}"
+        pattern = re.compile(rf"^{re.escape(key)}=.*$", re.MULTILINE)
+        if pattern.search(text):
+            text = pattern.sub(line, text)
+        else:
+            if text and not text.endswith("\n"):
+                text += "\n"
+            text += line + "\n"
+    _ENV_PATH.write_text(text, encoding="utf-8")
+
+
+class CredentialsUpdate(BaseModel):
+    """All optional — only the non-empty fields are changed. An empty
+    secret means 'leave the existing secret untouched'."""
+    fyers_app_id: Optional[str] = None
+    fyers_secret_key: Optional[str] = None
+    fyers_redirect_uri: Optional[str] = None
+    deepseek_api_key: Optional[str] = None
+
+
+def _credentials_view(settings: Settings) -> dict[str, Any]:
+    return {
+        "fyers_app_id": settings.FYERS_APP_ID or "",
+        "fyers_redirect_uri": settings.FYERS_REDIRECT_URI
+        or "http://localhost:8000/api/fyers/callback",
+        "fyers_secret_set": bool((settings.FYERS_SECRET_KEY or "").strip()),
+        "fyers_secret_masked": _mask_secret(settings.FYERS_SECRET_KEY),
+        "deepseek_key_set": bool((settings.DEEPSEEK_API_KEY or "").strip()),
+        "deepseek_key_masked": _mask_secret(settings.DEEPSEEK_API_KEY),
+    }
+
+
+@router.get("/credentials")
+def get_credentials(settings: Settings = Depends(get_settings)) -> dict[str, Any]:
+    """Effective Fyers + DeepSeek credentials. Secrets are NEVER returned —
+    only a masked preview and a `*_set` boolean."""
+    return _credentials_view(settings)
+
+
+@router.put("/credentials")
+async def update_credentials(
+    body: CredentialsUpdate,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Update credentials from the UI. Writes to .env (durable) and applies
+    to the live process (os.environ + Settings cache reset) so the change
+    takes effect immediately — no restart. After changing the Fyers App ID
+    or Secret, the operator must re-run Connect Fyers (new app → new token)."""
+    updates: dict[str, str] = {}
+    if body.fyers_app_id is not None and body.fyers_app_id.strip():
+        updates["FYERS_APP_ID"] = body.fyers_app_id.strip()
+    if body.fyers_secret_key and body.fyers_secret_key.strip():
+        updates["FYERS_SECRET_KEY"] = body.fyers_secret_key.strip()
+    if body.fyers_redirect_uri is not None and body.fyers_redirect_uri.strip():
+        updates["FYERS_REDIRECT_URI"] = body.fyers_redirect_uri.strip()
+    if body.deepseek_api_key and body.deepseek_api_key.strip():
+        updates["DEEPSEEK_API_KEY"] = body.deepseek_api_key.strip()
+
+    if not updates:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="no credential fields provided",
+        )
+
+    # Durable: write to .env (skipped under TESTING so the suite never
+    # touches the real file; the hot-apply below is still exercised).
+    if not get_settings().is_testing:
+        try:
+            _upsert_env_vars(updates)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"could not write .env: {e}",
+            )
+    # Hot: live process picks the values up on the next get_settings().
+    for key, value in updates.items():
+        os.environ[key] = value
+    reset_settings_cache()
+
+    # Audit WITHOUT secret values.
+    _audit(
+        db,
+        actor="ui",
+        action="settings.credentials",
+        target="fyers",
+        before=None,
+        after={
+            k: ("***set***" if k in _SECRET_CRED_KEYS else v) for k, v in updates.items()
+        },
+    )
+    db.commit()
+
+    # Drop cached Fyers backends (built with the old app_id) so the next
+    # order / OAuth rebuilds with the new credentials. The execution
+    # manager's `settings.updated` handler does exactly this.
+    await event_bus.publish("settings.updated", {"changed_keys": list(updates.keys())})
+
+    return _credentials_view(get_settings())

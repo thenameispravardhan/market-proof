@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     FYERS_SECRET_KEY: str = ""
     FYERS_ACCESS_TOKEN: str = ""
     FYERS_REDIRECT_URI: str = "http://localhost:8000/api/fyers/callback"
+    # HMAC-SHA256 secret for inbound Fyers postback webhooks. When
+    # `scripts/register_fyers_webhook.py` runs, it picks this up
+    # automatically and writes it to the `webhooks.secret` column for
+    # the Fyers webhook row. Leave blank to accept unsigned Fyers
+    # payloads (NOT recommended — Fyers' signature is your only proof
+    # the postback is real).
+    FYERS_POSTBACK_SECRET: str = ""
 
     # ---------- Storage ----------
     # Ignored if TESTING=1 (in-memory sqlite is used).

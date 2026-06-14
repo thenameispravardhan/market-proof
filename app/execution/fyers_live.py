@@ -22,11 +22,17 @@ the docstring in `_SDK_CANDIDATES`.
 
 API surface:
 
-    place_order()     POST /orders  (or /api/v3/orders/sync)
+    place_order()     POST /orders/sync  (matches the official fyers-apiv3 SDK)
     cancel_order()    DELETE /orders?id=<id>
     get_positions()   GET /positions
     get_order_status  GET /orders?id=<id>
     get_quote()       GET /quotes?symbols=...
+
+We use /orders/sync (not the plain /orders) because the plain
+endpoint is fronted by a Cloudflare anti-bot layer that returns
+HTML challenge pages to non-browser clients in production. The
+/sync variant returns real Fyers JSON. See
+https://pypi.org/project/fyers-apiv3/ for the SDK reference.
 
 `place_order` is fire-and-poll: Fyers' sync endpoint returns the
 order id immediately, and the manager polls `get_order_status`
@@ -57,6 +63,7 @@ Rate limiting:
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -70,6 +77,7 @@ from app.execution.base import (
     OrderStatus,
     OrderType,
     Position,
+    ProductType,
     safe_float,
 )
 from app.execution.market_data import Quote
@@ -116,6 +124,76 @@ class FyersAuthError(FyersAPIError):
     """Subclass of FyersAPIError raised on 401."""
 
 
+class FyersBlockedError(FyersAPIError):
+    """The Fyers edge (or a CDN in front of it — Cloudflare, Akamai,
+    etc.) refused the request as a bot/script. We surface a one-line
+    operator-friendly message; the raw HTML body never reaches the
+    UI or the trade error. Distinguished from `FyersAPIError` so
+    the place-order flow can map it to a "rejected, fix creds /
+    network" outcome rather than a transient retryable error.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: Optional[int] = None,
+        body: Optional[str] = None,
+        reason: str = "blocked",
+    ) -> None:
+        super().__init__(message, status_code=status_code, body=body)
+        self.reason = reason
+
+
+def _looks_like_blocked_response(resp: httpx.Response) -> Optional[str]:
+    """Return a one-line reason if `resp` looks like a bot block /
+    challenge page rather than a real Fyers API response.
+
+    Fyers sits behind Cloudflare in production. The default httpx
+    `User-Agent: python-httpx/X.Y` is treated as a script and gets
+    a 403 with a Cloudflare "Attention Required!" challenge HTML
+    instead of the real API. We detect that and a few friends here
+    so the operator sees a clear "your backend is being blocked"
+    message instead of a 500-char wall of HTML.
+
+    IMPORTANT: every Fyers response carries `Server: cloudflare`,
+    even legitimate JSON ones (auth errors, rate limits, etc.). We
+    must NOT key off that header alone — only flag a response as
+    a challenge when the body / content-type also look like a
+    challenge page. Otherwise every successful API call would be
+    mis-classified as blocked. See `tests/test_fyers_live.py::
+    test_cloudflare_blocked_html_raises_fyers_blocked_error` for
+    the regression we care about.
+    """
+    ct = (resp.headers.get("content-type") or "").lower()
+    # Cheap, low-cost markers first (no body read). The text checks
+    # below are the only ones that need the body, and they read
+    # at most the first 2 KB.
+    body_lower = (resp.text or "")[:2000].lower()
+    if "text/html" in ct and "json" not in ct:
+        # Real Fyers endpoints always return JSON. HTML with a
+        # 4xx/5xx almost certainly means we hit a CDN challenge /
+        # login page.
+        return "non_json_html"
+    if "attention required" in body_lower:
+        return "cloudflare_challenge"
+    if "access denied" in body_lower and "json" not in ct:
+        return "cdn_access_denied"
+    if "cloudflare" in ct:
+        # Cloudflare sometimes tags challenge responses with a
+        # content-type like `text/html; charset=UTF-8` plus a
+        # `__cf_bm` cookie header; we don't read cookies here, so
+        # fall back to the explicit "cloudflare" content-type
+        # signal. Plain JSON responses from Fyers are served with
+        # `content-type: application/json`, so this never matches
+        # a normal API call.
+        return "cloudflare_challenge"
+    # Plain JSON 4xx/5xx from Fyers is a real broker / auth /
+    # validation error, not a CDN block — let the caller see the
+    # response body in the error message.
+    return None
+
+
 # ---- Low-level client ----------------------------------------------------
 
 
@@ -147,6 +225,7 @@ class FyersClient:
         app_id: str,
         access_token: str,
         base_url: str = "https://api-t1.fyers.in/api/v3",
+        data_base_url: str = "https://api-t1.fyers.in/data",
         timeout_s: float = 30.0,
         max_retries: int = 3,
         concurrency: int = 5,
@@ -159,6 +238,10 @@ class FyersClient:
         self._app_id = app_id
         self._access_token = access_token
         self._base_url = base_url.rstrip("/")
+        # Fyers v3 market-data endpoints (quotes / history / depth /
+        # options-chain) live under `/data`, NOT `/api/v3`. Orders use
+        # `_base_url`; data calls pass `base_url=self._data_base_url`.
+        self._data_base_url = data_base_url.rstrip("/")
         self._timeout_s = float(timeout_s)
         self._max_retries = int(max_retries)
         self._semaphore = asyncio.Semaphore(concurrency)
@@ -169,9 +252,24 @@ class FyersClient:
 
     async def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None:
+            # Default httpx `User-Agent: python-httpx/X.Y` is on every
+            # CDN bot-blocklist in existence. Fyers sits behind
+            # Cloudflare; with the default UA, real-API requests come
+            # back as 403 + Cloudflare "Attention Required!" HTML.
+            # The UA below is a generic browser-style header — not
+            # impersonating any specific browser — that the Fyers edge
+            # accepts as a normal client.
             self._client = httpx.AsyncClient(
                 transport=self._transport or httpx.AsyncHTTPTransport(),
                 timeout=self._timeout_s,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (compatible; TradeBot/1.0; "
+                        "+https://github.com/local/tradebot)"
+                    ),
+                    "Accept": "application/json, text/plain, */*",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
             )
         return self._client
 
@@ -206,8 +304,9 @@ class FyersClient:
         *,
         params: Optional[dict[str, Any]] = None,
         json_body: Optional[dict[str, Any]] = None,
+        base_url: Optional[str] = None,
     ) -> dict[str, Any]:
-        url = f"{self._base_url}/{path.lstrip('/')}"
+        url = f"{(base_url or self._base_url).rstrip('/')}/{path.lstrip('/')}"
         headers = {
             "Authorization": self._auth_header(),
             "Content-Type": "application/json",
@@ -271,6 +370,30 @@ class FyersClient:
                 )
                 await self._backoff(attempt, base=1.0)
                 continue
+            # Bot-block detection runs on every non-2xx (and even
+            # 2xx-with-HTML, but those are vanishingly rare). If the
+            # response is HTML or carries a Cloudflare challenge, we
+            # raise a clean FyersBlockedError instead of dumping the
+            # raw HTML body into the operator's error banner. Retry
+            # won't help (the CDN has flagged the UA / IP), so this
+            # is terminal.
+            block_marker = _looks_like_blocked_response(resp)
+            if block_marker and resp.status_code >= 400:
+                log.warning(
+                    "fyers.blocked",
+                    method=method, path=path, status=resp.status_code,
+                    marker=block_marker, server=resp.headers.get("server"),
+                    content_type=resp.headers.get("content-type"),
+                )
+                raise FyersBlockedError(
+                    "Fyers edge is blocking requests as a script — "
+                    "Cloudflare / anti-bot challenge detected. "
+                    "Check that the server's outbound IP isn't on a "
+                    "blocklist and that the User-Agent is acceptable.",
+                    status_code=resp.status_code,
+                    body=_safe_body(resp),
+                    reason=block_marker,
+                )
             # Other 4xx — terminal.
             if resp.status_code >= 400:
                 raise FyersAPIError(
@@ -303,8 +426,19 @@ class FyersClient:
     # -- public API ------------------------------------------------------
 
     async def place_order(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """POST /orders. Payload follows Fyers' order schema."""
-        return await self._request("POST", "/orders", json_body=payload)
+        """POST /orders/sync. Payload follows Fyers' order schema.
+
+        The /orders/sync endpoint (not the plain /orders) is the
+        one that matches the official `fyers-apiv3` SDK's behaviour
+        and the one that returns real Fyers JSON on the most
+        common Fyers production environment (api-t1.fyers.in). The
+        plain /orders endpoint is increasingly fronted by a CDN
+        anti-bot layer that returns a 403 Cloudflare challenge to
+        any non-browser client — including httpx. Using /sync
+        avoids that path entirely. See also
+        https://pypi.org/project/fyers-apiv3/ for the SDK reference.
+        """
+        return await self._request("POST", "/orders/sync", json_body=payload)
 
     async def cancel_order(self, order_id: str) -> dict[str, Any]:
         """DELETE /orders?id=<id>."""
@@ -319,15 +453,54 @@ class FyersClient:
         return await self._request("GET", "/orders", params={"id": order_id})
 
     async def get_quote(self, symbols: list[str]) -> dict[str, Any]:
-        """GET /quotes?symbols=<comma-separated>."""
+        """GET /data/quotes?symbols=<comma-separated>.
+
+        Quotes are a market-data endpoint → the `/data` host path, not
+        `/api/v3` (which is orders only). Hitting `/api/v3/quotes`
+        returns a 404/error, which is why the live quote feed was
+        silently empty.
+        """
         if not symbols:
             return {"s": "ok", "d": []}
         return await self._request(
-            "GET", "/quotes", params={"symbols": ",".join(symbols)}
+            "GET", "/quotes", params={"symbols": ",".join(symbols)},
+            base_url=self._data_base_url,
+        )
+
+    async def get_option_chain(
+        self, symbol: str, *, strikecount: int = 10, timestamp: str = ""
+    ) -> dict[str, Any]:
+        """GET /data/options-chain-v3 — live option chain for an index /
+        equity underlying.
+
+        `strikecount` is the number of strikes on EACH side of ATM.
+        `timestamp` selects a specific expiry (the epoch from the
+        response's `expiryData`); blank = the nearest expiry.
+        """
+        params: dict[str, Any] = {"symbol": symbol, "strikecount": int(strikecount)}
+        if timestamp:
+            params["timestamp"] = timestamp
+        return await self._request(
+            "GET", "/options-chain-v3", params=params, base_url=self._data_base_url
         )
 
 
 # ---- Helpers -------------------------------------------------------------
+
+
+# Fyers app ids look like `LUVWQUOVWJ-200`, `XTK927LW7V-100`,
+# `9TJPAJSKCX-100`: a run of alphanumerics, a hyphen, then digits.
+_APP_ID_RE = re.compile(r"this app\s+([A-Za-z0-9]+-\d+)", re.IGNORECASE)
+
+
+def _extract_rejected_app_id(message: str) -> Optional[str]:
+    """Pull the app_id Fyers names in a code -50 rejection message
+    (`...not allowed from this app <APP_ID>`). Returns None when the
+    message doesn't carry one."""
+    if not message:
+        return None
+    m = _APP_ID_RE.search(message)
+    return m.group(1) if m else None
 
 
 def _safe_body(resp: httpx.Response) -> str:
@@ -341,17 +514,25 @@ def _safe_body(resp: httpx.Response) -> str:
 
 
 def _fyers_order_type(order_type: OrderType) -> int:
-    """Fyers order-type codes. The exact mapping is documented at
-    https://myapi.fyers.in/docs/#tag/Orders. We expose ints because
-    Fyers' API is int-keyed; the backend converts to the matching
-    OrderType on the way out.
+    """Fyers v3 order-type codes (Fyers API v3 Orders schema):
+
+        1 = Limit order        (needs limitPrice)
+        2 = Market order       (no price)
+        3 = Stop order / SL-M  (needs stopPrice trigger; fills at market)
+        4 = Stoplimit / SL-L   (needs stopPrice trigger AND limitPrice)
+
+    NOTE: these were previously swapped (MARKET→1, LIMIT→2), which made
+    every MARKET order go to Fyers as a *Limit* order with limitPrice=0 —
+    rejected with "limitPrice: Must be greater than or equal to 0.0025".
+    OrderType.STOP_LOSS is the UI's "SL-L" (stop-limit) → 4;
+    OrderType.STOP_LOSS_MARKET is "SL-M" (stop-market) → 3.
     """
     return {
-        OrderType.MARKET: 1,
-        OrderType.LIMIT: 2,
-        OrderType.STOP_LOSS: 3,
-        OrderType.STOP_LOSS_MARKET: 4,
-    }.get(order_type, 1)
+        OrderType.LIMIT: 1,
+        OrderType.MARKET: 2,
+        OrderType.STOP_LOSS_MARKET: 3,  # SL-M
+        OrderType.STOP_LOSS: 4,         # SL-L
+    }.get(order_type, 2)  # default to MARKET
 
 
 def _fyers_side(side: OrderSide) -> int:
@@ -359,11 +540,12 @@ def _fyers_side(side: OrderSide) -> int:
 
 
 def _order_type_from_int(code: int) -> OrderType:
+    # Inverse of `_fyers_order_type` — Fyers v3 codes.
     return {
-        1: OrderType.MARKET,
-        2: OrderType.LIMIT,
-        3: OrderType.STOP_LOSS,
-        4: OrderType.STOP_LOSS_MARKET,
+        1: OrderType.LIMIT,
+        2: OrderType.MARKET,
+        3: OrderType.STOP_LOSS_MARKET,  # SL-M
+        4: OrderType.STOP_LOSS,         # SL-L
     }.get(code, OrderType.MARKET)
 
 
@@ -400,6 +582,91 @@ def _state_from_str(status: str) -> OrderState:
         "REJECTED": OrderState.REJECTED,
         "EXPIRED": OrderState.EXPIRED,
     }.get(upper, OrderState.PENDING)
+
+
+# ---- Option chain normalisation -----------------------------------------
+
+
+# Known F&O lot sizes for the common index underlyings — a fallback for
+# when the scrip master (which carries the authoritative per-symbol lot
+# size) hasn't been downloaded. These change periodically; refresh from
+# data/scrip_master/*.csv when available.
+_INDEX_LOT_SIZES: dict[str, int] = {
+    "NIFTYNXT50": 25,
+    "MIDCPNIFTY": 120,
+    "FINNIFTY": 65,
+    "BANKNIFTY": 30,
+    "NIFTY50": 75,
+    "NIFTY": 75,
+    "SENSEX": 20,
+    "BANKEX": 30,
+}
+
+
+def _guess_lot_size(underlying_symbol: str) -> int:
+    s = (underlying_symbol or "").upper()
+    for key, lot in _INDEX_LOT_SIZES.items():
+        if key in s:
+            return lot
+    return 1
+
+
+def normalize_option_chain(
+    data: dict[str, Any], *, underlying_symbol: str
+) -> dict[str, Any]:
+    """Translate Fyers' /data/options-chain-v3 response into the shape the
+    Trade page renders: spot, an expiry list, and per-strike CE/PE legs
+    with live ltp / bid / ask / oi.
+
+    Fyers returns a FLAT `optionsChain` list: the first entry (option_type
+    blank / strike_price <= 0) is the underlying spot, the rest are CE/PE
+    rows. We group them by strike. `expiryData` is `[{date, expiry}]`
+    where `expiry` is the epoch to pass back as `timestamp`.
+    """
+    d = data.get("data") if isinstance(data, dict) else None
+    d = d or {}
+    rows = d.get("optionsChain") or []
+    expiry_rows = d.get("expiryData") or []
+    expiries = [
+        {"label": str(e.get("date") or ""), "ts": str(e.get("expiry") or "")}
+        for e in expiry_rows
+        if isinstance(e, dict) and e.get("expiry") is not None
+    ]
+    lot = _guess_lot_size(underlying_symbol)
+    spot: Optional[float] = None
+    by_strike: dict[float, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        otype = str(row.get("option_type") or "").upper()
+        if otype not in ("CE", "PE"):
+            sp = safe_float(row.get("ltp") or row.get("fp"))
+            if sp > 0:
+                spot = sp
+            continue
+        strike = safe_float(row.get("strike_price"))
+        leg = {
+            "symbol": str(row.get("symbol") or ""),
+            "ltp": safe_float(row.get("ltp")) or None,
+            "bid": safe_float(row.get("bid")) or None,
+            "ask": safe_float(row.get("ask")) or None,
+            "oi": int(safe_float(row.get("oi"))) or None,
+            "volume": int(safe_float(row.get("volume"))) or None,
+            "ltpch": safe_float(row.get("ltpch")) or None,
+            "lot_size": lot,
+            "tick_size": 0.05,
+        }
+        by_strike.setdefault(strike, {})[otype] = leg
+    strikes = [
+        {"strike": s, "ce": by_strike[s].get("CE"), "pe": by_strike[s].get("PE")}
+        for s in sorted(by_strike.keys())
+    ]
+    return {
+        "symbol": underlying_symbol,
+        "spot": spot,
+        "expiries": expiries,
+        "strikes": strikes,
+    }
 
 
 # ---- The backend --------------------------------------------------------
@@ -454,6 +721,7 @@ class FyersLiveBackend:
         order_type: OrderType = OrderType.MARKET,
         limit_price: Optional[float] = None,
         stop_price: Optional[float] = None,
+        product_type: ProductType = ProductType.INTRADAY,
     ) -> OrderResult:
         if int(quantity) <= 0:
             return OrderResult(
@@ -465,14 +733,56 @@ class FyersLiveBackend:
                 order_type=order_type,
                 error="quantity must be > 0",
             )
+        # Map our ProductType enum onto Fyers' productType strings.
+        # Unknown values fall back to INTRADAY (the safe default).
+        try:
+            pt = product_type if isinstance(product_type, ProductType) else ProductType(product_type)
+        except ValueError:
+            pt = ProductType.INTRADAY
+        fyers_product = {
+            ProductType.INTRADAY: "INTRADAY",
+            ProductType.DELIVERY: "CNC",
+            ProductType.NORMAL: "NRML",
+            ProductType.MARGIN: "MARGIN",
+            ProductType.CO: "CO",
+            ProductType.BO: "BO",
+        }.get(pt, "INTRADAY")
+        fyers_type = _fyers_order_type(order_type)
+        # Per Fyers v3: Limit(1)/SL-L(4) need a positive limitPrice;
+        # SL-M(3)/SL-L(4) need a positive stopPrice (trigger). A
+        # Market(2) order must send both as 0. We zero out the prices
+        # that don't apply so a stray value can't trip Fyers' validation,
+        # and reject early (with a clear message) when a required price
+        # is missing rather than letting Fyers 400.
+        needs_limit = fyers_type in (1, 4)
+        needs_stop = fyers_type in (3, 4)
+        lp = float(limit_price) if (needs_limit and limit_price is not None) else 0.0
+        sp = float(stop_price) if (needs_stop and stop_price is not None) else 0.0
+
+        def _reject(msg: str) -> OrderResult:
+            return OrderResult(
+                broker_order_id="",
+                state=OrderState.REJECTED,
+                symbol=symbol,
+                side=side,
+                quantity=int(quantity),
+                order_type=order_type,
+                error=msg,
+            )
+
+        if needs_limit and lp <= 0:
+            return _reject(f"{order_type.value} order requires a limit price > 0")
+        if needs_stop and sp <= 0:
+            return _reject(f"{order_type.value} order requires a stop/trigger price > 0")
+
         payload = {
             "symbol": symbol,
             "qty": int(quantity),
-            "type": _fyers_order_type(order_type),
+            "type": fyers_type,
             "side": _fyers_side(side),
-            "productType": "INTRADAY",
-            "limitPrice": float(limit_price) if limit_price is not None else 0.0,
-            "stopPrice": float(stop_price) if stop_price is not None else 0.0,
+            "productType": fyers_product,
+            "limitPrice": lp,
+            "stopPrice": sp,
             "validity": "DAY",
             "disclosedQty": 0,
             "offlineOrder": False,
@@ -491,6 +801,29 @@ class FyersLiveBackend:
                 error=str(e),
                 raw={"status_code": e.status_code},
             )
+        except FyersBlockedError as e:
+            # CDN-level block (Cloudflare, Akamai, etc.). Not
+            # retryable — the operator needs to fix the network /
+            # IP / UA situation. Surface a clean one-liner; the
+            # full HTML body is in the log only.
+            log.error(
+                "fyers.place_order.blocked",
+                symbol=symbol, status_code=e.status_code, reason=e.reason,
+            )
+            return OrderResult(
+                broker_order_id="",
+                state=OrderState.REJECTED,
+                symbol=symbol,
+                side=side,
+                quantity=int(quantity),
+                order_type=order_type,
+                error=(
+                    "Fyers edge blocked the request (anti-bot). "
+                    "Check server IP allowlist / User-Agent. "
+                    f"({e.reason})"
+                ),
+                raw={"status_code": e.status_code, "reason": e.reason},
+            )
         except FyersAPIError as e:
             # Retryable failures stay PENDING (manager will time out
             # the row). Non-retryable 4xx are REJECTED.
@@ -505,6 +838,68 @@ class FyersLiveBackend:
                     order_type=order_type,
                     error=str(e),
                     raw={"status_code": e.status_code},
+                )
+            # Fyers code=-50 family: the order was refused at the
+            # *app* level. Two message variants we've seen in the
+            # wild, both code -50:
+            #   "Order placement restricted. Algo orders are not
+            #    allowed from this app <APP_ID>"
+            #   "Order placement are not allowed from this app
+            #    <APP_ID>"
+            # These collapse to the same class of problem — the app
+            # the request authenticated as is (a) not whitelisted for
+            # this server's IP, (b) missing the Order Placement
+            # permission, or (c) simply the WRONG app_id: the operator
+            # re-created the app on https://myapi.fyers.in/dashboard/
+            # but the configured/cached app_id still points at the old
+            # one. The misleading "algo orders" wording (per Fyers
+            # support docs) is just the IP-whitelist sub-case. We surface
+            # one clear message that names the rejected app_id (so the
+            # operator can eyeball it against their dashboard) and keep
+            # `raw.reason = "ip_whitelist"` so the Trade page renders the
+            # copyable public-IP hint.
+            err_str = str(e)
+            err_lower = err_str.lower()
+            app_level_block = "not allowed from this app" in err_lower or (
+                "order placement restricted" in err_lower
+                and "algo orders" in err_lower
+            )
+            if app_level_block:
+                configured_app_id = getattr(self._client, "_app_id", None)
+                rejected_app_id = _extract_rejected_app_id(err_str) or configured_app_id
+                log.error(
+                    "fyers.place_order.app_level_block",
+                    symbol=symbol,
+                    # `app_id` lives on the FyersClient (the inner
+                    # `_client`); the FyersLiveBackend doesn't keep
+                    # a copy.
+                    configured_app_id=configured_app_id,
+                    rejected_app_id=rejected_app_id,
+                    error=err_str,
+                )
+                app_clause = (
+                    f" (app {rejected_app_id})" if rejected_app_id else ""
+                )
+                return OrderResult(
+                    broker_order_id="",
+                    state=OrderState.REJECTED,
+                    symbol=symbol,
+                    side=side,
+                    quantity=int(quantity),
+                    order_type=order_type,
+                    error=(
+                        f"Fyers rejected the order{app_clause}. On "
+                        "https://myapi.fyers.in/dashboard/ confirm the app_id "
+                        "matches .env (re-created apps need a fresh Connect "
+                        "Fyers), this server's IP is on the static-IP "
+                        "whitelist, and Order Placement permission is enabled."
+                    ),
+                    raw={
+                        "status_code": e.status_code,
+                        "reason": "ip_whitelist",
+                        "rejected_app_id": rejected_app_id,
+                        "configured_app_id": configured_app_id,
+                    },
                 )
             log.error("fyers.place_order.failed", symbol=symbol, error=str(e))
             return OrderResult(
@@ -650,21 +1045,42 @@ class FyersLiveBackend:
         out: list[Quote] = []
         for entry in dlist:
             try:
-                sym = str(entry.get("symbol") or entry.get("n") or "")
+                if not isinstance(entry, dict):
+                    continue
+                # Fyers /data/quotes nests the live values under `v`:
+                #   {"n": "NSE:SBIN-EQ", "s": "ok", "v": {"lp": .., "bid": ..}}
+                # Fall back to a flat entry for tolerance across shapes.
+                v = entry.get("v") if isinstance(entry.get("v"), dict) else entry
+                sym = str(entry.get("n") or entry.get("symbol") or v.get("symbol") or "")
                 if not sym:
                     continue
-                lp = safe_float(entry.get("lp") or entry.get("lastPrice") or 0.0)
+                lp = safe_float(
+                    v.get("lp") or v.get("lastPrice") or v.get("last_price") or 0.0
+                )
                 if lp <= 0:
                     continue
                 out.append(
                     Quote(
                         symbol=sym,
                         last_price=lp,
-                        bid=safe_float(entry.get("bid")) or None,
-                        ask=safe_float(entry.get("ask")) or None,
-                        volume=int(entry.get("vol") or 0) or None,
+                        bid=safe_float(v.get("bid")) or None,
+                        ask=safe_float(v.get("ask")) or None,
+                        volume=int(safe_float(v.get("volume") or v.get("vol") or 0)) or None,
                     )
                 )
             except Exception:  # noqa: BLE001
                 log.exception("fyers.quote.parse_error")
         return out
+
+    # -- option chain (live, for the Trade page) ------------------------
+
+    async def get_option_chain(
+        self, symbol: str, *, strikecount: int = 10, timestamp: str = ""
+    ) -> dict[str, Any]:
+        """Live option chain for `symbol` (e.g. "NSE:NIFTY50-INDEX"),
+        normalised for the UI. Raises FyersAPIError on broker failure so
+        the caller can fall back to the static master chain."""
+        data = await self._client.get_option_chain(
+            symbol, strikecount=strikecount, timestamp=timestamp
+        )
+        return normalize_option_chain(data, underlying_symbol=symbol)

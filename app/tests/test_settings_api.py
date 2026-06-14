@@ -11,6 +11,53 @@ from fastapi.testclient import TestClient
 from app.services.event_bus import event_bus
 
 
+def test_credentials_get_masks_secrets(client: TestClient) -> None:
+    r = client.get("/api/settings/credentials")
+    assert r.status_code == 200
+    b = r.json()
+    assert "fyers_app_id" in b
+    assert "fyers_secret_set" in b
+    # Raw secret values are NEVER returned.
+    assert "fyers_secret_key" not in b
+    assert "deepseek_api_key" not in b
+
+
+def test_credentials_put_hot_applies_without_restart(client: TestClient) -> None:
+    """PUT hot-applies to the live process so get_settings() reflects the
+    change with no restart (the .env write is skipped under TESTING).
+    Secrets are masked on the way back out."""
+    import os
+    from app.config import get_settings
+
+    keys = ("FYERS_APP_ID", "FYERS_SECRET_KEY", "FYERS_REDIRECT_URI", "DEEPSEEK_API_KEY")
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        r = client.put(
+            "/api/settings/credentials",
+            json={
+                "fyers_app_id": "TESTAPP-100",
+                "fyers_secret_key": "supersecret123",
+                "fyers_redirect_uri": "http://localhost:8000/api/fyers/callback",
+            },
+        )
+        assert r.status_code == 200, r.text
+        s = get_settings()
+        assert s.FYERS_APP_ID == "TESTAPP-100"
+        assert s.FYERS_SECRET_KEY == "supersecret123"
+        b = client.get("/api/settings/credentials").json()
+        assert b["fyers_app_id"] == "TESTAPP-100"
+        assert b["fyers_secret_set"] is True
+        assert "supersecret123" not in json.dumps(b)
+        assert client.put("/api/settings/credentials", json={}).status_code == 422
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        get_settings.cache_clear()
+
+
 def test_get_settings_defaults(client: TestClient) -> None:
     r = client.get("/api/settings")
     assert r.status_code == 200

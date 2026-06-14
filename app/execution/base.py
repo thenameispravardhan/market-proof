@@ -55,6 +55,22 @@ class OrderType(str, Enum):
     STOP_LOSS_MARKET = "SL-M"
 
 
+class ProductType(str, Enum):
+    """Broker product / settlement code.
+
+    Misnamed-vs-Fyers note: Fyers calls this `productType` on the
+    API; the values below are the union of what the supported
+    brokers accept. `INTRADAY` is the default for the auto-pipeline;
+    manual trades pick the right one explicitly.
+    """
+    INTRADAY = "INTRADAY"     # MIS — square off intraday
+    DELIVERY = "DELIVERY"     # CNC — actual delivery to demat
+    NORMAL = "NORMAL"         # F&O NRML — carry forward
+    MARGIN = "MARGIN"         # F&O NRML with margin benefit
+    CO = "CO"                 # Cover order
+    BO = "BO"                 # Bracket order (Dhan-style)
+
+
 class OrderState(str, Enum):
     """The state machine for a placed order.
 
@@ -158,8 +174,16 @@ class TradingBackend(Protocol):
         order_type: OrderType = OrderType.MARKET,
         limit_price: Optional[float] = None,
         stop_price: Optional[float] = None,
+        product_type: "ProductType" = ...,
     ) -> OrderResult:
-        """Submit an order. Return the initial OrderResult."""
+        """Submit an order. Return the initial OrderResult.
+
+        `product_type` defaults to whatever the backend considers
+        the standard product for the segment (INTRADAY for Fyers
+        cash by default). Callers that need a specific settlement
+        (CNC, NRML, CO, etc.) MUST pass it explicitly. Manual
+        trades from the UI always do.
+        """
         ...
 
     async def cancel_order(self, broker_order_id: str) -> bool:

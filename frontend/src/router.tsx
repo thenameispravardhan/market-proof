@@ -6,6 +6,7 @@ import { useState, useEffect } from "react";
 
 export type TabKey =
   | "dashboard"
+  | "trade"
   | "trades"
   | "prompts"
   | "rules"
@@ -18,6 +19,7 @@ export type TabKey =
 
 const VALID_TABS = new Set<TabKey>([
   "dashboard",
+  "trade",
   "trades",
   "prompts",
   "rules",

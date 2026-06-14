@@ -64,6 +64,7 @@ from app.execution.base import (
     OrderStatus,
     OrderType,
     Position,
+    ProductType,
     safe_float,
 )
 from app.execution.market_data import MarketDataBus, Quote
@@ -269,6 +270,7 @@ class PaperBackend:
         order_type: OrderType = OrderType.MARKET,
         limit_price: Optional[float] = None,
         stop_price: Optional[float] = None,
+        product_type: ProductType = ProductType.INTRADAY,
     ) -> OrderResult:
         if int(quantity) <= 0:
             return OrderResult(

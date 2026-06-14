@@ -46,11 +46,7 @@ function ModeBanner() {
   const mode = data?.global?.TRADING_MODE ?? "paper";
   return (
     <div className={`mode-banner ${mode}`}>
-      <span>
-        {mode === "live"
-          ? "LIVE TRADING — real orders are being placed"
-          : "PAPER TRADING — simulated fills, no real money"}
-      </span>
+      <span>{mode === "live" ? "LIVE TRADING" : "PAPER TRADING"}</span>
     </div>
   );
 }

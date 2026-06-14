@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 from fastapi import APIRouter
@@ -53,6 +53,81 @@ _HEADERS = {
 
 
 _cache: dict[str, Any] = {"data": None, "ts": 0.0, "lock": asyncio.Lock()}
+
+
+# ---- generic per-symbol quote (used by the Trade page) -------------------
+
+_INDEX_YAHOO = {
+    "NSE:NIFTY50-INDEX": "^NSEI",
+    "NSE:NIFTYBANK-INDEX": "^NSEBANK",
+    "BSE:SENSEX-INDEX": "^BSESN",
+    "NSE:NIFTY-INDEX": "^NSEI",
+    "NSE:BANKNIFTY-INDEX": "^NSEBANK",
+}
+
+
+def _to_yahoo_symbol(broker_symbol: str) -> Optional[str]:
+    """Map a Fyers-style symbol to a Yahoo Finance ticker.
+
+    Equities + indices are public on Yahoo and need no auth:
+      NSE:RELIANCE-EQ  -> RELIANCE.NS
+      BSE:TCS-EQ       -> TCS.BO
+      NSE:NIFTY50-INDEX-> ^NSEI
+    F&O / options return None (no public Yahoo symbol — needs Fyers).
+    """
+    if not broker_symbol:
+        return None
+    s = broker_symbol.strip().upper()
+    if s in _INDEX_YAHOO:
+        return _INDEX_YAHOO[s]
+    if "-INDEX" in s:
+        return _INDEX_YAHOO.get(s)
+    exch, _, rest = s.partition(":")
+    rest = rest or exch
+    # Only plain cash equities map cleanly (suffix -EQ / -BE / -A ...).
+    base, _, suffix = rest.rpartition("-")
+    base = base or rest
+    if suffix not in ("EQ", "BE", "A", "B", "") :
+        return None  # likely a derivative
+    if exch == "BSE":
+        return f"{base}.BO"
+    return f"{base}.NS"
+
+
+async def fetch_quote(broker_symbol: str) -> Optional[dict[str, Any]]:
+    """Live last-price for any equity/index symbol via Yahoo. Returns
+    None for symbols Yahoo can't serve (F&O) or on failure."""
+    ysym = _to_yahoo_symbol(broker_symbol)
+    if not ysym:
+        return None
+    try:
+        async with httpx.AsyncClient(http2=False) as client:
+            r = await client.get(
+                _YAHOO_CHART.format(symbol=ysym),
+                params={"interval": "1d", "range": "1d"},
+                headers=_HEADERS,
+                timeout=8.0,
+            )
+            r.raise_for_status()
+            meta = (((r.json() or {}).get("chart") or {}).get("result") or [{}])[0].get("meta") or {}
+    except Exception as e:  # noqa: BLE001
+        log.debug("market.quote_fetch_failed", symbol=broker_symbol, yahoo=ysym, error=str(e))
+        return None
+    price = meta.get("regularMarketPrice")
+    if price is None:
+        return None
+    prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+    price = float(price)
+    out: dict[str, Any] = {
+        "last_price": price,
+        "prev_close": float(prev) if prev else None,
+        "high": meta.get("regularMarketDayHigh"),
+        "low": meta.get("regularMarketDayLow"),
+        "volume": meta.get("regularMarketVolume"),
+        "change": round(price - float(prev), 2) if prev else None,
+        "change_pct": round((price - float(prev)) / float(prev) * 100.0, 2) if prev else None,
+    }
+    return out
 
 
 async def _fetch_one(client: httpx.AsyncClient, row: dict[str, str]) -> dict[str, Any]:

@@ -245,6 +245,7 @@ class RiskEngine:
         stop_loss: Optional[float] = None,
         target: Optional[float] = None,
         session: Optional[Session] = None,
+        manual_qty: Optional[int] = None,
     ) -> RiskDecision:
         """Run the full risk check on a signal.
 
@@ -269,6 +270,7 @@ class RiskEngine:
                 stop_loss=stop_loss,
                 target=target,
                 session=session,
+                manual_qty=manual_qty,
             )
         loop = asyncio.get_running_loop()
         from app.db.session import SessionLocal
@@ -285,6 +287,7 @@ class RiskEngine:
                 stop_loss=stop_loss,
                 target=target,
                 session=factory(),
+                manual_qty=manual_qty,
             ),
         )
 
@@ -298,6 +301,7 @@ class RiskEngine:
         stop_loss: Optional[float],
         target: Optional[float],
         session: Session,
+        manual_qty: Optional[int] = None,
     ) -> RiskDecision:
         settings = get_settings()
         overrides = StrategyOverrides.from_strategy(strategy)
@@ -400,6 +404,20 @@ class RiskEngine:
             portfolio_value=float(portfolio_value),
             max_capital_risk_pct=max_capital_risk_pct,
         )
+        # When the caller passes a `manual_qty` (the Trade page),
+        # the operator has explicitly chosen the position size.
+        # Override the auto-computed qty so the position-cap check
+        # (and the rest of the downstream `sizing.qty` reads) uses
+        # the operator's number, not the engine's idealized one.
+        if manual_qty is not None and int(manual_qty) >= 0:
+            mq = int(manual_qty)
+            sizing = SizingResult(
+                qty=mq,
+                risk_amount=float(mq) * abs(float(entry) - float(stop_loss)),
+                entry=sizing.entry,
+                stop_loss=sizing.stop_loss,
+                distance=sizing.distance,
+            )
         context["sizing"] = {
             "qty": sizing.qty,
             "risk_amount": sizing.risk_amount,

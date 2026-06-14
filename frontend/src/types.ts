@@ -280,3 +280,127 @@ export interface ManagedPosition {
   strategy_id: number | null;
   opened_at: string;
 }
+
+// ---- Trade page ----
+
+export type OrderType = "MARKET" | "LIMIT" | "STOP_LOSS" | "SL-M";
+export type ProductType = "INTRADAY" | "DELIVERY" | "NORMAL" | "MARGIN" | "CO" | "BO";
+
+export interface InstrumentHit {
+  symbol: string;          // "NSE:SBIN-EQ" or "NSE:NIFTY2561424500CE"
+  short_name: string;
+  exchange: string;
+  segment: string;         // "EQ" / "FO" / "COM" / "CD" / "INDEX"
+  instrument_type: string; // "EQ" / "FUT" / "CE" / "PE" / "IND"
+  lot_size: number;
+  tick_size: number;
+  expiry: string | null;   // YYYY-MM-DD
+  strike: number | null;
+  underlying: string | null;
+  display: string;
+}
+
+export interface SearchResponse {
+  ok: boolean;
+  count: number;
+  hits: InstrumentHit[];
+}
+
+export interface OptionLeg {
+  symbol: string;
+  ltp: number | null;
+  bid: number | null;
+  ask: number | null;
+  oi: number | null;
+  volume: number | null;
+  ltpch: number | null;
+  lot_size: number;
+  tick_size: number;
+}
+
+export interface OptionExpiry {
+  label: string; // human label, e.g. "16-06-2026"
+  ts: string; // epoch string passed back as `expiry` to re-fetch
+}
+
+export interface OptionChainResponse {
+  ok: boolean;
+  underlying: string;
+  symbol: string;
+  spot: number | null;
+  expiries: OptionExpiry[];
+  selected_expiry: string | null;
+  strikes: {
+    strike: number;
+    ce: OptionLeg | null;
+    pe: OptionLeg | null;
+  }[];
+  // "fyers" (live prices) or "master" (static ladder, no prices).
+  source: string;
+  reason: string | null;
+}
+
+export interface PlaceOrderRequest {
+  account_id: number;
+  symbol: string;
+  side: "BUY" | "SELL";
+  quantity: number;
+  order_type: OrderType;
+  limit_price?: number | null;
+  stop_price?: number | null;
+  product_type: ProductType;
+  bypass_risk?: boolean;
+  operator?: string;
+}
+
+export interface PlaceOrderResponse {
+  ok: boolean;
+  blocked?: boolean;
+  bypassed_risk?: boolean;
+  risk_codes: string[];
+  risk_message: string;
+  risk_warning?: string | null;
+  broker_order_id: string | null;
+  status: string;
+  error: string | null;
+  // Diagnostic marker from the Fyers backend (e.g. "ip_whitelist"
+  // when Fyers rejects with the misleading "Algo orders are not
+  // allowed from this app" message that's actually about the
+  // server's IP not being on the app's whitelist). Lets the UI
+  // render a custom banner with a copyable public IP.
+  reason?: string | null;
+  entry_used?: number;
+  stop_loss_used?: number;
+  target_used?: number;
+  entry_is_synthetic?: boolean;
+}
+
+export interface PendingOrder {
+  id: number;
+  broker_order_id: string | null;
+  broker_account_id: number | null;
+  symbol: string;
+  side: Side;
+  quantity: number;
+  price: number;
+  order_type: string;
+  status: string;
+  created_at: string | null;
+}
+
+export interface PendingOrdersResponse {
+  ok: boolean;
+  count: number;
+  orders: PendingOrder[];
+}
+
+export interface QuoteResponse {
+  ok: boolean;
+  symbol: string;
+  last_price?: number;
+  bid?: number | null;
+  ask?: number | null;
+  volume?: number | null;
+  as_of?: string;
+  reason?: string;
+}

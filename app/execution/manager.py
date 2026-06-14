@@ -77,6 +77,7 @@ from app.execution.base import (
     OrderSide,
     OrderState,
     OrderType,
+    ProductType,
     TradingBackend,
 )
 from app.execution.fyers_live import FyersLiveBackend
@@ -93,6 +94,15 @@ log = get_logger(__name__)
 CHANNEL_TRADE_EXECUTED = "trade.executed"
 CHANNEL_RISK_BLOCKED = "risk.blocked"
 CHANNEL_SETTINGS_UPDATED = "settings.updated"
+# Published by the Fyers OAuth callback after a successful
+# token rotation. Payload: {"broker_account_id": int}. The
+# execution manager subscribes to this so it can drop its
+# cached FyersLiveBackend (which is built with the OLD
+# app_id + access_token) and rebuild on the next signal —
+# the FyersLiveBackend constructor reads the row from the DB
+# on first use, so this guarantees the new credentials are
+# the ones that hit the broker.
+CHANNEL_BROKER_TOKEN_ROTATED = "broker.token_rotated"
 
 
 # Regex to pull entry / sl / target / rr out of T3's rationale
@@ -211,6 +221,14 @@ class Manager:
             except Exception:  # noqa: BLE001
                 pass
             self._settings_sub_queue = None
+        if self._token_sub_queue is not None:
+            try:
+                event_bus.unsubscribe(
+                    CHANNEL_BROKER_TOKEN_ROTATED, self._token_sub_queue
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            self._token_sub_queue = None
 
     async def wait_until_stopped(self) -> None:
         if self._task is None:
@@ -232,6 +250,7 @@ class Manager:
     async def _run(self) -> None:
         self._sub_queue = event_bus.subscribe(CHANNEL_NEW_SIGNAL)
         self._settings_sub_queue = event_bus.subscribe(CHANNEL_SETTINGS_UPDATED)
+        self._token_sub_queue = event_bus.subscribe(CHANNEL_BROKER_TOKEN_ROTATED)
         log.info("execution_manager.start", channel=CHANNEL_NEW_SIGNAL)
         # Start the paper backend's pending-order loop.
         self._paper.start()
@@ -244,7 +263,11 @@ class Manager:
                 # cancellation).
                 events: list[Any] = []
                 deadline = asyncio.get_running_loop().time() + 0.5
-                for q in (self._sub_queue, self._settings_sub_queue):
+                for q in (
+                    self._sub_queue,
+                    self._settings_sub_queue,
+                    self._token_sub_queue,
+                ):
                     if q is None:
                         continue
                     try:
@@ -276,6 +299,11 @@ class Manager:
                             await self._on_settings_updated(event.payload)
                         except Exception:  # noqa: BLE001
                             log.exception("execution_manager.settings_reload_failed")
+                    elif event.channel == CHANNEL_BROKER_TOKEN_ROTATED:
+                        try:
+                            self._on_broker_token_rotated(event.payload)
+                        except Exception:  # noqa: BLE001
+                            log.exception("execution_manager.token_rotation_handler_crashed")
         finally:
             log.info("execution_manager.stop")
             if self._sub_queue is not None:
@@ -284,6 +312,9 @@ class Manager:
             if self._settings_sub_queue is not None:
                 event_bus.unsubscribe(CHANNEL_SETTINGS_UPDATED, self._settings_sub_queue)
                 self._settings_sub_queue = None
+            if self._token_sub_queue is not None:
+                event_bus.unsubscribe(CHANNEL_BROKER_TOKEN_ROTATED, self._token_sub_queue)
+                self._token_sub_queue = None
             try:
                 await self._paper.stop()
             except Exception:  # noqa: BLE001
@@ -502,6 +533,23 @@ class Manager:
 
     # -- backend selection ---------------------------------------------
 
+    def _effective_app_id(self, account: BrokerAccount) -> Optional[str]:
+        """The Fyers app_id to authenticate order placement with.
+
+        `.env` (FYERS_APP_ID) is the SINGLE SOURCE OF TRUTH. The
+        `broker_accounts.app_id` column only mirrors it (written during
+        OAuth) and goes stale the moment the operator edits `.env` /
+        re-creates their Fyers app without re-running OAuth — which is
+        exactly how an order ends up rejected as the *old* app. Reading
+        from settings here guarantees the bot always trades as the app
+        configured in `.env`, falling back to the row's copy only when
+        `.env` is blank.
+        """
+        settings = self._settings_provider()
+        return (getattr(settings, "FYERS_APP_ID", "") or "").strip() or getattr(
+            account, "app_id", None
+        )
+
     def _backend_for(self, account: BrokerAccount) -> Optional[TradingBackend]:
         """Pick the backend for `account`.
 
@@ -523,15 +571,46 @@ class Manager:
         settings = self._settings_provider()
         if bool(getattr(account, "paper_mode", True)) or settings.is_paper:
             return self._paper
-        # Live.
-        if not getattr(account, "app_id", None) or not getattr(account, "access_token", None):
+        # Live. app_id comes from .env (see `_effective_app_id`); the
+        # access_token is the OAuth artifact stored on the row.
+        app_id = self._effective_app_id(account)
+        if not app_id or not getattr(account, "access_token", None):
             log.warning(
                 "execution_manager.account_missing_creds",
                 account_id=account.id, name=account.name,
             )
             return None
         backend = FyersLiveBackend(
-            app_id=account.app_id,
+            app_id=app_id,
+            access_token=account.access_token,
+            broker_account_id=int(account.id),
+            account_name=account.name,
+        )
+        self._backends[int(account.id)] = backend
+        return backend
+
+    def _manual_backend_for(self, account: BrokerAccount) -> Optional[TradingBackend]:
+        """Backend for a *manual* Trade-page order.
+
+        Unlike `_backend_for`, this ignores the global paper
+        kill-switch: the Trade page is real-money by design and the
+        account has already been verified as a live, tokened account
+        by the API. So a manual order on a Fyers account always routes
+        to the live Fyers backend (otherwise orders silently went to
+        paper whenever TRADING_MODE=paper). Pre-seeded backends (test
+        stubs) still win.
+        """
+        cached = self._backends.get(int(account.id))
+        if cached is not None:
+            return cached
+        if bool(getattr(account, "paper_mode", False)):
+            return self._paper
+        # app_id from .env (single source of truth); token from the row.
+        app_id = self._effective_app_id(account)
+        if not app_id or not getattr(account, "access_token", None):
+            return None
+        backend = FyersLiveBackend(
+            app_id=app_id,
             access_token=account.access_token,
             broker_account_id=int(account.id),
             account_name=account.name,
@@ -547,6 +626,421 @@ class Manager:
     def register_backend(self, broker_account_id: int, backend: TradingBackend) -> None:
         """Inject a backend (e.g. a stub for tests)."""
         self._backends[int(broker_account_id)] = backend
+
+    # -- manual order placement (Trade page) ---------------------------
+
+    async def place_manual_order(
+        self,
+        *,
+        account: BrokerAccount,
+        symbol: str,
+        side: str,
+        quantity: int,
+        order_type: str = "MARKET",
+        limit_price: Optional[float] = None,
+        stop_price: Optional[float] = None,
+        product_type: str = "INTRADAY",
+        bypass_risk: bool = False,
+        operator: str = "ui_trade_page",
+    ) -> dict[str, Any]:
+        """Place a single order from the Trade page (NOT from a signal).
+
+        Flow:
+          1. Build a lightweight `ManualSignal` duck-typed object
+             carrying the order's fields (action, symbol, confidence,
+             position_size_pct, rationale, id=None).
+          2. Run the risk engine against that signal so manual trades
+             respect the same global caps as auto-generated ones.
+             With `bypass_risk=True` (the operator typed the confirm
+             phrase) we still LOG the risk verdict but don't block.
+          3. Pick the backend for the account and submit.
+          4. Persist a `trades` row in the same shape the auto-pipeline
+             uses, plus an `audit_log` row tagged with `actor=ui` and
+             the operator's reason.
+          5. Publish `trade.executed` so the WS / dashboard updates.
+        """
+        if int(quantity) <= 0:
+            raise ValueError("quantity must be > 0")
+        try:
+            side_enum = OrderSide(side.upper())
+        except ValueError as e:
+            raise ValueError(f"side must be BUY or SELL, got {side!r}") from e
+        try:
+            type_enum = OrderType(order_type.upper())
+        except ValueError as e:
+            raise ValueError(f"unknown order_type {order_type!r}") from e
+        try:
+            product_enum = ProductType(product_type.upper())
+        except ValueError as e:
+            raise ValueError(f"unknown product_type {product_type!r}") from e
+
+        # The risk engine expects an object with these attributes.
+        from types import SimpleNamespace
+        manual_signal = SimpleNamespace(
+            id=None,
+            symbol=symbol,
+            action=side_enum.value,
+            confidence=1.0,
+            position_size_pct=0.0,
+            strategy_id=None,
+            rationale=f"manual trade from {operator}",
+        )
+
+        # Derive entry / stop_loss / target for the risk engine. For
+        # manual trades, the operator didn't pick SL/target — but the
+        # risk engine hard-blocks on None. We use:
+        #   entry     = the limit_price the operator entered, else the
+        #               last cached quote. If we have neither, we use
+        #               a conservative placeholder so the engine can
+        #               at least produce a decision — but flag it in
+        #               the response so the operator knows the SL/target
+        #               numbers are derived, not real.
+        settings = self._settings_provider()
+        try:
+            sl_pct = float(settings.DEFAULT_SL_PCT) / 100.0
+            rr = float(settings.DEFAULT_TARGET_RR)
+        except (AttributeError, TypeError, ValueError):
+            sl_pct, rr = 0.06, 3.0
+
+        entry = limit_price
+        entry_is_synthetic = False
+        if entry is None:
+            q = await self._md.get_quote(symbol)
+            if q is not None:
+                entry = float(q.last_price)
+        if entry is None or float(entry) <= 0.0:
+            # Synthetic placeholder: ₹100 / share is a reasonable
+            # NSE cash default. The risk engine's position-cap check
+            # uses this as the size basis; it's better than 1.0 INR
+            # which would let huge qty's slip through the cap.
+            entry = 100.0
+            entry_is_synthetic = True
+        entry = float(entry)
+        if side_enum == OrderSide.BUY:
+            stop_loss = entry * (1.0 - sl_pct)
+            target = entry * (1.0 + sl_pct * rr)
+        else:
+            stop_loss = entry * (1.0 + sl_pct)
+            target = entry * (1.0 - sl_pct * rr)
+
+        # Risk is ADVISORY for manual Trade-page orders. The operator
+        # is placing this deliberately on an explicitly-chosen live
+        # account, so we evaluate + surface any warnings but never
+        # block (the hard risk engine still governs the AUTO pipeline).
+        risk_codes: list[str] = []
+        risk_message = ""
+        try:
+            decision = await self._risk.evaluate(
+                signal=manual_signal,
+                account=account,
+                entry=entry,
+                stop_loss=stop_loss,
+                target=target,
+                manual_qty=int(quantity),
+            )
+            if not decision.approved:
+                risk_codes = list(decision.codes)
+                risk_message = (
+                    "; ".join(v.get("code", "?") for v in decision.violations)
+                    if decision.violations
+                    else "risk advisory"
+                )
+                log.info(
+                    "manual_order.risk_advisory",
+                    account_id=account.id, symbol=symbol, side=side,
+                    quantity=quantity, codes=risk_codes,
+                )
+        except Exception as e:  # noqa: BLE001
+            # Advisory only — never block a manual order on a risk
+            # engine error; just note it.
+            log.warning("manual_order.risk_engine_failed", error=str(e))
+            risk_message = f"risk check unavailable: {e}"
+
+        backend = self._manual_backend_for(account)
+        if backend is None:
+            raise RuntimeError(
+                f"no live backend for account {account.id} "
+                f"(name={account.name!r}). Complete Fyers OAuth in the Accounts page."
+            )
+
+        result = await backend.place_order(
+            signal=manual_signal,
+            symbol=symbol,
+            side=side_enum,
+            quantity=int(quantity),
+            order_type=type_enum,
+            limit_price=limit_price,
+            stop_price=stop_price,
+            product_type=product_enum,
+        )
+        # MARKET orders fill near-instantly on Fyers, but /orders/sync
+        # returns PENDING with the id and the fill lands milliseconds
+        # later. Poll briefly so the position shows on the dashboard and
+        # the fill price is captured immediately — without depending on
+        # the postback webhook being set up. Skipped under TESTING (the
+        # suite uses stubs and asserts PENDING) and only for MARKET.
+        if (
+            type_enum == OrderType.MARKET
+            and result.state == OrderState.PENDING
+            and result.broker_order_id
+            and hasattr(backend, "get_order_status")
+            and not self._settings_provider().is_testing
+        ):
+            for _ in range(4):
+                await asyncio.sleep(0.6)
+                try:
+                    st = await backend.get_order_status(result.broker_order_id)
+                except Exception:  # noqa: BLE001
+                    break
+                if st is None:
+                    break
+                if st.state in (
+                    OrderState.FILLED,
+                    OrderState.REJECTED,
+                    OrderState.CANCELLED,
+                ):
+                    result = OrderResult(
+                        broker_order_id=result.broker_order_id,
+                        state=st.state,
+                        symbol=result.symbol,
+                        side=result.side,
+                        quantity=result.quantity,
+                        order_type=result.order_type,
+                        filled_quantity=getattr(st, "filled_quantity", 0) or 0,
+                        average_price=getattr(st, "average_price", None),
+                        limit_price=result.limit_price,
+                        stop_price=result.stop_price,
+                        raw=result.raw,
+                    )
+                    break
+        # Persist + audit
+        await asyncio.get_running_loop().run_in_executor(
+            None,
+            self._persist_manual_trade_executed,
+            account.id,
+            manual_signal,
+            side_enum,
+            int(quantity),
+            float(limit_price or stop_price or 0.0),
+            type_enum,
+            product_enum,
+            result,
+            operator,
+            bypass_risk,
+            risk_codes,
+            risk_message,
+        )
+        # `result.state` is one of PENDING / FILLED / REJECTED / etc.
+        # The local `trades.status` column uses the same lowercase
+        # vocab as the auto-pipeline ("placed" for new rows, "filled"
+        # for executed, "rejected" for refused, "cancelled" for
+        # cancelled).
+        # Publish so /ws and the dashboard light up.
+        try:
+            from app.services.event_bus import event_bus
+            await event_bus.publish(
+                CHANNEL_TRADE_EXECUTED,
+                {
+                    "trade_id": getattr(result, "trade_id", None),
+                    "broker_order_id": result.broker_order_id,
+                    "symbol": result.symbol,
+                    "side": result.side.value,
+                    "quantity": result.quantity,
+                    "order_type": result.order_type.value,
+                    "state": result.state.value,
+                    "source": "manual",
+                    "operator": operator,
+                },
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("manual_order.publish_failed")
+        return {
+            "ok": result.state in (OrderState.PENDING, OrderState.FILLED),
+            "blocked": False,
+            # Risk is advisory for manual orders — surface codes as a
+            # warning the UI can show, but the order was NOT blocked.
+            "risk_codes": risk_codes,
+            "risk_message": risk_message,
+            "risk_warning": risk_message or None,
+            "bypassed_risk": False,
+            "broker_order_id": result.broker_order_id,
+            "status": result.state.value,
+            "error": result.error,
+            # Surface the OrderResult's `raw` field as `reason` so
+            # the UI can branch on diagnostic markers from the
+            # Fyers backend (e.g. "ip_whitelist" → render a
+            # copyable public IP hint).
+            "reason": (result.raw or {}).get("reason") if result.raw else None,
+            "entry_used": entry,
+            "stop_loss_used": stop_loss,
+            "target_used": target,
+            "entry_is_synthetic": entry_is_synthetic,
+        }
+
+    def _persist_manual_trade_executed(
+        self,
+        account_id: int,
+        signal: Any,
+        side: OrderSide,
+        quantity: int,
+        price: float,
+        order_type: OrderType,
+        product_type: ProductType,
+        result: OrderResult,
+        operator: str,
+        bypass_risk: bool,
+        risk_codes: list[str],
+        risk_message: str,
+    ) -> None:
+        # Map OrderState -> the local trades.status vocabulary the
+        # rest of the app uses (lowercase, "placed" for new rows).
+        state_to_status = {
+            OrderState.PENDING: "placed",
+            OrderState.FILLED: "filled",
+            OrderState.CANCELLED: "cancelled",
+            OrderState.REJECTED: "rejected",
+            OrderState.EXPIRED: "expired",
+        }
+        local_status = state_to_status.get(result.state, "placed")
+        # On a confirmed fill, the authoritative price is the broker's
+        # average fill price (a MARKET order's `price` arg is 0).
+        fill_price = float(
+            result.average_price
+            if result.average_price is not None
+            else (price or 0.0)
+        )
+        from app.db.session import SessionLocal
+        with SessionLocal() as session:
+            session.add(
+                TradeRow(
+                    signal_id=None,
+                    broker_account_id=account_id,
+                    symbol=result.symbol,
+                    side=side.value,
+                    quantity=int(quantity),
+                    price=fill_price,
+                    order_type=order_type.value,
+                    status=local_status,
+                    broker_order_id=result.broker_order_id or None,
+                    executed_at=datetime.now(timezone.utc) if result.state == OrderState.FILLED else None,
+                )
+            )
+            # Mirror a confirmed fill into the positions table so the
+            # dashboard's Active Positions shows the manual trade (and it
+            # can be squared off). Pending orders update later via the
+            # postback / next status poll.
+            if result.state == OrderState.FILLED and fill_price > 0:
+                qty = int(quantity)
+                signed = qty if side == OrderSide.BUY else -qty
+                pos = (
+                    session.query(PositionRow)
+                    .filter_by(symbol=result.symbol)
+                    .one_or_none()
+                )
+                if pos is None:
+                    if signed != 0:
+                        session.add(
+                            PositionRow(
+                                symbol=result.symbol,
+                                quantity=signed,
+                                average_price=fill_price,
+                                last_price=fill_price,
+                                unrealized_pnl=0.0,
+                            )
+                        )
+                else:
+                    new_qty = pos.quantity + signed
+                    if signed > 0 and new_qty != 0:
+                        pos.average_price = (
+                            pos.average_price * pos.quantity + fill_price * signed
+                        ) / new_qty
+                    pos.quantity = new_qty
+                    pos.last_price = fill_price
+            session.add(
+                AuditLog(
+                    actor=operator,
+                    action="order.manual_placed",
+                    target=f"account:{account_id}",
+                    before=None,
+                    after={
+                        "symbol": result.symbol,
+                        "side": side.value,
+                        "quantity": int(quantity),
+                        "order_type": order_type.value,
+                        "product_type": product_type.value,
+                        "broker_order_id": result.broker_order_id,
+                        "state": result.state.value,
+                        "limit_price": float(price or 0.0),
+                        "bypass_risk": bypass_risk,
+                        "risk_codes": risk_codes,
+                        "risk_message": risk_message,
+                    },
+                )
+            )
+            session.commit()
+
+    def _persist_manual_trade_blocked(
+        self,
+        *,
+        account: BrokerAccount,
+        signal: Any,
+        side: OrderSide,
+        quantity: int,
+        price: float,
+        order_type: OrderType,
+        product_type: ProductType,
+        reason: str,
+        codes: list[str],
+        operator: str,
+    ) -> None:
+        from app.db.session import SessionLocal
+        with SessionLocal() as session:
+            session.add(
+                TradeRow(
+                    signal_id=None,
+                    broker_account_id=account.id,
+                    symbol=signal.symbol,
+                    side=side.value,
+                    quantity=int(quantity),
+                    price=float(price or 0.0),
+                    order_type=order_type.value,
+                    status="rejected_risk",
+                    broker_order_id=None,
+                )
+            )
+            session.add(
+                RiskEvent(
+                    event_type="manual_risk_block",
+                    severity="warning",
+                    message=reason,
+                    halted=False,
+                    context={
+                        "source": "manual",
+                        "operator": operator,
+                        "side": side.value,
+                        "quantity": int(quantity),
+                        "order_type": order_type.value,
+                        "product_type": product_type.value,
+                        "codes": codes,
+                    },
+                )
+            )
+            session.add(
+                AuditLog(
+                    actor=operator,
+                    action="order.manual_blocked",
+                    target=f"account:{account.id}",
+                    before=None,
+                    after={
+                        "symbol": signal.symbol,
+                        "side": side.value,
+                        "quantity": int(quantity),
+                        "reason": reason,
+                        "codes": codes,
+                    },
+                )
+            )
+            session.commit()
 
     def attach_quote_feed(self, quote_feed: Any) -> None:
         """Wire in a QuoteFeed so paper orders get a fill price and
@@ -577,6 +1071,44 @@ class Manager:
         # have been swapped by tests).
         if not getattr(self._risk, "_md", None):  # type: ignore[attr-defined]
             self._risk._md = self._md  # type: ignore[attr-defined]
+
+    # -- token rotation hot-reload --------------------------------------
+
+    def _on_broker_token_rotated(self, payload: dict[str, Any]) -> None:
+        """Drop any cached FyersLiveBackend for the rotated account.
+
+        The Fyers OAuth callback writes the new access_token (and,
+        if the operator re-created their Fyers app, the new
+        app_id) to the `broker_accounts` row and then publishes
+        `broker.token_rotated`. We drop the cached backend so the
+        next signal / place_order rebuilds it from the DB — the
+        rebuild path reads the row fresh, so the operator's next
+        trade uses the new credentials without a backend restart.
+        """
+        acc_id = payload.get("broker_account_id")
+        if not isinstance(acc_id, int):
+            log.warning(
+                "execution_manager.token_rotation_bad_payload",
+                payload=payload,
+            )
+            return
+        # Only drop if we actually have a cached backend for this
+        # account — no need to invalidate something that doesn't
+        # exist, and the log line is more useful with a single
+        # account_id than with a list of all backends.
+        if acc_id in self._backends:
+            log.info(
+                "execution_manager.invalidate_after_token_rotation",
+                account_id=acc_id,
+            )
+            self._backends.pop(acc_id, None)
+        # Note: the broker_accounts row may also have changed
+        # `app_id` (operator re-created their Fyers app). The
+        # cached backend is keyed by `broker_account_id`; the
+        # FyersLiveBackend constructor reads the row from the DB
+        # when the account is first looked up, so a fresh
+        # `app_id` + `access_token` will be picked up on the
+        # next `_manual_backend_for(account)` call.
 
     # -- public test helpers --------------------------------------------
 

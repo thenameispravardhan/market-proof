@@ -26,12 +26,16 @@ from app.api import (
     broker_accounts as broker_accounts_api,
     core as core_api,
     fyers_callback,
+    fyers_postback,
     health,
     market as market_api,
     notifications as notifications_api,
+    options as options_api,
+    orders as orders_api,
     positions as positions_api,
     prompts as prompts_api,
     rules as rules_api,
+    search as search_api,
     settings_api,
     strategies as strategies_api,
     trading_mode,
@@ -121,16 +125,58 @@ async def lifespan(app: FastAPI):
     # Quote feed + trade manager share the execution manager's market
     # data bus and paper backend so entries, exits and P&L all see the
     # same prices.
-    quote_feed = QuoteFeed(market_data=execution_manager.market_data)
+    async def _fyers_live_quote(symbol: str):
+        """Live last-price for the quote feed when TRADING_MODE=live —
+        pulled from the connected Fyers account. Returns None on any miss
+        so the feed keeps the last known price (never drops a symbol).
+        Without this the feed simulated prices even in live mode, so
+        open-position P&L was synthetic."""
+        from sqlalchemy import select
+        from app.db.models import BrokerAccount
+        from app.db.session import SessionLocal
+
+        try:
+            with SessionLocal() as s:
+                acc = (
+                    s.execute(
+                        select(BrokerAccount).where(
+                            BrokerAccount.broker == "fyers",
+                            BrokerAccount.paper_mode == False,  # noqa: E712
+                            BrokerAccount.enabled == True,  # noqa: E712
+                            BrokerAccount.access_token.is_not(None),
+                        ).order_by(BrokerAccount.id.asc())
+                    )
+                    .scalars()
+                    .first()
+                )
+                backend = (
+                    execution_manager._manual_backend_for(acc) if acc is not None else None
+                )
+            if backend is None or not hasattr(backend, "get_quote"):
+                return None
+            quotes = await backend.get_quote([symbol])
+            if quotes:
+                return float(quotes[0].last_price)
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    quote_feed = QuoteFeed(
+        market_data=execution_manager.market_data,
+        live_quote_fn=_fyers_live_quote,
+    )
     trade_manager = TradeManager(
         market_data=execution_manager.market_data,
         quote_feed=quote_feed,
         paper_backend=execution_manager.paper_backend,
     )
     execution_manager.attach_quote_feed(quote_feed)
-    # Expose the trade manager so the positions API can close trades.
+    # Expose the trade manager so the positions API can close trades,
+    # AND the execution manager itself so the manual-trade orders API
+    # (and tests) can grab it via `app.state.execution_manager`.
     app.state.trade_manager = trade_manager
     app.state.quote_feed = quote_feed
+    app.state.execution_manager = execution_manager
     if not settings.TESTING:
         # T3: start the analyzer before the monitors so its event-bus
         # subscription is live before the first `announcements.new`
@@ -243,6 +289,7 @@ app.include_router(health.router)
 app.include_router(settings_api.router)
 app.include_router(trading_mode.router)
 app.include_router(fyers_callback.router)
+app.include_router(fyers_postback.router)
 app.include_router(ws.router)
 app.include_router(backtest.router)
 app.include_router(notifications_api.router)
@@ -255,6 +302,9 @@ app.include_router(audit_log_api.router)
 app.include_router(positions_api.router)
 app.include_router(market_api.router)
 app.include_router(core_api.router)
+app.include_router(orders_api.router)
+app.include_router(search_api.router)
+app.include_router(options_api.router)
 
 
 # -------------------------------------------------------------------------

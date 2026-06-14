@@ -275,19 +275,42 @@ class TradeManager:
     async def close_position(
         self, symbol: str, *, reason: str = "MANUAL"
     ) -> Optional[dict[str, Any]]:
-        """Manually close a managed position at the latest price."""
+        """Manually close a position at the latest price.
+
+        Works for any open position, not just ones in the in-memory
+        managed book: if the symbol isn't being actively managed (e.g.
+        it was opened before the trade manager started, after a restart,
+        or seeded), we reconstruct a position from the DB so the
+        operator can always flatten it from the dashboard.
+        """
         symbol = symbol.upper().strip()
         quote = await self._md.get_quote(symbol)
         async with self._lock:
             mp = self._book.get(symbol)
+        fallback_price: Optional[float] = None
         if mp is None:
-            return None
-        exit_price = float(quote.last_price) if quote is not None else mp.entry
-        return await self._exit(symbol, reason=reason, exit_price=exit_price)
+            loaded = await asyncio.get_running_loop().run_in_executor(
+                None, _open_position_as_managed, self._session_factory, symbol
+            )
+            if loaded is None:
+                return None
+            mp, fallback_price = loaded
+        exit_price = (
+            float(quote.last_price)
+            if quote is not None
+            else (fallback_price if fallback_price is not None else mp.entry)
+        )
+        return await self._exit(symbol, reason=reason, exit_price=exit_price, mp=mp)
 
     async def close_all(self, *, reason: str = "SQUARE_OFF") -> list[dict[str, Any]]:
+        # Union of the managed book and every open position row, so
+        # "square off all" really flattens everything.
         async with self._lock:
-            symbols = list(self._book.keys())
+            symbols = set(self._book.keys())
+        db_syms = await asyncio.get_running_loop().run_in_executor(
+            None, _open_position_symbols, self._session_factory
+        )
+        symbols.update(db_syms)
         out: list[dict[str, Any]] = []
         for symbol in symbols:
             res = await self.close_position(symbol, reason=reason)
@@ -296,10 +319,18 @@ class TradeManager:
         return out
 
     async def _exit(
-        self, symbol: str, *, reason: str, exit_price: float
+        self,
+        symbol: str,
+        *,
+        reason: str,
+        exit_price: float,
+        mp: Optional[ManagedPosition] = None,
     ) -> Optional[dict[str, Any]]:
+        # Always drop the symbol from the managed book if present; use
+        # the caller-supplied position (DB fallback) when it isn't.
         async with self._lock:
-            mp = self._book.pop(symbol, None)
+            booked = self._book.pop(symbol, None)
+        mp = mp or booked
         if mp is None:
             return None
         pnl = mp.realised_pnl(exit_price)
@@ -335,6 +366,50 @@ class TradeManager:
 
 
 # -- DB helpers (sync, run in executor) ----------------------------------
+
+
+def _open_position_symbols(session_factory: Callable[[], Any]) -> list[str]:
+    """Symbols of every open (non-zero quantity) position row."""
+    from app.db.models import Position as PositionRow
+
+    with session_factory() as session:
+        rows = session.query(PositionRow).filter(PositionRow.quantity != 0).all()
+        return [r.symbol for r in rows]
+
+
+def _open_position_as_managed(
+    session_factory: Callable[[], Any], symbol: str
+) -> Optional[tuple[ManagedPosition, float]]:
+    """Reconstruct a ManagedPosition from a DB position row so it can be
+    closed even when it isn't in the in-memory managed book.
+
+    Returns (managed_position, fallback_exit_price) or None when there
+    is no open position for the symbol.
+    """
+    from app.db.models import Position as PositionRow
+
+    with session_factory() as session:
+        row = (
+            session.query(PositionRow)
+            .filter(PositionRow.symbol == symbol, PositionRow.quantity != 0)
+            .one_or_none()
+        )
+        if row is None:
+            return None
+        mp = ManagedPosition(
+            symbol=row.symbol,
+            quantity=int(row.quantity),
+            entry=float(row.average_price),
+            stop_loss=None,
+            target=None,
+            signal_id=None,
+            strategy_id=row.strategy_id,
+            broker_account_id=None,
+        )
+        fallback_price = float(
+            row.last_price if row.last_price and row.last_price > 0 else row.average_price
+        )
+        return (mp, fallback_price)
 
 
 def _load_signal_levels(

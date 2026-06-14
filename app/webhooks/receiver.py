@@ -38,6 +38,10 @@ from app.analyzer.schemas import (
 )
 from app.db.models import Analysis, Announcement, Signal, Webhook
 from app.logging_config import get_logger
+from app.webhooks.fyers import (
+    is_fyers_postback,
+    normalize_fyers_postback,
+)
 from app.webhooks.signing import (
     REPLAY_WINDOW_SECONDS,
     is_fresh_timestamp,
@@ -172,6 +176,22 @@ def process_inbound(
         payload = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as e:
         raise InboundError(f"invalid json: {e}", status_code=400) from e
+
+    # 2a. Fyers postback normalizer. Activated when EITHER:
+    #   - the webhook's name is prefixed with "fyers-", or
+    #   - the raw payload shape looks like a Fyers postback
+    #     (detected heuristically in `is_fyers_postback`).
+    # The output is a dict in the generic receiver's contract shape;
+    # the original is preserved under `raw_fyers`.
+    webhook_name = (getattr(webhook, "name", "") or "").lower()
+    if webhook_name.startswith("fyers-") or is_fyers_postback(payload):
+        try:
+            payload = normalize_fyers_postback(payload)
+        except Exception as e:  # noqa: BLE001
+            log.exception(
+                "webhook_inbound.fyers_normalize_failed", webhook_id=webhook.id, error=str(e)
+            )
+            raise InboundError(f"fyers normalization failed: {e}", status_code=400) from e
 
     # 3. shape
     payload = _validate_payload_shape(payload)

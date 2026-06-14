@@ -139,6 +139,43 @@ async def test_close_unknown_symbol_returns_none(db_session, isolated_db):
     assert await tm.close_position("NOPE") is None
 
 
+@pytest.mark.asyncio
+async def test_close_unmanaged_position_from_db(db_session, isolated_db):
+    """Bug fix: a position that isn't in the in-memory managed book
+    (e.g. opened before the trade manager started, or seeded) must
+    still be closeable from the dashboard."""
+    md = MarketDataBus()
+    db_session.add(
+        PositionRow(symbol="WIPRO", quantity=12, average_price=240.0, last_price=255.0)
+    )
+    db_session.commit()
+    tm = TradeManager(market_data=md)
+    # Not registered in the managed book — close must still work via the
+    # DB fallback, settling at the row's last_price.
+    assert tm.managed_positions() == []
+    result = await tm.close_position("WIPRO", reason="MANUAL")
+    assert result is not None
+    assert result["pnl"] == pytest.approx((255.0 - 240.0) * 12)
+    db_session.expire_all()
+    pos = db_session.query(PositionRow).filter_by(symbol="WIPRO").one()
+    assert pos.quantity == 0
+
+
+@pytest.mark.asyncio
+async def test_close_all_flattens_unmanaged_positions(db_session, isolated_db):
+    md = MarketDataBus()
+    db_session.add_all([
+        PositionRow(symbol="A", quantity=5, average_price=100.0, last_price=110.0),
+        PositionRow(symbol="B", quantity=3, average_price=50.0, last_price=45.0),
+    ])
+    db_session.commit()
+    tm = TradeManager(market_data=md)
+    results = await tm.close_all()
+    assert len(results) == 2
+    db_session.expire_all()
+    assert all(p.quantity == 0 for p in db_session.query(PositionRow).all())
+
+
 # -- Integration: quote feed seeds a fill for a BUY ----------------------
 
 

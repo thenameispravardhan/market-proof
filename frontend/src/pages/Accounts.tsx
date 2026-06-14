@@ -6,6 +6,9 @@
 // beyond connecting Fyers.
 
 import { ConnectFyers } from "../components/accounts/ConnectFyers";
+import { FyersCredentialsCard } from "../components/accounts/FyersCredentialsCard";
+import { FyersSetupCard } from "../components/accounts/FyersSetupCard";
+import { FyersWebhookCard } from "../components/accounts/FyersWebhookCard";
 import { useGlobalSettings } from "../hooks/useApi";
 
 function PaperAccountCard() {
@@ -47,6 +50,15 @@ export default function Accounts() {
       <div className="layout-2">
         <PaperAccountCard />
         <ConnectFyers />
+      </div>
+      <div style={{ marginTop: 16 }}>
+        <FyersCredentialsCard />
+      </div>
+      <div style={{ marginTop: 16 }}>
+        <FyersSetupCard />
+      </div>
+      <div style={{ marginTop: 16 }}>
+        <FyersWebhookCard />
       </div>
     </div>
   );

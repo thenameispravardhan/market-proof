@@ -19,6 +19,9 @@ os.environ["TESTING"] = "1"
 os.environ.setdefault("DEEPSEEK_API_KEY", "")
 os.environ.setdefault("FYERS_APP_ID", "")
 os.environ.setdefault("FYERS_SECRET_KEY", "")
+# Keep the real .env's postback secret out of tests so the DB-override
+# path (which the postback tests exercise) stays authoritative here.
+os.environ.setdefault("FYERS_POSTBACK_SECRET", "")
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402

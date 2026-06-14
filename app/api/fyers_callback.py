@@ -100,18 +100,50 @@ async def fyers_callback(
         select(BrokerAccount).where(BrokerAccount.app_id == app_id)
     ).scalar_one_or_none()
     if account is None:
-        # Fall back: first enabled account with a name starting with
-        # 'fyers'. Operators can configure the broker_accounts row
-        # via T5's UI; for v1 we accept either match.
+        # Fall back: prefer a REAL Fyers account (paper_mode=False)
+        # whose app_id is set but mismatched (the common case is
+        # the operator re-created their Fyers app on
+        # https://myapi.fyers.in/dashboard/ — the old app_id was
+        # deleted, they updated FYERS_APP_ID in .env, restarted
+        # the backend, and re-ran OAuth; the existing row still
+        # has the OLD app_id on it). We re-associate that row to
+        # the new app_id below after a successful token exchange.
+        # If multiple real Fyers accounts exist, we take the
+        # first by id. We deliberately skip the default paper
+        # `Fyers` row that the app seeds at startup — that row
+        # is just a placeholder for paper-mode trading, not a
+        # real Fyers integration, and re-associating it would
+        # shadow the operator's actual real-account row.
         account = db.execute(
-            select(BrokerAccount).where(BrokerAccount.broker == "fyers").order_by(BrokerAccount.id.asc())
+            select(BrokerAccount)
+            .where(
+                BrokerAccount.broker == "fyers",
+                BrokerAccount.paper_mode == False,  # noqa: E712
+                BrokerAccount.app_id.is_not(None),
+            )
+            .order_by(BrokerAccount.id.asc())
         ).scalars().first()
+        if account is None:
+            # Last resort: any Fyers row, including the seeded
+            # paper placeholder. We only land here if the
+            # operator has never had a real Fyers account row.
+            account = db.execute(
+                select(BrokerAccount)
+                .where(BrokerAccount.broker == "fyers")
+                .order_by(BrokerAccount.id.asc())
+            ).scalars().first()
     if account is None:
         log.error("fyers.callback.no_account_for_app_id", app_id=app_id)
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="no broker_accounts row matches the configured FYERS_APP_ID",
         )
+    # Track whether we're re-associating the row to a new app_id
+    # so we can (a) update the row's app_id after a successful
+    # token exchange, and (b) record both the old and new app_id
+    # in the audit log for traceability.
+    previous_app_id = account.app_id
+    app_id_changed = previous_app_id != app_id
     # Exchange the code for a token.
     try:
         token = await exchange_code_for_token(
@@ -127,17 +159,41 @@ async def fyers_callback(
         )
     # Persist.
     account.access_token = token.access_token
+    # Re-associate the row to the new app_id when the operator has
+    # re-created their Fyers app. Without this, the trade page
+    # uses the row's old app_id (cached from the previous OAuth
+    # round) and Fyers rejects every place_order with
+    # "Order placement restricted. Algo orders are not allowed
+    # from this app <old-app-id>". The access_token and app_id
+    # MUST be a matched pair; updating only one of them leaves
+    # the row in an inconsistent state.
+    if app_id_changed:
+        log.warning(
+            "fyers.callback.reassociated_app_id",
+            account_id=account.id,
+            previous_app_id=previous_app_id,
+            new_app_id=app_id,
+        )
+        account.app_id = app_id
     # Also persist the redirect_uri for record-keeping if blank.
     if not account.redirect_uri:
         account.redirect_uri = redirect_uri
     # Write to audit_log. We deliberately do NOT log the token.
+    # When the app_id changed we record both the old and the new
+    # value in the audit row so an operator reviewing the log
+    # later can see when the re-association happened.
+    audit_after: dict[str, Any] = {"account_id": account.id, "app_id": app_id}
+    audit_before: Optional[dict[str, Any]] = None
+    if app_id_changed:
+        audit_before = {"app_id": previous_app_id}
+        audit_after["previous_app_id"] = previous_app_id
     db.add(
         AuditLog(
             actor="ui",
             action="fyers.token_rotated",
             target=f"broker_account:{account.id}",
-            before=None,
-            after={"account_id": account.id, "app_id": app_id},
+            before=audit_before,
+            after=audit_after,
         )
     )
     db.commit()
@@ -176,7 +232,7 @@ async def fyers_callback(
 
 
 @router.get("/authorize-url")
-def fyers_authorize_url() -> dict[str, Any]:
+async def fyers_authorize_url() -> dict[str, Any]:
     """One-shot helper: returns the Fyers authorize URL the operator
     should open in a browser. The `state` is registered for CSRF
     protection; the callback validates it.
@@ -186,6 +242,16 @@ def fyers_authorize_url() -> dict[str, Any]:
     When creds are missing we return `configured: false` with a clear
     reason (HTTP 200) so the UI can render the message instead of
     throwing on a 5xx.
+
+    Pre-validation: we ping the OAuth URL with the configured
+    `app_id` and inspect the response. Fyers returns either:
+      * 200 with the login form HTML         → app is valid
+      * 200 with a `<a href=".../error/...">Found</a>` tiny HTML
+        page (or a 302 to that URL)         → app is invalid/deleted
+    We surface that "deleted app" / "invalid clientId" case here
+    so the operator sees the real reason in the bot UI *before*
+    opening the popup, instead of having to read Fyers' error
+    page after the OAuth flow silently dies.
     """
     import secrets
 
@@ -209,6 +275,65 @@ def fyers_authorize_url() -> dict[str, Any]:
         redirect_uri=settings.FYERS_REDIRECT_URI,
         state=state,
     )
+    # Pre-validate the configured app_id by pinging the OAuth URL.
+    # Fyers responds 200 with the login form for a valid app, and
+    # 200/302 to `.../api-login/error/index.html?error_msg=...` for
+    # an invalid one. We let httpx follow the redirect (default)
+    # so the final URL lands on either the login page or the error
+    # page, and key off that. This is a best-effort validation —
+    # Fyers can still 500 or change its behaviour; if anything goes
+    # wrong here we silently fall through and return the URL.
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(
+            timeout=5.0,
+            follow_redirects=True,
+            headers={
+                # Match the User-Agent we send to the Fyers data API
+                # so the OAuth server doesn't see us as a script.
+                "User-Agent": (
+                    "Mozilla/5.0 (compatible; TradeBot/1.0; "
+                    "+https://github.com/local/tradebot)"
+                ),
+            },
+        ) as client:
+            # Use the build_authorize_url output as the ping target.
+            # We DON'T register `state` for the ping (already done
+            # above) — this is a GET with no auth, just to see what
+            # Fyers does with the app_id.
+            resp = await client.get(url)
+        final_url = str(resp.url)
+        if "api-login/error" in final_url or "error_msg=" in final_url:
+            # Fyers redirected to its own error page. Extract the
+            # `error_msg` if present so the operator sees the
+            # exact Fyers-side reason.
+            from urllib.parse import parse_qs, urlparse
+
+            qs = parse_qs(urlparse(final_url).query)
+            err = (qs.get("error_msg") or ["invalid app_id"])[0]
+            log.warning(
+                "fyers.authorize_url.app_id_rejected",
+                app_id=settings.FYERS_APP_ID, fyers_error=err,
+            )
+            return {
+                "configured": False,
+                "url": "",
+                "state": "",
+                "reason": (
+                    f"Fyers rejected FYERS_APP_ID {settings.FYERS_APP_ID!r} "
+                    f"as {err!r}. The app was likely deleted on "
+                    "https://myapi.fyers.in/dashboard/. Create a new "
+                    "Fyers app, then update FYERS_APP_ID and "
+                    "FYERS_SECRET_KEY in .env and restart the backend."
+                ),
+            }
+    except Exception as e:  # noqa: BLE001
+        # Best-effort. Don't block the operator if Fyers is down or
+        # the ping times out — let them try the real flow and let
+        # the popup surface the error.
+        log.info("fyers.authorize_url.precheck_skipped", error=str(e))
+
     return {"configured": True, "url": url, "state": state, "reason": None}
 
 
@@ -281,13 +406,18 @@ def fyers_status(db: Session = Depends(get_db)) -> dict[str, Any]:
         "credentials_set": credentials_set,
         "account_present": account_present,
         "app_id": settings.FYERS_APP_ID or None,
+        # Surfaced so the Accounts "Fyers App Activation" card can show
+        # the exact Redirect URL the operator must paste into the Fyers
+        # dashboard — it has to match this value character-for-character
+        # or OAuth fails with a redirect mismatch.
+        "redirect_uri": settings.FYERS_REDIRECT_URI or None,
         "live_mode": settings.is_live,
         "reason": reason,
     }
 
 
 @router.post("/disconnect")
-def fyers_disconnect(db: Session = Depends(get_db)) -> dict[str, Any]:
+async def fyers_disconnect(db: Session = Depends(get_db)) -> dict[str, Any]:
     """Clear the Fyers access token (and rotate if possible).
 
     The credentials in .env stay put — this only kills the current
@@ -316,7 +446,27 @@ def fyers_disconnect(db: Session = Depends(get_db)) -> dict[str, Any]:
         .order_by(BrokerAccount.id.asc())
     ).scalars().first()
     if account is None:
-        return {"ok": False, "reason": "no fyers broker account found"}
+        # The configured FYERS_APP_ID may not match the row's app_id:
+        # the operator re-created their Fyers app and updated .env, but
+        # the broker_accounts row still carries the OLD app_id (written
+        # at the last OAuth). Disconnect must STILL find and clear that
+        # row — otherwise the stale token lingers, order placement keeps
+        # authenticating as the old app, and the banner is stuck on
+        # "Connected". Fall back to the first enabled real Fyers account
+        # that actually holds a token. (This was the "disconnect does
+        # nothing" bug.)
+        account = db.execute(
+            select(BrokerAccount)
+            .where(
+                BrokerAccount.broker == "fyers",
+                BrokerAccount.paper_mode == False,  # noqa: E712
+                BrokerAccount.access_token.is_not(None),
+                BrokerAccount.enabled == True,  # noqa: E712
+            )
+            .order_by(BrokerAccount.id.asc())
+        ).scalars().first()
+    if account is None:
+        return {"ok": False, "reason": "no connected fyers account to disconnect"}
 
     account.access_token = None
     db.add(
@@ -329,5 +479,16 @@ def fyers_disconnect(db: Session = Depends(get_db)) -> dict[str, Any]:
         )
     )
     db.commit()
+    # Drop any cached FyersLiveBackend for this account so the next
+    # order can't keep trading on the just-revoked token held in the
+    # manager's in-memory backend cache.
+    from app.services.event_bus import event_bus
+    try:
+        await event_bus.publish(
+            "broker.token_rotated",
+            {"broker_account_id": int(account.id)},
+        )
+    except Exception:  # noqa: BLE001
+        pass
     log.info("fyers.disconnect", account_id=account.id, account_name=account.name)
     return {"ok": True}

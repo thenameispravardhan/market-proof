@@ -26,6 +26,7 @@ function readSidebarOpen(): boolean {
 import Dashboard from "./pages/Dashboard";
 import Prompts from "./pages/Prompts";
 
+const Trade = lazy(() => import("./pages/Trade"));
 const TradeHistory = lazy(() => import("./pages/TradeHistory"));
 const Rules = lazy(() => import("./pages/Rules"));
 const Strategies = lazy(() => import("./pages/Strategies"));
@@ -37,6 +38,7 @@ const Settings = lazy(() => import("./pages/Settings"));
 
 const TABS: { key: TabKey; label: string; emoji: string; group: "MAIN" | "OPS" | "CFG" }[] = [
   { key: "dashboard",      label: "Dashboard",      emoji: "▤", group: "MAIN" },
+  { key: "trade",          label: "Trade",          emoji: "▶", group: "MAIN" },
   { key: "trades",         label: "Trade History",  emoji: "₹", group: "MAIN" },
   { key: "prompts",        label: "Prompts",        emoji: "✎", group: "MAIN" },
   { key: "rules",          label: "Rules",          emoji: "≡", group: "MAIN" },
@@ -51,6 +53,7 @@ const TABS: { key: TabKey; label: string; emoji: string; group: "MAIN" | "OPS" |
 function PageContent({ tab }: { tab: TabKey }) {
   switch (tab) {
     case "dashboard": return <Dashboard />;
+    case "trade": return <Trade />;
     case "trades": return <TradeHistory />;
     case "prompts": return <Prompts />;
     case "rules": return <Rules />;
