@@ -44,9 +44,12 @@ function StatRow() {
 function ModeBanner() {
   const { data } = useGlobalSettings();
   const mode = data?.global?.TRADING_MODE ?? "paper";
+  // Only surface the LIVE-trading warning. Paper mode shows no banner
+  // (the mode is already indicated in the bottom status bar).
+  if (mode !== "live") return null;
   return (
-    <div className={`mode-banner ${mode}`}>
-      <span>{mode === "live" ? "LIVE TRADING" : "PAPER TRADING"}</span>
+    <div className="mode-banner live">
+      <span>LIVE TRADING — real orders are being placed</span>
     </div>
   );
 }

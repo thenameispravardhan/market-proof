@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import BrokerAccount
 from app.db.session import get_db
-from app.execution.fyers_live import FyersAPIError, FyersBlockedError
+from app.execution.fyers_live import FyersAPIError, FyersAuthError, FyersBlockedError
 from app.logging_config import get_logger
 from app.services.instrument_master import get_master
 
@@ -158,6 +158,15 @@ async def options_chain(
     try:
         chain = await backend.get_option_chain(
             idx_symbol, strikecount=strikecount, timestamp=expiry or ""
+        )
+    except FyersAuthError as e:
+        # Daily token expiry is the common case — give an actionable hint.
+        log.warning("options.chain.token_expired", symbol=idx_symbol, error=str(e))
+        return _master_chain(
+            underlying,
+            expiry,
+            "Fyers token expired — open Accounts and click Connect Fyers to "
+            "re-authorise (Fyers tokens expire daily).",
         )
     except (FyersAPIError, FyersBlockedError) as e:
         log.warning("options.chain.fyers_failed", symbol=idx_symbol, error=str(e))

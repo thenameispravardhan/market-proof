@@ -20,6 +20,7 @@ Everything is frontend-configurable:
 from __future__ import annotations
 
 import json
+import os
 import secrets
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -113,7 +114,24 @@ def update_postback_config(
     if body.public_base_url is not None:
         _set(db, _PUBLIC_URL_KEY, body.public_base_url.strip())
     if body.regenerate_secret or not _effective_secret(db):
-        _set(db, _SECRET_KEY, "fy_" + secrets.token_urlsafe(24))
+        new_secret = "fy_" + secrets.token_urlsafe(24)
+        _set(db, _SECRET_KEY, new_secret)
+        # `_effective_secret` reads .env (FYERS_POSTBACK_SECRET) FIRST — it's
+        # the source of truth — so a DB-only write is ignored in production
+        # and the displayed secret never changes ("regenerate not working").
+        # Persist to .env and hot-apply so the new value actually takes
+        # effect. Skipped under TESTING (where .env is blank and the DB
+        # override is authoritative).
+        if not get_settings().is_testing:
+            from app.api.settings_api import _upsert_env_vars
+            from app.config import reset_settings_cache
+
+            try:
+                _upsert_env_vars({"FYERS_POSTBACK_SECRET": new_secret})
+            except Exception:  # noqa: BLE001
+                pass
+            os.environ["FYERS_POSTBACK_SECRET"] = new_secret
+            reset_settings_cache()
     db.add(
         AuditLog(
             actor="ui",

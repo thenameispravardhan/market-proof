@@ -433,22 +433,20 @@ async def get_quote(
 ) -> dict[str, Any]:
     """Live quote for `symbol`.
 
-    1. Serve the in-process market-data bus cache if it's fresh.
-    2. Otherwise fetch a live last price from the public market-data
-       source (Yahoo — works for any NSE/BSE equity or index, no Fyers
-       token needed) and seed the bus.
-    3. For F&O / option symbols Yahoo can't serve, fetch a live quote via
-       the connected Fyers account — this is how an option leg picked
-       from the chain shows a price in the ticket.
-    Returns ok:false only when none of those produce a price."""
+    Source priority — REAL-TIME first:
+      1. Fresh in-process bus cache (a live feed re-publishes constantly).
+      2. The connected Fyers account's real-time exchange quote
+         (`/data/quotes`) — authoritative for any NSE/BSE equity, index,
+         future or option. This is the real-time stock data.
+      3. Public Yahoo feed — a fallback for when Fyers isn't connected or
+         the token has expired (Yahoo is delayed and can't serve F&O).
+      4. A stale (but real) bus quote, else ok:false.
+    """
     sym = symbol.upper()
     md = _manager().market_data
     cached = await md.get_quote(sym)
-    # Serve the in-process bus cache ONLY when it's fresh. A stale entry
-    # (a Yahoo seed from earlier in the session, or a one-off paper-fill
-    # publish) would otherwise freeze the ticket price — the bus is
-    # checked before the live fetch and, once seeded, was never
-    # refreshed. See `_bus_quote_is_fresh`.
+    # Serve the in-process bus cache ONLY when it's fresh and real (never
+    # a simulated paper price). See `_bus_quote_is_fresh` / `_is_simulated`.
     if cached is not None and _bus_quote_is_fresh(cached) and not _is_simulated(cached):
         return {
             "ok": True,
@@ -461,74 +459,69 @@ async def get_quote(
             "as_of": cached.timestamp.isoformat(),
         }
 
+    # 1. Real-time exchange price via Fyers (preferred when connected).
+    fy = await _fyers_quote(db, sym)
+    if fy is not None and fy.get("last_price"):
+        try:
+            await md.publish(
+                sym,
+                float(fy["last_price"]),
+                bid=fy.get("bid"),
+                ask=fy.get("ask"),
+                volume=fy.get("volume"),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return {
+            "ok": True,
+            "symbol": sym,
+            "last_price": fy["last_price"],
+            "bid": fy.get("bid"),
+            "ask": fy.get("ask"),
+            "volume": fy.get("volume"),
+            "source": "fyers",
+            "as_of": datetime.now(timezone.utc).isoformat(),
+        }
+
+    # 2. Public Yahoo fallback (equities/indices; delayed; no F&O).
     from app.api.market import fetch_quote as _fetch_live_quote
 
     live = await _fetch_live_quote(sym)
-    if live is None:
-        # Yahoo can't serve this (F&O / option). Try a live Fyers quote
-        # via the connected real account.
-        fy = await _fyers_quote(db, sym)
-        if fy is not None and fy.get("last_price"):
-            try:
-                await md.publish(
-                    sym,
-                    float(fy["last_price"]),
-                    bid=fy.get("bid"),
-                    ask=fy.get("ask"),
-                    volume=fy.get("volume"),
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            return {
-                "ok": True,
-                "symbol": sym,
-                "last_price": fy["last_price"],
-                "bid": fy.get("bid"),
-                "ask": fy.get("ask"),
-                "volume": fy.get("volume"),
-                "source": "fyers",
-                "as_of": datetime.now(timezone.utc).isoformat(),
-            }
-        # Fall back to a stale bus quote if one exists — a slightly old
-        # price from a REAL feed beats showing nothing. Never serve a
-        # simulated (paper) price: a fake number is worse than "no quote".
-        if cached is not None and not _is_simulated(cached):
-            return {
-                "ok": True,
-                "symbol": cached.symbol,
-                "last_price": cached.last_price,
-                "bid": cached.bid,
-                "ask": cached.ask,
-                "volume": cached.volume,
-                "source": "bus_stale",
-                "as_of": cached.timestamp.isoformat(),
-            }
+    if live is not None:
+        try:
+            await md.publish(sym, float(live["last_price"]), volume=live.get("volume"))
+        except Exception:  # noqa: BLE001
+            pass
         return {
-            "ok": False,
+            "ok": True,
             "symbol": sym,
-            "reason": "no live quote for this symbol (F&O / options need a connected Fyers feed)",
+            "last_price": live["last_price"],
+            "bid": live.get("bid"),
+            "ask": live.get("ask"),
+            "volume": live.get("volume"),
+            "change": live.get("change"),
+            "change_pct": live.get("change_pct"),
+            "high": live.get("high"),
+            "low": live.get("low"),
+            "prev_close": live.get("prev_close"),
+            "source": "live",
+            "as_of": datetime.now(timezone.utc).isoformat(),
         }
-    # Seed the bus so subsequent reads + position MTM see it.
-    try:
-        await md.publish(
-            sym,
-            float(live["last_price"]),
-            volume=live.get("volume"),
-        )
-    except Exception:  # noqa: BLE001
-        pass
+
+    # 3. A stale-but-real bus quote beats nothing.
+    if cached is not None and not _is_simulated(cached):
+        return {
+            "ok": True,
+            "symbol": cached.symbol,
+            "last_price": cached.last_price,
+            "bid": cached.bid,
+            "ask": cached.ask,
+            "volume": cached.volume,
+            "source": "bus_stale",
+            "as_of": cached.timestamp.isoformat(),
+        }
     return {
-        "ok": True,
+        "ok": False,
         "symbol": sym,
-        "last_price": live["last_price"],
-        "bid": live.get("bid"),
-        "ask": live.get("ask"),
-        "volume": live.get("volume"),
-        "change": live.get("change"),
-        "change_pct": live.get("change_pct"),
-        "high": live.get("high"),
-        "low": live.get("low"),
-        "prev_close": live.get("prev_close"),
-        "source": "live",
-        "as_of": datetime.now(timezone.utc).isoformat(),
+        "reason": "no live quote — connect Fyers for real-time data (the token may have expired)",
     }
