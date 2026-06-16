@@ -723,12 +723,14 @@ class Manager:
             stop_loss = entry * (1.0 + sl_pct)
             target = entry * (1.0 - sl_pct * rr)
 
-        # Risk is ADVISORY for manual Trade-page orders. The operator
-        # is placing this deliberately on an explicitly-chosen live
-        # account, so we evaluate + surface any warnings but never
-        # block (the hard risk engine still governs the AUTO pipeline).
+        # Manual Trade-page orders respect the SAME global risk caps as
+        # the auto pipeline (so changes you make in Settings actually take
+        # effect here too). A rejected verdict BLOCKS the order unless the
+        # operator explicitly overrides it (`bypass_risk=True`). A risk-
+        # engine *fault* never blocks — it's surfaced as advisory only.
         risk_codes: list[str] = []
         risk_message = ""
+        risk_approved = True
         try:
             decision = await self._risk.evaluate(
                 signal=manual_signal,
@@ -738,23 +740,48 @@ class Manager:
                 target=target,
                 manual_qty=int(quantity),
             )
+            risk_approved = bool(decision.approved)
             if not decision.approved:
                 risk_codes = list(decision.codes)
                 risk_message = (
                     "; ".join(v.get("code", "?") for v in decision.violations)
                     if decision.violations
-                    else "risk advisory"
+                    else "risk limit exceeded"
                 )
-                log.info(
-                    "manual_order.risk_advisory",
+                log.warning(
+                    "manual_order.risk_bypassed" if bypass_risk
+                    else "manual_order.risk_blocked",
                     account_id=account.id, symbol=symbol, side=side,
                     quantity=quantity, codes=risk_codes,
                 )
         except Exception as e:  # noqa: BLE001
-            # Advisory only — never block a manual order on a risk
-            # engine error; just note it.
+            # Engine fault → advisory only; never block on an engine error.
             log.warning("manual_order.risk_engine_failed", error=str(e))
             risk_message = f"risk check unavailable: {e}"
+
+        # Enforce: a rejected verdict blocks the order unless bypassed. We
+        # return before touching the backend so no order reaches the broker.
+        if not risk_approved and not bypass_risk:
+            return {
+                "ok": False,
+                "blocked": True,
+                "risk_codes": risk_codes,
+                "risk_message": risk_message,
+                "risk_warning": risk_message or None,
+                "bypassed_risk": False,
+                "broker_order_id": None,
+                "status": "REJECTED_RISK",
+                "error": (
+                    f"Blocked by risk limits: {risk_message}. Reduce the "
+                    "order size, relax the limit in Settings, or re-submit "
+                    "with risk override to place it anyway."
+                ),
+                "reason": "risk_block",
+                "entry_used": entry,
+                "stop_loss_used": stop_loss,
+                "target_used": target,
+                "entry_is_synthetic": entry_is_synthetic,
+            }
 
         backend = self._manual_backend_for(account)
         if backend is None:
@@ -773,46 +800,12 @@ class Manager:
             stop_price=stop_price,
             product_type=product_enum,
         )
-        # MARKET orders fill near-instantly on Fyers, but /orders/sync
-        # returns PENDING with the id and the fill lands milliseconds
-        # later. Poll briefly so the position shows on the dashboard and
-        # the fill price is captured immediately — without depending on
-        # the postback webhook being set up. Skipped under TESTING (the
-        # suite uses stubs and asserts PENDING) and only for MARKET.
-        if (
-            type_enum == OrderType.MARKET
-            and result.state == OrderState.PENDING
-            and result.broker_order_id
-            and hasattr(backend, "get_order_status")
-            and not self._settings_provider().is_testing
-        ):
-            for _ in range(4):
-                await asyncio.sleep(0.6)
-                try:
-                    st = await backend.get_order_status(result.broker_order_id)
-                except Exception:  # noqa: BLE001
-                    break
-                if st is None:
-                    break
-                if st.state in (
-                    OrderState.FILLED,
-                    OrderState.REJECTED,
-                    OrderState.CANCELLED,
-                ):
-                    result = OrderResult(
-                        broker_order_id=result.broker_order_id,
-                        state=st.state,
-                        symbol=result.symbol,
-                        side=result.side,
-                        quantity=result.quantity,
-                        order_type=result.order_type,
-                        filled_quantity=getattr(st, "filled_quantity", 0) or 0,
-                        average_price=getattr(st, "average_price", None),
-                        limit_price=result.limit_price,
-                        stop_price=result.stop_price,
-                        raw=result.raw,
-                    )
-                    break
+        # Fill reconciliation is webhook-only by design: the order is
+        # persisted in whatever state the broker returned (PENDING for a
+        # Fyers /orders/sync), and the Fyers postback (/api/fyers/postback)
+        # flips it to filled/rejected and updates the position. We do NOT
+        # poll get_order_status here — the operator wants order data to come
+        # exclusively from the Fyers webhook.
         # Persist + audit
         await asyncio.get_running_loop().run_in_executor(
             None,
@@ -857,12 +850,12 @@ class Manager:
         return {
             "ok": result.state in (OrderState.PENDING, OrderState.FILLED),
             "blocked": False,
-            # Risk is advisory for manual orders — surface codes as a
-            # warning the UI can show, but the order was NOT blocked.
+            # Risk codes are surfaced as a warning; the order proceeded
+            # either because it passed risk or the operator overrode it.
             "risk_codes": risk_codes,
             "risk_message": risk_message,
             "risk_warning": risk_message or None,
-            "bypassed_risk": False,
+            "bypassed_risk": bool(bypass_risk and risk_codes),
             "broker_order_id": result.broker_order_id,
             "status": result.state.value,
             "error": result.error,
@@ -1296,8 +1289,15 @@ def _persist_trade(
                 executed_at=result.submitted_at if result.state == OrderState.FILLED else None,
             )
             session.add(row)
-        # If the order filled, also update the position row.
-        if result.state == OrderState.FILLED and result.filled_quantity > 0:
+        # If the order filled, also update the position row — but ONLY for
+        # non-paper backends. The paper backend already mirrors its own
+        # positions to the DB (paper._mirror_position); updating here too
+        # DOUBLED the quantity (e.g. a BUY 17 showed as a 34-share position
+        # with a 34-share exit). Fyers/live fills still update here.
+        is_paper_fill = bool(
+            result.broker_order_id and result.broker_order_id.startswith("PAPER-")
+        )
+        if result.state == OrderState.FILLED and result.filled_quantity > 0 and not is_paper_fill:
             pos = session.query(PositionRow).filter_by(symbol=result.symbol).one_or_none()
             if pos is None:
                 pos = PositionRow(

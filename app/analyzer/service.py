@@ -251,7 +251,10 @@ class Service:
         # Step 3: call DeepSeek. Use the URL we have — empty string
         # only if the announcement had no PDF.
         pdf_url = announcement.pdf_url or ""
-        system = render_system_prompt(template, event_type=template.event_type)
+        # Inject the DETECTED event type for context — the single DEFAULT
+        # prompt handles every category, but telling the model what kind
+        # of filing it's looking at still helps.
+        system = render_system_prompt(template, event_type=detected)
         user = render_user_prompt(
             template,
             pdf_url=pdf_url,
@@ -395,15 +398,12 @@ def _default_analysis_exists(session: Session, announcement_id: int) -> bool:
 def _pick_template(
     session_factory: Callable[[], Session], detected_event_type: str
 ) -> Optional[Any]:
+    # Single-prompt mode: ONE editable prompt (the DEFAULT row) drives
+    # every filing, regardless of the detected event type. Event
+    # detection still runs to tag the announcement and give the prompt
+    # context, but there's only one prompt to maintain and edit.
     with session_factory() as session:
-        # Try the detected event_type first, then DEFAULT.
-        t = load_template(session, detected_event_type)
-        if t is not None:
-            return t
-        t = load_default_template(session)
-        if t is not None:
-            return t
-        return None
+        return load_default_template(session)
 
 
 def _store_failed_analysis(

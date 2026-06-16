@@ -361,6 +361,9 @@ def fyers_status(db: Session = Depends(get_db)) -> dict[str, Any]:
     # We deliberately require `app_id` to be set on the account row —
     # the seeded `Paper Account` (broker='fyers', app_id=None) is just
     # a placeholder for paper-mode trading, NOT a real Fyers integration.
+    # Find the Fyers account regardless of its enabled flag, so we can
+    # tell "no account / no token" apart from "account exists with a valid
+    # token but is switched OFF" — those need very different messages.
     account: Optional[BrokerAccount] = None
     if credentials_set:
         account = db.execute(
@@ -369,7 +372,6 @@ def fyers_status(db: Session = Depends(get_db)) -> dict[str, Any]:
                 BrokerAccount.broker == "fyers",
                 BrokerAccount.app_id == settings.FYERS_APP_ID,
                 BrokerAccount.app_id.is_not(None),
-                BrokerAccount.enabled == True,  # noqa: E712
             )
             .order_by(BrokerAccount.id.asc())
         ).scalars().first()
@@ -379,13 +381,13 @@ def fyers_status(db: Session = Depends(get_db)) -> dict[str, Any]:
             .where(
                 BrokerAccount.broker == "fyers",
                 BrokerAccount.app_id.is_not(None),
-                BrokerAccount.enabled == True,  # noqa: E712
             )
             .order_by(BrokerAccount.id.asc())
         ).scalars().first()
 
     account_present = account is not None
     has_token = bool(account_present and account.access_token)  # type: ignore[union-attr]
+    enabled = bool(account_present and account.enabled)  # type: ignore[union-attr]
 
     reason: Optional[str] = None
     if not credentials_set:
@@ -400,9 +402,16 @@ def fyers_status(db: Session = Depends(get_db)) -> dict[str, Any]:
             "Fyers account is configured but the access token is missing. "
             "Click 'Connect Fyers' to re-authorise (Fyers tokens expire daily)."
         )
+    elif not enabled:
+        # OAuth is fine; the account is just switched off. Don't tell the
+        # operator to re-run OAuth — that's not the problem.
+        reason = (
+            "Fyers is authorised but the account is switched OFF. Turn it "
+            "back on with the Fyers toggle on the Dashboard."
+        )
 
     return {
-        "connected": credentials_set and account_present and has_token,
+        "connected": credentials_set and account_present and has_token and enabled,
         "credentials_set": credentials_set,
         "account_present": account_present,
         "app_id": settings.FYERS_APP_ID or None,

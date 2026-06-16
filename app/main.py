@@ -125,17 +125,39 @@ async def lifespan(app: FastAPI):
     # Quote feed + trade manager share the execution manager's market
     # data bus and paper backend so entries, exits and P&L all see the
     # same prices.
-    async def _fyers_live_quote(symbol: str):
-        """Live last-price for the quote feed when TRADING_MODE=live —
-        pulled from the connected Fyers account. Returns None on any miss
-        so the feed keeps the last known price (never drops a symbol).
-        Without this the feed simulated prices even in live mode, so
-        open-position P&L was synthetic."""
-        from sqlalchemy import select
-        from app.db.models import BrokerAccount
-        from app.db.session import SessionLocal
+    async def _real_quote(symbol: str):
+        """REAL market price for the quote feed (used in BOTH paper and
+        live mode so paper-order fills are realistic, not synthetic).
 
+        Resolves a bare short-name (e.g. 'BHARTIARTL', as the news pipeline
+        emits) to a full broker symbol (NSE:BHARTIARTL-EQ) via the
+        instrument master, then fetches the live price from the connected
+        Fyers account, falling back to the public Yahoo feed. Returns None
+        on any miss so the feed keeps the last price / simulates."""
+        # Resolve bare short-name -> full Fyers symbol.
+        full = symbol
+        if ":" not in symbol:
+            try:
+                from app.services.instrument_master import get_master
+
+                hits = get_master().search(symbol, limit=8, segments=["EQ"])
+                exact = [h for h in hits if h.short_name == symbol.upper()]
+                # Prefer the NSE listing (primary / most liquid) over BSE.
+                pick = (
+                    next((h for h in exact if h.exchange == "NSE"), None)
+                    or (exact[0] if exact else None)
+                    or (hits[0] if hits else None)
+                )
+                if pick is not None:
+                    full = pick.symbol
+            except Exception:  # noqa: BLE001
+                pass
+        # 1. Fyers real-time (when a real account is connected).
         try:
+            from sqlalchemy import select
+            from app.db.models import BrokerAccount
+            from app.db.session import SessionLocal
+
             with SessionLocal() as s:
                 acc = (
                     s.execute(
@@ -152,18 +174,26 @@ async def lifespan(app: FastAPI):
                 backend = (
                     execution_manager._manual_backend_for(acc) if acc is not None else None
                 )
-            if backend is None or not hasattr(backend, "get_quote"):
-                return None
-            quotes = await backend.get_quote([symbol])
-            if quotes:
-                return float(quotes[0].last_price)
+            if backend is not None and hasattr(backend, "get_quote"):
+                quotes = await backend.get_quote([full])
+                if quotes and quotes[0].last_price > 0:
+                    return float(quotes[0].last_price)
         except Exception:  # noqa: BLE001
-            return None
+            pass
+        # 2. Public Yahoo fallback.
+        try:
+            from app.api.market import fetch_quote
+
+            q = await fetch_quote(full)
+            if q and q.get("last_price"):
+                return float(q["last_price"])
+        except Exception:  # noqa: BLE001
+            pass
         return None
 
     quote_feed = QuoteFeed(
         market_data=execution_manager.market_data,
-        live_quote_fn=_fyers_live_quote,
+        live_quote_fn=_real_quote,
     )
     trade_manager = TradeManager(
         market_data=execution_manager.market_data,

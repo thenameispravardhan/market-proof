@@ -251,7 +251,7 @@ export default function Trade() {
     });
   };
 
-  const onSubmit = async () => {
+  const onSubmit = async (opts?: { bypassRisk?: boolean }) => {
     if (!selected || !accountId) return;
     const body: PlaceOrderRequest = {
       account_id: accountId,
@@ -262,7 +262,7 @@ export default function Trade() {
       limit_price: requiresLimit && limitPrice ? Number(limitPrice) : null,
       stop_price: requiresStop && stopPrice ? Number(stopPrice) : null,
       product_type: productType,
-      bypass_risk: false,
+      bypass_risk: opts?.bypassRisk ?? false,
       operator: "ui_trade_page",
     };
     try {
@@ -568,6 +568,36 @@ export default function Trade() {
           {lastResult && lastResult.type === "error" && (
             <div className="result error" data-testid="ticket-result-error">
               {lastResult.message}
+              {lastResult.reason === "risk_block" && (
+                <div
+                  className="risk-override-hint"
+                  data-testid="ticket-risk-override"
+                  style={{
+                    marginTop: 10,
+                    padding: "8px 10px",
+                    border: "1px solid var(--amber)",
+                    borderRadius: 4,
+                    background: "rgba(255, 200, 80, 0.08)",
+                    fontSize: 12,
+                  }}
+                >
+                  <div style={{ marginBottom: 8 }}>
+                    This order breaches a limit set in <b>Settings</b>. Reduce
+                    the size or relax the limit — or override the check and
+                    place it anyway.
+                  </div>
+                  <button
+                    className="btn-sm sell"
+                    onClick={() => onSubmit({ bypassRisk: true })}
+                    disabled={placeOrder.isPending}
+                    data-testid="ticket-risk-override-btn"
+                  >
+                    {placeOrder.isPending
+                      ? "placing…"
+                      : "⚠ Override risk & place anyway"}
+                  </button>
+                </div>
+              )}
               {lastResult.reason === "ip_whitelist" && serverInfo?.public_ip && (
                 <div
                   className="ip-whitelist-hint"

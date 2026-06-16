@@ -38,6 +38,36 @@ def init_db() -> None:
     if first_time:
         log.info("init_db.start", tables=len(Base.metadata.tables))
     Base.metadata.create_all(bind=engine)
+    _ensure_columns(engine)
     if first_time:
         _logged_engines.add(engine)
         log.info("init_db.done", tables=len(Base.metadata.tables))
+
+
+# Columns added to existing tables in later model versions. `create_all`
+# only CREATEs missing tables — it never ALTERs an existing one — so we
+# add these by hand. Idempotent and SQLite-friendly.
+_ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
+    "positions": [("stop_loss", "FLOAT"), ("target", "FLOAT")],
+}
+
+
+def _ensure_columns(engine: object) -> None:
+    from sqlalchemy import inspect as _inspect, text
+
+    try:
+        insp = _inspect(engine)
+        tables = set(insp.get_table_names())
+        for table, cols in _ADDED_COLUMNS.items():
+            if table not in tables:
+                continue
+            have = {c["name"] for c in insp.get_columns(table)}
+            missing = [(n, t) for n, t in cols if n not in have]
+            if not missing:
+                continue
+            with engine.begin() as conn:  # type: ignore[attr-defined]
+                for name, sqltype in missing:
+                    conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN {name} {sqltype}'))
+            log.info("init_db.added_columns", table=table, columns=[n for n, _ in missing])
+    except Exception:  # noqa: BLE001 — never block startup on a migration hiccup
+        log.exception("init_db.ensure_columns_failed")

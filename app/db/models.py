@@ -209,6 +209,11 @@ class Position(Base):
     average_price: Mapped[float] = mapped_column(Float, nullable=False)
     last_price: Mapped[Optional[float]] = mapped_column(Float)
     unrealized_pnl: Mapped[Optional[float]] = mapped_column(Float)
+    # Managed exit levels, persisted so the trade manager can re-arm
+    # stop-loss / target after a restart (the in-memory book is empty
+    # then). Nullable — a position may have no managed exits.
+    stop_loss: Mapped[Optional[float]] = mapped_column(Float)
+    target: Mapped[Optional[float]] = mapped_column(Float)
     strategy_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("strategies.id", ondelete="SET NULL")
     )

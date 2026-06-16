@@ -165,11 +165,43 @@ class TradeManager:
             self._book[symbol] = mp
         if self._quote_feed is not None:
             self._quote_feed.watch(symbol, entry)
+        # Persist the exit levels onto the position row so the book can be
+        # rebuilt with them after a restart (it's otherwise in-memory only).
+        await asyncio.get_running_loop().run_in_executor(
+            None, _persist_position_levels,
+            self._session_factory, symbol, stop_loss, target,
+        )
         log.info(
             "trade_manager.registered",
             symbol=symbol, quantity=quantity, entry=entry,
             stop_loss=stop_loss, target=target,
         )
+
+    async def _hydrate_book(self) -> None:
+        """Rebuild the managed book from open position rows so stop-loss /
+        target re-arm after a restart (the book is in-memory)."""
+        loop = asyncio.get_running_loop()
+        symbols = await loop.run_in_executor(
+            None, _open_position_symbols, self._session_factory
+        )
+        for symbol in symbols:
+            async with self._lock:
+                if symbol in self._book:
+                    continue
+            loaded = await loop.run_in_executor(
+                None, _open_position_as_managed, self._session_factory, symbol
+            )
+            if loaded is None:
+                continue
+            mp, _ = loaded
+            async with self._lock:
+                self._book[symbol] = mp
+            if self._quote_feed is not None:
+                try:
+                    self._quote_feed.watch(symbol, mp.entry)
+                except Exception:  # noqa: BLE001
+                    pass
+        log.info("trade_manager.hydrated", managed=len(self._book))
 
     def managed_positions(self) -> list[ManagedPosition]:
         return list(self._book.values())
@@ -178,6 +210,12 @@ class TradeManager:
 
     async def _run(self) -> None:
         self._sub_queue = event_bus.subscribe(CHANNEL_TRADE_EXECUTED)
+        # Re-arm stop-loss / target for positions opened before this
+        # process started (their levels were persisted to the DB).
+        try:
+            await self._hydrate_book()
+        except Exception:  # noqa: BLE001
+            log.exception("trade_manager.hydrate_failed")
         log.info("trade_manager.start")
         self._ready_event.set()
         try:
@@ -259,16 +297,37 @@ class TradeManager:
         )
 
     async def _sweep(self) -> None:
+        loop = asyncio.get_running_loop()
+        # Track EVERY open position (not just the in-memory managed book —
+        # which is empty after a restart). For each: make sure the quote
+        # feed is fetching its price, mark-to-market the DB row (so the
+        # dashboard shows live, moving P&L), and — for the ones we manage —
+        # check SL/target exits.
+        db_symbols = await loop.run_in_executor(
+            None, _open_position_symbols, self._session_factory
+        )
         async with self._lock:
-            items = list(self._book.items())
-        for symbol, mp in items:
+            book = dict(self._book)
+        for symbol in set(db_symbols) | set(book.keys()):
+            # Idempotent: ensures the feed pulls a live price for this
+            # symbol even if it was opened before this process started.
+            try:
+                self._quote_feed.watch(symbol)
+            except Exception:  # noqa: BLE001
+                pass
             quote = await self._md.get_quote(symbol)
             if quote is None:
                 continue
             last = float(quote.last_price)
-            reason = mp.exit_reason(last)
-            if reason is not None:
-                await self._exit(symbol, reason=reason, exit_price=last)
+            # Persist the live price + unrealised P&L (no-op if unchanged).
+            await loop.run_in_executor(
+                None, _mark_to_market, self._session_factory, symbol, last
+            )
+            mp = book.get(symbol)
+            if mp is not None:
+                reason = mp.exit_reason(last)
+                if reason is not None:
+                    await self._exit(symbol, reason=reason, exit_price=last)
 
     # -- exits -----------------------------------------------------------
 
@@ -377,6 +436,45 @@ def _open_position_symbols(session_factory: Callable[[], Any]) -> list[str]:
         return [r.symbol for r in rows]
 
 
+def _persist_position_levels(
+    session_factory: Callable[[], Any],
+    symbol: str,
+    stop_loss: Optional[float],
+    target: Optional[float],
+) -> None:
+    """Save the managed exit levels onto the position row so the book can
+    be rebuilt with them after a restart."""
+    from app.db.models import Position as PositionRow
+
+    with session_factory() as session:
+        pos = session.query(PositionRow).filter_by(symbol=symbol).one_or_none()
+        if pos is None:
+            return
+        pos.stop_loss = float(stop_loss) if stop_loss is not None else None
+        pos.target = float(target) if target is not None else None
+        session.commit()
+
+
+def _mark_to_market(
+    session_factory: Callable[[], Any], symbol: str, last_price: float
+) -> None:
+    """Update a position's last_price + unrealised P&L from the live quote
+    so the dashboard shows moving P&L. Skips the write when the price hasn't
+    changed (the sweep runs far more often than prices tick), keeping DB
+    churn down."""
+    from app.db.models import Position as PositionRow
+
+    with session_factory() as session:
+        pos = session.query(PositionRow).filter_by(symbol=symbol).one_or_none()
+        if pos is None or pos.quantity == 0 or last_price <= 0:
+            return
+        if pos.last_price is not None and abs(float(pos.last_price) - float(last_price)) < 0.01:
+            return  # unchanged — skip the write
+        pos.last_price = float(last_price)
+        pos.unrealized_pnl = (float(last_price) - float(pos.average_price)) * pos.quantity
+        session.commit()
+
+
 def _open_position_as_managed(
     session_factory: Callable[[], Any], symbol: str
 ) -> Optional[tuple[ManagedPosition, float]]:
@@ -400,8 +498,8 @@ def _open_position_as_managed(
             symbol=row.symbol,
             quantity=int(row.quantity),
             entry=float(row.average_price),
-            stop_loss=None,
-            target=None,
+            stop_loss=float(row.stop_loss) if row.stop_loss is not None else None,
+            target=float(row.target) if row.target is not None else None,
             signal_id=None,
             strategy_id=row.strategy_id,
             broker_account_id=None,

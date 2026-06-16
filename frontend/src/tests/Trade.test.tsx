@@ -239,13 +239,14 @@ describe("Trade page", () => {
     expect(success.textContent).toMatch(/NSE:RELIANCE-EQ/);
   });
 
-  it("places a manual order despite a risk warning (advisory, never blocked)", async () => {
-    // Risk is advisory for manual orders: the backend still places the
-    // order and returns a risk_warning the UI shows — no block, no bypass.
+  it("surfaces a risk warning on a placed order (override / engine-fault)", async () => {
+    // When the backend places an order that still carries a risk note
+    // (an operator override, or a risk-engine fault that didn't block),
+    // the UI shows it as a warning on the success result.
     const placeResponse = {
       ok: true,
       blocked: false,
-      bypassed_risk: false,
+      bypassed_risk: true,
       risk_codes: ["RISK_MAX_SINGLE_POSITION_PCT"],
       risk_message: "RISK_MAX_SINGLE_POSITION_PCT",
       risk_warning: "RISK_MAX_SINGLE_POSITION_PCT",
@@ -267,13 +268,71 @@ describe("Trade page", () => {
     await waitFor(() => expect(submit).not.toBeDisabled());
     await user.click(submit);
 
-    // No bypass UI exists anymore.
-    expect(screen.queryByTestId("ticket-bypass")).toBeNull();
-    // The order succeeded and the advisory warning is surfaced.
+    // The order succeeded and the risk warning is surfaced.
     const ok = await screen.findByTestId("ticket-result-success");
     expect(ok.textContent).toMatch(/PENDING/);
     const advisory = await screen.findByTestId("ticket-risk-advisory");
     expect(advisory.textContent).toMatch(/RISK_MAX_SINGLE_POSITION_PCT/);
+  });
+
+  it("blocks a manual order on a risk breach, then places it on override", async () => {
+    // Settings actually take effect on the Trade page: a risk breach
+    // BLOCKS the order (REJECTED_RISK). The operator can then click the
+    // override button, which re-submits with bypass_risk=true and places.
+    const blocked = {
+      ok: false,
+      blocked: true,
+      bypassed_risk: false,
+      risk_codes: ["RISK_MAX_SINGLE_POSITION_PCT"],
+      risk_message: "RISK_MAX_SINGLE_POSITION_PCT",
+      risk_warning: "RISK_MAX_SINGLE_POSITION_PCT",
+      broker_order_id: null,
+      status: "REJECTED_RISK",
+      error: "Blocked by risk limits: RISK_MAX_SINGLE_POSITION_PCT.",
+      reason: "risk_block",
+    };
+    const placed = {
+      ok: true,
+      blocked: false,
+      bypassed_risk: true,
+      risk_codes: ["RISK_MAX_SINGLE_POSITION_PCT"],
+      risk_message: "RISK_MAX_SINGLE_POSITION_PCT",
+      risk_warning: "RISK_MAX_SINGLE_POSITION_PCT",
+      broker_order_id: "FY-OVR-1",
+      status: "PENDING",
+      error: null,
+    };
+    // Stateful place handler: the bypass re-submit places, otherwise block.
+    const base = defaultStubs();
+    globalThis.fetch = makeFetchStub((url, init) => {
+      if (url.includes("/api/orders") && init?.method === "POST") {
+        const body = init?.body ? JSON.parse(String(init.body)) : {};
+        return makeJsonResponse(body.bypass_risk ? placed : blocked);
+      }
+      return base(url, init);
+    });
+    const user = userEvent.setup();
+    const qc = makeQc();
+    render(<Trade />, { wrapper: wrapper(qc) });
+
+    const search = await screen.findByTestId("trade-search");
+    await user.type(search, "REL");
+    const row = await screen.findByTestId("search-row-NSE:RELIANCE-EQ");
+    await user.click(row);
+
+    const submit = await screen.findByTestId("ticket-submit");
+    await waitFor(() => expect(submit).not.toBeDisabled());
+    await user.click(submit);
+
+    // The order was blocked and the override affordance appears.
+    const err = await screen.findByTestId("ticket-result-error");
+    expect(err.textContent).toMatch(/Blocked by risk limits/);
+    const overrideBtn = await screen.findByTestId("ticket-risk-override-btn");
+
+    // Operator overrides → the re-submit places the order.
+    await user.click(overrideBtn);
+    const ok = await screen.findByTestId("ticket-result-success");
+    expect(ok.textContent).toMatch(/PENDING/);
   });
 
   it("shows the LIMIT price field when order type is LIMIT and refuses submit without it", async () => {

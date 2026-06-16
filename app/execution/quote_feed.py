@@ -86,13 +86,29 @@ class QuoteFeed:
     async def seed_symbol(self, symbol: str, anchor: Optional[float] = None) -> float:
         """Ensure a quote exists for `symbol` right now and return its
         price. Used by the manager before placing a paper order so the
-        MARKET fill has a price to hit."""
+        MARKET fill has a price to hit — prefers a REAL price so the fill
+        (and thus the trade-history entry) reflects the actual market."""
         symbol = symbol.upper().strip()
         existing = await self._md.get_quote(symbol)
-        if existing is not None and symbol in self._watched:
+        if (
+            existing is not None
+            and symbol in self._watched
+            and not (existing.extra and existing.extra.get("simulated"))
+        ):
             return float(existing.last_price)
+        # Prefer a real market price for the fill.
+        if self._live_quote_fn is not None:
+            try:
+                price = await self._live_quote_fn(symbol)
+            except Exception:  # noqa: BLE001
+                price = None
+            if price is not None and price > 0:
+                self._watched[symbol] = float(price)
+                await self._publish(symbol, float(price), simulated=False)
+                return float(price)
+        # Synthetic fallback (no feed / unresolvable symbol).
         price = self.watch(symbol, anchor)
-        await self._publish(symbol, price)
+        await self._publish(symbol, price, simulated=True)
         return price
 
     def watched_symbols(self) -> list[str]:
@@ -139,24 +155,24 @@ class QuoteFeed:
             log.info("quote_feed.stop")
 
     async def _tick_all(self) -> None:
-        live = False
-        try:
-            live = bool(self._is_live())
-        except Exception:  # noqa: BLE001
-            live = False
         for symbol in list(self._watched.keys()):
             try:
+                price = None
                 simulated = True
-                if live and self._live_quote_fn is not None:
+                # Always prefer a REAL price (Fyers/Yahoo via live_quote_fn)
+                # — in paper mode too, so fills/P&L use real market prices.
+                if self._live_quote_fn is not None:
                     price = await self._live_quote_fn(symbol)
-                    if price is None or price <= 0:
-                        # Keep last known price on a feed gap.
-                        price = self._watched.get(symbol)
-                    else:
+                    if price is not None and price > 0:
                         self._watched[symbol] = float(price)
-                        simulated = False  # real Fyers price
-                else:
+                        simulated = False
+                    else:
+                        # Keep last known real price on a feed gap.
+                        price = self._watched.get(symbol)
+                # No real feed / unresolvable symbol → synthetic walk.
+                if price is None or price <= 0:
                     price = self._next_paper_price(symbol)
+                    simulated = True
                 if price is not None and price > 0:
                     await self._publish(symbol, float(price), simulated=simulated)
             except Exception:  # noqa: BLE001

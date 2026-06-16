@@ -199,11 +199,18 @@ def list_positions(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
 @router.get("/api/trades")
 def list_trades(
     limit: int = Query(200, ge=1, le=1000),
+    status: str | None = Query(
+        None,
+        description="Filter by trade status (e.g. 'filled'). Useful so a "
+        "burst of rejected HOLD signals doesn't crowd real fills out of "
+        "the newest-N window.",
+    ),
     db: Session = Depends(get_db),
 ) -> list[dict[str, Any]]:
-    rows = db.execute(
-        select(Trade).order_by(Trade.created_at.desc()).limit(limit)
-    ).scalars().all()
+    stmt = select(Trade).order_by(Trade.created_at.desc())
+    if status:
+        stmt = stmt.where(Trade.status == status)
+    rows = db.execute(stmt.limit(limit)).scalars().all()
     return [_ser_trade(t) for t in rows]
 
 

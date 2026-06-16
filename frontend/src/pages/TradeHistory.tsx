@@ -63,51 +63,20 @@ function _acctMeta(
   return { isPaper, accountName };
 }
 
-// Auto-pipeline trades: the entry + exit legs of one position share a
-// `signal_id`, and the exit leg carries the realised P&L.
-function _signalRoundTrips(
-  filled: Trade[],
+// Pair entry + exit legs into round-trips via FIFO, keyed on SYMBOL alone.
+// We can't key on signal_id or account: auto-pipeline exit legs (the SELL
+// the trade manager issues) carry neither the original signal_id nor the
+// account, so symbol is the only reliable join. A BUY opens a lot; a later
+// opposite-side SELL closes it (and vice-versa for shorts). Leftover lots
+// stay OPEN.
+function buildRoundTrips(
+  trades: Trade[],
   byId: Map<number, BrokerAccount>
 ): RoundTrip[] {
+  const filled = trades.filter((t) => t.status === "filled");
   const groups = new Map<string, Trade[]>();
   for (const t of filled) {
-    const k = `sig-${t.signal_id}`;
-    (groups.get(k) ?? groups.set(k, []).get(k)!).push(t);
-  }
-  const out: RoundTrip[] = [];
-  for (const [k, legs] of groups) {
-    const exitLeg = legs.find((l) => l.pnl !== null && l.pnl !== undefined) ?? null;
-    const entryLeg = legs.find((l) => l !== exitLeg) ?? legs[0];
-    const { isPaper, accountName } = _acctMeta(entryLeg, byId);
-    out.push({
-      key: k,
-      symbol: entryLeg.symbol,
-      isPaper,
-      accountName,
-      side: entryLeg.side,
-      quantity: Math.abs(entryLeg.quantity || exitLeg?.quantity || 0),
-      entryPrice: entryLeg.price || null,
-      exitPrice: exitLeg ? exitLeg.price : null,
-      exitTime: exitLeg?.executed_at ?? exitLeg?.created_at ?? null,
-      pnl: exitLeg?.pnl ?? null,
-      open: exitLeg == null,
-    });
-  }
-  return out;
-}
-
-// Manual (Trade-page) trades have NO signal_id, so they never paired into
-// round-trips and every leg showed as OPEN forever. Pair them FIFO per
-// symbol+account: a BUY opens a lot, a later opposite SELL closes it (and
-// vice-versa for shorts). P&L is computed from the entry/exit prices.
-function _manualRoundTrips(
-  filled: Trade[],
-  byId: Map<number, BrokerAccount>
-): RoundTrip[] {
-  const groups = new Map<string, Trade[]>();
-  for (const t of filled) {
-    const k = `${t.broker_account_id ?? "x"}|${t.symbol}`;
-    (groups.get(k) ?? groups.set(k, []).get(k)!).push(t);
+    (groups.get(t.symbol) ?? groups.set(t.symbol, []).get(t.symbol)!).push(t);
   }
   const out: RoundTrip[] = [];
   for (const [, legs] of groups) {
@@ -116,6 +85,7 @@ function _manualRoundTrips(
     let seq = 0;
     for (const t of legs) {
       let qty = Math.abs(t.quantity || 0);
+      const exitQtyTotal = Math.abs(t.quantity || 0) || 1;
       while (qty > 0 && openLots.length > 0 && openLots[0].side !== t.side) {
         const lot = openLots[0];
         const matched = Math.min(qty, lot.qty);
@@ -123,8 +93,14 @@ function _manualRoundTrips(
         const entryP = lot.price;
         const exitP = t.price ?? 0;
         const { isPaper, accountName } = _acctMeta(lot.t, byId);
+        // Prefer the broker's realised P&L on the exit leg (scaled to the
+        // matched quantity); fall back to entry/exit price math.
+        const pnl =
+          t.pnl != null
+            ? (t.pnl * matched) / exitQtyTotal
+            : (long ? exitP - entryP : entryP - exitP) * matched;
         out.push({
-          key: `m-${lot.t.id}-${t.id}-${seq++}`,
+          key: `r-${lot.t.id}-${t.id}-${seq++}`,
           symbol: t.symbol,
           isPaper,
           accountName,
@@ -133,7 +109,7 @@ function _manualRoundTrips(
           entryPrice: entryP,
           exitPrice: exitP,
           exitTime: t.executed_at ?? t.created_at ?? null,
-          pnl: (long ? exitP - entryP : entryP - exitP) * matched,
+          pnl,
           open: false,
         });
         lot.qty -= matched;
@@ -142,11 +118,10 @@ function _manualRoundTrips(
       }
       if (qty > 0) openLots.push({ side: t.side, qty, price: t.price ?? 0, t });
     }
-    // Leftover open lots are still-open manual positions.
     for (const lot of openLots) {
       const { isPaper, accountName } = _acctMeta(lot.t, byId);
       out.push({
-        key: `m-open-${lot.t.id}`,
+        key: `o-${lot.t.id}`,
         symbol: lot.t.symbol,
         isPaper,
         accountName,
@@ -160,21 +135,6 @@ function _manualRoundTrips(
       });
     }
   }
-  return out;
-}
-
-function buildRoundTrips(
-  trades: Trade[],
-  byId: Map<number, BrokerAccount>
-): RoundTrip[] {
-  const filled = trades.filter((t) => t.status === "filled");
-  const signalLegs = filled.filter((t) => t.signal_id != null);
-  const manualLegs = filled.filter((t) => t.signal_id == null);
-
-  const out = [
-    ..._signalRoundTrips(signalLegs, byId),
-    ..._manualRoundTrips(manualLegs, byId),
-  ];
   // Most recently closed first; open positions sink to the bottom.
   out.sort((a, b) => {
     if (a.open !== b.open) return a.open ? 1 : -1;
@@ -237,7 +197,10 @@ function Section({ title, rows }: { title: string; rows: RoundTrip[] }) {
 }
 
 export default function TradeHistory() {
-  const { data: trades, isLoading, error } = useTrades(500);
+  // Filled-only: a burst of rejected HOLD signals must not push real fills
+  // (especially older entry legs) out of the newest-N window, or a closed
+  // round-trip would lose its entry and show as a phantom open position.
+  const { data: trades, isLoading, error } = useTrades(500, "filled");
   const { data: accounts } = useBrokerAccounts();
 
   const byId = useMemo(

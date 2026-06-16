@@ -536,6 +536,34 @@ def test_cancel_handles_duplicate_broker_order_id_rows(
         assert t.status == "cancelled", f"row {t.id} not flipped"
 
 
+def test_list_trades_status_filter(
+    client: TestClient, db_session, isolated_db, real_account
+):
+    """`/api/trades?status=filled` returns only filled rows, so a burst of
+    rejected HOLD signals can't crowd real fills out of the newest-N window
+    (which is what made Trade History lose old entry legs)."""
+    for i in range(3):
+        db_session.add(Trade(
+            broker_account_id=real_account.id, broker_order_id=f"REJ{i}",
+            symbol="NSE:SBIN-EQ", side="HOLD", quantity=0, order_type="MARKET",
+            price=0.0, status="rejected",
+        ))
+    db_session.add(Trade(
+        broker_account_id=real_account.id, broker_order_id="FILL1",
+        symbol="NSE:SBIN-EQ", side="BUY", quantity=5, order_type="MARKET",
+        price=100.0, status="filled",
+    ))
+    db_session.commit()
+
+    allrows = client.get("/api/trades?limit=1000").json()
+    assert any(t["status"] == "rejected" for t in allrows)
+
+    filled = client.get("/api/trades?limit=1000&status=filled").json()
+    assert len(filled) >= 1
+    assert all(t["status"] == "filled" for t in filled)
+    assert not any(t["status"] == "rejected" for t in filled)
+
+
 def test_list_pending_orders(
     client: TestClient, db_session, isolated_db, real_account
 ):
@@ -635,6 +663,73 @@ def test_manager_place_manual_order_stub_path(
     )
     assert result["ok"] is True
     assert result["broker_order_id"] == "X1"
+
+
+def test_manual_order_blocked_by_risk_unless_bypassed(
+    client: TestClient, db_session, isolated_db, real_account
+):
+    """A rejected risk verdict BLOCKS a manual order (so limits set in
+    Settings actually take effect on the Trade page too); the operator
+    can still override it with bypass_risk=True."""
+    from app.main import app
+    from types import SimpleNamespace
+    import asyncio
+
+    class StubB:
+        name = "stub"
+        broker_account_id = real_account.id
+        async def place_order(
+            self, *, signal, symbol, side, quantity,
+            order_type=OrderType.MARKET, limit_price=None, stop_price=None,
+            product_type=ProductType.INTRADAY,
+        ):
+            return OrderResult(
+                broker_order_id="X9", state=OrderState.PENDING,
+                symbol=symbol, side=side, quantity=quantity, order_type=order_type,
+            )
+        async def cancel_order(self, broker_order_id): return True
+        async def get_positions(self): return []
+        async def get_order_status(self, broker_order_id): return None
+
+    class RejectingRisk:
+        async def evaluate(self, **_):
+            return SimpleNamespace(
+                approved=False,
+                codes=["RISK_MAX_SINGLE_POSITION_PCT"],
+                violations=[{"code": "RISK_MAX_SINGLE_POSITION_PCT"}],
+            )
+
+    mgr = app.state.execution_manager
+    mgr.register_backend(real_account.id, StubB())
+    db_session.refresh(real_account)
+    original_risk = mgr._risk
+    mgr._risk = RejectingRisk()
+    try:
+        blocked = asyncio.get_event_loop().run_until_complete(
+            mgr.place_manual_order(
+                account=real_account, symbol="NSE:SBIN-EQ", side="BUY",
+                quantity=2, order_type="MARKET", product_type="INTRADAY",
+            )
+        )
+        assert blocked["ok"] is False
+        assert blocked["blocked"] is True
+        assert blocked["status"] == "REJECTED_RISK"
+        assert blocked["broker_order_id"] is None
+        assert "RISK_MAX_SINGLE_POSITION_PCT" in blocked["risk_codes"]
+
+        # The operator overrides → the order is placed.
+        placed = asyncio.get_event_loop().run_until_complete(
+            mgr.place_manual_order(
+                account=real_account, symbol="NSE:SBIN-EQ", side="BUY",
+                quantity=2, order_type="MARKET", product_type="INTRADAY",
+                bypass_risk=True,
+            )
+        )
+        assert placed["ok"] is True
+        assert placed["broker_order_id"] == "X9"
+        assert placed["bypassed_risk"] is True
+    finally:
+        mgr._risk = original_risk
 
 
 def test_manager_rejects_invalid_side(

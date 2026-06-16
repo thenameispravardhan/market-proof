@@ -133,10 +133,11 @@ export function useCloseAllPositions() {
   });
 }
 
-export function useTrades(limit = 200) {
+export function useTrades(limit = 200, status?: string) {
+  const qs = status ? `?limit=${limit}&status=${status}` : `?limit=${limit}`;
   return useQuery<Trade[]>({
-    queryKey: ["trades", limit],
-    queryFn: () => api.get(`/api/trades?limit=${limit}`),
+    queryKey: ["trades", limit, status ?? null],
+    queryFn: () => api.get(`/api/trades${qs}`),
     refetchInterval: 10000,
   });
 }
