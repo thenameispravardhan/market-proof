@@ -3,6 +3,7 @@
 import { GlobalSettings } from "../components/settings/GlobalSettings";
 import { TradingModeToggle } from "../components/settings/TradingModeToggle";
 import { AuditLog } from "../components/settings/AuditLog";
+import { ThemeSwitcher } from "../components/settings/ThemeSwitcher";
 
 export default function Settings() {
   return (
@@ -15,7 +16,12 @@ export default function Settings() {
             <GlobalSettings />
           </div>
         </div>
-        <AuditLog />
+        <div>
+          <ThemeSwitcher />
+          <div style={{ marginTop: 16 }}>
+            <AuditLog />
+          </div>
+        </div>
       </div>
     </div>
   );

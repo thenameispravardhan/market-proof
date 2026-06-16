@@ -7,6 +7,7 @@ import {
   useGlobalSettings,
   useMarketIndices,
 } from "./hooks/useApi";
+import { useTheme } from "./hooks/useTheme";
 
 // Persisted sidebar open/closed state. Default open. Stored in
 // localStorage so the choice survives reloads.
@@ -191,6 +192,10 @@ export default function App() {
   const [tab, navigate] = useRouter();
   const { status } = useWebSocket({ channels: ["signals", "trades", "positions"] });
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(readSidebarOpen);
+
+  // Apply theme on mount + on change. The hook writes data-theme to
+  // <html> and persists the choice in localStorage.
+  useTheme();
 
   // Persist sidebar state on change.
   useEffect(() => {

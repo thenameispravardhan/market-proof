@@ -1456,3 +1456,465 @@ kbd {
 /* POSITIONS */
 .trade-card { min-height: 0; }
 .warn { color: var(--yellow); font-size: 12px; }
+
+
+/* =========================================================================
+   27. Theme switcher UI
+   ========================================================================= */
+.theme-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 8px;
+}
+.theme-card {
+  display: grid;
+  grid-template-columns: 36px 1fr auto;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 0;
+  text-align: left;
+  cursor: pointer;
+  font-family: inherit;
+  color: var(--text);
+  transition: border-color .1s, background .1s;
+  position: relative;
+}
+.theme-card:hover {
+  background: var(--bg-surface);
+  border-color: var(--border-hi);
+}
+.theme-card.active {
+  background: var(--bg-surface);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.theme-card .theme-swatch {
+  width: 36px;
+  height: 28px;
+  border: 1px solid var(--border);
+  display: flex;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.theme-card .theme-swatch span { flex: 1; display: block; height: 100%; }
+.theme-card .theme-name {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.theme-card .theme-blurb {
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-top: 2px;
+  text-transform: none;
+  letter-spacing: 0;
+  line-height: 1.3;
+}
+.theme-card.active .theme-blurb { color: var(--text-dim); }
+.theme-card .theme-check {
+  font-size: 10px;
+  color: var(--accent);
+  font-weight: 700;
+  margin-left: 4px;
+}
+@media (max-width: 720px) {
+  .theme-grid { grid-template-columns: 1fr; }
+}
+
+
+/* =========================================================================
+   28. Theme palettes
+   ------------------------------------------------------------------------
+   Each [data-theme="..."] block overrides the :root design tokens declared
+   in section 1. Themes only change colors / surfaces — never layout,
+   spacing, typography, or component structure.
+   ========================================================================= */
+
+/* --- 1. Cyberpunk Neon --- */
+[data-theme="cyberpunk"] {
+  --bg-app:    #0A0414;
+  --bg-panel:  #150826;
+  --bg-surface:#1F0C3A;
+  --bg-row:    #200E40;
+  --bg-row-alt:#180828;
+  --bg-input:  #0E0418;
+  --bg-elev:   #2A0F50;
+
+  --border:        #3A1A60;
+  --border-hi:     #5C2A8A;
+  --border-soft:   #2A0F4A;
+  --border-accent: #FF2D8A;
+
+  --text:      #F5E8FF;
+  --text-dim:  #C9A8E8;
+  --text-faint:#7A5A9A;
+  --text-inv:  #0A0414;
+
+  --accent:    #FF2D8A;
+  --accent-dim:#B81F5E;
+  --accent-2:  #00D9FF;
+
+  --green:     #00FFA3;
+  --green-dim: #008F5A;
+  --red:       #FF2D8A;
+  --red-dim:   #B81F5E;
+  --amber:     #FFB84D;
+  --cyan:      #00D9FF;
+  --magenta:   #FF00C8;
+
+  --green-bg:  rgba(0, 255, 163, 0.10);
+  --red-bg:    rgba(255, 45, 138, 0.10);
+  --amber-bg:  rgba(255, 184, 77, 0.10);
+  --cyan-bg:   rgba(0, 217, 255, 0.10);
+}
+
+/* --- 2. Glassmorphism (tinted dark) --- */
+[data-theme="glass"] {
+  --bg-app:    #14102A;
+  --bg-panel:  #1D1738;
+  --bg-surface:#251D44;
+  --bg-row:    #2A2250;
+  --bg-row-alt:#1F1840;
+  --bg-input:  #14102A;
+  --bg-elev:   #322856;
+
+  --border:        #3A2A60;
+  --border-hi:     #5A4080;
+  --border-soft:   #2A1F50;
+  --border-accent: #C084FC;
+
+  --text:      #F0E8FF;
+  --text-dim:  #B8A8D8;
+  --text-faint:#7A6A98;
+  --text-inv:  #14102A;
+
+  --accent:    #C084FC;
+  --accent-dim:#7A4FB8;
+  --accent-2:  #67E8F9;
+
+  --green:     #6EE7B7;
+  --green-dim: #2A8A6A;
+  --red:       #FDA4AF;
+  --red-dim:   #B8506A;
+  --amber:     #FDE68A;
+  --cyan:      #67E8F9;
+  --magenta:   #F0ABFC;
+
+  --green-bg:  rgba(110, 231, 183, 0.10);
+  --red-bg:    rgba(253, 164, 175, 0.10);
+  --amber-bg:  rgba(253, 230, 138, 0.10);
+  --cyan-bg:   rgba(103, 232, 249, 0.10);
+}
+
+/* --- 3. Sci-Fi Command --- */
+[data-theme="command"] {
+  --bg-app:    #050B14;
+  --bg-panel:  #0A1628;
+  --bg-surface:#0F1D36;
+  --bg-row:    #142540;
+  --bg-row-alt:#0B172A;
+  --bg-input:  #050B14;
+  --bg-elev:   #1A2D4A;
+
+  --border:        #1A3050;
+  --border-hi:     #2A4870;
+  --border-soft:   #142540;
+  --border-accent: #00D4FF;
+
+  --text:      #E8F4FF;
+  --text-dim:  #8DB5D6;
+  --text-faint:#4A6B87;
+  --text-inv:  #050B14;
+
+  --accent:    #00D4FF;
+  --accent-dim:#0080B0;
+  --accent-2:  #FFA726;
+
+  --green:     #00E676;
+  --green-dim: #008F5A;
+  --red:       #FF5252;
+  --red-dim:   #B81F1F;
+  --amber:     #FFA726;
+  --cyan:      #00D4FF;
+  --magenta:   #FF00C8;
+
+  --green-bg:  rgba(0, 230, 118, 0.10);
+  --red-bg:    rgba(255, 82, 82, 0.10);
+  --amber-bg:  rgba(255, 167, 38, 0.10);
+  --cyan-bg:   rgba(0, 212, 255, 0.10);
+}
+
+/* --- 4. Deep Space --- */
+[data-theme="space"] {
+  --bg-app:    #06001A;
+  --bg-panel:  #100A30;
+  --bg-surface:#1A1244;
+  --bg-row:    #1F1554;
+  --bg-row-alt:#120A38;
+  --bg-input:  #06001A;
+  --bg-elev:   #2A1F68;
+
+  --border:        #2E1F70;
+  --border-hi:     #4A2F9A;
+  --border-soft:   #221560;
+  --border-accent: #B484FF;
+
+  --text:      #F0E8FF;
+  --text-dim:  #B8A8E0;
+  --text-faint:#7565A0;
+  --text-inv:  #06001A;
+
+  --accent:    #B484FF;
+  --accent-dim:#7858C0;
+  --accent-2:  #4DCCFF;
+
+  --green:     #6AFFB0;
+  --green-dim: #2A8A5A;
+  --red:       #FF6B9D;
+  --red-dim:   #B81F5A;
+  --amber:     #FFD166;
+  --cyan:      #4DCCFF;
+  --magenta:   #FF00C8;
+
+  --green-bg:  rgba(106, 255, 176, 0.10);
+  --red-bg:    rgba(255, 107, 157, 0.10);
+  --amber-bg:  rgba(255, 209, 102, 0.10);
+  --cyan-bg:   rgba(77, 204, 255, 0.10);
+}
+
+/* --- 5. Minimal Mint (light) --- */
+[data-theme="minimal"] {
+  --bg-app:    #FAFAFA;
+  --bg-panel:  #FFFFFF;
+  --bg-surface:#F5F5F5;
+  --bg-row:    #F0F0F0;
+  --bg-row-alt:#FFFFFF;
+  --bg-input:  #FFFFFF;
+  --bg-elev:   #EBEBEB;
+
+  --border:        #E0E0E0;
+  --border-hi:     #C0C0C0;
+  --border-soft:   #EBEBEB;
+  --border-accent: #00D68F;
+
+  --text:      #0A0A0A;
+  --text-dim:  #525252;
+  --text-faint:#A3A3A3;
+  --text-inv:  #FFFFFF;
+
+  --accent:    #00D68F;
+  --accent-dim:#00A06A;
+  --accent-2:  #00B377;
+
+  --green:     #00A86B;
+  --green-dim: #007A4D;
+  --red:       #DC2626;
+  --red-dim:   #991B1B;
+  --amber:     #D97706;
+  --cyan:      #0891B2;
+  --magenta:   #C026D3;
+
+  --green-bg:  rgba(0, 168, 107, 0.08);
+  --red-bg:    rgba(220, 38, 38, 0.08);
+  --amber-bg:  rgba(217, 119, 6, 0.08);
+  --cyan-bg:   rgba(8, 145, 178, 0.08);
+}
+
+/* --- 6. Bio-Organic --- */
+[data-theme="bio"] {
+  --bg-app:    #021410;
+  --bg-panel:  #052620;
+  --bg-surface:#0A3A30;
+  --bg-row:    #0E4538;
+  --bg-row-alt:#062E26;
+  --bg-input:  #021410;
+  --bg-elev:   #125544;
+
+  --border:        #1A5A48;
+  --border-hi:     #2A7A60;
+  --border-soft:   #0E4538;
+  --border-accent: #2DD4BF;
+
+  --text:      #E8FFF5;
+  --text-dim:  #8FD4BA;
+  --text-faint:#4D8A72;
+  --text-inv:  #021410;
+
+  --accent:    #2DD4BF;
+  --accent-dim:#1A8A78;
+  --accent-2:  #10B981;
+
+  --green:     #34D399;
+  --green-dim: #1A7A5A;
+  --red:       #FB7185;
+  --red-dim:   #B81F4A;
+  --amber:     #FBBF24;
+  --cyan:      #2DD4BF;
+  --magenta:   #F0ABFC;
+
+  --green-bg:  rgba(52, 211, 153, 0.10);
+  --red-bg:    rgba(251, 113, 133, 0.10);
+  --amber-bg:  rgba(251, 191, 36, 0.10);
+  --cyan-bg:   rgba(45, 212, 191, 0.10);
+}
+
+/* --- 7. Retro Synthwave --- */
+[data-theme="synthwave"] {
+  --bg-app:    #1A0033;
+  --bg-panel:  #2D0A4A;
+  --bg-surface:#3F1166;
+  --bg-row:    #4A1572;
+  --bg-row-alt:#321055;
+  --bg-input:  #1A0033;
+  --bg-elev:   #5A1A88;
+
+  --border:        #4A1A78;
+  --border-hi:     #6A2A98;
+  --border-soft:   #3A1268;
+  --border-accent: #FF00C8;
+
+  --text:      #FFF0FF;
+  --text-dim:  #FFB3E6;
+  --text-faint:#B366CC;
+  --text-inv:  #1A0033;
+
+  --accent:    #FF00C8;
+  --accent-dim:#B8008A;
+  --accent-2:  #00F0FF;
+
+  --green:     #00FFA3;
+  --green-dim: #008F5A;
+  --red:       #FF0080;
+  --red-dim:   #B81F5A;
+  --amber:     #FFD700;
+  --cyan:      #00F0FF;
+  --magenta:   #FF00C8;
+
+  --green-bg:  rgba(0, 255, 163, 0.10);
+  --red-bg:    rgba(255, 0, 128, 0.10);
+  --amber-bg:  rgba(255, 215, 0, 0.10);
+  --cyan-bg:   rgba(0, 240, 255, 0.10);
+}
+
+/* --- 8. AI Neural --- */
+[data-theme="neural"] {
+  --bg-app:    #04050D;
+  --bg-panel:  #0A0D1F;
+  --bg-surface:#111634;
+  --bg-row:    #161D40;
+  --bg-row-alt:#0C1028;
+  --bg-input:  #04050D;
+  --bg-elev:   #1A2048;
+
+  --border:        #1F2858;
+  --border-hi:     #2F3A78;
+  --border-soft:   #161D40;
+  --border-accent: #00F0FF;
+
+  --text:      #E8F4FF;
+  --text-dim:  #8DB8E0;
+  --text-faint:#4A6B8A;
+  --text-inv:  #04050D;
+
+  --accent:    #00F0FF;
+  --accent-dim:#00A0B0;
+  --accent-2:  #FF00D4;
+
+  --green:     #00FFA3;
+  --green-dim: #008F5A;
+  --red:       #FF0080;
+  --red-dim:   #B81F5A;
+  --amber:     #FFAA00;
+  --cyan:      #00F0FF;
+  --magenta:   #FF00D4;
+
+  --green-bg:  rgba(0, 255, 163, 0.10);
+  --red-bg:    rgba(255, 0, 128, 0.10);
+  --amber-bg:  rgba(255, 170, 0, 0.10);
+  --cyan-bg:   rgba(0, 240, 255, 0.10);
+}
+
+/* --- 9. Arctic Frost (light) --- */
+[data-theme="arctic"] {
+  --bg-app:    #E6F4FF;
+  --bg-panel:  #FFFFFF;
+  --bg-surface:#F0F8FF;
+  --bg-row:    #E6F4FF;
+  --bg-row-alt:#FFFFFF;
+  --bg-input:  #FFFFFF;
+  --bg-elev:   #D4ECFF;
+
+  --border:        #B8DDF5;
+  --border-hi:     #88C5EA;
+  --border-soft:   #D4ECFF;
+  --border-accent: #0EA5E9;
+
+  --text:      #0C2533;
+  --text-dim:  #2A5468;
+  --text-faint:#6B8A9A;
+  --text-inv:  #FFFFFF;
+
+  --accent:    #0EA5E9;
+  --accent-dim:#0A6FA0;
+  --accent-2:  #38BDF8;
+
+  --green:     #059669;
+  --green-dim: #047857;
+  --red:       #DC2626;
+  --red-dim:   #991B1B;
+  --amber:     #D97706;
+  --cyan:      #0EA5E9;
+  --magenta:   #C026D3;
+
+  --green-bg:  rgba(5, 150, 105, 0.08);
+  --red-bg:    rgba(220, 38, 38, 0.08);
+  --amber-bg:  rgba(217, 119, 6, 0.08);
+  --cyan-bg:   rgba(14, 165, 233, 0.08);
+}
+
+/* --- 10. Sunset Cyber --- */
+[data-theme="sunset"] {
+  --bg-app:    #1A0A05;
+  --bg-panel:  #2A1408;
+  --bg-surface:#3D1F0E;
+  --bg-row:    #4A2714;
+  --bg-row-alt:#321808;
+  --bg-input:  #1A0A05;
+  --bg-elev:   #55301A;
+
+  --border:        #5A2A14;
+  --border-hi:     #7A3A1C;
+  --border-soft:   #3D1F0E;
+  --border-accent: #FF8C32;
+
+  --text:      #FFF4E8;
+  --text-dim:  #FFB380;
+  --text-faint:#B87A4A;
+  --text-inv:  #1A0A05;
+
+  --accent:    #FF8C32;
+  --accent-dim:#C0581A;
+  --accent-2:  #2DD4BF;
+
+  --green:     #2DD4BF;
+  --green-dim: #1A8A78;
+  --red:       #FF3860;
+  --red-dim:   #B81F4A;
+  --amber:     #FFAA00;
+  --cyan:      #2DD4BF;
+  --magenta:   #FF00C8;
+
+  --green-bg:  rgba(45, 212, 191, 0.10);
+  --red-bg:    rgba(255, 56, 96, 0.10);
+  --amber-bg:  rgba(255, 170, 0, 0.10);
+  --cyan-bg:   rgba(45, 212, 191, 0.10);
+}
+
+/* Smooth color transitions when theme changes (data attribute is
+   toggled, so the change is instant — these transitions soften it). */
+html { transition: background-color .2s ease, color .2s ease; }
+body { transition: background-color .2s ease, color .2s ease; }
