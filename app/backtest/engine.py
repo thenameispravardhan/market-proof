@@ -24,6 +24,21 @@ For each announcement in [start_date, end_date] we:
 Every step is recorded in `BacktestResult.decisions` (a list of
 dicts) and the final `metrics` come from `metrics.summarise`.
 
+Isolation: a backtest must never leak into the live trading view.
+The analyzer / rules / risk / paper code all read and write the
+shared `analyses`, `signals`, `trades`, and `positions` tables —
+so running them against the live DB would pollute the Dashboard,
+Trade History, and Positions panels (and, worse, leave fake
+`PAPER-` positions that the live risk engine counts against its
+concurrency / sector limits). To prevent that, each run builds a
+throwaway in-memory SQLite **sandbox** seeded with copies of the
+strategy, its rules, and the broker account. Every simulated
+analysis / signal / trade / position is written there and thrown
+away when the run ends. The live DB is touched only to (a) read
+the source announcements + config and (b) write the final
+`backtest_runs.results` blob. That blob is what the Backtest page
+renders — backtest results live on that page only.
+
 Concurrency: the engine is single-threaded (one announcement at
 a time, in chronological order). For 1 year of NSE/BSE filings
 at ~50-100 filings/day, that's ~30k announcements — linear in N,
@@ -49,8 +64,10 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, Optional, Protocol
 
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import create_engine, select
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from app.analyzer.rules_engine import (
     RuleMatch,
@@ -80,6 +97,7 @@ from app.db.models import (
     BrokerAccount,
     Position as PositionRow,
     Signal,
+    SignalRule,
     Strategy,
     Trade as TradeRow,
 )
@@ -285,13 +303,21 @@ class BacktestEngine:
         self._config = config
         from app.db.session import SessionLocal
 
+        # The LIVE session factory. Used read-only (load source data)
+        # and to write the final `backtest_runs.results` blob — never
+        # for simulated trades/positions/signals/analyses.
         self._session_factory: Callable[[], Session] = session_factory or SessionLocal
         self._md = MarketDataBus()
-        self._paper = PaperBackend(market_data=self._md, pending_timeout_s=5.0)
-        self._risk = RiskEngine(
-            market_data=self._md,
-            portfolio_value=config.initial_capital,
-        )
+        # The sandbox (in-memory SQLite) factory + engine. Built in
+        # `_run_sync` once the run's strategy/rules/account are known;
+        # every simulated row is written here and discarded at the end.
+        self._sim_engine: Optional[Engine] = None
+        self._sim_factory: Optional[Callable[[], Session]] = None
+        # PaperBackend + RiskEngine are constructed in `_run_sync` and
+        # bound to the sandbox factory (so their DB reads/writes stay
+        # isolated from the live tables).
+        self._paper: Optional[PaperBackend] = None
+        self._risk: Optional[RiskEngine] = None
         # Pre-pick the strategy + account for routing. Falls back
         # to the default strategy / first enabled paper account.
         self._strategy_id: int = 0
@@ -325,42 +351,82 @@ class BacktestEngine:
         if cfg.initial_capital <= 0:
             raise ValueError("initial_capital must be > 0")
 
-        # Step 1: load context (strategy + account) + range of
-        # announcements.
+        # Step 1: load context + announcements from the LIVE DB. This
+        # is the ONLY time the run reads the live tables, and the only
+        # write is lazily creating the shared 'default' strategy when
+        # the caller didn't pick one (a config row, not a backtest
+        # artefact). Strategy / rules / account are captured as plain
+        # snapshots so we can reseed them into the sandbox; the
+        # announcements stay as detached ORM rows (expire_on_commit is
+        # False, so their loaded attributes survive the session close).
         with self._session_factory() as session:
-            strategy_id = cfg.strategy_id
-            if strategy_id is None:
-                s = get_or_create_default_strategy(session)
-                strategy_id = int(s.id)
-            account_id = cfg.broker_account_id
-            if account_id is None:
+            if cfg.strategy_id is None:
+                strat = get_or_create_default_strategy(session)
+                session.commit()
+                strategy_id = int(strat.id)
+            else:
+                strategy_id = int(cfg.strategy_id)
+                strat = session.get(Strategy, strategy_id)
+                if strat is None:
+                    raise ValueError(f"strategy {strategy_id} not found")
+            strategy_data = {
+                "id": int(strat.id),
+                "name": strat.name,
+                "description": strat.description,
+                "enabled": bool(strat.enabled),
+                "config": dict(strat.config) if isinstance(strat.config, dict) else {},
+            }
+            rules_data = [
+                {
+                    "id": int(r.id),
+                    "strategy_id": int(r.strategy_id),
+                    "name": r.name,
+                    "priority": int(r.priority),
+                    "conditions": r.conditions,
+                    "action": r.action,
+                    "action_params": r.action_params,
+                    "enabled": bool(r.enabled),
+                }
+                for r in load_rules_for_strategy(session, strategy_id)
+            ]
+            if cfg.broker_account_id is not None:
+                acc = session.get(BrokerAccount, int(cfg.broker_account_id))
+                if acc is None:
+                    raise ValueError(
+                        f"broker_account {cfg.broker_account_id} not found"
+                    )
+            else:
                 acc = (
                     session.query(BrokerAccount)
-                    .filter(BrokerAccount.enabled.is_(True), BrokerAccount.paper_mode.is_(True))
+                    .filter(
+                        BrokerAccount.enabled.is_(True),
+                        BrokerAccount.paper_mode.is_(True),
+                    )
                     .order_by(BrokerAccount.id.asc())
                     .first()
                 )
-                if acc is None:
-                    # Create a synthetic paper account so the
-                    # backtest can still complete and report a
-                    # useful error. Tests do this on a clean DB.
-                    acc = BrokerAccount(
-                        name=f"backtest-paper-{uuid.uuid4().hex[:8]}",
-                        broker="paper",
-                        paper_mode=True,
-                        enabled=True,
-                    )
-                    session.add(acc)
-                    session.flush()
-                account_id = int(acc.id)
-            self._strategy_id = int(strategy_id)
-            self._broker_account_id = int(account_id)
-            strategy = session.get(Strategy, strategy_id)
-            account = session.get(BrokerAccount, account_id)
-            # Commit so the strategy + account rows survive the
-            # session close (we use them by id in subsequent
-            # sessions during the replay loop).
-            session.commit()
+            if acc is not None:
+                account_data = {
+                    "id": int(acc.id),
+                    "name": acc.name,
+                    "broker": acc.broker,
+                    "paper_mode": bool(acc.paper_mode),
+                    "enabled": bool(acc.enabled),
+                }
+            else:
+                # No paper account configured — synthesise one for the
+                # sandbox ONLY (never written to the live DB, so a
+                # backtest on a clean install doesn't create junk
+                # broker accounts).
+                account_data = {
+                    "id": 1_000_000,
+                    "name": f"backtest-paper-{uuid.uuid4().hex[:8]}",
+                    "broker": "paper",
+                    "paper_mode": True,
+                    "enabled": True,
+                }
+            self._strategy_id = strategy_id
+            self._broker_account_id = int(account_data["id"])
             announcements: list[Announcement] = list(
                 session.execute(
                     select(Announcement)
@@ -381,82 +447,112 @@ class BacktestEngine:
                 "backtest.loaded",
                 announcements=len(announcements),
                 strategy_id=strategy_id,
-                account_id=account_id,
+                account_id=self._broker_account_id,
                 start_date=cfg.start_date.isoformat(),
                 end_date=cfg.end_date.isoformat(),
             )
 
-        # Step 2: replay loop. For each announcement (in chronological
-        # order), synthesise a price, build a deterministic analysis,
-        # run rules, run risk, place the paper order, mark-to-market.
-        result = BacktestResult(
-            run_id=cfg.run_id,
-            config=cfg,
-            equity_curve=[
-                {
-                    "date": cfg.start_date.isoformat(),
-                    "equity": float(cfg.initial_capital),
-                }
-            ],
-            finished_at=datetime.now(timezone.utc),
+        # Step 2: build the isolated sandbox DB and wire the paper +
+        # risk engines (and every replay-phase DB read/write) to it.
+        # Nothing past this point touches the live tables until we
+        # persist the results blob.
+        self._sim_engine, self._sim_factory = _build_sim_session_factory(
+            strategy_data=strategy_data,
+            rules_data=rules_data,
+            account_data=account_data,
         )
-        result.signals_generated = 0
-        result.blocked_trades = 0
-        result.announcements_processed = 0
+        self._paper = PaperBackend(
+            market_data=self._md,
+            session_factory=self._sim_factory,
+            pending_timeout_s=5.0,
+        )
+        self._risk = RiskEngine(
+            market_data=self._md,
+            portfolio_value=cfg.initial_capital,
+            session_factory=self._sim_factory,
+        )
+        with self._sim_factory() as sim:
+            strategy = sim.get(Strategy, strategy_id)
+            account = sim.get(BrokerAccount, int(account_data["id"]))
 
-        for ann in announcements:
-            try:
-                self._replay_one(ann, strategy, account, result)
-            except Exception as e:  # noqa: BLE001
-                # We never want a single bad announcement to abort
-                # the whole run. Log and continue.
-                log.exception(
-                    "backtest.replay_failed",
-                    announcement_id=ann.id,
-                    symbol=ann.symbol,
-                )
-                result.decisions.append(
+        try:
+            # Step 3: replay loop. For each announcement (in chronological
+            # order), synthesise a price, build a deterministic analysis,
+            # run rules, run risk, place the paper order, mark-to-market.
+            result = BacktestResult(
+                run_id=cfg.run_id,
+                config=cfg,
+                equity_curve=[
                     {
-                        "announcement_id": ann.id,
-                        "symbol": ann.symbol,
-                        "filed_at": ann.filed_at.isoformat() if ann.filed_at else None,
-                        "error": str(e),
-                        "outcome": "error",
+                        "date": cfg.start_date.isoformat(),
+                        "equity": float(cfg.initial_capital),
                     }
-                )
-            result.announcements_processed += 1
-            # Mark-to-market at end of each day boundary (cheap
-            # because the paper backend caches the last quote).
-            self._snapshot_equity(result, ann.filed_at)
+                ],
+                finished_at=datetime.now(timezone.utc),
+            )
+            result.signals_generated = 0
+            result.blocked_trades = 0
+            result.announcements_processed = 0
 
-        # Step 3: final equity point at end_date, then compute metrics.
-        result.equity_curve.append(
-            {
-                "date": cfg.end_date.isoformat(),
-                "equity": self._compute_equity(cfg.initial_capital),
-            }
-        )
-        eq_values = [float(p["equity"]) for p in result.equity_curve]
-        result.metrics = _build_metrics(
-            initial_capital=cfg.initial_capital,
-            equity=eq_values,
-            trades=result.trades,
-            signals_generated=result.signals_generated,
-            blocked_trades=result.blocked_trades,
-        )
+            for ann in announcements:
+                try:
+                    self._replay_one(ann, strategy, account, result)
+                except Exception as e:  # noqa: BLE001
+                    # We never want a single bad announcement to abort
+                    # the whole run. Log and continue.
+                    log.exception(
+                        "backtest.replay_failed",
+                        announcement_id=ann.id,
+                        symbol=ann.symbol,
+                    )
+                    result.decisions.append(
+                        {
+                            "announcement_id": ann.id,
+                            "symbol": ann.symbol,
+                            "filed_at": ann.filed_at.isoformat() if ann.filed_at else None,
+                            "error": str(e),
+                            "outcome": "error",
+                        }
+                    )
+                result.announcements_processed += 1
+                # Mark-to-market at end of each day boundary (cheap
+                # because the paper backend caches the last quote).
+                self._snapshot_equity(result, ann.filed_at)
 
-        # Step 4: persist into backtest_runs.results if we have a run id.
-        if cfg.run_id is not None:
-            self._persist_result(result, status="done")
+            # Step 4: final equity point at end_date, then compute metrics.
+            result.equity_curve.append(
+                {
+                    "date": cfg.end_date.isoformat(),
+                    "equity": self._compute_equity(cfg.initial_capital),
+                }
+            )
+            eq_values = [float(p["equity"]) for p in result.equity_curve]
+            result.metrics = _build_metrics(
+                initial_capital=cfg.initial_capital,
+                equity=eq_values,
+                trades=result.trades,
+                signals_generated=result.signals_generated,
+                blocked_trades=result.blocked_trades,
+            )
 
-        log.info(
-            "backtest.done",
-            announcements=result.announcements_processed,
-            signals=result.signals_generated,
-            trades=len(result.trades),
-            final_equity=eq_values[-1] if eq_values else cfg.initial_capital,
-        )
-        return result
+            # Step 5: persist into backtest_runs.results (live DB) if we
+            # have a run id. This is the ONLY backtest output that
+            # reaches the live DB — the Backtest page reads it back.
+            if cfg.run_id is not None:
+                self._persist_result(result, status="done")
+
+            log.info(
+                "backtest.done",
+                announcements=result.announcements_processed,
+                signals=result.signals_generated,
+                trades=len(result.trades),
+                final_equity=eq_values[-1] if eq_values else cfg.initial_capital,
+            )
+            return result
+        finally:
+            # Discard the sandbox DB — its analyses / signals / trades /
+            # positions exist only for the duration of this run.
+            self._dispose_sim()
 
     # -- per-announcement replay --------------------------------------
 
@@ -490,11 +586,11 @@ class BacktestEngine:
         # — the backtest's "what-if" is for the rules + risk + paper
         # path, not the LLM.)
         analysis_dict = _synthesise_analysis(ann, price)
-        # Persist a minimal analyses row so the rules engine +
-        # any downstream UI can read it. (Tests can inspect via
-        # the trade rows; we don't read analyses back in the
-        # engine itself.)
-        with self._session_factory() as session:
+        # Write a minimal analyses row into the SANDBOX so the rules
+        # engine has something to evaluate. It is discarded with the
+        # sandbox at the end of the run — it never reaches the live
+        # `analyses` table the dashboard reads.
+        with self._sim_factory() as session:
             a = Analysis(
                 announcement_id=ann.id,
                 model="backtest-stub",
@@ -549,7 +645,7 @@ class BacktestEngine:
         # and move on. The T3 service also treats HOLD as "not approved".
         if match.action not in {"BUY", "SELL"}:
             result.blocked_trades += 1
-            with self._session_factory() as session:
+            with self._sim_factory() as session:
                 s = session.get(Signal, signal_id)
                 if s is not None:
                     s.status = "blocked"
@@ -591,7 +687,7 @@ class BacktestEngine:
         )
         if not decision.approved:
             result.blocked_trades += 1
-            with self._session_factory() as session:
+            with self._sim_factory() as session:
                 s = session.get(Signal, signal_id)
                 if s is not None:
                     s.status = "blocked"
@@ -634,9 +730,9 @@ class BacktestEngine:
                 order_type=OrderType.MARKET,
             )
         )
-        # Persist a Trade row (paper backend already wrote one —
-        # read it back so we record the realised PnL).
-        with self._session_factory() as session:
+        # Read the Trade row the paper backend just wrote to the
+        # sandbox so we can record the realised PnL in the result blob.
+        with self._sim_factory() as session:
             t = (
                 session.query(TradeRow)
                 .filter_by(broker_order_id=order.broker_order_id)
@@ -701,18 +797,19 @@ class BacktestEngine:
 
         v1 has no separate cash tracking; we treat
         `initial_capital + sum(realised PnL)` as cash and add
-        mark-to-market on top. PnL is read from the `trades`
-        table for the backtest's account.
+        mark-to-market on top. Both the realised PnL and the open
+        positions are read from the sandbox, which holds only this
+        run's simulated trades — so the figure can't be contaminated
+        by (or contaminate) the live book.
         """
         cash = float(initial_capital)
-        with self._session_factory() as session:
-            # Sum realised PnL for this account.
+        with self._sim_factory() as session:
+            # Sum realised PnL across the sandbox's trades.
             from sqlalchemy import func
 
             realised = float(
                 session.execute(
                     select(func.coalesce(func.sum(TradeRow.pnl), 0.0)).where(
-                        TradeRow.broker_account_id == self._broker_account_id,
                         TradeRow.pnl.is_not(None),
                     )
                 ).scalar_one()
@@ -751,6 +848,9 @@ class BacktestEngine:
             loop.close()
 
     def _persist_result(self, result: BacktestResult, *, status: str) -> None:
+        # Writes the LIVE DB (`self._session_factory`), not the sandbox:
+        # the `backtest_runs` row lives in the real database and this
+        # blob is what the Backtest page renders.
         with self._session_factory() as session:
             run = session.get(BacktestRun, result.run_id)
             if run is None:
@@ -769,6 +869,18 @@ class BacktestEngine:
             session.add(run)
             session.commit()
 
+    def _dispose_sim(self) -> None:
+        """Tear down the per-run sandbox DB (drops the in-memory data)."""
+        eng, self._sim_engine = self._sim_engine, None
+        self._sim_factory = None
+        self._paper = None
+        self._risk = None
+        if eng is not None:
+            try:
+                eng.dispose()
+            except Exception:  # noqa: BLE001
+                log.exception("backtest.sim_dispose_failed")
+
 
 # -------------------------------------------------------------------------
 # Helpers — outside the class so they're easy to test in isolation.
@@ -786,6 +898,81 @@ class _SignalProxy:
     action: str
     confidence: Optional[float]
     strategy_id: Optional[int] = None
+
+
+def _build_sim_session_factory(
+    *,
+    strategy_data: dict[str, Any],
+    rules_data: list[dict[str, Any]],
+    account_data: dict[str, Any],
+) -> tuple[Engine, Callable[[], Session]]:
+    """Create an isolated in-memory SQLite **sandbox** for one run.
+
+    Every simulated analysis / signal / trade / position the engine
+    produces is written here — never the live DB. The sandbox is
+    seeded with copies of the strategy, its rules, and the broker
+    account (same ids as the live rows) so the rules + risk engines
+    see exactly the configuration the live system would, but in a
+    throwaway database. This is what keeps backtest results confined
+    to the Backtest page.
+
+    Foreign keys are intentionally left OFF (we don't run the SQLite
+    `PRAGMA foreign_keys=ON` here): the sandbox holds copies of the
+    config rows but NOT the announcements, so a synthesised `analyses`
+    row references an announcement id that exists only in the live DB.
+    With FK enforcement off, those orphan-parent rows are fine.
+    """
+    from app.db.session import Base
+    import app.db.models  # noqa: F401 — ensure every table is registered
+
+    eng = create_engine(
+        "sqlite://",  # in-memory
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+        future=True,
+    )
+    Base.metadata.create_all(eng)
+    factory = sessionmaker(
+        bind=eng,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+        class_=Session,
+    )
+    with factory() as s:
+        s.add(
+            Strategy(
+                id=strategy_data["id"],
+                name=strategy_data["name"],
+                description=strategy_data.get("description"),
+                enabled=bool(strategy_data.get("enabled", True)),
+                config=strategy_data.get("config") or {},
+            )
+        )
+        for r in rules_data:
+            s.add(
+                SignalRule(
+                    id=r["id"],
+                    strategy_id=r["strategy_id"],
+                    name=r["name"],
+                    priority=r["priority"],
+                    conditions=r["conditions"],
+                    action=r["action"],
+                    action_params=r.get("action_params"),
+                    enabled=bool(r.get("enabled", True)),
+                )
+            )
+        s.add(
+            BrokerAccount(
+                id=account_data["id"],
+                name=account_data["name"],
+                broker=account_data.get("broker", "paper"),
+                paper_mode=bool(account_data.get("paper_mode", True)),
+                enabled=bool(account_data.get("enabled", True)),
+            )
+        )
+        s.commit()
+    return eng, factory
 
 
 def _synthesise_analysis(ann: Announcement, price: float) -> dict[str, Any]:

@@ -266,6 +266,57 @@ def test_get_trades_and_equity_curve(client: TestClient):
     assert len(body["curve"]) >= 2
 
 
+def test_backtest_run_does_not_pollute_live_endpoints(client: TestClient):
+    """A finished backtest must not add anything to the endpoints the
+    Dashboard / Trade History / Positions panels read. We compare the
+    row counts before and after the run (a delta of 0), so the check
+    is robust to whatever the rest of the session left in the DB."""
+    _seed_minimum(client)
+
+    def _count(path: str) -> int:
+        r = client.get(path)
+        assert r.status_code == 200, r.text
+        return len(r.json())
+
+    before = {
+        "trades": _count("/api/trades?limit=1000"),
+        "positions": _count("/api/positions"),
+        "signals": _count("/api/signals/recent?limit=200"),
+        "analyses": _count("/api/analyses/recent?limit=100"),
+    }
+
+    end = date.today()
+    start = end - timedelta(days=3)
+    r = client.post(
+        "/api/backtest/runs",
+        json={
+            "name": "isolation-api",
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+            "initial_capital": 100_000.0,
+        },
+    )
+    assert r.status_code == 201, r.text
+    run_id = r.json()["id"]
+    final = _wait_for_run_done(client, run_id)
+    assert final["status"] == "done", final
+    # The run genuinely exercised the pipeline inside its sandbox...
+    assert (final.get("signals_generated") or 0) > 0, final
+
+    after = {
+        "trades": _count("/api/trades?limit=1000"),
+        "positions": _count("/api/positions"),
+        "signals": _count("/api/signals/recent?limit=200"),
+        "analyses": _count("/api/analyses/recent?limit=100"),
+    }
+    assert after == before, (
+        f"backtest leaked into live tables: before={before} after={after}"
+    )
+    # ...and the results are reachable under the backtest run itself.
+    trades = client.get(f"/api/backtest/runs/{run_id}/trades").json()
+    assert "trades" in trades
+
+
 def test_get_run_404(client: TestClient):
     r = client.get("/api/backtest/runs/999999")
     assert r.status_code == 404

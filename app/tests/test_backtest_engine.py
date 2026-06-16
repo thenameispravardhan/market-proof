@@ -243,6 +243,45 @@ async def test_engine_idempotent_on_replay(seeded_db, db_session):
 
 
 @pytest.mark.asyncio
+async def test_engine_does_not_write_live_tables(seeded_db, db_session):
+    """Isolation: a backtest must not leak into the live trading view.
+
+    The engine runs the whole pipeline (analyzer → rules → risk →
+    paper) inside a throwaway in-memory sandbox; the only output that
+    reaches the real DB is the `backtest_runs.results` blob. So after
+    a run the shared analyses / signals / trades / positions tables —
+    the ones the Dashboard, Trade History and Positions panels read —
+    must be exactly as empty as before. This is the "results save on
+    the Backtest page only" guarantee.
+    """
+    from app.db.models import (
+        Analysis,
+        Position as PositionRow,
+        Signal,
+        Trade as TradeRow,
+    )
+
+    cfg = BacktestConfig(
+        name="t7-isolation",
+        start_date=date.today() - timedelta(days=30),
+        end_date=date.today(),
+        initial_capital=100_000.0,
+    )
+    result = await BacktestEngine(cfg, session_factory=_session_factory).run()
+    # The run genuinely exercised the pipeline (otherwise the leak
+    # assertions below would be vacuously true).
+    assert result.signals_generated > 0
+    assert (len(result.trades) + result.blocked_trades) >= 1
+
+    # ...yet nothing it simulated touched the live tables.
+    with db_session_mod.SessionLocal() as s:
+        assert s.query(Analysis).count() == 0
+        assert s.query(Signal).count() == 0
+        assert s.query(TradeRow).count() == 0
+        assert s.query(PositionRow).count() == 0
+
+
+@pytest.mark.asyncio
 async def test_engine_empty_window(db_session, isolated_db):
     """Backtest over a window with no announcements."""
     cfg = BacktestConfig(

@@ -123,7 +123,7 @@ class BacktestDetail(BacktestSummary):
 # -------------------------------------------------------------------------
 
 
-@router.get("/runs", response_model=list[BacktestSummary])
+@router.get("/runs", response_model=list[BacktestDetail])
 def list_runs(
     limit: int = Query(50, ge=1, le=200),
     strategy_id: Optional[int] = Query(None, description="filter by strategy_id"),
@@ -133,7 +133,12 @@ def list_runs(
         description="filter by status (pending|running|done|failed)",
     ),
     db: Session = Depends(get_db),
-) -> list[BacktestSummary]:
+) -> list[BacktestDetail]:
+    # Returns the detail shape (incl. `metrics` + the summary counts)
+    # so the run list can show each finished run's headline numbers
+    # without a per-row fetch. The heavy arrays (trades, decisions,
+    # equity_curve) are NOT included here — `BacktestDetail` only
+    # surfaces `metrics` and the counts from `results`.
     stmt = select(BacktestRun).order_by(BacktestRun.created_at.desc())
     if strategy_id is not None:
         stmt = stmt.where(BacktestRun.strategy_id == int(strategy_id))
@@ -141,7 +146,7 @@ def list_runs(
         stmt = stmt.where(BacktestRun.status == status_filter)
     stmt = stmt.limit(int(limit))
     rows = db.execute(stmt).scalars().all()
-    return [BacktestSummary.from_row(r) for r in rows]
+    return [BacktestDetail.from_row(r) for r in rows]
 
 
 @router.post(
