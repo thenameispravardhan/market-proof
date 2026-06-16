@@ -17,10 +17,10 @@ data/
 *.sqlite
 *.sqlite3
 
-# Local env
+# Local env (ignore every .env variant except the committed template)
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
 # Editor / OS
 .vscode/

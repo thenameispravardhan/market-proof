@@ -6,6 +6,16 @@
 import { useEffect, useState } from "react";
 import { useUpdatePrompt, usePrompts } from "../../hooks/useApi";
 
+// DeepSeek models the operator can pick per template. The backend
+// (PromptUpdate._model_check) accepts any non-empty string, so a
+// model stored outside this list still renders — see `modelOptions`
+// below, which folds the current value in if it isn't one of these.
+const DEEPSEEK_MODELS: { value: string; label: string }[] = [
+  { value: "deepseek-chat", label: "deepseek-chat — fast, general (default)" },
+  { value: "deepseek-reasoner", label: "deepseek-reasoner — deeper, slower" },
+  { value: "deepseek-coder", label: "deepseek-coder — code-focused" },
+];
+
 export function PromptEditor({
   eventType,
   onSaved,
@@ -22,6 +32,7 @@ export function PromptEditor({
 
   const [systemPrompt, setSystemPrompt] = useState("");
   const [userTemplate, setUserTemplate] = useState("");
+  const [model, setModel] = useState("deepseek-chat");
   const [temperature, setTemperature] = useState(0.2);
   const [maxTokens, setMaxTokens] = useState(2000);
   const [changeNote, setChangeNote] = useState("");
@@ -31,12 +42,14 @@ export function PromptEditor({
     if (current) {
       setSystemPrompt(current.system_prompt);
       setUserTemplate(current.user_template);
+      setModel(current.model);
       setTemperature(current.temperature);
       setMaxTokens(current.max_tokens);
       setChangeNote("");
     } else {
       setSystemPrompt("");
       setUserTemplate("");
+      setModel("deepseek-chat");
       setTemperature(0.2);
       setMaxTokens(2000);
       setChangeNote("");
@@ -63,15 +76,23 @@ export function PromptEditor({
   const dirty =
     systemPrompt !== current.system_prompt ||
     userTemplate !== current.user_template ||
+    model !== current.model ||
     temperature !== current.temperature ||
     maxTokens !== current.max_tokens;
+
+  // The known models plus the current value if it isn't one of them,
+  // so a model set outside this list (the backend allows any string)
+  // still shows in the dropdown rather than silently resetting.
+  const modelOptions = DEEPSEEK_MODELS.some((m) => m.value === model)
+    ? DEEPSEEK_MODELS
+    : [{ value: model, label: `${model} (custom)` }, ...DEEPSEEK_MODELS];
 
   const handleSave = async () => {
     try {
       await update.mutateAsync({
         system_prompt: systemPrompt,
         user_template: userTemplate,
-        model: current.model,
+        model,
         temperature,
         max_tokens: maxTokens,
         change_note: changeNote || undefined,
@@ -107,6 +128,22 @@ export function PromptEditor({
         />
         <div className="meta" style={{ color: "var(--text-dim)", fontSize: 11, marginTop: 4 }}>
           Use <code className="mono">{"{{pdf_url}}"}</code> where the filing URL should be inserted.
+        </div>
+      </div>
+      <div className="field">
+        <label htmlFor="model">Model</label>
+        <select
+          id="model"
+          value={model}
+          onChange={(e) => setModel(e.target.value)}
+          data-testid="prompt-model"
+        >
+          {modelOptions.map((m) => (
+            <option key={m.value} value={m.value}>{m.label}</option>
+          ))}
+        </select>
+        <div className="meta" style={{ color: "var(--text-dim)", fontSize: 11, marginTop: 4 }}>
+          The model used for this template's DeepSeek call. Saving bumps the version.
         </div>
       </div>
       <div className="field-row">

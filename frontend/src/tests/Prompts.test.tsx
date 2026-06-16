@@ -33,15 +33,20 @@ describe("Prompts", () => {
     vi.restoreAllMocks();
   });
 
-  it("renders the prompts list and selects a row to load it into the editor", async () => {
+  it("loads the DEFAULT template into the editor with a model selector", async () => {
+    // Single-prompt mode: the page renders the DEFAULT template editor
+    // directly (no list to click).
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = typeof input === "string" ? input : input.toString();
-      if (url.includes("/api/prompts") && !url.includes("/history") && !url.includes("/preview")) {
+      if (url.includes("/history")) {
+        return makeJsonResponse({ event_type: "DEFAULT", history: [] });
+      }
+      if (url.includes("/api/prompts") && !url.includes("/preview")) {
         return makeJsonResponse({
           prompts: [
             {
               id: 1,
-              event_type: "earnings",
+              event_type: "DEFAULT",
               system_prompt: "You are a financial analyst.",
               user_template: "Analyse the filing at {{pdf_url}}.",
               model: "deepseek-chat",
@@ -62,58 +67,38 @@ describe("Prompts", () => {
     });
     render(<Prompts />, { wrapper: wrapper(qc) });
 
-    // The list is rendered with the testid and shows our event type.
-    expect(screen.getByTestId("prompt-list")).toBeInTheDocument();
-    await waitFor(() => {
-      expect(screen.getByTestId("prompt-row-earnings")).toBeInTheDocument();
-    });
-
-    // Click the row → editor loads the system prompt text.
-    const user = userEvent.setup();
-    await user.click(screen.getByTestId("prompt-row-earnings"));
+    // The editor auto-loads the single DEFAULT template — no row click.
     await waitFor(() => {
       expect(
         (screen.getByLabelText("System prompt") as HTMLTextAreaElement).value
       ).toBe("You are a financial analyst.");
     });
-    // The user template hint is visible (in the help line below the textarea).
+    // The model selector is present and reflects the stored model.
+    const modelSel = screen.getByTestId("prompt-model") as HTMLSelectElement;
+    expect(modelSel.value).toBe("deepseek-chat");
+    const optionValues = [...modelSel.options].map((o) => o.value);
+    expect(optionValues).toContain("deepseek-reasoner");
+    expect(optionValues).toContain("deepseek-coder");
+    // The user template hint is visible (help line below the textarea).
     expect(screen.getAllByText(/pdf_url/i).length).toBeGreaterThan(0);
-    // The version chip shows v3 (the list row and the editor header both show it).
+    // The version chip shows v3.
     expect(screen.getAllByText(/v3/).length).toBeGreaterThan(0);
   });
 
-  it("Save POSTs the edited prompt and bumps the version on the server", async () => {
-    const postCalls: { url: string; body: unknown }[] = [];
+  it("changing the model and saving POSTs the new model + bumps the version", async () => {
+    const postCalls: { url: string; body: any }[] = [];
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       const method = (init?.method || "GET").toUpperCase();
-      if (url.endsWith("/api/prompts") || (url.includes("/api/prompts") && method === "GET" && !url.includes("/history") && !url.includes("/preview"))) {
-        // GET list
-        if (method === "GET") {
-          return makeJsonResponse({
-            prompts: [
-              {
-                id: 1,
-                event_type: "earnings",
-                system_prompt: "OLD system",
-                user_template: "OLD template {{pdf_url}}",
-                model: "deepseek-chat",
-                temperature: 0.2,
-                max_tokens: 2000,
-                version: 3,
-                updated_at: "2026-06-10T10:00:00Z",
-                updated_by: "ui",
-              },
-            ],
-          });
-        }
+      if (url.includes("/history")) {
+        return makeJsonResponse({ event_type: "DEFAULT", history: [] });
       }
-      if (url.includes("/api/prompts/earnings") && method === "POST") {
+      if (url.includes("/api/prompts/DEFAULT") && method === "POST") {
         const body = init?.body ? JSON.parse(init.body as string) : null;
         postCalls.push({ url, body });
         return makeJsonResponse({
           id: 1,
-          event_type: "earnings",
+          event_type: "DEFAULT",
           system_prompt: body?.system_prompt,
           user_template: body?.user_template,
           model: body?.model,
@@ -122,6 +107,24 @@ describe("Prompts", () => {
           version: 4,
           updated_at: "2026-06-12T00:00:00Z",
           updated_by: "ui",
+        });
+      }
+      if (url.includes("/api/prompts") && method === "GET" && !url.includes("/preview")) {
+        return makeJsonResponse({
+          prompts: [
+            {
+              id: 1,
+              event_type: "DEFAULT",
+              system_prompt: "OLD system prompt long enough to pass validation.",
+              user_template: "OLD template {{pdf_url}}",
+              model: "deepseek-chat",
+              temperature: 0.2,
+              max_tokens: 2000,
+              version: 3,
+              updated_at: "2026-06-10T10:00:00Z",
+              updated_by: "ui",
+            },
+          ],
         });
       }
       return makeJsonResponse({ detail: "not found" }, 404);
@@ -133,23 +136,19 @@ describe("Prompts", () => {
     render(<Prompts />, { wrapper: wrapper(qc) });
 
     const user = userEvent.setup();
-    await user.click(await screen.findByTestId("prompt-row-earnings"));
-    const ta = (await screen.findByLabelText("System prompt")) as HTMLTextAreaElement;
-    // Edit the system prompt and the temperature.
-    fireEvent.change(ta, { target: { value: "NEW system prompt" } });
-    const temp = screen.getByLabelText("Temperature") as HTMLInputElement;
-    fireEvent.change(temp, { target: { value: "0.4" } });
-    // Save.
+    // Editor auto-loads DEFAULT; change the model via the new selector.
+    const modelSel = (await screen.findByTestId("prompt-model")) as HTMLSelectElement;
+    fireEvent.change(modelSel, { target: { value: "deepseek-reasoner" } });
+    // Save (enabled now that the form is dirty).
     await user.click(screen.getByTestId("save-prompt"));
 
     await waitFor(() => {
       expect(postCalls).toHaveLength(1);
     });
-    expect(postCalls[0]!.url).toBe("/api/prompts/earnings");
+    expect(postCalls[0]!.url).toContain("/api/prompts/DEFAULT");
     expect(postCalls[0]!.body).toMatchObject({
-      system_prompt: "NEW system prompt",
-      temperature: 0.4,
-      model: "deepseek-chat",
+      model: "deepseek-reasoner",
+      temperature: 0.2,
       max_tokens: 2000,
     });
     // Optimistic UI shows the success state.
