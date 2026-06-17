@@ -50,9 +50,9 @@ _BUS_QUOTE_MAX_AGE_S = 6.0
 
 
 async def _fyers_quote(db: Session, sym: str) -> Optional[dict[str, Any]]:
-    """Live quote via the connected real Fyers account — used for F&O /
-    option symbols the public (Yahoo) feed can't serve. Returns None when
-    no Fyers account is connected or the broker call fails/returns empty."""
+    """Live quote via the connected real Fyers account — the sole price
+    source for every symbol (equity, index, future, option). Returns None
+    when no Fyers account is connected or the broker call fails/returns empty."""
     acc = (
         db.execute(
             select(BrokerAccount).where(
@@ -89,8 +89,8 @@ def _bus_quote_is_fresh(q: Quote) -> bool:
     """True when a bus quote is recent enough to serve as-is.
 
     A real feed (Fyers websocket / poll) re-publishes every few seconds
-    so its entries stay fresh; a one-off Yahoo seed or a paper-fill
-    publish goes stale and falls through to a fresh live fetch."""
+    so its entries stay fresh; a one-off seed or a paper-fill publish
+    goes stale and falls through to a fresh live Fyers fetch."""
     ts = getattr(q, "timestamp", None)
     if ts is None:
         return False
@@ -437,10 +437,8 @@ async def get_quote(
       1. Fresh in-process bus cache (a live feed re-publishes constantly).
       2. The connected Fyers account's real-time exchange quote
          (`/data/quotes`) — authoritative for any NSE/BSE equity, index,
-         future or option. This is the real-time stock data.
-      3. Public Yahoo feed — a fallback for when Fyers isn't connected or
-         the token has expired (Yahoo is delayed and can't serve F&O).
-      4. A stale (but real) bus quote, else ok:false.
+         future or option. This is the ONLY live source (no public feed).
+      3. A stale (but real) bus quote, else ok:false.
     """
     sym = symbol.upper()
     md = _manager().market_data
@@ -483,32 +481,7 @@ async def get_quote(
             "as_of": datetime.now(timezone.utc).isoformat(),
         }
 
-    # 2. Public Yahoo fallback (equities/indices; delayed; no F&O).
-    from app.api.market import fetch_quote as _fetch_live_quote
-
-    live = await _fetch_live_quote(sym)
-    if live is not None:
-        try:
-            await md.publish(sym, float(live["last_price"]), volume=live.get("volume"))
-        except Exception:  # noqa: BLE001
-            pass
-        return {
-            "ok": True,
-            "symbol": sym,
-            "last_price": live["last_price"],
-            "bid": live.get("bid"),
-            "ask": live.get("ask"),
-            "volume": live.get("volume"),
-            "change": live.get("change"),
-            "change_pct": live.get("change_pct"),
-            "high": live.get("high"),
-            "low": live.get("low"),
-            "prev_close": live.get("prev_close"),
-            "source": "live",
-            "as_of": datetime.now(timezone.utc).isoformat(),
-        }
-
-    # 3. A stale-but-real bus quote beats nothing.
+    # 2. A stale-but-real bus quote beats nothing.
     if cached is not None and not _is_simulated(cached):
         return {
             "ok": True,

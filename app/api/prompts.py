@@ -27,7 +27,13 @@ log = get_logger(__name__)
 router = APIRouter(prefix="/api/prompts", tags=["prompts"])
 init_db()
 
-_VALID_MODELS = {"deepseek-chat", "deepseek-coder", "deepseek-reasoner"}
+_VALID_MODELS = {
+    "deepseek-chat",
+    "deepseek-coder",
+    "deepseek-reasoner",
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+}
 
 
 # -------------------------------------------------------------------------

@@ -11,6 +11,7 @@ import {
   usePositions,
 } from "../../hooks/useApi";
 import { ApiClientError } from "../../api/client";
+import { LevelsCell } from "../positions/LevelsCell";
 import { SkeletonList } from "./Skeleton";
 
 function fmtMoney(v: number | null | undefined): string {
@@ -93,10 +94,12 @@ export function ActivePositions() {
                   <td className="mono">{p.quantity}</td>
                   <td className="mono">{fmtMoney(p.average_price)}</td>
                   <td className="mono">{fmtMoney(p.last_price)}</td>
-                  <td className="mono text-dim">
-                    {m && m.stop_loss != null && m.target != null
-                      ? `${fmtMoney(m.stop_loss)} / ${fmtMoney(m.target)}`
-                      : "—"}
+                  <td className="mono">
+                    <LevelsCell
+                      symbol={p.symbol}
+                      stopLoss={m?.stop_loss ?? null}
+                      target={m?.target ?? null}
+                    />
                   </td>
                   <td className={`mono ${pnlClass(p.unrealized_pnl)}`}>
                     {fmtMoney(p.unrealized_pnl)}

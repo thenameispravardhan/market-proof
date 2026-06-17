@@ -15,9 +15,10 @@ endpoints return a clear 503 rather than pretending to trade.
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Request, status
+from pydantic import BaseModel
 
 from app.db.models import AuditLog
 from app.db.session import SessionLocal
@@ -26,6 +27,14 @@ from app.logging_config import get_logger
 router = APIRouter(prefix="/api/positions", tags=["positions"])
 
 log = get_logger(__name__)
+
+
+class LevelsUpdate(BaseModel):
+    """New stop-loss / target for an open position. Either may be null
+    to clear (disarm) that exit level."""
+
+    stop_loss: Optional[float] = None
+    target: Optional[float] = None
 
 
 def _trade_manager(request: Request) -> Any:
@@ -72,6 +81,25 @@ async def close_position(symbol: str, request: Request) -> dict[str, Any]:
         )
     _audit("positions.close", symbol, result)
     return {"ok": True, "closed": result}
+
+
+@router.post("/{symbol}/levels")
+async def update_levels(
+    symbol: str, body: LevelsUpdate, request: Request
+) -> dict[str, Any]:
+    """Edit the stop-loss / target of an open position so the trade
+    manager exits on the new levels. Pass null for a level to clear it."""
+    tm = _trade_manager(request)
+    result = await tm.update_levels(
+        symbol, stop_loss=body.stop_loss, target=body.target
+    )
+    if result is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"no open position for symbol {symbol!r}",
+        )
+    _audit("positions.update_levels", symbol, result)
+    return {"ok": True, "managed": result}
 
 
 @router.post("/close-all")

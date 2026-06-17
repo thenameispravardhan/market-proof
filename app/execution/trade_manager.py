@@ -177,6 +177,66 @@ class TradeManager:
             stop_loss=stop_loss, target=target,
         )
 
+    async def update_levels(
+        self,
+        symbol: str,
+        *,
+        stop_loss: Optional[float],
+        target: Optional[float],
+    ) -> Optional[dict[str, Any]]:
+        """Edit the stop-loss / target of an open position.
+
+        Works for any open position, not just ones already in the
+        in-memory managed book: if the symbol isn't being actively
+        managed (opened before this process started, after a restart, or
+        seeded), we reconstruct it from the DB and arm it so the new
+        levels take effect immediately. Pass None for a level to clear it
+        (disarms that exit). Returns the updated managed view, or None
+        when there is no open position for the symbol.
+        """
+        symbol = symbol.upper().strip()
+        loop = asyncio.get_running_loop()
+        async with self._lock:
+            mp = self._book.get(symbol)
+        if mp is None:
+            loaded = await loop.run_in_executor(
+                None, _open_position_as_managed, self._session_factory, symbol
+            )
+            if loaded is None:
+                return None
+            mp, _ = loaded
+            async with self._lock:
+                self._book[symbol] = mp
+            if self._quote_feed is not None:
+                try:
+                    self._quote_feed.watch(symbol, mp.entry)
+                except Exception:  # noqa: BLE001
+                    pass
+        new_sl = float(stop_loss) if stop_loss is not None else None
+        new_target = float(target) if target is not None else None
+        async with self._lock:
+            mp.stop_loss = new_sl
+            mp.target = new_target
+        # Persist onto the position row so the levels survive a restart.
+        await loop.run_in_executor(
+            None, _persist_position_levels,
+            self._session_factory, symbol, new_sl, new_target,
+        )
+        log.info(
+            "trade_manager.levels_updated",
+            symbol=symbol, stop_loss=new_sl, target=new_target,
+        )
+        return {
+            "symbol": mp.symbol,
+            "quantity": mp.quantity,
+            "entry": mp.entry,
+            "stop_loss": mp.stop_loss,
+            "target": mp.target,
+            "signal_id": mp.signal_id,
+            "strategy_id": mp.strategy_id,
+            "opened_at": mp.opened_at.isoformat(),
+        }
+
     async def _hydrate_book(self) -> None:
         """Rebuild the managed book from open position rows so stop-loss /
         target re-arm after a restart (the book is in-memory)."""

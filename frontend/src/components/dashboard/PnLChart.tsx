@@ -1,8 +1,15 @@
-// PnL chart: cumulative realised P&L over the last N trading days,
-// computed client-side from /api/trades. The brief mentions a
-// server-side /api/dashboard/summary that returns `pnl_series`; we
-// fall back to the client-side synthesis if that endpoint is missing
-// or returns 404.
+// PnL chart: cumulative realised P&L over the last N trading days.
+//
+// Realised P&L is reconstructed from /api/trades with the SAME FIFO
+// round-trip logic the Trade History page uses (`buildRoundTrips`), so
+// the two views always agree — they used to diverge because the chart
+// summed raw per-trade pnl over every trade (incl. open entry legs and
+// non-filled rows) while Trade History paired legs into round-trips.
+//
+// The per-day bars cover the last 14 days; the cumulative line is
+// seeded with realised P&L from trades closed *before* that window, so
+// the final cumulative value equals the all-time realised total shown
+// on Trade History.
 
 import { useMemo } from "react";
 import {
@@ -14,10 +21,11 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { useTrades } from "../../hooks/useApi";
+import { useBrokerAccounts, useTrades } from "../../hooks/useApi";
 import { ApiClientError } from "../../api/client";
+import { buildRoundTrips } from "../../lib/roundtrips";
 import { Skeleton } from "./Skeleton";
-import type { Trade } from "../../types";
+import type { BrokerAccount, Trade } from "../../types";
 
 interface PnlPoint {
   date: string;
@@ -29,10 +37,12 @@ function ymd(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
 
-function synthesizeSeries(trades: Trade[], days = 14): PnlPoint[] {
-  // Bucket trades by date (using executed_at when available, else created_at).
-  // Within each bucket, sum pnl (treat null pnl as 0 — open positions
-  // don't have realised P&L yet).
+// Build the daily realised-P&L series from FIFO round-trips. Each
+// closed round-trip's realised P&L is bucketed on its exit date. The
+// cumulative line carries forward all realised P&L — including trades
+// closed before the visible window — so its last point matches the
+// Trade History realised total.
+function buildSeries(trades: Trade[], byId: Map<number, BrokerAccount>, days = 14): PnlPoint[] {
   const today = new Date();
   today.setUTCHours(0, 0, 0, 0);
   const start = new Date(today);
@@ -45,19 +55,22 @@ function synthesizeSeries(trades: Trade[], days = 14): PnlPoint[] {
     buckets.set(ymd(d), 0);
   }
 
-  for (const t of trades) {
-    const ts = t.executed_at ?? t.created_at;
-    if (!ts) continue;
-    const d = new Date(ts);
+  let preWindow = 0; // realised P&L from round-trips closed before the window
+  for (const r of buildRoundTrips(trades, byId)) {
+    if (r.open || r.pnl == null || !r.exitTime) continue;
+    const d = new Date(r.exitTime);
     if (Number.isNaN(d.getTime())) continue;
     d.setUTCHours(0, 0, 0, 0);
-    if (d < start) continue;
+    if (d < start) {
+      preWindow += r.pnl;
+      continue;
+    }
     const key = ymd(d);
     if (!buckets.has(key)) continue;
-    buckets.set(key, (buckets.get(key) ?? 0) + (t.pnl ?? 0));
+    buckets.set(key, (buckets.get(key) ?? 0) + r.pnl);
   }
 
-  let cum = 0;
+  let cum = preWindow;
   const out: PnlPoint[] = [];
   for (const [date, realized] of buckets) {
     cum += realized;
@@ -74,21 +87,30 @@ function shortDate(s: string): string {
 }
 
 export function PnLChart() {
-  const { data, isLoading, error } = useTrades(500);
+  // Filled-only + the same 500-row window as Trade History so both
+  // reconstruct the identical set of round-trips.
+  const { data, isLoading, error } = useTrades(500, "filled");
+  const { data: accounts } = useBrokerAccounts();
 
+  const byId = useMemo(
+    () => new Map((accounts ?? []).map((a) => [a.id, a])),
+    [accounts]
+  );
   const series = useMemo(() => {
     if (!data) return [];
-    return synthesizeSeries(data, 14);
-  }, [data]);
+    return buildSeries(data, byId, 14);
+  }, [data, byId]);
 
   const totalCum = series.length > 0 ? series[series.length - 1].cumulative : 0;
+  // No realised P&L anywhere (incl. the pre-window seed) → empty state.
+  const hasRealised = series.length > 0 && (totalCum !== 0 || series.some((p) => p.realized !== 0));
 
   return (
     <div className="widget widget-wide" data-testid="pnl-chart">
       <h3>
         P&amp;L (last 14 days){" "}
         <span className={`mono ${totalCum > 0 ? "pnl-pos" : totalCum < 0 ? "pnl-neg" : ""}`}>
-          cumulative ₹{totalCum.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+          realised ₹{totalCum.toLocaleString(undefined, { maximumFractionDigits: 2 })}
         </span>
       </h3>
       {isLoading ? (
@@ -99,8 +121,8 @@ export function PnLChart() {
             ? "Trades endpoint not available yet — backend doesn't expose /api/trades."
             : `Failed to load trades: ${error.message}`}
         </p>
-      ) : series.every((p) => p.cumulative === 0) ? (
-        <p className="empty">No realised P&amp;L in the last 14 days.</p>
+      ) : !hasRealised ? (
+        <p className="empty">No realised P&amp;L yet.</p>
       ) : (
         <div style={{ width: "100%", height: 240 }}>
           <ResponsiveContainer>

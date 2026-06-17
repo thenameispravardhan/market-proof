@@ -161,6 +161,83 @@ async def test_close_unmanaged_position_from_db(db_session, isolated_db):
     assert pos.quantity == 0
 
 
+# -- Edit stop-loss / target ---------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_update_levels_changes_managed_position(db_session, isolated_db):
+    """Editing SL/target updates the in-memory book (so the next sweep
+    exits on the new levels) and persists onto the position row."""
+    md = MarketDataBus()
+    db_session.add(
+        PositionRow(symbol="HDFC", quantity=10, average_price=100.0, last_price=100.0)
+    )
+    db_session.commit()
+    tm = TradeManager(market_data=md)
+    await tm.register(
+        symbol="HDFC", quantity=10, entry=100.0, stop_loss=95.0, target=120.0,
+    )
+    result = await tm.update_levels("HDFC", stop_loss=98.0, target=130.0)
+    assert result is not None
+    assert result["stop_loss"] == pytest.approx(98.0)
+    assert result["target"] == pytest.approx(130.0)
+    # In-memory book reflects the edit.
+    mp = tm.managed_positions()[0]
+    assert mp.stop_loss == pytest.approx(98.0)
+    assert mp.target == pytest.approx(130.0)
+    # Persisted onto the position row (survives a restart).
+    db_session.expire_all()
+    pos = db_session.query(PositionRow).filter_by(symbol="HDFC").one()
+    assert pos.stop_loss == pytest.approx(98.0)
+    assert pos.target == pytest.approx(130.0)
+
+
+@pytest.mark.asyncio
+async def test_update_levels_arms_unmanaged_position_from_db(db_session, isolated_db):
+    """A position not in the in-memory book (opened before the manager
+    started, or seeded) can still have its levels edited — we hydrate it
+    from the DB and arm it."""
+    md = MarketDataBus()
+    db_session.add(
+        PositionRow(symbol="ITC", quantity=20, average_price=400.0, last_price=405.0)
+    )
+    db_session.commit()
+    tm = TradeManager(market_data=md)
+    assert tm.managed_positions() == []
+    result = await tm.update_levels("ITC", stop_loss=390.0, target=440.0)
+    assert result is not None
+    assert result["stop_loss"] == pytest.approx(390.0)
+    # Now armed in the managed book.
+    assert any(mp.symbol == "ITC" for mp in tm.managed_positions())
+    db_session.expire_all()
+    pos = db_session.query(PositionRow).filter_by(symbol="ITC").one()
+    assert pos.stop_loss == pytest.approx(390.0)
+    assert pos.target == pytest.approx(440.0)
+
+
+@pytest.mark.asyncio
+async def test_update_levels_clears_a_level(db_session, isolated_db):
+    """Passing None clears (disarms) a level."""
+    md = MarketDataBus()
+    tm = TradeManager(market_data=md)
+    await tm.register(
+        symbol="SBIN", quantity=5, entry=500.0, stop_loss=480.0, target=550.0,
+    )
+    result = await tm.update_levels("SBIN", stop_loss=None, target=560.0)
+    assert result is not None
+    assert result["stop_loss"] is None
+    assert result["target"] == pytest.approx(560.0)
+    mp = tm.managed_positions()[0]
+    assert mp.stop_loss is None
+
+
+@pytest.mark.asyncio
+async def test_update_levels_unknown_symbol_returns_none(db_session, isolated_db):
+    md = MarketDataBus()
+    tm = TradeManager(market_data=md)
+    assert await tm.update_levels("NOPE", stop_loss=1.0, target=2.0) is None
+
+
 @pytest.mark.asyncio
 async def test_close_all_flattens_unmanaged_positions(db_session, isolated_db):
     md = MarketDataBus()

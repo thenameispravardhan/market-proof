@@ -132,8 +132,8 @@ async def lifespan(app: FastAPI):
         Resolves a bare short-name (e.g. 'BHARTIARTL', as the news pipeline
         emits) to a full broker symbol (NSE:BHARTIARTL-EQ) via the
         instrument master, then fetches the live price from the connected
-        Fyers account, falling back to the public Yahoo feed. Returns None
-        on any miss so the feed keeps the last price / simulates."""
+        Fyers account (the sole price source — no public feed). Returns
+        None on any miss so the feed keeps the last price / simulates."""
         # Resolve bare short-name -> full Fyers symbol.
         full = symbol
         if ":" not in symbol:
@@ -152,35 +152,10 @@ async def lifespan(app: FastAPI):
                     full = pick.symbol
             except Exception:  # noqa: BLE001
                 pass
-        # 1. Fyers real-time (when a real account is connected).
-        try:
-            from sqlalchemy import select
-            from app.db.models import BrokerAccount
-            from app.db.session import SessionLocal
-
-            with SessionLocal() as s:
-                acc = (
-                    s.execute(
-                        select(BrokerAccount).where(
-                            BrokerAccount.broker == "fyers",
-                            BrokerAccount.paper_mode == False,  # noqa: E712
-                            BrokerAccount.enabled == True,  # noqa: E712
-                            BrokerAccount.access_token.is_not(None),
-                        ).order_by(BrokerAccount.id.asc())
-                    )
-                    .scalars()
-                    .first()
-                )
-                backend = (
-                    execution_manager._manual_backend_for(acc) if acc is not None else None
-                )
-            if backend is not None and hasattr(backend, "get_quote"):
-                quotes = await backend.get_quote([full])
-                if quotes and quotes[0].last_price > 0:
-                    return float(quotes[0].last_price)
-        except Exception:  # noqa: BLE001
-            pass
-        # 2. Public Yahoo fallback.
+        # The connected Fyers account is the sole price source (no public
+        # feed). `market.fetch_quote` resolves it via the same execution
+        # manager singleton and serves equities, indices, futures and
+        # options; None when Fyers isn't connected.
         try:
             from app.api.market import fetch_quote
 

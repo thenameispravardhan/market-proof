@@ -272,6 +272,47 @@ async def test_get_quote_uses_data_path_and_nested_v_shape() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_quote_parses_day_change_fields() -> None:
+    """The status-bar index ticker renders day change %, so get_quote
+    must surface `ch` / `chp` / `prev_close_price` from the `v` object —
+    including a genuine 0.0 (flat), which must not collapse to None."""
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "s": "ok",
+                "d": [
+                    {"n": "NSE:NIFTY50-INDEX", "s": "ok",
+                     "v": {"lp": 25000.0, "ch": 125.5, "chp": 0.5,
+                           "prev_close_price": 24874.5}},
+                    {"n": "BSE:SENSEX-INDEX", "s": "ok",
+                     "v": {"lp": 82000.0, "ch": 0.0, "chp": 0.0}},  # flat
+                ],
+            },
+        )
+
+    client = _make_client(handler)
+    backend = FyersLiveBackend(
+        app_id="APP123", access_token="TOK",
+        broker_account_id=1, account_name="m", client=client,
+    )
+    try:
+        quotes = await backend.get_quote(["NSE:NIFTY50-INDEX", "BSE:SENSEX-INDEX"])
+        by_sym = {q.symbol: q for q in quotes}
+        nifty = by_sym["NSE:NIFTY50-INDEX"]
+        assert nifty.change == 125.5
+        assert nifty.change_pct == 0.5
+        assert nifty.prev_close == 24874.5
+        # A flat day: 0.0 is meaningful and must be preserved, not None.
+        sensex = by_sym["BSE:SENSEX-INDEX"]
+        assert sensex.change == 0.0
+        assert sensex.change_pct == 0.0
+        assert sensex.prev_close is None  # field absent → None
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_place_order_rejects_missing_required_price() -> None:
     """SL-M without a trigger, and SL-L without a limit, are rejected
     locally with a clear message — never sent to Fyers."""

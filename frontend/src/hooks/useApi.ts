@@ -120,6 +120,32 @@ export function useClosePosition() {
   });
 }
 
+// Edit an open position's stop-loss / target. Pass null for a level to
+// clear it. Refreshes the managed book + positions so both the
+// dashboard and Trade History reflect the new levels immediately.
+export function useUpdatePositionLevels() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      symbol,
+      stop_loss,
+      target,
+    }: {
+      symbol: string;
+      stop_loss: number | null;
+      target: number | null;
+    }) =>
+      api.post(`/api/positions/${encodeURIComponent(symbol)}/levels`, {
+        stop_loss,
+        target,
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["managed-positions"] });
+      qc.invalidateQueries({ queryKey: ["positions"] });
+    },
+  });
+}
+
 export function useCloseAllPositions() {
   const qc = useQueryClient();
   return useMutation({

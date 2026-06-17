@@ -1059,6 +1059,11 @@ class FyersLiveBackend:
                 )
                 if lp <= 0:
                     continue
+                # Day change vs prev close. Keep a genuine 0.0 (flat),
+                # only fall to None when the field is absent.
+                ch_raw = v.get("ch")
+                chp_raw = v.get("chp")
+                pc_raw = v.get("prev_close_price") or v.get("c")
                 out.append(
                     Quote(
                         symbol=sym,
@@ -1066,6 +1071,9 @@ class FyersLiveBackend:
                         bid=safe_float(v.get("bid")) or None,
                         ask=safe_float(v.get("ask")) or None,
                         volume=int(safe_float(v.get("volume") or v.get("vol") or 0)) or None,
+                        change=safe_float(ch_raw) if ch_raw is not None else None,
+                        change_pct=safe_float(chp_raw) if chp_raw is not None else None,
+                        prev_close=(safe_float(pc_raw) or None) if pc_raw is not None else None,
                     )
                 )
             except Exception:  # noqa: BLE001

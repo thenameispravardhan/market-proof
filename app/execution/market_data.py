@@ -48,6 +48,12 @@ class Quote:
     ask: Optional[float] = None
     volume: Optional[int] = None
     average_daily_volume_crore: Optional[float] = None
+    # Day change vs previous close (absolute + percent) and the prev
+    # close itself. Populated by the live Fyers feed; the status-bar
+    # index ticker renders change_pct. None when the source omits them.
+    change: Optional[float] = None
+    change_pct: Optional[float] = None
+    prev_close: Optional[float] = None
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     extra: dict[str, Any] = field(default_factory=dict)
 

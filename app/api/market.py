@@ -3,18 +3,20 @@
 The status bar polls `GET /api/market/indices` every few seconds to
 render NIFTY 50 / SENSEX / BANK NIFTY in (near) real time.
 
-Index levels are *public* data, so we source them from Yahoo Finance's
-free chart endpoint rather than Fyers. That means the ticker works in
-paper mode and before any Fyers OAuth — no token required. (Fyers is
-only needed to place orders, not to read an index level.)
+Every price in the app comes from the connected real Fyers account —
+there is NO public-feed fallback. Fyers serves equities, indices,
+futures and options off the same `/data/quotes` endpoint, so a single
+source covers the index ticker, the Trade-page quote, and the paper /
+P&L quote feed. The trade-off: the ticker is blank until a Fyers
+account is connected (the status bar then shows a "connect" prompt).
 
-  Yahoo symbols:
-    ^NSEI     NIFTY 50
-    ^BSESN    SENSEX
-    ^NSEBANK  NIFTY Bank
+  Fyers index symbols:
+    NSE:NIFTY50-INDEX    NIFTY 50
+    BSE:SENSEX-INDEX     SENSEX
+    NSE:NIFTYBANK-INDEX  NIFTY Bank
 
 The response is cached in-process for CACHE_TTL_S to avoid hammering
-upstream. Errors never raise to the caller; the endpoint returns
+the broker. Errors never raise to the caller; the endpoint returns
 `{ok: false, reason: ...}` so the UI can render an inline message.
 """
 from __future__ import annotations
@@ -23,9 +25,9 @@ import asyncio
 import time
 from typing import Any, Optional
 
-import httpx
 from fastapi import APIRouter
 
+from app.execution.market_data import Quote
 from app.logging_config import get_logger
 
 log = get_logger(__name__)
@@ -33,136 +35,114 @@ log = get_logger(__name__)
 router = APIRouter(tags=["market"])
 
 
-# key/name shown in the UI + the Yahoo Finance ticker symbol.
+# key/name shown in the UI + the Fyers quote symbol.
 INDICES: list[dict[str, str]] = [
-    {"key": "NIFTY",     "yahoo": "^NSEI",    "name": "NIFTY 50"},
-    {"key": "SENSEX",    "yahoo": "^BSESN",   "name": "SENSEX"},
-    {"key": "BANKNIFTY", "yahoo": "^NSEBANK", "name": "BANK NIFTY"},
+    {"key": "NIFTY",     "symbol": "NSE:NIFTY50-INDEX",   "name": "NIFTY 50"},
+    {"key": "SENSEX",    "symbol": "BSE:SENSEX-INDEX",    "name": "SENSEX"},
+    {"key": "BANKNIFTY", "symbol": "NSE:NIFTYBANK-INDEX", "name": "BANK NIFTY"},
 ]
 
 CACHE_TTL_S: float = 5.0
-_YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-# Yahoo rejects requests without a browser-like UA.
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json",
-}
-
 
 _cache: dict[str, Any] = {"data": None, "ts": 0.0, "lock": asyncio.Lock()}
 
 
-# ---- generic per-symbol quote (used by the Trade page) -------------------
-
-_INDEX_YAHOO = {
-    "NSE:NIFTY50-INDEX": "^NSEI",
-    "NSE:NIFTYBANK-INDEX": "^NSEBANK",
-    "BSE:SENSEX-INDEX": "^BSESN",
-    "NSE:NIFTY-INDEX": "^NSEI",
-    "NSE:BANKNIFTY-INDEX": "^NSEBANK",
-}
+# ---- Fyers access --------------------------------------------------------
 
 
-def _to_yahoo_symbol(broker_symbol: str) -> Optional[str]:
-    """Map a Fyers-style symbol to a Yahoo Finance ticker.
+def _manager():
+    """The shared ExecutionManager (built in the FastAPI lifespan). A
+    throwaway instance is returned when the lifespan hasn't run (tests),
+    which is harmless because `_fyers_backend` only calls it once it has
+    found a connected account — and tests have none."""
+    from app.main import app
 
-    Equities + indices are public on Yahoo and need no auth:
-      NSE:RELIANCE-EQ  -> RELIANCE.NS
-      BSE:TCS-EQ       -> TCS.BO
-      NSE:NIFTY50-INDEX-> ^NSEI
-    F&O / options return None (no public Yahoo symbol — needs Fyers).
-    """
-    if not broker_symbol:
+    mgr = getattr(app.state, "execution_manager", None)
+    if mgr is None:
+        from app.execution.manager import Manager
+        from app.execution.market_data import MarketDataBus
+        from app.risk.engine import RiskEngine
+
+        return Manager(market_data=MarketDataBus(), risk_engine=RiskEngine())
+    return mgr
+
+
+def _fyers_backend() -> Optional[Any]:
+    """The live backend for the connected real Fyers account, or None
+    when no such account exists (so the caller degrades gracefully).
+
+    Never raises — a DB or manager hiccup returns None so the index
+    endpoint keeps its "always 200" contract."""
+    try:
+        from sqlalchemy import select
+
+        from app.db.models import BrokerAccount
+        from app.db.session import SessionLocal
+
+        with SessionLocal() as db:
+            acc = (
+                db.execute(
+                    select(BrokerAccount).where(
+                        BrokerAccount.broker == "fyers",
+                        BrokerAccount.paper_mode == False,  # noqa: E712
+                        BrokerAccount.enabled == True,  # noqa: E712
+                        BrokerAccount.access_token.is_not(None),
+                    ).order_by(BrokerAccount.id.asc())
+                )
+                .scalars()
+                .first()
+            )
+            if acc is None:
+                return None
+            backend = _manager()._manual_backend_for(acc)  # noqa: SLF001
+            if backend is None or not hasattr(backend, "get_quote"):
+                return None
+            return backend
+    except Exception as e:  # noqa: BLE001
+        log.debug("market.fyers_backend_lookup_failed", error=str(e))
         return None
-    s = broker_symbol.strip().upper()
-    if s in _INDEX_YAHOO:
-        return _INDEX_YAHOO[s]
-    if "-INDEX" in s:
-        return _INDEX_YAHOO.get(s)
-    exch, _, rest = s.partition(":")
-    rest = rest or exch
-    # Only plain cash equities map cleanly (suffix -EQ / -BE / -A ...).
-    base, _, suffix = rest.rpartition("-")
-    base = base or rest
-    if suffix not in ("EQ", "BE", "A", "B", "") :
-        return None  # likely a derivative
-    if exch == "BSE":
-        return f"{base}.BO"
-    return f"{base}.NS"
+
+
+async def fyers_quotes(symbols: list[str]) -> dict[str, Quote]:
+    """Live quotes for `symbols` from the connected Fyers account, keyed
+    by upper-cased symbol. Empty dict when no account is connected or the
+    broker call fails — there is no public-feed fallback."""
+    if not symbols:
+        return {}
+    backend = _fyers_backend()
+    if backend is None:
+        return {}
+    try:
+        quotes = await backend.get_quote(list(symbols))
+    except Exception as e:  # noqa: BLE001
+        log.debug("market.fyers_quote_failed", symbols=symbols, error=str(e))
+        return {}
+    return {q.symbol.upper(): q for q in quotes}
 
 
 async def fetch_quote(broker_symbol: str) -> Optional[dict[str, Any]]:
-    """Live last-price for any equity/index symbol via Yahoo. Returns
-    None for symbols Yahoo can't serve (F&O) or on failure."""
-    ysym = _to_yahoo_symbol(broker_symbol)
-    if not ysym:
+    """Live quote for any Fyers symbol (equity, index, future, option).
+    Returns None when Fyers isn't connected or the symbol can't be served."""
+    if not broker_symbol:
         return None
-    try:
-        async with httpx.AsyncClient(http2=False) as client:
-            r = await client.get(
-                _YAHOO_CHART.format(symbol=ysym),
-                params={"interval": "1d", "range": "1d"},
-                headers=_HEADERS,
-                timeout=8.0,
-            )
-            r.raise_for_status()
-            meta = (((r.json() or {}).get("chart") or {}).get("result") or [{}])[0].get("meta") or {}
-    except Exception as e:  # noqa: BLE001
-        log.debug("market.quote_fetch_failed", symbol=broker_symbol, yahoo=ysym, error=str(e))
+    sym = broker_symbol.strip().upper()
+    quotes = await fyers_quotes([sym])
+    # Fyers echoes the requested symbol; fall back to the lone result.
+    q = quotes.get(sym) or (next(iter(quotes.values())) if len(quotes) == 1 else None)
+    if q is None or not q.last_price:
         return None
-    price = meta.get("regularMarketPrice")
-    if price is None:
-        return None
-    prev = meta.get("chartPreviousClose") or meta.get("previousClose")
-    price = float(price)
-    out: dict[str, Any] = {
-        "last_price": price,
-        "prev_close": float(prev) if prev else None,
-        "high": meta.get("regularMarketDayHigh"),
-        "low": meta.get("regularMarketDayLow"),
-        "volume": meta.get("regularMarketVolume"),
-        "change": round(price - float(prev), 2) if prev else None,
-        "change_pct": round((price - float(prev)) / float(prev) * 100.0, 2) if prev else None,
+    return {
+        "last_price": q.last_price,
+        "bid": q.bid,
+        "ask": q.ask,
+        "volume": q.volume,
+        "change": q.change,
+        "change_pct": q.change_pct,
+        "prev_close": q.prev_close,
     }
-    return out
 
 
-async def _fetch_one(client: httpx.AsyncClient, row: dict[str, str]) -> dict[str, Any]:
-    out = {
-        "key": row["key"],
-        "name": row["name"],
-        "symbol": row["yahoo"],
-        "last_price": None,
-        "change": None,
-        "change_pct": None,
-    }
-    try:
-        r = await client.get(
-            _YAHOO_CHART.format(symbol=row["yahoo"]),
-            params={"interval": "1d", "range": "1d"},
-            headers=_HEADERS,
-            timeout=8.0,
-        )
-        r.raise_for_status()
-        meta = (((r.json() or {}).get("chart") or {}).get("result") or [{}])[0].get("meta") or {}
-        price = meta.get("regularMarketPrice")
-        prev = meta.get("chartPreviousClose") or meta.get("previousClose")
-        if price is not None and prev:
-            price = float(price)
-            prev = float(prev)
-            out["last_price"] = price
-            out["change"] = round(price - prev, 2)
-            out["change_pct"] = round((price - prev) / prev * 100.0, 2) if prev else 0.0
-        elif price is not None:
-            out["last_price"] = float(price)
-            out["change"] = 0.0
-            out["change_pct"] = 0.0
-    except Exception as e:  # noqa: BLE001
-        log.debug("market.index_fetch_failed", symbol=row["yahoo"], error=str(e))
-    return out
+# ---- index ticker --------------------------------------------------------
 
 
 async def _fetch_indices() -> dict[str, Any]:
@@ -171,31 +151,61 @@ async def _fetch_indices() -> dict[str, Any]:
         if _cache["data"] is not None and (now - _cache["ts"]) < CACHE_TTL_S:
             return _cache["data"]
 
-        try:
-            async with httpx.AsyncClient(http2=False) as client:
-                results = await asyncio.gather(
-                    *[_fetch_one(client, row) for row in INDICES]
-                )
-        except Exception as e:  # noqa: BLE001
-            log.warning("market.indices.fetch_failed", error=str(e))
+        backend = _fyers_backend()
+        # Shell rows so the UI always has the three index slots to render.
+        rows: list[dict[str, Any]] = [
+            {
+                "key": idx["key"],
+                "name": idx["name"],
+                "symbol": idx["symbol"],
+                "last_price": None,
+                "change": None,
+                "change_pct": None,
+            }
+            for idx in INDICES
+        ]
+
+        if backend is None:
             payload = {
                 "ok": False,
-                "configured": True,
-                "reason": f"market data unavailable: {e!s}"[:120],
-                "indices": [],
+                "configured": False,
+                "reason": "connect a Fyers account for live index data",
+                "indices": rows,
                 "fetched_at": None,
             }
             _cache["data"] = payload
             _cache["ts"] = now
             return payload
 
-        got_any = any(r["last_price"] is not None for r in results)
+        try:
+            quotes = await fyers_quotes([idx["symbol"] for idx in INDICES])
+        except Exception as e:  # noqa: BLE001
+            log.warning("market.indices.fetch_failed", error=str(e))
+            payload = {
+                "ok": False,
+                "configured": True,
+                "reason": f"market data unavailable: {e!s}"[:120],
+                "indices": rows,
+                "fetched_at": None,
+            }
+            _cache["data"] = payload
+            _cache["ts"] = now
+            return payload
+
+        for row in rows:
+            q = quotes.get(row["symbol"].upper())
+            if q is not None and q.last_price:
+                row["last_price"] = q.last_price
+                row["change"] = q.change
+                row["change_pct"] = q.change_pct
+
+        got_any = any(r["last_price"] is not None for r in rows)
         payload = {
             "ok": got_any,
             "configured": True,
-            "reason": None if got_any else "no index data returned upstream",
-            "indices": results,
-            "fetched_at": time.time(),
+            "reason": None if got_any else "no index data returned by Fyers",
+            "indices": rows,
+            "fetched_at": time.time() if got_any else None,
         }
         _cache["data"] = payload
         _cache["ts"] = now
@@ -206,6 +216,8 @@ async def _fetch_indices() -> dict[str, Any]:
 async def market_indices() -> dict[str, Any]:
     """NIFTY 50 / SENSEX / BANK NIFTY last price, change, and %.
 
-    Always 200. Sourced from public data, so it works without Fyers.
+    Always 200. Sourced from the connected Fyers account; returns
+    `configured: false` when no Fyers account is connected so the UI
+    can prompt the operator to connect one.
     """
     return await _fetch_indices()

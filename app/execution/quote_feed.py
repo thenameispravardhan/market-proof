@@ -159,8 +159,9 @@ class QuoteFeed:
             try:
                 price = None
                 simulated = True
-                # Always prefer a REAL price (Fyers/Yahoo via live_quote_fn)
-                # — in paper mode too, so fills/P&L use real market prices.
+                # Always prefer a REAL price (the connected Fyers account,
+                # via live_quote_fn) — in paper mode too, so fills/P&L use
+                # real market prices. Simulates only when Fyers can't serve it.
                 if self._live_quote_fn is not None:
                     price = await self._live_quote_fn(symbol)
                     if price is not None and price > 0:

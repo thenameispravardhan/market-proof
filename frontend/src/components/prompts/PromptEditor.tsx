@@ -14,6 +14,8 @@ const DEEPSEEK_MODELS: { value: string; label: string }[] = [
   { value: "deepseek-chat", label: "deepseek-chat — fast, general (default)" },
   { value: "deepseek-reasoner", label: "deepseek-reasoner — deeper, slower" },
   { value: "deepseek-coder", label: "deepseek-coder — code-focused" },
+  { value: "deepseek-v4-flash", label: "deepseek-v4-flash — v4, fast" },
+  { value: "deepseek-v4-pro", label: "deepseek-v4-pro — v4, most capable" },
 ];
 
 export function PromptEditor({
