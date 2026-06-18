@@ -3,12 +3,29 @@ import { useEffect, useState } from "react";
 import { useRules, useCreateRule, useUpdateRule } from "../../hooks/useApi";
 import type { Action, SignalCondition, SignalConditions } from "../../types";
 
-const FIELDS = [
-  "event_type", "sentiment", "sentiment_score", "confidence",
-  "recommendation", "deal_value_inr_crore", "stake_change_pct",
-  "dividend_per_share", "buyback_value_inr_crore",
+// Plain-language labels for the condition builder. The `value` is what
+// the rules engine stores; the `label` is what the operator reads.
+const FIELDS: { value: string; label: string }[] = [
+  { value: "event_type", label: "Event type" },
+  { value: "sentiment", label: "Sentiment" },
+  { value: "sentiment_score", label: "Sentiment score (−100…100)" },
+  { value: "confidence", label: "Confidence (0…1)" },
+  { value: "recommendation", label: "AI recommendation" },
+  { value: "deal_value_inr_crore", label: "Deal value (₹ cr)" },
+  { value: "stake_change_pct", label: "Stake change (%)" },
+  { value: "dividend_per_share", label: "Dividend per share (₹)" },
+  { value: "buyback_value_inr_crore", label: "Buyback value (₹ cr)" },
 ];
-const OPS = ["==", "!=", "in", "not_in", ">=", "<=", ">", "<"];
+const OPS: { value: string; label: string }[] = [
+  { value: "==", label: "is" },
+  { value: "!=", label: "is not" },
+  { value: "in", label: "is one of" },
+  { value: "not_in", label: "is not one of" },
+  { value: ">=", label: "is at least (≥)" },
+  { value: "<=", label: "is at most (≤)" },
+  { value: ">", label: "is more than (>)" },
+  { value: "<", label: "is less than (<)" },
+];
 const ACTIONS = ["BUY", "SELL", "HOLD", "BLOCK"];
 
 interface Props {
@@ -94,13 +111,17 @@ export function RuleEditor({ ruleId, strategyId, onSaved }: Props) {
       </div>
       <div className="field-row">
         <div className="field">
-          <label htmlFor="rule-priority">Priority (lower = first)</label>
+          <label htmlFor="rule-priority">Order checked</label>
           <input
             id="rule-priority"
             type="number"
             value={priority}
             onChange={(e) => setPriority(Number(e.target.value))}
+            title="Lower numbers are checked first; the first matching rule wins"
           />
+          <div className="meta" style={{ color: "var(--text-dim)", fontSize: 11, marginTop: 4 }}>
+            Lower runs first
+          </div>
         </div>
         <div className="field">
           <label htmlFor="rule-action">Action</label>
@@ -128,13 +149,13 @@ export function RuleEditor({ ruleId, strategyId, onSaved }: Props) {
               value={cond.field}
               onChange={(e) => updateCond(idx, { field: e.target.value })}
             >
-              {FIELDS.map((f) => <option key={f}>{f}</option>)}
+              {FIELDS.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
             </select>
             <select
               value={cond.op}
               onChange={(e) => updateCond(idx, { op: e.target.value })}
             >
-              {OPS.map((o) => <option key={o}>{o}</option>)}
+              {OPS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
             </select>
             <input
               value={String(cond.value)}
