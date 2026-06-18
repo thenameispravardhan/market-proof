@@ -24,6 +24,18 @@ The service has the same lifecycle as `MonitorManager` (start/stop,
 idempotent) and is wired into the FastAPI lifespan (T5 will add the
 startup hook; for now there's a `run_forever` entry point for
 standalone use).
+
+Speed-trading rules (NEW):
+  - STALENESS GATE: at step 0.5 (right after idempotency check, before
+    the LLM call), if `(now - announcement.filed_at) > MAX_NEWS_AGE_SECONDS`
+    we skip the DeepSeek call, write a placeholder analyses row tagged
+    `reason="stale_news"`, and return. This implements the "no trades
+    on old queued news" rule — the spike is gone, so even a correct
+    analysis won't catch the move.
+  - STARTUP SWEEP: when `Service.start()` runs we also pre-mark every
+    announcement older than the threshold that has no analyses row.
+    This protects against replay paths (a future manual replay tool, a
+    bus redelivery, a stray cron job) firing the LLM on the backlog.
 """
 from __future__ import annotations
 
@@ -121,8 +133,97 @@ class Service:
             return self._task
         self._stop_event.clear()
         self._ready_event.clear()
+        # Pre-mark every stale announcement in the DB before we even
+        # subscribe. This closes the "old queued news" hole: even if a
+        # future tool republishes every announcement row, the analyses
+        # table already has placeholders so `_analysis_exists` returns
+        # True and the LLM is never called. Runs synchronously — the
+        # query is indexable (announcement_id FK) and the writes are
+        # idempotent.
+        try:
+            self._pre_mark_stale_announcements()
+        except Exception:  # noqa: BLE001
+            log.exception("analyzer.startup_sweep_failed")
         self._task = asyncio.create_task(self._run(), name="analyzer")
         return self._task
+
+    def _pre_mark_stale_announcements(self) -> None:
+        """One-shot sweep: mark every announcement older than the
+        freshness threshold that has no analyses row.
+
+        Idempotent: the existing `_default_analysis_exists` check
+        inside `_store_failed_analysis` is a no-op when an analyses
+        row already exists, so this is safe to run on every start().
+        """
+        from sqlalchemy import select
+        from app.db.models import Analysis, Announcement
+
+        settings = get_settings()
+        max_age_s = int(getattr(settings, "MAX_NEWS_AGE_SECONDS", 90))
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=max_age_s)
+
+        with self._session_factory() as session:
+            # Find every announcement older than cutoff that has NO
+            # analyses row yet. SQLite stores naive UTC datetimes, so
+            # we compare against a naive cutoff (assumed UTC).
+            cutoff_naive = cutoff.replace(tzinfo=None)
+            stale_rows = (
+                session.execute(
+                    select(Announcement)
+                    .where(Announcement.filed_at.isnot(None))
+                    .where(Announcement.filed_at < cutoff_naive)
+                )
+                .scalars()
+                .all()
+            )
+            if not stale_rows:
+                log.info(
+                    "analyzer.startup_sweep",
+                    stale_found=0,
+                    max_age_seconds=max_age_s,
+                )
+                return
+
+            # Filter down to rows that have no analyses child.
+            skipped = 0
+            for ann in stale_rows:
+                has = session.execute(
+                    select(Analysis.id).where(Analysis.announcement_id == ann.id)
+                ).first()
+                if has is not None:
+                    continue
+                # Reuse the same placeholder shape as the per-event
+                # gate so downstream consumers (UI, audit, queries)
+                # see one consistent row format regardless of
+                # whether the gate fired in-flight or at startup.
+                session.add(
+                    Analysis(
+                        announcement_id=ann.id,
+                        model="none",
+                        sentiment="neutral",
+                        sentiment_score=0.0,
+                        confidence=0.0,
+                        recommendation="HOLD",
+                        rationale=(
+                            f"Pre-marked at startup: filed_at older than "
+                            f"{max_age_s}s (stale_news gate)."
+                        ),
+                        raw_response={
+                            "event_type": "OTHER",
+                            "error": "stale_news",
+                            "pre_marked": True,
+                            "max_age_seconds": max_age_s,
+                        },
+                    )
+                )
+                skipped += 1
+            session.commit()
+            log.info(
+                "analyzer.startup_sweep",
+                stale_found=len(stale_rows),
+                pre_marked=skipped,
+                max_age_seconds=max_age_s,
+            )
 
     async def wait_until_ready(self, timeout: float = 2.0) -> None:
         """Block until the loop has subscribed to the event bus.
@@ -214,6 +315,43 @@ class Service:
         if already:
             log.info("analyzer.skip_existing_analysis", announcement_id=announcement_id)
             return None
+
+        # Step 1.5: STALENESS GATE. The spike is gone; don't burn an LLM
+        # call on a stale filing and don't open a position that's
+        # guaranteed to be late. We persist a placeholder analysis row
+        # (same shape as a real failure path) so a future replay won't
+        # re-trigger this announcement, and we log the skip.
+        settings = get_settings()
+        max_age_s = int(getattr(settings, "MAX_NEWS_AGE_SECONDS", 90))
+        filed_at = announcement.filed_at
+        age_seconds: Optional[float] = None
+        if filed_at is not None:
+            # filed_at comes back from the DB as a naive datetime in our
+            # SQLite schema; treat naive as UTC (matches monitor + DB
+            # convention) before subtracting now.
+            if filed_at.tzinfo is None:
+                filed_at = filed_at.replace(tzinfo=timezone.utc)
+            age_seconds = (datetime.now(timezone.utc) - filed_at).total_seconds()
+            if age_seconds > max_age_s:
+                log.warning(
+                    "analyzer.stale_news_skipped",
+                    announcement_id=announcement_id,
+                    symbol=announcement.symbol,
+                    age_seconds=round(age_seconds, 2),
+                    max_age_seconds=max_age_s,
+                    headline=announcement.headline,
+                )
+                await loop.run_in_executor(
+                    None, _store_failed_analysis,
+                    self._session_factory, announcement_id,
+                    "stale_news",
+                    {
+                        "age_seconds": round(age_seconds, 2),
+                        "max_age_seconds": max_age_s,
+                        "filed_at": filed_at.isoformat(),
+                    },
+                )
+                return None
 
         # Step 2: pick prompt template (event-type heuristic + DEFAULT).
         detected = detect_event_type(

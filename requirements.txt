@@ -18,6 +18,12 @@ structlog==24.4.0
 # HTTP client (used by future tracks; included now so deps are stable)
 httpx==0.28.1
 
+# Fyers broker SDK — used ONLY for the realtime WebSocket feeds
+# (data socket = live prices, order socket = fill updates). REST
+# order placement / quotes stay on httpx (see app/execution/fyers_live.py).
+# The SDK handles the binary HSM data protocol, heartbeats and reconnect.
+fyers-apiv3==3.1.6
+
 # Scraping — NSE / BSE monitors (T2). Optional at runtime; the import
 # is lazy so tests + non-scraping envs don't need it.
 playwright==1.49.1

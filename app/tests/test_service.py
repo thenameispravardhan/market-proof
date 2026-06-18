@@ -100,8 +100,14 @@ def _make_deepseek_client(handler) -> DeepSeekClient:
     )
 
 
-def _make_announcement(session, *, title: str = "Reliance wins order worth Rs 5000 cr", pdf_url: str = "https://nse/x.pdf") -> Announcement:
+def _make_announcement(session, *, title: str = "Reliance wins order worth Rs 5000 cr", pdf_url: str = "https://nse/x.pdf", filed_at=None) -> Announcement:
     from datetime import datetime, timezone
+    # Use `now` (not a fixed past date) so the analyzer's freshness
+    # gate doesn't pre-empt the test signal — most tests here aren't
+    # about filed_at. Tests that DO want a specific filed_at can
+    # pass one explicitly.
+    if filed_at is None:
+        filed_at = datetime.now(timezone.utc)
     a = Announcement(
         symbol="RELIANCE",
         exchange="NSE",
@@ -109,7 +115,7 @@ def _make_announcement(session, *, title: str = "Reliance wins order worth Rs 50
         headline=title,
         pdf_url=pdf_url,
         source="https://nseindia.com/",
-        filed_at=datetime(2026, 5, 1, 9, 30, tzinfo=timezone.utc),
+        filed_at=filed_at,
     )
     session.add(a)
     session.commit()
@@ -485,3 +491,175 @@ async def test_handle_event_with_bad_payload_logs_and_returns_none(db_session, i
         assert r is None
     finally:
         await svc.aclose()
+
+
+# -- Speed-trading: freshness gate --------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stale_news_skips_llm_and_writes_placeholder(
+    db_session, isolated_db, monkeypatch
+):
+    """An announcement older than MAX_NEWS_AGE_SECONDS must skip the
+    LLM call entirely and persist a placeholder analyses row tagged
+    `stale_news`. This is the 'no trades on old queued news' rule.
+
+    We assert:
+      - the DeepSeek transport is NEVER called,
+      - exactly one analyses row exists, with `reason == "stale_news"`,
+      - no signal row is created,
+      - the service returns None (no publish).
+    """
+    from datetime import datetime, timedelta, timezone
+
+    # Tighten the freshness window so the test is deterministic.
+    # Patch the analyzer's bound reference (it imports `get_settings`
+    # at module load, so a patch on `app.config` won't reach it).
+    monkeypatch.setattr("app.analyzer.service.get_settings", lambda: _settings_with(max_news_age_seconds=30))
+
+    ann = _make_announcement(
+        db_session,
+        title="Stale but plausible positive news",
+        filed_at=datetime.now(timezone.utc) - timedelta(seconds=120),
+    )
+
+    # A transport that EXPLODES if DeepSeek is invoked — if the gate
+    # works we never call it.
+    called = {"n": 0}
+
+    def _explode_if_called(req: httpx.Request) -> httpx.Response:
+        called["n"] += 1
+        raise AssertionError("DeepSeek must NOT be called for stale news")
+
+    client = _make_deepseek_client(_explode_if_called)
+    svc = Service(deepseek_client=client)
+    try:
+        result = await svc.process_announcement(ann.id)
+        assert result is None
+        assert called["n"] == 0
+
+        # Exactly one placeholder analysis, error = "stale_news",
+        # confidence = 0 (so the risk engine can never approve it).
+        analyses = db_session.execute(select(Analysis)).scalars().all()
+        assert len(analyses) == 1
+        a = analyses[0]
+        assert a.announcement_id == ann.id
+        assert a.confidence == 0.0
+        assert a.recommendation == "HOLD"
+        # `_store_failed_analysis` writes the reason into `error` so
+        # it's queryable alongside other failure reasons.
+        assert a.raw_response["error"] == "stale_news"
+        assert "age_seconds" in a.raw_response
+
+        # No signal was published.
+        signals = db_session.execute(select(Signal)).scalars().all()
+        assert signals == []
+    finally:
+        await svc.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fresh_news_proceeds_normally(db_session, isolated_db, monkeypatch):
+    """Sanity: a fresh announcement (filed_at = now) is NOT skipped.
+
+    Ensures the gate doesn't over-trigger.
+    """
+    monkeypatch.setattr("app.analyzer.service.get_settings", lambda: _settings_with(max_news_age_seconds=90))
+    seed_defaults(db_session)
+    _seed_strategy_with_buy_rule(db_session)
+    db_session.commit()
+    ann = _make_announcement(db_session)
+
+    handler = lambda req: httpx.Response(200, json=_deepseek_response(_valid_analysis_json()))
+    client = _make_deepseek_client(handler)
+    svc = Service(deepseek_client=client)
+    try:
+        signal = await svc.process_announcement(ann.id)
+        assert signal is not None
+        assert signal.action == "BUY"
+    finally:
+        await svc.aclose()
+
+
+@pytest.mark.asyncio
+async def test_startup_sweep_premarks_stale_announcements(
+    db_session, isolated_db, monkeypatch
+):
+    """Service.start() must pre-mark every announcement older than the
+    threshold that has no analyses row — so a queue replay (manual
+    tool, future redelivery) can't trigger the LLM on stale news.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setattr("app.analyzer.service.get_settings", lambda: _settings_with(max_news_age_seconds=60))
+
+    # Two stale rows (no analysis), one fresh row.
+    stale1 = _make_announcement(
+        db_session, title="Old #1",
+        filed_at=datetime.now(timezone.utc) - timedelta(seconds=600),
+    )
+    stale2 = _make_announcement(
+        db_session, title="Old #2",
+        filed_at=datetime.now(timezone.utc) - timedelta(seconds=300),
+    )
+    fresh = _make_announcement(
+        db_session, title="Fresh",
+        filed_at=datetime.now(timezone.utc),
+    )
+
+    # Stub the loop task so start() doesn't actually subscribe to the
+    # event bus (the loop task would block the test). We only care
+    # about the pre-mark sweep, which runs synchronously inside start().
+    svc = Service(deepseek_client=_make_deepseek_client(lambda r: httpx.Response(200)))
+    try:
+        svc.start()  # runs the sweep synchronously, then creates the loop task
+        # Stop the loop task right away (we don't need it for this test).
+        svc.stop()
+        await svc.wait_until_stopped()
+
+        # The two stale rows should now have placeholder analyses.
+        from sqlalchemy import select as _sel
+        ann_ids = {stale1.id, stale2.id, fresh.id}
+        analyses_by_ann = {
+            row.announcement_id: row
+            for row in db_session.execute(_sel(Analysis)).scalars().all()
+        }
+        assert stale1.id in analyses_by_ann
+        assert stale2.id in analyses_by_ann
+        # The fresh row should NOT have been pre-marked.
+        assert fresh.id not in analyses_by_ann
+        # All placeholders tagged stale_news (written into `error`
+        # by the path that mirrors `_store_failed_analysis`).
+        for aid in (stale1.id, stale2.id):
+            row = analyses_by_ann[aid]
+            assert row.raw_response.get("error") == "stale_news"
+            assert row.confidence == 0.0
+    finally:
+        await svc.aclose()
+
+
+def _settings_with(*, max_news_age_seconds: int = 90) -> Any:
+    """Build a Settings stub with all the fields the analyzer's
+    pipeline reads, defaulted to safe values, plus the freshness
+    override the test cares about.
+
+    The stale-news tests hit the gate and return early so they never
+    read the other fields — but the fresh-news test goes through the
+    rules + risk check, which reads `MAX_SINGLE_POSITION_PCT` and
+    `MAX_SIGNALS_PER_DAY`. We provide both so one stub covers all
+    three tests.
+    """
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        MAX_NEWS_AGE_SECONDS=max_news_age_seconds,
+        MAX_SINGLE_POSITION_PCT=20.0,
+        MAX_SIGNALS_PER_DAY=20,
+        MAX_CAPITAL_RISK_PCT=1.0,
+        DAILY_MAX_LOSS_PCT=2.0,
+        MAX_CONCURRENT_POSITIONS=5,
+        MIN_LIQUIDITY_CRORE=5.0,
+        DEFAULT_SL_PCT=6.0,
+        DEFAULT_TARGET_RR=3.0,
+        PORTFOLIO_VALUE=1_000_000.0,
+        TRADING_MODE="paper",
+    )

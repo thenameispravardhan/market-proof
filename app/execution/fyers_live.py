@@ -289,6 +289,17 @@ class FyersClient:
     def access_token(self) -> str:
         return self._access_token
 
+    @property
+    def app_id(self) -> str:
+        return self._app_id
+
+    @property
+    def ws_access_token(self) -> str:
+        """The `<app_id>:<access_token>` string the Fyers WebSocket SDK
+        (data + order sockets) expects as its `access_token` argument —
+        the same format as the REST `Authorization` header."""
+        return self._auth_header()
+
     # -- auth header -----------------------------------------------------
 
     def _auth_header(self) -> str:
@@ -708,6 +719,19 @@ class FyersLiveBackend:
 
     def set_access_token(self, access_token: str) -> None:
         self._client.set_access_token(access_token)
+
+    @property
+    def app_id(self) -> str:
+        return self._client.app_id
+
+    @property
+    def access_token(self) -> str:
+        return self._client.access_token
+
+    @property
+    def ws_access_token(self) -> str:
+        """`<app_id>:<access_token>` for the Fyers WebSocket SDK."""
+        return self._client.ws_access_token
 
     # -- TradingBackend protocol -----------------------------------------
 

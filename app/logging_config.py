@@ -12,20 +12,49 @@ import structlog
 # in every log line emitted while the request is in flight.
 correlation_id_var: ContextVar[str | None] = ContextVar("correlation_id", default=None)
 
-# Keys we never want to see in logs, even when nested. Match is
-# case-insensitive substring.
-_SECRET_KEYS: tuple[str, ...] = (
-    "key",
-    "token",
-    "secret",
-    "password",
-    "passwd",
-    "authorization",
-    "cookie",
-    "credential",
+# Compound secret names — substring match (case-insensitive). These are
+# the snake_case / camelCase variants of the common credential fields;
+# they match anywhere inside a key so `{"refreshToken": ...}` is caught
+# just like `{"refresh_token": ...}`.
+_SECRET_PATTERNS: tuple[str, ...] = (
+    "api_key", "apikey",
+    "access_token", "accesstoken",
+    "auth_token", "authtoken", "authtokens",
+    "refresh_token", "refreshtoken",
+    "session_token", "sessiontoken",
+    "csrf_token", "csrftoken",
+    "bearer_token", "bearertoken",
+    "secret_key", "secretkey",
+    "private_key", "privatekey",
+    "client_secret", "clientsecret",
+    "app_secret", "appsecret",
+    "password_hash", "passwd_hash", "pwd_hash",
+    "x-api-key", "x_api_key",
+    "authorization",  # both header name and field name in responses
+)
+
+# Standalone secret names — exact match ONLY (case-insensitive). These
+# are short common words that double as field names; matching them as
+# substrings would false-positive on `keys`, `keyword`, `tokenizer`,
+# `passwordless`, etc., so we only fire when the key IS one of these
+# words (nothing else attached).
+_STANDALONE_SECRETS: frozenset[str] = frozenset(
+    s.lower()
+    for s in (
+        "key", "token", "secret", "password", "passwd", "pwd",
+        "cookie", "credential", "credentials",
+    )
 )
 
 _REDACTED = "***"
+
+
+def _is_secret_key(k: str) -> bool:
+    """True when `k` (a dict key) looks like a secret field name."""
+    lk = k.lower()
+    if lk in _STANDALONE_SECRETS:
+        return True
+    return any(p in lk for p in _SECRET_PATTERNS)
 
 
 def _redact(value: Any) -> Any:
@@ -33,7 +62,7 @@ def _redact(value: Any) -> Any:
     if isinstance(value, dict):
         out: dict[str, Any] = {}
         for k, v in value.items():
-            if isinstance(k, str) and any(s in k.lower() for s in _SECRET_KEYS):
+            if isinstance(k, str) and _is_secret_key(k):
                 out[k] = _REDACTED
             else:
                 out[k] = _redact(v)

@@ -44,5 +44,11 @@ frontend/dist/
 logs/*.log
 logs/*.err
 
+# Fyers SDK WebSocket logs (written to cwd by fyers-apiv3; we redirect
+# them into logs/ but ignore the root-level fallback too).
+fyersDataSocket.log
+fyersOrderSocket.log
+fyersRequests.log
+
 # Live-trading safety sentinel (operator-created, not committed)
 .i_accept_live_risk

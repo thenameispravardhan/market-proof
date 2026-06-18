@@ -77,9 +77,17 @@ class MarketDataBus:
         ask: Optional[float] = None,
         volume: Optional[int] = None,
         average_daily_volume_crore: Optional[float] = None,
+        change: Optional[float] = None,
+        change_pct: Optional[float] = None,
+        prev_close: Optional[float] = None,
         extra: Optional[dict[str, Any]] = None,
     ) -> Quote:
         """Update the cache and notify all subscribers for `symbol`.
+
+        `change` / `change_pct` / `prev_close` are the day-change fields
+        the live Fyers feed (REST or WebSocket) carries; the status-bar
+        index ticker renders `change_pct`. They stay None for synthetic
+        paper ticks.
 
         Returns the new Quote.
         """
@@ -90,6 +98,9 @@ class MarketDataBus:
             ask=ask,
             volume=volume,
             average_daily_volume_crore=average_daily_volume_crore,
+            change=change,
+            change_pct=change_pct,
+            prev_close=prev_close,
             extra=dict(extra or {}),
         )
         async with self._lock:

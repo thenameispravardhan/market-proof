@@ -253,6 +253,118 @@ async def test_close_all_flattens_unmanaged_positions(db_session, isolated_db):
     assert all(p.quantity == 0 for p in db_session.query(PositionRow).all())
 
 
+# -- Speed-trading: time-based exit --------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_managed_position_time_exit_expired():
+    """`time_exit_expired` returns True iff max_hold_seconds has elapsed."""
+    from datetime import datetime, timedelta, timezone
+    opened = datetime.now(timezone.utc) - timedelta(seconds=120)
+    # 60s window, 120s elapsed -> expired.
+    mp = ManagedPosition(
+        symbol="X", quantity=10, entry=100.0, stop_loss=95.0, target=120.0,
+        opened_at=opened, max_hold_seconds=60,
+    )
+    assert mp.time_exit_expired() is True
+    # 200s window, 120s elapsed -> not expired.
+    mp.max_hold_seconds = 200
+    assert mp.time_exit_expired() is False
+    # max_hold_seconds = 0 disables the time exit entirely.
+    mp.max_hold_seconds = 0
+    assert mp.time_exit_expired() is False
+
+
+@pytest.mark.asyncio
+async def test_trade_manager_exits_on_time_window(db_session, isolated_db):
+    """A position held past `max_hold_seconds` is force-closed on the
+    next sweep with reason TIME_EXIT, at the latest quote, regardless
+    of whether SL/target has been hit. Speed-trading rule: capture the
+    20-30 min spike and get out.
+    """
+    from datetime import datetime, timedelta, timezone
+    md = MarketDataBus()
+    # Build the manager then tamper with the registered position's
+    # opened_at to simulate a position held for 31 minutes (past the
+    # 30-min default window). Easier than sleeping in a test.
+    tm = TradeManager(market_data=md)
+    await tm.register(
+        symbol="TATAMOTORS", quantity=10, entry=100.0,
+        stop_loss=80.0, target=130.0,
+        max_hold_seconds=1800,  # 30 min default
+    )
+    # Backdate opened_at by 31 minutes via the in-memory book.
+    async with tm._lock:
+        mp = tm._book["TATAMOTORS"]
+        mp.opened_at = datetime.now(timezone.utc) - timedelta(seconds=31 * 60)
+    # The current price is 105 (well within SL/target) — the only
+    # reason to exit is TIME_EXIT.
+    await md.publish("TATAMOTORS", 105.0)
+    await tm._sweep()
+
+    # Position no longer managed.
+    assert tm.managed_positions() == []
+    # A SELL trade was written with reason TIME_EXIT and a small
+    # realised P&L (105 - 100) * 10 = +50.
+    trades = db_session.query(TradeRow).filter_by(symbol="TATAMOTORS").all()
+    assert len(trades) == 1
+    assert trades[0].side == "SELL"
+    assert trades[0].pnl == pytest.approx(50.0)
+    assert trades[0].status == "filled"
+    # The exit reason propagates into the trade_manager.exit log line
+    # (covered by the audit_log row written by _settle_exit).
+    from app.db.models import AuditLog
+    audit_rows = db_session.query(AuditLog).filter_by(action="trade.closed").all()
+    assert any(
+        r.after and r.after.get("reason") == "TIME_EXIT"
+        for r in audit_rows
+    )
+
+
+@pytest.mark.asyncio
+async def test_time_exit_does_not_fire_when_disabled(db_session, isolated_db):
+    """max_hold_seconds = 0 disables the time exit entirely — only
+    SL/target apply. (Forward-compat for strategies that want the
+    manager as a pure SL/target executor.)"""
+    md = MarketDataBus()
+    tm = TradeManager(market_data=md)
+    await tm.register(
+        symbol="HCL", quantity=5, entry=200.0,
+        stop_loss=180.0, target=240.0,
+        max_hold_seconds=0,  # disabled
+    )
+    # Backdate so we'd otherwise hit the time window, but it's disabled.
+    from datetime import datetime, timedelta, timezone
+    async with tm._lock:
+        tm._book["HCL"].opened_at = datetime.now(timezone.utc) - timedelta(seconds=7200)
+    await md.publish("HCL", 210.0)  # within SL/target
+    await tm._sweep()
+    # Still managed — only SL/target would close it.
+    assert any(mp.symbol == "HCL" for mp in tm.managed_positions())
+    # And no exit trade was written.
+    assert db_session.query(TradeRow).filter_by(symbol="HCL").count() == 0
+
+
+@pytest.mark.asyncio
+async def test_register_uses_global_max_hold_default(db_session, isolated_db, monkeypatch):
+    """When register() is called without an explicit max_hold_seconds,
+    it falls back to the global Settings.MAX_HOLD_SECONDS — that's how
+    the speed-trading 20-30 min window propagates to every trade.
+    """
+    from types import SimpleNamespace
+    monkeypatch.setattr(
+        "app.execution.trade_manager.get_settings",
+        lambda: SimpleNamespace(MAX_HOLD_SECONDS=1234),
+    )
+    md = MarketDataBus()
+    tm = TradeManager(market_data=md)
+    await tm.register(
+        symbol="AUTO", quantity=1, entry=10.0, stop_loss=9.0, target=12.0,
+    )
+    mp = tm.managed_positions()[0]
+    assert mp.max_hold_seconds == 1234
+
+
 # -- Integration: quote feed seeds a fill for a BUY ----------------------
 
 

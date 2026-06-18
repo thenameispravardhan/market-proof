@@ -133,6 +133,14 @@ def _manager():
     return mgr
 
 
+def _fyers_stream():
+    """The realtime Fyers stream manager from the lifespan, or None when
+    it isn't running (tests / streaming disabled)."""
+    from app.main import app
+
+    return getattr(app.state, "fyers_stream", None)
+
+
 def _require_real_account(db: Session, account_id: int) -> BrokerAccount:
     """Return the broker_accounts row, or raise 404/400.
 
@@ -442,6 +450,16 @@ async def get_quote(
     """
     sym = symbol.upper()
     md = _manager().market_data
+    # WebSocket-first: tell the realtime feed this symbol is being viewed so
+    # it subscribes (and keeps it subscribed while the page polls). After the
+    # first tick lands, the fresh-bus branch below serves it and we stop
+    # hitting REST /data/quotes for the Trade page. Non-blocking.
+    stream = _fyers_stream()
+    if stream is not None:
+        try:
+            stream.touch_interest(sym)
+        except Exception:  # noqa: BLE001
+            pass
     cached = await md.get_quote(sym)
     # Serve the in-process bus cache ONLY when it's fresh and real (never
     # a simulated paper price). See `_bus_quote_is_fresh` / `_is_simulated`.

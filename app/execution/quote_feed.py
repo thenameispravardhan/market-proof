@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import random
+from datetime import datetime, timezone
 from typing import Awaitable, Callable, Optional
 
 from app.config import get_settings
@@ -157,6 +158,13 @@ class QuoteFeed:
     async def _tick_all(self) -> None:
         for symbol in list(self._watched.keys()):
             try:
+                # If the realtime Fyers WebSocket has published a fresh tick
+                # for this symbol, the bus is already live — skip the REST
+                # poll entirely. This is what removes the per-symbol
+                # /data/quotes calls (and the 429s). REST / simulation only
+                # kick in as a backstop when the socket is silent or absent.
+                if await self._has_fresh_stream_tick(symbol):
+                    continue
                 price = None
                 simulated = True
                 # Always prefer a REAL price (the connected Fyers account,
@@ -178,6 +186,24 @@ class QuoteFeed:
                     await self._publish(symbol, float(price), simulated=simulated)
             except Exception:  # noqa: BLE001
                 log.exception("quote_feed.tick_failed", symbol=symbol)
+
+    async def _has_fresh_stream_tick(self, symbol: str) -> bool:
+        """True when the realtime WebSocket feed (source ``fyers_ws``) has
+        published a recent tick for `symbol`.
+
+        Only the socket's ``fyers_ws`` source counts — NOT this feed's own
+        REST publishes (``fyers``), otherwise the poll would suppress
+        itself and never refresh. The window is 2×QUOTE_REFRESH_SECONDS so
+        the REST backstop resumes promptly if the socket goes quiet.
+        """
+        quote = await self._md.get_quote(symbol)
+        if quote is None:
+            return False
+        if (quote.extra or {}).get("source") != "fyers_ws":
+            return False
+        age = (datetime.now(timezone.utc) - quote.timestamp).total_seconds()
+        window = max(2.0, 2.0 * float(get_settings().QUOTE_REFRESH_SECONDS))
+        return age < window
 
     def _next_paper_price(self, symbol: str) -> float:
         last = self._watched.get(symbol) or _base_price_for(symbol)

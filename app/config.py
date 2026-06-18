@@ -79,6 +79,28 @@ class Settings(BaseSettings):
     # How often the quote feed refreshes watched symbols (seconds).
     QUOTE_REFRESH_SECONDS: int = 5
 
+    # ---------- Speed-trading / freshness / hold rules ----------
+    # Maximum age (seconds) of an announcement, measured against its
+    # `filed_at`, before the analyzer treats it as STALE and refuses
+    # to call the LLM. This is the "no trades on old queued news"
+    # rule. The analyzer also pre-marks every announcement older than
+    # this on startup so a process restart never replays the backlog.
+    # Default 90s gives ~70s of slack inside the 20-second trade
+    # budget for downstream latency (LLM + Fyers + fill).
+    MAX_NEWS_AGE_SECONDS: int = 90
+    # Maximum time (seconds) the trade manager holds an open position
+    # regardless of stop-loss / target. Captures the "20-30 min spike
+    # capture" rule — when the window closes we exit at the last
+    # price with reason TIME_EXIT. Per-position values are read live
+    # so an operator can shorten / extend the window without a code
+    # change. Default 1800s = 30 minutes.
+    MAX_HOLD_SECONDS: int = 1800
+    # Realtime Fyers WebSocket feed (data socket = live prices, order
+    # socket = fill tracking). When True (default) it supersedes per-symbol
+    # REST quote polling for any symbol the socket is actively streaming;
+    # set False to fall back to pure REST polling.
+    FYERS_STREAMING_ENABLED: bool = True
+
     # ---------- Internal ----------
     TESTING: int = 0
     APP_VERSION: str = "0.1.0"
@@ -124,6 +146,13 @@ class Settings(BaseSettings):
     def _refresh_positive(cls, v: int) -> int:
         if v < 1:
             raise ValueError("QUOTE_REFRESH_SECONDS must be >= 1")
+        return v
+
+    @field_validator("MAX_NEWS_AGE_SECONDS", "MAX_HOLD_SECONDS")
+    @classmethod
+    def _positive_seconds(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("seconds value must be >= 1")
         return v
 
     @field_validator("MAX_CONCURRENT_POSITIONS", "MAX_SIGNALS_PER_DAY")

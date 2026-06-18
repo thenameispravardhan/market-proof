@@ -45,6 +45,7 @@ from app.api import (
 from app.config import get_settings
 from app.db.init import init_db
 from app.execution.manager import Manager as ExecutionManager
+from app.execution.fyers_stream import FyersStreamManager
 from app.execution.quote_feed import QuoteFeed
 from app.execution.trade_manager import TradeManager
 from app.logging_config import configure_logging, correlation_id_var, get_logger
@@ -129,33 +130,27 @@ async def lifespan(app: FastAPI):
         """REAL market price for the quote feed (used in BOTH paper and
         live mode so paper-order fills are realistic, not synthetic).
 
-        Resolves a bare short-name (e.g. 'BHARTIARTL', as the news pipeline
-        emits) to a full broker symbol (NSE:BHARTIARTL-EQ) via the
-        instrument master, then fetches the live price from the connected
-        Fyers account (the sole price source — no public feed). Returns
-        None on any miss so the feed keeps the last price / simulates."""
-        # Resolve bare short-name -> full Fyers symbol.
-        full = symbol
-        if ":" not in symbol:
+        WebSocket-FIRST: ask the realtime stream for the price (it serves
+        from its live cache if the symbol is already streaming, else
+        subscribes on demand and waits briefly for the first tick). Only
+        when the socket can't deliver — not connected, or no tick in time —
+        do we fall back to a one-shot REST quote. This is what keeps the
+        per-symbol /data/quotes calls from coming back for symbols the
+        socket can serve. Returns None on any miss so the feed keeps the
+        last price / simulates."""
+        # WS-first.
+        if fyers_stream is not None:
             try:
-                from app.services.instrument_master import get_master
-
-                hits = get_master().search(symbol, limit=8, segments=["EQ"])
-                exact = [h for h in hits if h.short_name == symbol.upper()]
-                # Prefer the NSE listing (primary / most liquid) over BSE.
-                pick = (
-                    next((h for h in exact if h.exchange == "NSE"), None)
-                    or (exact[0] if exact else None)
-                    or (hits[0] if hits else None)
-                )
-                if pick is not None:
-                    full = pick.symbol
+                price = await fyers_stream.get_live_price(symbol)
+                if price is not None and price > 0:
+                    return float(price)
             except Exception:  # noqa: BLE001
                 pass
-        # The connected Fyers account is the sole price source (no public
-        # feed). `market.fetch_quote` resolves it via the same execution
-        # manager singleton and serves equities, indices, futures and
-        # options; None when Fyers isn't connected.
+        # REST fallback. Resolve bare short-name -> full Fyers symbol
+        # (shared with the streaming feed so both resolve identically).
+        from app.execution.symbols import resolve_fyers_symbol
+
+        full = resolve_fyers_symbol(symbol) or symbol
         try:
             from app.api.market import fetch_quote
 
@@ -176,11 +171,20 @@ async def lifespan(app: FastAPI):
         paper_backend=execution_manager.paper_backend,
     )
     execution_manager.attach_quote_feed(quote_feed)
+    # Realtime Fyers feed: data socket streams live prices into the same
+    # market-data bus (so QuoteFeed can skip REST polling for streamed
+    # symbols → no more /quotes 429s), order socket tracks fills in real
+    # time. No-op until a live Fyers account is connected.
+    fyers_stream = FyersStreamManager(
+        market_data=execution_manager.market_data,
+        quote_feed=quote_feed,
+    )
     # Expose the trade manager so the positions API can close trades,
     # AND the execution manager itself so the manual-trade orders API
     # (and tests) can grab it via `app.state.execution_manager`.
     app.state.trade_manager = trade_manager
     app.state.quote_feed = quote_feed
+    app.state.fyers_stream = fyers_stream
     app.state.execution_manager = execution_manager
     if not settings.TESTING:
         # T3: start the analyzer before the monitors so its event-bus
@@ -203,6 +207,11 @@ async def lifespan(app: FastAPI):
         quote_feed.start()
         trade_manager.start()
         await trade_manager.wait_until_ready()
+        # Realtime Fyers WebSocket feed (prices + order fills). Lazily
+        # connects once a live account is present; toggled off via
+        # FYERS_STREAMING_ENABLED to fall back to pure REST polling.
+        if settings.FYERS_STREAMING_ENABLED:
+            fyers_stream.start()
         # T6: start the notification + outbound webhook managers.
         # Both subscribe to the event bus; the dispatcher POSTs to
         # registered webhook URLs, the notification manager fans
@@ -217,12 +226,16 @@ async def lifespan(app: FastAPI):
             # Stop the producers first so consumers drain cleanly.
             await monitor_manager.stop()
             analyzer_service.stop()
+            # Stop the realtime socket feed before the quote feed so it
+            # stops publishing into the bus first.
+            fyers_stream.stop()
             trade_manager.stop()
             quote_feed.stop()
             execution_manager.stop()
             notification_manager.stop()
             webhook_dispatcher.stop()
             await analyzer_service.wait_until_stopped()
+            await fyers_stream.wait_until_stopped()
             await trade_manager.wait_until_stopped()
             await quote_feed.wait_until_stopped()
             await execution_manager.wait_until_stopped()

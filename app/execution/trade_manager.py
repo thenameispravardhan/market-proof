@@ -2,9 +2,9 @@
 
 The execution Manager opens positions. The TradeManager *closes* them:
 it watches the quote feed for every open position and exits when the
-price hits the stop-loss or the target, computes realised P&L, and
-records everything. It also backs the manual "close" / "square-off
-all" controls on the dashboard.
+price hits the stop-loss, the target, or the time-based exit window
+closes, and computes realised P&L on the way out. It also backs the
+manual "close" / "square-off all" controls on the dashboard.
 
 Flow:
 
@@ -13,6 +13,7 @@ Flow:
       -> register a ManagedPosition, ask the QuoteFeed to watch it
   every QUOTE_REFRESH_SECONDS:
       -> for each managed position, read the latest quote
+      -> TIME_EXIT:  exit if now - opened_at >= max_hold_seconds
       -> long:  exit if last <= stop_loss (STOP) or last >= target (TARGET)
          short: exit if last >= stop_loss (STOP) or last <= target (TARGET)
       -> on exit: settle the position (qty -> 0), write a SELL/BUY
@@ -26,6 +27,16 @@ seam for routing live exits through the broker.
 Idempotent and crash-safe: a handler error is logged and the loop
 keeps running; a position is only settled once (popped from the book
 under the exit path).
+
+Speed-trading rules (NEW):
+  - TIME_EXIT: every position carries a `max_hold_seconds` (default
+    `Settings.MAX_HOLD_SECONDS`, currently 1800s = 30 min). When the
+    window closes we exit at the latest quote regardless of where
+    price is relative to SL/target — captures the "20-30 min spike"
+    rule. Re-armed after a restart from `Position.opened_at`.
+  - Per-position `max_hold_seconds` overrides are honoured if the
+    caller passes one (used by tests; future feature could let
+    strategies set their own window).
 """
 from __future__ import annotations
 
@@ -36,6 +47,7 @@ from typing import Any, Callable, Optional
 
 from app.execution.market_data import MarketDataBus
 from app.execution.quote_feed import QuoteFeed
+from app.config import get_settings
 from app.logging_config import get_logger
 from app.services.event_bus import event_bus
 
@@ -57,6 +69,28 @@ class ManagedPosition:
     strategy_id: Optional[int] = None
     broker_account_id: Optional[int] = None
     opened_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # Maximum time (seconds) the position may stay open before the
+    # trade manager force-closes it at the latest quote (TIME_EXIT).
+    # Speed-trading rule: captures the "20-30 min spike" window so a
+    # slow-mover never stays in the book past its useful life.
+    # 0 / None disables the time exit (only SL/target apply).
+    max_hold_seconds: int = 0
+
+    def time_exit_expired(self, now: Optional[datetime] = None) -> bool:
+        """True iff a non-zero max_hold_seconds has elapsed since opened_at.
+
+        `now` is injectable for tests. Naive `opened_at` is treated as
+        UTC (matches the DB convention) before comparing.
+        """
+        if not self.max_hold_seconds or self.max_hold_seconds <= 0:
+            return False
+        cur = now or datetime.now(timezone.utc)
+        opened = self.opened_at
+        if opened.tzinfo is None:
+            opened = opened.replace(tzinfo=timezone.utc)
+        if cur.tzinfo is None:
+            cur = cur.replace(tzinfo=timezone.utc)
+        return (cur - opened).total_seconds() >= float(self.max_hold_seconds)
 
     def exit_reason(self, last: float) -> Optional[str]:
         """Return 'STOP' / 'TARGET' if `last` triggers an exit, else None."""
@@ -149,8 +183,17 @@ class TradeManager:
         signal_id: Optional[int] = None,
         strategy_id: Optional[int] = None,
         broker_account_id: Optional[int] = None,
+        max_hold_seconds: Optional[int] = None,
     ) -> None:
         symbol = symbol.upper().strip()
+        # Default the hold window to the global setting so the
+        # speed-trading "20-30 min spike" rule applies unless an
+        # override is passed (per-strategy in the future).
+        if max_hold_seconds is None:
+            try:
+                max_hold_seconds = int(get_settings().MAX_HOLD_SECONDS)
+            except Exception:  # noqa: BLE001
+                max_hold_seconds = 0
         mp = ManagedPosition(
             symbol=symbol,
             quantity=int(quantity),
@@ -160,6 +203,7 @@ class TradeManager:
             signal_id=signal_id,
             strategy_id=strategy_id,
             broker_account_id=broker_account_id,
+            max_hold_seconds=int(max_hold_seconds or 0),
         )
         async with self._lock:
             self._book[symbol] = mp
@@ -175,6 +219,7 @@ class TradeManager:
             "trade_manager.registered",
             symbol=symbol, quantity=quantity, entry=entry,
             stop_loss=stop_loss, target=target,
+            max_hold_seconds=mp.max_hold_seconds,
         )
 
     async def update_levels(
@@ -345,6 +390,12 @@ class TradeManager:
         signed_qty = qty if side == "BUY" else -qty
         if signed_qty == 0:
             return
+        # `max_hold_seconds` may be supplied by the publisher (e.g.
+        # the execution manager can read the strategy config and pass
+        # a per-trade override); otherwise `register` defaults to the
+        # global MAX_HOLD_SECONDS setting.
+        mh_payload = payload.get("max_hold_seconds")
+        max_hold_seconds = int(mh_payload) if mh_payload is not None else None
         await self.register(
             symbol=symbol,
             quantity=signed_qty,
@@ -354,6 +405,7 @@ class TradeManager:
             signal_id=signal_id if isinstance(signal_id, int) else None,
             strategy_id=payload.get("strategy_id"),
             broker_account_id=payload.get("account_id"),
+            max_hold_seconds=max_hold_seconds,
         )
 
     async def _sweep(self) -> None:
@@ -362,12 +414,13 @@ class TradeManager:
         # which is empty after a restart). For each: make sure the quote
         # feed is fetching its price, mark-to-market the DB row (so the
         # dashboard shows live, moving P&L), and — for the ones we manage —
-        # check SL/target exits.
+        # check SL/target exits AND the time-based exit window.
         db_symbols = await loop.run_in_executor(
             None, _open_position_symbols, self._session_factory
         )
         async with self._lock:
             book = dict(self._book)
+        now = datetime.now(timezone.utc)
         for symbol in set(db_symbols) | set(book.keys()):
             # Idempotent: ensures the feed pulls a live price for this
             # symbol even if it was opened before this process started.
@@ -385,6 +438,15 @@ class TradeManager:
             )
             mp = book.get(symbol)
             if mp is not None:
+                # TIME_EXIT runs FIRST — the speed-trading rule says the
+                # hold window closes whether or not SL/target has been
+                # hit. After a restart the in-memory book may not hold
+                # the position yet (it rebuilds async from the DB), but
+                # `Position.opened_at` is preserved on disk so the time
+                # exit is still correct on the next sweep.
+                if mp.time_exit_expired(now):
+                    await self._exit(symbol, reason="TIME_EXIT", exit_price=last)
+                    continue
                 reason = mp.exit_reason(last)
                 if reason is not None:
                     await self._exit(symbol, reason=reason, exit_price=last)
@@ -543,6 +605,12 @@ def _open_position_as_managed(
 
     Returns (managed_position, fallback_exit_price) or None when there
     is no open position for the symbol.
+
+    `max_hold_seconds` is re-derived from the live `Settings` so a
+    position opened before a restart still honours the current rule
+    (the alternative — persisting per-position max_hold_seconds —
+    would silently override an operator's setting change for old
+    positions, which is rarely what you want).
     """
     from app.db.models import Position as PositionRow
 
@@ -554,6 +622,14 @@ def _open_position_as_managed(
         )
         if row is None:
             return None
+        # `opened_at` is a naive UTC datetime in the SQLite schema.
+        opened_at = row.opened_at
+        if opened_at is None:
+            opened_at = datetime.now(timezone.utc)
+        try:
+            max_hold_seconds = int(get_settings().MAX_HOLD_SECONDS)
+        except Exception:  # noqa: BLE001
+            max_hold_seconds = 0
         mp = ManagedPosition(
             symbol=row.symbol,
             quantity=int(row.quantity),
@@ -563,6 +639,8 @@ def _open_position_as_managed(
             signal_id=None,
             strategy_id=row.strategy_id,
             broker_account_id=None,
+            opened_at=opened_at,
+            max_hold_seconds=max_hold_seconds,
         )
         fallback_price = float(
             row.last_price if row.last_price and row.last_price > 0 else row.average_price
