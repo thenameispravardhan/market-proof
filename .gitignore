@@ -20,7 +20,7 @@ data/
 # Local env (ignore every .env variant except the committed template)
 .env
 .env.*
-!.env.example
+
 
 # Editor / OS
 .vscode/
