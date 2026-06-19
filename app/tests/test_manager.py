@@ -71,7 +71,8 @@ class _StubBackend:
         self._result = result  # may be None — we synthesise per call.
 
     async def place_order(self, *, signal, symbol, side, quantity,
-                          order_type=OrderType.MARKET, limit_price=None, stop_price=None) -> OrderResult:
+                          order_type=OrderType.MARKET, limit_price=None, stop_price=None,
+                          **kwargs) -> OrderResult:
         self.calls.append({
             "method": "place_order",
             "symbol": symbol, "side": side, "quantity": int(quantity),

@@ -64,6 +64,7 @@ from app.analyzer.service import CHANNEL_NEW_SIGNAL
 from app.config import Settings, get_settings
 from app.db.models import (
     Analysis,
+    Announcement,
     AuditLog,
     BrokerAccount,
     Position as PositionRow,
@@ -141,6 +142,17 @@ def parse_rationale_levels(rationale: Optional[str]) -> dict[str, float]:
 def _default_session_factory() -> Callable[[], Session]:
     from app.db.session import SessionLocal
     return SessionLocal
+
+
+def _check_entry_breakers(
+    session_factory: Callable[[], Session], confidence: float
+) -> tuple[bool, Optional[str]]:
+    """Open a session and ask the circuit breakers whether a new entry is
+    allowed (kill-switch, daily/monthly halt, cooldown, daily trade cap)."""
+    from app.risk import circuit_breakers
+
+    with session_factory() as session:
+        return circuit_breakers.entry_allowed(session, confidence=confidence)
 
 
 # ---- The manager --------------------------------------------------------
@@ -343,7 +355,7 @@ class Manager:
         if loaded is None:
             log.warning("execution_manager.signal_not_found", signal_id=signal_id)
             return None
-        signal, strategy, account, levels = loaded
+        signal, strategy, account, levels, filed_at = loaded
         if signal is None:
             return None
         if strategy is None or account is None:
@@ -374,6 +386,24 @@ class Manager:
                 {"signal_id": signal.id, "code": "ACCOUNT_DISABLED", "account_id": account.id},
             )
             return {"approved": False, "code": "ACCOUNT_DISABLED"}
+
+        # Step 1.5: pre-entry gate (RISK.md) — portfolio circuit breakers /
+        # kill-switch, the IST entry window, and an order-time staleness
+        # re-check (the LLM call may have aged the signal past the
+        # freshness budget). Any of these blocks before we touch a broker.
+        gate = await self._pre_entry_gate(signal, filed_at)
+        if gate is not None:
+            code, message = gate
+            await asyncio.get_running_loop().run_in_executor(
+                None, _persist_risk_block,
+                self._session_factory, signal, account.id, code, message,
+            )
+            await event_bus.publish(
+                CHANNEL_RISK_BLOCKED,
+                {"signal_id": signal.id, "code": code, "message": message,
+                 "symbol": signal.symbol, "account_id": account.id},
+            )
+            return {"approved": False, "code": code}
 
         # Step 2: pick the backend.
         backend = self._backend_for(account)
@@ -467,10 +497,26 @@ class Manager:
 
         # Step 5: place the order.
         side = OrderSide.BUY if signal.action == "BUY" else OrderSide.SELL
-        order_type = OrderType.MARKET
-        # If the signal has explicit limit/stop from T3's
-        # action_params, honour them.
-        # (v1: T3 only emits MARKET-style signals.)
+        # IOC marketable-limit entry (RISK.md §5): cap the fill within a
+        # small buffer of the intended entry so a news spike can't fill us
+        # far away, and use immediate-or-cancel so we never rest in a fast
+        # market. Always INTRADAY for the auto pipeline. Falls back to a
+        # plain MARKET order only when we have no entry price to anchor the
+        # limit on.
+        settings_obj = self._settings_provider()
+        intended_entry = float(entry) if entry is not None else None
+        buffer = float(getattr(settings_obj, "ENTRY_BUFFER_PCT", 0.2)) / 100.0
+        if intended_entry is not None and intended_entry > 0:
+            limit_price = (
+                intended_entry * (1.0 + buffer) if side == OrderSide.BUY
+                else intended_entry * (1.0 - buffer)
+            )
+            order_type = OrderType.LIMIT
+            validity = "IOC"
+        else:
+            limit_price = None
+            order_type = OrderType.MARKET
+            validity = "DAY"
         try:
             result = await backend.place_order(
                 signal=signal,
@@ -478,8 +524,10 @@ class Manager:
                 side=side,
                 quantity=int(decision.sizing.qty),
                 order_type=order_type,
-                limit_price=stop_loss if order_type == OrderType.LIMIT else None,
-                stop_price=stop_loss if order_type in (OrderType.STOP_LOSS, OrderType.STOP_LOSS_MARKET) else None,
+                limit_price=limit_price,
+                stop_price=None,
+                product_type=ProductType.INTRADAY,
+                validity=validity,
             )
         except Exception as e:  # noqa: BLE001
             log.exception("execution_manager.place_order_crashed", signal_id=signal.id)
@@ -491,10 +539,26 @@ class Manager:
             )
             return {"approved": True, "code": "PLACE_ORDER_FAILED", "error": str(e)}
 
+        # Slippage of the fill vs the intended entry (RISK.md §5/§7). The
+        # IOC marketable-limit bounds this to ~the buffer; we record it on
+        # the trade row and warn if it ever exceeds tolerance.
+        slippage_pct: Optional[float] = None
+        if result.average_price is not None and intended_entry and intended_entry > 0:
+            slippage_pct = (
+                abs(float(result.average_price) - intended_entry) / intended_entry * 100.0
+            )
+            if slippage_pct > float(getattr(settings_obj, "MAX_SLIPPAGE_PCT", 0.25)):
+                log.warning(
+                    "execution_manager.slippage_exceeded",
+                    symbol=signal.symbol, intended=round(intended_entry, 2),
+                    fill=round(float(result.average_price), 2),
+                    slippage_pct=round(slippage_pct, 3),
+                )
+
         # Step 6: persist the trade row (status from result).
         await asyncio.get_running_loop().run_in_executor(
             None, _persist_trade,
-            self._session_factory, signal, account.id, result,
+            self._session_factory, signal, account.id, result, slippage_pct,
         )
         # The actual fill price is the authoritative entry — prefer it
         # over the analysis levels so the TradeManager's P&L matches
@@ -530,6 +594,40 @@ class Manager:
             "qty": int(decision.sizing.qty),
             "backend": getattr(backend, "name", type(backend).__name__),
         }
+
+    async def _pre_entry_gate(
+        self, signal: Signal, filed_at: Optional[datetime]
+    ) -> Optional[tuple[str, str]]:
+        """Gate a new auto entry on the portfolio circuit breakers /
+        kill-switch, the IST entry window, and order-time freshness.
+
+        Returns (code, message) when blocked, else None. Manual Trade-page
+        orders deliberately do NOT pass through here.
+        """
+        from app.risk import market_clock
+
+        settings = self._settings_provider()
+        # 1. Circuit breakers / kill switch (DB-backed; respects the
+        #    consecutive-loser high-conviction resume bar).
+        allowed, reason = await asyncio.get_running_loop().run_in_executor(
+            None, _check_entry_breakers, self._session_factory,
+            float(getattr(signal, "confidence", 0.0) or 0.0),
+        )
+        if not allowed:
+            return (f"HALT_{(reason or 'blocked').upper()}", f"circuit breaker: {reason}")
+        # 2. IST entry window (skipped when ENFORCE_MARKET_HOURS is off).
+        if not market_clock.is_entry_window():
+            return ("MARKET_CLOSED",
+                    market_clock.entry_block_reason() or "outside entry window")
+        # 3. Order-time staleness re-check.
+        if filed_at is not None:
+            fa = filed_at if filed_at.tzinfo is not None else filed_at.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - fa).total_seconds()
+            max_age = float(getattr(settings, "MAX_NEWS_AGE_SECONDS", 90))
+            if age > max_age:
+                return ("STALE_AT_ORDER",
+                        f"news aged {age:.0f}s > {max_age:.0f}s at order time")
+        return None
 
     # -- backend selection ---------------------------------------------
 
@@ -1124,11 +1222,11 @@ class Manager:
 def _load_signal_context(
     session_factory: Callable[[], Session],
     signal_id: int,
-) -> Optional[tuple[Optional[Signal], Optional[Strategy], Optional[BrokerAccount], dict[str, float]]]:
+) -> Optional[tuple[Optional[Signal], Optional[Strategy], Optional[BrokerAccount], dict[str, float], Optional[datetime]]]:
     with session_factory() as session:
         signal = session.get(Signal, signal_id)
         if signal is None:
-            return (None, None, None, {})
+            return (None, None, None, {}, None)
         strategy = (
             session.get(Strategy, signal.strategy_id) if signal.strategy_id else None
         )
@@ -1153,8 +1251,17 @@ def _load_signal_context(
                 .order_by(BrokerAccount.id.asc())
                 .first()
             )
+        # Pull the originating announcement's filed_at for the order-time
+        # staleness re-check (the LLM call may have aged the signal).
+        filed_at = None
+        if signal.analysis_id is not None:
+            a = session.get(Analysis, signal.analysis_id)
+            if a is not None and a.announcement_id is not None:
+                ann = session.get(Announcement, a.announcement_id)
+                if ann is not None:
+                    filed_at = ann.filed_at
         levels = parse_rationale_levels(signal.rationale)
-        return (signal, strategy, account, levels)
+        return (signal, strategy, account, levels, filed_at)
 
 
 def _update_signal_levels(
@@ -1243,6 +1350,7 @@ def _persist_trade(
     signal: Signal,
     account_id: int,
     result: OrderResult,
+    slippage_pct: Optional[float] = None,
 ) -> None:
     """Persist the trade row for a placed/filled order.
 
@@ -1275,6 +1383,8 @@ def _persist_trade(
                 existing.price = float(result.average_price)
                 existing.executed_at = result.submitted_at
             existing.broker_account_id = account_id
+            if slippage_pct is not None:
+                existing.slippage_pct = float(slippage_pct)
         else:
             row = TradeRow(
                 signal_id=s.id,
@@ -1286,6 +1396,7 @@ def _persist_trade(
                 order_type=result.order_type.value,
                 status=new_status,
                 broker_order_id=result.broker_order_id or None,
+                slippage_pct=float(slippage_pct) if slippage_pct is not None else None,
                 executed_at=result.submitted_at if result.state == OrderState.FILLED else None,
             )
             session.add(row)

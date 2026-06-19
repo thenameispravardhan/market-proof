@@ -22,6 +22,9 @@ os.environ.setdefault("FYERS_SECRET_KEY", "")
 # Keep the real .env's postback secret out of tests so the DB-override
 # path (which the postback tests exercise) stays authoritative here.
 os.environ.setdefault("FYERS_POSTBACK_SECRET", "")
+# Don't enforce IST market hours in tests — auto-entry gating would
+# otherwise depend on the wall-clock time the suite happens to run at.
+os.environ.setdefault("ENFORCE_MARKET_HOURS", "0")
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402

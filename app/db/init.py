@@ -49,6 +49,7 @@ def init_db() -> None:
 # add these by hand. Idempotent and SQLite-friendly.
 _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
     "positions": [("stop_loss", "FLOAT"), ("target", "FLOAT")],
+    "trades": [("slippage_pct", "FLOAT"), ("r_multiple", "FLOAT")],
 }
 
 

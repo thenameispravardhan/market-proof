@@ -2,10 +2,12 @@ import { lazy, Suspense, useEffect, useState } from "react";
 import { useRouter } from "./router";
 import type { TabKey } from "./router";
 import { useWebSocket } from "./hooks/useWebSocket";
+import { ingestQuote, useLiveQuote } from "./hooks/useQuotes";
 import {
   useFyersAuthorizeUrl,
   useGlobalSettings,
   useMarketIndices,
+  type IndexQuote,
 } from "./hooks/useApi";
 import { useTheme } from "./hooks/useTheme";
 
@@ -68,9 +70,41 @@ function PageContent({ tab }: { tab: TabKey }) {
   }
 }
 
+// Format a number in Indian style (24,856.40).
+function fmtNum(v: number | null | undefined): string {
+  if (v === null || v === undefined) return "—";
+  return v.toLocaleString("en-IN", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+function fmtPct(v: number | null | undefined): string {
+  if (v === null || v === undefined) return "—";
+  const sign = v > 0 ? "+" : "";
+  return `${sign}${v.toFixed(2)}%`;
+}
+
+// One index in the status-bar ticker. Prefers the live `/ws` push quote
+// (sub-second, keyed by the full Fyers index symbol) and falls back to the
+// REST `/api/market/indices` baseline until the first tick streams in.
+function TickerItem({ idx }: { idx: IndexQuote }) {
+  const live = useLiveQuote(idx.symbol);
+  const last_price = live?.last_price ?? idx.last_price;
+  const change_pct = live?.change_pct ?? idx.change_pct;
+  const change = live?.change ?? idx.change;
+  const up = (change ?? 0) >= 0;
+  return (
+    <span className="seg">
+      <span className="sym">{idx.key}</span>
+      <span className="px">{fmtNum(last_price)}</span>
+      <span className={`ch ${up ? "up" : "dn"}`}>{fmtPct(change_pct)}</span>
+    </span>
+  );
+}
+
 // Bloomberg-style status bar at the bottom of the screen. Shows
 // WS state, trading mode, capital, a live ticker of NSE indices
-// (sourced from Fyers via /api/market/indices), and the IST clock.
+// (streamed live over /ws, REST baseline on first paint), and the IST clock.
 function StatusBar({ wsStatus }: { wsStatus: string }) {
   const { data: settings } = useGlobalSettings();
   const { data: market } = useMarketIndices();
@@ -88,20 +122,6 @@ function StatusBar({ wsStatus }: { wsStatus: string }) {
     timeZone: "Asia/Kolkata",
     hour12: false,
   });
-
-  // Format a number in Indian style (24,856.40).
-  const fmt = (v: number | null | undefined): string => {
-    if (v === null || v === undefined) return "—";
-    return v.toLocaleString("en-IN", {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    });
-  };
-  const fmtPct = (v: number | null | undefined): string => {
-    if (v === null || v === undefined) return "—";
-    const sign = v > 0 ? "+" : "";
-    return `${sign}${v.toFixed(2)}%`;
-  };
 
   return (
     <div className="statusbar" data-testid="statusbar">
@@ -128,18 +148,9 @@ function StatusBar({ wsStatus }: { wsStatus: string }) {
       <div className="spacer" />
 
       <div className="ticker" title={market?.ok ? "Live Fyers data" : (market?.reason ?? "loading")}>
-        {(market?.indices ?? []).map((idx) => {
-          const up = (idx.change ?? 0) >= 0;
-          return (
-            <span key={idx.key} className="seg">
-              <span className="sym">{idx.key}</span>
-              <span className="px">{fmt(idx.last_price)}</span>
-              <span className={`ch ${up ? "up" : "dn"}`}>
-                {fmtPct(idx.change_pct)}
-              </span>
-            </span>
-          );
-        })}
+        {(market?.indices ?? []).map((idx) => (
+          <TickerItem key={idx.key} idx={idx} />
+        ))}
         {market && !market.ok && market.configured === false && (
           <span className="seg ticker-empty">
             <span className="sym">MARKET</span>
@@ -190,7 +201,12 @@ function StatusBar({ wsStatus }: { wsStatus: string }) {
 
 export default function App() {
   const [tab, navigate] = useRouter();
-  const { status } = useWebSocket({ channels: ["signals", "trades", "positions"] });
+  const { status } = useWebSocket({
+    channels: ["signals", "trades", "positions", "quotes"],
+    onEvent: (msg) => {
+      if (msg.channel === "quotes") ingestQuote(msg.payload);
+    },
+  });
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(readSidebarOpen);
 
   // Apply theme on mount + on change. The hook writes data-theme to

@@ -214,14 +214,14 @@ class QuoteFeed:
         return new_price
 
     async def _publish(self, symbol: str, price: float, *, simulated: bool = True) -> None:
-        # A simple ADV estimate keeps the liquidity rule happy in paper
-        # mode; in live mode the Fyers quote carries real volume.
-        # `simulated` tags paper (synthetic) prices so consumers that need
-        # REAL prices — the Trade page quote — can skip them. The default
-        # is True because every caller except a live Fyers tick is paper.
+        # ADV honesty (RISK.md §1 seam): only SIMULATED paper prices carry
+        # a synthetic ADV (so the liquidity rule passes in paper testing).
+        # A REAL Fyers tick publishes ADV=None — the Fyers quote doesn't
+        # carry volume yet, and faking it would be a phantom liquidity
+        # guard. The engine treats unknown ADV per REQUIRE_KNOWN_LIQUIDITY.
         await self._md.publish(
             symbol,
             price,
-            average_daily_volume_crore=50.0,
+            average_daily_volume_crore=50.0 if simulated else None,
             extra={"simulated": True} if simulated else {"source": "fyers"},
         )

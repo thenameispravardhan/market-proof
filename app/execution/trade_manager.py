@@ -75,6 +75,27 @@ class ManagedPosition:
     # slow-mover never stays in the book past its useful life.
     # 0 / None disables the time exit (only SL/target apply).
     max_hold_seconds: int = 0
+    # --- Trailing-stop / scale-out state (RISK.md §3). R = the initial
+    # per-share risk (|entry - stop_loss| at open). The trailing stop
+    # arms at +`trail_activate_r`·R and then trails the best price by
+    # `trail_distance_r`·R; with scale-out on, half the position is taken
+    # at +`scale_out_r`·R and the rest is trailed with no hard target.
+    initial_risk: float = 0.0
+    peak_price: Optional[float] = None      # best price seen (high long / low short)
+    trail_active: bool = False
+    scaled_out: bool = False
+    scale_out_enabled: bool = False
+    scale_out_r: float = 2.0
+    trail_activate_r: float = 1.5
+    trail_distance_r: float = 0.5
+
+    def r_multiple_at(self, price: float) -> Optional[float]:
+        """Reward (in R) at `price`, or None when R is unknown."""
+        if not self.initial_risk or self.initial_risk <= 0:
+            return None
+        if self.quantity > 0:
+            return (float(price) - self.entry) / self.initial_risk
+        return (self.entry - float(price)) / self.initial_risk
 
     def time_exit_expired(self, now: Optional[datetime] = None) -> bool:
         """True iff a non-zero max_hold_seconds has elapsed since opened_at.
@@ -93,18 +114,57 @@ class ManagedPosition:
         return (cur - opened).total_seconds() >= float(self.max_hold_seconds)
 
     def exit_reason(self, last: float) -> Optional[str]:
-        """Return 'STOP' / 'TARGET' if `last` triggers an exit, else None."""
+        """Return 'STOP' / 'TARGET' if `last` triggers an exit, else None.
+
+        In scale-out mode the fixed target is ignored — the upside is
+        captured by the partial take-profit + trailing stop, so a winner
+        is never hard-capped (preserves the fat tail). The stop (which
+        the trailing logic ratchets) always applies.
+        """
+        use_target = not self.scale_out_enabled
         if self.quantity > 0:  # long
             if self.stop_loss is not None and last <= self.stop_loss:
                 return "STOP"
-            if self.target is not None and last >= self.target:
+            if use_target and self.target is not None and last >= self.target:
                 return "TARGET"
         elif self.quantity < 0:  # short
             if self.stop_loss is not None and last >= self.stop_loss:
                 return "STOP"
-            if self.target is not None and last <= self.target:
+            if use_target and self.target is not None and last <= self.target:
                 return "TARGET"
         return None
+
+    def apply_trailing(self, last: float) -> bool:
+        """Update the peak and (once armed) ratchet the trailing stop.
+
+        Returns True if the trailing stop became active / moved — purely
+        informational. R must be known (initial_risk > 0); otherwise this
+        is a no-op and only the original SL/target apply.
+        """
+        R = self.initial_risk
+        if not R or R <= 0:
+            return False
+        # Track the best price seen since entry.
+        if self.quantity > 0:
+            self.peak_price = last if self.peak_price is None else max(self.peak_price, last)
+            peak_r = (self.peak_price - self.entry) / R
+        else:
+            self.peak_price = last if self.peak_price is None else min(self.peak_price, last)
+            peak_r = (self.entry - self.peak_price) / R
+        if peak_r >= self.trail_activate_r:
+            self.trail_active = True
+        if not self.trail_active:
+            return False
+        # Ratchet the stop toward the best price, never loosening it.
+        if self.quantity > 0:
+            trail_stop = self.peak_price - self.trail_distance_r * R
+            if self.stop_loss is None or trail_stop > self.stop_loss:
+                self.stop_loss = trail_stop
+        else:
+            trail_stop = self.peak_price + self.trail_distance_r * R
+            if self.stop_loss is None or trail_stop < self.stop_loss:
+                self.stop_loss = trail_stop
+        return True
 
     def realised_pnl(self, exit_price: float) -> float:
         # Long: (exit-entry)*qty ; Short: (entry-exit)*|qty|.
@@ -194,6 +254,12 @@ class TradeManager:
                 max_hold_seconds = int(get_settings().MAX_HOLD_SECONDS)
             except Exception:  # noqa: BLE001
                 max_hold_seconds = 0
+        st = get_settings()
+        # R = the per-share risk at open. Drives the trailing stop and the
+        # scale-out take-profit. Zero when there's no stop (trailing off).
+        initial_risk = (
+            abs(float(entry) - float(stop_loss)) if stop_loss is not None else 0.0
+        )
         mp = ManagedPosition(
             symbol=symbol,
             quantity=int(quantity),
@@ -204,6 +270,11 @@ class TradeManager:
             strategy_id=strategy_id,
             broker_account_id=broker_account_id,
             max_hold_seconds=int(max_hold_seconds or 0),
+            initial_risk=initial_risk,
+            scale_out_enabled=bool(getattr(st, "SCALE_OUT_ENABLED", True)),
+            scale_out_r=float(getattr(st, "SCALE_OUT_R", 2.0)),
+            trail_activate_r=float(getattr(st, "TRAIL_ACTIVATE_R", 1.5)),
+            trail_distance_r=float(getattr(st, "TRAIL_DISTANCE_R", 0.5)),
         )
         async with self._lock:
             self._book[symbol] = mp
@@ -410,6 +481,10 @@ class TradeManager:
 
     async def _sweep(self) -> None:
         loop = asyncio.get_running_loop()
+        # EOD square-off (RISK.md §5): once the IST cutoff passes, flatten
+        # everything and skip the rest of the sweep. No-op under TESTING.
+        if await self.square_off_if_due():
+            return
         # Track EVERY open position (not just the in-memory managed book —
         # which is empty after a restart). For each: make sure the quote
         # feed is fetching its price, mark-to-market the DB row (so the
@@ -447,6 +522,15 @@ class TradeManager:
                 if mp.time_exit_expired(now):
                     await self._exit(symbol, reason="TIME_EXIT", exit_price=last)
                     continue
+                # Scale-out a partial at the take-profit R, then trail the
+                # remainder (RISK.md §3 — preserves the fat tail vs a hard
+                # target cap).
+                if mp.scale_out_enabled and not mp.scaled_out and mp.initial_risk > 0:
+                    rmult = mp.r_multiple_at(last)
+                    if rmult is not None and rmult >= mp.scale_out_r:
+                        await self._scale_out(symbol, mp, last)
+                # Ratchet the trailing stop (mutates mp.stop_loss in place).
+                mp.apply_trailing(last)
                 reason = mp.exit_reason(last)
                 if reason is not None:
                     await self._exit(symbol, reason=reason, exit_price=last)
@@ -499,6 +583,24 @@ class TradeManager:
                 out.append(res)
         return out
 
+    async def square_off_if_due(
+        self, now: Optional[datetime] = None, *, force: bool = False
+    ) -> list[dict[str, Any]]:
+        """Flatten everything once the IST square-off time (default 15:10)
+        passes — RISK.md §5, "all intraday positions squared off".
+
+        Gated off under TESTING so unit tests aren't time-of-day
+        dependent; pass `force=True` (or a `now` in the window) to
+        exercise it directly. Returns the list of closed positions.
+        """
+        from app.risk import market_clock
+
+        if not force and getattr(get_settings(), "TESTING", 0):
+            return []
+        if not market_clock.square_off_due(now):
+            return []
+        return await self.close_all(reason="EOD_SQUAREOFF")
+
     async def _exit(
         self,
         symbol: str,
@@ -515,10 +617,11 @@ class TradeManager:
         if mp is None:
             return None
         pnl = mp.realised_pnl(exit_price)
+        r_multiple = mp.r_multiple_at(exit_price)
         # Settle in the DB + in-memory paper book.
         await asyncio.get_running_loop().run_in_executor(
             None, _settle_exit,
-            self._session_factory, mp, exit_price, pnl, reason,
+            self._session_factory, mp, exit_price, pnl, reason, r_multiple,
         )
         if self._paper is not None:
             try:
@@ -539,11 +642,83 @@ class TradeManager:
             "quantity": mp.quantity,
             "entry": mp.entry,
             "pnl": pnl,
+            "r_multiple": r_multiple,
             "signal_id": mp.signal_id,
             "strategy_id": mp.strategy_id,
         }
         await event_bus.publish(CHANNEL_TRADE_CLOSED, result)
         return result
+
+    async def _scale_out(
+        self, symbol: str, mp: ManagedPosition, last: float
+    ) -> Optional[float]:
+        """Take partial profit at the take-profit R and trail the rest.
+
+        Closes half the position at `last`, books the realised P&L, moves
+        the stop on the remainder to breakeven, and flags `scaled_out` so
+        this fires once. If the position is too small to split (1 share)
+        we skip the partial and just lock breakeven.
+        """
+        loop = asyncio.get_running_loop()
+        sign = 1 if mp.quantity > 0 else -1
+        half = abs(int(mp.quantity)) // 2
+        if half < 1:
+            mp.scaled_out = True
+            mp.stop_loss = mp.entry
+            await loop.run_in_executor(
+                None, _persist_position_levels,
+                self._session_factory, symbol, mp.stop_loss, mp.target,
+            )
+            return None
+        closed_signed = half * sign
+        pnl = (float(last) - mp.entry) * closed_signed
+        r_multiple = mp.r_multiple_at(last)
+        # Persist the partial close + reduce the position row (before we
+        # mutate mp.quantity, so the close side is derived from the
+        # original direction).
+        await loop.run_in_executor(
+            None, _partial_settle,
+            self._session_factory, mp, closed_signed, float(last), pnl, r_multiple,
+        )
+        # Reduce the paper backend's in-memory book to match.
+        if self._paper is not None:
+            try:
+                pos = self._paper._positions.get(symbol)  # type: ignore[attr-defined]
+                if pos is not None:
+                    pos.quantity -= closed_signed
+            except Exception:  # noqa: BLE001
+                pass
+        # Remainder runs with a breakeven stop (then the trailing logic
+        # ratchets it up from there).
+        mp.quantity -= closed_signed
+        mp.scaled_out = True
+        mp.stop_loss = mp.entry
+        async with self._lock:
+            booked = self._book.get(symbol)
+            if booked is not None:
+                booked.quantity = mp.quantity
+                booked.scaled_out = True
+                booked.stop_loss = mp.entry
+                booked.peak_price = mp.peak_price
+        await loop.run_in_executor(
+            None, _persist_position_levels,
+            self._session_factory, symbol, mp.stop_loss, mp.target,
+        )
+        log.info(
+            "trade_manager.scale_out",
+            symbol=symbol, closed=half, remainder=mp.quantity,
+            price=round(float(last), 2), pnl=round(pnl, 2),
+        )
+        await event_bus.publish(
+            CHANNEL_TRADE_CLOSED,
+            {
+                "symbol": symbol, "reason": "SCALE_OUT", "exit_price": float(last),
+                "quantity": closed_signed, "entry": mp.entry, "pnl": pnl,
+                "r_multiple": r_multiple, "signal_id": mp.signal_id,
+                "strategy_id": mp.strategy_id, "partial": True,
+            },
+        )
+        return pnl
 
 
 # -- DB helpers (sync, run in executor) ----------------------------------
@@ -626,21 +801,33 @@ def _open_position_as_managed(
         opened_at = row.opened_at
         if opened_at is None:
             opened_at = datetime.now(timezone.utc)
+        st = get_settings()
         try:
-            max_hold_seconds = int(get_settings().MAX_HOLD_SECONDS)
+            max_hold_seconds = int(st.MAX_HOLD_SECONDS)
         except Exception:  # noqa: BLE001
             max_hold_seconds = 0
+        entry = float(row.average_price)
+        stop_loss = float(row.stop_loss) if row.stop_loss is not None else None
+        # Best-effort R after a restart (the persisted stop may already be
+        # trailed, so this can understate R — trailing then resumes from
+        # the current stop, which is safe).
+        initial_risk = abs(entry - stop_loss) if stop_loss is not None else 0.0
         mp = ManagedPosition(
             symbol=row.symbol,
             quantity=int(row.quantity),
-            entry=float(row.average_price),
-            stop_loss=float(row.stop_loss) if row.stop_loss is not None else None,
+            entry=entry,
+            stop_loss=stop_loss,
             target=float(row.target) if row.target is not None else None,
             signal_id=None,
             strategy_id=row.strategy_id,
             broker_account_id=None,
             opened_at=opened_at,
             max_hold_seconds=max_hold_seconds,
+            initial_risk=initial_risk,
+            scale_out_enabled=bool(getattr(st, "SCALE_OUT_ENABLED", True)),
+            scale_out_r=float(getattr(st, "SCALE_OUT_R", 2.0)),
+            trail_activate_r=float(getattr(st, "TRAIL_ACTIVATE_R", 1.5)),
+            trail_distance_r=float(getattr(st, "TRAIL_DISTANCE_R", 0.5)),
         )
         fallback_price = float(
             row.last_price if row.last_price and row.last_price > 0 else row.average_price
@@ -669,6 +856,7 @@ def _settle_exit(
     exit_price: float,
     pnl: float,
     reason: str,
+    r_multiple: Optional[float] = None,
 ) -> None:
     from app.db.models import AuditLog, Position as PositionRow, Signal, Trade as TradeRow
 
@@ -686,6 +874,7 @@ def _settle_exit(
                 status="filled",
                 broker_order_id=None,
                 pnl=float(pnl),
+                r_multiple=float(r_multiple) if r_multiple is not None else None,
                 executed_at=datetime.now(timezone.utc),
             )
         )
@@ -710,7 +899,49 @@ def _settle_exit(
                     "reason": reason,
                     "exit_price": exit_price,
                     "pnl": pnl,
+                    "r_multiple": r_multiple,
                 },
             )
         )
+        session.commit()
+
+
+def _partial_settle(
+    session_factory: Callable[[], Any],
+    mp: ManagedPosition,
+    closed_signed: int,
+    exit_price: float,
+    pnl: float,
+    r_multiple: Optional[float] = None,
+) -> None:
+    """Book a partial (scale-out) close: write the realised-P&L trade
+    row for the closed slice and reduce the position toward zero, leaving
+    the remainder open with a breakeven stop. Does NOT close the signal."""
+    from app.db.models import Position as PositionRow, Trade as TradeRow
+
+    # Close side is opposite the position's direction (sign taken BEFORE
+    # mp.quantity is reduced by the caller).
+    close_side = "SELL" if mp.quantity > 0 else "BUY"
+    with session_factory() as session:
+        session.add(
+            TradeRow(
+                signal_id=mp.signal_id,
+                broker_account_id=mp.broker_account_id,
+                symbol=mp.symbol,
+                side=close_side,
+                quantity=abs(int(closed_signed)),
+                price=float(exit_price),
+                order_type="market",
+                status="filled",
+                broker_order_id=None,
+                pnl=float(pnl),
+                r_multiple=float(r_multiple) if r_multiple is not None else None,
+                executed_at=datetime.now(timezone.utc),
+            )
+        )
+        pos = session.query(PositionRow).filter_by(symbol=mp.symbol).one_or_none()
+        if pos is not None:
+            pos.quantity = int(pos.quantity) - int(closed_signed)
+            pos.last_price = float(exit_price)
+            pos.stop_loss = mp.entry  # breakeven on the remainder
         session.commit()

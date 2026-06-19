@@ -746,6 +746,7 @@ class FyersLiveBackend:
         limit_price: Optional[float] = None,
         stop_price: Optional[float] = None,
         product_type: ProductType = ProductType.INTRADAY,
+        validity: str = "DAY",
     ) -> OrderResult:
         if int(quantity) <= 0:
             return OrderResult(
@@ -807,7 +808,9 @@ class FyersLiveBackend:
             "productType": fyers_product,
             "limitPrice": lp,
             "stopPrice": sp,
-            "validity": "DAY",
+            # IOC for speed-news auto entries (immediate-or-cancel bounds
+            # slippage); DAY for everything else. Fyers v3 accepts both.
+            "validity": "IOC" if str(validity).upper() == "IOC" else "DAY",
             "disclosedQty": 0,
             "offlineOrder": False,
         }

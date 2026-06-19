@@ -289,14 +289,21 @@ async def test_max_single_position_pct_blocks(db_session, isolated_db):
         db_session, "r7", config={"max_single_position_pct": 1.0}  # very tight
     )
     acct = _make_account(db_session)
+    # With notional-capped sizing, a *fresh* order can never exceed the
+    # cap on its own — R7 now guards STACKING. Seed an existing RELIANCE
+    # position already at/over the 1% cap (25k > 10k), so adding any more
+    # blocks. (cap = 1% of 1M = 10k.)
+    db_session.add(PositionRow(
+        symbol="RELIANCE", quantity=10, average_price=2500.0,
+        last_price=2500.0, strategy_id=strat.id,
+    ))
+    db_session.commit()
     sig = _make_signal(db_session, symbol="RELIANCE", action="BUY", strategy_id=strat.id)
     engine = RiskEngine(market_data=md, portfolio_value=1_000_000.0)
     decision = await engine.evaluate(
         signal=sig, strategy=strat, account=acct,
         entry=2500.0, stop_loss=2475.0, session=db_session,
     )
-    # Sizing gives 40 shares (= 100k INR). 100k > 1% of 1M (10k).
-    # R7 fires.
     assert decision.approved is False
     assert "RISK_MAX_SINGLE_POSITION_PCT" in decision.codes
 

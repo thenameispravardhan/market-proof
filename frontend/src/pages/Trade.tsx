@@ -36,12 +36,14 @@ import {
   useSearchSymbols,
   useServerInfo,
 } from "../hooks/useApi";
+import { useLiveQuote } from "../hooks/useQuotes";
 import type {
   BrokerAccount,
   InstrumentHit,
   OptionLeg,
   OrderType,
   PlaceOrderRequest,
+  Position,
   ProductType,
 } from "../types";
 
@@ -51,6 +53,28 @@ function fmtMoney(v: number | null | undefined): string {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });
+}
+
+// One open-position row. Overlays the live `/ws` mark over the 5s REST
+// poll and recomputes unrealised P&L from it — (last - avg) * qty handles
+// both long and short (qty is negative for shorts). Falls back to the REST
+// values until the first tick for this symbol streams in.
+function PositionRow({ p }: { p: Position }) {
+  const live = useLiveQuote(p.symbol);
+  const ltp = live?.last_price ?? p.last_price;
+  const pnl =
+    live?.last_price != null
+      ? (live.last_price - p.average_price) * p.quantity
+      : p.unrealized_pnl;
+  return (
+    <tr>
+      <td className="sym">{p.symbol}</td>
+      <td className={p.quantity > 0 ? "up" : "down"}>{p.quantity}</td>
+      <td>{fmtMoney(p.average_price)}</td>
+      <td>{fmtMoney(ltp)}</td>
+      <td className={(pnl ?? 0) >= 0 ? "up" : "down"}>{fmtMoney(pnl)}</td>
+    </tr>
+  );
 }
 
 /** Compact open-interest formatter (Indian units): K / L (lakh) / Cr. */
@@ -118,6 +142,12 @@ export default function Trade() {
   const refreshInstruments = useRefreshInstruments();
 
   const { data: quote } = useQuote(selected?.symbol ?? "");
+  // Sub-second overlay: the `/ws` push stream (touched live by the quote
+  // endpoint above) overrides the 3s REST poll the instant ticks arrive.
+  const live = useLiveQuote(selected?.symbol);
+  const ltp = live?.last_price ?? (quote?.ok ? quote.last_price : null);
+  const bid = live?.bid ?? (quote?.ok ? quote.bid : null);
+  const ask = live?.ask ?? (quote?.ok ? quote.ask : null);
   // Selected option-chain expiry (epoch ts). Reset on each new symbol.
   const [selectedExpiry, setSelectedExpiry] = useState<string | null>(null);
   // The chain is available for index underlyings AND F&O stocks. We fetch
@@ -423,16 +453,16 @@ export default function Trade() {
                 <div className="quote-cell">
                   <div className="k">LTP</div>
                   <div className="v big" data-testid="quote-ltp">
-                    {quote?.ok ? fmtMoney(quote.last_price) : "—"}
+                    {ltp != null ? fmtMoney(ltp) : "—"}
                   </div>
                 </div>
                 <div className="quote-cell">
                   <div className="k">BID</div>
-                  <div className="v">{quote?.ok ? fmtMoney(quote.bid) : "—"}</div>
+                  <div className="v">{bid != null ? fmtMoney(bid) : "—"}</div>
                 </div>
                 <div className="quote-cell">
                   <div className="k">ASK</div>
-                  <div className="v">{quote?.ok ? fmtMoney(quote.ask) : "—"}</div>
+                  <div className="v">{ask != null ? fmtMoney(ask) : "—"}</div>
                 </div>
                 <div className="quote-cell">
                   <div className="k">LOT</div>
@@ -855,15 +885,7 @@ export default function Trade() {
             </thead>
             <tbody>
               {positions.map((p) => (
-                <tr key={p.symbol}>
-                  <td className="sym">{p.symbol}</td>
-                  <td className={p.quantity > 0 ? "up" : "down"}>{p.quantity}</td>
-                  <td>{fmtMoney(p.average_price)}</td>
-                  <td>{fmtMoney(p.last_price)}</td>
-                  <td className={(p.unrealized_pnl ?? 0) >= 0 ? "up" : "down"}>
-                    {fmtMoney(p.unrealized_pnl)}
-                  </td>
-                </tr>
+                <PositionRow key={p.symbol} p={p} />
               ))}
             </tbody>
           </table>

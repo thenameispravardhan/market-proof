@@ -271,6 +271,7 @@ class PaperBackend:
         limit_price: Optional[float] = None,
         stop_price: Optional[float] = None,
         product_type: ProductType = ProductType.INTRADAY,
+        validity: str = "DAY",
     ) -> OrderResult:
         if int(quantity) <= 0:
             return OrderResult(
@@ -322,6 +323,57 @@ class PaperBackend:
                     stop_price=stop_price,
                     raw={"mode": "paper", "fill_source": "market_immediate"},
                 )
+
+        # Marketable LIMIT (the auto-entry path uses an IOC marketable
+        # limit): fill immediately at the quote when the limit is already
+        # crossable. An IOC limit that ISN'T marketable is cancelled
+        # (EXPIRED) rather than resting — immediate-or-cancel.
+        if (
+            order_type == OrderType.LIMIT
+            and limit_price is not None
+            and self._fill_on_market_immediate
+        ):
+            quote = await self._md.get_quote(symbol)
+            if quote is not None:
+                last = float(quote.last_price)
+                marketable = (
+                    last <= float(limit_price) if side == OrderSide.BUY
+                    else last >= float(limit_price)
+                )
+                if marketable:
+                    await self._fill(oid, last, quantity=int(quantity),
+                                     side=side, symbol=symbol,
+                                     signal_id=signal_id, strategy_id=strategy_id,
+                                     order_type=order_type)
+                    return OrderResult(
+                        broker_order_id=oid,
+                        state=OrderState.FILLED,
+                        symbol=symbol,
+                        side=side,
+                        quantity=int(quantity),
+                        order_type=order_type,
+                        filled_quantity=int(quantity),
+                        average_price=float(last),
+                        limit_price=limit_price,
+                        stop_price=stop_price,
+                        raw={"mode": "paper", "fill_source": "marketable_limit"},
+                    )
+                if str(validity).upper() == "IOC":
+                    # Not marketable -> immediate-or-cancel cancels it. The
+                    # manager's _persist_trade flips the placed row to
+                    # 'expired' from this result's state.
+                    return OrderResult(
+                        broker_order_id=oid,
+                        state=OrderState.EXPIRED,
+                        symbol=symbol,
+                        side=side,
+                        quantity=int(quantity),
+                        order_type=order_type,
+                        limit_price=limit_price,
+                        stop_price=stop_price,
+                        error="IOC limit not marketable",
+                        raw={"mode": "paper", "fill_source": "ioc_cancelled"},
+                    )
 
         # Otherwise PENDING.
         pending = _PendingOrder(

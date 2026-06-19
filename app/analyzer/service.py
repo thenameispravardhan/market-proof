@@ -413,13 +413,33 @@ class Service:
                 headline=announcement.headline or "",
             )
         try:
-            ds_result = await self._deepseek.complete(
-                system=system,
-                user=user,
-                model=template.model,
-                temperature=template.temperature,
-                max_tokens=template.max_tokens,
+            # LLM latency cap (RISK.md §5): news alpha is gone in seconds —
+            # if DeepSeek is slow, discard the opportunity rather than place
+            # a late trade.
+            llm_timeout = float(getattr(settings, "LLM_TIMEOUT_SECONDS", 18.0))
+            ds_result = await asyncio.wait_for(
+                self._deepseek.complete(
+                    system=system,
+                    user=user,
+                    model=template.model,
+                    temperature=template.temperature,
+                    max_tokens=template.max_tokens,
+                ),
+                timeout=llm_timeout,
             )
+        except asyncio.TimeoutError:
+            log.warning(
+                "analyzer.llm_timeout",
+                announcement_id=announcement_id,
+                timeout_s=llm_timeout,
+            )
+            await loop.run_in_executor(
+                None, _store_failed_analysis,
+                self._session_factory, announcement_id,
+                "llm_timeout",
+                {"timeout_s": llm_timeout},
+            )
+            return None
         except DeepSeekError as e:
             log.error(
                 "analyzer.deepseek_failed",

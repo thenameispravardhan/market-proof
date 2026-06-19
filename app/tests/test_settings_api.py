@@ -64,9 +64,10 @@ def test_get_settings_defaults(client: TestClient) -> None:
     body = r.json()
     g = body["global"]
     assert g["TRADING_MODE"] == "paper"
-    assert g["MAX_CAPITAL_RISK_PCT"] == 1.0
-    assert g["DAILY_MAX_LOSS_PCT"] == 2.0
-    assert g["MAX_CONCURRENT_POSITIONS"] == 5
+    # Risk defaults follow RISK.md (0.75% risk, 2.5% daily, 3 concurrent).
+    assert g["MAX_CAPITAL_RISK_PCT"] == 0.75
+    assert g["DAILY_MAX_LOSS_PCT"] == 2.5
+    assert g["MAX_CONCURRENT_POSITIONS"] == 3
     assert g["MAX_SINGLE_POSITION_PCT"] == 20.0
     assert g["MIN_LIQUIDITY_CRORE"] == 5.0
     assert g["MAX_SIGNALS_PER_DAY"] == 20
@@ -93,7 +94,7 @@ def test_put_updates_and_persists(client: TestClient) -> None:
     assert g["MAX_CAPITAL_RISK_PCT"] == 1.5
     assert g["DAILY_MAX_LOSS_PCT"] == 3.0
     # Untouched settings keep their previous values
-    assert g["MAX_CONCURRENT_POSITIONS"] == 5
+    assert g["MAX_CONCURRENT_POSITIONS"] == 3
 
     # GET reflects the change
     r2 = client.get("/api/settings")

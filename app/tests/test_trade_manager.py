@@ -74,7 +74,13 @@ def test_managed_position_exit_reasons_short():
 
 
 @pytest.mark.asyncio
-async def test_trade_manager_exits_on_target(db_session, isolated_db):
+async def test_trade_manager_exits_on_target(db_session, isolated_db, monkeypatch):
+    # Hard-target full-exit path (scale-out disabled). With scale-out on
+    # (the default) a target hit instead scales out + trails — covered in
+    # test_trade_exits.py.
+    monkeypatch.setenv("SCALE_OUT_ENABLED", "0")
+    from app.config import get_settings
+    get_settings.cache_clear()
     md = MarketDataBus()
     tm = TradeManager(market_data=md)
     await tm.register(
@@ -92,6 +98,7 @@ async def test_trade_manager_exits_on_target(db_session, isolated_db):
     assert trades[0].side == "SELL"
     assert trades[0].pnl == pytest.approx(110.0)  # (111-100)*10
     assert trades[0].status == "filled"
+    get_settings.cache_clear()
 
 
 @pytest.mark.asyncio

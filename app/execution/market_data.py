@@ -29,7 +29,16 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
+
+from app.logging_config import get_logger
+
+log = get_logger(__name__)
+
+# An async callback invoked once per published quote. Used to bridge ticks
+# onto the /ws event bus so the dashboard gets sub-second price pushes
+# instead of polling REST.
+QuoteSink = Callable[["Quote"], Awaitable[None]]
 
 
 @dataclass
@@ -65,6 +74,16 @@ class MarketDataBus:
         self._quotes: dict[str, Quote] = {}
         self._subs: dict[str, set[asyncio.Queue[Quote]]] = {}
         self._lock = asyncio.Lock()
+        self._sink: Optional[QuoteSink] = None
+
+    def set_quote_sink(self, sink: Optional[QuoteSink]) -> None:
+        """Register an async callback fired once per published quote.
+
+        The lifespan wires this to the `/ws` event bus so every tick is
+        pushed to connected dashboards in real time. Sink errors are
+        swallowed — a slow or broken consumer must never stall the price
+        feed that fills orders and marks positions."""
+        self._sink = sink
 
     # -- producer side ---------------------------------------------------
 
@@ -113,6 +132,15 @@ class MarketDataBus:
                 # Slow consumer — drop. Better to drop a tick than
                 # block the publisher.
                 pass
+        # Fan the tick out to the /ws bridge (if wired). Outside the lock
+        # and isolated so a sink hiccup never affects the local subscribers
+        # above (order fills, P&L marks) that must always see the tick.
+        sink = self._sink
+        if sink is not None:
+            try:
+                await sink(q)
+            except Exception:  # noqa: BLE001
+                log.debug("market_data.sink_failed", symbol=symbol)
         return q
 
     async def tick(self, symbol: str, last_price: float) -> Quote:

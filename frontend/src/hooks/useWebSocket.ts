@@ -20,6 +20,10 @@ interface UseWebSocketOptions {
   channels?: string[];
   backoffMinMs?: number;
   backoffMaxMs?: number;
+  // Imperative per-event callback. Fired for every event frame BEFORE
+  // `lastMessage` is set. High-frequency channels (e.g. "quotes") route
+  // through here into an external store so they never churn React state.
+  onEvent?: (msg: WsMessage) => void;
 }
 
 interface UseWebSocketResult {
@@ -36,7 +40,7 @@ const WS_OPEN = WebSocket.OPEN;
 const WS_CONNECTING = WebSocket.CONNECTING;
 
 export function useWebSocket(options: UseWebSocketOptions = {}): UseWebSocketResult {
-  const { channels = [], backoffMinMs = 1000, backoffMaxMs = 30_000 } = options;
+  const { channels = [], backoffMinMs = 1000, backoffMaxMs = 30_000, onEvent } = options;
 
   const [status, setStatus] = useState<WsStatus>("connecting");
   const [lastMessage, setLastMessage] = useState<WsMessage | null>(null);
@@ -47,6 +51,8 @@ export function useWebSocket(options: UseWebSocketOptions = {}): UseWebSocketRes
   const backoffRef = useRef(backoffMinMs);
   const channelsRef = useRef(channels);
   channelsRef.current = channels;
+  const onEventRef = useRef(onEvent);
+  onEventRef.current = onEvent;
 
   const getUrl = () => {
     const proto = window.location.protocol === "https:" ? "wss" : "ws";
@@ -70,12 +76,17 @@ export function useWebSocket(options: UseWebSocketOptions = {}): UseWebSocketRes
       try {
         const frame = JSON.parse(ev.data as string);
         if (frame.type === "event") {
-          setLastMessage({
+          const msg: WsMessage = {
             channel: frame.channel,
             payload: frame.payload,
             event_id: frame.event_id ?? "",
             ts: frame.ts ?? "",
-          });
+          };
+          onEventRef.current?.(msg);
+          // Quotes are high-frequency and consumed via the external store
+          // through onEvent — don't re-render every lastMessage subscriber
+          // on each tick.
+          if (msg.channel !== "quotes") setLastMessage(msg);
         }
       } catch {
         // ignore malformed frames

@@ -53,9 +53,13 @@ class Settings(BaseSettings):
     POLL_INTERVAL_SECONDS: int = 5
 
     # ---------- Risk defaults (per-strategy overrides in DB) ----------
-    MAX_CAPITAL_RISK_PCT: float = 1.0
-    DAILY_MAX_LOSS_PCT: float = 2.0
-    MAX_CONCURRENT_POSITIONS: int = 5
+    # Per-trade capital-at-risk cap. RISK.md targets 0.75%; the graduated
+    # ramp (RISK_RAMP_*) starts a fresh account lower and works up to this.
+    MAX_CAPITAL_RISK_PCT: float = 0.75
+    DAILY_MAX_LOSS_PCT: float = 2.5
+    # Max simultaneous open positions. RISK.md caps this at 3 for the
+    # speed-news strategy (clustering risk on correlated names).
+    MAX_CONCURRENT_POSITIONS: int = 3
     MAX_SINGLE_POSITION_PCT: float = 20.0
     MIN_LIQUIDITY_CRORE: float = 5.0
     MAX_SIGNALS_PER_DAY: int = 20
@@ -93,13 +97,71 @@ class Settings(BaseSettings):
     # capture" rule — when the window closes we exit at the last
     # price with reason TIME_EXIT. Per-position values are read live
     # so an operator can shorten / extend the window without a code
-    # change. Default 1800s = 30 minutes.
-    MAX_HOLD_SECONDS: int = 1800
+    # change. Default 1080s = 18 minutes (RISK.md §3 — news alpha decays
+    # fast; holding longer only adds mean-reversion risk).
+    MAX_HOLD_SECONDS: int = 1080
     # Realtime Fyers WebSocket feed (data socket = live prices, order
     # socket = fill tracking). When True (default) it supersedes per-symbol
     # REST quote polling for any symbol the socket is actively streaming;
     # set False to fall back to pure REST polling.
     FYERS_STREAMING_ENABLED: bool = True
+
+    # ---------- Risk management framework (RISK.md) ----------
+    # §1 Pre-trade filters. Some of these gate on market data we don't
+    # yet source (India VIX, live bid/ask spread); those filters NO-OP
+    # (skip + log) rather than fake a pass until a feed is wired — see
+    # app/risk/market_clock.py and the engine's filter seams.
+    MIN_SENTIMENT_CONFIDENCE: float = 0.7      # block weaker-conviction LLM calls
+    INDIA_VIX_MAX: float = 30.0                # suspend entries above this (needs feed)
+    MAX_SPREAD_PCT: float = 0.1               # max bid/ask spread % (needs L1 feed)
+    SHORTING_ENABLED: bool = True             # allow negative-news shorts (intraday)
+    # When True, an unknown ADV blocks the trade in LIVE mode (fail
+    # closed). Default False because the Fyers quote does not yet carry
+    # real volume — flipping this on before a volume feed is wired would
+    # block every live trade. Turn it on once ADV is sourced for real.
+    REQUIRE_KNOWN_LIQUIDITY: bool = False
+    # §2 Position sizing. The risk-based qty and the notional cap are
+    # both computed; the SMALLER wins. A fresh account ramps its
+    # per-trade risk from RISK_RAMP_START_PCT up to MAX_CAPITAL_RISK_PCT
+    # over the first RISK_RAMP_TRADES filled trades.
+    RISK_RAMP_TRADES: int = 100
+    RISK_RAMP_START_PCT: float = 0.5
+    # §3 Stops / targets / trailing (R = initial risk per share).
+    SCALE_OUT_ENABLED: bool = True            # partial at target R, trail the rest
+    SCALE_OUT_R: float = 2.0                  # take-profit multiple of initial risk
+    TRAIL_ACTIVATE_R: float = 1.5             # arm the trailing stop at +1.5R
+    TRAIL_DISTANCE_R: float = 0.5             # trail the high/low by 0.5R
+    DEFAULT_SL_MIN_PCT: float = 1.0           # floor stop distance (1% of entry)
+    DEFAULT_SL_SMALLCAP_PCT: float = 1.5      # 1.5% for stocks under SMALLCAP_PRICE
+    SMALLCAP_PRICE: float = 200.0
+    # §4 Portfolio circuit breakers. Loss limits are % of the relevant
+    # anchor equity (day-start, week-peak, month-start). Tripping the
+    # daily/monthly breaker flattens + halts; weekly throttles risk.
+    WEEKLY_MAX_LOSS_PCT: float = 5.0
+    MONTHLY_MAX_DRAWDOWN_PCT: float = 8.0
+    WEEKLY_BREACH_RISK_PCT: float = 0.25      # risk/trade after a weekly breach
+    MAX_CONSECUTIVE_LOSERS: int = 4
+    CONSECUTIVE_LOSER_PAUSE_MINUTES: int = 45
+    CONSECUTIVE_LOSER_RESUME_CONFIDENCE: float = 0.85
+    MAX_TRADES_PER_DAY: int = 12
+    # §5 Execution safeguards. Auto entries use an IOC marketable-limit
+    # (last ± ENTRY_BUFFER_PCT) cancelled after ORDER_FILL_TIMEOUT; a
+    # fill worse than MAX_SLIPPAGE_PCT off the intended entry is rejected.
+    ENTRY_BUFFER_PCT: float = 0.2
+    MAX_SLIPPAGE_PCT: float = 0.25
+    ORDER_FILL_TIMEOUT_SECONDS: float = 1.5
+    LLM_TIMEOUT_SECONDS: float = 18.0         # discard the opportunity past this
+    # Market session (IST, "HH:MM"). Entry window excludes the first
+    # 15 min after open and the last 30 min before close; all intraday
+    # positions are force-squared-off at SQUARE_OFF_TIME.
+    MARKET_OPEN_IST: str = "09:15"
+    MARKET_CLOSE_IST: str = "15:30"
+    ENTRY_WINDOW_START_IST: str = "09:30"
+    ENTRY_WINDOW_END_IST: str = "15:00"
+    SQUARE_OFF_TIME_IST: str = "15:10"
+    # Skip the market-hours / session gate (handy for paper testing or
+    # backtests where wall-clock time shouldn't block entries).
+    ENFORCE_MARKET_HOURS: bool = True
 
     # ---------- Internal ----------
     TESTING: int = 0
@@ -168,6 +230,37 @@ class Settings(BaseSettings):
         if v < 0:
             raise ValueError("min liquidity must be non-negative")
         return v
+
+    @field_validator(
+        "MIN_SENTIMENT_CONFIDENCE",
+        "CONSECUTIVE_LOSER_RESUME_CONFIDENCE",
+        "RISK_RAMP_START_PCT",
+    )
+    @classmethod
+    def _conf_in_unit_or_pct(cls, v: float) -> float:
+        # MIN_SENTIMENT_CONFIDENCE / resume confidence are 0..1 (LLM
+        # confidence scale); RISK_RAMP_START_PCT is a small percent. All
+        # three must be > 0 — a zero floor would disable the check.
+        if v <= 0:
+            raise ValueError("value must be > 0")
+        return v
+
+    @field_validator(
+        "MARKET_OPEN_IST",
+        "MARKET_CLOSE_IST",
+        "ENTRY_WINDOW_START_IST",
+        "ENTRY_WINDOW_END_IST",
+        "SQUARE_OFF_TIME_IST",
+    )
+    @classmethod
+    def _hhmm(cls, v: str) -> str:
+        parts = v.split(":")
+        if len(parts) != 2 or not (parts[0].isdigit() and parts[1].isdigit()):
+            raise ValueError(f"time must be 'HH:MM', got {v!r}")
+        hh, mm = int(parts[0]), int(parts[1])
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            raise ValueError(f"time out of range: {v!r}")
+        return f"{hh:02d}:{mm:02d}"
 
     # ----- Derived helpers -----
 

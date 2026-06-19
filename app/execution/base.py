@@ -175,6 +175,7 @@ class TradingBackend(Protocol):
         limit_price: Optional[float] = None,
         stop_price: Optional[float] = None,
         product_type: "ProductType" = ...,
+        validity: str = "DAY",
     ) -> OrderResult:
         """Submit an order. Return the initial OrderResult.
 

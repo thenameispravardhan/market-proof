@@ -10,6 +10,8 @@ import {
   useManagedPositions,
   usePositions,
 } from "../../hooks/useApi";
+import { useLiveQuote } from "../../hooks/useQuotes";
+import type { ManagedPosition, Position } from "../../types";
 import { ApiClientError } from "../../api/client";
 import { LevelsCell } from "../positions/LevelsCell";
 import { SkeletonList } from "./Skeleton";
@@ -24,6 +26,55 @@ function pnlClass(v: number | null | undefined): string {
   if (v > 0) return "pnl-pos";
   if (v < 0) return "pnl-neg";
   return "";
+}
+
+// One open-position row. Overlays the live `/ws` mark over the 5s REST
+// poll and recomputes unrealised P&L from it; (last - avg) * qty handles
+// both long and short (qty is negative for shorts). Falls back to the REST
+// values until the first tick for this symbol streams in.
+function PositionRow({
+  p,
+  m,
+  busy,
+  onClose,
+}: {
+  p: Position;
+  m: ManagedPosition | undefined;
+  busy: string | null;
+  onClose: (symbol: string) => void;
+}) {
+  const live = useLiveQuote(p.symbol);
+  const ltp = live?.last_price ?? p.last_price;
+  const pnl =
+    live?.last_price != null
+      ? (live.last_price - p.average_price) * p.quantity
+      : p.unrealized_pnl;
+  return (
+    <tr>
+      <td className="mono symbol">{p.symbol}</td>
+      <td className="mono">{p.quantity}</td>
+      <td className="mono">{fmtMoney(p.average_price)}</td>
+      <td className="mono">{fmtMoney(ltp)}</td>
+      <td className="mono">
+        <LevelsCell
+          symbol={p.symbol}
+          stopLoss={m?.stop_loss ?? null}
+          target={m?.target ?? null}
+        />
+      </td>
+      <td className={`mono ${pnlClass(pnl)}`}>{fmtMoney(pnl)}</td>
+      <td>
+        <button
+          className="btn-sm"
+          onClick={() => onClose(p.symbol)}
+          disabled={busy === p.symbol}
+          title="Close this position at market"
+        >
+          {busy === p.symbol ? "…" : "Close"}
+        </button>
+      </td>
+    </tr>
+  );
 }
 
 export function ActivePositions() {
@@ -86,37 +137,15 @@ export function ActivePositions() {
             </tr>
           </thead>
           <tbody>
-            {open.map((p) => {
-              const m = managedBy.get(p.symbol);
-              return (
-                <tr key={p.id}>
-                  <td className="mono symbol">{p.symbol}</td>
-                  <td className="mono">{p.quantity}</td>
-                  <td className="mono">{fmtMoney(p.average_price)}</td>
-                  <td className="mono">{fmtMoney(p.last_price)}</td>
-                  <td className="mono">
-                    <LevelsCell
-                      symbol={p.symbol}
-                      stopLoss={m?.stop_loss ?? null}
-                      target={m?.target ?? null}
-                    />
-                  </td>
-                  <td className={`mono ${pnlClass(p.unrealized_pnl)}`}>
-                    {fmtMoney(p.unrealized_pnl)}
-                  </td>
-                  <td>
-                    <button
-                      className="btn-sm"
-                      onClick={() => onClose(p.symbol)}
-                      disabled={busy === p.symbol}
-                      title="Close this position at market"
-                    >
-                      {busy === p.symbol ? "…" : "Close"}
-                    </button>
-                  </td>
-                </tr>
-              );
-            })}
+            {open.map((p) => (
+              <PositionRow
+                key={p.id}
+                p={p}
+                m={managedBy.get(p.symbol)}
+                busy={busy}
+                onClose={onClose}
+              />
+            ))}
           </tbody>
         </table>
       )}

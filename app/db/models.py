@@ -189,6 +189,11 @@ class Trade(Base):
     status: Mapped[str] = mapped_column(String(16), default="placed", nullable=False)
     broker_order_id: Mapped[Optional[str]] = mapped_column(String(128), index=True)
     pnl: Mapped[Optional[float]] = mapped_column(Float)
+    # Realised-trade analytics (RISK.md §7): % the fill slipped from the
+    # intended entry, and the exit's reward-to-risk multiple. Populated
+    # on entry fill (slippage) and on close (r_multiple).
+    slippage_pct: Mapped[Optional[float]] = mapped_column(Float)
+    r_multiple: Mapped[Optional[float]] = mapped_column(Float)
     executed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
 
@@ -238,6 +243,45 @@ class RiskEvent(Base):
     context: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
     halted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+
+
+# =========================================================================
+# Core: risk_state (singleton — portfolio circuit-breaker + kill-switch)
+# =========================================================================
+
+
+class RiskState(Base):
+    """Persistent, account-wide risk state. Exactly one row (id=1).
+
+    Backs the circuit breakers and the kill switch: the execution
+    manager refuses to place new orders while `trading_disabled` is
+    set or `halted_until` is in the future, and the breaker checker
+    flattens + sets these when a limit trips. Anchors are captured on
+    the first evaluation of each new day / week / month so equity
+    drawdown can be measured against a stable baseline.
+    """
+
+    __tablename__ = "risk_state"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    # Kill switch / daily / monthly halt.
+    trading_disabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    disabled_reason: Mapped[Optional[str]] = mapped_column(String(256))
+    # Consecutive-loser cooldown — entries refused until this passes.
+    halted_until: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    # Per-trade risk override (e.g. throttled after a weekly-loss breach,
+    # or the graduated ramp on a young account). None → use settings.
+    current_risk_pct: Mapped[Optional[float]] = mapped_column(Float)
+    # Drawdown anchors (the date the window opened + the equity then).
+    day_anchor: Mapped[Optional[date]] = mapped_column(Date)
+    day_start_equity: Mapped[Optional[float]] = mapped_column(Float)
+    week_anchor: Mapped[Optional[date]] = mapped_column(Date)        # Monday of the week
+    week_peak_equity: Mapped[Optional[float]] = mapped_column(Float)  # running peak for peak→trough
+    month_anchor: Mapped[Optional[date]] = mapped_column(Date)       # 1st of the month
+    month_start_equity: Mapped[Optional[float]] = mapped_column(Float)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=_utcnow, onupdate=_utcnow, nullable=False
+    )
 
 
 # =========================================================================
@@ -506,6 +550,7 @@ __all__ = [
     "Trade",
     "Position",
     "RiskEvent",
+    "RiskState",
     "Strategy",
     "BrokerAccount",
     "SignalRule",

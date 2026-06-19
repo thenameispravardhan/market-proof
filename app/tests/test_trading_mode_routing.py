@@ -59,7 +59,8 @@ class _LiveStub:
         self.calls: list[dict[str, Any]] = []
 
     async def place_order(self, *, signal, symbol, side, quantity,
-                          order_type=OrderType.MARKET, limit_price=None, stop_price=None):
+                          order_type=OrderType.MARKET, limit_price=None, stop_price=None,
+                          **kwargs):
         self.calls.append({"method": "place_order", "symbol": symbol, "quantity": int(quantity)})
         return OrderResult(
             broker_order_id=f"STUB-{symbol}",

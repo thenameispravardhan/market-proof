@@ -6,13 +6,20 @@ module seeds a small, sensible rule set on the default strategy so a
 fresh install does something useful in paper mode immediately. The
 operator can edit / disable / reorder these in the Rules UI.
 
-Rule set (priority ASC — first match wins):
+Rule set (priority ASC — first match wins). Longs and shorts are
+symmetric: strong positive news goes long, strong negative news goes
+short (intraday). The old "block strong negatives" rule is gone — we
+now TRADE negatives instead of sitting them out.
 
-  10  Block negatives        any strong negative sentiment        -> BLOCK
+  10  High-conviction short   negative + score<=-60 + conf>=0.7    -> SELL (1.5x size)
   20  High-conviction buy     positive + score>=60 + conf>=0.7     -> BUY  (1.5x size)
   30  Momentum buy            BUY rec + score>=40 + conf>=0.6      -> BUY
+  35  Momentum short          SELL rec + score<=-40 + conf>=0.6    -> SELL
   40  Big-deal buy            ORDER_WIN/ACQUISITION + deal>=100cr   -> BUY
-  50  Sell on bad news        SELL rec + score<=-40                 -> SELL
+
+Shorting is also gated globally by `Settings.SHORTING_ENABLED` (the risk
+engine refuses to OPEN a short when it's off), so disabling shorts needs
+no rule edits.
 
 Idempotent: rules are keyed by (strategy_id, name). Re-running updates
 the existing row's conditions/action in place rather than duplicating.
@@ -75,16 +82,17 @@ def seed_default_paper_account(session: Session) -> bool:
 # Each entry: (name, priority, conditions, action, action_params)
 DEFAULT_RULES: list[tuple[str, int, dict[str, Any], str, dict[str, Any]]] = [
     (
-        "Block strong negatives",
+        "High-conviction short",
         10,
         {
             "all_of": [
                 {"field": "sentiment", "op": "==", "value": "negative"},
                 {"field": "sentiment_score", "op": "<=", "value": -60},
+                {"field": "confidence", "op": ">=", "value": 0.7},
             ]
         },
-        "BLOCK",
-        {"reason": "strong negative news"},
+        "SELL",
+        {"position_size_pct": 15.0, "size_multiplier": 1.5},
     ),
     (
         "High-conviction buy",
@@ -113,6 +121,19 @@ DEFAULT_RULES: list[tuple[str, int, dict[str, Any], str, dict[str, Any]]] = [
         {"position_size_pct": 10.0},
     ),
     (
+        "Momentum short",
+        35,
+        {
+            "all_of": [
+                {"field": "recommendation", "op": "==", "value": "SELL"},
+                {"field": "sentiment_score", "op": "<=", "value": -40},
+                {"field": "confidence", "op": ">=", "value": 0.6},
+            ]
+        },
+        "SELL",
+        {"position_size_pct": 10.0},
+    ),
+    (
         "Big-deal buy",
         40,
         {
@@ -128,18 +149,6 @@ DEFAULT_RULES: list[tuple[str, int, dict[str, Any], str, dict[str, Any]]] = [
         },
         "BUY",
         {"position_size_pct": 12.0},
-    ),
-    (
-        "Sell on bad news",
-        50,
-        {
-            "all_of": [
-                {"field": "recommendation", "op": "==", "value": "SELL"},
-                {"field": "sentiment_score", "op": "<=", "value": -40},
-            ]
-        },
-        "SELL",
-        {"position_size_pct": 10.0},
     ),
 ]
 

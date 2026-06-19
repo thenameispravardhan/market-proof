@@ -52,7 +52,8 @@ def test_high_conviction_buy_matches(db_session):
     assert match.rule_id is not None
 
 
-def test_strong_negative_is_blocked(db_session):
+def test_strong_negative_is_shorted(db_session):
+    # Strong negative news now opens a short (intraday), not BLOCK.
     seed_default_rules(db_session)
     db_session.commit()
     strategy = get_or_create_default_strategy(db_session)
@@ -66,7 +67,7 @@ def test_strong_negative_is_blocked(db_session):
         "recommendation": "SELL",
     }
     match = evaluate(analysis, rules)
-    assert match.action == "BLOCK"
+    assert match.action == "SELL"
 
 
 def test_neutral_news_falls_through_to_hold(db_session):

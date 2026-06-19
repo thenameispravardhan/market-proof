@@ -34,6 +34,7 @@ from app.api import (
     orders as orders_api,
     positions as positions_api,
     prompts as prompts_api,
+    risk as risk_api,
     rules as rules_api,
     search as search_api,
     settings_api,
@@ -175,10 +176,41 @@ async def lifespan(app: FastAPI):
     # market-data bus (so QuoteFeed can skip REST polling for streamed
     # symbols → no more /quotes 429s), order socket tracks fills in real
     # time. No-op until a live Fyers account is connected.
+    from app.api.market import INDICES as _INDICES
+
     fyers_stream = FyersStreamManager(
         market_data=execution_manager.market_data,
         quote_feed=quote_feed,
+        # Keep the index symbols streaming all session so the status-bar
+        # ticker is sub-second, not REST-polled.
+        always_subscribe=[idx["symbol"] for idx in _INDICES],
     )
+
+    # Bridge every market-data tick onto the /ws event bus so the dashboard
+    # gets sub-second price pushes instead of polling REST. Publishing to a
+    # channel with no subscribers is a cheap no-op, so this stays idle until
+    # a browser subscribes to the "quotes" channel.
+    from app.services.event_bus import event_bus as _event_bus
+
+    async def _quote_sink(q) -> None:
+        await _event_bus.publish(
+            "quotes",
+            {
+                "symbol": q.symbol,
+                "last_price": q.last_price,
+                "bid": q.bid,
+                "ask": q.ask,
+                "volume": q.volume,
+                "change": q.change,
+                "change_pct": q.change_pct,
+                "prev_close": q.prev_close,
+                "source": (q.extra or {}).get("source"),
+                "simulated": bool((q.extra or {}).get("simulated")),
+                "ts": q.timestamp.isoformat(),
+            },
+        )
+
+    execution_manager.market_data.set_quote_sink(_quote_sink)
     # Expose the trade manager so the positions API can close trades,
     # AND the execution manager itself so the manual-trade orders API
     # (and tests) can grab it via `app.state.execution_manager`.
@@ -219,10 +251,44 @@ async def lifespan(app: FastAPI):
         notification_manager.start()
         webhook_dispatcher.start()
 
+        # Portfolio circuit-breaker monitor (RISK.md §4): periodically
+        # rolls the day/week/month equity anchors, trips the daily /
+        # weekly / monthly breakers, and flattens everything on a halt.
+        # The EOD square-off itself runs inside the TradeManager sweep.
+        async def _risk_monitor() -> None:
+            from app.db.session import SessionLocal
+            from app.risk import circuit_breakers
+            from app.services.event_bus import event_bus as _bus
+
+            while True:
+                try:
+                    await asyncio.sleep(10.0)
+                    with SessionLocal() as _s:
+                        summary = circuit_breakers.evaluate_breakers(
+                            _s, execution_manager.market_data
+                        )
+                    if summary.get("newly_tripped"):
+                        await _bus.publish("breaker.tripped", summary)
+                    if summary.get("flatten_required"):
+                        log.warning("risk_monitor.flatten", reason=summary.get("disabled_reason"))
+                        await trade_manager.close_all(reason="CIRCUIT_BREAKER")
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    log.exception("risk_monitor.tick_failed")
+
+        risk_monitor_task = asyncio.create_task(_risk_monitor(), name="risk-monitor")
+
     try:
         yield
     finally:
         if not settings.TESTING:
+            # Stop the breaker monitor first.
+            risk_monitor_task.cancel()
+            try:
+                await risk_monitor_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
             # Stop the producers first so consumers drain cleanly.
             await monitor_manager.stop()
             analyzer_service.stop()
@@ -318,6 +384,7 @@ app.include_router(strategies_api.router)
 app.include_router(broker_accounts_api.router)
 app.include_router(audit_log_api.router)
 app.include_router(positions_api.router)
+app.include_router(risk_api.router)
 app.include_router(market_api.router)
 app.include_router(core_api.router)
 app.include_router(orders_api.router)

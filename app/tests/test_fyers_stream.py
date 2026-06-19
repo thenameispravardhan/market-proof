@@ -174,6 +174,46 @@ async def test_unsubscribe_when_symbol_unwatched():
 
 
 @pytest.mark.asyncio
+async def test_always_subscribe_index_symbols_stay_subscribed():
+    """`always_subscribe` ids (the status-bar index ticker) get subscribed
+    on connect and are NEVER unsubscribed by the reconcile sweep, even with
+    an empty position book. A tick publishes under the full id so the
+    dashboard can match on the index symbol."""
+    md = MarketDataBus()
+    holder, df, of = _factories()
+    feed = _FakeQuoteFeed([])  # no open positions
+    mgr = FyersStreamManager(
+        market_data=md,
+        quote_feed=feed,
+        backend_provider=lambda: _FakeBackend(),
+        data_socket_factory=df,
+        order_socket_factory=of,
+        resolve_fn=lambda s: None,
+        always_subscribe=["NSE:NIFTY50-INDEX", "BSE:SENSEX-INDEX"],
+    )
+    mgr._loop = asyncio.get_running_loop()
+    await mgr._ensure_connected()
+    await mgr._reconcile_subscriptions()
+
+    subs = holder["data"].subscribed[0][0]
+    assert "NSE:NIFTY50-INDEX" in subs
+    assert "BSE:SENSEX-INDEX" in subs
+
+    # A second sweep with an empty book must NOT unsubscribe the indices.
+    await mgr._reconcile_subscriptions()
+    assert holder["data"].unsubscribed == []
+
+    # A tick for an index lands on the bus under the full id, source=fyers_ws.
+    mgr._on_data_message(
+        {"symbol": "NSE:NIFTY50-INDEX", "ltp": 24850.5, "ch": 12.0, "chp": 0.05}
+    )
+    await asyncio.sleep(0.05)
+    q = await md.get_quote("NSE:NIFTY50-INDEX")
+    assert q is not None and q.last_price == 24850.5
+    assert q.extra.get("source") == "fyers_ws"
+
+
+@pytest.mark.asyncio
 async def test_data_tick_tolerant_symbol_mapping():
     """The feed may echo the symbol in a different shape than the
     subscription string (split exchange + no NSE: prefix). The tick must

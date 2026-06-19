@@ -68,7 +68,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from typing import Any, Iterable, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional, Sequence
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -80,8 +80,16 @@ from app.db.models import (
     Strategy,
     Trade as TradeRow,
 )
-from app.execution.market_data import MarketDataBus
 from app.logging_config import get_logger
+from app.risk import position_sizer
+
+# Type-only import — `MarketDataBus` is used solely in annotations here
+# (the engine reads `self._md._quotes` off the injected instance). With
+# `from __future__ import annotations` these never evaluate at runtime,
+# so importing it lazily breaks the risk<->execution import cycle that
+# would otherwise fire when `app.risk` is imported before `app.execution`.
+if TYPE_CHECKING:
+    from app.execution.market_data import MarketDataBus
 
 log = get_logger(__name__)
 
@@ -333,6 +341,19 @@ class RiskEngine:
             })
             return RiskDecision(approved=False, violations=violations, context=context)
 
+        # ---- R2b. confidence floor (RISK.md §1) -------------------------
+        # Speed-news trades fire on the LLM's conviction; below the floor
+        # the edge isn't worth the slippage. Manual orders carry
+        # confidence=1.0 so they're unaffected.
+        min_conf = float(getattr(settings, "MIN_SENTIMENT_CONFIDENCE", 0.0) or 0.0)
+        if min_conf > 0.0 and confidence < min_conf:
+            violations.append({
+                "code": "RISK_CONFIDENCE_BELOW_FLOOR",
+                "message": f"confidence={confidence:.2f} < floor {min_conf:.2f}.",
+                "severity": "critical",
+            })
+            return RiskDecision(approved=False, violations=violations, context=context)
+
         # ---- R0. invalid stop loss --------------------------------------
         # Block any signal that arrives with a missing, zero, or
         # negative stop_loss. The size math divides by |entry - stop_loss|
@@ -363,6 +384,19 @@ class RiskEngine:
             })
             return RiskDecision(approved=False, violations=violations, context=context)
 
+        # ---- R11. shorting toggle (RISK.md) ----------------------------
+        # A SELL that OPENS a short (no existing long to close) is only
+        # allowed when shorting is enabled. Closing/reducing a long is
+        # always permitted regardless of the toggle.
+        if action == "SELL" and not getattr(settings, "SHORTING_ENABLED", True):
+            if not self._holds_position(session, symbol):
+                violations.append({
+                    "code": "RISK_SHORTING_DISABLED",
+                    "message": "shorting is disabled; refusing to open a short.",
+                    "severity": "critical",
+                })
+                return RiskDecision(approved=False, violations=violations, context=context)
+
         # ---- Look up entry / SL from quote if not provided ------------
         quote = None
         if self._md is not None:
@@ -390,13 +424,30 @@ class RiskEngine:
                 stop_loss = float(entry) * 1.05
 
         # ---- compute qty -------------------------------------------------
-        portfolio_value = self._portfolio_value_override
-        if portfolio_value is None:
-            portfolio_value = self._compute_portfolio_value(session)
-        max_capital_risk_pct = float(
+        # Equity is a real ledger now (capital + realised + unrealised),
+        # not gross open exposure. An explicit `portfolio_value` override
+        # (tests / backtests) short-circuits to that value.
+        portfolio_value = position_sizer.compute_equity(
+            session, self._md, override=self._portfolio_value_override
+        )
+        # Per-trade risk %: strategy/settings ceiling, then the graduated
+        # ramp + any RiskState throttle. Skip the ramp when an explicit
+        # portfolio override is supplied so sizing stays deterministic.
+        cap_pct = float(
             overrides.max_capital_risk_pct
             if overrides.max_capital_risk_pct is not None
             else settings.MAX_CAPITAL_RISK_PCT
+        )
+        max_capital_risk_pct = position_sizer.resolve_risk_pct(
+            session, cap_pct=cap_pct, ramp=(self._portfolio_value_override is None)
+        )
+        # Single-name notional cap (resolved here so we can clamp the
+        # auto-sized qty to it — RISK.md §2: take the SMALLER of the
+        # risk-based and notional-based quantities).
+        max_pos_pct = float(
+            overrides.max_single_position_pct
+            if overrides.max_single_position_pct is not None
+            else settings.MAX_SINGLE_POSITION_PCT
         )
         sizing = self._compute_qty(
             entry=float(entry),
@@ -404,6 +455,25 @@ class RiskEngine:
             portfolio_value=float(portfolio_value),
             max_capital_risk_pct=max_capital_risk_pct,
         )
+        # Clamp the auto-sized qty to the notional cap (a tight stop must
+        # not let the risk-based qty blow past the single-name cap). Only
+        # for auto-sizing — a manual qty is the operator's explicit choice
+        # and is checked (not silently shrunk) by R7 below.
+        if manual_qty is None:
+            ncap = position_sizer.notional_cap_qty(
+                entry=float(entry),
+                equity=float(portfolio_value),
+                max_single_position_pct=max_pos_pct,
+            )
+            if 0 <= ncap < sizing.qty:
+                sizing = SizingResult(
+                    qty=ncap,
+                    risk_amount=float(ncap) * sizing.distance,
+                    entry=sizing.entry,
+                    stop_loss=sizing.stop_loss,
+                    distance=sizing.distance,
+                    note="notional_capped",
+                )
         # When the caller passes a `manual_qty` (the Trade page),
         # the operator has explicitly chosen the position size.
         # Override the auto-computed qty so the position-cap check
@@ -496,11 +566,8 @@ class RiskEngine:
 
         # ---- R7. max single position % of portfolio --------------------
         # Position value = qty * entry. Cap = portfolio * max_pct / 100.
-        max_pos_pct = float(
-            overrides.max_single_position_pct
-            if overrides.max_single_position_pct is not None
-            else settings.MAX_SINGLE_POSITION_PCT
-        )
+        # `max_pos_pct` was resolved above (used for the notional clamp);
+        # here it guards STACKING past the cap (new + existing holding).
         position_value = sizing.qty * sizing.entry
         # Include the existing position in this symbol (if any) to
         # block stacking past the cap.
@@ -534,14 +601,26 @@ class RiskEngine:
                 ),
                 "severity": "critical",
             })
-        # If adv is None, we *warn* and allow (per the spec:
-        # "if unavailable, warn + allow"). We emit a `warnings`
-        # list for the manager to log but do not block.
+        # Unknown ADV: in LIVE we fail closed (block) — you should never
+        # market into a name whose liquidity you can't confirm with real
+        # money. In paper we warn + allow so testing isn't blocked by the
+        # absent volume feed (the Fyers quote doesn't carry ADV yet — see
+        # the seam note in quote_feed). RISK.md §1.
         warnings: list[str] = []
         if adv is None:
-            warnings.append(
-                f"ADV unknown for {symbol!r}; min_liquidity rule not enforced."
-            )
+            if settings.is_live and getattr(settings, "REQUIRE_KNOWN_LIQUIDITY", False):
+                violations.append({
+                    "code": "RISK_MIN_LIQUIDITY_UNKNOWN",
+                    "message": (
+                        f"ADV unknown for {symbol!r}; refusing to trade it "
+                        f"live without confirmed liquidity."
+                    ),
+                    "severity": "critical",
+                })
+            else:
+                warnings.append(
+                    f"ADV unknown for {symbol!r}; min_liquidity rule not enforced."
+                )
 
         # ---- R9. sector concentration ----------------------------------
         sector_cap = float(

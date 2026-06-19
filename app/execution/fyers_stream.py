@@ -142,6 +142,7 @@ class FyersStreamManager:
         reconcile_fn: Optional[Callable[..., Any]] = None,
         session_factory: Optional[Callable[[], Any]] = None,
         resolve_fn: Optional[Callable[[str], Optional[str]]] = None,
+        always_subscribe: Optional[list[str]] = None,
         reconcile_interval_s: float = 2.0,
         fresh_window_s: float = 6.0,
         ondemand_ttl_s: float = 12.0,
@@ -155,6 +156,11 @@ class FyersStreamManager:
         self._reconcile_fn = reconcile_fn or reconcile_order_update
         self._session_factory = session_factory
         self._resolve = resolve_fn or resolve_fyers_symbol
+        # Full Fyers ids kept subscribed for the whole session regardless of
+        # the position book — the status-bar index ticker (NIFTY / SENSEX /
+        # BANKNIFTY) so it streams sub-second like everything else. Their bus
+        # key IS the full id, so the dashboard matches on the index symbol.
+        self._always_subscribe = [s.upper() for s in (always_subscribe or [])]
         self._interval = float(reconcile_interval_s)
         # A bus tick counts as "live" for this long; an on-demand
         # subscription is protected from the reconcile sweep for this long
@@ -350,6 +356,10 @@ class FyersStreamManager:
             set(self._quote_feed.watched_symbols()) if self._quote_feed is not None else set()
         )
         desired: dict[str, str] = {}
+        # Always-on subscriptions (index ticker): bus key == full id so the
+        # tick publishes back under the symbol the dashboard renders.
+        for full in self._always_subscribe:
+            desired[full] = full
         for short in watched:
             full = self._resolve(short) or (short if ":" in short else None)
             if full:
