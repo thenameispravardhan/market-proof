@@ -4,8 +4,8 @@
     {
       "name": "trading-bot",
       "runtimeExecutable": ".venv/Scripts/python.exe",
-      "runtimeArgs": ["-c", "import os; os.environ['DATABASE_URL']='sqlite:///./data/ui_preview.db'; import uvicorn; uvicorn.run('app.main:app', host='127.0.0.1', port=8124)"],
-      "port": 8124
+      "runtimeArgs": ["-c", "import os; os.environ['DATABASE_URL']='sqlite:///./data/ui_preview.db'; import uvicorn; uvicorn.run('app.main:app', host='127.0.0.1', port=8000)"],
+      "port": 8000
     },
     {
       "name": "frontend",

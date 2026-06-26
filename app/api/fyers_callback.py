@@ -412,6 +412,15 @@ def fyers_status(db: Session = Depends(get_db)) -> dict[str, Any]:
 
     return {
         "connected": credentials_set and account_present and has_token and enabled,
+        # `authorized` = OAuth is done and a valid token is held, regardless
+        # of the trade on/off switch. The UI uses this (not `connected`) to
+        # decide whether to show the calm "connected / switched off" card vs
+        # the "token expired, re-auth" CTA — so a switched-OFF account isn't
+        # mislabelled as expired, and a successful re-auth while OFF still
+        # counts as success.
+        "authorized": credentials_set and account_present and has_token,
+        "has_token": has_token,
+        "enabled": enabled,
         "credentials_set": credentials_set,
         "account_present": account_present,
         "app_id": settings.FYERS_APP_ID or None,
@@ -445,12 +454,16 @@ async def fyers_disconnect(db: Session = Depends(get_db)) -> dict[str, Any]:
             detail="FYERS creds are not configured in .env",
         )
 
+    # Disconnect is a CONNECTION operation, not a trade one — it must find
+    # the account whether or not the Fyers trade switch (`enabled`) is on.
+    # A switched-OFF-but-authorised account still holds a token to revoke;
+    # filtering on `enabled` here is exactly why "Disconnect did nothing"
+    # when Fyers was toggled off.
     account: Optional[BrokerAccount] = db.execute(
         select(BrokerAccount)
         .where(
             BrokerAccount.broker == "fyers",
             BrokerAccount.app_id == settings.FYERS_APP_ID,
-            BrokerAccount.enabled == True,  # noqa: E712
         )
         .order_by(BrokerAccount.id.asc())
     ).scalars().first()
@@ -461,16 +474,14 @@ async def fyers_disconnect(db: Session = Depends(get_db)) -> dict[str, Any]:
         # at the last OAuth). Disconnect must STILL find and clear that
         # row — otherwise the stale token lingers, order placement keeps
         # authenticating as the old app, and the banner is stuck on
-        # "Connected". Fall back to the first enabled real Fyers account
-        # that actually holds a token. (This was the "disconnect does
-        # nothing" bug.)
+        # "Connected". Fall back to the first real Fyers account that
+        # actually holds a token (regardless of the trade switch).
         account = db.execute(
             select(BrokerAccount)
             .where(
                 BrokerAccount.broker == "fyers",
                 BrokerAccount.paper_mode == False,  # noqa: E712
                 BrokerAccount.access_token.is_not(None),
-                BrokerAccount.enabled == True,  # noqa: E712
             )
             .order_by(BrokerAccount.id.asc())
         ).scalars().first()

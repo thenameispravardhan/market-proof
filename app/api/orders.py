@@ -52,13 +52,17 @@ _BUS_QUOTE_MAX_AGE_S = 6.0
 async def _fyers_quote(db: Session, sym: str) -> Optional[dict[str, Any]]:
     """Live quote via the connected real Fyers account — the sole price
     source for every symbol (equity, index, future, option). Returns None
-    when no Fyers account is connected or the broker call fails/returns empty."""
+    when no Fyers account is connected or the broker call fails/returns empty.
+
+    Market-data path: keyed on a connected (token-bearing) account, NOT the
+    `enabled` trading switch — the Trade-page price must keep updating even
+    when Fyers trading is toggled off. Order placement is gated separately
+    (`_require_real_account`)."""
     acc = (
         db.execute(
             select(BrokerAccount).where(
                 BrokerAccount.broker == "fyers",
                 BrokerAccount.paper_mode == False,  # noqa: E712
-                BrokerAccount.enabled == True,  # noqa: E712
                 BrokerAccount.access_token.is_not(None),
             ).order_by(BrokerAccount.id.asc())
         )

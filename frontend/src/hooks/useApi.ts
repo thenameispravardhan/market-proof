@@ -398,6 +398,14 @@ export interface FyersStatus {
   // AND a Fyers broker account exists in the DB with a valid
   // access_token. The "fully wired up" state.
   connected: boolean;
+  // True if OAuth is done and a valid token is held — regardless of the
+  // trade on/off switch. The banner keys on this (not `connected`) so a
+  // switched-OFF account isn't mislabelled "Token Expired".
+  authorized?: boolean;
+  // True if the account row holds a non-empty access_token.
+  has_token?: boolean;
+  // True if the Fyers account's trade switch is ON (`enabled`).
+  enabled?: boolean;
   // True if creds are in .env but no OAuth has run yet (or token expired).
   credentials_set: boolean;
   // True if a Fyers broker account row exists in the DB (regardless of token).

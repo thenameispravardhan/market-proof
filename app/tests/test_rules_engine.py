@@ -320,6 +320,93 @@ def test_no_match_returns_hold_with_none_rule_id():
     assert m.action_params.get("reason") == "no_matching_rule"
 
 
+# -- `between` operator + market-context fields ---------------------------
+
+
+def test_op_between_matches_inside_range():
+    m = evaluate(
+        _base_analysis(india_vix=15.0),
+        [_rule(conditions={"all_of": [{"field": "india_vix", "op": "between", "value": [10, 20]}]})],
+    )
+    assert m.action == "BUY"
+
+
+def test_op_between_misses_outside_range():
+    m = evaluate(
+        _base_analysis(india_vix=25.0),
+        [_rule(conditions={"all_of": [{"field": "india_vix", "op": "between", "value": [10, 20]}]})],
+    )
+    assert m.action == "HOLD"
+
+
+def test_op_between_missing_field_is_fail_safe():
+    # india_vix absent (feed not wired) → the condition is a non-match,
+    # not a crash, not a phantom pass.
+    m = evaluate(
+        _base_analysis(),
+        [_rule(conditions={"all_of": [{"field": "india_vix", "op": "between", "value": [10, 20]}]})],
+    )
+    assert m.action == "HOLD"
+
+
+def test_op_between_bad_bounds_skips_rule():
+    # A malformed `between` (one bound) raises RuleError internally, which
+    # the engine catches → the rule is skipped, falling through to HOLD.
+    m = evaluate(
+        _base_analysis(india_vix=15.0),
+        [_rule(conditions={"all_of": [{"field": "india_vix", "op": "between", "value": [10]}]})],
+    )
+    assert m.action == "HOLD"
+
+
+def test_new_field_sector_in_list():
+    m = evaluate(
+        _base_analysis(sector="BANK"),
+        [_rule(conditions={"all_of": [{"field": "sector", "op": "in", "value": ["BANK", "NBFC"]}]})],
+    )
+    assert m.action == "BUY"
+
+
+def test_unsupported_field_still_raises():
+    with pytest.raises(RuleError):
+        from app.analyzer.rules_engine import _match_condition
+        _match_condition({"field": "not_a_field", "op": "==", "value": 1}, _base_analysis())
+
+
+def test_enrich_analysis_context_adds_sector_and_price():
+    from types import SimpleNamespace
+    from app.analyzer.rules_engine import enrich_analysis_context
+
+    quote = SimpleNamespace(
+        last_price=2500.0, change_pct=3.2, average_daily_volume_crore=50.0
+    )
+    enriched = enrich_analysis_context(
+        {"symbol": "RELIANCE", "event_type": "ORDER_WIN"},
+        quote=quote,
+        sector_map={"RELIANCE": "ENERGY"},
+    )
+    assert enriched["sector"] == "ENERGY"
+    assert enriched["price"] == 2500.0
+    assert enriched["change_pct"] == 3.2
+    assert enriched["adv_crore"] == 50.0
+    # Now a rule can gate on the enriched fields.
+    m = evaluate(
+        enriched,
+        [_rule(conditions={"all_of": [{"field": "change_pct", "op": "between", "value": [1, 5]}]})],
+    )
+    assert m.action == "BUY"
+
+
+def test_enrich_does_not_overwrite_existing_keys():
+    from app.analyzer.rules_engine import enrich_analysis_context
+
+    enriched = enrich_analysis_context(
+        {"symbol": "RELIANCE", "sector": "CUSTOM"},
+        sector_map={"RELIANCE": "ENERGY"},
+    )
+    assert enriched["sector"] == "CUSTOM"
+
+
 def test_empty_rules_list_returns_hold():
     m = evaluate(_base_analysis(), [])
     assert m.action == "HOLD"

@@ -100,14 +100,19 @@ def resolve_risk_pct(
     *,
     cap_pct: float,
     ramp: bool = True,
+    extra_mult: float = 1.0,
 ) -> float:
-    """Effective per-trade risk %, after the graduated ramp and any
-    `RiskState` throttle.
+    """Effective per-trade risk %, after the graduated ramp, any
+    `RiskState` throttle, and an optional volatility-regime multiplier.
 
     `cap_pct` is the strategy/settings ceiling. While ramping (first
     `RISK_RAMP_TRADES` fills) the result is held down to
     `RISK_RAMP_START_PCT`. A `RiskState.current_risk_pct` (e.g. set to
     0.25 after a weekly-loss breach) always takes the lower value.
+
+    `extra_mult` scales the result after the caps — used for the high-VIX
+    throttle (`< 1.0` shrinks risk in a volatile regime). Defaults to 1.0
+    (no-op), so the VIX seam is inert until the feed is wired.
 
     `ramp=False` skips the graduation step (used when an explicit
     portfolio override is supplied, to keep sizing deterministic for
@@ -125,6 +130,7 @@ def resolve_risk_pct(
     if rs is not None and rs.current_risk_pct is not None:
         base = min(base, float(rs.current_risk_pct))
 
+    base = base * max(0.0, float(extra_mult))
     return max(0.0, base)
 
 

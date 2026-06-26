@@ -45,22 +45,34 @@ export function ConnectFyers() {
     return () => clearInterval(t);
   }, [mode, refetch]);
 
+  // "Authorized" = OAuth done + a valid token held, regardless of the trade
+  // on/off switch. This — NOT `connected` (which also requires the account
+  // to be switched ON) — is what tells a successful OAuth apart from a
+  // failure. A switched-OFF-but-authorised account is connected, just not
+  // trading. Fall back to `connected` for older status payloads that don't
+  // carry `has_token`/`authorized`.
+  const isAuthorized = (s: typeof status): boolean =>
+    !!(s?.connected || s?.authorized || (s?.account_present && s?.has_token));
+  const authorized = isAuthorized(status);
+  // Trade switch is OFF but the connection is fine.
+  const tradingOff = authorized && status?.enabled === false;
+
   // Clear stale error messages whenever the underlying status changes
   // (e.g. user fixed the .env, or token got refreshed). Prevents the
   // banner from showing "Fyers creds not configured" on top of a
   // "Token Expired" message — they are different states.
   useEffect(() => {
     setErrorMsg(null);
-  }, [status?.connected, status?.credentials_set, status?.account_present]);
+  }, [status?.connected, status?.has_token, status?.credentials_set, status?.account_present]);
 
-  // Watch for the connected state — when it flips on, close the popup
-  // and reset.
+  // Watch for the authorised state — when it flips on (token minted), close
+  // the popup and reset, even if the account is currently switched OFF.
   useEffect(() => {
-    if (status?.connected && (mode === "opening" || mode === "waiting")) {
+    if (authorized && (mode === "opening" || mode === "waiting")) {
       setMode("idle");
       setErrorMsg(null);
     }
-  }, [status?.connected, mode]);
+  }, [authorized, mode]);
 
   const onConnect = async () => {
     setMode("opening");
@@ -116,7 +128,7 @@ export function ConnectFyers() {
           // we see the most recent value, not the one captured at
           // click-time.
           setTimeout(() => {
-            if (!statusRef.current?.connected) {
+            if (!isAuthorized(statusRef.current)) {
               setMode("error");
               setErrorMsg(
                 "OAuth did not complete. Most common causes: " +
@@ -165,21 +177,29 @@ export function ConnectFyers() {
 
   // ---- Render ----
 
-  if (status?.connected) {
+  // Authorised (token held) — show the connected card. If the trade switch
+  // is OFF we say so plainly (amber) instead of the alarming "Token Expired"
+  // / "OAuth failed" state: the OAuth is fine, only trading is paused, and
+  // live prices keep flowing.
+  if (authorized) {
+    const accent = tradingOff ? "var(--amber)" : "var(--green)";
     return (
       <div
         className="widget"
         data-testid="connect-fyers"
-        style={{ borderColor: "var(--green)", borderWidth: 1, borderStyle: "solid" }}
+        style={{ borderColor: accent, borderWidth: 1, borderStyle: "solid" }}
       >
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <span style={{ color: "var(--green)", fontSize: 20 }}>●</span>
+          <span style={{ color: accent, fontSize: 20 }}>●</span>
           <div style={{ flex: 1 }}>
             <div style={{ fontWeight: 700, color: "var(--text)" }}>
-              Fyers Connected
+              {tradingOff ? "Fyers Connected — Trading Off" : "Fyers Connected"}
             </div>
             <div style={{ fontSize: 12, color: "var(--text-dim)", marginTop: 2 }}>
-              App ID: {status.app_id || "—"} · Status bar will show live NIFTY / SENSEX / BANKNIFTY
+              {tradingOff
+                ? status?.reason ??
+                  "Authorised — the Fyers account is switched OFF, so no orders route to it. Live prices keep flowing. Turn it back on with the Fyers toggle on the Dashboard."
+                : `App ID: ${status?.app_id || "—"} · Status bar will show live NIFTY / SENSEX / BANKNIFTY`}
             </div>
           </div>
           <button

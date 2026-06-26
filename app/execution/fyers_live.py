@@ -478,6 +478,36 @@ class FyersClient:
             base_url=self._data_base_url,
         )
 
+    async def get_history(
+        self,
+        symbol: str,
+        *,
+        resolution: str = "5",
+        range_from: str,
+        range_to: str,
+        date_format: int = 1,
+        cont_flag: int = 1,
+    ) -> dict[str, Any]:
+        """GET /data/history — OHLCV candles for a symbol.
+
+        `resolution` is the Fyers timeframe code ("5" = 5-minute, "15",
+        "60", "D", …). `range_from`/`range_to` are `yyyy-mm-dd` when
+        `date_format=1` (epoch seconds when 0). Returns the raw Fyers
+        payload `{"candles": [[ts, o, h, l, c, v], ...]}`. Market-data
+        endpoint → the `/data` host.
+        """
+        params = {
+            "symbol": symbol,
+            "resolution": str(resolution),
+            "date_format": int(date_format),
+            "range_from": str(range_from),
+            "range_to": str(range_to),
+            "cont_flag": str(cont_flag),
+        }
+        return await self._request(
+            "GET", "/history", params=params, base_url=self._data_base_url
+        )
+
     async def get_option_chain(
         self, symbol: str, *, strikecount: int = 10, timestamp: str = ""
     ) -> dict[str, Any]:
@@ -1106,6 +1136,34 @@ class FyersLiveBackend:
             except Exception:  # noqa: BLE001
                 log.exception("fyers.quote.parse_error")
         return out
+
+    # -- history (candles, for ATR) -------------------------------------
+
+    async def get_history(
+        self, symbol: str, *, resolution: str = "5", days: int = 5
+    ) -> list[Any]:
+        """OHLCV candles for `symbol` over the last `days` (for ATR).
+
+        Returns the raw `[[ts, o, h, l, c, v], ...]` list (oldest→newest),
+        or `[]` on any broker failure — the caller (volatility provider)
+        treats `[]`/insufficient data as "no ATR" and falls back to the %
+        stop. Never raises."""
+        from datetime import date, timedelta
+
+        today = date.today()
+        start = today - timedelta(days=max(1, int(days)))
+        try:
+            data = await self._client.get_history(
+                symbol,
+                resolution=resolution,
+                range_from=start.isoformat(),
+                range_to=today.isoformat(),
+            )
+        except FyersAPIError as e:
+            log.warning("fyers.history.failed", symbol=symbol, error=str(e))
+            return []
+        candles = data.get("candles") or data.get("data") or []
+        return candles if isinstance(candles, list) else []
 
     # -- option chain (live, for the Trade page) ------------------------
 

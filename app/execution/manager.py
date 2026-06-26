@@ -85,6 +85,7 @@ from app.execution.fyers_live import FyersLiveBackend
 from app.execution.market_data import MarketDataBus
 from app.execution.paper import PaperBackend
 from app.logging_config import get_logger
+from app.risk import event_profiles, volatility
 from app.risk.engine import RiskEngine
 from app.services.event_bus import event_bus
 
@@ -181,13 +182,25 @@ class Manager:
         backends: Optional[dict[int, TradingBackend]] = None,
         paper_backend: Optional[PaperBackend] = None,
         settings_provider: Optional[Callable[[], Settings]] = None,
+        vol_provider: Optional[volatility.VolatilityProvider] = None,
+        vol_regime: Optional[volatility.VolatilityRegime] = None,
     ) -> None:
         self._risk = risk_engine or RiskEngine(market_data=market_data)
+        # Volatility seams. Defaults are the safe no-data impls, so the
+        # ATR stop falls back to the % stop and the VIX gate no-ops until
+        # the real feeds are wired (Phase 5). Tests / the lifespan inject
+        # live providers.
+        self._vol_provider = vol_provider or volatility.NullVolatilityProvider()
+        self._vol_regime = vol_regime or volatility.NullVolatilityRegime()
         self._md = market_data or MarketDataBus()
         # Wire market_data into the risk engine so quote lookups
         # work end-to-end.
         if not hasattr(self._risk, "_md") or self._risk._md is None:  # type: ignore[attr-defined]
             self._risk._md = self._md  # type: ignore[attr-defined]
+        # Share the volatility regime with the risk engine so its high-VIX
+        # sizing throttle reads the same feed the manager's gate uses.
+        if getattr(self._risk, "_vol_regime", None) is None:  # type: ignore[attr-defined]
+            self._risk._vol_regime = self._vol_regime  # type: ignore[attr-defined]
         self._session_factory = session_factory or _default_session_factory()
         self._backends: dict[int, TradingBackend] = dict(backends or {})
         # A single paper backend instance is reused for all paper
@@ -355,7 +368,7 @@ class Manager:
         if loaded is None:
             log.warning("execution_manager.signal_not_found", signal_id=signal_id)
             return None
-        signal, strategy, account, levels, filed_at = loaded
+        signal, strategy, account, levels, filed_at, event_type = loaded
         if signal is None:
             return None
         if strategy is None or account is None:
@@ -391,7 +404,7 @@ class Manager:
         # kill-switch, the IST entry window, and an order-time staleness
         # re-check (the LLM call may have aged the signal past the
         # freshness budget). Any of these blocks before we touch a broker.
-        gate = await self._pre_entry_gate(signal, filed_at)
+        gate = await self._pre_entry_gate(signal, filed_at, event_type)
         if gate is not None:
             code, message = gate
             await asyncio.get_running_loop().run_in_executor(
@@ -434,6 +447,10 @@ class Manager:
         entry = levels.get("entry")
         stop_loss = levels.get("stop_loss")
         target = levels.get("target")
+        # Per-event hold window (set when we derive coherent levels below).
+        # Falls through to the global MAX_HOLD_SECONDS in TradeManager when
+        # left None (older publishers / no quote feed).
+        event_max_hold: Optional[int] = None
         if self._quote_feed is not None:
             try:
                 seeded = await self._quote_feed.seed_symbol(signal.symbol)
@@ -441,16 +458,16 @@ class Manager:
                 log.exception("execution_manager.quote_seed_failed", symbol=signal.symbol)
                 seeded = None
             if seeded is not None and seeded > 0:
-                settings = self._settings_provider()
-                sl_pct = float(settings.DEFAULT_SL_PCT) / 100.0
-                rr = float(settings.DEFAULT_TARGET_RR)
                 entry = float(seeded)
-                if signal.action == "BUY":
-                    stop_loss = entry * (1.0 - sl_pct)
-                    target = entry * (1.0 + sl_pct * rr)
-                else:
-                    stop_loss = entry * (1.0 + sl_pct)
-                    target = entry * (1.0 - sl_pct * rr)
+                # Warm the ATR cache (live Fyers candle provider) before we
+                # size the stop; no-op for the Null / paper providers.
+                await self._refresh_atr(signal.symbol)
+                stop_loss, target, rr, event_max_hold = self._derive_levels(
+                    symbol=signal.symbol,
+                    entry=entry,
+                    action=signal.action,
+                    event_type=event_type,
+                )
                 await asyncio.get_running_loop().run_in_executor(
                     None, _update_signal_levels,
                     self._session_factory, signal.id, entry, stop_loss, target, rr,
@@ -464,6 +481,28 @@ class Manager:
                 stop_loss = float(entry) * 0.95
             else:
                 stop_loss = float(entry) * 1.05
+
+        # Step 3.5: anti-chase (RISK.md §5). If the price already ran in our
+        # favour beyond MAX_ENTRY_DRIFT_PCT between signal time (the
+        # rationale's intended entry) and order time (the seeded entry), the
+        # move is extended — skip rather than chase into a reversal.
+        drift_block = self._entry_drift_block(
+            action=signal.action,
+            intended=levels.get("entry"),
+            current=entry,
+        )
+        if drift_block is not None:
+            code, message = drift_block
+            await asyncio.get_running_loop().run_in_executor(
+                None, _persist_risk_block,
+                self._session_factory, signal, account.id, code, message,
+            )
+            await event_bus.publish(
+                CHANNEL_RISK_BLOCKED,
+                {"signal_id": signal.id, "code": code, "message": message,
+                 "symbol": signal.symbol, "account_id": account.id},
+            )
+            return {"approved": False, "code": code}
 
         # Step 4: risk engine.
         decision = await self._risk.evaluate(
@@ -585,6 +624,9 @@ class Manager:
                 "entry": fill_entry,
                 "stop_loss": float(stop_loss) if stop_loss is not None else None,
                 "target": float(target) if target is not None else None,
+                # Per-event hold window (None → TradeManager uses the global
+                # MAX_HOLD_SECONDS). Carries the event-matrix hold rule.
+                "max_hold_seconds": event_max_hold,
             },
         )
         return {
@@ -595,11 +637,117 @@ class Manager:
             "backend": getattr(backend, "name", type(backend).__name__),
         }
 
+    def _entry_drift_block(
+        self, *, action: str, intended: Optional[float], current: Optional[float]
+    ) -> Optional[tuple[str, str]]:
+        """Anti-chase guard. Returns (code, message) when the order-time
+        price has already run more than MAX_ENTRY_DRIFT_PCT *in the trade's
+        favour* vs the signal's intended entry — i.e. the move is extended
+        and we'd be chasing. Fail-safe: missing either price, a non-positive
+        value, or a zero/blank threshold → None (skip)."""
+        if intended is None or current is None:
+            return None
+        try:
+            intended_f = float(intended)
+            current_f = float(current)
+        except (TypeError, ValueError):
+            return None
+        if intended_f <= 0 or current_f <= 0:
+            return None
+        max_drift = float(
+            getattr(self._settings_provider(), "MAX_ENTRY_DRIFT_PCT", 0.0) or 0.0
+        )
+        if max_drift <= 0:
+            return None
+        if str(action).upper() == "BUY":
+            drift_pct = (current_f - intended_f) / intended_f * 100.0
+        else:  # SELL/short: favourable = price already fell
+            drift_pct = (intended_f - current_f) / intended_f * 100.0
+        if drift_pct > max_drift:
+            return ("ENTRY_DRIFT",
+                    f"price moved {drift_pct:.2f}% in-favour since signal "
+                    f"(intended {intended_f:.2f} → {current_f:.2f}); "
+                    f"max chase {max_drift:.2f}%")
+        return None
+
+    def _derive_levels(
+        self,
+        *,
+        symbol: str,
+        entry: float,
+        action: str,
+        event_type: Optional[str],
+    ) -> tuple[float, float, float, int]:
+        """Compute (stop_loss, target, rr, max_hold_seconds) for an entry.
+
+        Volatility-aware: the stop distance is ATR×mult (clamped to a sane
+        band of entry) when an ATR is available, else the event profile's
+        percentage stop. The target sits at `rr`× the stop distance. Both
+        the ATR multiplier, the RR, and the hold window come from the
+        per-event-type profile (`event_profiles`), which falls back to the
+        global Settings for anything it doesn't override.
+        """
+        settings = self._settings_provider()
+        profile = event_profiles.profile_for(event_type).resolved(settings)
+        atr = (
+            volatility.resolve_atr(self._vol_provider, symbol)
+            if getattr(settings, "ATR_ENABLED", True)
+            else None
+        )
+        dist = volatility.stop_distance(
+            entry=float(entry),
+            atr=atr,
+            mult=profile.sl_atr_mult,
+            default_pct=profile.sl_default_pct,
+            min_pct=float(settings.DEFAULT_SL_MIN_PCT),
+            max_pct=float(settings.ATR_MAX_STOP_PCT),
+            smallcap_price=float(settings.SMALLCAP_PRICE),
+            smallcap_pct=float(settings.DEFAULT_SL_SMALLCAP_PCT),
+        )
+        rr = float(profile.target_rr)
+        entry = float(entry)
+        if str(action).upper() == "BUY":
+            stop_loss = entry - dist
+            target = entry + dist * rr
+        else:
+            stop_loss = entry + dist
+            target = entry - dist * rr
+        # Guard a degenerate (sub-floor) entry from producing a <=0 stop.
+        stop_loss = max(0.01, stop_loss)
+        return (stop_loss, target, rr, int(profile.max_hold_seconds))
+
+    async def _refresh_atr(self, symbol: str) -> None:
+        """Warm the ATR cache for `symbol` before sizing (async path).
+        No-op for providers without an async `refresh` (Null / stub /
+        paper tick estimator). Never raises."""
+        p = self._vol_provider
+        refresh = getattr(p, "refresh", None)
+        if refresh is None:
+            return
+        try:
+            await refresh(symbol)
+        except Exception:  # noqa: BLE001
+            log.debug("execution_manager.atr_refresh_failed", symbol=symbol)
+
+    async def _refresh_vix(self) -> None:
+        """Warm the India-VIX cache before the gate / sizing read it.
+        No-op for regimes without an async `refresh`. Never raises."""
+        r = self._vol_regime
+        refresh = getattr(r, "refresh", None)
+        if refresh is None:
+            return
+        try:
+            await refresh()
+        except Exception:  # noqa: BLE001
+            log.debug("execution_manager.vix_refresh_failed")
+
     async def _pre_entry_gate(
-        self, signal: Signal, filed_at: Optional[datetime]
+        self, signal: Signal, filed_at: Optional[datetime],
+        event_type: Optional[str] = None,
     ) -> Optional[tuple[str, str]]:
         """Gate a new auto entry on the portfolio circuit breakers /
-        kill-switch, the IST entry window, and order-time freshness.
+        kill-switch, the volatility regime, the per-event confidence floor,
+        the IST entry window, and order-time freshness.
 
         Returns (code, message) when blocked, else None. Manual Trade-page
         orders deliberately do NOT pass through here.
@@ -615,8 +763,35 @@ class Manager:
         )
         if not allowed:
             return (f"HALT_{(reason or 'blocked').upper()}", f"circuit breaker: {reason}")
-        # 2. IST entry window (skipped when ENFORCE_MARKET_HOURS is off).
-        if not market_clock.is_entry_window():
+        # 1b. Volatility regime (India VIX). Fail-safe: None VIX → skip. When
+        #     the feed is wired, suspend new entries above INDIA_VIX_MAX.
+        await self._refresh_vix()
+        vix_max = float(getattr(settings, "INDIA_VIX_MAX", 0.0) or 0.0)
+        if vix_max > 0 and self._vol_regime is not None:
+            try:
+                vix = self._vol_regime.india_vix()
+            except Exception:  # noqa: BLE001
+                vix = None
+            if vix is not None and float(vix) > vix_max:
+                return ("HIGH_VIX",
+                        f"India VIX {float(vix):.2f} > max {vix_max:.2f}; entries suspended")
+        # 1c. Per-event confidence floor (event matrix). Priced-in events
+        #     (dividends, splits) demand stronger conviction than the global
+        #     floor; the global floor itself is still enforced in the risk
+        #     engine (R2b). This only RAISES the bar for certain events.
+        profile = event_profiles.profile_for(event_type).resolved(settings)
+        conf = float(getattr(signal, "confidence", 0.0) or 0.0)
+        if profile.min_confidence > 0 and conf < profile.min_confidence:
+            return ("EVENT_CONFIDENCE_FLOOR",
+                    f"confidence {conf:.2f} < {profile.min_confidence:.2f} required "
+                    f"for event {event_type or 'DEFAULT'}")
+        # 2. IST entry window — enforced for LIVE trading ONLY. In paper
+        #    mode the wall clock must NOT block entries: you simulate at any
+        #    hour (evenings, weekends), and a closed session is only a real
+        #    constraint with real money (a live order would be rejected by
+        #    the broker / exchange anyway). ENFORCE_MARKET_HOURS still gates
+        #    live (and can disable even that for live backtests).
+        if settings.is_live and not market_clock.is_entry_window():
             return ("MARKET_CLOSED",
                     market_clock.entry_block_reason() or "outside entry window")
         # 3. Order-time staleness re-check.
@@ -1138,6 +1313,22 @@ class Manager:
         coherent entry/SL/target. Called by the lifespan."""
         self._quote_feed = quote_feed
 
+    def attach_volatility_providers(
+        self,
+        *,
+        vol_provider: Optional[volatility.VolatilityProvider] = None,
+        vol_regime: Optional[volatility.VolatilityRegime] = None,
+    ) -> None:
+        """Swap in live volatility providers (Fyers ATR + India VIX) after
+        construction. Called by the lifespan once the Fyers fetch fns are
+        ready. The regime is shared with the risk engine so its high-VIX
+        sizing throttle reads the same feed."""
+        if vol_provider is not None:
+            self._vol_provider = vol_provider
+        if vol_regime is not None:
+            self._vol_regime = vol_regime
+            self._risk._vol_regime = vol_regime  # type: ignore[attr-defined]
+
     # -- settings hot-reload -------------------------------------------
 
     async def _on_settings_updated(self, _payload: dict[str, Any]) -> None:
@@ -1222,11 +1413,11 @@ class Manager:
 def _load_signal_context(
     session_factory: Callable[[], Session],
     signal_id: int,
-) -> Optional[tuple[Optional[Signal], Optional[Strategy], Optional[BrokerAccount], dict[str, float], Optional[datetime]]]:
+) -> Optional[tuple[Optional[Signal], Optional[Strategy], Optional[BrokerAccount], dict[str, float], Optional[datetime], Optional[str]]]:
     with session_factory() as session:
         signal = session.get(Signal, signal_id)
         if signal is None:
-            return (None, None, None, {}, None)
+            return (None, None, None, {}, None, None)
         strategy = (
             session.get(Strategy, signal.strategy_id) if signal.strategy_id else None
         )
@@ -1252,16 +1443,25 @@ def _load_signal_context(
                 .first()
             )
         # Pull the originating announcement's filed_at for the order-time
-        # staleness re-check (the LLM call may have aged the signal).
+        # staleness re-check (the LLM call may have aged the signal) and the
+        # analysis event_type, which drives the per-event trade-management
+        # profile (stop/target/hold).
         filed_at = None
+        event_type = None
         if signal.analysis_id is not None:
             a = session.get(Analysis, signal.analysis_id)
             if a is not None and a.announcement_id is not None:
                 ann = session.get(Announcement, a.announcement_id)
                 if ann is not None:
                     filed_at = ann.filed_at
+                    # event_type lives on the Announcement (the Analysis row
+                    # has no such column). It drives the per-event trade
+                    # profile (stop/target/hold) and the per-event confidence
+                    # floor — reading it off `a` always yielded None, which
+                    # silently flattened every trade to the DEFAULT profile.
+                    event_type = ann.event_type
         levels = parse_rationale_levels(signal.rationale)
-        return (signal, strategy, account, levels, filed_at)
+        return (signal, strategy, account, levels, filed_at, event_type)
 
 
 def _update_signal_levels(

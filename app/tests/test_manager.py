@@ -536,3 +536,80 @@ async def test_loop_processes_published_signal(db_session, isolated_db):
         event_bus.unsubscribe(CHANNEL_TRADE_EXECUTED, sub)
         mgr.stop()
         await mgr.wait_until_stopped()
+
+
+# -- Market-hours gate: paper any time, live enforces --------------------
+
+
+@pytest.mark.asyncio
+async def test_market_hours_gate_paper_vs_live(monkeypatch, db_session, isolated_db):
+    """The entry-window (MARKET_CLOSED) gate is enforced for LIVE only —
+    paper testing must run at any hour (evenings / weekends)."""
+    from types import SimpleNamespace
+    from app.risk import market_clock
+    from app import config as app_config
+
+    # Pretend the exchange session is closed, with enforcement ON.
+    monkeypatch.setattr(market_clock, "is_entry_window", lambda *a, **k: False)
+    monkeypatch.setenv("ENFORCE_MARKET_HOURS", "1")
+
+    mgr = Manager(market_data=MarketDataBus())
+    sig = SimpleNamespace(id=1, symbol="RELIANCE", action="BUY", confidence=0.9)
+
+    # Paper → the clock does NOT block the entry.
+    monkeypatch.setenv("TRADING_MODE", "paper")
+    app_config.reset_settings_cache()
+    assert await mgr._pre_entry_gate(sig, None, None) is None
+
+    # Live → blocked with MARKET_CLOSED.
+    monkeypatch.setenv("TRADING_MODE", "live")
+    app_config.reset_settings_cache()
+    gate = await mgr._pre_entry_gate(sig, None, None)
+    assert gate is not None and gate[0] == "MARKET_CLOSED"
+    app_config.reset_settings_cache()
+
+
+# -- event_type sourcing: must read the Announcement, not the Analysis ----
+
+
+def test_load_signal_context_sources_event_type_from_announcement(
+    db_session, isolated_db
+):
+    """Regression: `event_type` must come from the Announcement (which has
+    the column), not the Analysis (which does not). Reading it off the
+    Analysis silently returned None for every signal, flattening the whole
+    per-event trade matrix + confidence floor to the DEFAULT profile."""
+    from app.db.session import SessionLocal
+    from app.db.models import Analysis, Announcement
+    from app.execution.manager import _load_signal_context
+
+    with SessionLocal() as s:
+        ann = Announcement(
+            symbol="RELIANCE",
+            exchange="NSE",
+            event_type="DIVIDEND",
+            headline="Board approves dividend",
+            filed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+            content_hash="hash-evt-type-regression",
+        )
+        s.add(ann)
+        s.flush()
+        analysis = Analysis(announcement_id=ann.id, confidence=0.9)
+        s.add(analysis)
+        s.flush()
+        sig = Signal(
+            analysis_id=analysis.id,
+            symbol="RELIANCE",
+            action="BUY",
+            confidence=0.9,
+            rationale="",
+            status="pending",
+        )
+        s.add(sig)
+        s.commit()
+        sig_id = sig.id
+
+    loaded = _load_signal_context(SessionLocal, sig_id)
+    assert loaded is not None
+    # tuple shape: (signal, strategy, account, levels, filed_at, event_type)
+    assert loaded[5] == "DIVIDEND"

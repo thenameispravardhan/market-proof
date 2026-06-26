@@ -57,14 +57,17 @@ def _manager():
 
 
 def _connected_fyers_account(db: Session) -> Optional[BrokerAccount]:
-    """First enabled, real (non-paper) Fyers account holding a token."""
+    """First real (non-paper) Fyers account holding an OAuth token.
+
+    Market-data path (option chain): keyed on "connected" (token present),
+    NOT the `enabled` trading switch — turning Fyers trading off must not
+    blank the chain. Order placement is gated separately."""
     return (
         db.execute(
             select(BrokerAccount)
             .where(
                 BrokerAccount.broker == "fyers",
                 BrokerAccount.paper_mode == False,  # noqa: E712
-                BrokerAccount.enabled == True,  # noqa: E712
                 BrokerAccount.access_token.is_not(None),
             )
             .order_by(BrokerAccount.id.asc())

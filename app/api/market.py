@@ -68,8 +68,15 @@ def _manager():
 
 
 def _fyers_backend() -> Optional[Any]:
-    """The live backend for the connected real Fyers account, or None
+    """The live backend for the CONNECTED real Fyers account, or None
     when no such account exists (so the caller degrades gracefully).
+
+    "Connected" means a real (non-paper) Fyers account that holds an OAuth
+    access token. This is a MARKET-DATA path (index ticker, quotes, history,
+    and the realtime WebSocket feed), so it deliberately does NOT require the
+    account's `enabled` flag — that flag is the *trading* on/off switch.
+    Turning trading off must keep prices flowing and the OAuth login intact;
+    only order routing is gated on `enabled` (manager / orders API).
 
     Never raises — a DB or manager hiccup returns None so the index
     endpoint keeps its "always 200" contract."""
@@ -85,7 +92,6 @@ def _fyers_backend() -> Optional[Any]:
                     select(BrokerAccount).where(
                         BrokerAccount.broker == "fyers",
                         BrokerAccount.paper_mode == False,  # noqa: E712
-                        BrokerAccount.enabled == True,  # noqa: E712
                         BrokerAccount.access_token.is_not(None),
                     ).order_by(BrokerAccount.id.asc())
                 )
@@ -140,6 +146,26 @@ async def fetch_quote(broker_symbol: str) -> Optional[dict[str, Any]]:
         "change_pct": q.change_pct,
         "prev_close": q.prev_close,
     }
+
+
+async def fetch_history(
+    broker_symbol: str, resolution: str = "5", days: int = 5
+) -> list[Any]:
+    """OHLCV candles for any Fyers symbol (for ATR). Returns [] when Fyers
+    isn't connected or the call fails — the volatility provider treats an
+    empty/short series as "no ATR" and falls back to the % stop."""
+    if not broker_symbol:
+        return []
+    backend = _fyers_backend()
+    if backend is None or not hasattr(backend, "get_history"):
+        return []
+    try:
+        return await backend.get_history(
+            broker_symbol.strip().upper(), resolution=resolution, days=days
+        )
+    except Exception as e:  # noqa: BLE001
+        log.debug("market.fyers_history_failed", symbol=broker_symbol, error=str(e))
+        return []
 
 
 # ---- index ticker --------------------------------------------------------

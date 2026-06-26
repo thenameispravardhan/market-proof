@@ -67,7 +67,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional, Sequence
 
 from sqlalchemy import func, select
@@ -81,7 +81,7 @@ from app.db.models import (
     Trade as TradeRow,
 )
 from app.logging_config import get_logger
-from app.risk import position_sizer
+from app.risk import position_sizer, volatility
 
 # Type-only import — `MarketDataBus` is used solely in annotations here
 # (the engine reads `self._md._quotes` off the injected instance). With
@@ -231,9 +231,14 @@ class RiskEngine:
         market_data: Optional[MarketDataBus] = None,
         portfolio_value: Optional[float] = None,
         session_factory: Optional[Callable[[], Session]] = None,
+        vol_regime: Optional[volatility.VolatilityRegime] = None,
     ) -> None:
         self._sector_map = sector_map or load_sector_map()
         self._md = market_data
+        # Volatility-regime seam (India VIX). None → no throttle. When wired
+        # (Phase 5) a high VIX shrinks the per-trade risk %. Sizing only —
+        # never touches the LLM conviction.
+        self._vol_regime = vol_regime
         # When set, the engine uses this number as the portfolio
         # value instead of the SUM(open positions) — useful for
         # tests and for backtests where the user supplies a
@@ -438,8 +443,21 @@ class RiskEngine:
             if overrides.max_capital_risk_pct is not None
             else settings.MAX_CAPITAL_RISK_PCT
         )
+        # High-VIX risk throttle (fail-safe): None VIX → 1.0× (no-op). When
+        # the India-VIX feed is wired this shrinks the per-trade risk % in a
+        # volatile regime. Sizing only — conviction is untouched.
+        vix_level = None
+        if self._vol_regime is not None:
+            try:
+                vix_level = self._vol_regime.india_vix()
+            except Exception:  # noqa: BLE001
+                vix_level = None
+        vix_mult = volatility.vix_risk_multiplier(vix_level)
         max_capital_risk_pct = position_sizer.resolve_risk_pct(
-            session, cap_pct=cap_pct, ramp=(self._portfolio_value_override is None)
+            session,
+            cap_pct=cap_pct,
+            ramp=(self._portfolio_value_override is None),
+            extra_mult=vix_mult,
         )
         # Single-name notional cap (resolved here so we can clamp the
         # auto-sized qty to it — RISK.md §2: take the SMALLER of the
@@ -622,11 +640,44 @@ class RiskEngine:
                     f"ADV unknown for {symbol!r}; min_liquidity rule not enforced."
                 )
 
+        # ---- R12. bid/ask spread (RISK.md §1) --------------------------
+        # A wide spread means a bad fill and a stop that's already underwater
+        # at entry. Block when the quoted spread exceeds MAX_SPREAD_PCT. The
+        # Fyers quote doesn't carry bid/ask yet, so this is fail-safe: when
+        # bid/ask are absent we SKIP (warn, never fake a pass) — it switches
+        # on the moment an L1 feed populates them (Phase 5).
+        max_spread = float(getattr(settings, "MAX_SPREAD_PCT", 0.0) or 0.0)
+        bid = getattr(quote, "bid", None) if quote is not None else None
+        ask = getattr(quote, "ask", None) if quote is not None else None
+        if max_spread > 0 and bid is not None and ask is not None:
+            try:
+                bid_f, ask_f = float(bid), float(ask)
+            except (TypeError, ValueError):
+                bid_f = ask_f = 0.0
+            mid = (bid_f + ask_f) / 2.0
+            if mid > 0 and ask_f >= bid_f:
+                spread_pct = (ask_f - bid_f) / mid * 100.0
+                if spread_pct > max_spread:
+                    violations.append({
+                        "code": "RISK_WIDE_SPREAD",
+                        "message": (
+                            f"spread {spread_pct:.3f}% > max {max_spread:.3f}% "
+                            f"for {symbol!r} (bid={bid_f:.2f}, ask={ask_f:.2f})."
+                        ),
+                        "severity": "critical",
+                    })
+        elif max_spread > 0:
+            warnings.append(
+                f"bid/ask unknown for {symbol!r}; spread rule not enforced."
+            )
+
         # ---- R9. sector concentration ----------------------------------
+        # Global default now comes from Settings (SECTOR_CONCENTRATION_PCT,
+        # tightened to 25%); a per-strategy override still wins.
         sector_cap = float(
             overrides.sector_concentration_pct
             if overrides.sector_concentration_pct is not None
-            else DEFAULT_SECTOR_CAP_PCT
+            else getattr(settings, "SECTOR_CONCENTRATION_PCT", DEFAULT_SECTOR_CAP_PCT)
         )
         sector = self._sector_map.get(symbol)
         if sector is not None:
@@ -639,6 +690,43 @@ class RiskEngine:
                         f"sector {sector!r} exposure would reach "
                         f"{projected:.2f} ({projected / portfolio_value * 100:.1f}%), "
                         f"cap is {sector_cap:.1f}%."
+                    ),
+                    "severity": "critical",
+                })
+            # ---- R13. clustering: max distinct names per sector ---------
+            # News hits correlated names at once; cap the COUNT of names per
+            # sector (not just the value). Adding to a name we already hold
+            # doesn't count as a new cluster member.
+            open_syms = self._sector_open_symbols(session, sector)
+            max_per_sector = int(getattr(settings, "MAX_POSITIONS_PER_SECTOR", 0) or 0)
+            if (
+                max_per_sector > 0
+                and symbol not in open_syms
+                and len(open_syms) >= max_per_sector
+            ):
+                violations.append({
+                    "code": "RISK_SECTOR_CLUSTER",
+                    "message": (
+                        f"sector {sector!r} already holds {len(open_syms)} name(s) "
+                        f"({', '.join(sorted(open_syms))}); cap is {max_per_sector}."
+                    ),
+                    "severity": "critical",
+                })
+            # ---- One-name-per-event window ------------------------------
+            # If another name in this sector was entered within the cluster
+            # window, treat it as the same news event and take only the
+            # first — refuse the correlated follow-on.
+            window = int(getattr(settings, "SECTOR_CLUSTER_WINDOW_SECONDS", 0) or 0)
+            if (
+                window > 0
+                and symbol not in open_syms
+                and self._recent_sector_entry(session, sector, symbol, window)
+            ):
+                violations.append({
+                    "code": "RISK_SECTOR_CLUSTER_WINDOW",
+                    "message": (
+                        f"another {sector!r} name was entered within the last "
+                        f"{window}s; taking only the first of a news cluster."
                     ),
                     "severity": "critical",
                 })
@@ -769,6 +857,42 @@ class RiskEngine:
             price = r.last_price or fallback_price
             total += abs(int(r.quantity)) * float(price)
         return total
+
+    def _sector_open_symbols(self, session: Session, sector: str) -> set[str]:
+        """Distinct symbols in `sector` that currently hold an open
+        (non-zero quantity) position — drives the per-sector name cap."""
+        syms = {s for s, sec in self._sector_map.items() if sec == sector}
+        if not syms:
+            return set()
+        rows = session.query(PositionRow).filter(PositionRow.symbol.in_(syms)).all()
+        return {r.symbol for r in rows if int(r.quantity) != 0}
+
+    def _recent_sector_entry(
+        self, session: Session, sector: str, symbol: str, window_seconds: int
+    ) -> bool:
+        """True if another name in `sector` (not `symbol`) had an ENTRY fill
+        within the last `window_seconds`. Entry fills carry NULL pnl (exits
+        carry realised pnl); `executed_at` is stored naive-UTC. Mirrors the
+        entry/exit distinction used by `circuit_breakers.entries_today`."""
+        syms = {
+            s for s, sec in self._sector_map.items()
+            if sec == sector and s != symbol
+        }
+        if not syms:
+            return False
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=int(window_seconds))
+        ).replace(tzinfo=None)
+        n = session.execute(
+            select(func.count(TradeRow.id)).where(
+                TradeRow.symbol.in_(syms),
+                TradeRow.status == "filled",
+                TradeRow.pnl.is_(None),
+                TradeRow.executed_at.is_not(None),
+                TradeRow.executed_at >= cutoff,
+            )
+        ).scalar_one()
+        return bool(n or 0)
 
 
 # ---- Async import (kept here so the module can be imported without

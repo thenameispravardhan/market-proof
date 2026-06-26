@@ -59,6 +59,89 @@ _KEYWORD_MAP: dict[str, tuple[str, ...]] = {
 }
 
 
+# -- Pre-LLM noise filter ------------------------------------------------
+#
+# A conservative denylist of clearly-administrative NSE/BSE filings that
+# are never market-moving on their own. Matching one of these by
+# substring lets the analyzer skip the slow, paid LLM call entirely —
+# which also keeps the serial analyzer queue from backing up behind junk
+# on a busy filing day, so a real market-mover isn't stuck waiting.
+#
+# Keep this list TIGHT: a false positive here silently drops a real
+# trade. When in doubt, leave it out and let the LLM judge. We
+# deliberately do NOT filter broad "Regulation 30" disclosures — material
+# events (orders, acquisitions) are routinely filed citing Reg. 30.
+_NON_MATERIAL_KEYWORDS: tuple[str, ...] = (
+    "trading window",
+    "compliance certificate",
+    "certificate under regulation 40",
+    "regulation 74",
+    "reg 74",
+    "regulation 7(3)",
+    "newspaper publication",
+    "newspaper advertisement",
+    "publication in newspaper",
+    "duplicate share certificate",
+    "loss of share certificate",
+    "issue of duplicate",
+    "reconciliation of share capital",
+    "investor complaints",
+    "change in registrar",
+)
+
+
+# Strong material-event markers. Administrative notices are routinely
+# *bundled* with a genuinely tradeable event in the same headline (e.g. a
+# board meeting to consider fund-raising filed alongside a trading-window
+# closure). If any of these appears we never skip — the substring denylist
+# above is too blunt to safely drop such a headline, so we let the LLM judge.
+# Kept to strong, unambiguous catalysts that would be a real loss if
+# dropped. We deliberately leave out priced-in actions (results / bonus /
+# split): a "board meeting to consider results" is already covered by
+# "board meeting", while a bare "newspaper publication of results" is the
+# administrative notice we *want* to keep filtering.
+_MATERIAL_OVERRIDE_KEYWORDS: tuple[str, ...] = (
+    "board meeting",
+    "fund rais",
+    "fund-rais",
+    "fundrais",
+    "acquisition",
+    "acquire",
+    "merger",
+    "amalgamation",
+    "demerger",
+    "scheme of arrangement",
+    "open offer",
+    "preferential",
+    "buyback",
+    "buy-back",
+    "order win",
+    "bags order",
+    "wins order",
+    "awarded",
+)
+
+
+def is_non_material(title: str) -> bool:
+    """True when the filing is a clearly-administrative, non-tradeable
+    notice (trading-window closures, compliance certificates, newspaper
+    publications, …).
+
+    Conservative by design — only the obvious noise in
+    `_NON_MATERIAL_KEYWORDS` is filtered, and even then a strong
+    material-event marker (`_MATERIAL_OVERRIDE_KEYWORDS`) anywhere in the
+    same headline vetoes the skip, so a material event bundled with an
+    administrative one is never dropped. Everything else falls through to
+    the LLM. Matches case-insensitively on the exchange-feed headline.
+    """
+    haystack = (title or "").lower()
+    if not haystack:
+        return False
+    if any(kw in haystack for kw in _MATERIAL_OVERRIDE_KEYWORDS):
+        return False
+    return any(kw in haystack for kw in _NON_MATERIAL_KEYWORDS)
+
+
 def detect_event_type(title: str, pdf_url: Optional[str] = None) -> str:
     """Pick the most likely event type from title (+ optional URL).
 
@@ -257,7 +340,11 @@ def render_system_prompt(
         f"You are a financial analyst analysing an NSE/BSE corporate "
         f"announcement (event_type: {event_type}). "
         f"{template.system_prompt} "
-        f"Return ONLY valid JSON matching the schema. No prose, no markdown."
+        f"Return ONLY valid JSON matching the schema. No prose, no markdown. "
+        f"Be concise: keep `summary` to one sentence and `reasoning` to at "
+        f"most two short sentences, so the JSON stays compact and fast to "
+        f"generate (it must fit well within the token budget — never let "
+        f"the JSON get truncated)."
     )
 
 

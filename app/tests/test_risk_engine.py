@@ -580,3 +580,109 @@ def test_sector_map_known_symbols():
 def test_sector_map_unknown_returns_none():
     smap = load_sector_map()
     assert smap.get("ZZZZ_NEWSYMBOL") is None
+
+
+# -- R12: bid/ask spread gate --------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_wide_spread_blocks(db_session, isolated_db):
+    md = MarketDataBus()
+    # 1% spread (bid 100 / ask 101) — well over the 0.1% default.
+    md.set_quote_sync("RELIANCE", last_price=100.5, bid=100.0, ask=101.0)
+    strat = _make_strategy(db_session, "r12")
+    acct = _make_account(db_session)
+    sig = _make_signal(db_session, symbol="RELIANCE", action="BUY", strategy_id=strat.id)
+    engine = RiskEngine(market_data=md, portfolio_value=50_000_000.0)
+    decision = await engine.evaluate(
+        signal=sig, strategy=strat, account=acct,
+        entry=100.5, stop_loss=99.0, session=db_session,
+    )
+    assert decision.approved is False
+    assert "RISK_WIDE_SPREAD" in decision.codes
+
+
+@pytest.mark.asyncio
+async def test_unknown_spread_skips(db_session, isolated_db):
+    """No bid/ask on the quote → the spread rule SKIPS (never fakes a pass)."""
+    md = MarketDataBus()
+    md.set_quote_sync("RELIANCE", last_price=2500.0)  # no bid/ask
+    strat = _make_strategy(db_session, "r12b", config={"max_capital_risk_pct": 0.05})
+    acct = _make_account(db_session)
+    sig = _make_signal(db_session, symbol="RELIANCE", action="BUY", strategy_id=strat.id)
+    engine = RiskEngine(market_data=md, portfolio_value=50_000_000.0)
+    decision = await engine.evaluate(
+        signal=sig, strategy=strat, account=acct,
+        entry=2500.0, stop_loss=2475.0, session=db_session,
+    )
+    assert "RISK_WIDE_SPREAD" not in decision.codes
+
+
+@pytest.mark.asyncio
+async def test_tight_spread_allows(db_session, isolated_db):
+    md = MarketDataBus()
+    # 0.05% spread — inside the 0.1% default.
+    md.set_quote_sync("RELIANCE", last_price=2500.0, bid=2499.5, ask=2500.5)
+    strat = _make_strategy(db_session, "r12c", config={"max_capital_risk_pct": 0.05})
+    acct = _make_account(db_session)
+    sig = _make_signal(db_session, symbol="RELIANCE", action="BUY", strategy_id=strat.id)
+    engine = RiskEngine(market_data=md, portfolio_value=50_000_000.0)
+    decision = await engine.evaluate(
+        signal=sig, strategy=strat, account=acct,
+        entry=2500.0, stop_loss=2475.0, session=db_session,
+    )
+    assert "RISK_WIDE_SPREAD" not in decision.codes
+
+
+# -- R13 + cluster window: clustering control ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_sector_name_cap_blocks(db_session, isolated_db):
+    """Two ENERGY names already open → a 3rd ENERGY entry is blocked by the
+    per-sector name cap (default 2), independent of the value cap."""
+    md = MarketDataBus()
+    md.set_quote_sync("RELIANCE", last_price=2500.0)
+    strat = _make_strategy(db_session, "r13")
+    acct = _make_account(db_session)
+    # Tiny positions so the VALUE cap (R9) is nowhere near tripped — this
+    # isolates the COUNT cap.
+    for sym in ("ONGC", "BPCL"):
+        db_session.add(PositionRow(
+            symbol=sym, quantity=10, average_price=200.0,
+            last_price=200.0, strategy_id=strat.id,
+        ))
+    db_session.commit()
+    sig = _make_signal(db_session, symbol="RELIANCE", action="BUY", strategy_id=strat.id)
+    engine = RiskEngine(market_data=md, portfolio_value=50_000_000.0)
+    decision = await engine.evaluate(
+        signal=sig, strategy=strat, account=acct,
+        entry=2500.0, stop_loss=2475.0, session=db_session,
+    )
+    assert decision.approved is False
+    assert "RISK_SECTOR_CLUSTER" in decision.codes
+
+
+@pytest.mark.asyncio
+async def test_sector_cluster_window_blocks(db_session, isolated_db):
+    """A recent ENTRY in another same-sector name (no open position) → the
+    correlated follow-on is blocked as one-name-per-event."""
+    md = MarketDataBus()
+    md.set_quote_sync("RELIANCE", last_price=2500.0)
+    strat = _make_strategy(db_session, "rwin")
+    acct = _make_account(db_session)
+    # ONGC entry fill seconds ago (pnl=None marks an entry), no open position.
+    db_session.add(TradeRow(
+        symbol="ONGC", side="BUY", quantity=10, price=200.0,
+        order_type="market", status="filled", pnl=None,
+        executed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+    ))
+    db_session.commit()
+    sig = _make_signal(db_session, symbol="RELIANCE", action="BUY", strategy_id=strat.id)
+    engine = RiskEngine(market_data=md, portfolio_value=50_000_000.0)
+    decision = await engine.evaluate(
+        signal=sig, strategy=strat, account=acct,
+        entry=2500.0, stop_loss=2475.0, session=db_session,
+    )
+    assert decision.approved is False
+    assert "RISK_SECTOR_CLUSTER_WINDOW" in decision.codes

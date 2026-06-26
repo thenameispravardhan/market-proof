@@ -50,7 +50,13 @@ class Settings(BaseSettings):
     BIND_HOST: str = "127.0.0.1"
     BIND_PORT: int = 8000
     LOG_LEVEL: str = "INFO"
-    POLL_INTERVAL_SECONDS: int = 5
+    # How often each monitor re-polls NSE/BSE. Lower = faster detection
+    # of a fresh filing, but poll too aggressively and the exchange CDNs
+    # start returning 403s / rate-limit your IP (the scraper then falls
+    # back to the slower Playwright path or stalls entirely). 2s is a
+    # balance for a single local operator; raise it if you start seeing
+    # `monitor.retry` 403/429 spam in the logs.
+    POLL_INTERVAL_SECONDS: int = 2
 
     # ---------- Risk defaults (per-strategy overrides in DB) ----------
     # Per-trade capital-at-risk cap. RISK.md targets 0.75%; the graduated
@@ -134,6 +140,16 @@ class Settings(BaseSettings):
     DEFAULT_SL_MIN_PCT: float = 1.0           # floor stop distance (1% of entry)
     DEFAULT_SL_SMALLCAP_PCT: float = 1.5      # 1.5% for stocks under SMALLCAP_PRICE
     SMALLCAP_PRICE: float = 200.0
+    # §3b Volatility-aware (ATR) initial stop. When ATR is available the
+    # stop distance is ATR×ATR_STOP_MULT (clamped to [floor, ATR_MAX_STOP_PCT]
+    # of entry); otherwise we fall back to the percentage stop above. Wider
+    # stops on volatile names cut whipsaw; tighter stops on quiet names cut
+    # the loss when wrong. The ATR feed is wired fail-safe — until intraday
+    # candles are sourced the provider returns None and the % stop applies.
+    ATR_ENABLED: bool = True
+    ATR_PERIOD: int = 14                      # Wilder period (intraday)
+    ATR_STOP_MULT: float = 2.0               # stop distance = ATR × this
+    ATR_MAX_STOP_PCT: float = 8.0            # cap the ATR stop at this % of entry
     # §4 Portfolio circuit breakers. Loss limits are % of the relevant
     # anchor equity (day-start, week-peak, month-start). Tripping the
     # daily/monthly breaker flattens + halts; weekly throttles risk.
@@ -144,13 +160,49 @@ class Settings(BaseSettings):
     CONSECUTIVE_LOSER_PAUSE_MINUTES: int = 45
     CONSECUTIVE_LOSER_RESUME_CONFIDENCE: float = 0.85
     MAX_TRADES_PER_DAY: int = 12
+    # §4b Clustering control. News often hits correlated names at once (e.g.
+    # every PSU bank on one policy headline). The whole-portfolio sector cap
+    # (SECTOR_CONCENTRATION_PCT) limits exposure; MAX_POSITIONS_PER_SECTOR
+    # limits the COUNT of names per sector; and the cluster window realises
+    # "take only the single best when several names move on the same event"
+    # by blocking a second entry in a sector within
+    # SECTOR_CLUSTER_WINDOW_SECONDS of the first (NSE/BSE filings are
+    # per-company, so same-sector + short window ≈ same news event).
+    SECTOR_CONCENTRATION_PCT: float = 25.0
+    MAX_POSITIONS_PER_SECTOR: int = 2
+    SECTOR_CLUSTER_WINDOW_SECONDS: int = 120
     # §5 Execution safeguards. Auto entries use an IOC marketable-limit
     # (last ± ENTRY_BUFFER_PCT) cancelled after ORDER_FILL_TIMEOUT; a
     # fill worse than MAX_SLIPPAGE_PCT off the intended entry is rejected.
     ENTRY_BUFFER_PCT: float = 0.2
     MAX_SLIPPAGE_PCT: float = 0.25
+    # Anti-chase guard: the IOC buffer bounds the order→fill move, but
+    # nothing else stops us from entering a name that already ran between
+    # signal generation and order time. If the order-time price has moved
+    # more than this % in the trade's favour vs the signal's intended entry,
+    # the move is "already extended" and we skip it (block ENTRY_DRIFT)
+    # rather than chase the spike into a reversal.
+    MAX_ENTRY_DRIFT_PCT: float = 1.5
     ORDER_FILL_TIMEOUT_SECONDS: float = 1.5
     LLM_TIMEOUT_SECONDS: float = 18.0         # discard the opportunity past this
+    # Hard cap on LLM completion tokens. Generation latency scales almost
+    # linearly with output length, and a signal JSON needs only a few
+    # hundred tokens — so capping here (clamped against each template's
+    # own max_tokens at call time) shaves seconds off every analysis.
+    # Paired with the brevity instruction in `render_system_prompt` so the
+    # model stays well inside this. 1024 keeps the latency win over the
+    # 2000-token template default while leaving 2-3× headroom over the
+    # expected JSON length, so a slightly verbose response can't truncate
+    # its JSON mid-string (a truncated response fails to parse → lost
+    # signal). Don't drop this below the size a full signal JSON needs.
+    LLM_MAX_TOKENS: int = 1024
+    # Pre-LLM noise filter: drop clearly-administrative filings (trading-
+    # window notices, compliance certificates, newspaper publications, …)
+    # BEFORE spending an LLM call on them. Saves cost and — because the
+    # analyzer processes announcements serially — stops the queue backing
+    # up behind junk so a real market-mover isn't stuck waiting. The
+    # denylist is deliberately conservative; see app/analyzer/prompts.py.
+    PRE_LLM_FILTER_ENABLED: bool = True
     # Market session (IST, "HH:MM"). Entry window excludes the first
     # 15 min after open and the last 30 min before close; all intraday
     # positions are force-squared-off at SQUARE_OFF_TIME.
@@ -189,6 +241,9 @@ class Settings(BaseSettings):
         "DAILY_MAX_LOSS_PCT",
         "MAX_SINGLE_POSITION_PCT",
         "DEFAULT_SL_PCT",
+        "ATR_MAX_STOP_PCT",
+        "MAX_ENTRY_DRIFT_PCT",
+        "SECTOR_CONCENTRATION_PCT",
     )
     @classmethod
     def _pct_in_range(cls, v: float) -> float:
@@ -196,7 +251,7 @@ class Settings(BaseSettings):
             raise ValueError("percent value must be in (0, 100]")
         return v
 
-    @field_validator("PORTFOLIO_VALUE", "DEFAULT_TARGET_RR")
+    @field_validator("PORTFOLIO_VALUE", "DEFAULT_TARGET_RR", "ATR_STOP_MULT")
     @classmethod
     def _strictly_positive(cls, v: float) -> float:
         if v <= 0:
@@ -210,6 +265,13 @@ class Settings(BaseSettings):
             raise ValueError("QUOTE_REFRESH_SECONDS must be >= 1")
         return v
 
+    @field_validator("POLL_INTERVAL_SECONDS", "LLM_MAX_TOKENS", "ATR_PERIOD")
+    @classmethod
+    def _ge_one(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("value must be >= 1")
+        return v
+
     @field_validator("MAX_NEWS_AGE_SECONDS", "MAX_HOLD_SECONDS")
     @classmethod
     def _positive_seconds(cls, v: int) -> int:
@@ -217,7 +279,12 @@ class Settings(BaseSettings):
             raise ValueError("seconds value must be >= 1")
         return v
 
-    @field_validator("MAX_CONCURRENT_POSITIONS", "MAX_SIGNALS_PER_DAY")
+    @field_validator(
+        "MAX_CONCURRENT_POSITIONS",
+        "MAX_SIGNALS_PER_DAY",
+        "MAX_POSITIONS_PER_SECTOR",
+        "SECTOR_CLUSTER_WINDOW_SECONDS",
+    )
     @classmethod
     def _positive_int(cls, v: int) -> int:
         if v < 0:

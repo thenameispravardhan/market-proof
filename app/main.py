@@ -172,6 +172,31 @@ async def lifespan(app: FastAPI):
         paper_backend=execution_manager.paper_backend,
     )
     execution_manager.attach_quote_feed(quote_feed)
+    # Live volatility feeds (Phase 5): ATR from Fyers history candles and
+    # India VIX from the index quote, both fail-safe. Until a Fyers account
+    # is connected the fetches return empty/None and the risk layer falls
+    # back to the % stop / no VIX gate. The bare symbol is resolved to the
+    # full Fyers symbol for the candle fetch (same resolver the quote feed
+    # uses); Fyers stays the only price source (no public-feed fallback).
+    from app.api.market import fetch_history as _fetch_history
+    from app.api.market import fetch_quote as _fetch_quote
+    from app.execution.symbols import resolve_fyers_symbol as _resolve_sym
+    from app.risk import volatility as _volatility
+
+    async def _candle_fetch(symbol: str, resolution: str, days: int):
+        full = _resolve_sym(symbol) or symbol
+        return await _fetch_history(full, resolution, days)
+
+    async def _vix_fetch():
+        q = await _fetch_quote("NSE:INDIAVIX-INDEX")
+        return float(q["last_price"]) if q and q.get("last_price") else None
+
+    execution_manager.attach_volatility_providers(
+        vol_provider=_volatility.FyersCandleVolatilityProvider(
+            _candle_fetch, period=int(settings.ATR_PERIOD),
+        ),
+        vol_regime=_volatility.FyersVolatilityRegime(_vix_fetch),
+    )
     # Realtime Fyers feed: data socket streams live prices into the same
     # market-data bus (so QuoteFeed can skip REST polling for streamed
     # symbols → no more /quotes 429s), order socket tracks fills in real

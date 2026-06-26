@@ -53,6 +53,7 @@ from app.analyzer.prompts import (
     DEFAULT_EVENT_TYPE,
     append_announcement_context,
     detect_event_type,
+    is_non_material,
     load_default_template,
     load_template,
     render_system_prompt,
@@ -60,6 +61,7 @@ from app.analyzer.prompts import (
 )
 from app.analyzer.rules_engine import (
     RuleMatch,
+    enrich_analysis_context,
     evaluate as rules_evaluate,
     get_or_create_default_strategy,
     load_rules_for_strategy,
@@ -353,6 +355,31 @@ class Service:
                 )
                 return None
 
+        # Step 1.7: PRE-LLM NOISE FILTER. Clearly-administrative filings
+        # (trading-window notices, compliance certificates, newspaper
+        # publications, …) never move the stock on their own. Skip the
+        # slow, paid LLM call for them — and because the analyzer
+        # processes announcements serially, this also stops the queue
+        # backing up behind junk so a real market-mover isn't stuck
+        # waiting. We persist the usual placeholder analysis so the
+        # announcement isn't retried.
+        if getattr(settings, "PRE_LLM_FILTER_ENABLED", True) and is_non_material(
+            announcement.headline or ""
+        ):
+            log.info(
+                "analyzer.non_material_skipped",
+                announcement_id=announcement_id,
+                symbol=announcement.symbol,
+                headline=announcement.headline,
+            )
+            await loop.run_in_executor(
+                None, _store_failed_analysis,
+                self._session_factory, announcement_id,
+                "non_material_filing",
+                {"headline": announcement.headline or ""},
+            )
+            return None
+
         # Step 2: pick prompt template (event-type heuristic + DEFAULT).
         detected = detect_event_type(
             announcement.headline or "", announcement.pdf_url
@@ -417,13 +444,22 @@ class Service:
             # if DeepSeek is slow, discard the opportunity rather than place
             # a late trade.
             llm_timeout = float(getattr(settings, "LLM_TIMEOUT_SECONDS", 18.0))
+            # Clamp the template's max_tokens against the global cap:
+            # shorter completions generate faster, and a few hundred
+            # tokens is plenty for the signal JSON. min() means an
+            # operator can still set a *lower* per-template value, but
+            # never blow past the global safety cap.
+            max_tokens = min(
+                int(template.max_tokens),
+                int(getattr(settings, "LLM_MAX_TOKENS", 512)),
+            )
             ds_result = await asyncio.wait_for(
                 self._deepseek.complete(
                     system=system,
                     user=user,
                     model=template.model,
                     temperature=template.temperature,
-                    max_tokens=template.max_tokens,
+                    max_tokens=max_tokens,
                 ),
                 timeout=llm_timeout,
             )
@@ -640,10 +676,18 @@ def _persist_analysis_and_signal(
         # Rules engine.
         strategy = get_or_create_default_strategy(session)
         rules = load_rules_for_strategy(session, strategy.id)
-        # Add the symbol/exchange for the rule context.
+        # Add the symbol/exchange for the rule context, then enrich with the
+        # cheaply-available market context (sector) so rules can gate on it.
+        # Price / change_pct / adv_crore need a live quote and are only
+        # filled when one is passed to enrich_analysis_context (not wired in
+        # this offline analysis path yet) — they stay absent here, which the
+        # engine treats as a fail-safe non-match.
+        from app.risk.engine import load_sector_map
+
         eval_ctx = dict(analysis_dict)
         eval_ctx["symbol"] = announcement.symbol
         eval_ctx["exchange"] = announcement.exchange
+        eval_ctx = enrich_analysis_context(eval_ctx, sector_map=load_sector_map())
         match = rules_evaluate(eval_ctx, rules)
 
         # Trade levels (deterministic stub for v1).

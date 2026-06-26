@@ -25,6 +25,7 @@ from app.analyzer.prompts import (
     EVENT_TYPES,
     append_announcement_context,
     detect_event_type,
+    is_non_material,
     load_default_template,
     load_template,
     render_system_prompt,
@@ -38,6 +39,38 @@ from app.db.models import PromptHistory, PromptTemplate
 # Wipe rows between tests so test order doesn't leak PromptTemplate /
 # PromptHistory data from one test into another.
 pytestmark = pytest.mark.usefixtures("isolated_db")
+
+
+# -- is_non_material (pre-LLM noise filter) -----------------------------
+
+
+def test_non_material_filters_obvious_admin_notices():
+    assert is_non_material("Closure of Trading Window") is True
+    assert is_non_material("Compliance Certificate under Regulation 7(3)") is True
+    assert is_non_material("Newspaper Publication of audited accounts") is True
+
+
+def test_non_material_lets_real_events_through():
+    assert is_non_material("Company wins order worth Rs 1500 cr") is False
+    assert is_non_material("Interim Dividend Announcement") is False
+    assert is_non_material("") is False
+
+
+def test_non_material_does_not_drop_material_event_bundled_with_admin_notice():
+    """Regression: a material catalyst in the same headline as an
+    administrative phrase must NOT be filtered — the substring denylist is
+    too blunt to safely drop it, so the material-override veto wins."""
+    assert (
+        is_non_material(
+            "Intimation of Board Meeting to consider fund raising "
+            "and closure of Trading Window"
+        )
+        is False
+    )
+    assert (
+        is_non_material("Newspaper publication of notice of buyback of equity shares")
+        is False
+    )
 
 
 # -- detect_event_type --------------------------------------------------

@@ -71,7 +71,7 @@ def test_get_settings_defaults(client: TestClient) -> None:
     assert g["MAX_SINGLE_POSITION_PCT"] == 20.0
     assert g["MIN_LIQUIDITY_CRORE"] == 5.0
     assert g["MAX_SIGNALS_PER_DAY"] == 20
-    assert g["POLL_INTERVAL_SECONDS"] == 5
+    assert g["POLL_INTERVAL_SECONDS"] == 2
     assert "sections" in body
     assert "version" in body
 

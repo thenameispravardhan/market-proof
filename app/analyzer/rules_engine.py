@@ -52,13 +52,24 @@ CHANNEL_RULE_MATCHED = "signal_rules.matched"
 DEFAULT_STRATEGY_NAME = "default"
 
 
-# Supported operators. Keep in sync with the T1 spec.
+# Supported operators. `between` takes a [low, high] pair (inclusive).
 SUPPORTED_OPS: frozenset[str] = frozenset(
-    {"==", "!=", "in", "not_in", ">=", "<=", ">", "<"}
+    {"==", "!=", "in", "not_in", ">=", "<=", ">", "<", "between"}
 )
 
 # Fields the engine understands. Anything else in a rule is a
 # configuration error and we raise a clear `RuleError`.
+#
+# The second group is market-context fields. `sector` is enriched onto the
+# analysis dict in the live analysis path (the service calls
+# `enrich_analysis_context` with the sector map before evaluating rules).
+# `price` / `change_pct` / `adv_crore` are filled by the same helper only
+# when a live quote is supplied to it — the offline analysis path has no
+# quote, so they're absent there for now. `atr_pct` / `india_vix` /
+# `spread_pct` are schema-ready and populate once their feeds are wired
+# (Phase 5). A rule referencing a field that's absent evaluates that
+# condition as a non-match (numeric comparisons against None are False) —
+# fail-safe, the same convention the rest of the engine uses.
 SUPPORTED_FIELDS: frozenset[str] = frozenset(
     {
         "event_type",
@@ -70,6 +81,16 @@ SUPPORTED_FIELDS: frozenset[str] = frozenset(
         "stake_change_pct",
         "dividend_per_share",
         "buyback_value_inr_crore",
+        # market-context: `sector` enriched live now; price/change/adv
+        # enrich only when a quote is supplied to enrich_analysis_context
+        "sector",
+        "price",
+        "change_pct",
+        "adv_crore",
+        # market-context (feed-backed; activate in Phase 5)
+        "atr_pct",
+        "india_vix",
+        "spread_pct",
     }
 )
 
@@ -319,6 +340,27 @@ def _apply_op(op: str, actual: Any, value: Any) -> bool:
         if value is None or not hasattr(value, "__iter__"):
             raise RuleError("`not_in` requires value to be a list/tuple")
         return not _in(actual, value)
+    if op == "between":
+        if (
+            value is None
+            or isinstance(value, (str, bytes))
+            or not hasattr(value, "__iter__")
+        ):
+            raise RuleError("`between` requires value to be a [low, high] list")
+        bounds = list(value)
+        if len(bounds) != 2:
+            raise RuleError("`between` requires exactly two bounds [low, high]")
+        if actual is None:
+            return False  # missing value never matches (fail-safe)
+        try:
+            a = float(actual)
+            lo = float(bounds[0])
+            hi = float(bounds[1])
+        except (TypeError, ValueError) as e:
+            raise RuleError(f"non-numeric value for op 'between': {value!r}") from e
+        if lo > hi:
+            lo, hi = hi, lo
+        return lo <= a <= hi
     # Numeric ordering.
     if actual is None:
         return False
@@ -355,6 +397,46 @@ def _in(actual: Any, choices: Iterable[Any]) -> bool:
 
 
 # -- Public helpers used by the service ----------------------------------
+
+
+def enrich_analysis_context(
+    analysis: Mapping[str, Any],
+    *,
+    quote: Any = None,
+    sector_map: Optional[Mapping[str, str]] = None,
+) -> dict[str, Any]:
+    """Return a copy of `analysis` enriched with the market-context fields
+    rules can gate on (`sector`, `price`, `change_pct`, `adv_crore`).
+
+    Only the cheaply-available fields are filled; feed-backed fields
+    (`atr_pct`, `india_vix`, `spread_pct`) are left for Phase 5. Existing
+    keys are never overwritten, and every addition is best-effort — a
+    missing quote / sector simply leaves the field unset, which the engine
+    treats as a non-match (fail-safe). Reusable so the call site can opt in
+    without the engine reaching out for market data itself (it stays pure).
+    """
+    enriched = dict(analysis)
+    symbol = str(enriched.get("symbol") or "").upper().strip()
+    if sector_map and symbol and "sector" not in enriched:
+        sec = sector_map.get(symbol)
+        if sec is not None:
+            enriched["sector"] = sec
+    if quote is not None:
+        for src_attr, dst_key in (
+            ("last_price", "price"),
+            ("change_pct", "change_pct"),
+            ("average_daily_volume_crore", "adv_crore"),
+        ):
+            if dst_key in enriched:
+                continue
+            val = getattr(quote, src_attr, None)
+            if val is None:
+                continue
+            try:
+                enriched[dst_key] = float(val)
+            except (TypeError, ValueError):
+                pass
+    return enriched
 
 
 async def publish_match(match: RuleMatch, *, analysis: dict[str, Any]) -> int:

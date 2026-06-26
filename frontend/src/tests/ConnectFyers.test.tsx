@@ -41,11 +41,29 @@ const NOT_CONNECTED = {
 
 const CONNECTED = {
   connected: true,
+  authorized: true,
+  has_token: true,
+  enabled: true,
   credentials_set: true,
   account_present: true,
   app_id: "WORKING-APP-100",
   live_mode: true,
   reason: null,
+};
+
+// Authorised (valid token) but the trade switch is OFF. Must NOT look like
+// an expired token / failed OAuth — only trading is paused.
+const SWITCHED_OFF = {
+  connected: false,
+  authorized: true,
+  has_token: true,
+  enabled: false,
+  credentials_set: true,
+  account_present: true,
+  app_id: "WORKING-APP-100",
+  live_mode: true,
+  reason:
+    "Fyers is authorised but the account is switched OFF. Turn it back on with the Fyers toggle on the Dashboard.",
 };
 
 describe("ConnectFyers", () => {
@@ -107,6 +125,28 @@ describe("ConnectFyers", () => {
     // the running app_id matches what's on disk.
     const appIdRow = screen.getByTestId("fyers-app-id");
     expect(appIdRow).toHaveTextContent(/DELETED-APP-100/);
+  });
+
+  it("shows a calm 'switched off' state (not Token Expired) when authorised but disabled", async () => {
+    globalThis.fetch = vi.fn(async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/api/fyers/status")) {
+        return makeJsonResponse(SWITCHED_OFF);
+      }
+      return makeJsonResponse({}, 404);
+    }) as unknown as typeof fetch;
+    const qc = makeQc();
+    render(<ConnectFyers />, { wrapper: wrapper(qc) });
+    await waitFor(() => {
+      expect(screen.getByText(/Trading Off/i)).toBeInTheDocument();
+    });
+    // It is NOT mislabelled as an expired token / OAuth failure.
+    expect(screen.queryByText(/Token Expired/i)).not.toBeInTheDocument();
+    expect(screen.queryByTestId("fyers-error")).not.toBeInTheDocument();
+    // No re-auth CTA — the connection is fine; only trading is paused.
+    expect(screen.queryByTestId("fyers-connect")).not.toBeInTheDocument();
+    // The reason explains how to turn it back on.
+    expect(screen.getByText(/toggle on the Dashboard/i)).toBeInTheDocument();
   });
 
   it("renders the connected state when status.connected is true", async () => {

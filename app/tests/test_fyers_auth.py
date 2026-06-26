@@ -610,6 +610,60 @@ def test_disconnect_clears_token_when_app_id_mismatched(client: TestClient) -> N
         app_config.reset_settings_cache()
 
 
+def test_disconnect_clears_token_when_switched_off(client: TestClient) -> None:
+    """Regression: a Fyers account that is authorised (holds a token) but
+    switched OFF (enabled=False) must still be disconnectable. Filtering the
+    disconnect lookup on `enabled == True` made "Disconnect" a silent no-op
+    once Fyers was toggled off on the dashboard."""
+    import os
+    from app.db.session import SessionLocal
+    from app import config as app_config
+
+    saved_app_id = os.environ.get("FYERS_APP_ID")
+    saved_secret = os.environ.get("FYERS_SECRET_KEY")
+    os.environ["FYERS_APP_ID"] = "MATCHING-APP-300"
+    os.environ["FYERS_SECRET_KEY"] = "FAKE-SECRET"
+    app_config.reset_settings_cache()
+    try:
+        with SessionLocal() as s:
+            from app.db import init as db_init
+            db_init.init_db()
+            s.query(BrokerAccount).filter(
+                BrokerAccount.broker == "fyers",
+                BrokerAccount.paper_mode == False,  # noqa: E712
+            ).delete()
+            s.add(
+                BrokerAccount(
+                    name="disconnect-off-test",
+                    broker="fyers",
+                    app_id="MATCHING-APP-300",  # == FYERS_APP_ID in .env
+                    secret_key="sk",
+                    access_token="live-token",
+                    paper_mode=False,
+                    enabled=False,  # trade switch OFF, but still authorised
+                )
+            )
+            s.commit()
+
+        r = client.post("/api/fyers/disconnect", json={})
+        assert r.status_code == 200, r.text
+        assert r.json()["ok"] is True
+
+        with SessionLocal() as s:
+            row = s.query(BrokerAccount).filter_by(name="disconnect-off-test").one()
+            assert row.access_token is None, "token must clear even when switched off"
+    finally:
+        if saved_app_id is None:
+            os.environ.pop("FYERS_APP_ID", None)
+        else:
+            os.environ["FYERS_APP_ID"] = saved_app_id
+        if saved_secret is None:
+            os.environ.pop("FYERS_SECRET_KEY", None)
+        else:
+            os.environ["FYERS_SECRET_KEY"] = saved_secret
+        app_config.reset_settings_cache()
+
+
 def test_authorize_url_endpoint_returns_url_and_state(monkeypatch, client: TestClient) -> None:
     import os
     saved = os.environ.get("FYERS_APP_ID")
