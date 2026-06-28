@@ -49,9 +49,12 @@ describe("Prompts", () => {
               event_type: "DEFAULT",
               system_prompt: "You are a financial analyst.",
               user_template: "Analyse the filing at {{pdf_url}}.",
-              model: "deepseek-chat",
+              model: "deepseek-v4-flash",
               temperature: 0.2,
               max_tokens: 2000,
+              reasoning_effort: "medium",
+              thinking_enabled: false,
+              stream: false,
               version: 3,
               updated_at: "2026-06-10T10:00:00Z",
               updated_by: "ui",
@@ -75,14 +78,24 @@ describe("Prompts", () => {
     });
     // The model selector is present and reflects the stored model.
     const modelSel = screen.getByTestId("prompt-model") as HTMLSelectElement;
-    expect(modelSel.value).toBe("deepseek-chat");
+    expect(modelSel.value).toBe("deepseek-v4-flash");
     const optionValues = [...modelSel.options].map((o) => o.value);
-    expect(optionValues).toContain("deepseek-reasoner");
-    expect(optionValues).toContain("deepseek-coder");
+    expect(optionValues).toEqual(["deepseek-v4-flash", "deepseek-v4-pro"]);
     // The user template hint is visible (help line below the textarea).
     expect(screen.getAllByText(/pdf_url/i).length).toBeGreaterThan(0);
     // The version chip shows v3.
     expect(screen.getAllByText(/v3/).length).toBeGreaterThan(0);
+
+    // The v4 inference controls reflect the stored values.
+    const thinkingSel = screen.getByTestId("prompt-thinking") as HTMLSelectElement;
+    expect(thinkingSel.value).toBe("disabled");
+    const reasoningSel = screen.getByTestId("prompt-reasoning") as HTMLSelectElement;
+    expect(reasoningSel.value).toBe("medium");
+    // Reasoning effort is an independent control — always selectable,
+    // even with thinking off.
+    expect(reasoningSel.disabled).toBe(false);
+    const streamSel = screen.getByTestId("prompt-stream") as HTMLSelectElement;
+    expect(streamSel.value).toBe("off");
   });
 
   it("changing the model and saving POSTs the new model + bumps the version", async () => {
@@ -117,9 +130,12 @@ describe("Prompts", () => {
               event_type: "DEFAULT",
               system_prompt: "OLD system prompt long enough to pass validation.",
               user_template: "OLD template {{pdf_url}}",
-              model: "deepseek-chat",
+              model: "deepseek-v4-flash",
               temperature: 0.2,
               max_tokens: 2000,
+              reasoning_effort: "medium",
+              thinking_enabled: false,
+              stream: false,
               version: 3,
               updated_at: "2026-06-10T10:00:00Z",
               updated_by: "ui",
@@ -138,7 +154,18 @@ describe("Prompts", () => {
     const user = userEvent.setup();
     // Editor auto-loads DEFAULT; change the model via the new selector.
     const modelSel = (await screen.findByTestId("prompt-model")) as HTMLSelectElement;
-    fireEvent.change(modelSel, { target: { value: "deepseek-reasoner" } });
+    fireEvent.change(modelSel, { target: { value: "deepseek-v4-pro" } });
+    // Flip the v4 inference controls too: enable thinking, bump reasoning
+    // effort to high, and turn streaming on.
+    fireEvent.change(screen.getByTestId("prompt-thinking"), {
+      target: { value: "enabled" },
+    });
+    fireEvent.change(screen.getByTestId("prompt-reasoning"), {
+      target: { value: "high" },
+    });
+    fireEvent.change(screen.getByTestId("prompt-stream"), {
+      target: { value: "on" },
+    });
     // Save (enabled now that the form is dirty).
     await user.click(screen.getByTestId("save-prompt"));
 
@@ -147,9 +174,12 @@ describe("Prompts", () => {
     });
     expect(postCalls[0]!.url).toContain("/api/prompts/DEFAULT");
     expect(postCalls[0]!.body).toMatchObject({
-      model: "deepseek-reasoner",
+      model: "deepseek-v4-pro",
       temperature: 0.2,
       max_tokens: 2000,
+      reasoning_effort: "high",
+      thinking_enabled: true,
+      stream: true,
     });
     // Optimistic UI shows the success state.
     expect(await screen.findByText(/Saved/)).toBeInTheDocument();

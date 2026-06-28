@@ -401,3 +401,4 @@ class NSEMonitor(BaseMonitor):
         if fetcher is None:
             fetcher = fetch_nse
         super().__init__(fetcher=fetcher, parser=parser, **kwargs)
+

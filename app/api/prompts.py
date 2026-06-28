@@ -28,12 +28,11 @@ router = APIRouter(prefix="/api/prompts", tags=["prompts"])
 init_db()
 
 _VALID_MODELS = {
-    "deepseek-chat",
-    "deepseek-coder",
-    "deepseek-reasoner",
     "deepseek-v4-flash",
     "deepseek-v4-pro",
 }
+
+_VALID_REASONING_EFFORT = {"low", "medium", "high"}
 
 
 # -------------------------------------------------------------------------
@@ -44,9 +43,15 @@ _VALID_MODELS = {
 class PromptUpdate(BaseModel):
     system_prompt: str = Field(..., min_length=50, max_length=4000)
     user_template: str = Field(...)
-    model: str = Field(default="deepseek-chat")
+    model: str = Field(default="deepseek-v4-flash")
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)
     max_tokens: int = Field(default=2000, ge=100, le=8000)
+    # DeepSeek v4 inference controls. reasoning_effort tunes the thinking
+    # depth (only used when thinking is on); thinking_enabled=False sends
+    # extra_body={"thinking": {"type": "disabled"}}; stream toggles SSE.
+    reasoning_effort: str = Field(default="medium")
+    thinking_enabled: bool = Field(default=False)
+    stream: bool = Field(default=False)
     change_note: Optional[str] = None
 
     @field_validator("user_template")
@@ -63,6 +68,16 @@ class PromptUpdate(BaseModel):
             # Be lenient — allow any non-empty string so operators can try new models
             if not v.strip():
                 raise ValueError("model must be a non-empty string")
+        return v
+
+    @field_validator("reasoning_effort")
+    @classmethod
+    def _reasoning_check(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        if v not in _VALID_REASONING_EFFORT:
+            raise ValueError(
+                f"reasoning_effort must be one of {sorted(_VALID_REASONING_EFFORT)}"
+            )
         return v
 
 
@@ -84,6 +99,9 @@ def _ser_template(t: PromptTemplate) -> dict[str, Any]:
         "model": t.model,
         "temperature": t.temperature,
         "max_tokens": t.max_tokens,
+        "reasoning_effort": t.reasoning_effort,
+        "thinking_enabled": t.thinking_enabled,
+        "stream": t.stream,
         "version": t.version,
         "updated_at": t.updated_at.isoformat() if t.updated_at else None,
         "updated_by": t.updated_by,
@@ -100,6 +118,9 @@ def _ser_history(h: PromptHistory) -> dict[str, Any]:
         "model": h.model,
         "temperature": h.temperature,
         "max_tokens": h.max_tokens,
+        "reasoning_effort": h.reasoning_effort,
+        "thinking_enabled": h.thinking_enabled,
+        "stream": h.stream,
         "changed_at": h.changed_at.isoformat() if h.changed_at else None,
         "change_note": h.change_note,
     }
@@ -125,6 +146,9 @@ def _save_history(db: Session, t: PromptTemplate) -> None:
             model=t.model,
             temperature=t.temperature,
             max_tokens=t.max_tokens,
+            reasoning_effort=t.reasoning_effort,
+            thinking_enabled=t.thinking_enabled,
+            stream=t.stream,
             change_note=None,
         )
     )
@@ -198,6 +222,9 @@ def upsert_prompt(
             model=body.model,
             temperature=body.temperature,
             max_tokens=body.max_tokens,
+            reasoning_effort=body.reasoning_effort,
+            thinking_enabled=body.thinking_enabled,
+            stream=body.stream,
             version=1,
             updated_by="api",
         )
@@ -213,6 +240,9 @@ def upsert_prompt(
                 model=body.model,
                 temperature=body.temperature,
                 max_tokens=body.max_tokens,
+                reasoning_effort=body.reasoning_effort,
+                thinking_enabled=body.thinking_enabled,
+                stream=body.stream,
                 change_note=body.change_note,
             )
         )
@@ -232,6 +262,9 @@ def upsert_prompt(
     t.model = body.model
     t.temperature = body.temperature
     t.max_tokens = body.max_tokens
+    t.reasoning_effort = body.reasoning_effort
+    t.thinking_enabled = body.thinking_enabled
+    t.stream = body.stream
     t.updated_by = "api"
 
     db.flush()
@@ -246,6 +279,9 @@ def upsert_prompt(
             model=body.model,
             temperature=body.temperature,
             max_tokens=body.max_tokens,
+            reasoning_effort=body.reasoning_effort,
+            thinking_enabled=body.thinking_enabled,
+            stream=body.stream,
             change_note=body.change_note,
         )
     )
@@ -278,6 +314,9 @@ def restore_prompt(
     t.model = hist.model
     t.temperature = hist.temperature
     t.max_tokens = hist.max_tokens
+    t.reasoning_effort = hist.reasoning_effort
+    t.thinking_enabled = hist.thinking_enabled
+    t.stream = hist.stream
     t.updated_by = "api"
 
     db.flush()
@@ -290,6 +329,9 @@ def restore_prompt(
             model=hist.model,
             temperature=hist.temperature,
             max_tokens=hist.max_tokens,
+            reasoning_effort=hist.reasoning_effort,
+            thinking_enabled=hist.thinking_enabled,
+            stream=hist.stream,
             change_note=f"restored from v{version}",
         )
     )
@@ -314,6 +356,9 @@ def preview_prompt(
         "model": t.model,
         "temperature": t.temperature,
         "max_tokens": t.max_tokens,
+        "reasoning_effort": t.reasoning_effort,
+        "thinking_enabled": t.thinking_enabled,
+        "stream": t.stream,
         "system_prompt": t.system_prompt,
         "rendered_user_template": rendered_user,
         "pdf_url": body.pdf_url,

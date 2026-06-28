@@ -194,9 +194,12 @@ def upsert_template(
     event_type: str,
     system_prompt: str,
     user_template: str,
-    model: str = "deepseek-chat",
+    model: str = "deepseek-v4-flash",
     temperature: float = 0.2,
     max_tokens: int = 2000,
+    reasoning_effort: str = "medium",
+    thinking_enabled: bool = False,
+    stream: bool = False,
     updated_by: str = "system",
     change_note: Optional[str] = None,
 ) -> tuple[PromptTemplate, bool]:
@@ -217,6 +220,9 @@ def upsert_template(
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+            thinking_enabled=thinking_enabled,
+            stream=stream,
             version=1,
             updated_by=updated_by,
         )
@@ -231,6 +237,9 @@ def upsert_template(
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
+                thinking_enabled=thinking_enabled,
+                stream=stream,
                 change_note=change_note or "seed",
             )
         )
@@ -244,6 +253,9 @@ def upsert_template(
         or existing.model != model
         or existing.temperature != temperature
         or existing.max_tokens != max_tokens
+        or existing.reasoning_effort != reasoning_effort
+        or existing.thinking_enabled != thinking_enabled
+        or existing.stream != stream
     )
     if not changed:
         return existing, False
@@ -253,6 +265,9 @@ def upsert_template(
     existing.model = model
     existing.temperature = temperature
     existing.max_tokens = max_tokens
+    existing.reasoning_effort = reasoning_effort
+    existing.thinking_enabled = thinking_enabled
+    existing.stream = stream
     existing.version = existing.version + 1
     existing.updated_by = updated_by
     session.flush()
@@ -265,6 +280,9 @@ def upsert_template(
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+            thinking_enabled=thinking_enabled,
+            stream=stream,
             change_note=change_note or "update",
         )
     )

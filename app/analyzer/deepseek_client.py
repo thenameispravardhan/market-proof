@@ -21,9 +21,10 @@ The `DeepSeekError` exception type lets `service.py` distinguish a
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 
@@ -189,6 +190,9 @@ class DeepSeekClient:
         model: str = "deepseek-chat",
         temperature: float = 0.2,
         max_tokens: int = 2000,
+        reasoning_effort: Optional[str] = None,
+        thinking: bool = True,
+        stream: bool = False,
         response_format_json: bool = True,
     ) -> DeepSeekResult:
         """Call DeepSeek chat/completions once (with retries).
@@ -196,6 +200,16 @@ class DeepSeekClient:
         On 429 / 5xx: retry up to `max_retries` times with 1s, 2s, 4s
         backoff. On 4xx other than 429: raise `DeepSeekError` immediately.
         On transport / timeout: also retried (status is None).
+
+        v4 inference controls:
+          - `reasoning_effort` (low|medium|high) tunes how deeply the model
+            reasons; sent whenever provided.
+          - `thinking=False` sends the DeepSeek
+            extra_body={"thinking": {"type": "disabled"}} flag, turning the
+            reasoning trace off (faster / cheaper).
+          - `stream=True` consumes the SSE stream and re-assembles it into
+            the same `DeepSeekResult`, so callers downstream (JSON parse →
+            signal → trade) are unaffected by the transport choice.
         """
         if not self._api_key:
             raise DeepSeekError("DEEPSEEK_API_KEY is not configured")
@@ -208,10 +222,19 @@ class DeepSeekClient:
             ],
             "temperature": float(temperature),
             "max_tokens": int(max_tokens),
-            "stream": False,
+            "stream": bool(stream),
         }
         if response_format_json:
             body["response_format"] = {"type": "json_object"}
+        if reasoning_effort:
+            body["reasoning_effort"] = reasoning_effort
+        if not thinking:
+            # extra_body={"thinking": {"type": "disabled"}}
+            body["thinking"] = {"type": "disabled"}
+        if stream:
+            # Ask the API to emit a final usage chunk so cost/token
+            # accounting still works in streaming mode.
+            body["stream_options"] = {"include_usage": True}
 
         headers = {
             "Authorization": f"Bearer {self._api_key}",
@@ -224,9 +247,14 @@ class DeepSeekClient:
             started = time.perf_counter()
             try:
                 client = await self._ensure_client()
-                response = await client.post(
-                    self._endpoint, json=body, headers=headers
-                )
+                if stream:
+                    status, data, body_text = await self._attempt_stream(
+                        client, body, headers, model
+                    )
+                else:
+                    status, data, body_text = await self._attempt_post(
+                        client, body, headers
+                    )
             except (httpx.TimeoutException, httpx.TransportError) as e:
                 last_err = DeepSeekError(f"transport error: {e!r}")
                 if attempt >= self._max_retries:
@@ -241,51 +269,122 @@ class DeepSeekClient:
 
             latency_ms = (time.perf_counter() - started) * 1000.0
 
-            if response.status_code in self.RETRYABLE_STATUS:
+            if status in self.RETRYABLE_STATUS:
                 last_err = DeepSeekError(
-                    f"deepseek {response.status_code}",
-                    status_code=response.status_code,
-                    body=_safe_body(response),
+                    f"deepseek {status}",
+                    status_code=status,
+                    body=body_text,
                 )
                 if attempt >= self._max_retries:
                     log.warning(
                         "deepseek.retry_exhausted",
-                        status=response.status_code,
+                        status=status,
                         attempts=attempt + 1,
                     )
                     raise last_err
                 log.info(
                     "deepseek.retry",
-                    status=response.status_code,
+                    status=status,
                     attempt=attempt + 1,
                 )
                 await self._backoff(attempt)
                 continue
 
-            if response.status_code >= 400:
+            if status >= 400:
                 # Non-retryable 4xx — usually 401 (bad key) or 400
                 # (malformed request).
                 raise DeepSeekError(
-                    f"deepseek {response.status_code}: {_safe_body(response)}",
-                    status_code=response.status_code,
-                    body=_safe_body(response),
+                    f"deepseek {status}: {body_text}",
+                    status_code=status,
+                    body=body_text,
                 )
 
-            # 2xx — parse + return.
-            try:
-                data = response.json()
-            except Exception as e:  # noqa: BLE001
-                raise DeepSeekError(
-                    f"deepseek returned non-JSON body: {e!r}",
-                    status_code=response.status_code,
-                    body=_safe_body(response),
-                ) from e
-
+            # 2xx — `data` is already parsed (post) or assembled (stream).
             return self._build_result(data, model, latency_ms)
 
         # Unreachable: the loop either returns or raises.
         assert last_err is not None
         raise last_err
+
+    async def _attempt_post(
+        self,
+        client: httpx.AsyncClient,
+        body: dict[str, Any],
+        headers: dict[str, str],
+    ) -> tuple[int, Optional[dict[str, Any]], str]:
+        """Single non-streaming POST. Returns (status, data, body_text).
+
+        For non-2xx, `data` is None and `body_text` carries the (truncated)
+        error body. For 2xx, `data` is the parsed JSON; a non-JSON 2xx body
+        raises `DeepSeekError` immediately (not retried).
+        """
+        response = await client.post(self._endpoint, json=body, headers=headers)
+        if response.status_code >= 400:
+            return response.status_code, None, _safe_body(response)
+        try:
+            data = response.json()
+        except Exception as e:  # noqa: BLE001
+            raise DeepSeekError(
+                f"deepseek returned non-JSON body: {e!r}",
+                status_code=response.status_code,
+                body=_safe_body(response),
+            ) from e
+        return response.status_code, data, ""
+
+    async def _attempt_stream(
+        self,
+        client: httpx.AsyncClient,
+        body: dict[str, Any],
+        headers: dict[str, str],
+        requested_model: str,
+    ) -> tuple[int, Optional[dict[str, Any]], str]:
+        """Single streaming POST. Re-assembles the SSE deltas into a normal
+        chat-completion dict so `_build_result` can stay unchanged.
+
+        Returns (status, data, body_text) with the same contract as
+        `_attempt_post`.
+        """
+        content_parts: list[str] = []
+        usage: dict[str, Any] = {}
+        model_seen: Optional[str] = None
+        async with client.stream(
+            "POST", self._endpoint, json=body, headers=headers
+        ) as response:
+            if response.status_code >= 400:
+                await response.aread()
+                return response.status_code, None, _safe_body(response)
+            async for raw_line in response.aiter_lines():
+                line = raw_line.strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                payload = line[len("data:"):].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(payload)
+                except json.JSONDecodeError:
+                    # Tolerate keep-alive / partial frames.
+                    continue
+                if chunk.get("model"):
+                    model_seen = chunk["model"]
+                choices = chunk.get("choices") or []
+                if choices:
+                    delta = choices[0].get("delta") or {}
+                    piece = delta.get("content")
+                    if piece:
+                        content_parts.append(piece)
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+            status = response.status_code
+
+        data = {
+            "model": model_seen or requested_model,
+            "choices": [
+                {"message": {"content": "".join(content_parts)}}
+            ],
+            "usage": usage,
+        }
+        return status, data, ""
 
     async def _backoff(self, attempt: int) -> None:
         # 1s, 2s, 4s — small, deterministic so tests can be fast with a

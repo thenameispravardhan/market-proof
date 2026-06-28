@@ -367,6 +367,14 @@ class PromptTemplate(Base):
     model: Mapped[str] = mapped_column(String(64), default="deepseek-chat", nullable=False)
     temperature: Mapped[float] = mapped_column(Float, default=0.2, nullable=False)
     max_tokens: Mapped[int] = mapped_column(Integer, default=2000, nullable=False)
+    # DeepSeek v4 inference controls (T5 prompt page). reasoning_effort is
+    # one of low|medium|high and tunes how much the model "thinks" when
+    # thinking is enabled. thinking_enabled=False sends the
+    # extra_body={"thinking": {"type": "disabled"}} flag (faster/cheaper,
+    # no reasoning trace). stream toggles SSE streaming on the call.
+    reasoning_effort: Mapped[str] = mapped_column(String(8), default="medium", nullable=False)
+    thinking_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    stream: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=_utcnow, onupdate=_utcnow, nullable=False
@@ -396,6 +404,11 @@ class PromptHistory(Base):
     model: Mapped[str] = mapped_column(String(64), nullable=False)
     temperature: Mapped[float] = mapped_column(Float, nullable=False)
     max_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Snapshot of the v4 inference controls at this version (mirrors
+    # PromptTemplate). See that model for semantics.
+    reasoning_effort: Mapped[str] = mapped_column(String(8), default="medium", nullable=False)
+    thinking_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    stream: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     changed_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
     change_note: Mapped[Optional[str]] = mapped_column(Text)
 

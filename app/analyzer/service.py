@@ -460,6 +460,11 @@ class Service:
                     model=template.model,
                     temperature=template.temperature,
                     max_tokens=max_tokens,
+                    # v4 inference controls from the prompt page. getattr
+                    # keeps this safe against pre-migration template rows.
+                    reasoning_effort=getattr(template, "reasoning_effort", None) or "medium",
+                    thinking=bool(getattr(template, "thinking_enabled", False)),
+                    stream=bool(getattr(template, "stream", False)),
                 ),
                 timeout=llm_timeout,
             )

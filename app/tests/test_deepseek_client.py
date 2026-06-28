@@ -144,6 +144,154 @@ async def test_complete_sends_authorization_header():
     ]
 
 
+# -- v4 inference controls (reasoning_effort / thinking / stream) -------
+
+
+@pytest.mark.asyncio
+async def test_thinking_disabled_sends_extra_body_flag():
+    """thinking=False emits extra_body={"thinking": {"type": "disabled"}}.
+    reasoning_effort is an independent control and is still sent."""
+    captured: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        captured.append(req)
+        return httpx.Response(200, json=_ok_response())
+
+    client = _client(handler)
+    try:
+        await client.complete(
+            system="s",
+            user="u",
+            model="deepseek-v4-flash",
+            thinking=False,
+            reasoning_effort="high",
+        )
+    finally:
+        await client.aclose()
+    body = json.loads(captured[0].content)
+    assert body["thinking"] == {"type": "disabled"}
+    assert body["reasoning_effort"] == "high"
+    assert body["stream"] is False
+
+
+@pytest.mark.asyncio
+async def test_thinking_enabled_sends_reasoning_effort():
+    """thinking=True sends reasoning_effort and no disabled flag."""
+    captured: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        captured.append(req)
+        return httpx.Response(200, json=_ok_response())
+
+    client = _client(handler)
+    try:
+        await client.complete(
+            system="s",
+            user="u",
+            model="deepseek-v4-pro",
+            thinking=True,
+            reasoning_effort="low",
+        )
+    finally:
+        await client.aclose()
+    body = json.loads(captured[0].content)
+    assert body["reasoning_effort"] == "low"
+    assert "thinking" not in body
+
+
+@pytest.mark.asyncio
+async def test_stream_reassembles_into_result():
+    """A streamed SSE response is re-assembled into the same
+    DeepSeekResult shape (content + usage) the non-stream path returns."""
+    content_json = json.dumps(
+        {
+            "event_type": "ORDER_WIN",
+            "summary": "x",
+            "sentiment": "positive",
+            "sentiment_score": 50.0,
+            "confidence": 0.8,
+            "recommendation": "BUY",
+            "reasoning": "x",
+            "key_numbers": {},
+        }
+    )
+    # Split the content across two delta chunks, then a usage-only chunk,
+    # then [DONE] — the DeepSeek streaming wire format.
+    half = len(content_json) // 2
+    sse_lines = [
+        'data: ' + json.dumps({"model": "deepseek-v4-flash", "choices": [{"delta": {"content": content_json[:half]}}]}),
+        'data: ' + json.dumps({"model": "deepseek-v4-flash", "choices": [{"delta": {"content": content_json[half:]}}]}),
+        'data: ' + json.dumps({"model": "deepseek-v4-flash", "choices": [], "usage": {"prompt_tokens": 30, "completion_tokens": 20, "total_tokens": 50}}),
+        "data: [DONE]",
+    ]
+    body_text = "\n\n".join(sse_lines) + "\n\n"
+
+    captured: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        captured.append(req)
+        return httpx.Response(
+            200,
+            text=body_text,
+            headers={"content-type": "text/event-stream"},
+        )
+
+    client = _client(handler)
+    try:
+        r = await client.complete(
+            system="s", user="u", model="deepseek-v4-flash", stream=True
+        )
+    finally:
+        await client.aclose()
+    # The request asked for streaming + a usage chunk.
+    sent = json.loads(captured[0].content)
+    assert sent["stream"] is True
+    assert sent["stream_options"] == {"include_usage": True}
+    # The result is fully re-assembled: content parses back to the JSON,
+    # and the usage chunk populated the token counts.
+    parsed = json.loads(r.content)
+    assert parsed["event_type"] == "ORDER_WIN"
+    assert r.prompt_tokens == 30
+    assert r.completion_tokens == 20
+    assert r.total_tokens == 50
+
+
+@pytest.mark.asyncio
+async def test_stream_retries_on_5xx_then_succeeds():
+    """Streaming follows the same retry policy as the non-stream path."""
+    content_json = json.dumps(
+        {
+            "event_type": "OTHER",
+            "summary": "x",
+            "sentiment": "neutral",
+            "sentiment_score": 0.0,
+            "confidence": 0.5,
+            "recommendation": "HOLD",
+            "reasoning": "x",
+            "key_numbers": {},
+        }
+    )
+    ok_stream = (
+        "data: "
+        + json.dumps({"choices": [{"delta": {"content": content_json}}]})
+        + "\n\ndata: [DONE]\n\n"
+    )
+    handler = _make_handler(
+        [
+            httpx.Response(503, text="unavailable"),
+            httpx.Response(200, text=ok_stream, headers={"content-type": "text/event-stream"}),
+        ]
+    )
+    client = _client(handler)
+    try:
+        r = await client.complete(
+            system="s", user="u", model="deepseek-v4-flash", stream=True
+        )
+        assert json.loads(r.content)["event_type"] == "OTHER"
+    finally:
+        await client.aclose()
+
+
 # -- Retry behaviour -----------------------------------------------------
 
 

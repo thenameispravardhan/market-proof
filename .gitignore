@@ -10,6 +10,8 @@ __pycache__/
 htmlcov/
 .mypy_cache/
 .ruff_cache/
+*.pptx
+*.pdf
 
 # Local data
 data/

@@ -5,17 +5,22 @@
 
 import { useEffect, useState } from "react";
 import { useUpdatePrompt, usePrompts } from "../../hooks/useApi";
+import type { ReasoningEffort } from "../../types";
 
 // DeepSeek models the operator can pick per template. The backend
 // (PromptUpdate._model_check) accepts any non-empty string, so a
 // model stored outside this list still renders — see `modelOptions`
 // below, which folds the current value in if it isn't one of these.
 const DEEPSEEK_MODELS: { value: string; label: string }[] = [
-  { value: "deepseek-chat", label: "deepseek-chat — fast, general (default)" },
-  { value: "deepseek-reasoner", label: "deepseek-reasoner — deeper, slower" },
-  { value: "deepseek-coder", label: "deepseek-coder — code-focused" },
-  { value: "deepseek-v4-flash", label: "deepseek-v4-flash — v4, fast" },
+  { value: "deepseek-v4-flash", label: "deepseek-v4-flash — v4, fast (default)" },
   { value: "deepseek-v4-pro", label: "deepseek-v4-pro — v4, most capable" },
+];
+
+// Reasoning depth (v4). Only applied when thinking is enabled.
+const REASONING_EFFORTS: { value: ReasoningEffort; label: string }[] = [
+  { value: "low", label: "low — fastest" },
+  { value: "medium", label: "medium — balanced" },
+  { value: "high", label: "high — deepest" },
 ];
 
 export function PromptEditor({
@@ -34,12 +39,17 @@ export function PromptEditor({
 
   const [systemPrompt, setSystemPrompt] = useState("");
   const [userTemplate, setUserTemplate] = useState("");
-  const [model, setModel] = useState("deepseek-chat");
+  const [model, setModel] = useState("deepseek-v4-flash");
   const [temperature, setTemperature] = useState(0.2);
   const [maxTokens, setMaxTokens] = useState(2000);
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("medium");
+  const [thinkingEnabled, setThinkingEnabled] = useState(false);
+  const [stream, setStream] = useState(false);
   const [changeNote, setChangeNote] = useState("");
 
-  // Re-seed the local form whenever the selected template changes.
+  // Re-seed the local form whenever the selected template changes. The
+  // `??` fallbacks keep pre-migration rows (no v4 fields) from blanking
+  // the new controls.
   useEffect(() => {
     if (current) {
       setSystemPrompt(current.system_prompt);
@@ -47,13 +57,19 @@ export function PromptEditor({
       setModel(current.model);
       setTemperature(current.temperature);
       setMaxTokens(current.max_tokens);
+      setReasoningEffort(current.reasoning_effort ?? "medium");
+      setThinkingEnabled(current.thinking_enabled ?? false);
+      setStream(current.stream ?? false);
       setChangeNote("");
     } else {
       setSystemPrompt("");
       setUserTemplate("");
-      setModel("deepseek-chat");
+      setModel("deepseek-v4-flash");
       setTemperature(0.2);
       setMaxTokens(2000);
+      setReasoningEffort("medium");
+      setThinkingEnabled(false);
+      setStream(false);
       setChangeNote("");
     }
   }, [current]);
@@ -80,7 +96,10 @@ export function PromptEditor({
     userTemplate !== current.user_template ||
     model !== current.model ||
     temperature !== current.temperature ||
-    maxTokens !== current.max_tokens;
+    maxTokens !== current.max_tokens ||
+    reasoningEffort !== (current.reasoning_effort ?? "medium") ||
+    thinkingEnabled !== (current.thinking_enabled ?? false) ||
+    stream !== (current.stream ?? false);
 
   // The known models plus the current value if it isn't one of them,
   // so a model set outside this list (the backend allows any string)
@@ -97,6 +116,9 @@ export function PromptEditor({
         model,
         temperature,
         max_tokens: maxTokens,
+        reasoning_effort: reasoningEffort,
+        thinking_enabled: thinkingEnabled,
+        stream,
         change_note: changeNote || undefined,
       });
       onSaved?.();
@@ -173,6 +195,50 @@ export function PromptEditor({
             onChange={(e) => setMaxTokens(parseInt(e.target.value, 10) || 64)}
           />
         </div>
+      </div>
+      <div className="field-row">
+        <div className="field">
+          <label htmlFor="thinking">Thinking</label>
+          <select
+            id="thinking"
+            value={thinkingEnabled ? "enabled" : "disabled"}
+            onChange={(e) => setThinkingEnabled(e.target.value === "enabled")}
+            data-testid="prompt-thinking"
+          >
+            <option value="disabled">Disabled — no reasoning trace (faster)</option>
+            <option value="enabled">Enabled — model reasons before answering</option>
+          </select>
+        </div>
+        <div className="field">
+          <label htmlFor="reasoning">Reasoning effort</label>
+          <select
+            id="reasoning"
+            value={reasoningEffort}
+            onChange={(e) => setReasoningEffort(e.target.value as ReasoningEffort)}
+            data-testid="prompt-reasoning"
+          >
+            {REASONING_EFFORTS.map((r) => (
+              <option key={r.value} value={r.value}>{r.label}</option>
+            ))}
+          </select>
+        </div>
+        <div className="field">
+          <label htmlFor="stream">Streaming</label>
+          <select
+            id="stream"
+            value={stream ? "on" : "off"}
+            onChange={(e) => setStream(e.target.value === "on")}
+            data-testid="prompt-stream"
+          >
+            <option value="off">Off</option>
+            <option value="on">On</option>
+          </select>
+        </div>
+      </div>
+      <div className="meta" style={{ color: "var(--text-dim)", fontSize: 11, marginTop: -4, marginBottom: 8 }}>
+        Thinking off sends <code className="mono">{`extra_body={"thinking": {"type": "disabled"}}`}</code>.
+        These flow straight into the DeepSeek call that turns each news item
+        into a signal.
       </div>
       <div className="field">
         <label htmlFor="note">Change note (optional)</label>

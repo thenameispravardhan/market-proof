@@ -50,6 +50,19 @@ def init_db() -> None:
 _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
     "positions": [("stop_loss", "FLOAT"), ("target", "FLOAT")],
     "trades": [("slippage_pct", "FLOAT"), ("r_multiple", "FLOAT")],
+    # DeepSeek v4 inference controls — added to the prompt tables after
+    # they shipped. DEFAULT clauses backfill existing rows so reads never
+    # see NULL (medium reasoning, thinking + streaming off).
+    "prompt_templates": [
+        ("reasoning_effort", "VARCHAR(8) DEFAULT 'medium'"),
+        ("thinking_enabled", "BOOLEAN DEFAULT 0"),
+        ("stream", "BOOLEAN DEFAULT 0"),
+    ],
+    "prompt_history": [
+        ("reasoning_effort", "VARCHAR(8) DEFAULT 'medium'"),
+        ("thinking_enabled", "BOOLEAN DEFAULT 0"),
+        ("stream", "BOOLEAN DEFAULT 0"),
+    ],
 }
 
 

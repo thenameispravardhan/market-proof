@@ -76,6 +76,9 @@ export interface Trade {
   created_at: string;
 }
 
+// DeepSeek v4 reasoning depth — only used when thinking is enabled.
+export type ReasoningEffort = "low" | "medium" | "high";
+
 export interface PromptTemplate {
   id: number;
   event_type: string;
@@ -84,6 +87,10 @@ export interface PromptTemplate {
   model: string;
   temperature: number;
   max_tokens: number;
+  // v4 inference controls (see PromptEditor).
+  reasoning_effort: ReasoningEffort;
+  thinking_enabled: boolean;
+  stream: boolean;
   version: number;
   updated_at: string;
   updated_by: string | null;
@@ -98,6 +105,9 @@ export interface PromptHistoryEntry {
   model: string;
   temperature: number;
   max_tokens: number;
+  reasoning_effort: ReasoningEffort;
+  thinking_enabled: boolean;
+  stream: boolean;
   changed_at: string;
   change_note: string | null;
 }

@@ -262,6 +262,61 @@ def test_upsert_updates_existing_and_bumps_version(db_session):
     assert [h.version for h in h_rows] == [1, 2]
 
 
+def test_upsert_persists_v4_inference_controls(db_session):
+    """reasoning_effort / thinking_enabled / stream round-trip onto the
+    template and its history snapshot."""
+    t, _ = upsert_template(
+        db_session,
+        event_type="ORDER_WIN",
+        system_prompt="s1",
+        user_template="u1",
+        reasoning_effort="high",
+        thinking_enabled=True,
+        stream=True,
+    )
+    db_session.commit()
+    assert t.reasoning_effort == "high"
+    assert t.thinking_enabled is True
+    assert t.stream is True
+    h = db_session.execute(
+        select(PromptHistory).where(PromptHistory.template_id == t.id)
+    ).scalar_one()
+    assert h.reasoning_effort == "high"
+    assert h.thinking_enabled is True
+    assert h.stream is True
+
+
+def test_upsert_defaults_v4_controls(db_session):
+    """Unspecified v4 controls fall back to medium / thinking-off /
+    stream-off."""
+    t, _ = upsert_template(
+        db_session, event_type="ORDER_WIN", system_prompt="s", user_template="u"
+    )
+    db_session.commit()
+    assert t.reasoning_effort == "medium"
+    assert t.thinking_enabled is False
+    assert t.stream is False
+
+
+def test_upsert_bumps_version_when_only_v4_control_changes(db_session):
+    """Flipping just the streaming toggle is a real change → version bump."""
+    t1, _ = upsert_template(
+        db_session, event_type="ORDER_WIN", system_prompt="s1", user_template="u1"
+    )
+    db_session.commit()
+    t2, created = upsert_template(
+        db_session,
+        event_type="ORDER_WIN",
+        system_prompt="s1",
+        user_template="u1",
+        stream=True,  # only this changed
+    )
+    db_session.commit()
+    assert created is False
+    assert t2.version == 2
+    assert t2.stream is True
+
+
 def test_upsert_no_change_does_not_bump_version(db_session):
     t1, _ = upsert_template(
         db_session,
