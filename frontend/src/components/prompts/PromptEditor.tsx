@@ -4,7 +4,7 @@
 // placeholder so operators know which variable is interpolated.
 
 import { useEffect, useState } from "react";
-import { useUpdatePrompt, usePrompts } from "../../hooks/useApi";
+import { useUpdatePrompt, usePrompts, useDefaultPrompt } from "../../hooks/useApi";
 import type { ReasoningEffort } from "../../types";
 
 // DeepSeek models the operator can pick per template. The backend
@@ -34,6 +34,7 @@ export function PromptEditor({
 }) {
   const { data } = usePrompts();
   const update = useUpdatePrompt(eventType);
+  const resetDefault = useDefaultPrompt(eventType);
 
   const current = data?.find((p) => p.event_type === eventType) ?? null;
 
@@ -107,6 +108,26 @@ export function PromptEditor({
   const modelOptions = DEEPSEEK_MODELS.some((m) => m.value === model)
     ? DEEPSEEK_MODELS
     : [{ value: model, label: `${model} (custom)` }, ...DEEPSEEK_MODELS];
+
+  // Reset to factory default. Fills the form ONLY — nothing is persisted
+  // and the analyzer keeps using the last-saved version until the operator
+  // clicks Save. Leaves the form dirty so Save lights up.
+  const handleReset = async () => {
+    try {
+      const d = await resetDefault.mutateAsync();
+      if (d.system_prompt !== undefined) setSystemPrompt(d.system_prompt);
+      if (d.user_template !== undefined) setUserTemplate(d.user_template);
+      if (d.model !== undefined) setModel(d.model);
+      if (d.temperature !== undefined) setTemperature(d.temperature);
+      if (d.max_tokens !== undefined) setMaxTokens(d.max_tokens);
+      setReasoningEffort(d.reasoning_effort ?? "medium");
+      setThinkingEnabled(d.thinking_enabled ?? false);
+      setStream(d.stream ?? false);
+      setChangeNote("Reset to default");
+    } catch (e) {
+      onError?.((e as Error).message || "Reset failed");
+    }
+  };
 
   const handleSave = async () => {
     try {
@@ -259,10 +280,27 @@ export function PromptEditor({
         >
           {update.isPending ? "Saving…" : "Save (bumps version)"}
         </button>
+        <button
+          type="button"
+          className="ghost"
+          onClick={handleReset}
+          disabled={resetDefault.isPending}
+          data-testid="reset-prompt"
+        >
+          {resetDefault.isPending ? "Resetting…" : "Reset to default"}
+        </button>
         {update.isError && (
           <span className="pnl-neg">{(update.error as Error).message}</span>
         )}
         {update.isSuccess && <span className="pnl-pos">Saved.</span>}
+        {resetDefault.isError && (
+          <span className="pnl-neg">{(resetDefault.error as Error).message}</span>
+        )}
+      </div>
+      <div className="meta" style={{ color: "var(--text-dim)", fontSize: 11, marginTop: 6 }}>
+        Reset fills the editor with the factory default — nothing changes
+        until you Save. Your last saved version keeps driving the analyzer
+        until then.
       </div>
     </div>
   );

@@ -99,6 +99,12 @@ async def lifespan(app: FastAPI):
     # Seed the analyzer prompt templates and the default signal rules so
     # a fresh install analyzes filings and can actually trade in paper
     # mode without any manual setup. Both seeders are idempotent.
+    #
+    # Prompts seed with overwrite=False: on a restart we only INSERT
+    # templates that are missing and never touch existing rows, so an
+    # operator's saved prompt edits survive a reboot. Resetting a prompt
+    # to factory default is an explicit, per-template action (the Prompts
+    # page "Reset to default" button), never something a restart does.
     try:
         from app.analyzer.default_rules import (
             seed_default_paper_account,
@@ -108,7 +114,7 @@ async def lifespan(app: FastAPI):
         from app.db.session import SessionLocal
 
         with SessionLocal() as _s:
-            n_prompts = len(seed_defaults(_s))
+            n_prompts = len(seed_defaults(_s, overwrite=False))
             n_rules = seed_default_rules(_s)
             acct_seeded = seed_default_paper_account(_s)
             _s.commit()

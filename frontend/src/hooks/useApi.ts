@@ -214,6 +214,16 @@ export function useUpdatePrompt(eventType: string | null) {
   });
 }
 
+// Fetches the factory-default field values for a template WITHOUT
+// persisting. Backs the editor's "Reset to default" button — the UI fills
+// the form from this; the operator must Save to change the active version.
+export function useDefaultPrompt(eventType: string | null) {
+  return useMutation<Partial<PromptTemplate>, Error, void>({
+    mutationFn: () =>
+      api.get<Partial<PromptTemplate>>(`/api/prompts/${eventType}/default`),
+  });
+}
+
 export function useRestorePrompt(eventType: string | null) {
   const qc = useQueryClient();
   return useMutation({

@@ -22,8 +22,13 @@ from sqlalchemy import select
 
 from app.analyzer.prompts import (
     DEFAULT_EVENT_TYPE,
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_MODEL,
+    DEFAULT_REASONING_EFFORT,
+    DEFAULT_TEMPERATURE,
     EVENT_TYPES,
     append_announcement_context,
+    default_template_fields,
     detect_event_type,
     is_non_material,
     load_default_template,
@@ -396,6 +401,115 @@ def test_seed_defaults_writes_history(db_session):
     # One history row per template (16).
     assert len(h_rows) == 16
     assert all(h.version == 1 for h in h_rows)
+
+
+def test_seed_defaults_overwrite_false_preserves_operator_edits(db_session):
+    """Regression: app startup must NOT reset an operator's saved prompt.
+
+    Seeds, then edits the DEFAULT template (as the UI would), then re-seeds
+    with overwrite=False (the startup path). The edit must survive — same
+    content, same version, no new history row."""
+    seed_defaults(db_session)
+    db_session.commit()
+    # Operator changes the DEFAULT prompt and saves (bumps to v2).
+    upsert_template(
+        db_session,
+        event_type=DEFAULT_EVENT_TYPE,
+        system_prompt="OPERATOR base prompt that must survive a restart.",
+        user_template="EDITED {{pdf_url}}",
+        change_note="base",
+    )
+    db_session.commit()
+    edited = load_default_template(db_session)
+    assert edited.version == 2
+    edited_hist_count = len(
+        db_session.execute(
+            select(PromptHistory).where(PromptHistory.template_id == edited.id)
+        ).scalars().all()
+    )
+
+    # Simulate a restart: insert-missing-only.
+    seed_defaults(db_session, overwrite=False)
+    db_session.commit()
+
+    after = load_default_template(db_session)
+    assert after.system_prompt == "OPERATOR base prompt that must survive a restart."
+    assert after.user_template == "EDITED {{pdf_url}}"
+    assert after.version == 2  # NOT bumped back to default
+    # No extra history row written for the untouched template.
+    after_hist_count = len(
+        db_session.execute(
+            select(PromptHistory).where(PromptHistory.template_id == after.id)
+        ).scalars().all()
+    )
+    assert after_hist_count == edited_hist_count
+
+
+def test_seed_defaults_overwrite_false_inserts_missing_on_fresh_db(db_session):
+    """On a fresh DB, overwrite=False still seeds all 16 templates."""
+    touched = seed_defaults(db_session, overwrite=False)
+    db_session.commit()
+    assert len(touched) == 16
+    rows = db_session.execute(select(PromptTemplate)).scalars().all()
+    assert len(rows) == 16
+    assert all(r.version == 1 for r in rows)
+
+
+# -- default_template_fields / reset-to-default ------------------------
+
+
+def test_default_template_fields_returns_factory_defaults():
+    f = default_template_fields(DEFAULT_EVENT_TYPE)
+    assert f["model"] == DEFAULT_MODEL
+    assert f["temperature"] == DEFAULT_TEMPERATURE
+    assert f["max_tokens"] == DEFAULT_MAX_TOKENS
+    assert f["reasoning_effort"] == DEFAULT_REASONING_EFFORT
+    assert f["thinking_enabled"] is False
+    assert f["stream"] is False
+    # The DEFAULT user template must keep the placeholder the editor needs.
+    assert "{{pdf_url}}" in f["user_template"]
+    assert f["system_prompt"]
+
+
+def test_default_template_fields_matches_a_fresh_seed(db_session):
+    """The Reset button (default_template_fields) and a fresh seed agree —
+    they share one source of truth, so resetting yields exactly what a
+    brand-new seed would have produced."""
+    seed_defaults(db_session)
+    db_session.commit()
+    t = load_default_template(db_session)
+    f = default_template_fields(DEFAULT_EVENT_TYPE)
+    assert f["system_prompt"] == t.system_prompt
+    assert f["user_template"] == t.user_template
+    assert f["model"] == t.model
+    assert f["reasoning_effort"] == t.reasoning_effort
+    assert f["thinking_enabled"] == t.thinking_enabled
+    assert f["stream"] == t.stream
+
+
+def test_get_prompt_default_endpoint_returns_defaults(client):
+    r = client.get(f"/api/prompts/{DEFAULT_EVENT_TYPE}/default")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["event_type"] == DEFAULT_EVENT_TYPE
+    assert body["model"] == DEFAULT_MODEL
+    assert body["reasoning_effort"] == DEFAULT_REASONING_EFFORT
+    assert body["thinking_enabled"] is False
+    assert body["stream"] is False
+    assert "{{pdf_url}}" in body["user_template"]
+
+
+def test_get_prompt_default_unknown_event_type_404(client):
+    assert client.get("/api/prompts/BOGUS/default").status_code == 404
+
+
+def test_get_prompt_default_does_not_persist(client, db_session):
+    """Reset-to-default is read-only — hitting it must not create or
+    mutate any template row (the last-saved version stays active)."""
+    before = len(db_session.execute(select(PromptTemplate)).scalars().all())
+    client.get(f"/api/prompts/{DEFAULT_EVENT_TYPE}/default")
+    after = len(db_session.execute(select(PromptTemplate)).scalars().all())
+    assert after == before
 
 
 # -- Script invocation -------------------------------------------------

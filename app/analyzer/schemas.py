@@ -115,7 +115,11 @@ class AnalysisResponse(BaseModel):
     confidence: float = Field(..., ge=0.0, le=1.0)
     recommendation: Recommendation
     reasoning: str = Field(..., min_length=1)
-    key_numbers: KeyNumbers
+    # Optional: the LLM omits the whole object when the filing carries no
+    # numbers at all (e.g. a bare board-meeting intimation). Treat a
+    # missing `key_numbers` as "no numbers" rather than discarding an
+    # otherwise-valid analysis — every sub-field is already nullable.
+    key_numbers: KeyNumbers = Field(default_factory=KeyNumbers)
 
     @field_validator("summary", "reasoning")
     @classmethod

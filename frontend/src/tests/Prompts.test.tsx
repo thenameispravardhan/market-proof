@@ -185,6 +185,205 @@ describe("Prompts", () => {
     expect(await screen.findByText(/Saved/)).toBeInTheDocument();
   });
 
+  it("reset-to-default fills the form without saving; Save then persists it", async () => {
+    const postCalls: { url: string; body: any }[] = [];
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = (init?.method || "GET").toUpperCase();
+      if (url.includes("/history")) {
+        return makeJsonResponse({ event_type: "DEFAULT", history: [] });
+      }
+      // Factory-default endpoint — returns seed values, never persists.
+      if (url.includes("/api/prompts/DEFAULT/default") && method === "GET") {
+        return makeJsonResponse({
+          event_type: "DEFAULT",
+          system_prompt: "FACTORY system prompt long enough to validate.",
+          user_template: "FACTORY {{pdf_url}}",
+          model: "deepseek-v4-flash",
+          temperature: 0.2,
+          max_tokens: 2000,
+          reasoning_effort: "medium",
+          thinking_enabled: false,
+          stream: false,
+        });
+      }
+      if (url.includes("/api/prompts/DEFAULT") && method === "POST") {
+        const body = init?.body ? JSON.parse(init.body as string) : null;
+        postCalls.push({ url, body });
+        return makeJsonResponse({
+          id: 1,
+          event_type: "DEFAULT",
+          ...body,
+          version: 8,
+          updated_at: "2026-06-12T00:00:00Z",
+          updated_by: "ui",
+        });
+      }
+      if (url.includes("/api/prompts") && method === "GET" && !url.includes("/preview")) {
+        // The currently-saved version — deliberately NOT the factory default.
+        return makeJsonResponse({
+          prompts: [
+            {
+              id: 1,
+              event_type: "DEFAULT",
+              system_prompt: "SAVED prompt the operator edited earlier, long enough.",
+              user_template: "SAVED {{pdf_url}}",
+              model: "deepseek-v4-pro",
+              temperature: 0.5,
+              max_tokens: 1500,
+              reasoning_effort: "high",
+              thinking_enabled: true,
+              stream: true,
+              version: 7,
+              updated_at: "2026-06-10T10:00:00Z",
+              updated_by: "ui",
+            },
+          ],
+        });
+      }
+      return makeJsonResponse({ detail: "not found" }, 404);
+    }) as unknown as typeof fetch;
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchInterval: false } },
+    });
+    render(<Prompts />, { wrapper: wrapper(qc) });
+
+    const user = userEvent.setup();
+    // Editor auto-loads the SAVED version → form == saved → Save disabled.
+    const sysPrompt = (await screen.findByLabelText("System prompt")) as HTMLTextAreaElement;
+    await waitFor(() => expect(sysPrompt.value).toContain("SAVED prompt"));
+    expect(screen.getByTestId("save-prompt")).toBeDisabled();
+
+    // Click Reset → form swaps to factory default, but nothing is POSTed.
+    await user.click(screen.getByTestId("reset-prompt"));
+    await waitFor(() =>
+      expect(sysPrompt.value).toBe("FACTORY system prompt long enough to validate.")
+    );
+    expect((screen.getByTestId("prompt-model") as HTMLSelectElement).value).toBe("deepseek-v4-flash");
+    expect(postCalls).toHaveLength(0);
+
+    // The form is now dirty, so Save lights up. Saving persists the default.
+    const saveBtn = screen.getByTestId("save-prompt") as HTMLButtonElement;
+    expect(saveBtn.disabled).toBe(false);
+    await user.click(saveBtn);
+
+    await waitFor(() => expect(postCalls).toHaveLength(1));
+    expect(postCalls[0]!.body).toMatchObject({
+      system_prompt: "FACTORY system prompt long enough to validate.",
+      user_template: "FACTORY {{pdf_url}}",
+      model: "deepseek-v4-flash",
+      reasoning_effort: "medium",
+      thinking_enabled: false,
+      stream: false,
+      change_note: "Reset to default",
+    });
+  });
+
+  it("restore button rolls a past version back via /restore and disables the current one", async () => {
+    const restoreCalls: string[] = [];
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = (init?.method || "GET").toUpperCase();
+      if (url.includes("/restore/") && method === "POST") {
+        restoreCalls.push(url);
+        return makeJsonResponse({
+          id: 1,
+          event_type: "DEFAULT",
+          system_prompt: "RESTORED prompt long enough to validate properly.",
+          user_template: "base {{pdf_url}}",
+          model: "deepseek-v4-flash",
+          temperature: 0.2,
+          max_tokens: 2000,
+          reasoning_effort: "medium",
+          thinking_enabled: false,
+          stream: false,
+          version: 3,
+          updated_at: "2026-06-12T00:00:00Z",
+          updated_by: "ui",
+        });
+      }
+      if (url.includes("/history")) {
+        return makeJsonResponse({
+          event_type: "DEFAULT",
+          history: [
+            {
+              id: 22,
+              template_id: 1,
+              version: 2,
+              system_prompt: "current default prompt, long enough.",
+              user_template: "default {{pdf_url}}",
+              model: "deepseek-v4-flash",
+              temperature: 0.2,
+              max_tokens: 2000,
+              reasoning_effort: "medium",
+              thinking_enabled: false,
+              stream: false,
+              changed_at: "2026-06-11T00:00:00Z",
+              change_note: "seed_default_prompts",
+            },
+            {
+              id: 21,
+              template_id: 1,
+              version: 1,
+              system_prompt: "base prompt the operator wrote, long enough.",
+              user_template: "base {{pdf_url}}",
+              model: "deepseek-v4-flash",
+              temperature: 0.2,
+              max_tokens: 2000,
+              reasoning_effort: "medium",
+              thinking_enabled: false,
+              stream: false,
+              changed_at: "2026-06-10T00:00:00Z",
+              change_note: "base",
+            },
+          ],
+        });
+      }
+      if (url.includes("/api/prompts") && method === "GET" && !url.includes("/preview")) {
+        return makeJsonResponse({
+          prompts: [
+            {
+              id: 1,
+              event_type: "DEFAULT",
+              system_prompt: "current default prompt, long enough.",
+              user_template: "default {{pdf_url}}",
+              model: "deepseek-v4-flash",
+              temperature: 0.2,
+              max_tokens: 2000,
+              reasoning_effort: "medium",
+              thinking_enabled: false,
+              stream: false,
+              version: 2,
+              updated_at: "2026-06-11T00:00:00Z",
+              updated_by: "ui",
+            },
+          ],
+        });
+      }
+      return makeJsonResponse({ detail: "not found" }, 404);
+    }) as unknown as typeof fetch;
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchInterval: false } },
+    });
+    render(<Prompts />, { wrapper: wrapper(qc) });
+
+    const user = userEvent.setup();
+    // The current version (v2) can't be restored onto itself.
+    const currentBtn = (await screen.findByTestId("restore-prompt-2")) as HTMLButtonElement;
+    expect(currentBtn.disabled).toBe(true);
+    expect(currentBtn.textContent).toContain("Current");
+
+    // Rolling back to v1 POSTs to the restore endpoint.
+    const restoreV1 = screen.getByTestId("restore-prompt-1") as HTMLButtonElement;
+    expect(restoreV1.disabled).toBe(false);
+    await user.click(restoreV1);
+
+    await waitFor(() => expect(restoreCalls).toHaveLength(1));
+    expect(restoreCalls[0]).toContain("/api/prompts/DEFAULT/restore/1");
+  });
+
   it("shows the empty state when /api/prompts returns 404", async () => {
     globalThis.fetch = vi.fn(async () => makeJsonResponse({ detail: "not found" }, 404)) as unknown as typeof fetch;
 

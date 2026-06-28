@@ -254,11 +254,18 @@ def test_missing_reasoning_rejected():
         AnalysisResponse.model_validate(p)
 
 
-def test_missing_key_numbers_rejected():
+def test_missing_key_numbers_defaults_to_empty():
+    """Regression: the LLM omits the whole `key_numbers` object for a
+    filing that carries no numbers (e.g. a bare board-meeting intimation).
+    That must NOT discard the analysis — it defaults to an all-None
+    KeyNumbers so the rest of the (valid) response still lands."""
     p = _valid_payload()
     del p["key_numbers"]
-    with pytest.raises(ValidationError):
-        AnalysisResponse.model_validate(p)
+    a = AnalysisResponse.model_validate(p)
+    assert a.key_numbers.deal_value_inr_crore is None
+    assert a.key_numbers.stake_change_pct is None
+    assert a.key_numbers.dividend_per_share is None
+    assert a.key_numbers.buyback_value_inr_crore is None
 
 
 # -- Enum invalid values ------------------------------------------------

@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.analyzer.prompts import EVENT_TYPES, default_template_fields
 from app.db.init import init_db
 from app.db.models import AuditLog, PromptHistory, PromptTemplate
 from app.db.session import get_db
@@ -200,6 +201,20 @@ def get_prompt_history(event_type: str, db: Session = Depends(get_db)) -> dict[s
         .order_by(PromptHistory.version.desc())
     ).scalars().all()
     return {"event_type": event_type, "history": [_ser_history(h) for h in rows]}
+
+
+@router.get("/{event_type}/default")
+def get_prompt_default(event_type: str) -> dict[str, Any]:
+    """Factory-default field values for a template — NOT persisted.
+
+    Backs the editor's "Reset to default" button: the UI fills the form
+    from this, and the operator must Save to actually change the active
+    version. Until they do, the last-saved prompt keeps driving the
+    analyzer.
+    """
+    if event_type not in EVENT_TYPES:
+        raise HTTPException(404, detail=f"unknown event_type '{event_type}'")
+    return {"event_type": event_type, **default_template_fields(event_type)}
 
 
 @router.post("/{event_type}", status_code=status.HTTP_200_OK)

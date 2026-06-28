@@ -30,6 +30,21 @@ from app.logging_config import get_logger
 log = get_logger(__name__)
 
 
+# -- Factory defaults ----------------------------------------------------
+#
+# The inference settings a freshly-seeded template gets. Single source of
+# truth shared by `upsert_template`, `seed_defaults`, and the API's
+# "reset to default" endpoint, so a fresh seed and the editor's Reset
+# button can never drift apart. (The Prompts page only edits the DEFAULT
+# template today, but these hold for every event type.)
+DEFAULT_MODEL = "deepseek-v4-flash"
+DEFAULT_TEMPERATURE = 0.2
+DEFAULT_MAX_TOKENS = 2000
+DEFAULT_REASONING_EFFORT = "medium"
+DEFAULT_THINKING_ENABLED = False
+DEFAULT_STREAM = False
+
+
 # -- Keyword heuristic (v1) ----------------------------------------------
 #
 # Maps each supported EventType to a list of substrings (case-
@@ -194,12 +209,12 @@ def upsert_template(
     event_type: str,
     system_prompt: str,
     user_template: str,
-    model: str = "deepseek-v4-flash",
-    temperature: float = 0.2,
-    max_tokens: int = 2000,
-    reasoning_effort: str = "medium",
-    thinking_enabled: bool = False,
-    stream: bool = False,
+    model: str = DEFAULT_MODEL,
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT,
+    thinking_enabled: bool = DEFAULT_THINKING_ENABLED,
+    stream: bool = DEFAULT_STREAM,
     updated_by: str = "system",
     change_note: Optional[str] = None,
 ) -> tuple[PromptTemplate, bool]:
@@ -432,30 +447,69 @@ def _per_event_tail(event_type: str) -> str:
     return ""
 
 
+def default_template_fields(event_type: str) -> dict:
+    """The factory-default field values for a template, exactly as a fresh
+    `seed_defaults` would create them.
+
+    Pure — no DB access — so the API can serve the editor's "reset to
+    default" without persisting anything. The operator then Saves to
+    actually change the active (last-saved) version.
+    """
+    if event_type == DEFAULT_EVENT_TYPE:
+        system_prompt = _default_system_prompt("OTHER")
+        user_template = (
+            "Read the PDF at {{pdf_url}} and return a JSON object "
+            "matching the schema."
+        )
+    else:
+        system_prompt = _per_event_system_prompt(event_type)
+        user_template = _default_user_template(event_type)
+    return {
+        "system_prompt": system_prompt,
+        "user_template": user_template,
+        "model": DEFAULT_MODEL,
+        "temperature": DEFAULT_TEMPERATURE,
+        "max_tokens": DEFAULT_MAX_TOKENS,
+        "reasoning_effort": DEFAULT_REASONING_EFFORT,
+        "thinking_enabled": DEFAULT_THINKING_ENABLED,
+        "stream": DEFAULT_STREAM,
+    }
+
+
 def seed_defaults(
-    session: Session, *, updated_by: str = "system"
+    session: Session, *, updated_by: str = "system", overwrite: bool = True
 ) -> list[PromptTemplate]:
     """Insert (or upsert) DEFAULT + 15 per-event-type templates.
 
     Idempotent — running twice yields 16 rows total. Returns the list
     of templates touched (created OR updated).
+
+    `overwrite` controls what happens to a template that ALREADY exists:
+      - True  (default): upsert it back to the factory default, bumping
+        the version if its content drifted. Used by the standalone
+        `seed_default_prompts.py` script — an explicit operator re-seed.
+      - False: leave existing rows untouched and only INSERT the ones
+        that are missing. This is what app startup uses, so a restart
+        never clobbers an operator's saved edits — the last-saved version
+        keeps driving the analyzer until they Reset to default by hand.
     """
     touched: list[PromptTemplate] = []
     for event_type in EVENT_TYPES:
-        if event_type == DEFAULT_EVENT_TYPE:
-            system_prompt = _default_system_prompt("OTHER")
-            user_template = (
-                "Read the PDF at {{pdf_url}} and return a JSON object "
-                "matching the schema."
-            )
-        else:
-            system_prompt = _per_event_system_prompt(event_type)
-            user_template = _default_user_template(event_type)
+        if not overwrite and load_template(session, event_type) is not None:
+            # Preserve operator edits across restarts — insert-missing-only.
+            continue
+        fields = default_template_fields(event_type)
         t, _created = upsert_template(
             session,
             event_type=event_type,
-            system_prompt=system_prompt,
-            user_template=user_template,
+            system_prompt=fields["system_prompt"],
+            user_template=fields["user_template"],
+            model=fields["model"],
+            temperature=fields["temperature"],
+            max_tokens=fields["max_tokens"],
+            reasoning_effort=fields["reasoning_effort"],
+            thinking_enabled=fields["thinking_enabled"],
+            stream=fields["stream"],
             updated_by=updated_by,
             change_note="seed_default_prompts",
         )
