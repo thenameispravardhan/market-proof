@@ -64,7 +64,7 @@ from app.analyzer.rules_engine import (
     enrich_analysis_context,
     evaluate as rules_evaluate,
     get_or_create_default_strategy,
-    load_rules_for_strategy,
+    load_rules_for_enabled_strategies,
     publish_match,
 )
 from app.analyzer.schemas import (
@@ -377,6 +377,8 @@ class Service:
                 self._session_factory, announcement_id,
                 "non_material_filing",
                 {"headline": announcement.headline or ""},
+                # Friendly label — this is a deliberate skip, not a crash.
+                "Skipped — non-material filing (administrative notice; not sent to the AI).",
             )
             return None
 
@@ -610,12 +612,21 @@ def _store_failed_analysis(
     announcement_id: int,
     reason: str,
     raw_payload: dict[str, Any],
+    rationale: Optional[str] = None,
 ) -> None:
-    """Persist a placeholder analyses row when the real path fails.
+    """Persist a placeholder analyses row when the real path fails (or
+    when an announcement is deliberately skipped).
 
     We do this so the same announcement doesn't trigger retries
     forever — once an `analyses` row exists for `announcement_id`,
     the service skips the message on the event bus.
+
+    `reason` is the machine-readable tag stored in `raw_response.error`
+    (queryable across all skip/fail reasons). `rationale` is the
+    human-readable line shown in the pipeline; it defaults to
+    "Analyzer failed: {reason}" but callers pass a friendlier string for
+    deliberate skips (e.g. the non-material noise filter) so a skip isn't
+    surfaced to the operator as a crash.
     """
     with session_factory() as session:
         # Idempotency: don't double-insert.
@@ -628,7 +639,7 @@ def _store_failed_analysis(
             sentiment_score=0.0,
             confidence=0.0,
             recommendation="HOLD",
-            rationale=f"Analyzer failed: {reason}",
+            rationale=rationale or f"Analyzer failed: {reason}",
             raw_response={"event_type": "OTHER", "error": reason, **raw_payload},
         )
         session.add(a)
@@ -678,9 +689,11 @@ def _persist_analysis_and_signal(
         session.add(a)
         session.flush()
 
-        # Rules engine.
+        # Rules engine. Evaluate against every ENABLED strategy's enabled
+        # rules (priority ASC, first match wins). The default strategy is
+        # only the fallback owner for the HOLD signal below.
         strategy = get_or_create_default_strategy(session)
-        rules = load_rules_for_strategy(session, strategy.id)
+        rules = load_rules_for_enabled_strategies(session)
         # Add the symbol/exchange for the rule context, then enrich with the
         # cheaply-available market context (sector) so rules can gate on it.
         # Price / change_pct / adv_crore need a live quote and are only
@@ -694,6 +707,16 @@ def _persist_analysis_and_signal(
         eval_ctx["exchange"] = announcement.exchange
         eval_ctx = enrich_analysis_context(eval_ctx, sector_map=load_sector_map())
         match = rules_evaluate(eval_ctx, rules)
+
+        # Attribute the signal to the strategy that actually owns the
+        # matched rule (rules now span multiple strategies). HOLD / no
+        # match falls back to the default strategy.
+        matched_strategy_id = strategy.id
+        if match.rule_id is not None:
+            for r in rules:
+                if r.id == match.rule_id:
+                    matched_strategy_id = r.strategy_id
+                    break
 
         # Trade levels (deterministic stub for v1).
         levels = _compute_trade_levels(analysis_dict)
@@ -711,7 +734,7 @@ def _persist_analysis_and_signal(
 
         s = Signal(
             analysis_id=a.id,
-            strategy_id=strategy.id,
+            strategy_id=matched_strategy_id,
             rule_id=match.rule_id,
             symbol=announcement.symbol,
             action=match.action,

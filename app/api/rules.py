@@ -266,11 +266,21 @@ def dry_run_get() -> dict[str, Any]:
 
 @router.post("/dry-run")
 def dry_run(body: DryRunRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
-    """Evaluate all enabled rules against a synthetic analysis dict."""
+    """Evaluate enabled rules against a synthetic analysis dict.
+
+    With a `strategy_id` we test that one strategy's enabled rules (handy
+    for previewing a strategy even while it's switched off). Without one we
+    mirror the live pipeline: only rules whose parent strategy is ALSO
+    enabled are considered.
+    """
     stmt = select(SignalRule).where(SignalRule.enabled.is_(True))
     if body.strategy_id is not None:
         stmt = stmt.where(SignalRule.strategy_id == body.strategy_id)
-    stmt = stmt.order_by(SignalRule.priority.asc())
+    else:
+        stmt = stmt.join(Strategy, SignalRule.strategy_id == Strategy.id).where(
+            Strategy.enabled.is_(True)
+        )
+    stmt = stmt.order_by(SignalRule.priority.asc(), SignalRule.id.asc())
     rules = db.execute(stmt).scalars().all()
 
     for rule in rules:

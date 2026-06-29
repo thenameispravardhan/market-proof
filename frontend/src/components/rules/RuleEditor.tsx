@@ -1,32 +1,100 @@
 // RuleEditor — visual condition builder + action selector.
+//
+// Only four analysis fields are offered, each with a typed input so a
+// condition can never carry the wrong datatype (the old free-text box let
+// you compare a number field to the string "BUY", which the engine then
+// rejected at run time):
+//   • sentiment        → enum  (positive / neutral / negative)
+//   • sentiment_score  → number (−100 … 100)
+//   • confidence       → number (0 … 1)
+//   • recommendation   → enum  (BUY / SELL / HOLD)
 import { useEffect, useState } from "react";
 import { useRules, useCreateRule, useUpdateRule } from "../../hooks/useApi";
+import { Toggle } from "../common/Toggle";
 import type { Action, SignalCondition, SignalConditions } from "../../types";
 
-// Plain-language labels for the condition builder. The `value` is what
-// the rules engine stores; the `label` is what the operator reads.
-const FIELDS: { value: string; label: string }[] = [
-  { value: "event_type", label: "Event type" },
-  { value: "sentiment", label: "Sentiment" },
-  { value: "sentiment_score", label: "Sentiment score (−100…100)" },
-  { value: "confidence", label: "Confidence (0…1)" },
-  { value: "recommendation", label: "AI recommendation" },
-  { value: "deal_value_inr_crore", label: "Deal value (₹ cr)" },
-  { value: "stake_change_pct", label: "Stake change (%)" },
-  { value: "dividend_per_share", label: "Dividend per share (₹)" },
-  { value: "buyback_value_inr_crore", label: "Buyback value (₹ cr)" },
+type FieldKind = "enum" | "number";
+
+interface FieldDef {
+  value: string;
+  label: string;
+  kind: FieldKind;
+  options?: { value: string; label: string }[]; // enum only
+  min?: number; // number only
+  max?: number;
+  step?: number;
+  fallback: string | number; // default value when this field is picked
+  hint: string;
+}
+
+// The only four conditions we support, with the input each one needs.
+const FIELDS: FieldDef[] = [
+  {
+    value: "sentiment",
+    label: "Sentiment",
+    kind: "enum",
+    options: [
+      { value: "positive", label: "Positive" },
+      { value: "neutral", label: "Neutral" },
+      { value: "negative", label: "Negative" },
+    ],
+    fallback: "positive",
+    hint: "Overall tone the model assigned to the news.",
+  },
+  {
+    value: "sentiment_score",
+    label: "Sentiment score",
+    kind: "number",
+    min: -100,
+    max: 100,
+    step: 1,
+    fallback: 50,
+    hint: "−100 (most negative) … +100 (most positive).",
+  },
+  {
+    value: "confidence",
+    label: "Confidence",
+    kind: "number",
+    min: 0,
+    max: 1,
+    step: 0.05,
+    fallback: 0.7,
+    hint: "How sure the model is, from 0 to 1.",
+  },
+  {
+    value: "recommendation",
+    label: "AI recommendation",
+    kind: "enum",
+    options: [
+      { value: "BUY", label: "BUY" },
+      { value: "SELL", label: "SELL" },
+      { value: "HOLD", label: "HOLD" },
+    ],
+    fallback: "BUY",
+    hint: "The model's own call on the stock.",
+  },
 ];
-const OPS: { value: string; label: string }[] = [
+
+const FIELD_BY_VALUE = Object.fromEntries(FIELDS.map((f) => [f.value, f]));
+
+// Operators differ by datatype: enums only support is / is-not; numbers
+// support the ordering comparisons too.
+const ENUM_OPS = [
   { value: "==", label: "is" },
   { value: "!=", label: "is not" },
-  { value: "in", label: "is one of" },
-  { value: "not_in", label: "is not one of" },
+];
+const NUMBER_OPS = [
   { value: ">=", label: "is at least (≥)" },
   { value: "<=", label: "is at most (≤)" },
   { value: ">", label: "is more than (>)" },
   { value: "<", label: "is less than (<)" },
+  { value: "==", label: "equals (=)" },
+  { value: "!=", label: "is not (≠)" },
 ];
-const ACTIONS = ["BUY", "SELL", "HOLD", "BLOCK"];
+
+const opsFor = (kind: FieldKind) => (kind === "enum" ? ENUM_OPS : NUMBER_OPS);
+
+const ACTIONS: Action[] = ["BUY", "SELL", "HOLD", "BLOCK"];
 
 interface Props {
   ruleId: number | null;
@@ -36,6 +104,23 @@ interface Props {
 
 function newCond(): SignalCondition {
   return { field: "sentiment_score", op: ">=", value: 50 };
+}
+
+// Coerce a stored/loaded condition onto a supported field+op+value so
+// legacy rows (or hand-edited JSON) never render a blank dropdown.
+function normalizeCond(c: SignalCondition): SignalCondition {
+  const def = FIELD_BY_VALUE[c.field];
+  if (!def) return newCond();
+  const ops = opsFor(def.kind).map((o) => o.value);
+  const op = ops.includes(c.op) ? c.op : ops[0];
+  let value = c.value;
+  if (def.kind === "enum") {
+    const allowed = def.options!.map((o) => o.value);
+    value = allowed.includes(String(value)) ? String(value) : def.fallback;
+  } else {
+    value = typeof value === "number" && !Number.isNaN(value) ? value : def.fallback;
+  }
+  return { field: c.field, op, value };
 }
 
 export function RuleEditor({ ruleId, strategyId, onSaved }: Props) {
@@ -58,10 +143,8 @@ export function RuleEditor({ ruleId, strategyId, onSaved }: Props) {
       setPriority(rule.priority);
       setAction(rule.action);
       setEnabled(rule.enabled);
-      setAllOf((rule.conditions.all_of ?? []).length > 0
-        ? (rule.conditions.all_of as SignalCondition[])
-        : [newCond()]
-      );
+      const conds = (rule.conditions.all_of ?? []) as SignalCondition[];
+      setAllOf(conds.length > 0 ? conds.map(normalizeCond) : [newCond()]);
     } else {
       setName("");
       setPriority(100);
@@ -73,18 +156,74 @@ export function RuleEditor({ ruleId, strategyId, onSaved }: Props) {
   }, [rule]);
 
   const updateCond = (idx: number, patch: Partial<SignalCondition>) => {
-    setAllOf((prev) => prev.map((c, i) => i === idx ? { ...c, ...patch } : c));
+    setAllOf((prev) => prev.map((c, i) => (i === idx ? { ...c, ...patch } : c)));
+  };
+
+  // When the field changes, reset the op + value to ones valid for the
+  // new field's datatype. This is what keeps datatypes correct.
+  const changeField = (idx: number, nextField: string) => {
+    const def = FIELD_BY_VALUE[nextField];
+    if (!def) return;
+    updateCond(idx, {
+      field: nextField,
+      op: opsFor(def.kind)[0].value,
+      value: def.fallback,
+    });
+  };
+
+  const changeValue = (idx: number, def: FieldDef, raw: string) => {
+    if (def.kind === "number") {
+      // Keep an empty box as "" so the user can clear and retype; save
+      // validation rejects empties/NaNs before they reach the API.
+      updateCond(idx, { value: raw === "" ? "" : Number(raw) });
+    } else {
+      updateCond(idx, { value: raw });
+    }
+  };
+
+  const validate = (): string | null => {
+    if (!name.trim()) return "Give the rule a name.";
+    if (!strategyId && !rule) return "Select a strategy first.";
+    for (const c of allOf) {
+      const def = FIELD_BY_VALUE[c.field];
+      if (!def) return `Unknown condition field: ${c.field}`;
+      if (def.kind === "number") {
+        const n = Number(c.value);
+        if (c.value === "" || Number.isNaN(n)) {
+          return `Enter a number for "${def.label}".`;
+        }
+        if (def.min !== undefined && n < def.min)
+          return `"${def.label}" must be ≥ ${def.min}.`;
+        if (def.max !== undefined && n > def.max)
+          return `"${def.label}" must be ≤ ${def.max}.`;
+      } else {
+        const allowed = def.options!.map((o) => o.value);
+        if (!allowed.includes(String(c.value)))
+          return `Pick a valid value for "${def.label}".`;
+      }
+    }
+    return null;
   };
 
   const handleSave = async () => {
-    if (!strategyId && !rule) {
-      setError("Select a strategy first.");
+    const v = validate();
+    if (v) {
+      setError(v);
       return;
     }
-    const conditions: SignalConditions = { all_of: allOf };
+    // Final type-coercion so numbers go out as numbers, enums as strings.
+    const cleaned: SignalCondition[] = allOf.map((c) => {
+      const def = FIELD_BY_VALUE[c.field];
+      return {
+        field: c.field,
+        op: c.op,
+        value: def?.kind === "number" ? Number(c.value) : String(c.value),
+      };
+    });
+    const conditions: SignalConditions = { all_of: cleaned };
     const body = {
       strategy_id: rule?.strategy_id ?? strategyId!,
-      name,
+      name: name.trim(),
       priority,
       action,
       enabled,
@@ -102,99 +241,142 @@ export function RuleEditor({ ruleId, strategyId, onSaved }: Props) {
     }
   };
 
+  const saving = create.isPending || update.isPending;
+
   return (
     <div className="widget" data-testid="rule-editor">
-      <h3>{rule ? `Edit Rule #${rule.id}` : "New Rule"}</h3>
-      <div className="field">
-        <label htmlFor="rule-name">Name</label>
-        <input id="rule-name" value={name} onChange={(e) => setName(e.target.value)} />
+      <div className="widget-header">
+        <h3>
+          {rule ? `Edit rule #${rule.id}` : "New rule"}
+          <Toggle on={enabled} onChange={setEnabled} size="sm" label="Active" />
+        </h3>
       </div>
-      <div className="field-row">
+      <div className="widget-body rule-editor-body">
         <div className="field">
-          <label htmlFor="rule-priority">Order checked</label>
+          <label htmlFor="rule-name">Rule name</label>
           <input
-            id="rule-priority"
-            type="number"
-            value={priority}
-            onChange={(e) => setPriority(Number(e.target.value))}
-            title="Lower numbers are checked first; the first matching rule wins"
+            id="rule-name"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="e.g. High-conviction buy"
           />
-          <div className="meta" style={{ color: "var(--text-dim)", fontSize: 11, marginTop: 4 }}>
-            Lower runs first
-          </div>
         </div>
-        <div className="field">
-          <label htmlFor="rule-action">Action</label>
-          <select id="rule-action" value={action} onChange={(e) => setAction(e.target.value as Action)}>
-            {ACTIONS.map((a) => <option key={a}>{a}</option>)}
-          </select>
-        </div>
-        <div className="field" style={{ justifyContent: "flex-end", paddingTop: 20 }}>
-          <label>
-            <input
-              type="checkbox"
-              checked={enabled}
-              onChange={(e) => setEnabled(e.target.checked)}
-            />{" "}
-            Enabled
-          </label>
-        </div>
-      </div>
 
-      <div className="field">
-        <label>Conditions (ALL must match)</label>
-        {allOf.map((cond, idx) => (
-          <div key={idx} className="field-row" style={{ marginBottom: 8 }}>
+        <div className="field-row">
+          <div className="field">
+            <label htmlFor="rule-action">Then do</label>
             <select
-              value={cond.field}
-              onChange={(e) => updateCond(idx, { field: e.target.value })}
+              id="rule-action"
+              value={action}
+              onChange={(e) => setAction(e.target.value as Action)}
             >
-              {FIELDS.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
+              {ACTIONS.map((a) => (
+                <option key={a}>{a}</option>
+              ))}
             </select>
-            <select
-              value={cond.op}
-              onChange={(e) => updateCond(idx, { op: e.target.value })}
-            >
-              {OPS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-            </select>
-            <input
-              value={String(cond.value)}
-              onChange={(e) => {
-                const v = e.target.value;
-                updateCond(idx, { value: isNaN(Number(v)) ? v : Number(v) });
-              }}
-              placeholder="value"
-              style={{ width: 120 }}
-            />
-            <button
-              className="btn-sm danger"
-              onClick={() => setAllOf((prev) => prev.filter((_, i) => i !== idx))}
-              disabled={allOf.length <= 1}
-            >×</button>
           </div>
-        ))}
-        <button className="btn-sm" onClick={() => setAllOf((prev) => [...prev, newCond()])}>
-          + Add condition
+          <div className="field">
+            <label htmlFor="rule-priority">Order checked</label>
+            <input
+              id="rule-priority"
+              type="number"
+              value={priority}
+              onChange={(e) => setPriority(Number(e.target.value))}
+              title="Lower numbers are checked first; the first matching rule wins"
+            />
+            <div className="field-hint">Lower runs first.</div>
+          </div>
+        </div>
+
+        <div className="field">
+          <label>When ALL of these match</label>
+          <div className="cond-list">
+            {allOf.map((cond, idx) => {
+              const def = FIELD_BY_VALUE[cond.field] ?? FIELDS[0];
+              return (
+                <div key={idx} className="cond-card">
+                  <div className="cond-grid">
+                    <select
+                      aria-label="Field"
+                      value={cond.field}
+                      onChange={(e) => changeField(idx, e.target.value)}
+                    >
+                      {FIELDS.map((f) => (
+                        <option key={f.value} value={f.value}>
+                          {f.label}
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      aria-label="Operator"
+                      value={cond.op}
+                      onChange={(e) => updateCond(idx, { op: e.target.value })}
+                    >
+                      {opsFor(def.kind).map((o) => (
+                        <option key={o.value} value={o.value}>
+                          {o.label}
+                        </option>
+                      ))}
+                    </select>
+                    {def.kind === "enum" ? (
+                      <select
+                        aria-label="Value"
+                        value={String(cond.value)}
+                        onChange={(e) => changeValue(idx, def, e.target.value)}
+                      >
+                        {def.options!.map((o) => (
+                          <option key={o.value} value={o.value}>
+                            {o.label}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <input
+                        aria-label="Value"
+                        type="number"
+                        min={def.min}
+                        max={def.max}
+                        step={def.step}
+                        value={cond.value === "" ? "" : String(cond.value)}
+                        onChange={(e) => changeValue(idx, def, e.target.value)}
+                        placeholder="value"
+                      />
+                    )}
+                    <button
+                      className="btn-sm danger cond-remove"
+                      onClick={() =>
+                        setAllOf((prev) => prev.filter((_, i) => i !== idx))
+                      }
+                      disabled={allOf.length <= 1}
+                      title="Remove condition"
+                    >
+                      ×
+                    </button>
+                  </div>
+                  <div className="field-hint">{def.hint}</div>
+                </div>
+              );
+            })}
+          </div>
+          <button
+            className="btn-sm"
+            onClick={() => setAllOf((prev) => [...prev, newCond()])}
+          >
+            + Add condition
+          </button>
+        </div>
+
+        {error && <p className="pnl-neg rule-error">{error}</p>}
+
+        <button
+          className="primary save-rule-btn"
+          onClick={handleSave}
+          disabled={saving}
+          data-testid="save-rule"
+        >
+          {saving ? "Saving…" : rule ? "Update rule" : "Create rule"}
         </button>
       </div>
-
-      <div className="field">
-        <label>JSON Preview</label>
-        <pre className="mono" style={{ fontSize: 11, background: "#0d1117", padding: 8, borderRadius: 4 }}>
-          {JSON.stringify({ all_of: allOf }, null, 2)}
-        </pre>
-      </div>
-
-      {error && <p className="pnl-neg">{error}</p>}
-
-      <button
-        className="primary"
-        onClick={handleSave}
-        disabled={create.isPending || update.isPending}
-        data-testid="save-rule"
-      >
-        {create.isPending || update.isPending ? "Saving…" : rule ? "Update Rule" : "Create Rule"}
-      </button>
     </div>
   );
 }

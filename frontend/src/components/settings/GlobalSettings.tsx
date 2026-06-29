@@ -1,9 +1,10 @@
 // GlobalSettings — editable global risk settings form.
 import { useEffect, useState } from "react";
 import { useGlobalSettings, useUpdateSettings } from "../../hooks/useApi";
+import { Toggle } from "../common/Toggle";
 import type { GlobalSettings as GS } from "../../types";
 
-type NumField = Exclude<keyof GS, "TRADING_MODE">;
+type NumField = Exclude<keyof GS, "TRADING_MODE" | "PRE_LLM_FILTER_ENABLED">;
 
 const FIELDS: { key: NumField; label: string; min: number; max: number; step: number }[] = [
   { key: "MAX_CAPITAL_RISK_PCT", label: "Max capital risk (%)", min: 0.1, max: 100, step: 0.1 },
@@ -37,6 +38,8 @@ export function GlobalSettings() {
     setSaved(false);
   };
 
+  const preLlmFilter = values.PRE_LLM_FILTER_ENABLED ?? true;
+
   const handleSave = async () => {
     setError(null);
     try {
@@ -68,6 +71,25 @@ export function GlobalSettings() {
               />
             </div>
           ))}
+          <div className="field" style={{ marginTop: 4 }}>
+            <label>Pre-LLM noise filter</label>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <Toggle
+                on={preLlmFilter}
+                data-testid="pre-llm-filter-toggle"
+                onChange={(next) => {
+                  setValues((prev) => ({ ...prev, PRE_LLM_FILTER_ENABLED: next }));
+                  setSaved(false);
+                }}
+              />
+              <span className="field-hint" style={{ marginTop: 0 }}>
+                {preLlmFilter
+                  ? "Administrative filings (trading-window, compliance, newspaper notices) are skipped before the AI call."
+                  : "Every filing is sent to the AI — including administrative noise (more cost, slower queue)."}
+              </span>
+            </div>
+          </div>
+
           {error && <p className="pnl-neg">{error}</p>}
           {saved && <p className="pnl-pos">✓ Saved</p>}
           <button

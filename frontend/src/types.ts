@@ -278,6 +278,9 @@ export interface GlobalSettings {
   DEFAULT_SL_PCT: number;
   DEFAULT_TARGET_RR: number;
   QUOTE_REFRESH_SECONDS: number;
+  // When ON, clearly-administrative filings are skipped before the LLM
+  // call. OFF sends every filing to the AI (more cost, slower queue).
+  PRE_LLM_FILTER_ENABLED: boolean;
 }
 
 export interface ManagedPosition {

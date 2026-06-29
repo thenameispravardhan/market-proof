@@ -1,5 +1,8 @@
-// StrategyList — shows all strategies with enable/disable toggle.
-import { useStrategies, useDeleteStrategy, useUpdateStrategy } from "../../hooks/useApi";
+// StrategyList — all strategies with a working on/off switch.
+// A disabled strategy's rules are skipped by the live analyzer, so this
+// switch is how you turn a whole strategy on or off.
+import { useStrategies, useDeleteStrategy, useToggleStrategy } from "../../hooks/useApi";
+import { Toggle } from "../common/Toggle";
 import type { Strategy } from "../../types";
 
 interface Props {
@@ -11,70 +14,60 @@ interface Props {
 export function StrategyList({ selectedId, onSelect, onNew }: Props) {
   const { data: strategies, isLoading } = useStrategies();
   const deleteStrategy = useDeleteStrategy();
-  const updateStrategy = useUpdateStrategy(null);
+  const toggle = useToggleStrategy();
 
   const handleDelete = async (s: Strategy) => {
     if (!confirm(`Delete strategy "${s.name}" and ALL its rules?`)) return;
     await deleteStrategy.mutateAsync(s.id);
   };
 
-  const toggleEnabled = async (s: Strategy) => {
-    // We need the update hook with the correct id — use a one-off approach
-    try {
-      await fetch(`/api/strategies/${s.id}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ enabled: !s.enabled }),
-      });
-      // invalidate via parent
-    } catch {
-      // silent
-    }
-  };
-
   return (
     <div className="widget" data-testid="strategy-list">
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-        <h3 style={{ margin: 0 }}>Strategies</h3>
+      <div className="widget-header">
+        <h3>
+          Strategies
+          <span className="meta">{strategies?.length ?? 0} total</span>
+        </h3>
         <button className="btn-sm primary" onClick={onNew}>+ New</button>
       </div>
-      {isLoading ? (
-        <p className="empty">Loading…</p>
-      ) : !strategies || strategies.length === 0 ? (
-        <p className="empty">No strategies yet. Create one to get started.</p>
-      ) : (
-        <div className="list">
-          {strategies.map((s: Strategy) => (
-            <div
-              key={s.id}
-              className={`item${selectedId === s.id ? " selected" : ""}`}
-              onClick={() => onSelect(s.id)}
-            >
-              <div className="head">
-                <span className="symbol">{s.name}</span>
-                <span className={`badge ${s.enabled ? "info" : "warn"}`}>
-                  {s.enabled ? "enabled" : "disabled"}
-                </span>
+      <div className="widget-body" style={{ padding: 0 }}>
+        {isLoading ? (
+          <p className="empty">Loading…</p>
+        ) : !strategies || strategies.length === 0 ? (
+          <p className="empty">No strategies yet. Create one to get started.</p>
+        ) : (
+          <div className="list">
+            {strategies.map((s: Strategy) => (
+              <div
+                key={s.id}
+                className={`item strategy-item${selectedId === s.id ? " selected" : ""}${
+                  s.enabled ? "" : " is-off"
+                }`}
+                onClick={() => onSelect(s.id)}
+              >
+                <div className="head">
+                  <span className="symbol">{s.name}</span>
+                  <Toggle
+                    on={s.enabled}
+                    disabled={toggle.isPending}
+                    onChange={(next) => toggle.mutate({ id: s.id, enabled: next })}
+                    title={s.enabled ? "Strategy is active" : "Strategy is off"}
+                  />
+                </div>
+                {s.description && <div className="body">{s.description}</div>}
+                <div className="rule-actions">
+                  <button
+                    className="btn-sm danger"
+                    onClick={(e) => { e.stopPropagation(); handleDelete(s); }}
+                  >
+                    Delete
+                  </button>
+                </div>
               </div>
-              {s.description && <div className="body">{s.description}</div>}
-              <div className="body reason" style={{ display: "flex", gap: 8, marginTop: 6 }}>
-                <button
-                  className="btn-sm"
-                  onClick={(e) => { e.stopPropagation(); toggleEnabled(s); }}
-                >
-                  {s.enabled ? "Disable" : "Enable"}
-                </button>
-                <button
-                  className="btn-sm danger"
-                  onClick={(e) => { e.stopPropagation(); handleDelete(s); }}
-                >
-                  Delete
-                </button>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

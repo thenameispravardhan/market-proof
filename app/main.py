@@ -96,9 +96,14 @@ async def lifespan(app: FastAPI):
     except Exception:  # noqa: BLE001
         log.exception("app.settings_override_apply_failed")
 
-    # Seed the analyzer prompt templates and the default signal rules so
-    # a fresh install analyzes filings and can actually trade in paper
-    # mode without any manual setup. Both seeders are idempotent.
+    # Seed the analyzer prompt templates + the default strategy/paper
+    # account so a fresh install analyzes filings and can route paper
+    # trades without manual setup. All seeders are idempotent.
+    #
+    # NOTE: we intentionally do NOT auto-seed the example signal rules
+    # anymore. The operator builds their own rules in the Rules UI, and a
+    # restart must never resurrect deleted rules. (Re-seed on demand with
+    # `python -m scripts.seed_default_rules` if the starter set is wanted.)
     #
     # Prompts seed with overwrite=False: on a restart we only INSERT
     # templates that are missing and never touch existing rows, so an
@@ -106,21 +111,17 @@ async def lifespan(app: FastAPI):
     # to factory default is an explicit, per-template action (the Prompts
     # page "Reset to default" button), never something a restart does.
     try:
-        from app.analyzer.default_rules import (
-            seed_default_paper_account,
-            seed_default_rules,
-        )
+        from app.analyzer.default_rules import seed_default_paper_account
         from app.analyzer.prompts import seed_defaults
         from app.db.session import SessionLocal
 
         with SessionLocal() as _s:
             n_prompts = len(seed_defaults(_s, overwrite=False))
-            n_rules = seed_default_rules(_s)
             acct_seeded = seed_default_paper_account(_s)
             _s.commit()
         log.info(
             "app.seed_defaults",
-            prompts=n_prompts, rules=n_rules, paper_account=acct_seeded,
+            prompts=n_prompts, paper_account=acct_seeded,
         )
     except Exception:  # noqa: BLE001
         log.exception("app.seed_defaults_failed")

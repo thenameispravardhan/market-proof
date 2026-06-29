@@ -61,6 +61,11 @@ _GLOBAL_KEYS: dict[str, tuple[type, Any]] = {
     "DEFAULT_SL_PCT": (float, 6.0),
     "DEFAULT_TARGET_RR": (float, 3.0),
     "QUOTE_REFRESH_SECONDS": (int, 5),
+    # Pre-LLM noise filter: when ON, clearly-administrative filings
+    # (trading-window notices, compliance certificates, newspaper
+    # publications, …) are skipped before the paid LLM call. Turning it
+    # OFF sends every filing to the AI (more cost, slower queue).
+    "PRE_LLM_FILTER_ENABLED": (bool, True),
 }
 
 
@@ -104,6 +109,19 @@ class SettingsUpdate(BaseModel):
 def _coerce(key: str, value: Any) -> Any:
     """Coerce incoming value to the declared Python type and validate range."""
     typ, _default = _GLOBAL_KEYS[key]
+    # Booleans need explicit handling: bool("false") is True, so the
+    # generic typ(value) cast below would silently mangle a string.
+    if typ is bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"setting {key}: cannot coerce {value!r} to bool",
+        )
     try:
         coerced = typ(value)
     except (TypeError, ValueError) as e:

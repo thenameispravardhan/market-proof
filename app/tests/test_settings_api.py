@@ -155,6 +155,38 @@ def test_settings_updated_event_fires(client: TestClient) -> None:
         event_bus.unsubscribe("settings.updated", q)
 
 
+def test_pre_llm_filter_bool_roundtrips_and_hot_applies(client: TestClient) -> None:
+    """The pre-LLM noise filter toggle is a real boolean: it defaults ON,
+    PUT false flips it (and hot-applies to get_settings without restart),
+    and PUT true flips it back. Guards against bool('false') == True."""
+    import os
+    from app.config import get_settings
+
+    saved = os.environ.get("PRE_LLM_FILTER_ENABLED")
+    try:
+        # Default is ON.
+        assert client.get("/api/settings").json()["global"]["PRE_LLM_FILTER_ENABLED"] is True
+
+        # Turn it OFF.
+        r = client.put("/api/settings", json={"global": {"PRE_LLM_FILTER_ENABLED": False}})
+        assert r.status_code == 200, r.text
+        assert r.json()["global"]["PRE_LLM_FILTER_ENABLED"] is False
+        assert client.get("/api/settings").json()["global"]["PRE_LLM_FILTER_ENABLED"] is False
+        # Hot-applied to the live Settings (no restart).
+        assert get_settings().PRE_LLM_FILTER_ENABLED is False
+
+        # Turn it back ON.
+        r2 = client.put("/api/settings", json={"global": {"PRE_LLM_FILTER_ENABLED": True}})
+        assert r2.json()["global"]["PRE_LLM_FILTER_ENABLED"] is True
+        assert get_settings().PRE_LLM_FILTER_ENABLED is True
+    finally:
+        if saved is None:
+            os.environ.pop("PRE_LLM_FILTER_ENABLED", None)
+        else:
+            os.environ["PRE_LLM_FILTER_ENABLED"] = saved
+        get_settings.cache_clear()
+
+
 def _drain(q, timeout: float):
     """Pull a single event from a queue, but in a way that works with the
     synchronous TestClient (the event bus publishes from a coroutine

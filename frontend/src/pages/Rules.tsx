@@ -10,11 +10,13 @@ export default function Rules() {
   const { data: strategies } = useStrategies();
   const [strategyId, setStrategyId] = useState<number | null>(null);
 
+  const hasStrategies = (strategies ?? []).length > 0;
+
   return (
     <div>
       <h1 className="page-title">Signal Rules</h1>
-      <div style={{ marginBottom: 16, display: "flex", gap: 12, alignItems: "center" }}>
-        <label htmlFor="strategy-filter">Strategy:</label>
+      <div className="toolbar">
+        <span className="label">Strategy</span>
         <select
           id="strategy-filter"
           value={strategyId ?? ""}
@@ -23,12 +25,23 @@ export default function Rules() {
             setStrategyId(v ? Number(v) : null);
             setSelectedId(null);
           }}
+          style={{ width: "auto", minWidth: 200 }}
         >
           <option value="">All strategies</option>
           {(strategies ?? []).map((s) => (
-            <option key={s.id} value={s.id}>{s.name}</option>
+            <option key={s.id} value={s.id}>
+              {s.name}{s.enabled ? "" : " (off)"}
+            </option>
           ))}
         </select>
+        <span className="spacer" />
+        <span className="label">
+          {strategyId
+            ? "Editing rules for this strategy"
+            : hasStrategies
+              ? "Pick a strategy to add rules"
+              : "Create a strategy first"}
+        </span>
       </div>
       <div className="layout-2">
         <RuleList

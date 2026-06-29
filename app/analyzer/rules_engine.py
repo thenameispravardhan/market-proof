@@ -152,6 +152,29 @@ def load_rules_for_strategy(
     return list(session.execute(stmt).scalars().all())
 
 
+def load_rules_for_enabled_strategies(session: Session) -> list[SignalRule]:
+    """Load enabled rules from every ENABLED strategy, priority ASC.
+
+    This is what the live analyzer evaluates against: a rule fires only
+    when BOTH its own `enabled` flag and its parent strategy's `enabled`
+    flag are on. That's what makes the per-strategy on/off switch in the
+    UI meaningful — flipping a strategy off removes all of its rules from
+    the live pipeline without touching the individual rule flags.
+
+    Ordering is global by (priority ASC, id ASC) so the usual "first match
+    wins" semantics hold across strategies. Empty list is fine — the
+    engine returns the HOLD fallback.
+    """
+    stmt = (
+        select(SignalRule)
+        .join(Strategy, SignalRule.strategy_id == Strategy.id)
+        .where(SignalRule.enabled.is_(True))
+        .where(Strategy.enabled.is_(True))
+        .order_by(SignalRule.priority.asc(), SignalRule.id.asc())
+    )
+    return list(session.execute(stmt).scalars().all())
+
+
 # -- Pure evaluation -----------------------------------------------------
 
 

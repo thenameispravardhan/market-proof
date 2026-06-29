@@ -129,6 +129,13 @@ def _seed_strategy_with_buy_rule(session, action="BUY", priority=10) -> SignalRu
 
     Returns the rule (for assertions on id / action_params)."""
     from app.analyzer.rules_engine import DEFAULT_STRATEGY_NAME
+    # The live analyzer now evaluates rules across ALL enabled strategies
+    # (load_rules_for_enabled_strategies), so start from a clean slate to
+    # keep this test deterministic regardless of rows leaked by earlier
+    # tests sharing the in-memory DB.
+    session.query(SignalRule).delete(synchronize_session=False)
+    session.query(Strategy).delete(synchronize_session=False)
+    session.flush()
     s = (
         session.query(Strategy)
         .filter(Strategy.name == DEFAULT_STRATEGY_NAME)
