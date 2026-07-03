@@ -318,12 +318,33 @@ class Service:
             log.info("analyzer.skip_existing_analysis", announcement_id=announcement_id)
             return None
 
+        # Step 1.2: AI-ANALYSIS MASTER SWITCH (Dashboard toggle). When the
+        # operator turns AI analysis OFF, announcements are stored but never
+        # sent to the LLM — no analyses, no signals, no auto trades. We
+        # persist the usual placeholder so the announcement isn't re-analyzed
+        # when the switch comes back on (it would be stale by then anyway).
+        settings = get_settings()
+        if not getattr(settings, "AI_ANALYSIS_ENABLED", True):
+            log.info(
+                "analyzer.ai_disabled_skipped",
+                announcement_id=announcement_id,
+                symbol=announcement.symbol,
+                headline=announcement.headline,
+            )
+            await loop.run_in_executor(
+                None, _store_failed_analysis,
+                self._session_factory, announcement_id,
+                "ai_analysis_disabled",
+                {"headline": announcement.headline or ""},
+                "Skipped — AI analysis is turned OFF (Dashboard toggle).",
+            )
+            return None
+
         # Step 1.5: STALENESS GATE. The spike is gone; don't burn an LLM
         # call on a stale filing and don't open a position that's
         # guaranteed to be late. We persist a placeholder analysis row
         # (same shape as a real failure path) so a future replay won't
         # re-trigger this announcement, and we log the skip.
-        settings = get_settings()
         max_age_s = int(getattr(settings, "MAX_NEWS_AGE_SECONDS", 90))
         filed_at = announcement.filed_at
         age_seconds: Optional[float] = None

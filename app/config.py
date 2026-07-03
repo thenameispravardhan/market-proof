@@ -176,13 +176,6 @@ class Settings(BaseSettings):
     # fill worse than MAX_SLIPPAGE_PCT off the intended entry is rejected.
     ENTRY_BUFFER_PCT: float = 0.2
     MAX_SLIPPAGE_PCT: float = 0.25
-    # Anti-chase guard: the IOC buffer bounds the order→fill move, but
-    # nothing else stops us from entering a name that already ran between
-    # signal generation and order time. If the order-time price has moved
-    # more than this % in the trade's favour vs the signal's intended entry,
-    # the move is "already extended" and we skip it (block ENTRY_DRIFT)
-    # rather than chase the spike into a reversal.
-    MAX_ENTRY_DRIFT_PCT: float = 1.5
     ORDER_FILL_TIMEOUT_SECONDS: float = 1.5
     LLM_TIMEOUT_SECONDS: float = 18.0         # discard the opportunity past this
     # Hard cap on LLM completion tokens. Generation latency scales almost
@@ -203,6 +196,11 @@ class Settings(BaseSettings):
     # up behind junk so a real market-mover isn't stuck waiting. The
     # denylist is deliberately conservative; see app/analyzer/prompts.py.
     PRE_LLM_FILTER_ENABLED: bool = True
+    # Master switch for the AI (LLM) analysis of incoming news. When OFF,
+    # announcements are still monitored and stored, but nothing is sent to
+    # DeepSeek — no analyses, no signals, no auto trades. Manual trading
+    # from the Trade page is unaffected. Toggleable from the Dashboard.
+    AI_ANALYSIS_ENABLED: bool = True
     # Market session (IST, "HH:MM"). Entry window excludes the first
     # 15 min after open and the last 30 min before close; all intraday
     # positions are force-squared-off at SQUARE_OFF_TIME.
@@ -242,7 +240,6 @@ class Settings(BaseSettings):
         "MAX_SINGLE_POSITION_PCT",
         "DEFAULT_SL_PCT",
         "ATR_MAX_STOP_PCT",
-        "MAX_ENTRY_DRIFT_PCT",
         "SECTOR_CONCENTRATION_PCT",
     )
     @classmethod

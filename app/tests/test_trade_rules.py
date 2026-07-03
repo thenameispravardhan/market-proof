@@ -57,34 +57,6 @@ def test_derive_levels_falls_back_to_pct_without_atr():
     assert hold == 600
 
 
-# -- anti-chase guard -----------------------------------------------------
-
-
-def test_entry_drift_blocks_extended_long():
-    mgr = _manager()
-    # +2% vs intended 100 → over the 1.5% default → blocked.
-    block = mgr._entry_drift_block(action="BUY", intended=100.0, current=102.0)
-    assert block is not None and block[0] == "ENTRY_DRIFT"
-
-
-def test_entry_drift_allows_small_move():
-    mgr = _manager()
-    assert mgr._entry_drift_block(action="BUY", intended=100.0, current=101.0) is None
-
-
-def test_entry_drift_short_is_symmetric():
-    mgr = _manager()
-    # Short: favourable = price already fell. 100 → 98 is +2% favourable.
-    block = mgr._entry_drift_block(action="SELL", intended=100.0, current=98.0)
-    assert block is not None and block[0] == "ENTRY_DRIFT"
-
-
-def test_entry_drift_missing_price_skips():
-    mgr = _manager()
-    assert mgr._entry_drift_block(action="BUY", intended=None, current=102.0) is None
-    assert mgr._entry_drift_block(action="BUY", intended=100.0, current=None) is None
-
-
 # -- ATR-driven trailing (R = ATR distance) -------------------------------
 
 

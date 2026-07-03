@@ -281,6 +281,9 @@ export interface GlobalSettings {
   // When ON, clearly-administrative filings are skipped before the LLM
   // call. OFF sends every filing to the AI (more cost, slower queue).
   PRE_LLM_FILTER_ENABLED: boolean;
+  // Master switch for AI news analysis (Dashboard toggle). OFF = news is
+  // still collected but never sent to the LLM — no signals / auto trades.
+  AI_ANALYSIS_ENABLED: boolean;
 }
 
 export interface ManagedPosition {

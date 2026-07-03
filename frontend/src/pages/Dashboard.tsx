@@ -8,6 +8,7 @@ import { ActivePositions } from "../components/dashboard/ActivePositions";
 import { PnLChart } from "../components/dashboard/PnLChart";
 import { RiskMetrics } from "../components/dashboard/RiskMetrics";
 import { AccountToggles } from "../components/dashboard/AccountToggles";
+import { AiAnalysisToggle } from "../components/dashboard/AiAnalysisToggle";
 import { useDashboardSummary, useGlobalSettings } from "../hooks/useApi";
 
 function money(v: number | null | undefined): string {
@@ -59,6 +60,7 @@ export default function Dashboard() {
     <div>
       <div className="dashboard-head">
         <h1 className="page-title">Dashboard</h1>
+        <AiAnalysisToggle />
         <AccountToggles />
       </div>
       <ModeBanner />

@@ -4,7 +4,10 @@ import { useGlobalSettings, useUpdateSettings } from "../../hooks/useApi";
 import { Toggle } from "../common/Toggle";
 import type { GlobalSettings as GS } from "../../types";
 
-type NumField = Exclude<keyof GS, "TRADING_MODE" | "PRE_LLM_FILTER_ENABLED">;
+type NumField = Exclude<
+  keyof GS,
+  "TRADING_MODE" | "PRE_LLM_FILTER_ENABLED" | "AI_ANALYSIS_ENABLED"
+>;
 
 const FIELDS: { key: NumField; label: string; min: number; max: number; step: number }[] = [
   { key: "MAX_CAPITAL_RISK_PCT", label: "Max capital risk (%)", min: 0.1, max: 100, step: 0.1 },

@@ -18,12 +18,11 @@ or the Settings UI without code changes.
 |---|---|---|
 | Sentiment-confidence floor (`MIN_SENTIMENT_CONFIDENCE=0.7`) | ✅ | engine R2b blocks below the floor |
 | Event-category whitelist | ✅ | default signal rules (`default_rules.py`) |
-| Market-hours entry window (excl. first 15 / last 30 min) | ✅ | `market_clock.is_entry_window`, IST. **Enforced in LIVE only** — paper testing trades at any hour (evenings/weekends); a closed exchange only constrains real money |
+| Market-hours entry window (excl. first 15 / last 30 min) | ✅ | `market_clock.is_entry_window`, IST. **Enforced in EVERY mode** (intraday-only, no carry-forward): an off-hours entry can't be squared off the same session — the feed is frozen, SL/target can never fire, and the position risks surviving overnight. `ENFORCE_MARKET_HOURS=false` remains the explicit escape hatch for off-hours testing |
 | Order-time staleness re-check (`MAX_NEWS_AGE_SECONDS=90`) | ✅ | re-measured at order time, after the LLM call |
 | Liquidity / ADV (`MIN_LIQUIDITY_CRORE=5`) | 🟡 | Fyers quote carries no volume yet; `REQUIRE_KNOWN_LIQUIDITY=false` so unknown ADV warns rather than blocks. Flip on once a volume feed exists |
 | Bid-ask spread (`MAX_SPREAD_PCT=0.1`) | ✅🟡 | engine R12 blocks a too-wide quoted spread. Fail-safe: when the quote has no bid/ask (today) it SKIPS + warns. Switches on the moment an L1 feed populates them |
 | India VIX suspend (`INDIA_VIX_MAX=30`) | ✅ | gate + §2 size throttle read India VIX from the Fyers index quote (`FyersVolatilityRegime`, TTL-cached). Fail-safe: no Fyers account → no VIX → no gate |
-| Anti-chase / entry drift (`MAX_ENTRY_DRIFT_PCT=1.5`) | ✅ | blocks `ENTRY_DRIFT` when the order-time price already ran in our favour past the threshold vs the signal's intended entry — skip the extended move rather than chase a reversal |
 | Per-event confidence floor | ✅ | the event matrix raises the conviction bar above the global floor for priced-in events (dividends, splits) — `app/risk/event_profiles.py` |
 
 ## 2. Position sizing — `app/risk/position_sizer.py`
@@ -41,9 +40,14 @@ or the Settings UI without code changes.
 ## 3. Stops, targets & exits — `app/execution/trade_manager.py`
 - ✅ **Trailing stop** — arms at `+TRAIL_ACTIVATE_R=1.5`R, trails by
   `TRAIL_DISTANCE_R=0.5`R.
-- ✅ **Scale-out** — takes half at `SCALE_OUT_R=2`R, moves the rest to
-  breakeven and trails it (no hard cap, to keep the fat tail). Toggle with
-  `SCALE_OUT_ENABLED`; off = classic hard target.
+- ✅ **Explicit levels win** — when a position has a target set, that hard
+  target + stop govern the exit (a configured target always triggers a FULL
+  exit and is never silently overridden). Scale-out / trailing only manage
+  a position with **no** explicit target.
+- ✅ **Scale-out** (open-ended positions only) — with no hard target, takes
+  half at `SCALE_OUT_R=2`R, moves the rest to breakeven and trails it (no
+  hard cap, to keep the fat tail). Toggle the half-take with
+  `SCALE_OUT_ENABLED`.
 - ✅ **Time exit** — `MAX_HOLD_SECONDS=1080` (18 min).
 - ✅ **ATR-based initial stop** — `app/risk/volatility.py` sizes the stop
   at `ATR_STOP_MULT`×ATR (clamped to `[DEFAULT_SL_MIN_PCT, ATR_MAX_STOP_PCT]`

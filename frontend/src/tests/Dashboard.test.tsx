@@ -147,6 +147,44 @@ describe("Dashboard", () => {
     expect(screen.getAllByText("Open positions").length).toBeGreaterThan(0);
     expect(screen.getAllByText(/Realised P&L \(today\)/).length).toBeGreaterThan(0);
   });
+
+  it("renders the AI Analysis toggle and PUTs AI_ANALYSIS_ENABLED=false on click", async () => {
+    // Capture the PUT so we can assert the body. GET /api/settings
+    // reports the switch ON; clicking must flip it OFF.
+    const puts: Array<{ url: string; body: unknown }> = [];
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/api/settings") && init?.method === "PUT") {
+        puts.push({ url, body: JSON.parse(String(init.body)) });
+        return makeJsonResponse({ global: { AI_ANALYSIS_ENABLED: false } });
+      }
+      if (url.includes("/api/settings")) {
+        return makeJsonResponse({
+          global: { TRADING_MODE: "paper", AI_ANALYSIS_ENABLED: true },
+        });
+      }
+      return makeJsonResponse([], 404);
+    }) as unknown as typeof fetch;
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchInterval: false } },
+    });
+    render(<Dashboard />, { wrapper: wrapper(qc) });
+
+    const toggle = await screen.findByTestId("toggle-ai-analysis");
+    // Settings loaded with the switch ON.
+    await waitFor(() => {
+      expect(toggle).toHaveTextContent("ON");
+      expect(toggle).not.toBeDisabled();
+    });
+
+    toggle.click();
+
+    await waitFor(() => {
+      expect(puts.length).toBe(1);
+    });
+    expect(puts[0].body).toEqual({ global: { AI_ANALYSIS_ENABLED: false } });
+  });
 });
 
 

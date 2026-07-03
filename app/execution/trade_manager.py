@@ -113,24 +113,36 @@ class ManagedPosition:
             cur = cur.replace(tzinfo=timezone.utc)
         return (cur - opened).total_seconds() >= float(self.max_hold_seconds)
 
+    @property
+    def has_hard_target(self) -> bool:
+        """True when an explicit target is set.
+
+        A hard target pins a full-exit level and takes precedence over
+        scale-out / trailing: the operator's (or the analysis') bracket
+        wins, so a configured target ALWAYS triggers a full exit and is
+        never silently overridden. Scale-out + trailing only manage a
+        position that has NO explicit target (an open-ended winner we let
+        run on a trailing stop). See RISK.md §3.
+        """
+        return self.target is not None
+
     def exit_reason(self, last: float) -> Optional[str]:
         """Return 'STOP' / 'TARGET' if `last` triggers an exit, else None.
 
-        In scale-out mode the fixed target is ignored — the upside is
-        captured by the partial take-profit + trailing stop, so a winner
-        is never hard-capped (preserves the fat tail). The stop (which
-        the trailing logic ratchets) always applies.
+        Both levels are honoured whenever they're set: a hard target always
+        fires a full exit (it is never overridden by scale-out), and the
+        stop always applies. Scale-out / trailing only manage a position
+        with no explicit target — see `has_hard_target` and `_sweep`.
         """
-        use_target = not self.scale_out_enabled
         if self.quantity > 0:  # long
             if self.stop_loss is not None and last <= self.stop_loss:
                 return "STOP"
-            if use_target and self.target is not None and last >= self.target:
+            if self.target is not None and last >= self.target:
                 return "TARGET"
         elif self.quantity < 0:  # short
             if self.stop_loss is not None and last >= self.stop_loss:
                 return "STOP"
-            if use_target and self.target is not None and last <= self.target:
+            if self.target is not None and last <= self.target:
                 return "TARGET"
         return None
 
@@ -333,6 +345,14 @@ class TradeManager:
         async with self._lock:
             mp.stop_loss = new_sl
             mp.target = new_target
+            # An explicit edit is an operator override: reset the trailing
+            # baseline so the next sweep can't silently ratchet the new stop
+            # back toward a previous peak (the "my edit doesn't stick" bug).
+            # R is recomputed from the new stop so any trailing (which only
+            # runs when there's no hard target) re-arms from here.
+            mp.peak_price = None
+            mp.trail_active = False
+            mp.initial_risk = abs(mp.entry - new_sl) if new_sl is not None else 0.0
         # Persist onto the position row so the levels survive a restart.
         await loop.run_in_executor(
             None, _persist_position_levels,
@@ -522,15 +542,19 @@ class TradeManager:
                 if mp.time_exit_expired(now):
                     await self._exit(symbol, reason="TIME_EXIT", exit_price=last)
                     continue
-                # Scale-out a partial at the take-profit R, then trail the
-                # remainder (RISK.md §3 — preserves the fat tail vs a hard
-                # target cap).
-                if mp.scale_out_enabled and not mp.scaled_out and mp.initial_risk > 0:
-                    rmult = mp.r_multiple_at(last)
-                    if rmult is not None and rmult >= mp.scale_out_r:
-                        await self._scale_out(symbol, mp, last)
-                # Ratchet the trailing stop (mutates mp.stop_loss in place).
-                mp.apply_trailing(last)
+                # Scale-out + trailing manage ONLY a position with no
+                # explicit (hard) target — an open-ended winner we let run on
+                # a trailing stop (RISK.md §3 — preserves the fat tail). When
+                # a target IS set the operator's / analysis' bracket wins: the
+                # hard stop + target govern the exit and we skip both here, so
+                # a configured target is never silently overridden.
+                if not mp.has_hard_target:
+                    if mp.scale_out_enabled and not mp.scaled_out and mp.initial_risk > 0:
+                        rmult = mp.r_multiple_at(last)
+                        if rmult is not None and rmult >= mp.scale_out_r:
+                            await self._scale_out(symbol, mp, last)
+                    # Ratchet the trailing stop (mutates mp.stop_loss in place).
+                    mp.apply_trailing(last)
                 reason = mp.exit_reason(last)
                 if reason is not None:
                     await self._exit(symbol, reason=reason, exit_price=last)

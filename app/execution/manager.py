@@ -482,28 +482,6 @@ class Manager:
             else:
                 stop_loss = float(entry) * 1.05
 
-        # Step 3.5: anti-chase (RISK.md §5). If the price already ran in our
-        # favour beyond MAX_ENTRY_DRIFT_PCT between signal time (the
-        # rationale's intended entry) and order time (the seeded entry), the
-        # move is extended — skip rather than chase into a reversal.
-        drift_block = self._entry_drift_block(
-            action=signal.action,
-            intended=levels.get("entry"),
-            current=entry,
-        )
-        if drift_block is not None:
-            code, message = drift_block
-            await asyncio.get_running_loop().run_in_executor(
-                None, _persist_risk_block,
-                self._session_factory, signal, account.id, code, message,
-            )
-            await event_bus.publish(
-                CHANNEL_RISK_BLOCKED,
-                {"signal_id": signal.id, "code": code, "message": message,
-                 "symbol": signal.symbol, "account_id": account.id},
-            )
-            return {"approved": False, "code": code}
-
         # Step 4: risk engine.
         decision = await self._risk.evaluate(
             signal=signal,
@@ -637,39 +615,6 @@ class Manager:
             "backend": getattr(backend, "name", type(backend).__name__),
         }
 
-    def _entry_drift_block(
-        self, *, action: str, intended: Optional[float], current: Optional[float]
-    ) -> Optional[tuple[str, str]]:
-        """Anti-chase guard. Returns (code, message) when the order-time
-        price has already run more than MAX_ENTRY_DRIFT_PCT *in the trade's
-        favour* vs the signal's intended entry — i.e. the move is extended
-        and we'd be chasing. Fail-safe: missing either price, a non-positive
-        value, or a zero/blank threshold → None (skip)."""
-        if intended is None or current is None:
-            return None
-        try:
-            intended_f = float(intended)
-            current_f = float(current)
-        except (TypeError, ValueError):
-            return None
-        if intended_f <= 0 or current_f <= 0:
-            return None
-        max_drift = float(
-            getattr(self._settings_provider(), "MAX_ENTRY_DRIFT_PCT", 0.0) or 0.0
-        )
-        if max_drift <= 0:
-            return None
-        if str(action).upper() == "BUY":
-            drift_pct = (current_f - intended_f) / intended_f * 100.0
-        else:  # SELL/short: favourable = price already fell
-            drift_pct = (intended_f - current_f) / intended_f * 100.0
-        if drift_pct > max_drift:
-            return ("ENTRY_DRIFT",
-                    f"price moved {drift_pct:.2f}% in-favour since signal "
-                    f"(intended {intended_f:.2f} → {current_f:.2f}); "
-                    f"max chase {max_drift:.2f}%")
-        return None
-
     def _derive_levels(
         self,
         *,
@@ -785,13 +730,14 @@ class Manager:
             return ("EVENT_CONFIDENCE_FLOOR",
                     f"confidence {conf:.2f} < {profile.min_confidence:.2f} required "
                     f"for event {event_type or 'DEFAULT'}")
-        # 2. IST entry window — enforced for LIVE trading ONLY. In paper
-        #    mode the wall clock must NOT block entries: you simulate at any
-        #    hour (evenings, weekends), and a closed session is only a real
-        #    constraint with real money (a live order would be rejected by
-        #    the broker / exchange anyway). ENFORCE_MARKET_HOURS still gates
-        #    live (and can disable even that for live backtests).
-        if settings.is_live and not market_clock.is_entry_window():
+        # 2. IST entry window — enforced in EVERY mode (intraday-only rule:
+        #    no carry-forward, ever). An entry outside market hours can't be
+        #    squared off the same session — the price feed is frozen, so the
+        #    position just sits (SL/target can never trigger) until the time
+        #    exit closes it flat, or worse survives overnight if the bot
+        #    stops. Paper entries after hours are junk data, not simulation.
+        #    Set ENFORCE_MARKET_HOURS=false to deliberately test off-hours.
+        if not market_clock.is_entry_window():
             return ("MARKET_CLOSED",
                     market_clock.entry_block_reason() or "outside entry window")
         # 3. Order-time staleness re-check.

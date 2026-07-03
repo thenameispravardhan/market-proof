@@ -538,34 +538,54 @@ async def test_loop_processes_published_signal(db_session, isolated_db):
         await mgr.wait_until_stopped()
 
 
-# -- Market-hours gate: paper any time, live enforces --------------------
+# -- Market-hours gate: enforced in EVERY mode (intraday-only) ------------
 
 
 @pytest.mark.asyncio
-async def test_market_hours_gate_paper_vs_live(monkeypatch, db_session, isolated_db):
-    """The entry-window (MARKET_CLOSED) gate is enforced for LIVE only —
-    paper testing must run at any hour (evenings / weekends)."""
+async def test_market_hours_gate_blocks_all_modes(monkeypatch, db_session, isolated_db):
+    """The entry-window (MARKET_CLOSED) gate applies in EVERY mode —
+    intraday-only, no carry-forward. An off-hours entry can't be squared
+    off the same session (frozen feed → SL/target can never fire), so
+    paper must not take it either. ENFORCE_MARKET_HOURS=0 stays the
+    explicit escape hatch for deliberate off-hours testing."""
     from types import SimpleNamespace
     from app.risk import market_clock
     from app import config as app_config
 
-    # Pretend the exchange session is closed, with enforcement ON.
-    monkeypatch.setattr(market_clock, "is_entry_window", lambda *a, **k: False)
-    monkeypatch.setenv("ENFORCE_MARKET_HOURS", "1")
-
     mgr = Manager(market_data=MarketDataBus())
     sig = SimpleNamespace(id=1, symbol="RELIANCE", action="BUY", confidence=0.9)
 
-    # Paper → the clock does NOT block the entry.
+    # Pretend the exchange session is closed, with enforcement ON.
+    # (is_entry_window itself honours ENFORCE_MARKET_HOURS; patch through
+    # to the real function so the escape hatch below is exercised too.)
+    real_is_entry_window = market_clock.is_entry_window
+    monkeypatch.setattr(
+        market_clock,
+        "is_entry_window",
+        lambda *a, **k: (
+            False
+            if app_config.get_settings().ENFORCE_MARKET_HOURS
+            else real_is_entry_window(*a, **k)
+        ),
+    )
+    monkeypatch.setenv("ENFORCE_MARKET_HOURS", "1")
+
+    # Paper → ALSO blocked with MARKET_CLOSED (intraday-only rule).
     monkeypatch.setenv("TRADING_MODE", "paper")
     app_config.reset_settings_cache()
-    assert await mgr._pre_entry_gate(sig, None, None) is None
+    gate = await mgr._pre_entry_gate(sig, None, None)
+    assert gate is not None and gate[0] == "MARKET_CLOSED"
 
     # Live → blocked with MARKET_CLOSED.
     monkeypatch.setenv("TRADING_MODE", "live")
     app_config.reset_settings_cache()
     gate = await mgr._pre_entry_gate(sig, None, None)
     assert gate is not None and gate[0] == "MARKET_CLOSED"
+
+    # Escape hatch: enforcement OFF → the clock never blocks.
+    monkeypatch.setenv("ENFORCE_MARKET_HOURS", "0")
+    app_config.reset_settings_cache()
+    assert await mgr._pre_entry_gate(sig, None, None) is None
     app_config.reset_settings_cache()
 
 

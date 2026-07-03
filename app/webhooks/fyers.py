@@ -131,17 +131,23 @@ def is_fyers_postback(payload: Any) -> bool:
 
 
 def _unwrap_fyers(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """If the payload wraps the actual order object under `orders` (a
-    list), return the first entry. Otherwise return the payload
-    unchanged."""
-    if "orders" in payload and isinstance(payload["orders"], list) and payload["orders"]:
-        first = payload["orders"][0]
-        if isinstance(first, dict):
-            # Merge: list-level fields first, then order-level fields
-            # (order-level wins on collisions).
-            merged: dict[str, Any] = {k: v for k, v in payload.items() if k != "orders"}
-            merged.update(first)
-            return merged
+    """If the payload wraps the actual order object under `orders`,
+    return the inner order. Otherwise return the payload unchanged.
+
+    Fyers uses BOTH wrapper shapes: the order WebSocket delivers
+    ``{"s": "ok", "orders": {<order>}}`` (a single dict), while other
+    surfaces wrap a list (``{"orders": [{<order>}, …]}``). Handle both
+    so the postback receiver and the WS reconciler accept the same
+    bodies."""
+    inner = payload.get("orders")
+    if isinstance(inner, list) and inner and isinstance(inner[0], dict):
+        inner = inner[0]
+    if isinstance(inner, dict):
+        # Merge: wrapper-level fields first, then order-level fields
+        # (order-level wins on collisions).
+        merged: dict[str, Any] = {k: v for k, v in payload.items() if k != "orders"}
+        merged.update(inner)
+        return merged
     return dict(payload)
 
 

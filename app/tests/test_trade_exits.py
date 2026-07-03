@@ -44,13 +44,16 @@ def test_trailing_ratchets_short():
     assert mp.stop_loss == pytest.approx(90.0 + 0.5 * 5.0)  # 92.5
 
 
-def test_scale_out_in_mode_ignores_hard_target():
+def test_hard_target_takes_priority_over_scale_out():
     mp = ManagedPosition(
         symbol="X", quantity=10, entry=100.0, stop_loss=95.0,
         target=110.0, scale_out_enabled=True,
     )
-    # Target is ignored in scale-out mode; only the stop triggers.
-    assert mp.exit_reason(120.0) is None
+    # An explicit target is honoured as a full exit even with scale-out
+    # enabled — the operator/analysis bracket wins (explicit levels win).
+    # The stop still triggers too.
+    assert mp.has_hard_target is True
+    assert mp.exit_reason(120.0) == "TARGET"
     assert mp.exit_reason(94.0) == "STOP"
 
 
@@ -81,6 +84,30 @@ async def test_scale_out_takes_half_and_trails(db_session, isolated_db):
     assert partials[0].quantity == 5
     assert partials[0].pnl == pytest.approx((111.0 - 100.0) * 5)
     assert partials[0].r_multiple is not None
+
+
+@pytest.mark.asyncio
+async def test_hard_target_suppresses_scale_out(db_session, isolated_db):
+    """With an explicit target set, scale-out is suppressed and the
+    position exits FULLY at the target (not a half-take). Regression for
+    the 'auto trade never hits target' report."""
+    md = MarketDataBus()
+    tm = TradeManager(market_data=md)
+    # entry 100, stop 95 => R=5; scale-out would normally take half at 110,
+    # but a hard target at 108 means the whole position exits at the target.
+    await tm.register(symbol="RELIANCE", quantity=10, entry=100.0,
+                      stop_loss=95.0, target=108.0)
+    db_session.add(PositionRow(symbol="RELIANCE", quantity=10,
+                               average_price=100.0, last_price=100.0))
+    db_session.commit()
+    await md.publish("RELIANCE", 111.0)  # past the 108 target
+    await tm._sweep()
+    # Full exit — the position is gone, not partially scaled out.
+    assert tm.managed_positions() == []
+    trades = db_session.query(TradeRow).filter_by(symbol="RELIANCE").all()
+    assert len(trades) == 1
+    assert trades[0].quantity == 10  # full size, not 5
+    assert trades[0].pnl == pytest.approx((111.0 - 100.0) * 10)
 
 
 @pytest.mark.asyncio

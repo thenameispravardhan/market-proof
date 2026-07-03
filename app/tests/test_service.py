@@ -645,7 +645,9 @@ async def test_startup_sweep_premarks_stale_announcements(
         await svc.aclose()
 
 
-def _settings_with(*, max_news_age_seconds: int = 90) -> Any:
+def _settings_with(
+    *, max_news_age_seconds: int = 90, ai_analysis_enabled: bool = True
+) -> Any:
     """Build a Settings stub with all the fields the analyzer's
     pipeline reads, defaulted to safe values, plus the freshness
     override the test cares about.
@@ -659,6 +661,7 @@ def _settings_with(*, max_news_age_seconds: int = 90) -> Any:
     from types import SimpleNamespace
     return SimpleNamespace(
         MAX_NEWS_AGE_SECONDS=max_news_age_seconds,
+        AI_ANALYSIS_ENABLED=ai_analysis_enabled,
         MAX_SINGLE_POSITION_PCT=20.0,
         MAX_SIGNALS_PER_DAY=20,
         MAX_CAPITAL_RISK_PCT=1.0,
@@ -670,3 +673,45 @@ def _settings_with(*, max_news_age_seconds: int = 90) -> Any:
         PORTFOLIO_VALUE=1_000_000.0,
         TRADING_MODE="paper",
     )
+
+
+@pytest.mark.asyncio
+async def test_ai_analysis_disabled_skips_llm_and_writes_placeholder(
+    db_session, isolated_db, monkeypatch
+):
+    """With AI_ANALYSIS_ENABLED off (the Dashboard toggle), a fresh
+    announcement must skip the LLM entirely — no analysis call, no
+    signal — and persist an `ai_analysis_disabled` placeholder so the
+    row isn't re-analyzed when the switch comes back on."""
+    monkeypatch.setattr(
+        "app.analyzer.service.get_settings",
+        lambda: _settings_with(ai_analysis_enabled=False),
+    )
+
+    ann = _make_announcement(db_session)  # fresh (filed_at = now)
+
+    called = {"n": 0}
+
+    def _explode_if_called(req: httpx.Request) -> httpx.Response:
+        called["n"] += 1
+        raise AssertionError("DeepSeek must NOT be called when AI analysis is OFF")
+
+    client = _make_deepseek_client(_explode_if_called)
+    svc = Service(deepseek_client=client)
+    try:
+        result = await svc.process_announcement(ann.id)
+        assert result is None
+        assert called["n"] == 0
+
+        analyses = db_session.execute(select(Analysis)).scalars().all()
+        assert len(analyses) == 1
+        a = analyses[0]
+        assert a.announcement_id == ann.id
+        assert a.confidence == 0.0
+        assert a.recommendation == "HOLD"
+        assert a.raw_response["error"] == "ai_analysis_disabled"
+
+        signals = db_session.execute(select(Signal)).scalars().all()
+        assert signals == []
+    finally:
+        await svc.aclose()

@@ -66,6 +66,9 @@ _GLOBAL_KEYS: dict[str, tuple[type, Any]] = {
     # publications, …) are skipped before the paid LLM call. Turning it
     # OFF sends every filing to the AI (more cost, slower queue).
     "PRE_LLM_FILTER_ENABLED": (bool, True),
+    # Master switch for AI news analysis (Dashboard toggle). OFF = news is
+    # still collected but never sent to the LLM, so no signals / auto trades.
+    "AI_ANALYSIS_ENABLED": (bool, True),
 }
 
 

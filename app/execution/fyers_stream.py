@@ -116,8 +116,8 @@ def _default_session_factory() -> Callable[[], Any]:
 
 def _extract_order(message: Any) -> dict[str, Any]:
     """The order socket delivers ``{"s": "ok", "orders": {<order>}}``.
-    `_unwrap_fyers` only unwraps a *list* `orders`, so pull the inner dict
-    out here before reconciliation."""
+    `_unwrap_fyers` handles this shape too now; extracting here as well
+    keeps the WS path independent of the webhook parser."""
     if isinstance(message, dict):
         inner = message.get("orders")
         if isinstance(inner, dict):
