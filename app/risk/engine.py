@@ -245,6 +245,11 @@ class RiskEngine:
         # starting capital.
         self._portfolio_value_override = portfolio_value
         self._session_factory = session_factory
+        # Live-funds seam: in LIVE mode sizing anchors to the real Fyers
+        # account balance instead of PORTFOLIO_VALUE. None → the static
+        # ledger applies (paper mode, or no funds feed). Attached by the
+        # execution manager (`attach_funds_provider`).
+        self._funds_provider: Optional[position_sizer.FyersFundsProvider] = None
 
     # -- main entry point ----------------------------------------------
 
@@ -271,6 +276,15 @@ class RiskEngine:
         Returns a `RiskDecision`. The manager honours it; no
         soft override anywhere.
         """
+        # Warm the live-funds cache HERE (the only async hop) so the
+        # sync sizing path below can read it without blocking. Fail-safe:
+        # any error just leaves the cached value as-is / None.
+        if self._funds_provider is not None and self._portfolio_value_override is None:
+            try:
+                if get_settings().is_live:
+                    await self._funds_provider.refresh()
+            except Exception:  # noqa: BLE001
+                pass
         # Run the synchronous DB work in an executor to keep the
         # event loop free. Tests can pass a session directly to
         # bypass the executor.
@@ -431,10 +445,37 @@ class RiskEngine:
         # ---- compute qty -------------------------------------------------
         # Equity is a real ledger now (capital + realised + unrealised),
         # not gross open exposure. An explicit `portfolio_value` override
-        # (tests / backtests) short-circuits to that value.
+        # (tests / backtests) short-circuits to that value. In LIVE mode
+        # with a funds feed attached, the ledger anchors to the REAL Fyers
+        # account balance (fail-safe: feed unavailable → static ledger).
+        live_anchor: Optional[float] = None
+        if (
+            self._funds_provider is not None
+            and self._portfolio_value_override is None
+            and settings.is_live
+        ):
+            try:
+                # Cache warmed by the async `evaluate` wrapper.
+                live_anchor = self._funds_provider.equity()
+            except Exception:  # noqa: BLE001
+                live_anchor = None
         portfolio_value = position_sizer.compute_equity(
-            session, self._md, override=self._portfolio_value_override
+            session, self._md,
+            override=self._portfolio_value_override,
+            live_anchor=live_anchor,
         )
+        # Intraday buying power (§2b): Fyers MIS margins mean NOTIONAL
+        # capacity is equity × INTRADAY_LEVERAGE (~5x). Only notional
+        # contexts use it — the sizing clamp, single-name cap (R7) and
+        # sector cap (R9). Risk-per-trade and every loss limit stay on
+        # raw equity: leverage multiplies exposure, never the money we
+        # are willing to lose.
+        try:
+            leverage = float(getattr(settings, "INTRADAY_LEVERAGE", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            leverage = 1.0
+        leverage = max(1.0, leverage)
+        buying_power = float(portfolio_value) * leverage
         # Per-trade risk %: strategy/settings ceiling, then the graduated
         # ramp + any RiskState throttle. Skip the ramp when an explicit
         # portfolio override is supplied so sizing stays deterministic.
@@ -480,7 +521,7 @@ class RiskEngine:
         if manual_qty is None:
             ncap = position_sizer.notional_cap_qty(
                 entry=float(entry),
-                equity=float(portfolio_value),
+                equity=buying_power,
                 max_single_position_pct=max_pos_pct,
             )
             if 0 <= ncap < sizing.qty:
@@ -513,6 +554,8 @@ class RiskEngine:
             "stop_loss": sizing.stop_loss,
             "distance": sizing.distance,
             "portfolio_value": float(portfolio_value),
+            "intraday_leverage": leverage,
+            "buying_power": buying_power,
             "max_capital_risk_pct": max_capital_risk_pct,
         }
 
@@ -591,13 +634,14 @@ class RiskEngine:
         # block stacking past the cap.
         existing_pos_value = self._existing_position_value(session, symbol, sizing.entry)
         total_after_trade = position_value + existing_pos_value
-        if total_after_trade > portfolio_value * (max_pos_pct / 100.0) + 1e-6:
+        if total_after_trade > buying_power * (max_pos_pct / 100.0) + 1e-6:
             violations.append({
                 "code": "RISK_MAX_SINGLE_POSITION_PCT",
                 "message": (
                     f"position value {total_after_trade:.2f} would exceed "
-                    f"{max_pos_pct:.2f}% of portfolio "
-                    f"({portfolio_value * max_pos_pct / 100.0:.2f})."
+                    f"{max_pos_pct:.2f}% of buying power "
+                    f"({buying_power * max_pos_pct / 100.0:.2f}, "
+                    f"{leverage:.0f}x intraday)."
                 ),
                 "severity": "critical",
             })
@@ -683,13 +727,13 @@ class RiskEngine:
         if sector is not None:
             sector_value = self._sector_exposure_value(session, sector, sizing.entry)
             projected = sector_value + position_value
-            if projected > portfolio_value * (sector_cap / 100.0) + 1e-6:
+            if projected > buying_power * (sector_cap / 100.0) + 1e-6:
                 violations.append({
                     "code": "RISK_SECTOR_CONCENTRATION",
                     "message": (
                         f"sector {sector!r} exposure would reach "
-                        f"{projected:.2f} ({projected / portfolio_value * 100:.1f}%), "
-                        f"cap is {sector_cap:.1f}%."
+                        f"{projected:.2f} ({projected / buying_power * 100:.1f}% "
+                        f"of buying power), cap is {sector_cap:.1f}%."
                     ),
                     "severity": "critical",
                 })

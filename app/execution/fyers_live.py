@@ -459,6 +459,14 @@ class FyersClient:
         """GET /positions."""
         return await self._request("GET", "/positions")
 
+    async def get_funds(self) -> dict[str, Any]:
+        """GET /funds — account fund limits.
+
+        Returns the raw Fyers payload: `{"s": "ok", "fund_limit":
+        [{"id": 1, "title": "Total Balance", "equityAmount": …}, …]}`.
+        """
+        return await self._request("GET", "/funds")
+
     async def get_order_status(self, order_id: str) -> dict[str, Any]:
         """GET /orders?id=<id>."""
         return await self._request("GET", "/orders", params={"id": order_id})
@@ -1036,6 +1044,35 @@ class FyersLiveBackend:
             except Exception:  # noqa: BLE001
                 log.exception("fyers.positions.parse_error")
         return out
+
+    async def get_funds(self) -> Optional[float]:
+        """Total equity balance (₹) in the Fyers account, or None.
+
+        Parses the `/funds` fund_limit rows: prefers the "Total Balance"
+        row (id 1), falling back to a title match. Fail-safe — any error
+        or a non-positive number returns None so the risk layer falls
+        back to the PORTFOLIO_VALUE ledger rather than sizing off junk.
+        """
+        try:
+            data = await self._client.get_funds()
+        except FyersAPIError as e:
+            log.warning("fyers.funds.failed", error=str(e))
+            return None
+        rows = data.get("fund_limit") or data.get("data") or []
+        total: Optional[float] = None
+        for entry in rows:
+            try:
+                is_total = int(entry.get("id") or 0) == 1 or (
+                    "total balance" in str(entry.get("title") or "").lower()
+                )
+                if is_total:
+                    total = safe_float(entry.get("equityAmount"))
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+        if total is None or total <= 0:
+            return None
+        return float(total)
 
     async def get_order_status(self, broker_order_id: str) -> OrderStatus:
         if not broker_order_id:

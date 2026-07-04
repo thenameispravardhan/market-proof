@@ -31,6 +31,60 @@ def test_equity_is_capital_plus_realised_plus_unrealised(db_session, isolated_db
     assert equity == pytest.approx(start + 5000.0 + 5000.0)
 
 
+def test_live_anchor_replaces_capital_and_realised(db_session, isolated_db):
+    """With a live Fyers funds anchor, equity = broker balance +
+    unrealised only. Realised P&L must NOT be double-counted — the
+    broker balance already includes it."""
+    db_session.add(TradeRow(
+        symbol="TCS", side="SELL", quantity=10, price=3600.0,
+        order_type="market", status="filled",
+        executed_at=datetime.now(timezone.utc), pnl=5000.0,
+    ))
+    db_session.add(PositionRow(
+        symbol="INFY", quantity=100, average_price=1500.0, last_price=1550.0,
+    ))  # unrealised = +5000
+    db_session.commit()
+    equity = ps.compute_equity(db_session, None, live_anchor=200_000.0)
+    assert equity == pytest.approx(200_000.0 + 5000.0)
+
+
+def test_live_anchor_nonpositive_falls_back_to_ledger(db_session, isolated_db):
+    """A junk (<= 0) anchor must be ignored — fail-safe to the
+    PORTFOLIO_VALUE ledger, never sizing off a broken funds call."""
+    settings = get_settings()
+    assert ps.compute_equity(db_session, None, live_anchor=0.0) == pytest.approx(
+        float(settings.PORTFOLIO_VALUE)
+    )
+
+
+@pytest.mark.asyncio
+async def test_funds_provider_ttl_and_fail_safe():
+    """FyersFundsProvider caches within the TTL and keeps the last
+    good value when the fetch starts failing."""
+    calls = {"n": 0}
+    value = {"v": 150_000.0}
+
+    async def fetch():
+        calls["n"] += 1
+        if value["v"] is None:
+            raise RuntimeError("boom")
+        return value["v"]
+
+    p = ps.FyersFundsProvider(fetch, ttl_s=60.0)
+    assert p.equity() is None
+    await p.refresh()
+    assert p.equity() == 150_000.0
+    assert calls["n"] == 1
+    # Within the TTL: cached, no second call.
+    await p.refresh()
+    assert calls["n"] == 1
+    # Fetch failing later must not clear the last good value.
+    p._ts = 0.0  # force TTL expiry
+    value["v"] = None
+    await p.refresh()
+    assert p.equity() == 150_000.0
+
+
 def test_equity_floors_at_positive(db_session, isolated_db):
     # A realised loss bigger than starting capital must not yield <= 0.
     db_session.add(TradeRow(

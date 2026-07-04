@@ -25,6 +25,10 @@ os.environ.setdefault("FYERS_POSTBACK_SECRET", "")
 # Don't enforce IST market hours in tests — auto-entry gating would
 # otherwise depend on the wall-clock time the suite happens to run at.
 os.environ.setdefault("ENFORCE_MARKET_HOURS", "0")
+# Unleveraged sizing baseline: the sizing/cap tests were tuned with
+# notional capacity == equity. The 5x intraday leverage is exercised
+# explicitly in test_risk_engine.py::test_intraday_leverage_*.
+os.environ.setdefault("INTRADAY_LEVERAGE", "1")
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402

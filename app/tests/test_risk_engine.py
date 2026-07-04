@@ -108,6 +108,88 @@ async def test_healthy_signal_passes(db_session, isolated_db):
     assert decision.sizing.qty > 0
 
 
+# §2b intraday leverage — notional capacity scales, risk money doesn't.
+@pytest.mark.asyncio
+async def test_intraday_leverage_scales_notional_cap(
+    db_session, isolated_db, monkeypatch
+):
+    """With 5x INTRADAY_LEVERAGE the notional clamp allows exactly 5x
+    the unleveraged quantity (risk-based qty deliberately huge so the
+    notional cap binds in both runs)."""
+    from app import config as app_config
+
+    md = MarketDataBus()
+    md.set_quote_sync("RELIANCE", last_price=2500.0)
+    # 0.5% of 1M = 5000 risk; distance 2.5 → risk-based qty 2000
+    # (notional 5M) so the 20% single-name cap is the binding limit.
+    strat = _make_strategy(
+        db_session, "lev", config={"max_capital_risk_pct": 0.5}
+    )
+    acct = _make_account(db_session)
+
+    async def qty_with_leverage(lev: str) -> int:
+        monkeypatch.setenv("INTRADAY_LEVERAGE", lev)
+        app_config.reset_settings_cache()
+        sig = _make_signal(
+            db_session, symbol="RELIANCE", action="BUY", strategy_id=strat.id
+        )
+        engine = RiskEngine(market_data=md, portfolio_value=1_000_000.0)
+        decision = await engine.evaluate(
+            signal=sig, strategy=strat, account=acct,
+            entry=2500.0, stop_loss=2497.5, target=2510.0, session=db_session,
+        )
+        assert decision.sizing is not None
+        return decision.sizing.qty
+
+    try:
+        # Unleveraged: cap = 1M * 20% = 200k → 80 shares @ 2500.
+        assert await qty_with_leverage("1") == 80
+        # 5x: buying power 5M → cap 1M → 400 shares. Exactly 5x.
+        assert await qty_with_leverage("5") == 400
+    finally:
+        monkeypatch.setenv("INTRADAY_LEVERAGE", "1")
+        app_config.reset_settings_cache()
+
+
+@pytest.mark.asyncio
+async def test_intraday_leverage_never_scales_risk_money(
+    db_session, isolated_db, monkeypatch
+):
+    """Leverage multiplies exposure capacity ONLY. The risk-based qty
+    (money at stake per trade) must be identical at 1x and 5x when the
+    notional cap is not binding."""
+    from app import config as app_config
+
+    md = MarketDataBus()
+    md.set_quote_sync("RELIANCE", last_price=2500.0)
+    # 0.05% of 1M = 500 risk; distance 25 → qty 20 (notional 50k, far
+    # below the 200k unleveraged cap → the cap never binds).
+    strat = _make_strategy(
+        db_session, "lev-risk", config={"max_capital_risk_pct": 0.05}
+    )
+    acct = _make_account(db_session)
+    qtys: list[int] = []
+    try:
+        for lev in ("1", "5"):
+            monkeypatch.setenv("INTRADAY_LEVERAGE", lev)
+            app_config.reset_settings_cache()
+            sig = _make_signal(
+                db_session, symbol="RELIANCE", action="BUY", strategy_id=strat.id
+            )
+            engine = RiskEngine(market_data=md, portfolio_value=1_000_000.0)
+            decision = await engine.evaluate(
+                signal=sig, strategy=strat, account=acct,
+                entry=2500.0, stop_loss=2475.0, target=2575.0, session=db_session,
+            )
+            assert decision.approved is True, decision.violations
+            assert decision.sizing is not None
+            qtys.append(decision.sizing.qty)
+    finally:
+        monkeypatch.setenv("INTRADAY_LEVERAGE", "1")
+        app_config.reset_settings_cache()
+    assert qtys[0] == qtys[1] == 20
+
+
 # R1
 @pytest.mark.asyncio
 async def test_action_hold_blocks(db_session, isolated_db):

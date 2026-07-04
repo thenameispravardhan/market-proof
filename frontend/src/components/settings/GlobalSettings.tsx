@@ -14,6 +14,7 @@ const FIELDS: { key: NumField; label: string; min: number; max: number; step: nu
   { key: "DAILY_MAX_LOSS_PCT", label: "Daily max loss (%)", min: 0.1, max: 100, step: 0.1 },
   { key: "MAX_CONCURRENT_POSITIONS", label: "Max concurrent positions", min: 1, max: 100, step: 1 },
   { key: "MAX_SINGLE_POSITION_PCT", label: "Max single position (%)", min: 0.1, max: 100, step: 0.1 },
+  { key: "INTRADAY_LEVERAGE", label: "Intraday leverage (×)", min: 1, max: 10, step: 0.5 },
   { key: "MIN_LIQUIDITY_CRORE", label: "Min liquidity (₹ crore)", min: 1, max: 10000, step: 1 },
   { key: "MAX_SIGNALS_PER_DAY", label: "Max signals per day", min: 1, max: 500, step: 1 },
   { key: "POLL_INTERVAL_SECONDS", label: "Poll interval (seconds)", min: 5, max: 3600, step: 5 },

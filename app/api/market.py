@@ -168,6 +168,20 @@ async def fetch_history(
         return []
 
 
+async def fetch_funds() -> Optional[float]:
+    """Total equity balance (₹) of the connected Fyers account, or None
+    when Fyers isn't connected or the call fails. LIVE-mode position
+    sizing anchors to this so sizes follow the real account funds."""
+    backend = _fyers_backend()
+    if backend is None or not hasattr(backend, "get_funds"):
+        return None
+    try:
+        return await backend.get_funds()
+    except Exception as e:  # noqa: BLE001
+        log.debug("market.fyers_funds_failed", error=str(e))
+        return None
+
+
 # ---- index ticker --------------------------------------------------------
 
 

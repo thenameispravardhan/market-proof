@@ -17,7 +17,6 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from app.api import trading_mode as trading_mode_api
 from app.config import get_settings, reset_settings_cache
 from app.db.models import (
     AuditLog,
@@ -39,10 +38,8 @@ from app.risk.engine import RiskEngine
 from app.services.event_bus import event_bus
 
 
-@pytest.fixture
-def live_risk_acked(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pretend the operator created .i_accept_live_risk for this test."""
-    monkeypatch.setattr(trading_mode_api, "_live_risk_ack_present", lambda: True)
+# (The old `.i_accept_live_risk` sentinel fixture is gone — the file
+# gate was removed in favour of the UI's typed confirmation.)
 
 
 # -- Stub for the live backend -------------------------------------------
@@ -124,7 +121,7 @@ def _make_live_account(db_session, *, name: str = "live-acct-routing") -> Broker
 
 @pytest.mark.asyncio
 async def test_toggle_then_next_signal_routes_to_live(
-    db_session, isolated_db, client: TestClient, live_risk_acked
+    db_session, isolated_db, client: TestClient
 ) -> None:
     """The verifier bug: POST /api/settings/trading-mode with mode=live
     was cosmetic — the in-memory Settings.TRADING_MODE stayed at

@@ -6,8 +6,9 @@ Coverage:
   - POST with `confirm: true` flips to live, writes audit_log.
   - POST with `confirm: false` -> 422.
   - POST with unknown mode -> 422.
-  - POST live without the .i_accept_live_risk sentinel -> 403.
-  - POST live WITH the sentinel (test fixture) -> 200.
+  - POST live with `confirm: true` -> 200 (the old .i_accept_live_risk
+    file sentinel is GONE — frontend-only control; the UI's typed
+    confirmation + `confirm: true` are the gate).
   - Settings hot-reload fires on the bus.
   - **Hot-reload of the cached Settings instance**: after the
     POST, `get_settings().TRADING_MODE` returns the new mode
@@ -18,29 +19,20 @@ Coverage:
 """
 from __future__ import annotations
 
-import pytest
 from fastapi.testclient import TestClient
 
-from app.api import trading_mode as trading_mode_api
 from app.config import get_settings, reset_settings_cache
 from app.db.models import AuditLog
 from app.services.event_bus import event_bus
 
 
-@pytest.fixture
-def live_risk_acked(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pretend the operator created .i_accept_live_risk for this test."""
-    monkeypatch.setattr(trading_mode_api, "_live_risk_ack_present", lambda: True)
-
-
-def test_post_live_without_sentinel_is_403(client: TestClient) -> None:
-    """The .i_accept_live_risk sentinel gate is real — no sentinel, no live flip."""
-    r = client.post(
-        "/api/settings/trading-mode",
-        json={"mode": "live", "confirm": True},
-    )
-    assert r.status_code == 403
-    assert "i_accept_live_risk" in r.json()["detail"]
+def test_live_risk_ack_reports_not_required(client: TestClient) -> None:
+    """The old .i_accept_live_risk file sentinel is gone (frontend-only
+    control). The compat endpoint must always report present=True so no
+    UI ever greys out the live switch over a file."""
+    r = client.get("/api/settings/live-risk-ack")
+    assert r.status_code == 200
+    assert r.json()["present"] is True
 
 
 def test_post_without_confirm_rejected(client: TestClient) -> None:
@@ -103,7 +95,7 @@ def test_post_paper_with_confirm_succeeds(client: TestClient) -> None:
         event_bus.unsubscribe("settings.updated", sub)
 
 
-def test_post_live_with_confirm_succeeds(client: TestClient, live_risk_acked) -> None:
+def test_post_live_with_confirm_succeeds(client: TestClient) -> None:
     r = client.post(
         "/api/settings/trading-mode",
         json={"mode": "live", "confirm": True},
@@ -121,7 +113,49 @@ def test_post_live_with_confirm_succeeds(client: TestClient, live_risk_acked) ->
     )
 
 
-def test_effective_field_reflects_new_mode_immediately(client: TestClient, live_risk_acked) -> None:
+def test_fyers_account_toggle_flips_trading_mode(client: TestClient) -> None:
+    """The Dashboard Fyers switch IS the live-trading switch: enabling
+    the REAL (non-paper) account flips TRADING_MODE to live, disabling
+    flips back to paper. A paper-account toggle never touches the mode."""
+    # Start from a known state.
+    client.post("/api/settings/trading-mode", json={"mode": "paper", "confirm": True})
+
+    r = client.post(
+        "/api/broker-accounts",
+        json={"name": "mode-coupling-real", "broker": "fyers", "paper_mode": False, "enabled": False},
+    )
+    assert r.status_code == 201, r.text
+    real_id = r.json()["id"]
+    r = client.post(
+        "/api/broker-accounts",
+        json={"name": "mode-coupling-paper", "broker": "fyers", "paper_mode": True, "enabled": False},
+    )
+    assert r.status_code == 201, r.text
+    paper_id = r.json()["id"]
+
+    # Enable the REAL account -> live.
+    r = client.put(f"/api/broker-accounts/{real_id}", json={"enabled": True})
+    assert r.status_code == 200, r.text
+    assert client.get("/api/settings").json()["global"]["TRADING_MODE"] == "live"
+    assert get_settings().TRADING_MODE == "live"
+
+    # Toggling the PAPER account must not touch the mode.
+    client.put(f"/api/broker-accounts/{paper_id}", json={"enabled": True})
+    assert get_settings().TRADING_MODE == "live"
+
+    # Disable the REAL account -> back to paper.
+    r = client.put(f"/api/broker-accounts/{real_id}", json={"enabled": False})
+    assert r.status_code == 200, r.text
+    assert client.get("/api/settings").json()["global"]["TRADING_MODE"] == "paper"
+    assert get_settings().TRADING_MODE == "paper"
+
+    # A non-enabled update (e.g. rename) on the real account never
+    # touches the mode either.
+    client.put(f"/api/broker-accounts/{real_id}", json={"name": "mode-coupling-real-2"})
+    assert get_settings().TRADING_MODE == "paper"
+
+
+def test_effective_field_reflects_new_mode_immediately(client: TestClient) -> None:
     """Defence-in-depth: the response body must include the new
     effective mode, not the stale cached one."""
     # First flip to paper explicitly.

@@ -204,6 +204,16 @@ async def lifespan(app: FastAPI):
         ),
         vol_regime=_volatility.FyersVolatilityRegime(_vix_fetch),
     )
+    # Live funds feed: in LIVE mode position sizing anchors to the REAL
+    # Fyers account balance instead of the static PORTFOLIO_VALUE.
+    # Fail-safe — no connected account (or a failing call) → None → the
+    # risk layer falls back to the PORTFOLIO_VALUE ledger.
+    from app.api.market import fetch_funds as _fetch_funds
+    from app.risk import position_sizer as _position_sizer
+
+    execution_manager.attach_funds_provider(
+        _position_sizer.FyersFundsProvider(_fetch_funds)
+    )
     # Realtime Fyers feed: data socket streams live prices into the same
     # market-data bus (so QuoteFeed can skip REST polling for streamed
     # symbols → no more /quotes 429s), order socket tracks fills in real

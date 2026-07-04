@@ -1275,6 +1275,14 @@ class Manager:
             self._vol_regime = vol_regime
             self._risk._vol_regime = vol_regime  # type: ignore[attr-defined]
 
+    def attach_funds_provider(self, funds_provider: Any) -> None:
+        """Wire the live Fyers funds feed into the risk engine so LIVE
+        sizing anchors to the real account balance (RISK.md §2). Called
+        by the lifespan once the Fyers fetch fn is ready. Fail-safe —
+        with no provider (or a failing fetch) sizing falls back to the
+        PORTFOLIO_VALUE ledger."""
+        self._risk._funds_provider = funds_provider  # type: ignore[attr-defined]
+
     # -- settings hot-reload -------------------------------------------
 
     async def _on_settings_updated(self, _payload: dict[str, Any]) -> None:

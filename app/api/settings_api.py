@@ -69,6 +69,9 @@ _GLOBAL_KEYS: dict[str, tuple[type, Any]] = {
     # Master switch for AI news analysis (Dashboard toggle). OFF = news is
     # still collected but never sent to the LLM, so no signals / auto trades.
     "AI_ANALYSIS_ENABLED": (bool, True),
+    # Intraday buying-power multiplier (Fyers MIS ~5x). Notional caps only —
+    # risk-per-trade and loss limits always stay on real equity.
+    "INTRADAY_LEVERAGE": (float, 5.0),
 }
 
 
@@ -142,6 +145,13 @@ def _coerce(key: str, value: Any) -> Any:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=f"setting {key}: must be non-negative",
+            )
+        # Mirror the Settings validator here — an out-of-range override
+        # written to env would make every later get_settings() call blow up.
+        if key == "INTRADAY_LEVERAGE" and not (1.0 <= coerced <= 10.0):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="INTRADAY_LEVERAGE must be between 1 and 10",
             )
     if key == "TRADING_MODE" and coerced not in {"paper", "live"}:
         raise HTTPException(

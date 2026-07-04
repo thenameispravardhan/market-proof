@@ -557,19 +557,16 @@ export default function Trade() {
 
           <label className="ticket-row">
             <span>Product</span>
+            {/* Intraday-only bot: no delivery / carry-forward, ever. The
+                backend rejects anything else, so don't offer it. */}
             <select
               value={productType}
               onChange={(e) => setProductType(e.target.value as ProductType)}
               data-testid="ticket-product"
+              disabled
+              title="Intraday-only bot — every position is squared off the same day"
             >
               <option value="INTRADAY">INTRADAY (MIS)</option>
-              <option value="DELIVERY">DELIVERY (CNC)</option>
-              {(isOption || isFuture) && (
-                <option value="NORMAL">NORMAL (NRML)</option>
-              )}
-              {(isOption || isFuture) && (
-                <option value="MARGIN">MARGIN</option>
-              )}
             </select>
           </label>
 

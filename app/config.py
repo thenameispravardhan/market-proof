@@ -132,6 +132,14 @@ class Settings(BaseSettings):
     # over the first RISK_RAMP_TRADES filled trades.
     RISK_RAMP_TRADES: int = 100
     RISK_RAMP_START_PCT: float = 0.5
+    # §2b Intraday leverage. Fyers MIS gives ~5x buying power on equity
+    # intraday (20% margin, SEBI peak-margin rules). NOTIONAL caps — the
+    # sizing clamp, single-name cap (R7), sector cap (R9) — are computed
+    # against buying power = equity × INTRADAY_LEVERAGE. Everything
+    # denominated in REAL money stays on raw equity: risk-per-trade
+    # (MAX_CAPITAL_RISK_PCT), daily/weekly/monthly loss breakers. 1.0 =
+    # unleveraged sizing.
+    INTRADAY_LEVERAGE: float = 5.0
     # §3 Stops / targets / trailing (R = initial risk per share).
     SCALE_OUT_ENABLED: bool = True            # partial at target R, trail the rest
     SCALE_OUT_R: float = 2.0                  # take-profit multiple of initial risk
@@ -253,6 +261,15 @@ class Settings(BaseSettings):
     def _strictly_positive(cls, v: float) -> float:
         if v <= 0:
             raise ValueError("value must be > 0")
+        return v
+
+    @field_validator("INTRADAY_LEVERAGE")
+    @classmethod
+    def _leverage_in_range(cls, v: float) -> float:
+        # 1x = unleveraged; Fyers MIS equity intraday is ~5x. Anything
+        # past 10x is a typo, not a broker product.
+        if not (1.0 <= v <= 10.0):
+            raise ValueError("INTRADAY_LEVERAGE must be between 1 and 10")
         return v
 
     @field_validator("QUOTE_REFRESH_SECONDS")

@@ -27,7 +27,8 @@ ledger, the risk-% resolution, and the notional cap on top.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Optional
+import time
+from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -41,33 +42,80 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 
+FundsFetch = Callable[[], Awaitable[Optional[float]]]
+
+
+class FyersFundsProvider:
+    """Live account equity from the Fyers funds API, cached with a TTL.
+
+    In LIVE mode sizing should anchor to the REAL money in the Fyers
+    account, not the static PORTFOLIO_VALUE setting. `equity()` is sync
+    (returns the cached value or None); `refresh()` is awaited by the
+    risk engine before sizing. Fail-safe — any fetch error leaves the
+    value None and the equity ledger falls back to PORTFOLIO_VALUE, so
+    a broken funds call can never fake a bigger (or smaller) account.
+    """
+
+    def __init__(self, fetch_funds: FundsFetch, *, ttl_s: float = 30.0) -> None:
+        self._fetch = fetch_funds
+        self._ttl = float(ttl_s)
+        self._value: Optional[float] = None
+        self._ts: float = 0.0
+
+    def equity(self) -> Optional[float]:
+        return self._value
+
+    async def refresh(self) -> None:
+        now = time.monotonic()
+        if self._value is not None and (now - self._ts) < self._ttl:
+            return
+        try:
+            v = await self._fetch()
+        except Exception:  # noqa: BLE001
+            log.debug("position_sizer.funds_fetch_failed")
+            return
+        if v is not None and float(v) > 0:
+            self._value = float(v)
+            self._ts = now
+
 
 def compute_equity(
     session: Session,
     md: "Optional[MarketDataBus]" = None,
     *,
     override: Optional[float] = None,
+    live_anchor: Optional[float] = None,
 ) -> float:
     """Return account equity (starting capital + realised + unrealised).
 
     `override` short-circuits to that exact value — used by tests and
     backtests that supply a fixed starting capital (and to keep the
     risk engine's existing `portfolio_value=...` contract intact).
+
+    `live_anchor` replaces the *starting-capital + realised* part with
+    the broker's real funds balance (which already includes realised
+    P&L); only unrealised P&L on open positions is added on top. Used
+    in LIVE mode when the Fyers funds feed is available.
+
     Never returns a non-positive number (that would break sizing).
     """
     settings = get_settings()
     if override is not None:
         return float(override)
 
-    starting = float(settings.PORTFOLIO_VALUE)
-    realised = float(
-        session.execute(
-            select(func.coalesce(func.sum(TradeRow.pnl), 0.0)).where(
-                TradeRow.pnl.is_not(None)
-            )
-        ).scalar_one()
-        or 0.0
-    )
+    if live_anchor is not None and float(live_anchor) > 0:
+        starting = float(live_anchor)
+        realised = 0.0  # already inside the broker balance
+    else:
+        starting = float(settings.PORTFOLIO_VALUE)
+        realised = float(
+            session.execute(
+                select(func.coalesce(func.sum(TradeRow.pnl), 0.0)).where(
+                    TradeRow.pnl.is_not(None)
+                )
+            ).scalar_one()
+            or 0.0
+        )
 
     unrealised = 0.0
     rows = session.query(PositionRow).filter(PositionRow.quantity != 0).all()

@@ -284,6 +284,9 @@ export interface GlobalSettings {
   // Master switch for AI news analysis (Dashboard toggle). OFF = news is
   // still collected but never sent to the LLM — no signals / auto trades.
   AI_ANALYSIS_ENABLED: boolean;
+  // Intraday buying-power multiplier (Fyers MIS ~5x). Notional caps only —
+  // risk-per-trade and loss limits always stay on real equity.
+  INTRADAY_LEVERAGE: number;
 }
 
 export interface ManagedPosition {

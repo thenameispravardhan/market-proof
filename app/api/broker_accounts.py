@@ -1,9 +1,16 @@
 """`/api/broker-accounts` — CRUD for broker accounts.
 
 secret_key and access_token are NEVER returned in responses.
+
+The enable switch on a REAL (non-paper) account doubles as the live-
+trading master switch: enabling it flips TRADING_MODE to `live`,
+disabling flips back to `paper`. One Dashboard toggle = real trading
+on/off — the operator controls everything from the frontend.
 """
 from __future__ import annotations
 
+import json
+import os
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
@@ -11,10 +18,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.config import reset_settings_cache
+from app.db.infra_models import AppSetting
 from app.db.init import init_db
 from app.db.models import AuditLog, BrokerAccount
 from app.db.session import get_db
 from app.logging_config import get_logger
+from app.services.event_bus import event_bus
 
 log = get_logger(__name__)
 
@@ -141,8 +151,34 @@ def create_account(body: BrokerAccountCreate, db: Session = Depends(get_db)) -> 
     return _ser(a)
 
 
+def _sync_trading_mode(db: Session, mode: str) -> Optional[str]:
+    """Persist TRADING_MODE + hot-apply (env + settings cache). Returns
+    the previous mode (or None when unchanged). Caller commits + publishes."""
+    row = db.get(AppSetting, "TRADING_MODE")
+    before = json.loads(row.value) if row is not None and row.value else None
+    if before == mode:
+        return None
+    if row is None:
+        db.add(AppSetting(key="TRADING_MODE", value=json.dumps(mode)))
+    else:
+        row.value = json.dumps(mode)
+    db.flush()
+    db.add(
+        AuditLog(
+            actor="ui",
+            action="settings.trading_mode_changed",
+            target="TRADING_MODE",
+            before={"TRADING_MODE": before},
+            after={"TRADING_MODE": mode, "via": "broker_account_toggle"},
+        )
+    )
+    os.environ["TRADING_MODE"] = mode
+    reset_settings_cache()
+    return before or "paper"
+
+
 @router.put("/{account_id}")
-def update_account(
+async def update_account(
     account_id: int,
     body: BrokerAccountUpdate,
     db: Session = Depends(get_db),
@@ -173,8 +209,25 @@ def update_account(
     if body.enabled is not None:
         a.enabled = body.enabled
     _audit(db, action="broker_account.update", target=f"broker_account:{a.id}", before=before, after=_ser_audit(a))
+
+    # The REAL account's enable switch IS the live-trading switch
+    # (frontend-only control): Fyers ON → TRADING_MODE=live, OFF →
+    # paper. Paper-account toggles never touch the mode.
+    mode_changed = False
+    if body.enabled is not None and not a.paper_mode:
+        mode_changed = (
+            _sync_trading_mode(db, "live" if a.enabled else "paper") is not None
+        )
+
     db.commit()
     db.refresh(a)
+
+    if mode_changed:
+        # Hot-reload subscribers (execution manager drops cached live
+        # backends so the next signal routes with the new mode).
+        await event_bus.publish(
+            "settings.updated", {"changed_keys": ["TRADING_MODE"]}
+        )
     return _ser(a)
 
 

@@ -421,7 +421,12 @@ export function useToggleBrokerAccount() {
   return useMutation({
     mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
       api.put<BrokerAccount>(`/api/broker-accounts/${id}`, { enabled }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["broker-accounts"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["broker-accounts"] });
+      // Toggling the REAL account flips TRADING_MODE (paper/live) on the
+      // backend — refresh settings so the LIVE banner reacts instantly.
+      qc.invalidateQueries({ queryKey: ["settings"] });
+    },
   });
 }
 

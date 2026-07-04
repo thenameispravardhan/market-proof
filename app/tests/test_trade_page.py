@@ -317,7 +317,7 @@ def test_place_order_persists_trade_and_audit(
             "side": "SELL",
             "quantity": 5,
             "order_type": "MARKET",
-            "product_type": "DELIVERY",
+            "product_type": "INTRADAY",
         },
     )
     assert r.status_code == 200, r.text
@@ -328,6 +328,28 @@ def test_place_order_persists_trade_and_audit(
     assert trade.quantity == 5
     assert trade.status == "placed"
     assert trade.broker_order_id == "STUB-1"
+
+
+def test_non_intraday_product_rejected(
+    client: TestClient, db_session, isolated_db, real_account
+):
+    """Intraday-only bot: DELIVERY / NORMAL / MARGIN manual orders are
+    rejected outright — nothing may survive the EOD square-off."""
+    _install_stub_backend(client, real_account.id, ok=True)
+    for product in ("DELIVERY", "NORMAL", "MARGIN"):
+        r = client.post(
+            "/api/orders",
+            json={
+                "account_id": real_account.id,
+                "symbol": "NSE:INFY-EQ",
+                "side": "BUY",
+                "quantity": 1,
+                "order_type": "MARKET",
+                "product_type": product,
+            },
+        )
+        assert r.status_code == 422, f"{product}: {r.text}"
+        assert "intraday-only" in r.json()["detail"]
 
 
 # ---------------------------------------------------------------------------

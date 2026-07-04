@@ -230,6 +230,18 @@ async def place_order(
     bypass_risk = bool(body.get("bypass_risk", False))
     operator = str(body.get("operator", "ui_trade_page"))
 
+    # INTRADAY-ONLY bot: no delivery / carry-forward, ever. Every trade
+    # must be flattenable by the EOD square-off, so any other product
+    # type is rejected outright (not silently coerced).
+    if product_type != "INTRADAY":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"product_type {product_type!r} not allowed — this bot is "
+                f"intraday-only (no carry-forward); use INTRADAY."
+            ),
+        )
+
     if not symbol:
         raise HTTPException(status_code=422, detail="symbol is required")
     if quantity <= 0:
