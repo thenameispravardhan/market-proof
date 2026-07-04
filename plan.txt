@@ -6,57 +6,73 @@ All controls live in the UI; no file sentinels or CLI gates.)
 
 PHASE 0 — MEASURE FIRST (1-2 days, run alongside Phase 1)
 ---------------------------------------------------------
- 1. Instrument per-stage latency: filing detected -> PDF downloaded ->
-    text extracted -> LLM responded -> signal persisted -> order placed.
-    Log per announcement; check DeepSeek latency_ms logs today.
- 2. Confirm where the 30-40s actually goes (LLM vs detection lag vs
-    retries) before optimizing anything.
+ 1. [DONE] Instrument per-stage latency: every analysis now records
+    pdf_fetch_ms / pdf_extract_ms / llm_ms / total_ms /
+    news_age_s_at_start in analyses.raw_response.timings and logs an
+    `analyzer.pipeline_timing` line (track=fast|llm).
+ 2. [PENDING - OPERATOR] Run a trading day, read the timing logs, and
+    confirm where the 30-40s actually goes before optimizing Phase 3.
 
 PHASE 1 — REAL NEWS TEXT INTO THE PIPELINE (fixes wrong signals)
 ----------------------------------------------------------------
- 3. PDF prefetch in monitors (nse.py / bse.py): download the PDF
-    immediately on detection, in parallel with event publishing.
- 4. Text extraction module (app/analyzer/pdf_extract.py) using PyMuPDF;
-    graceful handling of corrupt/encrypted files.
- 5. Hindi filter: drop mostly-Devanagari lines (U+0900-U+097F).
- 6. Page selection: keep pages 1-2 always, score the rest by event-type
-    keywords, cap at ~6-8k tokens.
- 7. Scanned-PDF detection: no text layer -> mark unreadable, skip
+ 3. [PENDING] PDF prefetch in monitors (nse.py / bse.py): download the
+    PDF immediately on detection, in parallel with event publishing.
+    (Today the analyzer downloads at analysis time — works, but the
+    fetch could overlap with the event hop.)
+ 4. [DONE] Text extraction module (app/analyzer/pdf_extract.py),
+    PyMuPDF, graceful failure -> legacy fallback.
+ 5. [DONE] Hindi filter (Devanagari-dominant lines dropped).
+ 6. [DONE] Page selection: first 2 pages + keyword/digit-scored pages,
+    24k-char budget.
+ 7. [DONE] Scanned-PDF detection -> reason="scanned_pdf" -> fallback
     (no OCR in the hot path).
- 8. Prompt support for {{extracted_text}} alongside {{pdf_url}}.
-    TOGGLE (frontend Settings): "Send extracted PDF text to DeepSeek"
-    OFF (default) = current URL/metadata behavior, untouched.
-    ON = extracted text goes into the prompt; falls back to URL mode
-    if extraction fails.
- 9. NO_TRADE as default stance in prompts: model must cite a fact from
-    the text to justify buy/sell; few-shot examples of routine filings
-    -> no-trade.
+ 8. [DONE] {{extracted_text}} placeholder + append_extracted_document;
+    "Send extracted PDF text to AI" toggle in Settings, default OFF,
+    falls back to URL mode on any extraction failure.
+ 9. [DONE] NO_TRADE default stance in the extracted-text footer: BUY/
+    SELL requires citing a fact from the filing text. (Few-shot examples
+    of routine filings can still be added to the DEFAULT prompt via the
+    Prompts page.)
 
 PHASE 2 — TWO-TRACK SIGNALS (best trades stop waiting for the LLM)
 ------------------------------------------------------------------
-10. Deterministic fast track: regex/number parsers for top event types
-    (order wins "order worth Rs X crore" vs market cap, resignations/
-    appointments, key results figures). Parse -> rules engine -> signal
-    in 1-2s, no LLM.
-11. XBRL parser for financial results: structured revenue/profit from
-    the exchange XBRL filing, deterministic QoQ comparison; PDF+LLM is
-    the fallback for results, not the default.
-12. Routing logic in the analyzer: high-conviction structured events
-    take the fast track; ambiguous ones go to the LLM track. Both feed
-    the same rules engine and risk checks.
+10. [DONE] Deterministic fast track (app/analyzer/fast_track.py):
+    order win with explicit Rs-crore value (confidence tiers by size),
+    KMP resignation (MD/CEO/CFO/WTD/chairman, succession-guarded),
+    buyback with value. "Deterministic fast track" toggle in Settings,
+    default OFF. KNOWN GAP: deal value is not scaled vs market cap —
+    gate with rules (deal_value_inr_crore thresholds) until a
+    market-cap feed lands.
+11. [DEFERRED] XBRL parser for financial results: needs live NSE/BSE
+    XBRL attachment URLs + taxonomy mapping — build against real
+    filings during market hours, not blind.
+12. [DONE] Routing in the analyzer: fast-track match -> rules engine
+    directly (llm_ms=0); non-match -> LLM track. Both tracks feed the
+    same rules engine, risk checks, and signals.new channel.
 
 PHASE 3 — LLM TRACK UNDER ~8s
 -----------------------------
-13. Cut max_tokens 2000 -> ~400 in deepseek_client.py (compact JSON
-    verdict only).
-14. Benchmark providers on the real prompt during market hours:
-    DeepSeek vs Groq / Gemini Flash / Claude Haiku; pick whatever
-    reliably returns <= 5s.
-15. Tighten retries: one fast retry then discard (1s+2s+4s backoff
-    cannot fit the trading window).
-16. Hard end-to-end deadline: detect->signal over ~10-15s -> discard
-    (whole-pipeline extension of the staleness gate).
-17. Revisit MAX_NEWS_AGE_SECONDS = 90 once the pipeline is fast.
+13. [DONE] LLM_MAX_TOKENS default 1024 -> 400, editable in Settings
+    ("AI max output tokens"). NOTE: the project .env pins 512, which
+    stays effective until changed — a real signal JSON measured ~170
+    completion tokens, so 400 has 2x+ headroom.
+14. [PARTIAL] Benchmark: real pipeline measured 2026-07-04 ~22:00 IST —
+    PDF fetch 200-1200ms, extract <80ms, DeepSeek (deepseek-v4-flash)
+    ~2.3-2.4s, TOTAL ~2.5-2.7s end-to-end. Already under the 10s
+    target off-peak; re-check during market hours via the
+    analyzer.pipeline_timing logs. Groq/Gemini/Claude comparison needs
+    API keys — only worth doing if market-hours DeepSeek p95 > 5s.
+15. [DONE] Retries: settings-driven (LLM_MAX_RETRIES=1 default,
+    LLM_RETRY_BACKOFF_SECONDS=0.5) — worst case ~0.5s of retry dead
+    time instead of 7s. Explicit max_retries args still win (tests).
+16. [DONE] Hard end-to-end deadline: PIPELINE_DEADLINE_SECONDS
+    ("Signal deadline" in Settings, 0 = off by default). Late analyses
+    are stored (Phase 4 data) but the signal is BLOCKED with reason
+    pipeline_deadline. Recommended ~15s once market-hours timing is
+    confirmed.
+17. [DONE - EXPOSED] MAX_NEWS_AGE_SECONDS now editable in Settings
+    ("Max news age"); tighten from 90s after reading a few days of
+    timing logs.
 
 PHASE 4 — DATA COLLECTION (passive; starts as soon as Phase 1 ships)
 --------------------------------------------------------------------

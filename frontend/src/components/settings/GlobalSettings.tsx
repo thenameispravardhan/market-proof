@@ -10,6 +10,7 @@ type NumField = Exclude<
   | "PRE_LLM_FILTER_ENABLED"
   | "AI_ANALYSIS_ENABLED"
   | "SEND_EXTRACTED_TEXT"
+  | "FAST_TRACK_ENABLED"
 >;
 
 const FIELDS: { key: NumField; label: string; min: number; max: number; step: number }[] = [
@@ -25,6 +26,9 @@ const FIELDS: { key: NumField; label: string; min: number; max: number; step: nu
   { key: "DEFAULT_SL_PCT", label: "Default stop-loss (%)", min: 0.5, max: 50, step: 0.5 },
   { key: "DEFAULT_TARGET_RR", label: "Default target R:R", min: 0.5, max: 10, step: 0.5 },
   { key: "QUOTE_REFRESH_SECONDS", label: "Quote refresh (seconds)", min: 1, max: 600, step: 1 },
+  { key: "LLM_MAX_TOKENS", label: "AI max output tokens", min: 100, max: 4000, step: 50 },
+  { key: "MAX_NEWS_AGE_SECONDS", label: "Max news age (seconds)", min: 5, max: 600, step: 5 },
+  { key: "PIPELINE_DEADLINE_SECONDS", label: "Signal deadline (seconds, 0 = off)", min: 0, max: 300, step: 1 },
 ];
 
 export function GlobalSettings() {
@@ -48,6 +52,8 @@ export function GlobalSettings() {
   const preLlmFilter = values.PRE_LLM_FILTER_ENABLED ?? true;
   // Default OFF — legacy URL/metadata mode until the operator opts in.
   const sendExtractedText = values.SEND_EXTRACTED_TEXT ?? false;
+  // Default OFF — everything takes the AI track until the operator opts in.
+  const fastTrack = values.FAST_TRACK_ENABLED ?? false;
 
   const handleSave = async () => {
     setError(null);
@@ -113,6 +119,24 @@ export function GlobalSettings() {
                 {sendExtractedText
                   ? "The filing PDF is downloaded and its relevant pages (Hindi removed) are sent to the AI as real text. Falls back to URL mode if extraction fails."
                   : "Legacy mode: the AI gets only the PDF URL + headline metadata (no filing text)."}
+              </span>
+            </div>
+          </div>
+          <div className="field" style={{ marginTop: 4 }}>
+            <label>Deterministic fast track</label>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <Toggle
+                on={fastTrack}
+                data-testid="fast-track-toggle"
+                onChange={(next) => {
+                  setValues((prev) => ({ ...prev, FAST_TRACK_ENABLED: next }));
+                  setSaved(false);
+                }}
+              />
+              <span className="field-hint" style={{ marginTop: 0 }}>
+                {fastTrack
+                  ? "High-conviction headlines (order win / buyback with explicit ₹-crore value, key-management resignation) skip the AI and hit the rules engine in milliseconds. Everything else still goes to the AI."
+                  : "Every filing takes the AI track (legacy behavior)."}
               </span>
             </div>
           </div>

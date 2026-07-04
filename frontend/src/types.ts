@@ -289,6 +289,19 @@ export interface GlobalSettings {
   // the relevant pages are extracted (Hindi half dropped) and sent as
   // real text. Extraction failures always fall back to the legacy path.
   SEND_EXTRACTED_TEXT: boolean;
+  // Deterministic fast track. OFF (default) = every filing goes to the AI.
+  // ON = unambiguous high-conviction headlines (order win / buyback with
+  // explicit ₹-crore value, KMP resignation) skip the AI and hit the rules
+  // engine in milliseconds. Non-matches still go to the AI.
+  FAST_TRACK_ENABLED: boolean;
+  // Cap on AI completion tokens — shorter output generates faster; a full
+  // signal JSON measured ~165 tokens, so keep at least ~2× headroom.
+  LLM_MAX_TOKENS: number;
+  // Staleness gate: filings older than this (seconds) skip the AI entirely.
+  MAX_NEWS_AGE_SECONDS: number;
+  // Hard end-to-end deadline (seconds from filing to signal). Late signals
+  // are stored but blocked. 0 = disabled.
+  PIPELINE_DEADLINE_SECONDS: number;
   // Intraday buying-power multiplier (Fyers MIS ~5x). Notional caps only —
   // risk-per-trade and loss limits always stay on real equity.
   INTRADAY_LEVERAGE: number;

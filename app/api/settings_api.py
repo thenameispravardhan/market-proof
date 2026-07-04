@@ -74,6 +74,19 @@ _GLOBAL_KEYS: dict[str, tuple[type, Any]] = {
     # downloaded and its relevant pages are extracted and sent as real
     # text. Extraction failures always fall back to the legacy path.
     "SEND_EXTRACTED_TEXT": (bool, False),
+    # Deterministic fast track. OFF (default) = every filing takes the
+    # LLM track. ON = unambiguous high-conviction headlines (order win /
+    # buyback with explicit Rs-crore value, KMP resignation) skip the LLM
+    # and hit the rules engine in milliseconds.
+    "FAST_TRACK_ENABLED": (bool, False),
+    # Phase 3 latency knobs. LLM output-token cap (shorter = faster
+    # generation; a full signal JSON measured ~165 tokens, keep 2×+
+    # headroom). Staleness gate age. Hard end-to-end deadline from
+    # filed_at to signal creation — 0 disables; late signals are stored
+    # but blocked.
+    "LLM_MAX_TOKENS": (int, 400),
+    "MAX_NEWS_AGE_SECONDS": (int, 90),
+    "PIPELINE_DEADLINE_SECONDS": (int, 0),
     # Intraday buying-power multiplier (Fyers MIS ~5x). Notional caps only —
     # risk-per-trade and loss limits always stay on real equity.
     "INTRADAY_LEVERAGE": (float, 5.0),
@@ -157,6 +170,16 @@ def _coerce(key: str, value: Any) -> Any:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="INTRADAY_LEVERAGE must be between 1 and 10",
+            )
+        if key in {"LLM_MAX_TOKENS", "MAX_NEWS_AGE_SECONDS"} and coerced < 1:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"setting {key}: must be >= 1",
+            )
+        if key == "PIPELINE_DEADLINE_SECONDS" and coerced < 0:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="PIPELINE_DEADLINE_SECONDS must be >= 0 (0 = disabled)",
             )
     if key == "TRADING_MODE" and coerced not in {"paper", "live"}:
         raise HTTPException(

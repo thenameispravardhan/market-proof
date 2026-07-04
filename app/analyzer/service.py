@@ -50,6 +50,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.analyzer.deepseek_client import DeepSeekClient, DeepSeekError
+from app.analyzer.fast_track import FastTrackProducer, evaluate_fast_track
 from app.analyzer.pdf_extract import (
     ExtractionResult,
     download_pdf,
@@ -415,6 +416,67 @@ class Service:
             )
             return None
 
+        # Step 1.8: DETERMINISTIC FAST TRACK (Settings toggle, default OFF).
+        # For a few unambiguous, high-conviction headline shapes (order
+        # win with explicit Rs-crore value, KMP resignation, buyback with
+        # value) we skip template/PDF/LLM entirely and go straight to the
+        # rules engine — signal in milliseconds instead of seconds. No
+        # match (or toggle OFF) → the normal LLM track below, unchanged.
+        if bool(getattr(settings, "FAST_TRACK_ENABLED", False)):
+            ft = evaluate_fast_track(announcement.headline or "")
+            if ft is not None:
+                ft_elapsed_ms = (time.perf_counter() - t_start) * 1000.0
+                ft_timings: dict[str, Any] = {
+                    "pdf_fetch_ms": None,
+                    "pdf_extract_ms": None,
+                    "llm_ms": 0.0,
+                    "total_ms": round(ft_elapsed_ms, 1),
+                    "news_age_s_at_start": (
+                        round(age_seconds, 2) if age_seconds is not None else None
+                    ),
+                }
+                log.info(
+                    "analyzer.fast_track_matched",
+                    announcement_id=announcement_id,
+                    symbol=announcement.symbol,
+                    pattern=ft.pattern,
+                    recommendation=str(ft.response.recommendation),
+                    confidence=ft.response.confidence,
+                )
+                log.info(
+                    "analyzer.pipeline_timing",
+                    announcement_id=announcement_id,
+                    track="fast",
+                    used_extracted_text=False,
+                    **ft_timings,
+                )
+                ft_dict = analysis_to_dict(ft.response)
+                producer = FastTrackProducer(latency_ms=ft_elapsed_ms)
+                signal, approved = await loop.run_in_executor(
+                    None, _persist_analysis_and_signal,
+                    self._session_factory, announcement, ft.response, ft_dict,
+                    producer, self._signals_today,
+                    ft_timings,
+                    None,
+                )
+                await event_bus.publish(
+                    CHANNEL_NEW_SIGNAL,
+                    _signal_payload(signal, ft.response, ft_dict, approved=approved),
+                )
+                try:
+                    from app.services.audit_service import log_event
+                    log_event(
+                        actor="system",
+                        action="signal.created",
+                        target=f"signal:{signal.id}",
+                        after=_signal_payload(
+                            signal, ft.response, ft_dict, approved=approved
+                        ),
+                    )
+                except Exception:  # pragma: no cover — optional
+                    pass
+                return signal
+
         # Step 2: pick prompt template (event-type heuristic + DEFAULT).
         detected = detect_event_type(
             announcement.headline or "", announcement.pdf_url
@@ -638,6 +700,28 @@ class Service:
 
         analysis_dict = analysis_to_dict(response)
 
+        # Step 4.5: HARD PIPELINE DEADLINE (Settings, 0 = off). The
+        # staleness gate at step 1.5 checks age BEFORE the work; this
+        # checks it AFTER — a slow download + LLM call can push a fresh
+        # filing past the tradeable window. The analysis is still stored
+        # (it's training data for the outcome logger), but the signal is
+        # blocked: a late entry is worse than no entry.
+        deadline_s = int(getattr(settings, "PIPELINE_DEADLINE_SECONDS", 0))
+        force_block_reason: Optional[str] = None
+        if deadline_s > 0 and filed_at is not None:
+            age_now = (datetime.now(timezone.utc) - filed_at).total_seconds()
+            if age_now > deadline_s:
+                force_block_reason = (
+                    f"pipeline_deadline: {age_now:.1f}s from filing > "
+                    f"{deadline_s}s limit"
+                )
+                log.warning(
+                    "analyzer.pipeline_deadline_exceeded",
+                    announcement_id=announcement_id,
+                    age_seconds=round(age_now, 2),
+                    deadline_seconds=deadline_s,
+                )
+
         # Phase 0 instrumentation: one record per analysis of where the
         # wall time went. `news_age_s_at_start` is detection lag (exchange
         # publish -> our processing start); the *_ms fields are ours.
@@ -651,6 +735,7 @@ class Service:
         log.info(
             "analyzer.pipeline_timing",
             announcement_id=announcement_id,
+            track="llm",
             used_extracted_text=use_extracted,
             **timings,
         )
@@ -662,6 +747,7 @@ class Service:
             ds_result, self._signals_today,
             timings,
             extraction.meta() if extraction is not None else None,
+            force_block_reason,
         )
 
         # Step 9: publish.
@@ -767,10 +853,13 @@ def _persist_analysis_and_signal(
     signals_today: dict[str, int],
     timings: Optional[dict[str, Any]] = None,
     pdf_extraction_meta: Optional[dict[str, Any]] = None,
+    force_block_reason: Optional[str] = None,
 ) -> tuple[Signal, bool]:
     """Persist the analysis, run rules, persist signal.
 
     Returns (signal, approved). The caller publishes.
+    `force_block_reason` (e.g. the pipeline deadline) blocks the signal
+    regardless of the rules/risk outcome — analysis is kept, trade isn't.
     """
     with session_factory() as session:
         # Persist analysis row.
@@ -843,6 +932,8 @@ def _persist_analysis_and_signal(
 
         # Risk check (T1 stub).
         approved, deny_reason = _risk_check(response, match, signals_today)
+        if force_block_reason is not None:
+            approved, deny_reason = False, force_block_reason
         # Position size comes from action_params, with a default of
         # the global MAX_SINGLE_POSITION_PCT.
         position_size_pct = float(

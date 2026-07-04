@@ -6,9 +6,10 @@ Design choices:
 
 - async httpx with a configurable transport so tests can inject a
   `MockTransport` (see `test_deepseek_client.py`).
-- 30s default timeout, 3 retries on HTTP 429/5xx with exponential
-  backoff (1s, 2s, 4s). 4xx other than 429 is *not* retried — a
-  malformed request won't fix itself.
+- 30s default timeout. Retries on HTTP 429/5xx follow settings:
+  LLM_MAX_RETRIES (default 1) with exponential backoff starting at
+  LLM_RETRY_BACKOFF_SECONDS (default 0.5s). 4xx other than 429 is
+  *not* retried — a malformed request won't fix itself.
 - Per-call structured log: model, prompt_tokens, completion_tokens,
   latency_ms, cost_usd. The API key and prompt body are never logged.
 - Cost calculation is a configurable dict (USD per 1k tokens) — the
@@ -115,9 +116,10 @@ class DeepSeekClient:
 
     ENDPOINT = "https://api.deepseek.com/v1/chat/completions"
     DEFAULT_TIMEOUT_S = 30.0
-    DEFAULT_MAX_RETRIES = 3
-    # 429 + 5xx are retried; everything else (400/401/403/etc.) bubbles
-    # up immediately.
+    # Retry policy defaults come from settings (LLM_MAX_RETRIES /
+    # LLM_RETRY_BACKOFF_SECONDS). For a speed-news pipeline the old
+    # 3-retry 1s-2s-4s ladder added up to 7s of dead time to a failing
+    # call — one fast retry then give up is the right trade.
     RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
     def __init__(
@@ -126,16 +128,22 @@ class DeepSeekClient:
         api_key: Optional[str] = None,
         endpoint: Optional[str] = None,
         timeout_s: float = DEFAULT_TIMEOUT_S,
-        max_retries: int = DEFAULT_MAX_RETRIES,
+        max_retries: Optional[int] = None,
         cost_per_1k: Optional[dict[str, dict[str, float]]] = None,
         transport_factory: Optional[TransportFactory] = None,
     ) -> None:
+        settings = get_settings()
         if api_key is None:
-            api_key = get_settings().DEEPSEEK_API_KEY
+            api_key = settings.DEEPSEEK_API_KEY
         self._api_key = api_key
         self._endpoint = endpoint or self.ENDPOINT
         self._timeout_s = float(timeout_s)
+        if max_retries is None:
+            max_retries = int(getattr(settings, "LLM_MAX_RETRIES", 1))
         self._max_retries = int(max_retries)
+        self._backoff_base_s = float(
+            getattr(settings, "LLM_RETRY_BACKOFF_SECONDS", 0.5)
+        )
         self._cost_per_1k = cost_per_1k or DEFAULT_COST_PER_1K
         self._transport_factory = transport_factory or _default_transport_factory
         self._client: Optional[httpx.AsyncClient] = None
@@ -197,8 +205,9 @@ class DeepSeekClient:
     ) -> DeepSeekResult:
         """Call DeepSeek chat/completions once (with retries).
 
-        On 429 / 5xx: retry up to `max_retries` times with 1s, 2s, 4s
-        backoff. On 4xx other than 429: raise `DeepSeekError` immediately.
+        On 429 / 5xx: retry up to `max_retries` times with exponential
+        backoff (base LLM_RETRY_BACKOFF_SECONDS). On 4xx other than 429:
+        raise `DeepSeekError` immediately.
         On transport / timeout: also retried (status is None).
 
         v4 inference controls:
@@ -387,9 +396,11 @@ class DeepSeekClient:
         return status, data, ""
 
     async def _backoff(self, attempt: int) -> None:
-        # 1s, 2s, 4s — small, deterministic so tests can be fast with a
-        # patched sleep.
-        delay = 2 ** attempt
+        # base × 1, 2, 4… — deterministic so tests can be fast with a
+        # patched sleep. Base defaults to 0.5s (LLM_RETRY_BACKOFF_SECONDS):
+        # news alpha decays in seconds, so waiting whole seconds between
+        # retries just converts a recoverable blip into a stale trade.
+        delay = self._backoff_base_s * (2 ** attempt)
         await asyncio.sleep(delay)
 
     def _build_result(

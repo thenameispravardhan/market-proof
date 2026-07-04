@@ -191,12 +191,29 @@ class Settings(BaseSettings):
     # hundred tokens — so capping here (clamped against each template's
     # own max_tokens at call time) shaves seconds off every analysis.
     # Paired with the brevity instruction in `render_system_prompt` so the
-    # model stays well inside this. 1024 keeps the latency win over the
-    # 2000-token template default while leaving 2-3× headroom over the
-    # expected JSON length, so a slightly verbose response can't truncate
-    # its JSON mid-string (a truncated response fails to parse → lost
-    # signal). Don't drop this below the size a full signal JSON needs.
-    LLM_MAX_TOKENS: int = 1024
+    # model stays well inside this. Measured on the live pipeline
+    # (2026-07-04): a full signal JSON for a real filing ran 165
+    # completion tokens, so 400 leaves ~2.4× headroom while cutting the
+    # worst-case generation time roughly in half vs the old 1024. Don't
+    # drop this below the size a full signal JSON needs — a truncated
+    # response fails to parse → lost signal. Editable in Settings.
+    LLM_MAX_TOKENS: int = 400
+    # LLM retry policy. The old 3-retry / 1s-2s-4s ladder could add 7s+
+    # of dead time to a failing call — fatal for a speed-news strategy.
+    # One fast retry (0.5s, doubling per attempt) then give up: by the
+    # time a second retry would land, the spike is gone anyway and the
+    # staleness/deadline gates would discard the trade. Env-configurable;
+    # picked up when the analyzer (re)builds its client at startup.
+    LLM_MAX_RETRIES: int = 1
+    LLM_RETRY_BACKOFF_SECONDS: float = 0.5
+    # Hard end-to-end deadline (seconds from `filed_at` to signal). If a
+    # fully-analysed announcement is older than this by the time the
+    # signal would be created, the analysis is still stored (data for
+    # Phase 4) but the signal is BLOCKED with reason pipeline_deadline —
+    # a late entry is worse than no entry. 0 = disabled (default, so the
+    # legacy behavior is untouched until the operator opts in from the
+    # Settings page; recommended ~15s once the pipeline is fast).
+    PIPELINE_DEADLINE_SECONDS: int = 0
     # Pre-LLM noise filter: drop clearly-administrative filings (trading-
     # window notices, compliance certificates, newspaper publications, …)
     # BEFORE spending an LLM call on them. Saves cost and — because the
@@ -221,6 +238,13 @@ class Settings(BaseSettings):
     # keeps the prompt near ~6k tokens so DeepSeek stays fast.
     PDF_FETCH_TIMEOUT_SECONDS: float = 6.0
     PDF_MAX_TEXT_CHARS: int = 24_000
+    # Deterministic fast track (Settings toggle). OFF (default) = every
+    # filing takes the LLM track (legacy behavior). ON = a few unambiguous
+    # high-conviction headline shapes (order win with explicit Rs-crore
+    # value, KMP resignation, buyback with value) skip the LLM and go
+    # straight to the rules engine — signal in milliseconds. Non-matches
+    # always fall through to the LLM track. See app/analyzer/fast_track.py.
+    FAST_TRACK_ENABLED: bool = False
     # Market session (IST, "HH:MM"). Entry window excludes the first
     # 15 min after open and the last 30 min before close; all intraday
     # positions are force-squared-off at SQUARE_OFF_TIME.
@@ -310,6 +334,8 @@ class Settings(BaseSettings):
         "MAX_SIGNALS_PER_DAY",
         "MAX_POSITIONS_PER_SECTOR",
         "SECTOR_CLUSTER_WINDOW_SECONDS",
+        "LLM_MAX_RETRIES",
+        "PIPELINE_DEADLINE_SECONDS",
     )
     @classmethod
     def _positive_int(cls, v: int) -> int:
