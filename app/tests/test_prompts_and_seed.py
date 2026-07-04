@@ -567,3 +567,42 @@ def test_seed_script_runs_twice_yields_16_rows(tmp_path, monkeypatch):
         assert len(n) == 16
         # All version=1 still — re-seed with identical content is a no-op.
         assert all(r.version == 1 for r in n)
+
+
+# -- extracted-text mode helpers ------------------------------------------
+
+
+def test_append_extracted_document_grounds_with_filing_text():
+    from app.analyzer.prompts import append_extracted_document
+
+    out = append_extracted_document(
+        "Analyse this filing.",
+        symbol="TCS",
+        exchange="NSE",
+        headline="Order win announcement",
+        document_text="The company received an order worth Rs 500 crore.",
+        pages_used=[1, 2, 7],
+        pages_total=42,
+        truncated=True,
+    )
+    assert "TCS (NSE)" in out
+    assert "Rs 500 crore" in out
+    assert "pages 1, 2, 7 of 42" in out
+    assert "remaining pages omitted" in out
+    # No-trade default stance is stated.
+    assert "Default to recommendation HOLD" in out
+    # The legacy "cannot open URLs" footer must NOT be in this path.
+    assert "cannot open URLs" not in out
+
+
+def test_safe_replace_is_literal_for_backslashes():
+    """PDF text contains backslashes / regex group refs; substitution must
+    insert them literally instead of letting re.sub interpret them."""
+    from app.analyzer.prompts import _safe_replace
+
+    out = _safe_replace(
+        "Text: {{extracted_text}}",
+        "extracted_text",
+        r"C:\path\g<0> and \1 refs",
+    )
+    assert out == r"Text: C:\path\g<0> and \1 refs"

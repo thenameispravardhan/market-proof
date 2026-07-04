@@ -28,6 +28,11 @@ fyers-apiv3==3.1.6
 # is lazy so tests + non-scraping envs don't need it.
 playwright==1.49.1
 
+# PDF text extraction — extracted-text mode (SEND_EXTRACTED_TEXT toggle).
+# Import is lazy; without the wheel the analyzer falls back to the
+# legacy URL/metadata prompt path.
+PyMuPDF==1.25.1
+
 # Testing
 pytest==8.3.4
 pytest-asyncio==0.24.0

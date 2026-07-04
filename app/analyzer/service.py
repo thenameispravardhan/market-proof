@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 
@@ -49,9 +50,15 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.analyzer.deepseek_client import DeepSeekClient, DeepSeekError
+from app.analyzer.pdf_extract import (
+    ExtractionResult,
+    download_pdf,
+    extract_text_for_llm,
+)
 from app.analyzer.prompts import (
     DEFAULT_EVENT_TYPE,
     append_announcement_context,
+    append_extracted_document,
     detect_event_type,
     is_non_material,
     load_default_template,
@@ -305,6 +312,11 @@ class Service:
         self, announcement_id: int
     ) -> Optional[Signal]:
         loop = asyncio.get_running_loop()
+        # Pipeline stopwatch (Phase 0 instrumentation): per-stage wall
+        # times end up in the analysis raw_response and in the
+        # `analyzer.pipeline_timing` log line, so the 30-40s question
+        # ("where does the time actually go?") is answerable from data.
+        t_start = time.perf_counter()
 
         # Step 1: load announcement + check idempotency.
         announcement, already = await loop.run_in_executor(
@@ -436,6 +448,50 @@ class Service:
             template_version=template.version,
         )
 
+        # Step 2.5: EXTRACTED-TEXT MODE (Settings toggle, default OFF).
+        # When ON, download the filing PDF and extract the relevant pages
+        # (Hindi half dropped, keyword-scored selection) so DeepSeek
+        # analyses the actual filing instead of guessing from a headline.
+        # EVERY failure here — download, scanned PDF, encryption, missing
+        # wheel — falls back to the legacy metadata-only path below; this
+        # mode can degrade but never block a signal.
+        extraction: Optional[ExtractionResult] = None
+        pdf_fetch_ms: Optional[float] = None
+        pdf_extract_ms: Optional[float] = None
+        if bool(getattr(settings, "SEND_EXTRACTED_TEXT", False)) and announcement.pdf_url:
+            t_fetch = time.perf_counter()
+            pdf_bytes = await download_pdf(
+                announcement.pdf_url,
+                timeout_s=float(getattr(settings, "PDF_FETCH_TIMEOUT_SECONDS", 6.0)),
+            )
+            pdf_fetch_ms = (time.perf_counter() - t_fetch) * 1000.0
+            if pdf_bytes:
+                t_extract = time.perf_counter()
+                max_chars = int(getattr(settings, "PDF_MAX_TEXT_CHARS", 24_000))
+                extraction = await loop.run_in_executor(
+                    None,
+                    lambda: extract_text_for_llm(pdf_bytes, max_chars=max_chars),
+                )
+                pdf_extract_ms = (time.perf_counter() - t_extract) * 1000.0
+            if extraction is not None and extraction.ok:
+                log.info(
+                    "analyzer.pdf_extracted",
+                    announcement_id=announcement_id,
+                    fetch_ms=round(pdf_fetch_ms or 0.0, 1),
+                    extract_ms=round(pdf_extract_ms or 0.0, 1),
+                    **extraction.meta(),
+                )
+            else:
+                log.info(
+                    "analyzer.pdf_extract_fallback",
+                    announcement_id=announcement_id,
+                    reason=(
+                        extraction.reason if extraction is not None else "download_failed"
+                    ),
+                    fetch_ms=round(pdf_fetch_ms or 0.0, 1),
+                )
+        use_extracted = extraction is not None and extraction.ok
+
         # Step 3: call DeepSeek. Use the URL we have — empty string
         # only if the announcement had no PDF.
         pdf_url = announcement.pdf_url or ""
@@ -450,12 +506,28 @@ class Service:
                 "headline": announcement.headline or "",
                 "symbol": announcement.symbol or "",
                 "exchange": announcement.exchange or "",
+                # Templates may place the filing text themselves via
+                # {{extracted_text}}; empty when the mode is off/failed.
+                "extracted_text": extraction.text if use_extracted else "",
             },
         )
-        if "{{headline}}" not in template.user_template:
-            # Template doesn't place the headline itself — append the
-            # grounding block so the LLM analyses real text instead of
-            # hallucinating from a URL it cannot open.
+        if use_extracted and "{{extracted_text}}" not in template.user_template:
+            # Extracted-text mode: ground the prompt with the filing's
+            # real text (plus the no-trade-by-default footer).
+            user = append_extracted_document(
+                user,
+                symbol=announcement.symbol or "",
+                exchange=announcement.exchange or "",
+                headline=announcement.headline or "",
+                document_text=extraction.text,
+                pages_used=extraction.pages_used,
+                pages_total=extraction.pages_total,
+                truncated=extraction.truncated,
+            )
+        elif not use_extracted and "{{headline}}" not in template.user_template:
+            # Legacy path (mode off, or extraction fell back): append the
+            # metadata grounding block so the LLM analyses real text
+            # instead of hallucinating from a URL it cannot open.
             user = append_announcement_context(
                 user,
                 symbol=announcement.symbol or "",
@@ -566,11 +638,30 @@ class Service:
 
         analysis_dict = analysis_to_dict(response)
 
+        # Phase 0 instrumentation: one record per analysis of where the
+        # wall time went. `news_age_s_at_start` is detection lag (exchange
+        # publish -> our processing start); the *_ms fields are ours.
+        timings: dict[str, Any] = {
+            "pdf_fetch_ms": round(pdf_fetch_ms, 1) if pdf_fetch_ms is not None else None,
+            "pdf_extract_ms": round(pdf_extract_ms, 1) if pdf_extract_ms is not None else None,
+            "llm_ms": round(ds_result.latency_ms, 1),
+            "total_ms": round((time.perf_counter() - t_start) * 1000.0, 1),
+            "news_age_s_at_start": round(age_seconds, 2) if age_seconds is not None else None,
+        }
+        log.info(
+            "analyzer.pipeline_timing",
+            announcement_id=announcement_id,
+            used_extracted_text=use_extracted,
+            **timings,
+        )
+
         # Step 5+6+7+8: persist analysis, run rules, persist signal.
         signal, approved = await loop.run_in_executor(
             None, _persist_analysis_and_signal,
             self._session_factory, announcement, response, analysis_dict,
             ds_result, self._signals_today,
+            timings,
+            extraction.meta() if extraction is not None else None,
         )
 
         # Step 9: publish.
@@ -674,6 +765,8 @@ def _persist_analysis_and_signal(
     analysis_dict: dict[str, Any],
     ds_result: Any,
     signals_today: dict[str, int],
+    timings: Optional[dict[str, Any]] = None,
+    pdf_extraction_meta: Optional[dict[str, Any]] = None,
 ) -> tuple[Signal, bool]:
     """Persist the analysis, run rules, persist signal.
 
@@ -705,6 +798,12 @@ def _persist_analysis_and_signal(
                 },
                 "latency_ms": round(ds_result.latency_ms, 2),
                 "cost_usd": round(ds_result.cost_usd, 6),
+                # Phase 0 instrumentation + extracted-text provenance.
+                # `timings` answers "where did the seconds go" per
+                # analysis; `pdf_extraction` records whether the LLM saw
+                # real filing text (and why not, when it didn't).
+                "timings": timings,
+                "pdf_extraction": pdf_extraction_meta,
             },
         )
         session.add(a)

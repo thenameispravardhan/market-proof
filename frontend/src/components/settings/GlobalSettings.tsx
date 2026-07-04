@@ -6,7 +6,10 @@ import type { GlobalSettings as GS } from "../../types";
 
 type NumField = Exclude<
   keyof GS,
-  "TRADING_MODE" | "PRE_LLM_FILTER_ENABLED" | "AI_ANALYSIS_ENABLED"
+  | "TRADING_MODE"
+  | "PRE_LLM_FILTER_ENABLED"
+  | "AI_ANALYSIS_ENABLED"
+  | "SEND_EXTRACTED_TEXT"
 >;
 
 const FIELDS: { key: NumField; label: string; min: number; max: number; step: number }[] = [
@@ -43,6 +46,8 @@ export function GlobalSettings() {
   };
 
   const preLlmFilter = values.PRE_LLM_FILTER_ENABLED ?? true;
+  // Default OFF — legacy URL/metadata mode until the operator opts in.
+  const sendExtractedText = values.SEND_EXTRACTED_TEXT ?? false;
 
   const handleSave = async () => {
     setError(null);
@@ -90,6 +95,24 @@ export function GlobalSettings() {
                 {preLlmFilter
                   ? "Administrative filings (trading-window, compliance, newspaper notices) are skipped before the AI call."
                   : "Every filing is sent to the AI — including administrative noise (more cost, slower queue)."}
+              </span>
+            </div>
+          </div>
+          <div className="field" style={{ marginTop: 4 }}>
+            <label>Send extracted PDF text to AI</label>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <Toggle
+                on={sendExtractedText}
+                data-testid="send-extracted-text-toggle"
+                onChange={(next) => {
+                  setValues((prev) => ({ ...prev, SEND_EXTRACTED_TEXT: next }));
+                  setSaved(false);
+                }}
+              />
+              <span className="field-hint" style={{ marginTop: 0 }}>
+                {sendExtractedText
+                  ? "The filing PDF is downloaded and its relevant pages (Hindi removed) are sent to the AI as real text. Falls back to URL mode if extraction fails."
+                  : "Legacy mode: the AI gets only the PDF URL + headline metadata (no filing text)."}
               </span>
             </div>
           </div>

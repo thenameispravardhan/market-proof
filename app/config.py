@@ -209,6 +209,18 @@ class Settings(BaseSettings):
     # DeepSeek — no analyses, no signals, no auto trades. Manual trading
     # from the Trade page is unaffected. Toggleable from the Dashboard.
     AI_ANALYSIS_ENABLED: bool = True
+    # Extracted-text mode (Settings toggle). OFF (default) = the legacy
+    # behavior: DeepSeek gets the pdf_url + headline metadata only. ON =
+    # the analyzer downloads the filing PDF, extracts the relevant pages
+    # (Hindi half dropped, keyword-scored page selection), and sends the
+    # actual text to DeepSeek. Any download/extraction failure falls back
+    # to the legacy path — this mode can degrade but never block a signal.
+    SEND_EXTRACTED_TEXT: bool = False
+    # Budget knobs for extracted-text mode. The fetch timeout is deliberately
+    # short with no retries (the news spike decays in seconds); the char cap
+    # keeps the prompt near ~6k tokens so DeepSeek stays fast.
+    PDF_FETCH_TIMEOUT_SECONDS: float = 6.0
+    PDF_MAX_TEXT_CHARS: int = 24_000
     # Market session (IST, "HH:MM"). Entry window excludes the first
     # 15 min after open and the last 30 min before close; all intraday
     # positions are force-squared-off at SQUARE_OFF_TIME.

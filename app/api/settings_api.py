@@ -69,6 +69,11 @@ _GLOBAL_KEYS: dict[str, tuple[type, Any]] = {
     # Master switch for AI news analysis (Dashboard toggle). OFF = news is
     # still collected but never sent to the LLM, so no signals / auto trades.
     "AI_ANALYSIS_ENABLED": (bool, True),
+    # Extracted-text mode. OFF (default) = legacy behavior: DeepSeek gets
+    # the pdf_url + headline metadata only. ON = the filing PDF is
+    # downloaded and its relevant pages are extracted and sent as real
+    # text. Extraction failures always fall back to the legacy path.
+    "SEND_EXTRACTED_TEXT": (bool, False),
     # Intraday buying-power multiplier (Fyers MIS ~5x). Notional caps only —
     # risk-per-trade and loss limits always stay on real equity.
     "INTRADAY_LEVERAGE": (float, 5.0),

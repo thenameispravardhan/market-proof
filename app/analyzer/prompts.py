@@ -356,6 +356,53 @@ def append_announcement_context(
     )
 
 
+def append_extracted_document(
+    rendered: str,
+    *,
+    symbol: str,
+    exchange: str,
+    headline: str,
+    document_text: str,
+    pages_used: Optional[list[int]] = None,
+    pages_total: int = 0,
+    truncated: bool = False,
+) -> str:
+    """Ground the user prompt with the filing's ACTUAL extracted text.
+
+    Extracted-text mode's counterpart to `append_announcement_context`:
+    instead of telling the model it cannot open URLs, we hand it the
+    relevant pages of the PDF (Hindi half already dropped, pages selected
+    by relevance). The footer keeps the no-trade default: routine or
+    non-material filings must come back as HOLD with low confidence —
+    a BUY/SELL needs a specific fact from the document.
+    """
+    pages_note = ""
+    if pages_used and pages_total:
+        pages_note = (
+            f" (pages {', '.join(str(p) for p in pages_used)} of "
+            f"{pages_total}"
+            + ("; remaining pages omitted for length" if truncated else "")
+            + ")"
+        )
+    return (
+        f"{rendered}\n\n"
+        "Announcement metadata from the exchange feed (authoritative):\n"
+        f"- Company/symbol: {symbol} ({exchange})\n"
+        f"- Headline: {headline}\n\n"
+        f"Extracted text of the filing PDF{pages_note}:\n"
+        "-----BEGIN FILING TEXT-----\n"
+        f"{document_text}\n"
+        "-----END FILING TEXT-----\n\n"
+        "Base your analysis ONLY on the metadata and the filing text "
+        "above. Default to recommendation HOLD: most filings are routine "
+        "and not tradeable. Only recommend BUY or SELL when a specific "
+        "material fact in the filing text supports it, and cite that fact "
+        "in `reasoning`. If the text is insufficient or administrative, "
+        "use event_type OTHER, recommendation HOLD, and low `confidence`. "
+        "Never invent facts that are not in the text."
+    )
+
+
 def render_system_prompt(
     template: PromptTemplate,
     *,
@@ -385,9 +432,14 @@ _PLACEHOLDER_RE = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
 
 
 def _safe_replace(text: str, key: str, value: str) -> str:
-    """Replace `{{key}}` (with optional whitespace) with `value`."""
+    """Replace `{{key}}` (with optional whitespace) with `value`.
+
+    The replacement goes through a lambda so `value` is inserted
+    literally — re.sub would otherwise interpret backslashes / group
+    refs inside it (extracted PDF text routinely contains both).
+    """
     pattern = r"\{\{\s*" + re.escape(key) + r"\s*\}\}"
-    return re.sub(pattern, value, text)
+    return re.sub(pattern, lambda _m: value, text)
 
 
 # -- Default seed set ----------------------------------------------------

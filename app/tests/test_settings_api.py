@@ -206,3 +206,31 @@ def _drain(q, timeout: float):
             import time as _t
 
             _t.sleep(0.02)
+
+
+def test_send_extracted_text_toggle_roundtrip(client: TestClient) -> None:
+    """SEND_EXTRACTED_TEXT defaults OFF (legacy URL mode) and PUT toggles
+    it live — same contract as the other boolean switches."""
+    import os
+    from app.config import get_settings
+
+    saved = os.environ.get("SEND_EXTRACTED_TEXT")
+    try:
+        # Default is OFF — the legacy behavior is the default behavior.
+        assert client.get("/api/settings").json()["global"]["SEND_EXTRACTED_TEXT"] is False
+
+        r = client.put("/api/settings", json={"global": {"SEND_EXTRACTED_TEXT": True}})
+        assert r.status_code == 200, r.text
+        assert r.json()["global"]["SEND_EXTRACTED_TEXT"] is True
+        # Hot-applied to the live Settings (no restart).
+        assert get_settings().SEND_EXTRACTED_TEXT is True
+
+        r2 = client.put("/api/settings", json={"global": {"SEND_EXTRACTED_TEXT": False}})
+        assert r2.json()["global"]["SEND_EXTRACTED_TEXT"] is False
+        assert get_settings().SEND_EXTRACTED_TEXT is False
+    finally:
+        if saved is None:
+            os.environ.pop("SEND_EXTRACTED_TEXT", None)
+        else:
+            os.environ["SEND_EXTRACTED_TEXT"] = saved
+        get_settings.cache_clear()

@@ -1,0 +1,91 @@
+AI NEWS TRADING BOT — IMPROVEMENT PLAN
+=======================================
+(Consolidated roadmap. Constraint: NEVER destroy the existing setup — every new
+behavior ships behind a frontend toggle, defaulting to the current behavior.
+All controls live in the UI; no file sentinels or CLI gates.)
+
+PHASE 0 — MEASURE FIRST (1-2 days, run alongside Phase 1)
+---------------------------------------------------------
+ 1. Instrument per-stage latency: filing detected -> PDF downloaded ->
+    text extracted -> LLM responded -> signal persisted -> order placed.
+    Log per announcement; check DeepSeek latency_ms logs today.
+ 2. Confirm where the 30-40s actually goes (LLM vs detection lag vs
+    retries) before optimizing anything.
+
+PHASE 1 — REAL NEWS TEXT INTO THE PIPELINE (fixes wrong signals)
+----------------------------------------------------------------
+ 3. PDF prefetch in monitors (nse.py / bse.py): download the PDF
+    immediately on detection, in parallel with event publishing.
+ 4. Text extraction module (app/analyzer/pdf_extract.py) using PyMuPDF;
+    graceful handling of corrupt/encrypted files.
+ 5. Hindi filter: drop mostly-Devanagari lines (U+0900-U+097F).
+ 6. Page selection: keep pages 1-2 always, score the rest by event-type
+    keywords, cap at ~6-8k tokens.
+ 7. Scanned-PDF detection: no text layer -> mark unreadable, skip
+    (no OCR in the hot path).
+ 8. Prompt support for {{extracted_text}} alongside {{pdf_url}}.
+    TOGGLE (frontend Settings): "Send extracted PDF text to DeepSeek"
+    OFF (default) = current URL/metadata behavior, untouched.
+    ON = extracted text goes into the prompt; falls back to URL mode
+    if extraction fails.
+ 9. NO_TRADE as default stance in prompts: model must cite a fact from
+    the text to justify buy/sell; few-shot examples of routine filings
+    -> no-trade.
+
+PHASE 2 — TWO-TRACK SIGNALS (best trades stop waiting for the LLM)
+------------------------------------------------------------------
+10. Deterministic fast track: regex/number parsers for top event types
+    (order wins "order worth Rs X crore" vs market cap, resignations/
+    appointments, key results figures). Parse -> rules engine -> signal
+    in 1-2s, no LLM.
+11. XBRL parser for financial results: structured revenue/profit from
+    the exchange XBRL filing, deterministic QoQ comparison; PDF+LLM is
+    the fallback for results, not the default.
+12. Routing logic in the analyzer: high-conviction structured events
+    take the fast track; ambiguous ones go to the LLM track. Both feed
+    the same rules engine and risk checks.
+
+PHASE 3 — LLM TRACK UNDER ~8s
+-----------------------------
+13. Cut max_tokens 2000 -> ~400 in deepseek_client.py (compact JSON
+    verdict only).
+14. Benchmark providers on the real prompt during market hours:
+    DeepSeek vs Groq / Gemini Flash / Claude Haiku; pick whatever
+    reliably returns <= 5s.
+15. Tighten retries: one fast retry then discard (1s+2s+4s backoff
+    cannot fit the trading window).
+16. Hard end-to-end deadline: detect->signal over ~10-15s -> discard
+    (whole-pipeline extension of the staleness gate).
+17. Revisit MAX_NEWS_AGE_SECONDS = 90 once the pipeline is fast.
+
+PHASE 4 — DATA COLLECTION (passive; starts as soon as Phase 1 ships)
+--------------------------------------------------------------------
+18. Outcome logger per analysis: extracted text, event type, track
+    used, LLM/parser output, signal, price move at +5min/+30min/+1day
+    vs index.
+19. Review/export view: "signal vs what the stock did" for weekly
+    hand-correction of labels.
+
+PHASE 5 — PRE-FILTER MODEL (after ~1-2k logged announcements)
+-------------------------------------------------------------
+20. Weak-label materiality: "moved >X% vs index within 30 min".
+21. Train a small local classifier (FinBERT/IndicBERT-family, <100ms)
+    to kill routine noise before any LLM call; wire in as step 0.5
+    next to the staleness gate, fail-open.
+
+PHASE 6 — FINE-TUNING (only after 1-2 months of Phase 4 data)
+-------------------------------------------------------------
+22. Fine-tune for fact/event extraction, NOT buy-sell direction; the
+    rules engine stays the decision-maker.
+23. Backtest against logged history before it goes live.
+
+ONGOING
+-------
+24. Dashboard tile: p50/p95 detect-to-signal latency and signal
+    hit-rate in the UI (frontend-only-control rule).
+
+DEPENDENCIES
+------------
+Phase 0 runs alongside Phase 1 -> Phase 1 unlocks everything ->
+Phases 2 and 3 are independent of each other -> Phase 4 needs Phase 1
+-> Phase 5 needs Phase 4 -> Phase 6 needs months of Phase 4 data.
