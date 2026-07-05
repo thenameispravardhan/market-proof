@@ -37,6 +37,7 @@ import {
   useServerInfo,
 } from "../hooks/useApi";
 import { useLiveQuote } from "../hooks/useQuotes";
+import ChartPanel from "../components/trade/ChartPanel";
 import type {
   BrokerAccount,
   InstrumentHit,
@@ -119,10 +120,25 @@ function cleanError(raw: unknown, fallback: string): string {
   return s;
 }
 
+// Recently charted symbols (TradingView-watchlist-style quick switch).
+// Kept tiny and local: the last 8 instruments picked on this page.
+const RECENT_KEY = "trade:recent";
+
+function loadRecent(): InstrumentHit[] {
+  try {
+    const raw = localStorage.getItem(RECENT_KEY);
+    const list = raw ? (JSON.parse(raw) as InstrumentHit[]) : [];
+    return Array.isArray(list) ? list.filter((h) => h && h.symbol) : [];
+  } catch {
+    return [];
+  }
+}
+
 export default function Trade() {
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<InstrumentHit | null>(null);
   const [showResults, setShowResults] = useState(false);
+  const [recent, setRecent] = useState<InstrumentHit[]>(loadRecent);
 
   const { data: accounts } = useBrokerAccounts();
   // Trade page is REAL-MONEY ONLY. Filter out paper-mode rows.
@@ -231,6 +247,15 @@ export default function Trade() {
     setQuery(h.display);
     setLastResult(null);
     setSelectedExpiry(null); // load the nearest expiry for the new symbol
+    setRecent((prev) => {
+      const next = [h, ...prev.filter((r) => r.symbol !== h.symbol)].slice(0, 8);
+      try {
+        localStorage.setItem(RECENT_KEY, JSON.stringify(next));
+      } catch {
+        /* persistence is best-effort */
+      }
+      return next;
+    });
     if (h.instrument_type === "CE" || h.instrument_type === "PE") {
       setOrderType("MARKET");
       setProductType("NORMAL"); // F&O options default to NRML
@@ -408,6 +433,23 @@ export default function Trade() {
               : "↻ Load all NSE/BSE"}
           </button>
         </div>
+        {recent.length > 0 && (
+          <div className="trade-recent" data-testid="trade-recent">
+            <span className="trade-recent-label">recent</span>
+            {recent.map((h) => (
+              <button
+                key={h.symbol}
+                type="button"
+                className={`trade-recent-chip${selected?.symbol === h.symbol ? " on" : ""}`}
+                onClick={() => onSelect(h)}
+                title={h.symbol}
+                data-testid={`recent-chip-${h.symbol}`}
+              >
+                {h.short_name}
+              </button>
+            ))}
+          </div>
+        )}
         {showResults && query && (
           <div className="trade-search-results" data-testid="trade-search-results">
             {searching && <div className="hint">searching…</div>}
@@ -431,6 +473,17 @@ export default function Trade() {
           </div>
         )}
       </div>
+
+      {/* ---- TradingView-style chart for the selected instrument ----
+           key={symbol} remounts the panel per symbol so its internal
+           candle store, drawings, and pagination reset cleanly. */}
+      {selected && (
+        <ChartPanel
+          key={selected.symbol}
+          symbol={selected.symbol}
+          shortName={selected.short_name}
+        />
+      )}
 
       {/* ---- main grid: quote | ticket | pending ---- */}
       <div className="trade-grid">

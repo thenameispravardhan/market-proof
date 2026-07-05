@@ -7,6 +7,59 @@ import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import Trade from "../pages/Trade";
 
+// lightweight-charts needs a real <canvas>; jsdom has none. Stub the
+// whole engine so ChartPanel mounts and its toolbar renders, while the
+// chart surface itself is a no-op.
+vi.mock("lightweight-charts", () => {
+  const stubSeries = () => ({
+    setData: vi.fn(),
+    update: vi.fn(),
+    applyOptions: vi.fn(),
+    createPriceLine: vi.fn(() => ({ applyOptions: vi.fn() })),
+    removePriceLine: vi.fn(),
+    priceScale: vi.fn(() => ({ applyOptions: vi.fn() })),
+    coordinateToPrice: vi.fn(() => 100),
+    priceToCoordinate: vi.fn(() => 100),
+    attachPrimitive: vi.fn(),
+    detachPrimitive: vi.fn(),
+  });
+  return {
+    createChart: vi.fn(() => ({
+      addSeries: vi.fn(() => stubSeries()),
+      removeSeries: vi.fn(),
+      panes: vi.fn(() => []),
+      removePane: vi.fn(),
+      paneSize: vi.fn(() => ({ width: 800, height: 400 })),
+      takeScreenshot: vi.fn(() => document.createElement("canvas")),
+      priceScale: vi.fn(() => ({ applyOptions: vi.fn() })),
+      timeScale: vi.fn(() => ({
+        applyOptions: vi.fn(),
+        fitContent: vi.fn(),
+        scrollToRealTime: vi.fn(),
+        coordinateToLogical: vi.fn(() => 0),
+        logicalToCoordinate: vi.fn(() => 100),
+        subscribeVisibleLogicalRangeChange: vi.fn(),
+        unsubscribeVisibleLogicalRangeChange: vi.fn(),
+      })),
+      subscribeCrosshairMove: vi.fn(),
+      unsubscribeCrosshairMove: vi.fn(),
+      subscribeClick: vi.fn(),
+      unsubscribeClick: vi.fn(),
+      applyOptions: vi.fn(),
+      remove: vi.fn(),
+    })),
+    ColorType: { Solid: "solid" },
+    CrosshairMode: { Normal: 0, Magnet: 1 },
+    LineStyle: { Solid: 0, Dotted: 1, Dashed: 2, LargeDashed: 3, SparseDotted: 4 },
+    PriceScaleMode: { Normal: 0, Logarithmic: 1, Percentage: 2, IndexedTo100: 3 },
+    CandlestickSeries: {},
+    BarSeries: {},
+    LineSeries: {},
+    AreaSeries: {},
+    HistogramSeries: {},
+  };
+});
+
 function makeFetchStub(handler: (url: string, init?: RequestInit) => Response | Promise<Response>) {
   return vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input.toString();
@@ -78,6 +131,18 @@ function defaultStubs(overrides: Partial<{
     }
     if (url.includes("/api/search/symbols")) {
       return makeJsonResponse(SEARCH_RELIANCE);
+    }
+    if (url.includes("/api/market/history")) {
+      return makeJsonResponse({
+        ok: true,
+        symbol: "NSE:RELIANCE-EQ",
+        resolution: "5",
+        candles: [
+          [1750000000, 2440, 2455, 2438, 2450, 120000],
+          [1750000300, 2450, 2460, 2448, 2458, 98000],
+        ],
+        reason: null,
+      });
     }
     if (url.includes("/api/search/option-chain")) {
       return makeJsonResponse(overrides.optionChain ?? {

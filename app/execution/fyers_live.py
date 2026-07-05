@@ -1202,6 +1202,32 @@ class FyersLiveBackend:
         candles = data.get("candles") or data.get("data") or []
         return candles if isinstance(candles, list) else []
 
+    async def get_history_range(
+        self, symbol: str, *, resolution: str = "5", from_ts: int, to_ts: int
+    ) -> Optional[list[Any]]:
+        """OHLCV candles between two epoch bounds (for the Trade-page chart).
+
+        Unlike `get_history` (a days-back convenience for ATR), the chart
+        pages backwards through time and needs explicit epoch-second
+        bounds. Returns the raw `[[ts, o, h, l, c, v], ...]` list
+        (oldest→newest), `[]` when the broker genuinely has no candles in
+        the range, or None when the broker CALL failed — the API layer
+        maps None to `ok: false` so the chart can offer a retry instead
+        of rendering a misleading "no data". Never raises."""
+        try:
+            data = await self._client.get_history(
+                symbol,
+                resolution=resolution,
+                range_from=str(int(from_ts)),
+                range_to=str(int(to_ts)),
+                date_format=0,
+            )
+        except FyersAPIError as e:
+            log.warning("fyers.history_range.failed", symbol=symbol, error=str(e))
+            return None
+        candles = data.get("candles") or data.get("data") or []
+        return candles if isinstance(candles, list) else []
+
     # -- option chain (live, for the Trade page) ------------------------
 
     async def get_option_chain(

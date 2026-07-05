@@ -25,7 +25,7 @@ import asyncio
 import time
 from typing import Any, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 
 from app.execution.market_data import Quote
 from app.logging_config import get_logger
@@ -33,6 +33,13 @@ from app.logging_config import get_logger
 log = get_logger(__name__)
 
 router = APIRouter(tags=["market"])
+
+# Fyers timeframe codes the chart is allowed to request. Anything else
+# is rejected before it reaches the broker ("D" = daily, numbers are
+# minutes).
+CHART_RESOLUTIONS: frozenset[str] = frozenset(
+    {"1", "2", "3", "5", "10", "15", "20", "30", "45", "60", "120", "180", "240", "D"}
+)
 
 
 # key/name shown in the UI + the Fyers quote symbol.
@@ -250,6 +257,69 @@ async def _fetch_indices() -> dict[str, Any]:
         _cache["data"] = payload
         _cache["ts"] = now
         return payload
+
+
+# ---- chart history -------------------------------------------------------
+
+
+@router.get("/api/market/history")
+async def market_history(
+    symbol: str,
+    resolution: str = "5",
+    from_ts: int = Query(..., alias="from"),
+    to_ts: int = Query(..., alias="to"),
+) -> dict[str, Any]:
+    """OHLCV candles for the Trade-page chart.
+
+    `from`/`to` are epoch seconds (inclusive). `resolution` is a Fyers
+    timeframe code ("1", "5", "15", "60", "D", …). Candles come from the
+    connected real Fyers account — there is no public-feed fallback, so
+    the response degrades to `{ok: false, reason}` when Fyers isn't
+    connected. Always 200 so the chart can render an inline message.
+    """
+    sym = (symbol or "").strip().upper()
+    res = (resolution or "").strip().upper()
+    if not sym:
+        return {"ok": False, "reason": "symbol is required", "candles": []}
+    if res not in CHART_RESOLUTIONS:
+        return {
+            "ok": False,
+            "reason": f"unsupported resolution {resolution!r}",
+            "candles": [],
+        }
+    if to_ts <= from_ts:
+        return {"ok": False, "reason": "empty time range", "candles": []}
+
+    backend = _fyers_backend()
+    if backend is None or not hasattr(backend, "get_history_range"):
+        return {
+            "ok": False,
+            "reason": "connect a Fyers account for chart data",
+            "candles": [],
+        }
+    try:
+        candles = await backend.get_history_range(
+            sym, resolution=res, from_ts=from_ts, to_ts=to_ts
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("market.history.failed", symbol=sym, error=str(e))
+        return {"ok": False, "reason": f"history unavailable: {e!s}"[:120], "candles": []}
+    if candles is None:
+        # Broker call failed (e.g. cold start / transient) — distinct
+        # from an empty range so the chart can retry instead of showing
+        # a misleading "no data".
+        return {
+            "ok": False,
+            "reason": "broker history call failed — retrying may help",
+            "candles": [],
+        }
+    return {
+        "ok": True,
+        "symbol": sym,
+        "resolution": res,
+        "candles": candles,
+        "reason": None,
+    }
 
 
 @router.get("/api/market/indices")

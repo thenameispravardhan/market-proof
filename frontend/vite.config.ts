@@ -72,6 +72,7 @@ export default defineConfig({
           react: ["react", "react-dom"],
           query: ["@tanstack/react-query"],
           charts: ["recharts"],
+          lwcharts: ["lightweight-charts"],
         },
       },
     },

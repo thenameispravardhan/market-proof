@@ -441,3 +441,12 @@ export interface QuoteResponse {
   as_of?: string;
   reason?: string;
 }
+
+export interface HistoryResponse {
+  ok: boolean;
+  symbol?: string;
+  resolution?: string;
+  // Fyers candle rows: [epoch_s, open, high, low, close, volume]
+  candles?: number[][];
+  reason?: string | null;
+}
