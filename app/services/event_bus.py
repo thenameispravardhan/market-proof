@@ -45,18 +45,23 @@ class Event:
 
 
 class EventBus:
-    """Per-subscriber asyncio.Queue pub/sub."""
+    """Per-subscriber asyncio.Queue pub/sub.
+
+    Subscribe / unsubscribe operations snapshot the subscriber set so
+    the lock-free ``publish`` iteration is safe on CPython.  High-
+    frequency channels (e.g. quotes) use a ``list``-backed snapshot
+    for slightly faster iteration over the default ``set`` copy.
+    """
 
     def __init__(self, max_queue: int = _MAX_QUEUE) -> None:
-        self._subs: dict[str, set[asyncio.Queue[Event]]] = defaultdict(set)
+        self._subs: dict[str, list[asyncio.Queue[Event]]] = defaultdict(list)
         self._max_queue = max_queue
-        self._lock = asyncio.Lock()
 
     # -- subscriber side -------------------------------------------------
 
     def subscribe(self, channel: str) -> asyncio.Queue[Event]:
         q: asyncio.Queue[Event] = asyncio.Queue(maxsize=self._max_queue)
-        self._subs[channel].add(q)
+        self._subs[channel].append(q)
         log.debug("event_bus.subscribe", channel=channel, queue_id=id(q))
         return q
 
@@ -64,7 +69,10 @@ class EventBus:
         subs = self._subs.get(channel)
         if not subs:
             return
-        subs.discard(queue)
+        try:
+            subs.remove(queue)
+        except ValueError:
+            return
         if not subs:
             self._subs.pop(channel, None)
         log.debug("event_bus.unsubscribe", channel=channel, queue_id=id(queue))
@@ -78,7 +86,10 @@ class EventBus:
         event = Event(channel=channel, payload=payload)
         delivered = 0
         dropped = 0
-        for q in list(self._subs.get(channel, ())):
+        # Shallow-copy the subscriber list so the iteration is safe
+        # against concurrent subscribe / unsubscribe calls.
+        subs = list(self._subs.get(channel, ()))
+        for q in subs:
             try:
                 q.put_nowait(event)
                 delivered += 1
@@ -106,9 +117,10 @@ class EventBus:
         drain)."""
         event = Event(channel=channel, payload=payload)
         delivered = 0
+        subs = list(self._subs.get(channel, ()))
         try:
             async with asyncio.timeout(timeout):
-                for q in list(self._subs.get(channel, ())):
+                for q in subs:
                     await q.put(event)
                     delivered += 1
         except TimeoutError:

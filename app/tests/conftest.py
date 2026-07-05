@@ -35,6 +35,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
 from app import config as app_config  # noqa: E402
+from app.analyzer import service as analyzer_service  # noqa: E402
 from app.db import init as db_init  # noqa: E402
 from app.db import session as db_session_mod  # noqa: E402
 from app.db.session import Base  # noqa: E402
@@ -51,6 +52,13 @@ def _setup_in_memory_db() -> None:
     app_config.reset_settings_cache()
     db_session_mod.rebuild_engine_for_testing()
     db_init.init_db()
+
+
+@pytest.fixture(autouse=True)
+def _clear_pipeline_caches() -> None:
+    """Clear the analyzer's template / rules / sector-map caches before
+    every test so a cached row from one test doesn't leak into the next."""
+    analyzer_service._cache_clear()
 
 
 @pytest.fixture()

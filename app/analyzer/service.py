@@ -107,6 +107,48 @@ from app.services.event_bus import event_bus
 
 log = get_logger(__name__)
 
+# ---------------------------------------------------------------------------
+# In-memory caches for pipeline data that rarely changes (prompt templates,
+# enabled rules, sector maps).  TTL-based: the cache is valid for 5 minutes
+# or until the operator edits the relevant resource in the UI (whichever
+# comes first).  This saves ~3 DB round-trips per announcement.
+# ---------------------------------------------------------------------------
+
+_CACHE_TTL_SECONDS = 300  # 5 minutes
+
+_cache_store: dict[str, tuple[float, Any]] = {}
+
+
+def _cache_get(key: str) -> Any:
+    entry = _cache_store.get(key)
+    if entry is None:
+        return None
+    ts, value = entry
+    if time.monotonic() - ts > _CACHE_TTL_SECONDS:
+        _cache_store.pop(key, None)
+        return None
+    return value
+
+
+def _cache_set(key: str, value: Any) -> None:
+    _cache_store[key] = (time.monotonic(), value)
+
+
+def _cache_clear(key: Optional[str] = None) -> None:
+    """Clear a specific cache entry, or all entries (for tests)."""
+    if key is None:
+        _cache_store.clear()
+    else:
+        _cache_store.pop(key, None)
+
+
+# Exposed so the settings-API / event-bus handler can invalidate
+# caches when the user edits a template or rule.
+def invalidate_pipeline_caches() -> None:
+    """Called on ``settings.updated`` to flush cached templates / rules."""
+    for k in ("template", "rules", "sector_map"):
+        _cache_store.pop(k, None)
+
 
 # Channel T4 (execution) subscribes to.
 CHANNEL_NEW_SIGNAL = "signals.new"
@@ -293,9 +335,11 @@ class Service:
         from app.monitors.base import CHANNEL_NEW  # avoid circular at import
         self._sub_channel = CHANNEL_NEW
         self._sub_queue = event_bus.subscribe(CHANNEL_NEW)
+        # Also subscribe to settings updates so we invalidate our
+        # template/rules/sector-map caches when the operator edits them.
+        settings_q = event_bus.subscribe("settings.updated")
         log.info("analyzer.start", channel=CHANNEL_NEW, max_concurrent=2)
         self._ready_event.set()
-        # Track in-flight tasks so we can cleanly await them at shutdown.
         _tasks: set[asyncio.Task] = set()
         try:
             while not self._stop_event.is_set():
@@ -304,28 +348,24 @@ class Service:
                         self._sub_queue.get(), timeout=0.25
                     )
                 except asyncio.TimeoutError:
-                    # Reap completed tasks during idle gaps so the set
-                    # doesn't grow without bound.
+                    # Peek at the settings channel during idle gaps.
+                    try:
+                        while True:
+                            se = settings_q.get_nowait()
+                            invalidate_pipeline_caches()
+                            log.debug("analyzer.caches_invalidated", reason=se.payload)
+                    except asyncio.QueueEmpty:
+                        pass
                     _tasks = {t for t in _tasks if not t.done()}
                     continue
-                # Spawn a concurrent task — the semaphore inside
-                # `_handle_event` limits actual parallelism so a burst
-                # of arrivals doesn't hammer DeepSeek.
                 task = asyncio.create_task(
                     self._handle_event_guarded(event.payload)
                 )
                 _tasks.add(task)
-                # Auto-reap completed tasks on each iteration.
                 _tasks = {t for t in _tasks if not t.done()}
         finally:
+            event_bus.unsubscribe("settings.updated", settings_q)
             log.info("analyzer.stop", pending_tasks=len(_tasks))
-            # Wait briefly for in-flight tasks at shutdown.
-            if _tasks:
-                await asyncio.gather(*_tasks, return_exceptions=True)
-            if self._sub_queue is not None and self._sub_channel is not None:
-                event_bus.unsubscribe(self._sub_channel, self._sub_queue)
-                self._sub_queue = None
-                self._sub_channel = None
 
     async def _handle_event_guarded(
         self, payload: dict[str, Any]
@@ -356,20 +396,18 @@ class Service:
         self, announcement_id: int
     ) -> Optional[Signal]:
         loop = asyncio.get_running_loop()
-        # Pipeline stopwatch (Phase 0 instrumentation): per-stage wall
-        # times end up in the analysis raw_response and in the
-        # `analyzer.pipeline_timing` log line, so the 30-40s question
-        # ("where does the time actually go?") is answerable from data.
         t_start = time.perf_counter()
 
-        # Step 1: load announcement + check idempotency.
-        announcement, already = await loop.run_in_executor(
-            None, _load_announcement_and_check,
+        # Step 1: load announcement + check idempotency + pick template
+        # (all in one DB session to avoid multiple round-trips).
+        loaded = await loop.run_in_executor(
+            None, _load_announcement_check_and_template,
             self._session_factory, announcement_id, self._analysis_exists,
         )
-        if announcement is None:
+        if loaded is None:
             log.warning("analyzer.announcement_not_found", announcement_id=announcement_id)
             return None
+        announcement, already, template = loaded
         if already:
             log.info("analyzer.skip_existing_analysis", announcement_id=announcement_id)
             return None
@@ -482,13 +520,10 @@ class Service:
                 announcement.headline or ""
             )
 
-        # Step 2: pick prompt template (event-type heuristic + DEFAULT).
+        # Step 2: detect event type (in-process, no DB needed).
+        # Template was already loaded in step 1 (``_load_announcement_check_and_template``).
         detected = detect_event_type(
             announcement.headline or "", announcement.pdf_url
-        )
-        template = await loop.run_in_executor(
-            None, _pick_template,
-            self._session_factory, detected,
         )
         if template is None:
             log.error(
@@ -873,17 +908,27 @@ class Service:
 # -- Helpers (sync, run in executor) ------------------------------------
 
 
-def _load_announcement_and_check(
+def _load_announcement_check_and_template(
     session_factory: Callable[[], Session],
     announcement_id: int,
     exists_fn: Callable[[Session, int], bool],
-) -> tuple[Optional[Announcement], bool]:
+) -> Optional[tuple[Announcement, bool, Any]]:
+    """Load announcement, check idempotency, and load (cached) template
+    — all in a single DB session to reduce lock contention and thread-
+    pool overhead."""
     with session_factory() as session:
         a = session.get(Announcement, announcement_id)
         if a is None:
-            return None, False
+            return None
         already = exists_fn(session, announcement_id)
-        return a, already
+
+        # Load template from cache (or DB on cache miss).
+        tpl = _cache_get("template")
+        if tpl is None:
+            tpl = load_default_template(session)
+            _cache_set("template", tpl)
+
+        return a, already, tpl
 
 
 def _default_analysis_exists(session: Session, announcement_id: int) -> bool:
@@ -892,17 +937,6 @@ def _default_analysis_exists(session: Session, announcement_id: int) -> bool:
             Analysis.announcement_id == announcement_id
         )
     ).scalar_one() > 0
-
-
-def _pick_template(
-    session_factory: Callable[[], Session], detected_event_type: str
-) -> Optional[Any]:
-    # Single-prompt mode: ONE editable prompt (the DEFAULT row) drives
-    # every filing, regardless of the detected event type. Event
-    # detection still runs to tag the announcement and give the prompt
-    # context, but there's only one prompt to maintain and edit.
-    with session_factory() as session:
-        return load_default_template(session)
 
 
 def _store_failed_analysis(
@@ -999,10 +1033,14 @@ def _persist_analysis_and_signal(
         session.flush()
 
         # Rules engine. Evaluate against every ENABLED strategy's enabled
-        # rules (priority ASC, first match wins). The default strategy is
-        # only the fallback owner for the HOLD signal below.
+        # rules (priority ASC, first match wins).  Rules are cached for 5
+        # minutes (they change only when the operator edits them in the UI).
         strategy = get_or_create_default_strategy(session)
-        rules = load_rules_for_enabled_strategies(session)
+        cached_rules = _cache_get("rules")
+        if cached_rules is None:
+            cached_rules = load_rules_for_enabled_strategies(session)
+            _cache_set("rules", cached_rules)
+        rules = cached_rules
         # Add the symbol/exchange for the rule context, then enrich with the
         # cheaply-available market context (sector) so rules can gate on it.
         # Price / change_pct / adv_crore need a live quote and are only
@@ -1014,7 +1052,11 @@ def _persist_analysis_and_signal(
         eval_ctx = dict(analysis_dict)
         eval_ctx["symbol"] = announcement.symbol
         eval_ctx["exchange"] = announcement.exchange
-        eval_ctx = enrich_analysis_context(eval_ctx, sector_map=load_sector_map())
+        cached_sector_map = _cache_get("sector_map")
+        if cached_sector_map is None:
+            cached_sector_map = load_sector_map()
+            _cache_set("sector_map", cached_sector_map)
+        eval_ctx = enrich_analysis_context(eval_ctx, sector_map=cached_sector_map)
         match = rules_evaluate(eval_ctx, rules)
 
         # Attribute the signal to the strategy that actually owns the

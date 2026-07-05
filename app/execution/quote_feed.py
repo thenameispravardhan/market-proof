@@ -156,6 +156,11 @@ class QuoteFeed:
             log.info("quote_feed.stop")
 
     async def _tick_all(self) -> None:
+        # No watched symbols → nobody needs quotes → skip entirely.
+        # Saves the CPU cost of random-walking a paper portfolio when
+        # the dashboard is closed and no positions are open.
+        if not self._watched:
+            return
         for symbol in list(self._watched.keys()):
             try:
                 # If the realtime Fyers WebSocket has published a fresh tick

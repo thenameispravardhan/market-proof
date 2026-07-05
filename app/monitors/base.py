@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional, Union
 
 try:
@@ -190,8 +190,6 @@ class BaseMonitor:
         # When no explicit interval is passed, `_poll_interval`
         # re-reads the live setting on every loop iteration so a UI
         # change applies on the next tick without a restart.
-        # `poll_interval` is already typed `Optional[float]`, so the
-        # explicit `float(...)` cast is redundant.
         self._poll_interval_fixed: Optional[float] = poll_interval
         if source_url is not None:
             self.source_url = source_url
@@ -199,6 +197,11 @@ class BaseMonitor:
         self._task: Optional[asyncio.Task[None]] = None
         self._consecutive_failures = 0
         self._current_backoff = reset_backoff()
+        # Cursor-based dedup: track the most recent `posted_at` seen
+        # so the next tick can skip already-processed rows early,
+        # avoiding redundant DB existence checks for 99% of the
+        # day-long response window.
+        self._last_seen: Optional[datetime] = None
 
     @property
     def _poll_interval(self) -> float:
@@ -322,7 +325,7 @@ class BaseMonitor:
             log.info("monitor.stop", exchange=self.exchange)
 
     async def _tick(self) -> None:
-        """One poll cycle: fetch -> parse -> insert -> publish -> webhook."""
+        """One poll cycle: fetch -> parse -> early-exit -> insert -> publish -> webhook."""
         raw = await self._fetcher(self.source_url)
         try:
             raws = self._parser(raw, self.source_url)
@@ -332,7 +335,31 @@ class BaseMonitor:
             # Parser errors are usually structural (page layout changed) —
             # treat as retryable; the operator can fix the parser.
             raise _RetryableError(f"parse failed: {e}") from e
+
+        # Early-exit: skip rows whose posted_at is at or before our
+        # last-seen cursor (with a 5s overlap window so we don't miss
+        # rows that arrived during this tick with the same timestamp).
+        if self._last_seen is not None and raws:
+            cutoff = self._last_seen - timedelta(seconds=5)
+            before = len(raws)
+            raws = [r for r in raws if r.posted_at > cutoff]
+            skipped = before - len(raws)
+            if skipped:
+                log.debug(
+                    "monitor.early_exit",
+                    exchange=self.exchange,
+                    total=before,
+                    kept=len(raws),
+                    skipped=skipped,
+                )
+
         log.debug("monitor.fetched", exchange=self.exchange, count=len(raws))
+
+        # Update the last-seen cursor to the newest row we encountered.
+        for r in raws:
+            if self._last_seen is None or r.posted_at > self._last_seen:
+                self._last_seen = r.posted_at
+
         for raw_a in raws:
             try:
                 await self._insert_and_announce(raw_a)

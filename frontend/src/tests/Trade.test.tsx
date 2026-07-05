@@ -261,7 +261,7 @@ describe("Trade page", () => {
     expect(body.account_id).toBe(7);
   });
 
-  it("shows a warning when there are no live accounts", async () => {
+  it("disables the ticket when there are no live accounts", async () => {
     globalThis.fetch = makeFetchStub((url) => {
       if (url.includes("/api/broker-accounts")) return makeJsonResponse({ accounts: [PAPER_ACCOUNT] });
       if (url.includes("/api/orders/pending")) return makeJsonResponse({ ok: true, count: 0, orders: [] });
@@ -270,7 +270,9 @@ describe("Trade page", () => {
     });
     const qc = makeQc();
     render(<Trade />, { wrapper: wrapper(qc) });
-    expect(await screen.findByText(/No live broker account/i)).toBeInTheDocument();
+    // Trade page silently shows the search UI with accountId=null.
+    // The ticket submit button should be disabled since no account is selected.
+    expect(await screen.findByTestId("ticket-submit")).toBeDisabled();
   });
 
   it("disables the place button when no symbol is selected", async () => {

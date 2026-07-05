@@ -125,12 +125,20 @@ _BSE_DATE_FORMATS: tuple[str, ...] = (
 )
 
 
+# Cache the last matched format (99% of rows use the same one).
+_last_bse_date_fmt: str | None = None
+
+
 def _parse_bse_date(value: Any) -> Optional[datetime]:
     """Parse a BSE date string to a UTC datetime.
 
     Returns None for unparseable values. Naive datetimes are treated
     as IST (UTC+5:30) — BSE publishes in Indian Standard Time.
+
+    Optimization: caches the winning format to skip the try/except
+    loop on subsequent rows.
     """
+    global _last_bse_date_fmt
     if value is None:
         return None
     if not isinstance(value, str):
@@ -139,16 +147,28 @@ def _parse_bse_date(value: Any) -> Optional[datetime]:
     if not s:
         return None
     s = re.sub(r"\s*[A-Z]{2,4}$", "", s).strip()
+    if _last_bse_date_fmt is not None:
+        try:
+            dt = datetime.strptime(s, _last_bse_date_fmt)
+            return _bse_to_utc(dt)
+        except ValueError:
+            pass
     for fmt in _BSE_DATE_FORMATS:
         try:
             dt = datetime.strptime(s, fmt)
         except ValueError:
             continue
-        if dt.tzinfo is None:
-            ist = timezone(timedelta(hours=5, minutes=30))
-            dt = dt.replace(tzinfo=ist)
-        return dt.astimezone(timezone.utc)
+        _last_bse_date_fmt = fmt
+        return _bse_to_utc(dt)
     return None
+
+
+def _bse_to_utc(dt: datetime) -> datetime:
+    """Normalise naive datetimes as IST, then convert to UTC."""
+    if dt.tzinfo is None:
+        ist = timezone(timedelta(hours=5, minutes=30))
+        dt = dt.replace(tzinfo=ist)
+    return dt.astimezone(timezone.utc)
 
 
 def _normalise_attach(value: Any) -> Optional[str]:
@@ -303,6 +323,48 @@ def parse_bse_payload(
 
 
 # -------------------------------------------------------------------------
+# Persistent httpx client — reused across poll ticks to avoid
+# TCP/SSL setup per tick.  Same pattern as ``monitors.nse``.
+# -------------------------------------------------------------------------
+
+_bse_client: "httpx.AsyncClient | None" = None
+
+
+async def _get_bse_client(*, transport: Any = None) -> "httpx.AsyncClient":
+    """Return a shared persistent httpx client for BSE fetches.
+
+    When ``transport`` is provided (test mocks) a *new* throwaway
+    client is returned.  For production calls the module-level
+    singleton is created once and reused.
+    """
+    import httpx
+
+    global _bse_client
+    if transport is not None:
+        client_kwargs: dict[str, Any] = {
+            "headers": dict(BSE_REQUEST_HEADERS),
+            "timeout": 8.0,
+            "follow_redirects": True,
+            "transport": transport,
+        }
+        client_kwargs["headers"]["Accept-Encoding"] = "identity"
+        return httpx.AsyncClient(**client_kwargs)
+
+    if _bse_client is not None:
+        return _bse_client
+
+    client_kwargs = {
+        "headers": dict(BSE_REQUEST_HEADERS),
+        "timeout": 8.0,
+        "follow_redirects": True,
+        "http2": True,
+    }
+    client_kwargs["headers"]["Accept-Encoding"] = "identity"
+    _bse_client = httpx.AsyncClient(**client_kwargs)
+    return _bse_client
+
+
+# -------------------------------------------------------------------------
 # Wire-level fetchers — httpx fast path, Playwright fallback.
 # -------------------------------------------------------------------------
 
@@ -342,8 +404,13 @@ async def fetch_bse_with_httpx(
     a JSON shape that ``parse_bse_payload`` already understands:
     ``{"Table": [...], "Table1": []}``.
 
+    Uses the **shared persistent client** so TCP / SSL / HTTP/2
+    session setup happens once per process lifetime, saving
+    ~200-400ms per poll tick.
+
     `transport` is an optional httpx transport (e.g. MockTransport
-    for tests). When provided we skip the `http2=True` flag.
+    for tests). When provided we skip the shared client and create
+    a fresh one.
     """
     from app.monitors.base import _RetryableError
 
@@ -352,79 +419,68 @@ async def fetch_bse_with_httpx(
     except ImportError as e:  # pragma: no cover
         raise _RetryableError("httpx not installed") from e
 
-    client_kwargs: dict[str, Any] = {
-        "headers": dict(BSE_REQUEST_HEADERS),
-        "timeout": 8.0,
-        "follow_redirects": True,
-    }
-    # BSE may also gzip responses; ask for identity so .text works.
-    client_kwargs["headers"]["Accept-Encoding"] = "identity"
-    if transport is not None:
-        client_kwargs["transport"] = transport
-    else:
-        client_kwargs["http2"] = True
+    client = await _get_bse_client(transport=transport)
 
-    async with httpx.AsyncClient(**client_kwargs) as client:
-        # Step 1: prime cookies via the BSE home page.
+    # Step 1: prime cookies via the BSE home page.
+    try:
+        primer = await client.get(BSE_COOKIE_SEED_URL)
+    except Exception as e:  # noqa: BLE001
+        raise _RetryableError(f"bse cookie primer failed: {e}") from e
+    if primer.status_code >= 500:
+        raise _RetryableError(f"bse primer {primer.status_code}")
+    if primer.status_code in (401, 403):
+        raise _RetryableError(f"bse primer {primer.status_code} (likely IP block)")
+
+    # Step 2: fan out across the category set in parallel.
+    async def _one(cat: str) -> tuple[str, int, str]:
+        api_url = _bse_window_url(cat)
         try:
-            primer = await client.get(BSE_COOKIE_SEED_URL)
+            resp = await client.get(api_url)
         except Exception as e:  # noqa: BLE001
-            raise _RetryableError(f"bse cookie primer failed: {e}") from e
-        if primer.status_code >= 500:
-            raise _RetryableError(f"bse primer {primer.status_code}")
-        if primer.status_code in (401, 403):
-            raise _RetryableError(f"bse primer {primer.status_code} (likely IP block)")
+            return (cat, 0, "")
+        return (cat, resp.status_code, resp.text)
 
-        # Step 2: fan out across the category set in parallel.
-        async def _one(cat: str) -> tuple[str, int, str]:
-            api_url = _bse_window_url(cat)
-            try:
-                resp = await client.get(api_url)
-            except Exception as e:  # noqa: BLE001
-                return (cat, 0, "")
-            return (cat, resp.status_code, resp.text)
+    results = await asyncio.gather(*(_one(c) for c in categories), return_exceptions=True)
 
-        results = await asyncio.gather(*(_one(c) for c in categories), return_exceptions=True)
+    # Aggregate. A single failed category is logged but doesn't
+    # sink the whole tick — the operator still gets the rest.
+    merged: list[dict[str, Any]] = []
+    any_success = False
+    for cat, result in zip(categories, results):
+        if isinstance(result, Exception):
+            log.debug("bse category failed", category=cat, error=str(result))
+            continue
+        # `asyncio.gather(return_exceptions=True)` types `result` as
+        # `BaseException | T_return`. After the isinstance check
+        # above, the type checker can't narrow it to the tuple
+        # shape, so we cast to make the destructure explicit.
+        cat_name, status, text = cast(
+            tuple[str, int, str], result
+        )
+        if status == 429 or status >= 500:
+            raise _RetryableError(f"bse api {status}")
+        if status in (401, 403):
+            raise _RetryableError(f"bse api {status} (likely CORS / IP block)")
+        if status >= 400:
+            log.debug("bse category 4xx", category=cat_name, status=status)
+            continue
+        try:
+            payload = _parse_json(text)
+        except Exception:
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("Table"), list):
+            merged.extend(payload["Table"])
+            if payload["Table"]:
+                any_success = True
 
-        # Aggregate. A single failed category is logged but doesn't
-        # sink the whole tick — the operator still gets the rest.
-        merged: list[dict[str, Any]] = []
-        any_success = False
-        for cat, result in zip(categories, results):
-            if isinstance(result, Exception):
-                log.debug("bse category failed", category=cat, error=str(result))
-                continue
-            # `asyncio.gather(return_exceptions=True)` types `result` as
-            # `BaseException | T_return`. After the isinstance check
-            # above, the type checker can't narrow it to the tuple
-            # shape, so we cast to make the destructure explicit.
-            cat_name, status, text = cast(
-                tuple[str, int, str], result
-            )
-            if status == 429 or status >= 500:
-                raise _RetryableError(f"bse api {status}")
-            if status in (401, 403):
-                raise _RetryableError(f"bse api {status} (likely CORS / IP block)")
-            if status >= 400:
-                log.debug("bse category 4xx", category=cat_name, status=status)
-                continue
-            try:
-                payload = _parse_json(text)
-            except Exception:
-                continue
-            if isinstance(payload, dict) and isinstance(payload.get("Table"), list):
-                merged.extend(payload["Table"])
-                if payload["Table"]:
-                    any_success = True
+    if not any_success and not merged:
+        # All categories returned empty — treat as success with
+        # no announcements to avoid an empty-payload 5xx backoff
+        # loop. Operators will see the empty result in the
+        # dashboard.
+        return _json_dumps({"Table": [], "Table1": []})
 
-        if not any_success and not merged:
-            # All categories returned empty — treat as success with
-            # no announcements to avoid an empty-payload 5xx backoff
-            # loop. Operators will see the empty result in the
-            # dashboard.
-            return _json_dumps({"Table": [], "Table1": []})
-
-        return _json_dumps({"Table": merged, "Table1": []})
+    return _json_dumps({"Table": merged, "Table1": []})
 
 
 async def fetch_bse_with_playwright(

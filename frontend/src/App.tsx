@@ -24,13 +24,14 @@ function readSidebarOpen(): boolean {
   }
 }
 
-// Eager-load pages — the bundle is small enough that lazy() isn't needed,
-// but we lazy-load the backtest/settings pages to keep initial paint fast.
-import Dashboard from "./pages/Dashboard";
-import Prompts from "./pages/Prompts";
+// All pages are lazy-loaded so the initial JS bundle transfers
+// only what's needed for the first paint.  Suspense in the render
+// tree handles the loading fallback.
 
+const Dashboard = lazy(() => import("./pages/Dashboard"));
 const Trade = lazy(() => import("./pages/Trade"));
 const TradeHistory = lazy(() => import("./pages/TradeHistory"));
+const Prompts = lazy(() => import("./pages/Prompts"));
 const Rules = lazy(() => import("./pages/Rules"));
 const Strategies = lazy(() => import("./pages/Strategies"));
 const Accounts = lazy(() => import("./pages/Accounts"));

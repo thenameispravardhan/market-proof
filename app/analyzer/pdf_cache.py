@@ -33,6 +33,10 @@ log = get_logger(__name__)
 
 TTL_SECONDS = 600.0     # a prefetched PDF older than this is useless anyway
 MAX_ENTRIES = 64
+# Limit concurrent PDF downloads so a burst of filings doesn't
+# saturate the network link. 3 parallel downloads is enough to
+# keep the analyzer supplied without overwhelming the connection.
+_download_semaphore = asyncio.Semaphore(3)
 
 _cache: dict[str, tuple[float, "asyncio.Task[Optional[bytes]]"]] = {}
 
@@ -49,7 +53,11 @@ def _evict() -> None:
 
 
 def prefetch(url: Optional[str], *, timeout_s: float = 6.0) -> None:
-    """Fire-and-forget download start. Deduped by URL; never raises."""
+    """Fire-and-forget download start. Deduped by URL; never raises.
+
+    Downloads are rate-limited by ``_download_semaphore`` (max 3
+    concurrent) so a burst of filings doesn't saturate the network.
+    """
     if not url:
         return
     try:
@@ -57,7 +65,7 @@ def prefetch(url: Optional[str], *, timeout_s: float = 6.0) -> None:
             return
         _evict()
         task = asyncio.get_running_loop().create_task(
-            download_pdf(url, timeout_s=timeout_s), name="pdf-prefetch"
+            _bounded_download(url, timeout_s=timeout_s), name="pdf-prefetch"
         )
         # A failed prefetch must never surface as an "unretrieved
         # exception" warning — get_pdf handles the None/raise either way.
@@ -67,6 +75,12 @@ def prefetch(url: Optional[str], *, timeout_s: float = 6.0) -> None:
         # No running loop (sync test context) — skip silently; the
         # analyzer will download directly.
         pass
+
+
+async def _bounded_download(url: str, *, timeout_s: float = 6.0) -> Optional[bytes]:
+    """Download a PDF under the concurrency semaphore."""
+    async with _download_semaphore:
+        return await download_pdf(url, timeout_s=timeout_s)
 
 
 async def get_pdf(url: Optional[str], *, timeout_s: float = 6.0) -> Optional[bytes]:
