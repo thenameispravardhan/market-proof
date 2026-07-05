@@ -302,6 +302,9 @@ export interface GlobalSettings {
   // Hard end-to-end deadline (seconds from filing to signal). Late signals
   // are stored but blocked. 0 = disabled.
   PIPELINE_DEADLINE_SECONDS: number;
+  // Passive price tracking (+5m/+30m) for every signal into
+  // signal_outcomes — the win-rate report and future ML dataset.
+  OUTCOME_LOGGER_ENABLED: boolean;
   // Intraday buying-power multiplier (Fyers MIS ~5x). Notional caps only —
   // risk-per-trade and loss limits always stay on real equity.
   INTRADAY_LEVERAGE: number;

@@ -15,10 +15,11 @@ PHASE 0 — MEASURE FIRST (1-2 days, run alongside Phase 1)
 
 PHASE 1 — REAL NEWS TEXT INTO THE PIPELINE (fixes wrong signals)
 ----------------------------------------------------------------
- 3. [PENDING] PDF prefetch in monitors (nse.py / bse.py): download the
-    PDF immediately on detection, in parallel with event publishing.
-    (Today the analyzer downloads at analysis time — works, but the
-    fetch could overlap with the event hop.)
+ 3. [DONE] PDF prefetch in monitors: the moment a filing is detected
+    (and extracted-text mode or fast track is ON, and the title is not
+    administrative junk) the download starts in the background
+    (app/analyzer/pdf_cache.py); the analyzer reads cache-first. Saves
+    0.2-1.2s per analysis.
  4. [DONE] Text extraction module (app/analyzer/pdf_extract.py),
     PyMuPDF, graceful failure -> legacy fallback.
  5. [DONE] Hindi filter (Devanagari-dominant lines dropped).
@@ -40,9 +41,12 @@ PHASE 2 — TWO-TRACK SIGNALS (best trades stop waiting for the LLM)
     order win with explicit Rs-crore value (confidence tiers by size),
     KMP resignation (MD/CEO/CFO/WTD/chairman, succession-guarded),
     buyback with value. "Deterministic fast track" toggle in Settings,
-    default OFF. KNOWN GAP: deal value is not scaled vs market cap —
-    gate with rules (deal_value_inr_crore thresholds) until a
-    market-cap feed lands.
+    default OFF. PLUS the HYBRID path: order-context headline with no
+    value (typical NSE phrasing) -> value parsed deterministically from
+    the filing PDF text near the order mention (~1s, still no LLM);
+    cancellation wording anywhere in the text kills it. KNOWN GAP:
+    deal value is not scaled vs market cap — gate with rules
+    (deal_value_inr_crore thresholds) until a market-cap feed lands.
 11. [DEFERRED] XBRL parser for financial results: needs live NSE/BSE
     XBRL attachment URLs + taxonomy mapping — build against real
     filings during market hours, not blind.
@@ -76,11 +80,17 @@ PHASE 3 — LLM TRACK UNDER ~8s
 
 PHASE 4 — DATA COLLECTION (passive; starts as soon as Phase 1 ships)
 --------------------------------------------------------------------
-18. Outcome logger per analysis: extracted text, event type, track
-    used, LLM/parser output, signal, price move at +5min/+30min/+1day
-    vs index.
-19. Review/export view: "signal vs what the stock did" for weekly
-    hand-correction of labels.
+18. [DONE] Outcome logger (app/services/outcome_logger.py +
+    signal_outcomes table): for EVERY signal (approved AND blocked)
+    records the Fyers price at signal time and +5m/+30m with % moves
+    and a data-quality note. "Signal outcome tracking" toggle in
+    Settings, default ON (pure telemetry). +1d dropped by design —
+    the strategy is intraday-only. Analysis inputs (extracted text,
+    track, timings) already live on analyses.raw_response; join via
+    signal_id. Restart loses in-flight samples (rows keep a note).
+19. [PENDING] Review/export view: "signal vs what the stock did" for
+    weekly review — a Settings/Dashboard table over signal_outcomes,
+    or a CSV export endpoint.
 
 PHASE 5 — PRE-FILTER MODEL (after ~1-2k logged announcements)
 -------------------------------------------------------------

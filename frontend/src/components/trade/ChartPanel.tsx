@@ -33,6 +33,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   AreaSeries,
   BarSeries,
+  BaselineSeries,
   CandlestickSeries,
   ColorType,
   createChart,
@@ -59,6 +60,8 @@ import {
   cci,
   donchian,
   ema,
+  heikinAshi,
+  heikinAshiBar,
   ichimoku,
   macd,
   mfi,
@@ -104,19 +107,24 @@ const TIMEFRAMES: Timeframe[] = [
   { label: "1m", res: "1", initialDays: 7, chunkDays: 7 },
   { label: "3m", res: "3", initialDays: 15, chunkDays: 15 },
   { label: "5m", res: "5", initialDays: 20, chunkDays: 20 },
+  { label: "10m", res: "10", initialDays: 40, chunkDays: 40 },
   { label: "15m", res: "15", initialDays: 60, chunkDays: 60 },
   { label: "30m", res: "30", initialDays: 90, chunkDays: 90 },
   { label: "1h", res: "60", initialDays: 100, chunkDays: 100 },
+  { label: "2h", res: "120", initialDays: 100, chunkDays: 100 },
+  { label: "4h", res: "240", initialDays: 100, chunkDays: 100 },
   { label: "1D", res: "D", initialDays: 365, chunkDays: 365 },
 ];
 
-type ChartKind = "candles" | "bars" | "line" | "area";
+type ChartKind = "candles" | "heikin" | "bars" | "line" | "area" | "baseline";
 
 const CHART_KINDS: { id: ChartKind; label: string; title: string }[] = [
   { id: "candles", label: "Candle", title: "Candlestick chart" },
+  { id: "heikin", label: "HA", title: "Heikin Ashi (smoothed candles)" },
   { id: "bars", label: "Bar", title: "OHLC bar chart" },
   { id: "line", label: "Line", title: "Line chart (close)" },
   { id: "area", label: "Area", title: "Area chart (close)" },
+  { id: "baseline", label: "Base", title: "Baseline chart (vs first loaded close)" },
 ];
 
 type IndicatorId =
@@ -174,9 +182,16 @@ const DRAW_TOOLS: { id: DrawingType; label: string; hint: string }[] = [
   { id: "text", label: "T Text note", hint: "click where the note goes" },
 ];
 
-type DrawMode = DrawingType | "alert" | null;
+type DrawMode = DrawingType | "alert" | "ticket" | null;
 type MenuId = "ind" | "draw" | "alerts" | "compare" | null;
 type ScaleMode = "normal" | "log" | "percent";
+
+/** A broker-state line drawn on the chart (position avg / pending order). */
+export interface BrokerLine {
+  price: number;
+  title: string;
+  kind: "position-long" | "position-short" | "order";
+}
 
 const COMPARE_COLORS = ["#42A5F5", "#AB47BC", "#26C6DA", "#FFCA28"];
 
@@ -291,6 +306,7 @@ interface ChartPrefs {
   active?: Partial<Record<IndicatorId, boolean>>;
   magnet?: boolean;
   scaleMode?: ScaleMode;
+  volumeOn?: boolean;
 }
 
 /** Fetch + normalise one page of candles (sorted, deduped, IST-shifted). */
@@ -351,9 +367,15 @@ interface ChartStatus {
 export default function ChartPanel({
   symbol,
   shortName,
+  brokerLines,
+  onPickPrice,
 }: {
   symbol: string;
   shortName: string;
+  /** Position-average / pending-order levels to mark on the chart. */
+  brokerLines?: BrokerLine[];
+  /** When set, the "→ Ticket" tool sends a clicked price to the caller. */
+  onPickPrice?: (price: number) => void;
 }) {
   const prefs = useRef(loadJson<ChartPrefs>(PREFS_KEY, {})).current;
 
@@ -379,6 +401,8 @@ export default function ChartPanel({
   const [compareHits, setCompareHits] = useState<{ symbol: string; name: string }[]>([]);
   const [scaleMode, setScaleMode] = useState<ScaleMode>(prefs.scaleMode ?? "normal");
   const [magnet, setMagnet] = useState<boolean>(prefs.magnet ?? false);
+  const [volumeOn, setVolumeOn] = useState<boolean>(prefs.volumeOn ?? true);
+  const [atLive, setAtLive] = useState(true);
   const [toasts, setToasts] = useState<{ id: number; text: string }[]>([]);
   const [textDraft, setTextDraft] = useState<{
     x: number;
@@ -398,9 +422,18 @@ export default function ChartPanel({
   const chartRef = useRef<IChartApi | null>(null);
   const mainRef = useRef<ISeriesApi<SeriesType> | null>(null);
   const volumeRef = useRef<ISeriesApi<"Histogram"> | null>(null);
-  const indicatorSeriesRef = useRef<ISeriesApi<SeriesType>[]>([]);
+  // Indicator series with their data recipes: `compute` re-derives the
+  // series data from the candle array, so pagination and live bars can
+  // refresh values via setData WITHOUT tearing panes down (no flicker).
+  const indicatorSeriesRef = useRef<
+    { series: ISeriesApi<SeriesType>; compute: (candles: Candle[]) => unknown[] }[]
+  >([]);
   const compareSeriesRef = useRef<Map<string, ISeriesApi<"Line">>>(new Map());
   const alertLinesRef = useRef<Map<string, IPriceLine>>(new Map());
+  const brokerLinesRef = useRef<IPriceLine[]>([]);
+  // HA open/close of the bar BEFORE the live bar (live HA updates).
+  const prevHaRef = useRef<{ open: number; close: number } | null>(null);
+  const atLiveRef = useRef(true);
   const colorsRef = useRef<ThemeColors>(readThemeColors());
   const candlesRef = useRef<Candle[]>([]);
   const indexByTimeRef = useRef<Map<number, number>>(new Map());
@@ -653,6 +686,30 @@ export default function ChartPanel({
     const candles = candlesRef.current;
     if (chartKind === "line" || chartKind === "area") {
       s.setData(candles.map((c) => ({ time: c.time, value: c.close })));
+    } else if (chartKind === "baseline") {
+      try {
+        s.applyOptions({
+          baseValue: { type: "price", price: candles[0]?.close ?? 0 },
+        } as never);
+      } catch {
+        /* cosmetic */
+      }
+      s.setData(candles.map((c) => ({ time: c.time, value: c.close })));
+    } else if (chartKind === "heikin") {
+      const ha = heikinAshi(candles);
+      prevHaRef.current =
+        ha.length > 1
+          ? { open: ha[ha.length - 2].open, close: ha[ha.length - 2].close }
+          : null;
+      s.setData(
+        ha.map((c) => ({
+          time: c.time as UTCTimestamp,
+          open: c.open,
+          high: c.high,
+          low: c.low,
+          close: c.close,
+        })),
+      );
     } else {
       s.setData(
         candles.map((c) => ({
@@ -677,11 +734,28 @@ export default function ChartPanel({
     );
   }
 
-  function updateMainBar(bar: Candle): void {
+  /** Push a live update for the forming bar. `rolled` = a NEW bar just
+   *  opened (the previous live bar closed). */
+  function updateMainBar(bar: Candle, rolled = false): void {
     const s = mainRef.current;
     if (!s) return;
-    if (chartKind === "line" || chartKind === "area") {
+    if (chartKind === "line" || chartKind === "area" || chartKind === "baseline") {
       s.update({ time: bar.time, value: bar.close });
+    } else if (chartKind === "heikin") {
+      const candles = candlesRef.current;
+      if (rolled && candles.length > 1) {
+        // the bar that just closed becomes the new "previous" HA bar
+        const closed = heikinAshiBar(candles[candles.length - 2], prevHaRef.current);
+        prevHaRef.current = { open: closed.open, close: closed.close };
+      }
+      const ha = heikinAshiBar(bar, prevHaRef.current);
+      s.update({
+        time: ha.time as UTCTimestamp,
+        open: ha.open,
+        high: ha.high,
+        low: ha.low,
+        close: ha.close,
+      });
     } else {
       s.update({
         time: bar.time,
@@ -705,59 +779,76 @@ export default function ChartPanel({
     }
   }
 
+  /** Re-derive every registered indicator series from the current
+   *  candles. Cheap (setData only) — used on pagination and live bar
+   *  rolls so panes never flicker. */
+  function refreshIndicatorData(): void {
+    const candles = candlesRef.current;
+    for (const e of indicatorSeriesRef.current) {
+      try {
+        e.series.setData(e.compute(candles) as never);
+      } catch {
+        /* series may be mid-teardown */
+      }
+    }
+  }
+
+  /** (Re)create the indicator SERIES for the active toggles, then fill
+   *  them via refreshIndicatorData(). Only runs when the toggle set
+   *  changes — data-only updates go through refreshIndicatorData(). */
   function rebuildIndicators(): void {
     const chart = chartRef.current;
     if (!chart) return;
-    for (const s of indicatorSeriesRef.current) {
+    for (const e of indicatorSeriesRef.current) {
       try {
-        chart.removeSeries(s);
+        chart.removeSeries(e.series);
       } catch {
         /* already gone */
       }
     }
     indicatorSeriesRef.current = [];
-    const candles = candlesRef.current;
-    if (candles.length === 0) {
-      cleanupPanes(chart);
-      return;
-    }
-    const closes = candles.map((c) => c.close);
-    const times = candles.map((c) => c.time);
     const colors = colorsRef.current;
-    const interval = barInterval();
 
-    /** times[i + shift], extrapolating past the last bar. */
-    const shiftedTime = (i: number, shift: number): UTCTimestamp | null => {
-      const j = i + shift;
-      if (j < 0) return null;
-      if (j < times.length) return times[j];
-      return (times[times.length - 1] + (j - (times.length - 1)) * interval) as UTCTimestamp;
-    };
-
-    const lineData = (values: (number | null)[], shift = 0) => {
-      const data: { time: UTCTimestamp; value: number }[] = [];
+    type LinePoint = { time: UTCTimestamp; value: number } | { time: UTCTimestamp };
+    const closesOf = (c: Candle[]) => c.map((k) => k.close);
+    const toLine = (c: Candle[], values: (number | null)[], shift = 0): LinePoint[] => {
+      const interval = barInterval();
+      const n = c.length;
+      const data: LinePoint[] = [];
       for (let i = 0; i < values.length; i++) {
         const v = values[i];
         if (v === null) continue;
-        const t = shiftedTime(i, shift);
+        const j = i + shift;
+        if (j < 0) continue;
+        const t =
+          j < n
+            ? c[j].time
+            : n > 0
+              ? ((c[n - 1].time + (j - (n - 1)) * interval) as UTCTimestamp)
+              : null;
         if (t !== null) data.push({ time: t, value: v });
       }
       return data;
     };
-    // Line data with whitespace gaps where `mask` is false — used for
-    // regime-colored lines (e.g. supertrend up vs down segments).
-    const maskedLineData = (values: (number | null)[], mask: (boolean | null)[]) => {
-      const data: ({ time: UTCTimestamp; value: number } | { time: UTCTimestamp })[] = [];
+    // Whitespace gaps where `mask` is false — regime-colored lines
+    // (e.g. supertrend up vs down segments).
+    const toMasked = (
+      c: Candle[],
+      values: (number | null)[],
+      mask: (boolean | null)[],
+    ): LinePoint[] => {
+      const data: LinePoint[] = [];
       for (let i = 0; i < values.length; i++) {
         const v = values[i];
         if (v === null) continue;
-        if (mask[i]) data.push({ time: times[i], value: v });
-        else data.push({ time: times[i] });
+        if (mask[i]) data.push({ time: c[i].time, value: v });
+        else data.push({ time: c[i].time });
       }
       return data;
     };
+
     const addLine = (
-      data: ({ time: UTCTimestamp; value: number } | { time: UTCTimestamp })[],
+      compute: (c: Candle[]) => unknown[],
       color: string,
       paneIndex = 0,
       width: 1 | 2 = 1,
@@ -777,8 +868,7 @@ export default function ChartPanel({
         },
         paneIndex,
       );
-      s.setData(data);
-      indicatorSeriesRef.current.push(s);
+      indicatorSeriesRef.current.push({ series: s, compute });
       return s;
     };
     const guides = (s: ISeriesApi<"Line">, levels: number[]) => {
@@ -806,120 +896,137 @@ export default function ChartPanel({
     };
 
     // ---- overlays ----
-    if (active.sma) addLine(lineData(sma(closes, 20)), "#42A5F5");
-    if (active.ema) addLine(lineData(ema(closes, 50)), "#FFB74D");
-    if (active.wma) addLine(lineData(wma(closes, 20)), "#7E57C2");
-    if (active.vwap && resolution !== "D") addLine(lineData(vwap(candles)), "#CE93D8");
+    if (active.sma) addLine((c) => toLine(c, sma(closesOf(c), 20)), "#42A5F5");
+    if (active.ema) addLine((c) => toLine(c, ema(closesOf(c), 50)), "#FFB74D");
+    if (active.wma) addLine((c) => toLine(c, wma(closesOf(c), 20)), "#7E57C2");
+    if (active.vwap && resolution !== "D") {
+      addLine((c) => toLine(c, vwap(c)), "#CE93D8");
+    }
     if (active.bb) {
-      const b = bollinger(closes, 20, 2);
-      addLine(lineData(b.upper), "rgba(66,165,245,0.55)");
-      addLine(lineData(b.middle), "rgba(66,165,245,0.3)");
-      addLine(lineData(b.lower), "rgba(66,165,245,0.55)");
+      addLine((c) => toLine(c, bollinger(closesOf(c), 20, 2).upper), "rgba(66,165,245,0.55)");
+      addLine((c) => toLine(c, bollinger(closesOf(c), 20, 2).middle), "rgba(66,165,245,0.3)");
+      addLine((c) => toLine(c, bollinger(closesOf(c), 20, 2).lower), "rgba(66,165,245,0.55)");
     }
     if (active.supertrend) {
-      const st = supertrend(candles, 10, 3);
-      addLine(maskedLineData(st.value, st.up), colors.up, 0, 2);
-      addLine(maskedLineData(st.value, st.up.map((u) => u === false)), colors.down, 0, 2);
+      addLine(
+        (c) => {
+          const st = supertrend(c, 10, 3);
+          return toMasked(c, st.value, st.up);
+        },
+        colors.up,
+        0,
+        2,
+      );
+      addLine(
+        (c) => {
+          const st = supertrend(c, 10, 3);
+          return toMasked(c, st.value, st.up.map((u) => u === false));
+        },
+        colors.down,
+        0,
+        2,
+      );
     }
     if (active.psar) {
-      addLine(lineData(psar(candles)), "#FFD54F", 0, 1, LineStyle.Solid, {
+      addLine((c) => toLine(c, psar(c)), "#FFD54F", 0, 1, LineStyle.Solid, {
         lineVisible: false,
         pointMarkersVisible: true,
         pointMarkersRadius: 1.5,
       });
     }
     if (active.ichimoku) {
-      const ic = ichimoku(candles);
-      addLine(lineData(ic.tenkan), "#2962FF");
-      addLine(lineData(ic.kijun), "#B71C1C");
-      addLine(lineData(ic.spanA, 26), "rgba(76,175,80,0.8)");
-      addLine(lineData(ic.spanB, 26), "rgba(244,67,54,0.8)");
-      addLine(lineData(ic.chikou, -26), "#43A047", 0, 1, LineStyle.Dashed);
+      addLine((c) => toLine(c, ichimoku(c).tenkan), "#2962FF");
+      addLine((c) => toLine(c, ichimoku(c).kijun), "#B71C1C");
+      addLine((c) => toLine(c, ichimoku(c).spanA, 26), "rgba(76,175,80,0.8)");
+      addLine((c) => toLine(c, ichimoku(c).spanB, 26), "rgba(244,67,54,0.8)");
+      addLine((c) => toLine(c, ichimoku(c).chikou, -26), "#43A047", 0, 1, LineStyle.Dashed);
     }
     if (active.donchian) {
-      const dc = donchian(candles, 20);
-      addLine(lineData(dc.upper), "rgba(38,198,218,0.7)");
-      addLine(lineData(dc.middle), "rgba(38,198,218,0.35)", 0, 1, LineStyle.Dashed);
-      addLine(lineData(dc.lower), "rgba(38,198,218,0.7)");
+      addLine((c) => toLine(c, donchian(c, 20).upper), "rgba(38,198,218,0.7)");
+      addLine((c) => toLine(c, donchian(c, 20).middle), "rgba(38,198,218,0.35)", 0, 1, LineStyle.Dashed);
+      addLine((c) => toLine(c, donchian(c, 20).lower), "rgba(38,198,218,0.7)");
     }
 
     // ---- oscillator panes (assigned in a stable order) ----
     let pane = 1;
     if (active.rsi) {
       const p = pane++;
-      const s = addLine(lineData(rsi(closes, 14)), "#B39DDB", p);
+      const s = addLine((c) => toLine(c, rsi(closesOf(c), 14)), "#B39DDB", p);
       guides(s, [70, 30]);
       sizePane(p);
     }
     if (active.macd) {
       const p = pane++;
-      const m = macd(closes, 12, 26, 9);
       const hist = chart.addSeries(
         HistogramSeries,
         { lastValueVisible: false, priceLineVisible: false },
         p,
       );
-      const histData: { time: UTCTimestamp; value: number; color: string }[] = [];
-      for (let i = 0; i < m.histogram.length; i++) {
-        const v = m.histogram[i];
-        if (v !== null) {
-          histData.push({
-            time: times[i],
-            value: v,
-            color: v >= 0 ? colors.volUp : colors.volDown,
-          });
-        }
-      }
-      hist.setData(histData);
-      indicatorSeriesRef.current.push(hist);
-      addLine(lineData(m.macd), "#42A5F5", p);
-      addLine(lineData(m.signal), "#FF7043", p);
+      indicatorSeriesRef.current.push({
+        series: hist,
+        compute: (c) => {
+          const m = macd(closesOf(c), 12, 26, 9);
+          const data: { time: UTCTimestamp; value: number; color: string }[] = [];
+          for (let i = 0; i < m.histogram.length; i++) {
+            const v = m.histogram[i];
+            if (v !== null) {
+              data.push({
+                time: c[i].time,
+                value: v,
+                color: v >= 0 ? colors.volUp : colors.volDown,
+              });
+            }
+          }
+          return data;
+        },
+      });
+      addLine((c) => toLine(c, macd(closesOf(c), 12, 26, 9).macd), "#42A5F5", p);
+      addLine((c) => toLine(c, macd(closesOf(c), 12, 26, 9).signal), "#FF7043", p);
       sizePane(p);
     }
     if (active.stoch) {
       const p = pane++;
-      const st = stochastic(candles, 14, 3, 3);
-      const s = addLine(lineData(st.k), "#2962FF", p);
-      addLine(lineData(st.d), "#FF6D00", p);
+      const s = addLine((c) => toLine(c, stochastic(c, 14, 3, 3).k), "#2962FF", p);
+      addLine((c) => toLine(c, stochastic(c, 14, 3, 3).d), "#FF6D00", p);
       guides(s, [80, 20]);
       sizePane(p);
     }
     if (active.adx) {
       const p = pane++;
-      const a = adx(candles, 14);
-      addLine(lineData(a.adx), "#F23645", p, 2);
-      addLine(lineData(a.plusDi), colors.up, p);
-      addLine(lineData(a.minusDi), colors.down, p);
+      addLine((c) => toLine(c, adx(c, 14).adx), "#F23645", p, 2);
+      addLine((c) => toLine(c, adx(c, 14).plusDi), colors.up, p);
+      addLine((c) => toLine(c, adx(c, 14).minusDi), colors.down, p);
       sizePane(p);
     }
     if (active.atr) {
       const p = pane++;
-      addLine(lineData(atr(candles, 14)), "#FF8C00", p);
+      addLine((c) => toLine(c, atr(c, 14)), "#FF8C00", p);
       sizePane(p);
     }
     if (active.obv) {
       const p = pane++;
-      addLine(lineData(obv(candles)), "#26C6DA", p);
+      addLine((c) => toLine(c, obv(c)), "#26C6DA", p);
       sizePane(p);
     }
     if (active.cci) {
       const p = pane++;
-      const s = addLine(lineData(cci(candles, 20)), "#AB47BC", p);
+      const s = addLine((c) => toLine(c, cci(c, 20)), "#AB47BC", p);
       guides(s, [100, -100]);
       sizePane(p);
     }
     if (active.mfi) {
       const p = pane++;
-      const s = addLine(lineData(mfi(candles, 14)), "#FFCA28", p);
+      const s = addLine((c) => toLine(c, mfi(c, 14)), "#FFCA28", p);
       guides(s, [80, 20]);
       sizePane(p);
     }
     if (active.wpr) {
       const p = pane++;
-      const s = addLine(lineData(williamsR(candles, 14)), "#EC407A", p);
+      const s = addLine((c) => toLine(c, williamsR(c, 14)), "#EC407A", p);
       guides(s, [-20, -80]);
       sizePane(p);
     }
+    refreshIndicatorData();
     cleanupPanes(chart);
   }
 
@@ -931,9 +1038,23 @@ export default function ChartPanel({
     indexByTimeRef.current = idx;
     setMainData();
     setVolumeData();
-    rebuildIndicators();
+    refreshIndicatorData(); // data-only — no series teardown, no flicker
     legendLastBar();
     repaintDrawings();
+  }
+
+  /** (Re)load a compare overlay across the currently loaded time span. */
+  function loadCompareData(compareSymbol: string, series: ISeriesApi<"Line">): void {
+    const seq = fetchSeqRef.current;
+    const now = Math.floor(Date.now() / 1000);
+    const oldest =
+      candlesRef.current.length > 0
+        ? candlesRef.current[0].time - IST_OFFSET
+        : now - tf.initialDays * 86400;
+    void fetchHistory(compareSymbol, resolution, oldest, now).then((r) => {
+      if (seq !== fetchSeqRef.current || !compareSeriesRef.current.has(compareSymbol)) return;
+      series.setData(r.candles.map((k) => ({ time: k.time, value: k.close })));
+    });
   }
 
   async function maybeLoadOlder(): Promise<void> {
@@ -959,6 +1080,8 @@ export default function ChartPanel({
     }
     candlesRef.current = [...older, ...candlesRef.current];
     applyData();
+    // extend compare overlays across the newly loaded span
+    for (const [sym, s] of compareSeriesRef.current) loadCompareData(sym, s);
     loadingOlderRef.current = false;
   }
 
@@ -998,6 +1121,14 @@ export default function ChartPanel({
 
     if (mode === "alert") {
       if (price != null) addAlert(price as number);
+      setDrawMode(null);
+      return;
+    }
+    if (mode === "ticket") {
+      if (price != null && onPickPrice) {
+        onPickPrice(price as number);
+        addToast(`price ${fmtPrice(price as number)} sent to the ticket`);
+      }
       setDrawMode(null);
       return;
     }
@@ -1050,6 +1181,15 @@ export default function ChartPanel({
 
   function onVisibleRange(range: LogicalRange | null): void {
     if (range && range.from < 10) void maybeLoadOlder();
+    // "go to live" affordance when the newest bar is scrolled out of view
+    const n = candlesRef.current.length;
+    if (range && n > 0) {
+      const live = range.to >= n - 2;
+      if (live !== atLiveRef.current) {
+        atLiveRef.current = live;
+        setAtLive(live);
+      }
+    }
     repaintDrawings(); // keep drawings glued to bars while panning
   }
 
@@ -1401,6 +1541,17 @@ export default function ChartPanel({
           bottomColor: withAlpha(colors.accent, 0.03, "rgba(255,140,0,0.03)"),
         });
         break;
+      case "baseline":
+        series = chart.addSeries(BaselineSeries, {
+          topLineColor: colors.up,
+          topFillColor1: withAlpha(colors.up, 0.25, "rgba(38,166,154,0.25)"),
+          topFillColor2: withAlpha(colors.up, 0.03, "rgba(38,166,154,0.03)"),
+          bottomLineColor: colors.down,
+          bottomFillColor1: withAlpha(colors.down, 0.03, "rgba(239,83,80,0.03)"),
+          bottomFillColor2: withAlpha(colors.down, 0.25, "rgba(239,83,80,0.25)"),
+          lineWidth: 2,
+        });
+        break;
       default:
         series = chart.addSeries(CandlestickSeries, {
           upColor: colors.up,
@@ -1442,7 +1593,20 @@ export default function ChartPanel({
       else setStatus({ kind: "ready" });
       applyData();
       try {
-        chartRef.current?.timeScale().scrollToRealTime();
+        // Position the newest bar at the right edge. setVisibleLogicalRange
+        // is deterministic even with a market-closed gap (scrollToRealTime
+        // targets wall-clock "now", which would leave the last bar off-screen
+        // on a weekend / after hours).
+        const ts = chartRef.current?.timeScale();
+        const n = candlesRef.current.length;
+        if (ts && n > 0) {
+          ts.setVisibleLogicalRange({
+            from: Math.max(0, n - 90) as Logical,
+            to: (n + 4) as Logical,
+          });
+          atLiveRef.current = true;
+          setAtLive(true);
+        }
       } catch {
         /* cosmetic */
       }
@@ -1504,6 +1668,52 @@ export default function ChartPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [alerts, chartKind, status.kind]);
 
+  // 5b) Broker-state lines: open position average + pending orders.
+  useEffect(() => {
+    const main = mainRef.current;
+    if (!main) return;
+    for (const line of brokerLinesRef.current) {
+      try {
+        main.removePriceLine(line);
+      } catch {
+        /* already gone */
+      }
+    }
+    const next: IPriceLine[] = [];
+    const colors = colorsRef.current;
+    for (const b of brokerLines ?? []) {
+      try {
+        next.push(
+          main.createPriceLine({
+            price: b.price,
+            color:
+              b.kind === "order"
+                ? "#4A90D9"
+                : b.kind === "position-long"
+                  ? colors.up
+                  : colors.down,
+            lineWidth: 1,
+            lineStyle: b.kind === "order" ? LineStyle.Dashed : LineStyle.Solid,
+            axisLabelVisible: true,
+            title: b.title,
+          }),
+        );
+      } catch {
+        /* cosmetic */
+      }
+    }
+    brokerLinesRef.current = next;
+  }, [brokerLines, chartKind, status.kind]);
+
+  // 5c) Volume visibility toggle.
+  useEffect(() => {
+    try {
+      volumeRef.current?.applyOptions({ visible: volumeOn });
+    } catch {
+      /* cosmetic */
+    }
+  }, [volumeOn]);
+
   // 6) Compare series — create/remove and (re)load on timeframe change.
   useEffect(() => {
     const chart = chartRef.current;
@@ -1519,8 +1729,6 @@ export default function ChartPanel({
         map.delete(sym);
       }
     }
-    const seq = fetchSeqRef.current;
-    const now = Math.floor(Date.now() / 1000);
     for (const c of compares) {
       let s = map.get(c.symbol);
       if (!s) {
@@ -1533,11 +1741,7 @@ export default function ChartPanel({
         });
         map.set(c.symbol, s);
       }
-      const series = s;
-      void fetchHistory(c.symbol, resolution, now - tf.initialDays * 86400, now).then((r) => {
-        if (seq !== fetchSeqRef.current || !compareSeriesRef.current.has(c.symbol)) return;
-        series.setData(r.candles.map((k) => ({ time: k.time, value: k.close })));
-      });
+      loadCompareData(c.symbol, s); // spans the currently loaded range
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [compares, resolution, status.kind]);
@@ -1576,8 +1780,9 @@ export default function ChartPanel({
       active,
       magnet,
       scaleMode,
+      volumeOn,
     } satisfies ChartPrefs);
-  }, [resolution, chartKind, active, magnet, scaleMode]);
+  }, [resolution, chartKind, active, magnet, scaleMode, volumeOn]);
 
   // 10) Compare-symbol search (debounced).
   useEffect(() => {
@@ -1667,12 +1872,14 @@ export default function ChartPanel({
       };
       candles.push(bar);
       indexByTimeRef.current.set(bar.time, candles.length - 1);
-      updateMainBar(bar);
+      updateMainBar(bar, true);
       try {
         volumeRef.current?.update({ time: bar.time, value: 0 });
       } catch {
         /* cosmetic */
       }
+      // the previous bar just closed — bring indicators up to date
+      refreshIndicatorData();
     }
     legendLastBar();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1768,11 +1975,13 @@ export default function ChartPanel({
   const drawHint =
     drawMode === "alert"
       ? "click a price to set an alert"
-      : activeTool
-        ? pendingPoint
-          ? "click the second point (Esc cancels)"
-          : `${activeTool.hint} (Esc cancels)`
-        : null;
+      : drawMode === "ticket"
+        ? "click a price to load it into the ticket as a LIMIT"
+        : activeTool
+          ? pendingPoint
+            ? "click the second point (Esc cancels)"
+            : `${activeTool.hint} (Esc cancels)`
+          : null;
 
   // ------------------------------------------------------------------
   // Render
@@ -1830,6 +2039,15 @@ export default function ChartPanel({
           </button>
           {menuOpen === "ind" && (
             <div className="chart-menu chart-ind-menu" data-testid="chart-ind-menu">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={volumeOn}
+                  onChange={() => setVolumeOn((v) => !v)}
+                  data-testid="chart-ind-volume"
+                />
+                Volume
+              </label>
               {(["Overlays", "Oscillators"] as const).map((group) => (
                 <div key={group} className="chart-menu-section">
                   <div className="chart-menu-head">{group}</div>
@@ -1908,6 +2126,23 @@ export default function ChartPanel({
             </div>
           )}
         </div>
+
+        {/* send a chart price to the order ticket */}
+        {onPickPrice && (
+          <div className="chart-group">
+            <button
+              type="button"
+              className={`chart-btn${drawMode === "ticket" ? " on" : ""}`}
+              onClick={() =>
+                setDrawMode(drawModeRef.current === "ticket" ? null : "ticket")
+              }
+              title="Click a chart price to prefill the ticket's limit price"
+              data-testid="chart-pick-price"
+            >
+              ⤷ Ticket
+            </button>
+          </div>
+        )}
 
         {/* alerts */}
         <div className="chart-group chart-menu-wrap">
@@ -2139,6 +2374,38 @@ export default function ChartPanel({
             onBlur={commitTextDraft}
             data-testid="chart-text-input"
           />
+        )}
+        {!atLive && status.kind === "ready" && (
+          <button
+            type="button"
+            className="chart-golive"
+            onClick={() => {
+              // Scroll so the newest bar sits at the right edge. We set
+              // the logical range explicitly rather than
+              // scrollToRealTime(): when the market is closed there's a
+              // gap between the last bar and wall-clock now, and
+              // scrollToRealTime targets "now", leaving the last bar off
+              // to the left.
+              try {
+                const ts = chartRef.current?.timeScale();
+                const n = candlesRef.current.length;
+                if (ts && n > 0) {
+                  const visible = ts.getVisibleLogicalRange();
+                  const span = visible ? visible.to - visible.from : 60;
+                  ts.setVisibleLogicalRange({
+                    from: (n - span) as Logical,
+                    to: (n + 4) as Logical, // +rightOffset breathing room
+                  });
+                }
+              } catch {
+                /* cosmetic */
+              }
+            }}
+            title="Scroll back to the latest bar"
+            data-testid="chart-golive"
+          >
+            ⇥ live
+          </button>
         )}
         <div className="chart-toasts">
           {toasts.map((t) => (

@@ -167,6 +167,40 @@ class Signal(Base):
 
 
 # =========================================================================
+# Core: signal outcomes (what the stock actually did after each signal)
+# =========================================================================
+#
+# Written passively by app/services/outcome_logger.py for EVERY signal
+# (approved or blocked — blocked ones are exactly the counterfactuals a
+# win-rate review needs). Price moves at +5m / +30m vs the price at
+# signal time, measured off the Fyers quote feed. This table is the
+# labeled dataset Phase 5 (materiality pre-filter) and Phase 6
+# (fine-tuning) train on — see plan.txt.
+
+
+class SignalOutcome(Base):
+    __tablename__ = "signal_outcomes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Loose reference (no FK): outcomes are telemetry / training data and
+    # must survive signal rows being pruned or arriving out of band.
+    signal_id: Mapped[Optional[int]] = mapped_column(Integer, index=True)
+    symbol: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    action: Mapped[str] = mapped_column(String(8), nullable=False)
+    signal_status: Mapped[Optional[str]] = mapped_column(String(16))  # pending/blocked at signal time
+    price_at_signal: Mapped[Optional[float]] = mapped_column(Float)
+    price_5m: Mapped[Optional[float]] = mapped_column(Float)
+    price_30m: Mapped[Optional[float]] = mapped_column(Float)
+    move_5m_pct: Mapped[Optional[float]] = mapped_column(Float)
+    move_30m_pct: Mapped[Optional[float]] = mapped_column(Float)
+    # "ok" | "no_quote_at_signal" | "no_quote_5m" | ... — data-quality tag
+    # so a market-closed sample isn't mistaken for a flat move.
+    note: Mapped[Optional[str]] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+
+# =========================================================================
 # Core: trades (executed orders)
 # =========================================================================
 

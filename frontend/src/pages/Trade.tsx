@@ -37,7 +37,7 @@ import {
   useServerInfo,
 } from "../hooks/useApi";
 import { useLiveQuote } from "../hooks/useQuotes";
-import ChartPanel from "../components/trade/ChartPanel";
+import ChartPanel, { type BrokerLine } from "../components/trade/ChartPanel";
 import type {
   BrokerAccount,
   InstrumentHit,
@@ -138,6 +138,8 @@ export default function Trade() {
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<InstrumentHit | null>(null);
   const [showResults, setShowResults] = useState(false);
+  // Keyboard cursor into the search results (-1 = nothing highlighted).
+  const [highlightIdx, setHighlightIdx] = useState(-1);
   const [recent, setRecent] = useState<InstrumentHit[]>(loadRecent);
 
   const { data: accounts } = useBrokerAccounts();
@@ -223,6 +225,39 @@ export default function Trade() {
 
   const placeOrder = usePlaceOrder();
   const cancelOrder = useCancelOrder();
+
+  // Broker state drawn on the chart: open position average + pending
+  // order prices for the charted symbol.
+  const brokerLines = useMemo<BrokerLine[]>(() => {
+    if (!selected) return [];
+    const lines: BrokerLine[] = [];
+    const pos = positions?.find(
+      (p) => p.symbol === selected.symbol && p.quantity !== 0,
+    );
+    if (pos) {
+      lines.push({
+        price: pos.average_price,
+        title: `pos ${pos.quantity > 0 ? "+" : ""}${pos.quantity}`,
+        kind: pos.quantity > 0 ? "position-long" : "position-short",
+      });
+    }
+    for (const o of pending?.orders ?? []) {
+      if (o.symbol === selected.symbol && o.price > 0) {
+        lines.push({
+          price: o.price,
+          title: `${o.side} ${o.quantity} ${o.order_type}`,
+          kind: "order",
+        });
+      }
+    }
+    return lines;
+  }, [selected, positions, pending]);
+
+  // Chart "⤷ Ticket" tool → prefill the ticket as a LIMIT order.
+  const onPickPrice = (price: number) => {
+    setOrderType("LIMIT");
+    setLimitPrice(price.toFixed(2));
+  };
 
   const isOption =
     selected != null && (selected.instrument_type === "CE" || selected.instrument_type === "PE");
@@ -411,9 +446,38 @@ export default function Trade() {
             onChange={(e) => {
               setQuery(e.target.value);
               setShowResults(true);
+              setHighlightIdx(-1);
               setLastResult(null);
             }}
-            onFocus={() => setShowResults(true)}
+            onFocus={() => {
+              // Reopen only for a genuine query — not for the display
+              // string a selection left behind (which has no hits and
+              // would show a stale "no results" box).
+              if (query && query !== selected?.display) setShowResults(true);
+            }}
+            onKeyDown={(e) => {
+              const hits = searchData?.hits ?? [];
+              if (e.key === "Escape") {
+                setShowResults(false);
+                setHighlightIdx(-1);
+                return;
+              }
+              if (!showResults || hits.length === 0) return;
+              if (e.key === "ArrowDown") {
+                e.preventDefault();
+                setHighlightIdx((i) => (i + 1) % hits.length);
+              } else if (e.key === "ArrowUp") {
+                e.preventDefault();
+                setHighlightIdx((i) => (i <= 0 ? hits.length - 1 : i - 1));
+              } else if (e.key === "Enter") {
+                e.preventDefault();
+                const pick = hits[highlightIdx >= 0 ? highlightIdx : 0];
+                if (pick) {
+                  onSelect(pick);
+                  setHighlightIdx(-1);
+                }
+              }
+            }}
             placeholder="Search symbol — e.g. RELIANCE, NIFTY, BANKNIFTY"
             data-testid="trade-search"
             autoComplete="off"
@@ -456,12 +520,13 @@ export default function Trade() {
             {!searching && (searchData?.count ?? 0) === 0 && (
               <div className="hint">no results for "{query}"</div>
             )}
-            {(searchData?.hits ?? []).map((h) => (
+            {(searchData?.hits ?? []).map((h, i) => (
               <button
                 key={h.symbol}
                 type="button"
-                className="trade-search-row"
+                className={`trade-search-row${i === highlightIdx ? " hl" : ""}`}
                 onClick={() => onSelect(h)}
+                onMouseEnter={() => setHighlightIdx(i)}
                 data-testid={`search-row-${h.symbol}`}
               >
                 <span className="sym">{h.short_name}</span>
@@ -482,6 +547,8 @@ export default function Trade() {
           key={selected.symbol}
           symbol={selected.symbol}
           shortName={selected.short_name}
+          brokerLines={brokerLines}
+          onPickPrice={onPickPrice}
         />
       )}
 
@@ -592,6 +659,41 @@ export default function Trade() {
                 onChange={(e) => setLimitPrice(e.target.value)}
                 data-testid="ticket-limit"
               />
+              <span className="px-quick">
+                {bid != null && (
+                  <button
+                    type="button"
+                    className="px-quick-btn"
+                    onClick={() => setLimitPrice(bid.toFixed(2))}
+                    title={`bid ${fmtMoney(bid)}`}
+                    data-testid="limit-fill-bid"
+                  >
+                    bid
+                  </button>
+                )}
+                {ltp != null && (
+                  <button
+                    type="button"
+                    className="px-quick-btn"
+                    onClick={() => setLimitPrice(ltp.toFixed(2))}
+                    title={`LTP ${fmtMoney(ltp)}`}
+                    data-testid="limit-fill-ltp"
+                  >
+                    ltp
+                  </button>
+                )}
+                {ask != null && (
+                  <button
+                    type="button"
+                    className="px-quick-btn"
+                    onClick={() => setLimitPrice(ask.toFixed(2))}
+                    title={`ask ${fmtMoney(ask)}`}
+                    data-testid="limit-fill-ask"
+                  >
+                    ask
+                  </button>
+                )}
+              </span>
             </label>
           )}
 
@@ -605,6 +707,19 @@ export default function Trade() {
                 onChange={(e) => setStopPrice(e.target.value)}
                 data-testid="ticket-stop"
               />
+              {ltp != null && (
+                <span className="px-quick">
+                  <button
+                    type="button"
+                    className="px-quick-btn"
+                    onClick={() => setStopPrice(ltp.toFixed(2))}
+                    title={`LTP ${fmtMoney(ltp)}`}
+                    data-testid="stop-fill-ltp"
+                  >
+                    ltp
+                  </button>
+                </span>
+              )}
             </label>
           )}
 

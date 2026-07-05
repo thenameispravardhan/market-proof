@@ -241,6 +241,102 @@ def _match_buyback(headline_lc: str, headline: str) -> Optional[FastTrackMatch]:
 _PARSERS = (_match_order_win, _match_buyback, _match_kmp_resignation)
 
 
+# -- Hybrid track: headline says "order", value lives in the PDF -------------
+#
+# NSE headlines are usually generic ("…has informed the Exchange
+# regarding Bagging of order") with the value only inside the filing.
+# When the headline matches order context but carries no value, the
+# analyzer extracts the PDF text (already needed for the LLM track) and
+# we parse the value deterministically from it — still no LLM, ~1s
+# instead of milliseconds, but far more coverage than headline-only.
+
+
+def is_hybrid_order_candidate(headline: str) -> bool:
+    """Headline has order-win context but NO parseable value — worth
+    extracting the PDF to find the value deterministically."""
+    if not headline:
+        return False
+    lc = headline.lower()
+    if not _ORDER_CONTEXT_RE.search(lc):
+        return False
+    if any(kw in lc for kw in _ORDER_NEGATIVE_GUARDS):
+        return False
+    return parse_inr_crore(headline) is None
+
+
+def _order_value_near_context(text: str) -> Optional[float]:
+    """Largest INR value that appears NEAR an order-context keyword.
+
+    Restricting the search to a window around each order mention stops a
+    results table's revenue line ("total income Rs 5,000 crore") from
+    being mistaken for the order size. The text is whitespace-collapsed
+    first because PDF extraction breaks sentences across lines
+    ("order worth Rs\\n450 crore").
+    """
+    normalized = " ".join(text.split())
+    lc = normalized.lower()
+    best: Optional[float] = None
+    for m in _ORDER_CONTEXT_RE.finditer(lc):
+        window = normalized[max(0, m.start() - 150): m.end() + 250]
+        value = parse_inr_crore(window)
+        if value is not None and (best is None or value > best):
+            best = value
+    return best
+
+
+def evaluate_fast_track_text(
+    headline: str, extracted_text: str
+) -> Optional[FastTrackMatch]:
+    """Hybrid order-win parse: order-context headline + value from the
+    filing's extracted text. Returns None unless BOTH line up.
+
+    Slightly more conservative than the headline path (confidence capped
+    at 0.85): the value was inferred from document context rather than
+    stated in the exchange headline itself.
+    """
+    try:
+        if not is_hybrid_order_candidate(headline):
+            return None
+        if not extracted_text:
+            return None
+        text_lc = extracted_text.lower()
+        # A cancellation/termination anywhere in the filing kills it —
+        # too risky to auto-trade a document we only pattern-matched.
+        if any(kw in text_lc for kw in _ORDER_NEGATIVE_GUARDS):
+            return None
+        value = _order_value_near_context(extracted_text)
+        if value is None or value < 25.0:
+            return None
+        if value >= 500.0:
+            confidence, score = 0.85, 75.0
+        elif value >= 100.0:
+            confidence, score = 0.78, 68.0
+        else:
+            confidence, score = 0.72, 60.0
+        response = AnalysisResponse(
+            event_type="ORDER_WIN",
+            summary=(
+                f"Order win: headline indicates an order and the filing text "
+                f"states a value of Rs {value:g} crore."
+            ),
+            sentiment="positive",
+            sentiment_score=score,
+            confidence=confidence,
+            recommendation="BUY",
+            reasoning=(
+                f"Deterministic hybrid fast track: order-win context in the "
+                f"headline; Rs {value:g} crore parsed from the filing text "
+                f"near the order mention. "
+                f'Headline: "{headline.strip()}"'
+            ),
+            key_numbers={"deal_value_inr_crore": value},
+        )
+        return FastTrackMatch(pattern="order_win_pdf_value", response=response)
+    except Exception:  # noqa: BLE001 — never fail the pipeline
+        log.exception("fast_track.hybrid_crashed")
+        return None
+
+
 def evaluate_fast_track(headline: str) -> Optional[FastTrackMatch]:
     """Try every fast-track parser against the headline.
 

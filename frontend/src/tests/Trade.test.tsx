@@ -38,6 +38,8 @@ vi.mock("lightweight-charts", () => {
         scrollToRealTime: vi.fn(),
         coordinateToLogical: vi.fn(() => 0),
         logicalToCoordinate: vi.fn(() => 100),
+        getVisibleLogicalRange: vi.fn(() => ({ from: 0, to: 60 })),
+        setVisibleLogicalRange: vi.fn(),
         subscribeVisibleLogicalRangeChange: vi.fn(),
         unsubscribeVisibleLogicalRangeChange: vi.fn(),
       })),
@@ -56,6 +58,7 @@ vi.mock("lightweight-charts", () => {
     BarSeries: {},
     LineSeries: {},
     AreaSeries: {},
+    BaselineSeries: {},
     HistogramSeries: {},
   };
 });

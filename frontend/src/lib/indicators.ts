@@ -123,6 +123,52 @@ export function rsi(values: number[], period = 14): (number | null)[] {
   return out;
 }
 
+/** Heikin-Ashi transform. Returns a new candle array (same times and
+ *  volumes); the classic smoothing:
+ *    haClose = (o + h + l + c) / 4
+ *    haOpen  = (prevHaOpen + prevHaClose) / 2   (seed: (o + c) / 2)
+ *    haHigh  = max(h, haOpen, haClose), haLow = min(l, haOpen, haClose) */
+export function heikinAshi(candles: OhlcvCandle[]): OhlcvCandle[] {
+  const out: OhlcvCandle[] = [];
+  let prevOpen = 0;
+  let prevClose = 0;
+  for (let i = 0; i < candles.length; i++) {
+    const c = candles[i];
+    const haClose = (c.open + c.high + c.low + c.close) / 4;
+    const haOpen = i === 0 ? (c.open + c.close) / 2 : (prevOpen + prevClose) / 2;
+    out.push({
+      time: c.time,
+      open: haOpen,
+      high: Math.max(c.high, haOpen, haClose),
+      low: Math.min(c.low, haOpen, haClose),
+      close: haClose,
+      volume: c.volume,
+    });
+    prevOpen = haOpen;
+    prevClose = haClose;
+  }
+  return out;
+}
+
+/** One Heikin-Ashi bar from a raw bar + the previous HA bar's open/close.
+ *  Used by the chart's live-tick path so the forming bar updates without
+ *  recomputing the whole series. */
+export function heikinAshiBar(
+  raw: OhlcvCandle,
+  prevHa: { open: number; close: number } | null,
+): OhlcvCandle {
+  const haClose = (raw.open + raw.high + raw.low + raw.close) / 4;
+  const haOpen = prevHa ? (prevHa.open + prevHa.close) / 2 : (raw.open + raw.close) / 2;
+  return {
+    time: raw.time,
+    open: haOpen,
+    high: Math.max(raw.high, haOpen, haClose),
+    low: Math.min(raw.low, haOpen, haClose),
+    close: haClose,
+    volume: raw.volume,
+  };
+}
+
 /** Weighted moving average — the most recent value carries weight `period`. */
 export function wma(values: number[], period: number): (number | null)[] {
   const out: (number | null)[] = new Array(values.length).fill(null);

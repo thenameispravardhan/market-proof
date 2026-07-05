@@ -11,6 +11,7 @@ type NumField = Exclude<
   | "AI_ANALYSIS_ENABLED"
   | "SEND_EXTRACTED_TEXT"
   | "FAST_TRACK_ENABLED"
+  | "OUTCOME_LOGGER_ENABLED"
 >;
 
 const FIELDS: { key: NumField; label: string; min: number; max: number; step: number }[] = [
@@ -54,6 +55,8 @@ export function GlobalSettings() {
   const sendExtractedText = values.SEND_EXTRACTED_TEXT ?? false;
   // Default OFF — everything takes the AI track until the operator opts in.
   const fastTrack = values.FAST_TRACK_ENABLED ?? false;
+  // Default ON — passive telemetry, no trading influence.
+  const outcomeLogger = values.OUTCOME_LOGGER_ENABLED ?? true;
 
   const handleSave = async () => {
     setError(null);
@@ -137,6 +140,24 @@ export function GlobalSettings() {
                 {fastTrack
                   ? "High-conviction headlines (order win / buyback with explicit ₹-crore value, key-management resignation) skip the AI and hit the rules engine in milliseconds. Everything else still goes to the AI."
                   : "Every filing takes the AI track (legacy behavior)."}
+              </span>
+            </div>
+          </div>
+          <div className="field" style={{ marginTop: 4 }}>
+            <label>Signal outcome tracking</label>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <Toggle
+                on={outcomeLogger}
+                data-testid="outcome-logger-toggle"
+                onChange={(next) => {
+                  setValues((prev) => ({ ...prev, OUTCOME_LOGGER_ENABLED: next }));
+                  setSaved(false);
+                }}
+              />
+              <span className="field-hint" style={{ marginTop: 0 }}>
+                {outcomeLogger
+                  ? "Every signal's price move at +5 and +30 minutes is recorded (win-rate report + future ML training data). Pure telemetry — never affects trading."
+                  : "No outcome tracking — win-rate review and ML training data will not accumulate."}
               </span>
             </div>
           </div>

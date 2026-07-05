@@ -10,6 +10,8 @@ import {
   cci,
   donchian,
   ema,
+  heikinAshi,
+  heikinAshiBar,
   ichimoku,
   macd,
   mfi,
@@ -142,6 +144,43 @@ describe("volume + volatility", () => {
     const out = vwap([...day1, ...day2]);
     expect(out[1]).toBeCloseTo(15); // mean of the two typical prices (equal vol)
     expect(out[2]).toBeCloseTo(100); // fresh session
+  });
+});
+
+describe("heikin ashi", () => {
+  it("smooths candles with the classic recurrence", () => {
+    const cs: OhlcvCandle[] = [
+      { time: 0, open: 100, high: 110, low: 95, close: 105, volume: 10 },
+      { time: 300, open: 105, high: 115, low: 100, close: 112, volume: 20 },
+    ];
+    const ha = heikinAshi(cs);
+    // bar 0: haClose = (100+110+95+105)/4 = 102.5, haOpen = (100+105)/2 = 102.5
+    expect(ha[0].close).toBeCloseTo(102.5);
+    expect(ha[0].open).toBeCloseTo(102.5);
+    // bar 1: haOpen = (102.5+102.5)/2 = 102.5, haClose = (105+115+100+112)/4 = 108
+    expect(ha[1].open).toBeCloseTo(102.5);
+    expect(ha[1].close).toBeCloseTo(108);
+    expect(ha[1].high).toBeCloseTo(115); // max(h, haOpen, haClose)
+    // times and volumes pass through untouched
+    expect(ha.map((c) => c.time)).toEqual([0, 300]);
+    expect(ha[1].volume).toBe(20);
+  });
+
+  it("heikinAshiBar matches the full transform for the last bar", () => {
+    const cs: OhlcvCandle[] = [
+      { time: 0, open: 100, high: 110, low: 95, close: 105, volume: 10 },
+      { time: 300, open: 105, high: 115, low: 100, close: 112, volume: 20 },
+      { time: 600, open: 112, high: 118, low: 108, close: 110, volume: 15 },
+    ];
+    const full = heikinAshi(cs);
+    const incremental = heikinAshiBar(cs[2], {
+      open: full[1].open,
+      close: full[1].close,
+    });
+    expect(incremental.open).toBeCloseTo(full[2].open);
+    expect(incremental.close).toBeCloseTo(full[2].close);
+    expect(incremental.high).toBeCloseTo(full[2].high);
+    expect(incremental.low).toBeCloseTo(full[2].low);
   });
 });
 

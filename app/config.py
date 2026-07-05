@@ -243,8 +243,15 @@ class Settings(BaseSettings):
     # high-conviction headline shapes (order win with explicit Rs-crore
     # value, KMP resignation, buyback with value) skip the LLM and go
     # straight to the rules engine — signal in milliseconds. Non-matches
-    # always fall through to the LLM track. See app/analyzer/fast_track.py.
+    # always fall through to the LLM track. Includes the HYBRID path:
+    # order-context headline without a value → value parsed from the
+    # filing PDF text (still no LLM). See app/analyzer/fast_track.py.
     FAST_TRACK_ENABLED: bool = False
+    # Phase 4 outcome logger: records the Fyers price at signal time and
+    # +5m/+30m for EVERY signal (approved and blocked) into
+    # signal_outcomes. Pure telemetry — no trading influence — so it
+    # defaults ON; it is the win-rate report and the future ML dataset.
+    OUTCOME_LOGGER_ENABLED: bool = True
     # Market session (IST, "HH:MM"). Entry window excludes the first
     # 15 min after open and the last 30 min before close; all intraday
     # positions are force-squared-off at SQUARE_OFF_TIME.

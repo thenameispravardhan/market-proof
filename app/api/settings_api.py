@@ -79,6 +79,9 @@ _GLOBAL_KEYS: dict[str, tuple[type, Any]] = {
     # buyback with explicit Rs-crore value, KMP resignation) skip the LLM
     # and hit the rules engine in milliseconds.
     "FAST_TRACK_ENABLED": (bool, False),
+    # Phase 4 outcome logger: passive price tracking (+5m/+30m) for every
+    # signal into signal_outcomes. Telemetry only, so default ON.
+    "OUTCOME_LOGGER_ENABLED": (bool, True),
     # Phase 3 latency knobs. LLM output-token cap (shorter = faster
     # generation; a full signal JSON measured ~165 tokens, keep 2×+
     # headroom). Staleness gate age. Hard end-to-end deadline from

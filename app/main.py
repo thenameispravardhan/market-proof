@@ -131,6 +131,10 @@ async def lifespan(app: FastAPI):
     execution_manager = ExecutionManager()
     notification_manager = NotificationManager()
     webhook_dispatcher = WebhookDispatcher()
+    # Phase 4: passive signals.new → signal_outcomes recorder (price at
+    # signal, +5m, +30m). Pure telemetry — no trading influence.
+    from app.services.outcome_logger import OutcomeLogger
+    outcome_logger = OutcomeLogger()
     # Quote feed + trade manager share the execution manager's market
     # data bus and paper backend so entries, exits and P&L all see the
     # same prices.
@@ -292,6 +296,8 @@ async def lifespan(app: FastAPI):
         # events out to operator-curated channels (Telegram, etc.).
         notification_manager.start()
         webhook_dispatcher.start()
+        # Phase 4 outcome logger — subscribe before signals start flowing.
+        outcome_logger.start()
 
         # Portfolio circuit-breaker monitor (RISK.md §4): periodically
         # rolls the day/week/month equity anchors, trips the daily /
@@ -342,6 +348,7 @@ async def lifespan(app: FastAPI):
             execution_manager.stop()
             notification_manager.stop()
             webhook_dispatcher.stop()
+            outcome_logger.stop()
             await analyzer_service.wait_until_stopped()
             await fyers_stream.wait_until_stopped()
             await trade_manager.wait_until_stopped()
@@ -349,6 +356,7 @@ async def lifespan(app: FastAPI):
             await execution_manager.wait_until_stopped()
             await notification_manager.wait_until_stopped()
             await webhook_dispatcher.wait_until_stopped()
+            await outcome_logger.wait_until_stopped()
             await analyzer_service.aclose()
             await webhook_dispatcher.aclose()
         log.info("app.shutdown")

@@ -1,0 +1,516 @@
+================================================================================
+AI NEWS TRADING BOT — PROJECT OVERVIEW
+================================================================================
+
+Project name:    AI News Trading Bot
+Version:         1.0.0 (app/__init__.py)
+Workspace:       C:\Projects\AI News Trading Bot
+Platform:        Windows (PowerShell). Also has bash scripts for *nix-style runs.
+Genre:           Local-first, AI-driven intraday equity news-trading system for
+                 Indian markets (NSE / BSE), executed via the Fyers broker.
+Audience:        Single local operator (you). No multi-tenant auth, no public
+                 surface — bind to 127.0.0.1 by default.
+
+--------------------------------------------------------------------------------
+1. WHAT IT DOES (in one sentence)
+--------------------------------------------------------------------------------
+It watches corporate-announcement feeds on NSE/BSE the moment they are filed,
+asks a large language model (DeepSeek) to read the actual filing text and
+classify the event, runs the result through an operator-authored rules engine
+and a risk engine, and (in paper or live mode) places an entry/exit trade on
+Fyers — all inside a tight 20-second budget from `filed_at` to order on the
+wire.
+
+--------------------------------------------------------------------------------
+2. WHY IT EXISTS (the problem it solves)
+--------------------------------------------------------------------------------
+Material corporate announcements (order wins, M&A, resignations, buybacks,
+results) move NSE/BSE stocks in seconds. By the time a human sees a Telegram
+forward, the move is half over. The bot's job is to be first reader and
+first trader, with explicit risk gates so it cannot bleed the account.
+
+--------------------------------------------------------------------------------
+3. ARCHITECTURE — HIGH-LEVEL PIPELINE
+--------------------------------------------------------------------------------
+The system is split into six tracks (T1..T6). They are wired together through
+a single in-process event bus (app/services/event_bus.py), with each stage
+owning its own SQLite-backed state and its own asyncio lifecycle:
+
+    NSE/BSE filings  ─►  T2 Monitor  ─►  T3 Analyzer  ─►  T4 Execution
+                                                              │
+                                                              ▼
+                          ◄──  T5 Notifications / Webhooks  ◄──┘
+                                T1 infrastructure: FastAPI + WS + DB
+
+T1 — Infrastructure (app/main.py, app/api/*, app/db/*, app/services/*)
+    FastAPI app, lifespan-managed startup/shutdown, SQLite via SQLAlchemy,
+    WebSocket event bus, global Settings (app/config.py), correlation IDs,
+    structlog JSON logging, /ws endpoint, static SPA hosting.
+
+T2 — Monitors (app/monitors/{nse,bse,base,manager}.py)
+    Polls NSE & BSE corporate-announcement endpoints every POLL_INTERVAL_SECONDS
+    (default 2s, httpx fast path + Playwright fallback), normalizes results,
+    dedupes against the `announcements` table, publishes `announcements.new`
+    on the event bus. PDF prefetch + lang-detection + scoring happens here too.
+
+T3 — Analyzer (app/analyzer/*)
+    Subscribes to `announcements.new`. Has TWO tracks:
+      • Deterministic fast track (fast_track.py) — order wins with explicit
+        Rs-crore value, KMP resignations, buybacks — goes straight to the
+        rules engine, llm_ms=0.
+      • LLM track (deepseek_client.py) — sends prompt + filing text to
+        DeepSeek, validates JSON via pydantic (schemas.py), then the same
+        rules engine evaluates signal_rules rows. Persists `analyses` and
+        emits `signals.new`.
+
+T4 — Execution (app/execution/*)
+    ExecutionManager routes every signal through risk checks → position sizing
+    → paper or live order → reconciliation → trade manager (SL/target/time
+    exits, scale-out, trailing). Supports two backends:
+      • paper.py  — synthetic fills with realistic slippage + latency.
+      • fyers_live.py / fyers_stream.py — REST + the fyers-apiv3 WebSocket
+        for live data + order fill updates.
+
+T5 — Notifications & Webhooks (app/notifications/*, app/webhooks/*)
+    NotificationManager fans events out to operator-curated channels:
+    Telegram, Discord, Email, generic Webhook. WebhookDispatcher handles
+    outbound HTTP for both Fyers postback-style hooks and arbitrary
+    user-configured endpoints.
+
+T6 — Operational surfaces (app/api/*)
+    Health, audit log, settings, prompts, rules, strategies, broker accounts,
+    backtests, market data, orders, positions, risk — all exposed as a JSON
+    REST API under /api/* and consumed by the React dashboard.
+
+--------------------------------------------------------------------------------
+4. TECH STACK
+--------------------------------------------------------------------------------
+Backend
+    Python 3.11
+    FastAPI 0.115.6          — HTTP framework
+    Uvicorn 0.32.1           — ASGI server
+    SQLAlchemy 2.0.36        — ORM
+    Alembic 1.14.0           — migrations (configured, init_db() bootstraps)
+    Pydantic 2.10.3          — schemas + Settings
+    pydantic-settings 2.7.0
+    structlog 24.4.0         — JSON logging with correlation IDs
+    httpx 0.28.1             — async HTTP client (NSE/BSE, Fyers REST, DeepSeek)
+    fyers-apiv3 3.1.6        — ONLY for the realtime data + order WebSockets
+    playwright 1.49.1        — JS-rendered NSE/BSE fallback (lazy import)
+    PyMuPDF 1.25.1           — PDF text extraction (lazy import)
+    websockets 13.1
+    pytest 8.3.4 + pytest-asyncio 0.24.0 — tests
+
+Frontend
+    React 18.3 + TypeScript 5.7
+    Vite 6
+    TanStack React Query 5   — server state
+    recharts 2.13            — equity-curve + P&L charts
+    lightweight-charts 5.2   — TradingView chart on the Trade page
+    @dnd-kit/*               — drag-and-drop on the Rules / Prompts pages
+    vitest 2.1 + happy-dom + jsdom — unit tests
+
+Storage
+    SQLite (data/trading.db in production, in-memory when TESTING=1)
+    data/scrip_master/        — local NSE scrip master cache
+    Multiple .db files in /data for different environments (smoke, test_seed,
+    ui_preview, trading.db with shm/wal, backups).
+
+Runtime / OS
+    Windows-native. .venv lives in .venv/Scripts/python.exe on Windows.
+    scripts/run.sh / scripts/run.ps1 — production start
+    scripts/dev.sh / scripts/dev.ps1 — two-terminal dev with reload + Vite HMR
+
+--------------------------------------------------------------------------------
+5. DIRECTORY LAYOUT
+--------------------------------------------------------------------------------
+AI News Trading Bot/
+├── app/                       Backend package
+│   ├── main.py                FastAPI app + lifespan wiring
+│   ├── config.py              Pydantic Settings (all env vars)
+│   ├── logging_config.py      structlog setup + correlation-id contextvar
+│   ├── analyzer/              T3 — DeepSeek + fast-track + rules engine
+│   │   ├── service.py         event-bus loop tying monitor→rules→signals
+│   │   ├── deepseek_client.py async httpx wrapper, retries, cost logging
+│   │   ├── fast_track.py      deterministic regex/keyword fast path
+│   │   ├── pdf_extract.py     PyMuPDF + Hindi filter + page scoring
+│   │   ├── pdf_cache.py       on-disk PDF cache to avoid re-downloads
+│   │   ├── rules_engine.py    evaluates signal_rules rows
+│   │   ├── default_rules.py   seed helper for default paper account
+│   │   ├── prompts.py         template lookup, render, seed_default prompts
+│   │   └── schemas.py         pydantic models (AnalysisResponse, enums)
+│   ├── api/                   T6 — REST routers (see §7)
+│   ├── db/                    SQLAlchemy models + session + init_db()
+│   ├── execution/             T4 — paper + Fyers + trade manager
+│   ├── monitors/              T2 — NSE + BSE announcement scrapers
+│   ├── notifications/         T5 — Telegram / Discord / Email / Webhook
+│   ├── risk/                  Pre-trade filters, position sizer, ATR,
+│   │                          circuit breakers, event profiles, market clock
+│   ├── services/              event_bus, instrument_master, outcome_logger,
+│   │                          webhook_service
+│   ├── webhooks/              signing + receiver + dispatcher + fyers
+│   └── tests/                 ~70 pytest files (conftest.py + per-module)
+├── frontend/                  React + Vite dashboard
+│   ├── src/
+│   │   ├── pages/             Dashboard, Trade, TradeHistory, Prompts,
+│   │   │                      Rules, Strategies, Backtest, Accounts,
+│   │   │                      Notifications, Webhooks, Settings
+│   │   ├── components/        per-page components + common (Toggle etc.)
+│   │   ├── hooks/             useApi, useQuotes, useWebSocket, useTheme
+│   │   ├── api/               client.ts + ws.ts
+│   │   ├── lib/               indicators.ts, roundtrips.ts
+│   │   ├── tests/             vitest unit tests
+│   │   ├── App.tsx            sidebar + status bar (Bloomberg-style)
+│   │   ├── router.tsx         hash-based router
+│   │   ├── themes.ts          light/dark themes
+│   │   └── types.ts
+│   └── package.json
+├── scripts/                   Operational helpers
+│   ├── run.sh / run.ps1       production start (venv + seed + build + uvicorn)
+│   ├── dev.sh / dev.ps1       dev mode (uvicorn --reload + vite dev)
+│   ├── setup_fyers.py         OAuth + register-app flow
+│   ├── register_fyers_webhook.py  sets Fyers postback HMAC secret
+│   ├── seed_default_prompts.py / seed_default_rules.py / seed_demo_data.py
+│   ├── backtest_seed.py
+│   ├── smoke_e2e.py / smoke_t{2,3,4}_*.py   end-to-end smoke tests
+│   ├── clear_trading_data.py / fix_doubled_trades.py / fix_fyers_app_id.py
+│   ├── _oauth.py / _tunnel.py / start_webhook_tunnel.ps1   cloudflared tunnel
+│   └── dev_smoke.py
+├── data/                      SQLite DBs + scrip master cache
+├── docs/                      reserved (currently empty)
+├── logs/                      uvicorn.out.log, fyers sockets, cloudflared
+├── plan.txt                   the consolidated improvement roadmap (Phases 0-6)
+├── AI_News_Trading_Bot_Report.pdf  a snapshot report
+├── pyrightconfig.json
+├── requirements.txt
+├── .env.example               copy this to .env and fill secrets
+└── .gitignore
+
+--------------------------------------------------------------------------------
+6. KEY CONCEPTS
+--------------------------------------------------------------------------------
+TRADING_MODE (app.config.Settings.TRADING_MODE)
+    "paper" — synthetic fills via paper.py. Default.
+    "live"  — real orders via fyers_live.py + fyers_stream.py. Requires
+              a connected Fyers account AND the operator-created
+              sentinel file .i_accept_live_risk (gitignored).
+
+The 20-second budget
+    Filing hits NSE/BSE → monitor scrapes → analyzer reads + reasons → risk
+    approves → order hits Fyers. The whole chain must finish before the
+    news alpha decays. Hard controls:
+      MAX_NEWS_AGE_SECONDS = 90  (analyzer refuses anything older)
+      LLM_TIMEOUT_SECONDS  = 18  (LLM call deadline)
+      PIPELINE_DEADLINE_SECONDS = 0 by default; opt-in from Settings
+      MAX_HOLD_SECONDS = 1080   (force-square after 18 min)
+
+Two-track analyzer
+    Fast track (deterministic, ~ms): "wins order worth Rs X cr", KMP
+    resignation (MD/CEO/CFO/WTD/chairman), buyback with value. Goes
+    straight to the rules engine with llm_ms=0.
+    LLM track (slow, paid): everything else. DeepSeek reads the actual
+    filing text and returns a structured AnalysisResponse.
+    Both tracks feed the SAME rules engine and the SAME risk layer.
+
+Operator-curated rules (not hard-coded logic)
+    The bot has zero hard-coded "if order-win then BUY". The rules engine
+    evaluates `signal_rules` rows in the database. You author them in the
+    Rules UI — match patterns, sentiment thresholds, key-number filters,
+    event-type gates — and the engine combines them with AND/OR/NOT
+    groups. This is what makes the bot a "platform" rather than a strategy.
+
+Prompt templates are data
+    DeepSeek system prompts live in the `prompt_templates` table and are
+    editable from the Prompts page (versioned, with history and reset-to-
+    default). Restart never overwrites them. The DEFAULT template seeds
+    on first boot only.
+
+Risk framework (RISK.md is referenced throughout)
+    §1 Pre-trade filters: sentiment confidence floor, India VIX cap,
+       spread cap (L1 feed pending — NO-OPs), ADV floor.
+    §2 Position sizing: risk-based qty AND notional cap, smaller wins.
+       Fresh accounts ramp RISK_RAMP_START_PCT → MAX_CAPITAL_RISK_PCT
+       over RISK_RAMP_TRADES filled trades. INTRADAY_LEVERAGE=5x
+       applies to notional sizing only, never to real-money risk.
+    §3 Stops / targets: SCALE_OUT at SCALE_OUT_R, trailing armed at
+       TRAIL_ACTIVATE_R, ATR-aware initial stop (ATR×ATR_STOP_MULT
+       clamped to [DEFAULT_SL_MIN_PCT, ATR_MAX_STOP_PCT]).
+    §4 Portfolio circuit breakers: daily / weekly / monthly loss caps
+       (% of anchor equity). Daily+monthly flatten + halt; weekly
+       throttles risk-per-trade. Consecutive-loser pause.
+    §4b Clustering: SECTOR_CONCENTRATION_PCT (whole-portfolio sector
+       cap), MAX_POSITIONS_PER_SECTOR, SECTOR_CLUSTER_WINDOW_SECONDS
+       (block a 2nd same-sector entry inside the window).
+    §5 Execution safeguards: IOC marketable-limit at last±ENTRY_BUFFER_PCT
+       cancelled after ORDER_FILL_TIMEOUT, fill worse than MAX_SLIPPAGE_PCT
+       rejected.
+
+Outcome logger (Phase 4)
+    Every approved AND blocked signal writes a `signal_outcomes` row with
+    the Fyers price at signal time and +5m/+30m. Pure telemetry — no
+    trading influence — but it's the win-rate report and the future ML
+    dataset. Defaults ON.
+
+--------------------------------------------------------------------------------
+7. THE REST API (app/api/*)
+--------------------------------------------------------------------------------
+Health:               /api/health
+Settings:             /api/settings/*                CRUD on global settings
+Trading mode:         /api/trading-mode              paper ↔ live switch
+Broker accounts:      /api/broker-accounts/*        Fyers connect/list/delete
+                      /api/fyers/callback            OAuth redirect target
+                      /api/fyers/postback            inbound Fyers fill webhook
+Prompts:              /api/prompts/*                 templates + history + reset
+Rules:                /api/rules/*                   + /rules/dry-run
+Strategies:           /api/strategies/*              risk-config bundles
+Market:               /api/market/indices, /quotes, /history, /funds, /options
+Orders:               /api/orders/*                  manual + auto order routes
+Positions:            /api/positions/*               close / list / close-all
+Risk:                 /api/risk/*                    snapshot + reset
+Notifications:        /api/notifications/*           channels CRUD
+Webhooks:             /api/webhooks/*                outbound + delivery log
+Backtest:             /api/backtest/*                runs + runs/{id}
+                      /api/backtest/seed              seed historical bars
+Audit log:            /api/audit-log/*
+Search:               /api/search                    global search
+Core/analyses:        /api/analyses/*                trigger analyzer on a
+                                                       stored announcement,
+                                                       re-run, list
+WebSocket:            /ws                            channels: signals,
+                                                       trades, positions,
+                                                       quotes
+
+The frontend SPA (frontend/dist/index.html, served when built) mounts on /
+and provides Dashboard, Trade, TradeHistory, Prompts, Rules, Strategies,
+Backtest, Accounts, Notifications, Webhooks, Settings.
+
+--------------------------------------------------------------------------------
+8. DATA MODEL (app/db/models.py, ~750 LOC)
+--------------------------------------------------------------------------------
+announcements           raw NSE/BSE filings (deduped, with PDF link, lang)
+analyses                analyzer outputs (prompt, response JSON, timings)
+signals                 analyzer-emitted BUY/SHORT/HOLD with entry/SL/target
+trades                  opened/closed positions with realised P&L
+strategies              risk-config bundles referenced by signals
+signal_rules            operator-authored rules evaluated by rules_engine
+prompt_templates        versioned prompt templates
+broker_accounts         Fyers (and future brokers) credentials
+notifications           channels (Telegram/Discord/Email/Webhook) + settings
+webhooks                outbound + Fyers inbound webhook configs
+notifications_outbox    durable retry queue for notification delivery
+audit_log               settings / mode / rule edits
+backtest_runs           config + result summary
+backtest_trades         per-trade detail for backtest runs
+signal_outcomes         Phase 4 telemetry: price at signal, +5m, +30m
+
+Infra models (infra_models.py) hold the persisted UI/API setting overrides
+that the Settings page writes; apply_overrides_to_env() rebuilds the
+in-process env at boot so saved tweaks survive restart.
+
+--------------------------------------------------------------------------------
+9. CONFIGURATION (app/config.py)
+--------------------------------------------------------------------------------
+Everything goes through the Pydantic Settings class. The .env.example file
+documents every knob with inline comments. The Settings page in the UI
+overlays many of them into the DB so operators can tune without restart.
+
+Trading core
+    TRADING_MODE = paper | live
+    DEEPSEEK_API_KEY (required for AI)
+    FYERS_APP_ID, FYERS_SECRET_KEY, FYERS_ACCESS_TOKEN, FYERS_REDIRECT_URI,
+        FYERS_POSTBACK_SECRET (HMAC for Fyers postback)
+    DATABASE_URL (default sqlite:///./data/trading.db)
+    BIND_HOST = 127.0.0.1, BIND_PORT = 8000, LOG_LEVEL = INFO
+    POLL_INTERVAL_SECONDS = 2
+
+Risk defaults
+    MAX_CAPITAL_RISK_PCT = 0.75, DAILY_MAX_LOSS_PCT = 2.5,
+    MAX_CONCURRENT_POSITIONS = 3, MAX_SINGLE_POSITION_PCT = 20,
+    MIN_LIQUIDITY_CRORE = 5, MAX_SIGNALS_PER_DAY = 20,
+    PORTFOLIO_VALUE = 1,000,000, DEFAULT_SL_PCT = 6,
+    DEFAULT_TARGET_RR = 3, QUOTE_REFRESH_SECONDS = 5
+
+Speed-trading rules
+    MAX_NEWS_AGE_SECONDS = 90
+    MAX_HOLD_SECONDS = 1080  (18-min spike window)
+    FYERS_STREAMING_ENABLED = True
+
+Volatility-aware stops
+    ATR_ENABLED = True, ATR_PERIOD = 14, ATR_STOP_MULT = 2,
+    ATR_MAX_STOP_PCT = 8
+
+Risk framework (RISK.md)
+    MIN_SENTIMENT_CONFIDENCE = 0.7
+    INDIA_VIX_MAX = 30  (needs VIX feed; fail-safe skip)
+    MAX_SPREAD_PCT = 0.1  (needs L1 feed; fail-safe skip)
+    SHORTING_ENABLED = True
+    REQUIRE_KNOWN_LIQUIDITY = False
+    RISK_RAMP_TRADES = 100, RISK_RAMP_START_PCT = 0.5
+    INTRADAY_LEVERAGE = 5.0
+    SCALE_OUT_ENABLED = True, SCALE_OUT_R = 2.0
+    TRAIL_ACTIVATE_R = 1.5, TRAIL_DISTANCE_R = 0.5
+    DEFAULT_SL_MIN_PCT = 1, DEFAULT_SL_SMALLCAP_PCT = 1.5,
+        SMALLCAP_PRICE = 200
+    WEEKLY_MAX_LOSS_PCT = 5, MONTHLY_MAX_DRAWDOWN_PCT = 8,
+    WEEKLY_BREACH_RISK_PCT = 0.25
+    MAX_CONSECUTIVE_LOSERS = 4, CONSECUTIVE_LOSER_PAUSE_MINUTES = 45,
+        CONSECUTIVE_LOSER_RESUME_CONFIDENCE = 0.85
+    MAX_TRADES_PER_DAY = 12
+    SECTOR_CONCENTRATION_PCT = 25, MAX_POSITIONS_PER_SECTOR = 2,
+        SECTOR_CLUSTER_WINDOW_SECONDS = 120
+    ENTRY_BUFFER_PCT = 0.2, MAX_SLIPPAGE_PCT = 0.25
+    ORDER_FILL_TIMEOUT_SECONDS = 1.5
+    LLM_TIMEOUT_SECONDS = 18
+    LLM_MAX_TOKENS = 400 (was 1024; measured live ~165 actual)
+    LLM_MAX_RETRIES = 1, LLM_RETRY_BACKOFF_SECONDS = 0.5
+    PIPELINE_DEADLINE_SECONDS = 0 (opt-in)
+
+Toggles
+    PRE_LLM_FILTER_ENABLED = True (drop administrative filings pre-LLM)
+    AI_ANALYSIS_ENABLED = True (master kill-switch for LLM analysis)
+    SEND_EXTRACTED_TEXT = False (extract PDF text into the prompt)
+    FAST_TRACK_ENABLED = False (deterministic regex track)
+    OUTCOME_LOGGER_ENABLED = True (Phase 4 telemetry)
+    ENFORCE_MARKET_HOURS = True
+
+Market session (IST)
+    MARKET_OPEN 09:15, CLOSE 15:30, ENTRY 09:30..15:00,
+    SQUARE_OFF 15:10
+
+Internal
+    TESTING = 0 (pytest sets to 1 → in-memory sqlite)
+    APP_VERSION = "0.1.0"
+
+Validators enforce sane ranges: percent in (0,100], leverage 1..10,
+HH:MM strings, positive ints, etc.
+
+--------------------------------------------------------------------------------
+10. THE ROADMAP (plan.txt)
+--------------------------------------------------------------------------------
+The improvement plan in plan.txt is the project's north star. Constraint:
+NEVER destroy the existing setup — every new behavior ships behind a
+frontend toggle, defaulting to the current behavior. No file sentinels,
+no CLI gates. Controls live in the UI.
+
+Phase 0 — Measure first: instrument per-stage latency (pdf_fetch_ms /
+    pdf_extract_ms / llm_ms / total_ms / news_age_s_at_start), log an
+    analyzer.pipeline_timing line, then read the logs. STATUS: DONE for
+    instrumentation, PENDING for the operator to read them.
+
+Phase 1 — Real news text into the pipeline: PDF prefetch + extraction +
+    Hindi filter + page selection + scanned-PDF detection +
+    {{extracted_text}} placeholder + "Send extracted PDF text to AI"
+    toggle (default OFF). STATUS: DONE.
+
+Phase 2 — Two-track signals: deterministic fast track (order wins,
+    KMP resignations, buybacks) routed straight to the rules engine.
+    XBRL parser for financial results is DEFERRED until live XBRL
+    attachments are mapped. STATUS: DONE.
+
+Phase 3 — LLM track under ~8s: LLM_MAX_TOKENS 1024→400, end-to-end
+    deadline, retries trimmed, MAX_NEWS_AGE_SECONDS exposed. Live
+    benchmark 2026-07-04: PDF fetch 200-1200ms, extract <80ms,
+    DeepSeek deepseek-v4-flash ~2.3-2.4s, TOTAL ~2.5-2.7s off-peak.
+    STATUS: DONE off-peak; verify market-hours p95.
+
+Phase 4 — Data collection: outcome logger writes to signal_outcomes;
+    review/export view for label correction. STATUS: DONE (logger
+    running, review view is ongoing).
+
+Phase 5 — Pre-filter model: weak-label by "+X% vs index within 30 min",
+    train FinBERT/IndicBERT-class classifier (<100ms) to kill routine
+    noise before the LLM call. STATUS: BLOCKED on Phase 4 data volume
+    (needs 1-2k logged announcements).
+
+Phase 6 — Fine-tuning: only after 1-2 months of Phase 4 data, on fact
+    extraction (not buy/sell direction — the rules engine stays the
+    decision-maker). STATUS: BLOCKED.
+
+Dependency graph:
+    Phase 0 runs alongside Phase 1 → Phase 1 unlocks everything →
+    Phases 2 and 3 are independent of each other → Phase 4 needs
+    Phase 1 → Phase 5 needs Phase 4 → Phase 6 needs months of Phase 4.
+
+--------------------------------------------------------------------------------
+11. HOW TO RUN IT
+--------------------------------------------------------------------------------
+Prerequisites
+    Python 3.11
+    Node 20+ (for the React dashboard)
+    Fyers account (only for live trading or for real-time data; paper mode
+        works without one)
+
+First boot
+    cd "C:\Projects\AI News Trading Bot"
+    python -m venv .venv
+    .venv\Scripts\pip install -r requirements.txt
+    copy .env.example .env          # then edit and set DEEPSEEK_API_KEY
+    # PowerShell: .\scripts\run.ps1
+    # bash (Git Bash / WSL): bash scripts/run.sh
+    # Open http://127.0.0.1:8000/
+
+Dev mode (two terminals with HMR)
+    Terminal 1:  .\scripts\dev.ps1  (uvicorn --reload)
+    Terminal 2:  cd frontend ; npm install ; npm run dev
+    Then open the Vite URL (default 5173, .claude/launch.json uses 5174).
+
+Tests
+    .venv\Scripts\python -m pytest app\tests
+    frontend: cd frontend ; npm run test
+
+Smoke tests
+    python scripts/smoke_e2e.py
+    python scripts/smoke_t2_monitor.py
+    python scripts/smoke_t3_analyzer.py
+    python scripts/smoke_t4_execution.py
+
+Fyers setup (live mode)
+    1. Create an app on https://myapi.fyers.in/dashboard/
+    2. Put FYERS_APP_ID, FYERS_SECRET_KEY, FYERS_REDIRECT_URI in .env
+    3. Add your server's public IP to the app's IP-whitelist
+       (api.ipify.org to get it; Fyers error -50 is an IP issue, not
+       an app-type issue — see the agent's MEMORY.md)
+    4. python scripts/setup_fyers.py          (OAuth flow)
+    5. python scripts/register_fyers_webhook.py   (sets FYERS_POSTBACK_SECRET
+       and configures the inbound postback URL — use a cloudflared tunnel
+       on localhost for dev; scripts/start_webhook_tunnel.ps1 handles this)
+
+Going live
+    Edit .env: TRADING_MODE=live, set FYERS_ACCESS_TOKEN, add live
+    account under Accounts in the UI, then create the operator sentinel
+    file `.i_accept_live_risk` (gitignored). The file MUST exist; the
+    app refuses to enter live mode without it.
+
+--------------------------------------------------------------------------------
+12. DESIGN PHILOSOPHY / RULES OF THE ROAD
+--------------------------------------------------------------------------------
+• Operator-curated, not hard-coded. The bot ships with no "BUY on order
+  win" rule. You write the rules in the Rules UI; the engine evaluates
+  them. Same for prompts — templates live in the DB.
+• All knobs in the UI. No file sentinels, no CLI flags. The Settings
+  page owns every dial; restart must never silently change behavior.
+• Restart-safe. Prompts overwrite=False on seed; rules never re-seed;
+  saved overrides re-apply at boot. Deleting a rule stays deleted.
+• Fail-safe defaults. Features that need a feed they don't yet have
+  (VIX, L1 spread, ADV) NO-OP rather than fake a pass.
+• Latency is the product. Every layer measures itself. Logs carry
+  per-stage ms; the operator reads them.
+• Speed is a feature, but not at any cost. Risk gates, sector cluster
+  windows, freshness caps, and circuit breakers ALWAYS run before
+  the order goes out.
+
+--------------------------------------------------------------------------------
+13. WHERE TO LOOK NEXT (for new contributors)
+--------------------------------------------------------------------------------
+• Read plan.txt — it IS the spec.
+• app/main.py lifespan — the boot order and what depends on what.
+• app/analyzer/service.py — the event-bus loop; understand this and
+  you understand T3.
+• app/risk/engine.py — every pre-trade filter, why and how.
+• app/execution/manager.py — T4; the heart of paper and live both.
+• frontend/src/router.tsx + App.tsx — the SPA shell.
+• app/api/settings_api.py — how UI overrides become process env.
+
+================================================================================
+END OF FILE — generated 2026-07-05 for project workspace C:\Projects\AI News Trading Bot
+================================================================================

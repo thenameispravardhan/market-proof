@@ -50,10 +50,16 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.analyzer.deepseek_client import DeepSeekClient, DeepSeekError
-from app.analyzer.fast_track import FastTrackProducer, evaluate_fast_track
+from app.analyzer.fast_track import (
+    FastTrackMatch,
+    FastTrackProducer,
+    evaluate_fast_track,
+    evaluate_fast_track_text,
+    is_hybrid_order_candidate,
+)
+from app.analyzer import pdf_cache
 from app.analyzer.pdf_extract import (
     ExtractionResult,
-    download_pdf,
     extract_text_for_llm,
 )
 from app.analyzer.prompts import (
@@ -422,60 +428,22 @@ class Service:
         # value) we skip template/PDF/LLM entirely and go straight to the
         # rules engine — signal in milliseconds instead of seconds. No
         # match (or toggle OFF) → the normal LLM track below, unchanged.
-        if bool(getattr(settings, "FAST_TRACK_ENABLED", False)):
+        fast_track_on = bool(getattr(settings, "FAST_TRACK_ENABLED", False))
+        hybrid_candidate = False
+        if fast_track_on:
             ft = evaluate_fast_track(announcement.headline or "")
             if ft is not None:
-                ft_elapsed_ms = (time.perf_counter() - t_start) * 1000.0
-                ft_timings: dict[str, Any] = {
-                    "pdf_fetch_ms": None,
-                    "pdf_extract_ms": None,
-                    "llm_ms": 0.0,
-                    "total_ms": round(ft_elapsed_ms, 1),
-                    "news_age_s_at_start": (
-                        round(age_seconds, 2) if age_seconds is not None else None
-                    ),
-                }
-                log.info(
-                    "analyzer.fast_track_matched",
-                    announcement_id=announcement_id,
-                    symbol=announcement.symbol,
-                    pattern=ft.pattern,
-                    recommendation=str(ft.response.recommendation),
-                    confidence=ft.response.confidence,
+                return await self._emit_fast_track_signal(
+                    announcement, announcement_id, ft,
+                    t_start=t_start, age_seconds=age_seconds,
                 )
-                log.info(
-                    "analyzer.pipeline_timing",
-                    announcement_id=announcement_id,
-                    track="fast",
-                    used_extracted_text=False,
-                    **ft_timings,
-                )
-                ft_dict = analysis_to_dict(ft.response)
-                producer = FastTrackProducer(latency_ms=ft_elapsed_ms)
-                signal, approved = await loop.run_in_executor(
-                    None, _persist_analysis_and_signal,
-                    self._session_factory, announcement, ft.response, ft_dict,
-                    producer, self._signals_today,
-                    ft_timings,
-                    None,
-                )
-                await event_bus.publish(
-                    CHANNEL_NEW_SIGNAL,
-                    _signal_payload(signal, ft.response, ft_dict, approved=approved),
-                )
-                try:
-                    from app.services.audit_service import log_event
-                    log_event(
-                        actor="system",
-                        action="signal.created",
-                        target=f"signal:{signal.id}",
-                        after=_signal_payload(
-                            signal, ft.response, ft_dict, approved=approved
-                        ),
-                    )
-                except Exception:  # pragma: no cover — optional
-                    pass
-                return signal
+            # HYBRID candidate: the headline says "order" but carries no
+            # value (typical NSE phrasing). Extract the PDF below and try
+            # to parse the value deterministically before paying for the
+            # LLM.
+            hybrid_candidate = is_hybrid_order_candidate(
+                announcement.headline or ""
+            )
 
         # Step 2: pick prompt template (event-type heuristic + DEFAULT).
         detected = detect_event_type(
@@ -520,9 +488,13 @@ class Service:
         extraction: Optional[ExtractionResult] = None
         pdf_fetch_ms: Optional[float] = None
         pdf_extract_ms: Optional[float] = None
-        if bool(getattr(settings, "SEND_EXTRACTED_TEXT", False)) and announcement.pdf_url:
+        send_extracted_on = bool(getattr(settings, "SEND_EXTRACTED_TEXT", False))
+        if (send_extracted_on or hybrid_candidate) and announcement.pdf_url:
             t_fetch = time.perf_counter()
-            pdf_bytes = await download_pdf(
+            # Cache-first: the monitor started this download the moment
+            # the filing was detected (pdf_cache.prefetch); usually the
+            # bytes are already here.
+            pdf_bytes = await pdf_cache.get_pdf(
                 announcement.pdf_url,
                 timeout_s=float(getattr(settings, "PDF_FETCH_TIMEOUT_SECONDS", 6.0)),
             )
@@ -552,7 +524,26 @@ class Service:
                     ),
                     fetch_ms=round(pdf_fetch_ms or 0.0, 1),
                 )
-        use_extracted = extraction is not None and extraction.ok
+
+        # Step 2.7: HYBRID FAST TRACK. Order-context headline + value
+        # parsed deterministically from the filing text → signal without
+        # the LLM (~1s vs several). No value found → LLM track continues.
+        if hybrid_candidate and extraction is not None and extraction.ok:
+            ft2 = evaluate_fast_track_text(
+                announcement.headline or "", extraction.text
+            )
+            if ft2 is not None:
+                return await self._emit_fast_track_signal(
+                    announcement, announcement_id, ft2,
+                    t_start=t_start, age_seconds=age_seconds,
+                    pdf_fetch_ms=pdf_fetch_ms, pdf_extract_ms=pdf_extract_ms,
+                    pdf_extraction_meta=extraction.meta(),
+                )
+
+        # The LLM prompt uses the filing text only when the operator's
+        # extracted-text toggle is ON — a hybrid-only extraction is not
+        # sent to the LLM (strict toggle semantics).
+        use_extracted = send_extracted_on and extraction is not None and extraction.ok
 
         # Step 3: call DeepSeek. Use the URL we have — empty string
         # only if the announcement had no PDF.
@@ -767,6 +758,78 @@ class Service:
         except Exception:  # pragma: no cover — optional
             pass
 
+        return signal
+
+
+    # -- fast-track emit (shared by headline + hybrid paths) --------------
+
+    async def _emit_fast_track_signal(
+        self,
+        announcement: Announcement,
+        announcement_id: int,
+        ft: FastTrackMatch,
+        *,
+        t_start: float,
+        age_seconds: Optional[float],
+        pdf_fetch_ms: Optional[float] = None,
+        pdf_extract_ms: Optional[float] = None,
+        pdf_extraction_meta: Optional[dict[str, Any]] = None,
+    ) -> Signal:
+        """Persist + publish a fast-track analysis/signal (no LLM).
+
+        Same downstream path as the LLM track: rules engine, risk check,
+        signals.new publish, audit. The analysis row is stamped
+        model="fast-track" for provenance.
+        """
+        loop = asyncio.get_running_loop()
+        ft_elapsed_ms = (time.perf_counter() - t_start) * 1000.0
+        ft_timings: dict[str, Any] = {
+            "pdf_fetch_ms": round(pdf_fetch_ms, 1) if pdf_fetch_ms is not None else None,
+            "pdf_extract_ms": round(pdf_extract_ms, 1) if pdf_extract_ms is not None else None,
+            "llm_ms": 0.0,
+            "total_ms": round(ft_elapsed_ms, 1),
+            "news_age_s_at_start": (
+                round(age_seconds, 2) if age_seconds is not None else None
+            ),
+        }
+        log.info(
+            "analyzer.fast_track_matched",
+            announcement_id=announcement_id,
+            symbol=announcement.symbol,
+            pattern=ft.pattern,
+            recommendation=str(ft.response.recommendation),
+            confidence=ft.response.confidence,
+        )
+        log.info(
+            "analyzer.pipeline_timing",
+            announcement_id=announcement_id,
+            track="fast",
+            used_extracted_text=pdf_extraction_meta is not None,
+            **ft_timings,
+        )
+        ft_dict = analysis_to_dict(ft.response)
+        producer = FastTrackProducer(latency_ms=ft_elapsed_ms)
+        signal, approved = await loop.run_in_executor(
+            None, _persist_analysis_and_signal,
+            self._session_factory, announcement, ft.response, ft_dict,
+            producer, self._signals_today,
+            ft_timings,
+            pdf_extraction_meta,
+        )
+        await event_bus.publish(
+            CHANNEL_NEW_SIGNAL,
+            _signal_payload(signal, ft.response, ft_dict, approved=approved),
+        )
+        try:
+            from app.services.audit_service import log_event
+            log_event(
+                actor="system",
+                action="signal.created",
+                target=f"signal:{signal.id}",
+                after=_signal_payload(signal, ft.response, ft_dict, approved=approved),
+            )
+        except Exception:  # pragma: no cover — optional
+            pass
         return signal
 
 

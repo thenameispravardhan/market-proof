@@ -381,6 +381,30 @@ class BaseMonitor:
             company=raw_a.company,
             announcement_id=new_id,
         )
+        # PDF PREFETCH: start the download NOW, in parallel with the
+        # event-bus hop and the analyzer's gates, so extracted-text mode
+        # and the hybrid fast track find the bytes already in the cache.
+        # Only when a feature that reads PDFs is on, and never for
+        # clearly-administrative junk the analyzer will skip anyway.
+        try:
+            settings = get_settings()
+            if raw_a.pdf_url and (
+                bool(getattr(settings, "SEND_EXTRACTED_TEXT", False))
+                or bool(getattr(settings, "FAST_TRACK_ENABLED", False))
+            ):
+                from app.analyzer.prompts import is_non_material
+
+                if not is_non_material(raw_a.title or ""):
+                    from app.analyzer import pdf_cache
+
+                    pdf_cache.prefetch(
+                        raw_a.pdf_url,
+                        timeout_s=float(
+                            getattr(settings, "PDF_FETCH_TIMEOUT_SECONDS", 6.0)
+                        ),
+                    )
+        except Exception:  # noqa: BLE001 — prefetch must never break publish
+            log.debug("monitor.prefetch_failed", announcement_id=new_id)
         try:
             await event_bus.publish(CHANNEL_NEW, payload)
         except Exception:  # noqa: BLE001
