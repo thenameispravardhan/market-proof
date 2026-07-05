@@ -100,7 +100,7 @@ def _make_deepseek_client(handler) -> DeepSeekClient:
     )
 
 
-def _make_announcement(session, *, title: str = "Reliance wins order worth Rs 5000 cr", pdf_url: str = "https://nse/x.pdf", filed_at=None) -> Announcement:
+def _make_announcement(session, *, title: str = "Reliance Industries Limited - Quarterly Results", pdf_url: str = "https://nse/x.pdf", filed_at=None) -> Announcement:
     from datetime import datetime, timezone
     # Use `now` (not a fixed past date) so the analyzer's freshness
     # gate doesn't pre-empt the test signal — most tests here aren't

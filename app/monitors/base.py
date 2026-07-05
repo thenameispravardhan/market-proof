@@ -18,6 +18,27 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional, Union
 
+try:
+    import orjson as _fast_json
+
+    def _json_dumps(obj: Any) -> str:
+        return _fast_json.dumps(obj).decode("utf-8")
+
+    def _json_loads(s: Union[str, bytes]) -> Any:
+        if isinstance(s, str):
+            s = s.encode("utf-8")
+        return _fast_json.loads(s)
+except ImportError:
+    import json as _json_lib
+
+    def _json_dumps(obj: Any) -> str:
+        return _json_lib.dumps(obj)
+
+    def _json_loads(s: Union[str, bytes]) -> Any:
+        if isinstance(s, bytes):
+            s = s.decode("utf-8")
+        return _json_lib.loads(s)
+
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 

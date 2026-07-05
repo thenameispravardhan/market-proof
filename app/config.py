@@ -53,10 +53,10 @@ class Settings(BaseSettings):
     # How often each monitor re-polls NSE/BSE. Lower = faster detection
     # of a fresh filing, but poll too aggressively and the exchange CDNs
     # start returning 403s / rate-limit your IP (the scraper then falls
-    # back to the slower Playwright path or stalls entirely). 2s is a
-    # balance for a single local operator; raise it if you start seeing
+    # back to the slower Playwright path or stalls entirely). 1s is the
+    # floor for a single local operator; raise it if you start seeing
     # `monitor.retry` 403/429 spam in the logs.
-    POLL_INTERVAL_SECONDS: int = 2
+    POLL_INTERVAL_SECONDS: int = 1
 
     # ---------- Risk defaults (per-strategy overrides in DB) ----------
     # Per-trade capital-at-risk cap. RISK.md targets 0.75%; the graduated
@@ -95,9 +95,9 @@ class Settings(BaseSettings):
     # to call the LLM. This is the "no trades on old queued news"
     # rule. The analyzer also pre-marks every announcement older than
     # this on startup so a process restart never replays the backlog.
-    # Default 90s gives ~70s of slack inside the 20-second trade
+    # Default 45s gives ~30s of slack inside the 20-second trade
     # budget for downstream latency (LLM + Fyers + fill).
-    MAX_NEWS_AGE_SECONDS: int = 90
+    MAX_NEWS_AGE_SECONDS: int = 45
     # Maximum time (seconds) the trade manager holds an open position
     # regardless of stop-loss / target. Captures the "20-30 min spike
     # capture" rule — when the window closes we exit at the last
@@ -185,7 +185,7 @@ class Settings(BaseSettings):
     ENTRY_BUFFER_PCT: float = 0.2
     MAX_SLIPPAGE_PCT: float = 0.25
     ORDER_FILL_TIMEOUT_SECONDS: float = 1.5
-    LLM_TIMEOUT_SECONDS: float = 18.0         # discard the opportunity past this
+    LLM_TIMEOUT_SECONDS: float = 12.0         # discard the opportunity past this
     # Hard cap on LLM completion tokens. Generation latency scales almost
     # linearly with output length, and a signal JSON needs only a few
     # hundred tokens — so capping here (clamped against each template's
@@ -193,11 +193,10 @@ class Settings(BaseSettings):
     # Paired with the brevity instruction in `render_system_prompt` so the
     # model stays well inside this. Measured on the live pipeline
     # (2026-07-04): a full signal JSON for a real filing ran 165
-    # completion tokens, so 400 leaves ~2.4× headroom while cutting the
-    # worst-case generation time roughly in half vs the old 1024. Don't
-    # drop this below the size a full signal JSON needs — a truncated
+    # completion tokens, so 300 leaves ~1.8× headroom while cutting
+    # generation time further. Don't drop below ~250 — a truncated
     # response fails to parse → lost signal. Editable in Settings.
-    LLM_MAX_TOKENS: int = 400
+    LLM_MAX_TOKENS: int = 300
     # LLM retry policy. The old 3-retry / 1s-2s-4s ladder could add 7s+
     # of dead time to a failing call — fatal for a speed-news strategy.
     # One fast retry (0.5s, doubling per attempt) then give up: by the
@@ -236,7 +235,7 @@ class Settings(BaseSettings):
     # Budget knobs for extracted-text mode. The fetch timeout is deliberately
     # short with no retries (the news spike decays in seconds); the char cap
     # keeps the prompt near ~6k tokens so DeepSeek stays fast.
-    PDF_FETCH_TIMEOUT_SECONDS: float = 6.0
+    PDF_FETCH_TIMEOUT_SECONDS: float = 4.0
     PDF_MAX_TEXT_CHARS: int = 24_000
     # Deterministic fast track (Settings toggle). OFF (default) = every
     # filing takes the LLM track (legacy behavior). ON = a few unambiguous
@@ -246,7 +245,7 @@ class Settings(BaseSettings):
     # always fall through to the LLM track. Includes the HYBRID path:
     # order-context headline without a value → value parsed from the
     # filing PDF text (still no LLM). See app/analyzer/fast_track.py.
-    FAST_TRACK_ENABLED: bool = False
+    FAST_TRACK_ENABLED: bool = True
     # Phase 4 outcome logger: records the Fyers price at signal time and
     # +5m/+30m for EVERY signal (approved and blocked) into
     # signal_outcomes. Pure telemetry — no trading influence — so it

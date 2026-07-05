@@ -115,7 +115,7 @@ class DeepSeekClient:
     """
 
     ENDPOINT = "https://api.deepseek.com/v1/chat/completions"
-    DEFAULT_TIMEOUT_S = 30.0
+    DEFAULT_TIMEOUT_S = 20.0
     # Retry policy defaults come from settings (LLM_MAX_RETRIES /
     # LLM_RETRY_BACKOFF_SECONDS). For a speed-news pipeline the old
     # 3-retry 1s-2s-4s ladder added up to 7s of dead time to a failing

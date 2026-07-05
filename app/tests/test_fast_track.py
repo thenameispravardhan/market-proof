@@ -205,25 +205,33 @@ async def test_service_non_matching_headline_uses_llm_track(
 
 @pytest.mark.asyncio
 async def test_service_toggle_off_uses_llm_even_for_matching_headline(
-    db_session, isolated_db
+    db_session, isolated_db, monkeypatch
 ) -> None:
-    """Default OFF = legacy behavior: the LLM analyses order wins too."""
-    seed_defaults(db_session)
-    _seed_strategy_with_buy_rule(db_session)
-    db_session.commit()
-    ann = _make_announcement(
-        db_session, title="Reliance wins order worth Rs 5000 cr"
-    )
+    """Explicitly OFF: the LLM analyses order wins too, even though
+    the new default is ON — the toggle must gate the fast track."""
+    from app import config as app_config
 
-    handler = lambda req: httpx.Response(
-        200, json=_deepseek_response(_valid_analysis_json())
-    )
-    svc = Service(deepseek_client=_make_deepseek_client(handler))
+    monkeypatch.setenv("FAST_TRACK_ENABLED", "0")
+    app_config.reset_settings_cache()
     try:
-        signal = await svc.process_announcement(ann.id)
-    finally:
-        await svc.aclose()
+        seed_defaults(db_session)
+        _seed_strategy_with_buy_rule(db_session)
+        db_session.commit()
+        ann = _make_announcement(
+            db_session, title="Reliance wins order worth Rs 5000 cr"
+        )
 
-    assert signal is not None
-    analysis = db_session.execute(select(Analysis)).scalars().one()
-    assert analysis.model == "deepseek-chat"
+        handler = lambda req: httpx.Response(
+            200, json=_deepseek_response(_valid_analysis_json())
+        )
+        svc = Service(deepseek_client=_make_deepseek_client(handler))
+        try:
+            signal = await svc.process_announcement(ann.id)
+        finally:
+            await svc.aclose()
+
+        assert signal is not None
+        analysis = db_session.execute(select(Analysis)).scalars().one()
+        assert analysis.model == "deepseek-chat"
+    finally:
+        app_config.reset_settings_cache()

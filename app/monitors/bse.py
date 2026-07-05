@@ -42,13 +42,34 @@ Notes from a live probe (2026-06-12):
 from __future__ import annotations
 
 import asyncio
-import json
+import json as _stdlib_json
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Union, cast
 
 from app.logging_config import get_logger
 from app.monitors.base import BaseMonitor, RawAnnouncement
+
+# orjson is ~3-5× faster than stdlib json for exchange payloads. Fall
+# back to stdlib if orjson isn't installed.
+try:
+    import orjson as _fast_json
+
+    def _parse_json(raw: Union[str, bytes]) -> Any:
+        if isinstance(raw, str):
+            raw = raw.encode("utf-8")
+        return _fast_json.loads(raw)
+
+    def _json_dumps(obj: Any) -> str:
+        return _fast_json.dumps(obj).decode("utf-8")
+except ImportError:
+    def _parse_json(raw: Union[str, bytes]) -> Any:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        return _stdlib_json.loads(raw)
+
+    def _json_dumps(obj: Any) -> str:
+        return _stdlib_json.dumps(obj)
 
 log = get_logger(__name__)
 
@@ -260,8 +281,8 @@ def parse_bse_payload(
     if not isinstance(raw, str) or not raw.strip():
         return []
     try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
+        data = _parse_json(raw)
+    except Exception:
         return []
     if isinstance(data, dict):
         rows = data.get("Table") or data.get("table") or data.get("data") or []
@@ -286,7 +307,7 @@ def parse_bse_payload(
 # -------------------------------------------------------------------------
 
 
-def _bse_window_url(category: str, lookback_days: int = 2) -> str:
+def _bse_window_url(category: str, lookback_days: int = 1) -> str:
     """Build the BSE API URL for a single category over the rolling window.
 
     `strCat` MUST be a real category name (URL-encoded with `+` for
@@ -333,7 +354,7 @@ async def fetch_bse_with_httpx(
 
     client_kwargs: dict[str, Any] = {
         "headers": dict(BSE_REQUEST_HEADERS),
-        "timeout": 15.0,
+        "timeout": 8.0,
         "follow_redirects": True,
     }
     # BSE may also gzip responses; ask for identity so .text works.
@@ -388,8 +409,8 @@ async def fetch_bse_with_httpx(
                 log.debug("bse category 4xx", category=cat_name, status=status)
                 continue
             try:
-                payload = json.loads(text)
-            except json.JSONDecodeError:
+                payload = _parse_json(text)
+            except Exception:
                 continue
             if isinstance(payload, dict) and isinstance(payload.get("Table"), list):
                 merged.extend(payload["Table"])
@@ -401,9 +422,9 @@ async def fetch_bse_with_httpx(
             # no announcements to avoid an empty-payload 5xx backoff
             # loop. Operators will see the empty result in the
             # dashboard.
-            return json.dumps({"Table": [], "Table1": []})
+            return _json_dumps({"Table": [], "Table1": []})
 
-        return json.dumps({"Table": merged, "Table1": []})
+        return _json_dumps({"Table": merged, "Table1": []})
 
 
 async def fetch_bse_with_playwright(
@@ -414,88 +435,86 @@ async def fetch_bse_with_playwright(
     BSE's CORS preflight rejects raw HTTP clients on some endpoints
     — Playwright is the durable path because the browser handles
     the preflight transparently.
+
+    Uses the persistent warm browser shared with NSE so the fallback
+    doesn't pay a Chromium cold-start penalty.
     """
     from app.monitors.base import _RetryableError
+    from app.monitors.browser_pool import get_browser
 
     try:
-        from playwright.async_api import async_playwright
-    except ImportError as e:  # pragma: no cover
-        raise _RetryableError(
-            "playwright not installed; run `pip install playwright && playwright install chromium`"
-        ) from e
+        browser = await get_browser()
+    except Exception as e:
+        raise _RetryableError(f"chromium launch failed: {e}") from e
 
-    async with async_playwright() as pw:
+    context = await browser.new_context(
+        user_agent=BSE_REQUEST_HEADERS["User-Agent"],
+        extra_http_headers={
+            "Accept-Language": BSE_REQUEST_HEADERS["Accept-Language"],
+        },
+    )
+    try:
+        page = await context.new_page()
         try:
-            browser = await pw.chromium.launch(headless=True)
-        except Exception as e:  # noqa: BLE001
-            raise _RetryableError(f"chromium launch failed: {e}") from e
-        try:
-            context = await browser.new_context(
-                user_agent=BSE_REQUEST_HEADERS["User-Agent"],
-                extra_http_headers={
-                    "Accept-Language": BSE_REQUEST_HEADERS["Accept-Language"],
-                },
+            response = await page.goto(
+                BSE_COOKIE_SEED_URL, wait_until="domcontentloaded", timeout=8000
             )
-            page = await context.new_page()
+        except Exception as e:  # noqa: BLE001
+            raise _RetryableError(f"bse seed goto failed: {e}") from e
+        if response is not None and response.status >= 500:
+            raise _RetryableError(f"bse seed {response.status}")
+        if response is not None and response.status == 429:
+            raise _RetryableError("bse seed 429")
+
+        async def _one(cat: str) -> tuple[str, int, str]:
+            api_url = _bse_window_url(cat)
             try:
-                response = await page.goto(
-                    BSE_COOKIE_SEED_URL, wait_until="domcontentloaded", timeout=15000
+                api_resp = await context.request.get(
+                    api_url,
+                    headers={
+                        "Accept": BSE_REQUEST_HEADERS["Accept"],
+                        "Referer": BSE_REQUEST_HEADERS["Referer"],
+                        "Origin": BSE_REQUEST_HEADERS["Origin"],
+                    },
                 )
+                return (cat, api_resp.status, await api_resp.text())
             except Exception as e:  # noqa: BLE001
-                raise _RetryableError(f"bse seed goto failed: {e}") from e
-            if response is not None and response.status >= 500:
-                raise _RetryableError(f"bse seed {response.status}")
-            if response is not None and response.status == 429:
-                raise _RetryableError("bse seed 429")
+                return (cat, 0, "")
 
-            async def _one(cat: str) -> tuple[str, int, str]:
-                api_url = _bse_window_url(cat)
-                try:
-                    api_resp = await context.request.get(
-                        api_url,
-                        headers={
-                            "Accept": BSE_REQUEST_HEADERS["Accept"],
-                            "Referer": BSE_REQUEST_HEADERS["Referer"],
-                            "Origin": BSE_REQUEST_HEADERS["Origin"],
-                        },
-                    )
-                    return (cat, api_resp.status, await api_resp.text())
-                except Exception as e:  # noqa: BLE001
-                    return (cat, 0, "")
+        results = await asyncio.gather(*(_one(c) for c in categories), return_exceptions=True)
 
-            results = await asyncio.gather(*(_one(c) for c in categories), return_exceptions=True)
-
-            merged: list[dict[str, Any]] = []
-            any_success = False
-            for cat, result in zip(categories, results):
-                if isinstance(result, Exception):
-                    log.debug("bse category failed (playwright)", category=cat, error=str(result))
-                    continue
-                # See the sibling httpx path above for the cast rationale.
-                cat_name, status, text = cast(
-                    tuple[str, int, str], result
-                )
-                if status == 429 or status >= 500:
-                    raise _RetryableError(f"bse api {status}")
-                if status >= 400:
-                    continue
-                try:
-                    payload = json.loads(text)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(payload, dict) and isinstance(payload.get("Table"), list):
-                    merged.extend(payload["Table"])
-                    if payload["Table"]:
-                        any_success = True
-
-            if not any_success and not merged:
-                return json.dumps({"Table": [], "Table1": []})
-            return json.dumps({"Table": merged, "Table1": []})
-        finally:
+        merged: list[dict[str, Any]] = []
+        any_success = False
+        for cat, result in zip(categories, results):
+            if isinstance(result, Exception):
+                log.debug("bse category failed (playwright)", category=cat, error=str(result))
+                continue
+            # See the sibling httpx path above for the cast rationale.
+            cat_name, status, text = cast(
+                tuple[str, int, str], result
+            )
+            if status == 429 or status >= 500:
+                raise _RetryableError(f"bse api {status}")
+            if status >= 400:
+                continue
             try:
-                await browser.close()
-            except Exception:  # noqa: BLE001
-                pass
+                payload = _parse_json(text)
+            except Exception:
+                continue
+            if isinstance(payload, dict) and isinstance(payload.get("Table"), list):
+                merged.extend(payload["Table"])
+                if payload["Table"]:
+                    any_success = True
+
+        if not any_success and not merged:
+            return _json_dumps({"Table": [], "Table1": []})
+        return _json_dumps({"Table": merged, "Table1": []})
+    finally:
+        # Close the context but NOT the browser — it stays warm.
+        try:
+            await context.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def fetch_bse(url: str) -> str:

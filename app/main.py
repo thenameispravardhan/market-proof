@@ -359,6 +359,9 @@ async def lifespan(app: FastAPI):
             await outcome_logger.wait_until_stopped()
             await analyzer_service.aclose()
             await webhook_dispatcher.aclose()
+            # Close the warm Playwright browser shared by NSE/BSE monitors.
+            from app.monitors.browser_pool import shutdown_browser
+            await shutdown_browser()
         log.info("app.shutdown")
 
 

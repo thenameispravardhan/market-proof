@@ -25,6 +25,11 @@ idempotent) and is wired into the FastAPI lifespan (T5 will add the
 startup hook; for now there's a `run_forever` entry point for
 standalone use).
 
+CONCURRENCY: Announcements are processed in parallel (up to 2 at once)
+so a slow LLM call on one filing doesn't block the next one that
+arrived in the same tick. The semaphore is bounded to avoid hammering
+the DeepSeek API rate limit.
+
 Speed-trading rules (NEW):
   - STALENESS GATE: at step 0.5 (right after idempotency check, before
     the LLM call), if `(now - announcement.filed_at) > MAX_NEWS_AGE_SECONDS`
@@ -40,10 +45,19 @@ Speed-trading rules (NEW):
 from __future__ import annotations
 
 import asyncio
-import json
+import json as _stdlib_json
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
+
+try:
+    import orjson as _fast_json
+
+    def _parse_json(raw: str) -> Any:
+        return _fast_json.loads(raw.encode("utf-8"))
+except ImportError:
+    def _parse_json(raw: str) -> Any:
+        return _stdlib_json.loads(raw)
 
 from pydantic import ValidationError
 from sqlalchemy import func, select
@@ -130,6 +144,7 @@ class Service:
         deepseek_client: Optional[DeepSeekClient] = None,
         session_factory: Optional[Callable[[], Session]] = None,
         analysis_already_exists: Optional[Callable[[Session, int], bool]] = None,
+        max_concurrent: int = 2,
     ) -> None:
         self._deepseek = deepseek_client or DeepSeekClient()
         self._session_factory = session_factory or _default_session_factory()
@@ -139,6 +154,9 @@ class Service:
         self._task: Optional[asyncio.Task[None]] = None
         self._sub_queue: Optional[asyncio.Queue[Any]] = None
         self._sub_channel: Optional[str] = None
+        # Parallel processing: up to `max_concurrent` announcements
+        # processed at once. Bounded to avoid DeepSeek rate-limit 429s.
+        self._semaphore = asyncio.Semaphore(max_concurrent)
         # Risk-check counters (sliding window per UTC day).
         self._signals_today: dict[str, int] = {}
 
@@ -275,27 +293,46 @@ class Service:
         from app.monitors.base import CHANNEL_NEW  # avoid circular at import
         self._sub_channel = CHANNEL_NEW
         self._sub_queue = event_bus.subscribe(CHANNEL_NEW)
-        log.info("analyzer.start", channel=CHANNEL_NEW)
+        log.info("analyzer.start", channel=CHANNEL_NEW, max_concurrent=2)
         self._ready_event.set()
+        # Track in-flight tasks so we can cleanly await them at shutdown.
+        _tasks: set[asyncio.Task] = set()
         try:
             while not self._stop_event.is_set():
                 try:
                     event = await asyncio.wait_for(
-                        self._sub_queue.get(), timeout=1.0
+                        self._sub_queue.get(), timeout=0.25
                     )
                 except asyncio.TimeoutError:
+                    # Reap completed tasks during idle gaps so the set
+                    # doesn't grow without bound.
+                    _tasks = {t for t in _tasks if not t.done()}
                     continue
-                try:
-                    await self._handle_event(event.payload)
-                except Exception:  # noqa: BLE001
-                    # An unhandled error must not stop the loop.
-                    log.exception("analyzer.handler_crashed")
+                # Spawn a concurrent task — the semaphore inside
+                # `_handle_event` limits actual parallelism so a burst
+                # of arrivals doesn't hammer DeepSeek.
+                task = asyncio.create_task(
+                    self._handle_event_guarded(event.payload)
+                )
+                _tasks.add(task)
+                # Auto-reap completed tasks on each iteration.
+                _tasks = {t for t in _tasks if not t.done()}
         finally:
-            log.info("analyzer.stop")
+            log.info("analyzer.stop", pending_tasks=len(_tasks))
+            # Wait briefly for in-flight tasks at shutdown.
+            if _tasks:
+                await asyncio.gather(*_tasks, return_exceptions=True)
             if self._sub_queue is not None and self._sub_channel is not None:
                 event_bus.unsubscribe(self._sub_channel, self._sub_queue)
                 self._sub_queue = None
                 self._sub_channel = None
+
+    async def _handle_event_guarded(
+        self, payload: dict[str, Any]
+    ) -> Optional[Signal]:
+        """Handle one event under the concurrency semaphore."""
+        async with self._semaphore:
+            return await self._handle_event(payload)
 
     # -- public: per-announcement processor -----------------------------
 
@@ -658,8 +695,8 @@ class Service:
 
         # Step 4: validate the JSON. On failure store raw + OTHER.
         try:
-            parsed_json = json.loads(ds_result.content)
-        except json.JSONDecodeError as e:
+            parsed_json = _parse_json(ds_result.content)
+        except Exception as e:
             log.error(
                 "analyzer.invalid_json",
                 announcement_id=announcement_id,

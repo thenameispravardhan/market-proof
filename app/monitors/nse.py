@@ -33,13 +33,34 @@ UTC datetimes. If a row's `posted_at` is unparseable we drop it.
 """
 from __future__ import annotations
 
-import json
+import json as _stdlib_json
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Union
 
 from app.logging_config import get_logger
 from app.monitors.base import BaseMonitor, RawAnnouncement
+
+# orjson is ~3-5× faster than stdlib json for exchange payloads (200-500
+# rows). Fall back to stdlib if orjson isn't installed.
+try:
+    import orjson as _fast_json
+
+    def _parse_json(raw: Union[str, bytes]) -> Any:
+        if isinstance(raw, str):
+            raw = raw.encode("utf-8")
+        return _fast_json.loads(raw)
+
+    def _json_dumps(obj: Any) -> str:
+        return _fast_json.dumps(obj).decode("utf-8")
+except ImportError:
+    def _parse_json(raw: Union[str, bytes]) -> Any:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        return _stdlib_json.loads(raw)
+
+    def _json_dumps(obj: Any) -> str:
+        return _stdlib_json.dumps(obj)
 
 log = get_logger(__name__)
 
@@ -187,8 +208,8 @@ def parse_nse_payload(
     if not isinstance(raw, str) or not raw.strip():
         return []
     try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
+        data = _parse_json(raw)
+    except Exception:
         return []
     if isinstance(data, dict):
         # Some NSE endpoints wrap the array under "data".
@@ -247,7 +268,7 @@ async def fetch_nse_with_httpx(url: str, *, transport: Any = None) -> str:
 
     client_kwargs: dict[str, Any] = {
         "headers": dict(NSE_REQUEST_HEADERS),
-        "timeout": 15.0,
+        "timeout": 8.0,
         "follow_redirects": True,
     }
     # NSE ships gzip-compressed responses; ask for identity encoding
@@ -296,6 +317,10 @@ async def fetch_nse_with_httpx(url: str, *, transport: Any = None) -> str:
 async def fetch_nse_with_playwright(url: str) -> str:
     """Open Chromium, seed cookies via a small page, hit the XHR.
 
+    Uses a persistent warm browser shared across NSE/BSE monitors so
+    the fallback path doesn't pay a 1-2s cold-start Chromium penalty
+    every time the httpx fast path gets blocked.
+
     Uses `context.request` (Playwright's HTTP client) for the XHR
     call so the cookie jar is shared with the browser. Falls back
     to a 2nd in-page fetch() if `context.request` is blocked by
@@ -305,68 +330,64 @@ async def fetch_nse_with_playwright(url: str) -> str:
     5xx / 429 / 4xx.
     """
     from app.monitors.base import _RetryableError
+    from app.monitors.browser_pool import get_browser
 
     try:
-        from playwright.async_api import async_playwright
-    except ImportError as e:  # pragma: no cover — env-specific
-        raise _RetryableError(
-            "playwright not installed; run `pip install playwright && playwright install chromium`"
-        ) from e
+        browser = await get_browser()
+    except Exception as e:
+        raise _RetryableError(f"chromium launch failed: {e}") from e
 
-    async with async_playwright() as pw:
+    context = await browser.new_context(
+        user_agent=NSE_REQUEST_HEADERS["User-Agent"],
+        extra_http_headers={
+            "Accept-Language": NSE_REQUEST_HEADERS["Accept-Language"],
+        },
+    )
+    try:
+        # Step 1: hit a light URL to seed cookies.
+        page = await context.new_page()
         try:
-            browser = await pw.chromium.launch(headless=True)
+            response = await page.goto(
+                NSE_COOKIE_SEED_URL, wait_until="domcontentloaded", timeout=8000
+            )
         except Exception as e:  # noqa: BLE001
-            raise _RetryableError(f"chromium launch failed: {e}") from e
+            raise _RetryableError(f"nse seed goto failed: {e}") from e
+        if response is not None and response.status >= 500:
+            raise _RetryableError(f"nse seed {response.status}")
+        if response is not None and response.status == 429:
+            raise _RetryableError("nse seed 429")
+
+        # Step 2: hit the XHR via context.request so cookies flow.
+        xhr_url = _nse_xhr_url(lookback_days=1)
         try:
-            context = await browser.new_context(
-                user_agent=NSE_REQUEST_HEADERS["User-Agent"],
-                extra_http_headers={
-                    "Accept-Language": NSE_REQUEST_HEADERS["Accept-Language"],
+            api_resp = await context.request.get(
+                xhr_url,
+                headers={
+                    "Accept": NSE_REQUEST_HEADERS["Accept"],
+                    "Referer": NSE_REQUEST_HEADERS["Referer"],
+                    "Origin": NSE_REQUEST_HEADERS["Origin"],
                 },
             )
-            # Step 1: hit a light URL to seed cookies.
-            page = await context.new_page()
-            try:
-                response = await page.goto(
-                    NSE_COOKIE_SEED_URL, wait_until="domcontentloaded", timeout=15000
-                )
-            except Exception as e:  # noqa: BLE001
-                raise _RetryableError(f"nse seed goto failed: {e}") from e
-            if response is not None and response.status >= 500:
-                raise _RetryableError(f"nse seed {response.status}")
-            if response is not None and response.status == 429:
-                raise _RetryableError("nse seed 429")
-
-            # Step 2: hit the XHR via context.request so cookies flow.
-            xhr_url = _nse_xhr_url(lookback_days=1)
-            try:
-                api_resp = await context.request.get(
-                    xhr_url,
-                    headers={
-                        "Accept": NSE_REQUEST_HEADERS["Accept"],
-                        "Referer": NSE_REQUEST_HEADERS["Referer"],
-                        "Origin": NSE_REQUEST_HEADERS["Origin"],
-                    },
-                )
-            except Exception as e:  # noqa: BLE001
-                raise _RetryableError(f"nse xhr request failed: {e}") from e
-            status = api_resp.status
-            if status == 429 or status >= 500:
-                raise _RetryableError(f"nse xhr {status}")
-            if status >= 400:
-                # 4xx other than 429 — usually means our IP / cookies
-                # are blocked. Back off and retry.
-                raise _RetryableError(f"nse xhr {status}")
-            try:
-                return await api_resp.text()
-            except Exception as e:  # noqa: BLE001
-                raise _RetryableError(f"nse xhr read failed: {e}") from e
-        finally:
-            try:
-                await browser.close()
-            except Exception:  # noqa: BLE001
-                pass
+        except Exception as e:  # noqa: BLE001
+            raise _RetryableError(f"nse xhr request failed: {e}") from e
+        status = api_resp.status
+        if status == 429 or status >= 500:
+            raise _RetryableError(f"nse xhr {status}")
+        if status >= 400:
+            # 4xx other than 429 — usually means our IP / cookies
+            # are blocked. Back off and retry.
+            raise _RetryableError(f"nse xhr {status}")
+        try:
+            return await api_resp.text()
+        except Exception as e:  # noqa: BLE001
+            raise _RetryableError(f"nse xhr read failed: {e}") from e
+    finally:
+        # Close the context (cleans up pages/cookies) but NOT the
+        # browser — it stays warm for the next monitor tick.
+        try:
+            await context.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def fetch_nse(url: str) -> str:
