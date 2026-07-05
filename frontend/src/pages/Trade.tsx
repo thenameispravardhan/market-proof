@@ -425,17 +425,9 @@ export default function Trade() {
 
   // -------- render --------
 
-  const noRealAccounts = realAccounts.length === 0;
-
   return (
     <div className="trade-page">
       <h1 className="page-title">Trade</h1>
-      {noRealAccounts && (
-        <div className="warn">
-          No live broker account. Add one in the <b>Accounts</b> page and
-          complete OAuth.
-        </div>
-      )}
 
       {/* ---- search ---- */}
       <div className="trade-search">
