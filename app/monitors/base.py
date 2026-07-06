@@ -67,6 +67,14 @@ BACKOFF_FACTOR = 2.0
 BACKOFF_MAX = 60.0
 BACKOFF_JITTER = 0.1       # +/- 10% so monitors don't synchronise
 
+# Normal-cadence jitter. A poller that hits the exchange at exactly the
+# same sub-second boundary every tick, forever, is an obvious bot pattern
+# and the easiest thing for a WAF to rate-limit. We spread each sleep by
+# +/- this fraction so NSE and BSE (and successive ticks) desynchronise.
+# The mean stays at the configured interval, so detection speed is
+# unchanged — this only removes the *regularity*, not the speed.
+POLL_JITTER_FRAC = 0.15
+
 
 @dataclass(frozen=True)
 class RawAnnouncement:
@@ -216,6 +224,19 @@ class BaseMonitor:
             return self._poll_interval_fixed
         return float(get_settings().POLL_INTERVAL_SECONDS)
 
+    def _jittered_interval(self) -> float:
+        """Effective poll interval with a small +/- jitter applied.
+
+        Keeps the mean at ``_poll_interval`` (detection speed unchanged)
+        while breaking the perfectly-regular request cadence that makes a
+        scraper trivial to fingerprint and rate-limit. See
+        ``POLL_JITTER_FRAC``.
+        """
+        import random
+
+        base = self._poll_interval
+        return max(0.0, base * (1.0 + random.uniform(-POLL_JITTER_FRAC, POLL_JITTER_FRAC)))
+
     # -- lifecycle ------------------------------------------------------
 
     def start(self) -> asyncio.Task[None]:
@@ -311,11 +332,12 @@ class BaseMonitor:
                     except asyncio.TimeoutError:
                         pass
 
-                # Normal cadence between successful ticks.
+                # Normal cadence between successful ticks (jittered so the
+                # two monitors don't hit the exchanges in lockstep).
                 if not self._stop_event.is_set():
                     try:
                         await asyncio.wait_for(
-                            self._stop_event.wait(), timeout=self._poll_interval
+                            self._stop_event.wait(), timeout=self._jittered_interval()
                         )
                         # Stop was signalled — exit the loop.
                         break

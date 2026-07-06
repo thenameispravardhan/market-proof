@@ -7,12 +7,14 @@ import { useState } from "react";
 import {
   useCloseAllPositions,
   useClosePosition,
+  useGlobalSettings,
   useManagedPositions,
   usePositions,
 } from "../../hooks/useApi";
 import { useLiveQuote } from "../../hooks/useQuotes";
 import type { ManagedPosition, Position } from "../../types";
 import { ApiClientError } from "../../api/client";
+import { displayQty, isLeveraged } from "../../lib/leverage";
 import { LevelsCell } from "../positions/LevelsCell";
 import { SkeletonList } from "./Skeleton";
 
@@ -36,15 +38,19 @@ function PositionRow({
   p,
   m,
   busy,
+  leverage,
   onClose,
 }: {
   p: Position;
   m: ManagedPosition | undefined;
   busy: string | null;
+  leverage: number;
   onClose: (symbol: string) => void;
 }) {
   const live = useLiveQuote(p.symbol);
   const ltp = live?.last_price ?? p.last_price;
+  // uPnL stays on the full (leveraged) qty — only the printed share
+  // count is scaled to the 1× view.
   const pnl =
     live?.last_price != null
       ? (live.last_price - p.average_price) * p.quantity
@@ -52,7 +58,7 @@ function PositionRow({
   return (
     <tr>
       <td className="mono symbol">{p.symbol}</td>
-      <td className="mono">{p.quantity}</td>
+      <td className="mono">{displayQty(p.quantity, leverage)}</td>
       <td className="mono">{fmtMoney(p.average_price)}</td>
       <td className="mono">{fmtMoney(ltp)}</td>
       <td className="mono">
@@ -80,9 +86,12 @@ function PositionRow({
 export function ActivePositions() {
   const { data, isLoading, error } = usePositions();
   const { data: managed } = useManagedPositions();
+  const { data: settings } = useGlobalSettings();
   const closeOne = useClosePosition();
   const closeAll = useCloseAllPositions();
   const [busy, setBusy] = useState<string | null>(null);
+  // Display-only 1× view (see lib/leverage). Missing settings → 1 (no-op).
+  const leverage = settings?.global?.INTRADAY_LEVERAGE ?? 1;
 
   const open = (data ?? []).filter((p) => p.quantity !== 0);
   const managedBy = new Map((managed ?? []).map((m) => [m.symbol, m]));
@@ -128,7 +137,16 @@ export function ActivePositions() {
           <thead>
             <tr>
               <th>Symbol</th>
-              <th className="mono">Qty</th>
+              <th
+                className="mono"
+                title={
+                  isLeveraged(leverage)
+                    ? `Shown at 1× (raw fill size ÷ ${leverage} leverage). uPnL is the full leveraged amount.`
+                    : undefined
+                }
+              >
+                Qty{isLeveraged(leverage) ? " (1×)" : ""}
+              </th>
               <th className="mono">Avg</th>
               <th className="mono">LTP</th>
               <th className="mono">SL / Target</th>
@@ -143,6 +161,7 @@ export function ActivePositions() {
                 p={p}
                 m={managedBy.get(p.symbol)}
                 busy={busy}
+                leverage={leverage}
                 onClose={onClose}
               />
             ))}

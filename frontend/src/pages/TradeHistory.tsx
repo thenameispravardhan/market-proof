@@ -8,9 +8,15 @@
 // with no exit/P&L — its stop-loss / target is editable inline.
 
 import { useMemo } from "react";
-import { useBrokerAccounts, useManagedPositions, useTrades } from "../hooks/useApi";
+import {
+  useBrokerAccounts,
+  useGlobalSettings,
+  useManagedPositions,
+  useTrades,
+} from "../hooks/useApi";
 import { LevelsCell } from "../components/positions/LevelsCell";
 import { buildRoundTrips, type RoundTrip } from "../lib/roundtrips";
+import { displayQty, isLeveraged } from "../lib/leverage";
 import type { ManagedPosition } from "../types";
 
 function fmtMoney(v: number | null | undefined): string {
@@ -43,10 +49,12 @@ function Section({
   title,
   rows,
   managedBy,
+  leverage,
 }: {
   title: string;
   rows: RoundTrip[];
   managedBy: Map<string, ManagedPosition>;
+  leverage: number;
 }) {
   const realised = rows.reduce((acc, r) => acc + (r.pnl ?? 0), 0);
   return (
@@ -67,7 +75,16 @@ function Section({
               <tr>
                 <th>Symbol</th>
                 <th>Side</th>
-                <th className="mono">Qty</th>
+                <th
+                  className="mono"
+                  title={
+                    isLeveraged(leverage)
+                      ? `Shown at 1× (raw fill size ÷ ${leverage} leverage). P&L is the full leveraged amount.`
+                      : undefined
+                  }
+                >
+                  Qty{isLeveraged(leverage) ? " (1×)" : ""}
+                </th>
                 <th className="mono">Entry</th>
                 <th className="mono">Exit</th>
                 <th className="mono">SL / Target</th>
@@ -84,7 +101,7 @@ function Section({
                     <td>
                       <span className={`badge ${r.side === "BUY" ? "buy" : "sell"}`}>{r.side}</span>
                     </td>
-                    <td className="mono">{r.quantity}</td>
+                    <td className="mono">{displayQty(r.quantity, leverage)}</td>
                     <td className="mono">{fmtMoney(r.entryPrice)}</td>
                     <td className="mono">
                       {r.open ? <span className="badge warn">OPEN</span> : fmtMoney(r.exitPrice)}
@@ -122,6 +139,10 @@ export default function TradeHistory() {
   const { data: trades, isLoading, error } = useTrades(500, "filled");
   const { data: accounts } = useBrokerAccounts();
   const { data: managed } = useManagedPositions();
+  const { data: settings } = useGlobalSettings();
+  // Display-only 1× view: divide the raw fill qty by the intraday
+  // leverage. Missing settings → 1 (no-op) so the real number shows.
+  const leverage = settings?.global?.INTRADAY_LEVERAGE ?? 1;
 
   const byId = useMemo(
     () => new Map((accounts ?? []).map((a) => [a.id, a])),
@@ -182,8 +203,8 @@ export default function TradeHistory() {
       </div>
 
       <div className="dashboard-grid">
-        <Section title="Fyers — Executed Trades" rows={fyers} managedBy={managedBy} />
-        <Section title="Paper Trading — Executed Trades" rows={paper} managedBy={managedBy} />
+        <Section title="Fyers — Executed Trades" rows={fyers} managedBy={managedBy} leverage={leverage} />
+        <Section title="Paper Trading — Executed Trades" rows={paper} managedBy={managedBy} leverage={leverage} />
       </div>
     </div>
   );

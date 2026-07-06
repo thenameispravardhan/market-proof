@@ -329,6 +329,11 @@ def parse_bse_payload(
 
 _bse_client: "httpx.AsyncClient | None" = None
 
+# Whether the shared client's cookie jar has been seeded this process.
+# Same one-time-priming pattern as ``monitors.nse``; re-armed only when a
+# category call later returns 401/403.
+_bse_primed: bool = False
+
 
 async def _get_bse_client(*, transport: Any = None) -> "httpx.AsyncClient":
     """Return a shared persistent httpx client for BSE fetches.
@@ -347,7 +352,9 @@ async def _get_bse_client(*, transport: Any = None) -> "httpx.AsyncClient":
             "follow_redirects": True,
             "transport": transport,
         }
-        client_kwargs["headers"]["Accept-Encoding"] = "identity"
+        # gzip/deflate only (no brotli) — stdlib decompresses it, and it
+        # cuts the merged category payload several-fold on the wire.
+        client_kwargs["headers"]["Accept-Encoding"] = "gzip, deflate"
         return httpx.AsyncClient(**client_kwargs)
 
     if _bse_client is not None:
@@ -359,7 +366,7 @@ async def _get_bse_client(*, transport: Any = None) -> "httpx.AsyncClient":
         "follow_redirects": True,
         "http2": True,
     }
-    client_kwargs["headers"]["Accept-Encoding"] = "identity"
+    client_kwargs["headers"]["Accept-Encoding"] = "gzip, deflate"
     _bse_client = httpx.AsyncClient(**client_kwargs)
     return _bse_client
 
@@ -394,6 +401,24 @@ def _bse_window_url(category: str, lookback_days: int = 1) -> str:
     return f"{BSE_API_URL}?{params}"
 
 
+async def _prime_bse(client: "httpx.AsyncClient") -> None:
+    """Seed BSE session cookies via the home page.
+
+    Unlike NSE, a 401/403 here is a hard signal (BSE's edge is blocking
+    us), so it's raised as retryable rather than tolerated.
+    """
+    from app.monitors.base import _RetryableError
+
+    try:
+        primer = await client.get(BSE_COOKIE_SEED_URL)
+    except Exception as e:  # noqa: BLE001
+        raise _RetryableError(f"bse cookie primer failed: {e}") from e
+    if primer.status_code >= 500:
+        raise _RetryableError(f"bse primer {primer.status_code}")
+    if primer.status_code in (401, 403):
+        raise _RetryableError(f"bse primer {primer.status_code} (likely IP block)")
+
+
 async def fetch_bse_with_httpx(
     url: str, *, transport: Any = None, categories: tuple[str, ...] = BSE_CATEGORIES
 ) -> str:
@@ -415,21 +440,21 @@ async def fetch_bse_with_httpx(
     from app.monitors.base import _RetryableError
 
     try:
-        import httpx
+        import httpx  # noqa: F401
     except ImportError as e:  # pragma: no cover
         raise _RetryableError("httpx not installed") from e
 
+    global _bse_primed
     client = await _get_bse_client(transport=transport)
+    is_prod = transport is None
 
-    # Step 1: prime cookies via the BSE home page.
-    try:
-        primer = await client.get(BSE_COOKIE_SEED_URL)
-    except Exception as e:  # noqa: BLE001
-        raise _RetryableError(f"bse cookie primer failed: {e}") from e
-    if primer.status_code >= 500:
-        raise _RetryableError(f"bse primer {primer.status_code}")
-    if primer.status_code in (401, 403):
-        raise _RetryableError(f"bse primer {primer.status_code} (likely IP block)")
+    # Step 1: prime cookies via the BSE home page — only when needed. The
+    # persistent client keeps its cookie jar, so re-priming every tick was
+    # pure waste (9 requests/tick instead of 8). Re-armed on a 401/403.
+    if not is_prod or not _bse_primed:
+        await _prime_bse(client)
+        if is_prod:
+            _bse_primed = True
 
     # Step 2: fan out across the category set in parallel.
     async def _one(cat: str) -> tuple[str, int, str]:
@@ -460,6 +485,9 @@ async def fetch_bse_with_httpx(
         if status == 429 or status >= 500:
             raise _RetryableError(f"bse api {status}")
         if status in (401, 403):
+            # Cookies likely stale — re-arm priming for the next tick.
+            if is_prod:
+                _bse_primed = False
             raise _RetryableError(f"bse api {status} (likely CORS / IP block)")
         if status >= 400:
             log.debug("bse category 4xx", category=cat_name, status=status)

@@ -255,6 +255,11 @@ def parse_nse_payload(
 
 _nse_client: "httpx.AsyncClient | None" = None
 
+# Whether the shared client's cookie jar has been seeded this process.
+# Priming is a one-time cost (see fetch_nse_with_httpx); we re-arm this
+# flag only when the XHR later returns 401/403 (cookies expired).
+_nse_primed: bool = False
+
 
 async def _get_nse_client(*, transport: Any = None) -> "httpx.AsyncClient":
     """Return a shared persistent httpx client for NSE fetches.
@@ -274,7 +279,10 @@ async def _get_nse_client(*, transport: Any = None) -> "httpx.AsyncClient":
             "follow_redirects": True,
             "transport": transport,
         }
-        client_kwargs["headers"]["Accept-Encoding"] = "identity"
+        # gzip/deflate only (no brotli) so httpx decompresses with the
+        # stdlib and needs no extra wheel. Compression cuts the ~180 KB
+        # payload ~6x and is what a real browser sends.
+        client_kwargs["headers"]["Accept-Encoding"] = "gzip, deflate"
         return httpx.AsyncClient(**client_kwargs)
 
     if _nse_client is not None:
@@ -286,14 +294,14 @@ async def _get_nse_client(*, transport: Any = None) -> "httpx.AsyncClient":
         "follow_redirects": True,
         "http2": True,
     }
-    client_kwargs["headers"]["Accept-Encoding"] = "identity"
+    client_kwargs["headers"]["Accept-Encoding"] = "gzip, deflate"
     _nse_client = httpx.AsyncClient(**client_kwargs)
     return _nse_client
 
 
 def _close_nse_client() -> None:
     """Test / teardown helper — closes the shared client."""
-    global _nse_client
+    global _nse_client, _nse_primed
     if _nse_client is not None:
         import anyio
         try:
@@ -301,6 +309,8 @@ def _close_nse_client() -> None:
         except Exception:  # noqa: BLE001
             pass
         _nse_client = None
+    # A fresh client starts with an empty cookie jar, so it must re-prime.
+    _nse_primed = False
 
 
 # -------------------------------------------------------------------------
@@ -322,6 +332,25 @@ def _close_nse_client() -> None:
 # -------------------------------------------------------------------------
 
 
+async def _prime_nse(client: "httpx.AsyncClient") -> None:
+    """Seed the CDN cookies (`nseappid` etc.) onto the shared cookie jar.
+
+    The home page is small and rarely errors. A 403 here is tolerated —
+    the XHR carries its own auth — so only a 5xx is worth retrying.
+    """
+    from app.monitors.base import _RetryableError
+
+    try:
+        primer = await client.get(NSE_COOKIE_SEED_URL)
+    except Exception as e:  # noqa: BLE001
+        log.debug("nse cookie primer network error", error=str(e))
+        return
+    if primer.status_code >= 500:
+        raise _RetryableError(f"nse primer {primer.status_code}")
+    if primer.status_code in (401, 403):
+        log.debug("nse primer 403 — proceeding anyway, XHR has its own auth")
+
+
 async def fetch_nse_with_httpx(url: str, *, transport: Any = None) -> str:
     """Pure-httpx NSE fetcher.
 
@@ -332,6 +361,13 @@ async def fetch_nse_with_httpx(url: str, *, transport: Any = None) -> str:
     Uses the **shared persistent client** so TCP / SSL / HTTP/2
     session setup happens exactly once per process lifetime, saving
     ~200-400ms per poll tick.
+
+    Cookie priming is a ONE-TIME cost: the persistent client keeps its
+    cookie jar across ticks, so re-seeding on every poll only doubled the
+    request count (and the bot-detection signal) for no benefit. We prime
+    on the first production tick and again only when the XHR later returns
+    401/403 (cookies expired). In test/transport mode we always prime so
+    the recorded happy-path call order still holds.
 
     `transport` is an optional httpx transport (e.g. MockTransport
     for tests). When provided we skip the shared client and create
@@ -345,23 +381,19 @@ async def fetch_nse_with_httpx(url: str, *, transport: Any = None) -> str:
     from app.monitors.base import _RetryableError
 
     try:
-        import httpx
+        import httpx  # noqa: F401
     except ImportError as e:  # pragma: no cover
         raise _RetryableError("httpx not installed") from e
 
+    global _nse_primed
     client = await _get_nse_client(transport=transport)
+    is_prod = transport is None
 
-    # Step 1: prime cookies. The home page is much smaller than the
-    # corporate-filings landing and rarely returns HTTP/2 errors.
-    try:
-        primer = await client.get(NSE_COOKIE_SEED_URL)
-    except Exception as e:  # noqa: BLE001
-        log.debug("nse cookie primer network error", error=str(e))
-        primer = None
-    if primer is not None and primer.status_code >= 500:
-        raise _RetryableError(f"nse primer {primer.status_code}")
-    if primer is not None and primer.status_code in (401, 403):
-        log.debug("nse primer 403 — proceeding anyway, XHR has its own auth")
+    # Step 1: prime cookies — only when needed (see docstring).
+    if not is_prod or not _nse_primed:
+        await _prime_nse(client)
+        if is_prod:
+            _nse_primed = True
 
     # Step 2: hit the XHR with the primed cookies.
     xhr_url = _nse_xhr_url(lookback_days=1)
@@ -372,6 +404,10 @@ async def fetch_nse_with_httpx(url: str, *, transport: Any = None) -> str:
     if resp.status_code == 429 or resp.status_code >= 500:
         raise _RetryableError(f"nse xhr {resp.status_code}")
     if resp.status_code in (401, 403):
+        # Cookies likely went stale — re-arm priming for the next tick
+        # before we bounce to the Playwright fallback.
+        if is_prod:
+            _nse_primed = False
         raise _RetryableError(f"nse xhr {resp.status_code} (likely bot block)")
     if resp.status_code >= 400:
         raise _RetryableError(f"nse xhr {resp.status_code}")
