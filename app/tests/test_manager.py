@@ -250,6 +250,54 @@ async def test_paper_mode_routes_to_paper_backend(db_session, isolated_db):
         await paper.stop()
 
 
+@pytest.mark.asyncio
+async def test_no_live_price_blocks_instead_of_synthetic_fill(db_session, isolated_db):
+    """Regression for the CEIGALL ₹833→₹365 phantom loss: when a live quote
+    feed is attached but can't price the symbol (seed_symbol -> None), the
+    manager must BLOCK the entry rather than fill at the rule's placeholder
+    or a synthetic anchor. No trade row, a NO_LIVE_PRICE block."""
+    md = MarketDataBus()
+    paper = PaperBackend(market_data=md, session_factory=lambda: db_session)
+    paper.start()
+
+    class _DeadQuoteFeed:
+        async def seed_symbol(self, symbol):
+            return None  # live feed wired but no real price available
+
+        def watch(self, *a, **k):
+            return 0.0
+
+    try:
+        strat = _make_strategy(
+            db_session, "no-price-route",
+            config={"broker_account_id": None, "max_capital_risk_pct": 0.05},
+        )
+        account = _make_account(db_session, name="no-price-acct", paper_mode=True)
+        # Placeholder rationale entry (100) — must NOT become the fill.
+        sig = _make_signal(
+            db_session, symbol="CEIGALL", action="BUY", strategy_id=strat.id,
+            rationale="entry=100.00 sl=95.00 target=115.00 rr=3.00",
+        )
+        strat.config = {"broker_account_id": account.id, "max_capital_risk_pct": 0.05}
+        db_session.commit()
+
+        risk = RiskEngine(market_data=md, portfolio_value=50_000_000.0)
+        mgr = Manager(risk_engine=risk, market_data=md, paper_backend=paper)
+        mgr.attach_quote_feed(_DeadQuoteFeed())
+        outcome = await mgr.process_signal(sig.id)
+
+        assert outcome is not None
+        assert outcome["approved"] is False
+        assert outcome["code"] == "NO_LIVE_PRICE"
+        # No order was placed at a fabricated price.
+        rows = db_session.execute(
+            select(TradeRow).where(TradeRow.symbol == "CEIGALL")
+        ).scalars().all()
+        assert not any(r.status == "filled" for r in rows)
+    finally:
+        await paper.stop()
+
+
 # -- Live mode routing ----------------------------------------------------
 
 

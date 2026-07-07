@@ -39,6 +39,50 @@ def test_base_price_is_deterministic():
 
 
 @pytest.mark.asyncio
+async def test_seed_symbol_returns_none_when_live_feed_cannot_price():
+    """With a live feed wired, seed_symbol must NOT fabricate a synthetic
+    anchor when the real price is unavailable — otherwise a synthetic entry
+    gets marked/exited against the real feed (the CEIGALL ₹833→₹365 phantom
+    loss). It returns None and publishes no simulated quote."""
+    md = MarketDataBus()
+
+    async def live_fn(sym):  # feed can't serve this symbol right now
+        return None
+
+    qf = QuoteFeed(market_data=md, live_quote_fn=live_fn)
+    price = await qf.seed_symbol("CEIGALL")
+    assert price is None
+    # No synthetic price leaked onto the bus for the fill to hit.
+    assert await md.get_quote("CEIGALL") is None
+
+
+@pytest.mark.asyncio
+async def test_seed_symbol_uses_real_price_when_live_feed_serves():
+    md = MarketDataBus()
+
+    async def live_fn(sym):
+        return 365.05
+
+    qf = QuoteFeed(market_data=md, live_quote_fn=live_fn)
+    price = await qf.seed_symbol("CEIGALL")
+    assert price == 365.05
+    q = await md.get_quote("CEIGALL")
+    assert q is not None and q.last_price == 365.05
+    # Real Fyers tick — not flagged simulated.
+    assert not (q.extra or {}).get("simulated")
+
+
+@pytest.mark.asyncio
+async def test_seed_symbol_synthetic_only_without_live_feed():
+    """Pure offline paper mode (no live feed) keeps the self-consistent
+    synthetic anchor so paper testing still fills."""
+    md = MarketDataBus()
+    qf = QuoteFeed(market_data=md)  # live_quote_fn=None
+    price = await qf.seed_symbol("CEIGALL")
+    assert price == _base_price_for("CEIGALL")
+
+
+@pytest.mark.asyncio
 async def test_quote_feed_walks_price():
     md = MarketDataBus()
     qf = QuoteFeed(market_data=md, seed=42, volatility=0.05)

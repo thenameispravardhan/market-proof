@@ -472,6 +472,31 @@ class Manager:
                     None, _update_signal_levels,
                     self._session_factory, signal.id, entry, stop_loss, target, rr,
                 )
+            else:
+                # A live quote feed is wired but couldn't price the symbol
+                # right now (WS silent + REST miss). Do NOT fall back to the
+                # rule's placeholder entry or a synthetic anchor: the fill
+                # becomes the cost basis, and a fabricated entry that then
+                # marks/exits against the real feed manufactures a phantom
+                # P&L (the CEIGALL ₹833→₹365 ≈ -₹1L bug). Decline instead.
+                await asyncio.get_running_loop().run_in_executor(
+                    None, _persist_risk_block,
+                    self._session_factory, signal, account.id,
+                    "NO_LIVE_PRICE",
+                    f"no live price available for {signal.symbol!r}; entry "
+                    "skipped to avoid a synthetic fill",
+                )
+                await event_bus.publish(
+                    CHANNEL_RISK_BLOCKED,
+                    {"signal_id": signal.id, "code": "NO_LIVE_PRICE",
+                     "message": f"no live price for {signal.symbol}",
+                     "symbol": signal.symbol, "account_id": account.id},
+                )
+                log.warning(
+                    "execution_manager.no_live_price_block",
+                    symbol=signal.symbol, signal_id=signal.id,
+                )
+                return {"approved": False, "code": "NO_LIVE_PRICE"}
         if entry is None:
             quote = await self._md.get_quote(signal.symbol)
             if quote is not None:

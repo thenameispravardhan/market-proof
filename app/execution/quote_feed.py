@@ -84,11 +84,22 @@ class QuoteFeed:
     def unwatch(self, symbol: str) -> None:
         self._watched.pop(symbol.upper().strip(), None)
 
-    async def seed_symbol(self, symbol: str, anchor: Optional[float] = None) -> float:
+    async def seed_symbol(
+        self, symbol: str, anchor: Optional[float] = None
+    ) -> Optional[float]:
         """Ensure a quote exists for `symbol` right now and return its
-        price. Used by the manager before placing a paper order so the
-        MARKET fill has a price to hit — prefers a REAL price so the fill
-        (and thus the trade-history entry) reflects the actual market."""
+        price to anchor an order fill. Prefers a REAL price so the fill
+        (and thus the trade-history entry) reflects the actual market.
+
+        Returns ``None`` when a live feed is wired but can't price the
+        symbol right now. This is deliberate: the entry fill becomes the
+        cost basis, and a *synthetic* entry that is later marked/exited
+        against the *real* feed manufactures a phantom P&L (e.g. buy
+        CEIGALL at the hashed ₹833, exit at the real ₹365 → a fake ~₹1L
+        loss). The caller must decline the entry rather than fabricate a
+        price. A synthetic anchor is only ever returned in pure offline
+        paper mode (no live feed at all), where entry AND marking both use
+        it and the P&L stays self-consistent."""
         symbol = symbol.upper().strip()
         existing = await self._md.get_quote(symbol)
         if (
@@ -97,7 +108,7 @@ class QuoteFeed:
             and not (existing.extra and existing.extra.get("simulated"))
         ):
             return float(existing.last_price)
-        # Prefer a real market price for the fill.
+        # A live feed is wired → REAL prices are the source of truth.
         if self._live_quote_fn is not None:
             try:
                 price = await self._live_quote_fn(symbol)
@@ -107,7 +118,10 @@ class QuoteFeed:
                 self._watched[symbol] = float(price)
                 await self._publish(symbol, float(price), simulated=False)
                 return float(price)
-        # Synthetic fallback (no feed / unresolvable symbol).
+            # No real price available — do NOT synthesise an entry price.
+            return None
+        # No live feed at all (offline paper / tests): a self-consistent
+        # synthetic anchor is safe because marking uses the same simulator.
         price = self.watch(symbol, anchor)
         await self._publish(symbol, price, simulated=True)
         return price
