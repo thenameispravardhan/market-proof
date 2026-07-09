@@ -81,6 +81,12 @@ from app.execution.base import (
     ProductType,
     TradingBackend,
 )
+from app.execution import entry_manager as entry_sm
+from app.execution.entry_manager import (
+    EntryManager,
+    RetracementMonitor,
+    RetracementWatch,
+)
 from app.execution.fyers_live import FyersLiveBackend
 from app.execution.market_data import MarketDataBus
 from app.execution.paper import PaperBackend
@@ -94,7 +100,11 @@ log = get_logger(__name__)
 
 # Channels the manager publishes on.
 CHANNEL_TRADE_EXECUTED = "trade.executed"
+CHANNEL_TRADE_CLOSED = "trade.closed"
 CHANNEL_RISK_BLOCKED = "risk.blocked"
+# A drift-blocked signal entering the passive retracement watch (not a
+# hard risk block — it may still re-arm into a trade).
+CHANNEL_ENTRY_RETRACEMENT = "entry.retracement_watch"
 CHANNEL_SETTINGS_UPDATED = "settings.updated"
 # Published by the Fyers OAuth callback after a successful
 # token rotation. Payload: {"broker_account_id": int}. The
@@ -184,6 +194,8 @@ class Manager:
         settings_provider: Optional[Callable[[], Settings]] = None,
         vol_provider: Optional[volatility.VolatilityProvider] = None,
         vol_regime: Optional[volatility.VolatilityRegime] = None,
+        entry_manager: Optional[EntryManager] = None,
+        retracement_monitor: Optional[RetracementMonitor] = None,
     ) -> None:
         self._risk = risk_engine or RiskEngine(market_data=market_data)
         # Volatility seams. Defaults are the safe no-data impls, so the
@@ -213,9 +225,24 @@ class Manager:
         # price — and derives coherent entry/SL/target from it. Tests
         # leave this None and pre-seed quotes via `set_quote_sync`.
         self._quote_feed: Optional[Any] = None
+        # The entry state machine (drift gate, symbol mutex, IOC routing,
+        # dual-confirmation fill monitoring) and its retracement half.
+        self._entry = entry_manager or EntryManager(
+            market_data=self._md, settings_provider=self._settings_provider
+        )
+        self._retracement = retracement_monitor or RetracementMonitor(
+            market_data=self._md,
+            reenter_cb=self._on_retracement_ready,
+            expire_cb=self._on_retracement_expired,
+            settings_provider=self._settings_provider,
+        )
         self._stop_event: asyncio.Event = asyncio.Event()
         self._ready_event: asyncio.Event = asyncio.Event()
         self._task: Optional[asyncio.Task[None]] = None
+        # Per-signal entry tasks in flight (each attempt runs as its own
+        # asyncio task so a slow fill window can't stall the next signal
+        # — and so the symbol mutex actually has something to serialise).
+        self._inflight: set[asyncio.Task[None]] = set()
         self._sub_queue: Optional[asyncio.Queue[Any]] = None
         self._settings_sub_queue: Optional[asyncio.Queue[Any]] = None
 
@@ -234,6 +261,14 @@ class Manager:
 
     def stop(self) -> None:
         self._stop_event.set()
+        # Retracement watches and in-flight entry attempts die with the
+        # manager — an entry must never complete after shutdown began.
+        try:
+            self._retracement.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        for t in list(self._inflight):
+            t.cancel()
         if self._sub_queue is not None:
             try:
                 event_bus.unsubscribe(CHANNEL_NEW_SIGNAL, self._sub_queue)
@@ -315,10 +350,17 @@ class Manager:
                     continue
                 for event in events:
                     if event.channel == CHANNEL_NEW_SIGNAL:
-                        try:
-                            await self._handle_signal(event.payload)
-                        except Exception:  # noqa: BLE001
-                            log.exception("execution_manager.handler_crashed")
+                        # One asyncio task per entry attempt: the state
+                        # machine's fill window can take seconds, and the
+                        # symbol mutex needs concurrent attempts to
+                        # serialise (a sequential loop would make the
+                        # lock dead code).
+                        t = asyncio.create_task(
+                            self._handle_signal_safe(event.payload),
+                            name="entry-attempt",
+                        )
+                        self._inflight.add(t)
+                        t.add_done_callback(self._inflight.discard)
                     elif event.channel == CHANNEL_SETTINGS_UPDATED:
                         try:
                             await self._on_settings_updated(event.payload)
@@ -331,6 +373,16 @@ class Manager:
                             log.exception("execution_manager.token_rotation_handler_crashed")
         finally:
             log.info("execution_manager.stop")
+            # In-flight entry attempts + retracement watches die with the
+            # loop: nothing may place an order after shutdown began.
+            for t in list(self._inflight):
+                t.cancel()
+            if self._inflight:
+                await asyncio.gather(*self._inflight, return_exceptions=True)
+            try:
+                self._retracement.stop()
+            except Exception:  # noqa: BLE001
+                pass
             if self._sub_queue is not None:
                 event_bus.unsubscribe(CHANNEL_NEW_SIGNAL, self._sub_queue)
                 self._sub_queue = None
@@ -347,6 +399,14 @@ class Manager:
 
     # -- per-signal handler ---------------------------------------------
 
+    async def _handle_signal_safe(self, payload: dict[str, Any]) -> None:
+        try:
+            await self._handle_signal(payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("execution_manager.handler_crashed")
+
     async def _handle_signal(self, payload: dict[str, Any]) -> None:
         signal_id = payload.get("signal_id")
         if not isinstance(signal_id, int):
@@ -354,12 +414,26 @@ class Manager:
             return
         await self.process_signal(signal_id)
 
-    async def process_signal(self, signal_id: int) -> Optional[dict[str, Any]]:
+    async def process_signal(
+        self,
+        signal_id: int,
+        *,
+        retracement: bool = False,
+        retracement_deadline: Optional[datetime] = None,
+        drift_anchor: Optional[float] = None,
+    ) -> Optional[dict[str, Any]]:
         """Process one signal end-to-end.
 
         Returns a small dict describing the outcome (for tests
         that want to assert what happened). The manager itself
         emits the public events on the bus.
+
+        `retracement=True` marks a re-entry re-armed by the
+        RetracementMonitor: the order-time staleness gate is skipped
+        (the retracement window is its own freshness bound) and
+        `drift_anchor` / `retracement_deadline` carry the ORIGINAL
+        signal price + watch deadline so a re-drifted signal can't
+        restart its window.
         """
         # Step 1: load signal + strategy + account.
         loaded = await asyncio.get_running_loop().run_in_executor(
@@ -404,7 +478,9 @@ class Manager:
         # kill-switch, the IST entry window, and an order-time staleness
         # re-check (the LLM call may have aged the signal past the
         # freshness budget). Any of these blocks before we touch a broker.
-        gate = await self._pre_entry_gate(signal, filed_at, event_type)
+        gate = await self._pre_entry_gate(
+            signal, filed_at, event_type, skip_staleness=retracement
+        )
         if gate is not None:
             code, message = gate
             await asyncio.get_running_loop().run_in_executor(
@@ -537,79 +613,306 @@ class Manager:
             )
             return {"approved": False, "code": code, "violations": decision.violations}
 
-        # Step 5: place the order.
+        # Step 5: run the entry state machine. The EntryManager owns the
+        # anti-chase drift gate, the per-symbol mutex, the IOC
+        # marketable-limit routing and the dual-confirmation (order-WS +
+        # REST) fill watch; we own persistence + event publishing here.
         side = OrderSide.BUY if signal.action == "BUY" else OrderSide.SELL
-        # IOC marketable-limit entry (RISK.md §5): cap the fill within a
-        # small buffer of the intended entry so a news spike can't fill us
-        # far away, and use immediate-or-cancel so we never rest in a fast
-        # market. Always INTRADAY for the auto pipeline. Falls back to a
-        # plain MARKET order only when we have no entry price to anchor the
-        # limit on.
-        settings_obj = self._settings_provider()
         intended_entry = float(entry) if entry is not None else None
-        buffer = float(getattr(settings_obj, "ENTRY_BUFFER_PCT", 0.2)) / 100.0
-        if intended_entry is not None and intended_entry > 0:
-            limit_price = (
-                intended_entry * (1.0 + buffer) if side == OrderSide.BUY
-                else intended_entry * (1.0 - buffer)
+
+        if intended_entry is None or intended_entry <= 0:
+            # No price to anchor a limit or a drift check on — legacy
+            # plain-MARKET fallback (rationale-less signals with no quote
+            # source; effectively tests only).
+            return await self._place_market_fallback(
+                backend=backend, signal=signal, strategy=strategy,
+                account=account, side=side, qty=int(decision.sizing.qty),
+                stop_loss=stop_loss, target=target,
+                event_max_hold=event_max_hold,
             )
-            order_type = OrderType.LIMIT
-            validity = "IOC"
-        else:
-            limit_price = None
-            order_type = OrderType.MARKET
-            validity = "DAY"
-        try:
-            result = await backend.place_order(
-                signal=signal,
-                symbol=signal.symbol,
-                side=side,
-                quantity=int(decision.sizing.qty),
-                order_type=order_type,
-                limit_price=limit_price,
-                stop_price=None,
-                product_type=ProductType.INTRADAY,
-                validity=validity,
-            )
-        except Exception as e:  # noqa: BLE001
-            log.exception("execution_manager.place_order_crashed", signal_id=signal.id)
+
+        # Drift anchor = the price the signal was born at: the analysis
+        # levels parsed BEFORE step 3 rewrote the rationale with the
+        # seeded quote. On a retracement re-entry the monitor passes the
+        # original anchor back in. (Against a simulated paper quote the
+        # EntryManager ignores the anchor — drift is meaningless there.)
+        anchor = (
+            drift_anchor
+            if drift_anchor is not None and drift_anchor > 0
+            else (levels.get("entry") or intended_entry)
+        )
+
+        async def _persist_routed(routed: OrderResult) -> None:
+            # Persist the PENDING row before fill monitoring starts so
+            # the order-WS reconciler can match its fill event to it.
             await asyncio.get_running_loop().run_in_executor(
+                None, _persist_trade,
+                self._session_factory, signal, account.id, routed, None,
+            )
+
+        outcome = await self._entry.execute(
+            backend=backend,
+            symbol=signal.symbol,
+            side=side,
+            quantity=int(decision.sizing.qty),
+            signal_entry=float(anchor),
+            fallback_price=intended_entry,
+            stop_loss=float(stop_loss) if stop_loss is not None else None,
+            target=float(target) if target is not None else None,
+            signal=signal,
+            signal_id=signal.id,
+            on_routed=_persist_routed,
+        )
+        return await self._handle_entry_outcome(
+            outcome=outcome,
+            signal=signal,
+            strategy=strategy,
+            account=account,
+            backend=backend,
+            anchor=float(anchor),
+            stop_loss=stop_loss,
+            target=target,
+            event_max_hold=event_max_hold,
+            retracement_deadline=retracement_deadline,
+        )
+
+    # -- entry outcome handling ------------------------------------------
+
+    async def _handle_entry_outcome(
+        self,
+        *,
+        outcome: entry_sm.EntryOutcome,
+        signal: Signal,
+        strategy: Optional[Strategy],
+        account: BrokerAccount,
+        backend: TradingBackend,
+        anchor: float,
+        stop_loss: Optional[float],
+        target: Optional[float],
+        event_max_hold: Optional[int],
+        retracement_deadline: Optional[datetime],
+    ) -> dict[str, Any]:
+        """Persist + publish one EntryOutcome. Terminal fills hand over
+        to the TradeManager via `trade.executed`; everything else writes
+        its audit trail and stops."""
+        loop = asyncio.get_running_loop()
+        code = outcome.code
+        attempt = outcome.attempt
+        settings_obj = self._settings_provider()
+
+        # Drift → the passive retracement watch (NOT a hard block: the
+        # signal may still re-arm into a trade inside the window).
+        if code == entry_sm.OUTCOME_EXCESSIVE_DRIFT:
+            self._retracement.watch(
+                signal_id=signal.id,
+                symbol=signal.symbol,
+                side=signal.action,
+                signal_entry=anchor,
+                deadline=retracement_deadline,
+            )
+            await loop.run_in_executor(
+                None, _persist_retracement_watch,
+                self._session_factory, signal, account.id,
+                attempt.drift_pct, anchor, attempt.live_price,
+            )
+            await event_bus.publish(
+                CHANNEL_ENTRY_RETRACEMENT,
+                {
+                    "signal_id": signal.id, "symbol": signal.symbol,
+                    "code": "EXCESSIVE_DRIFT",
+                    "drift_pct": attempt.drift_pct,
+                    "anchor": anchor, "live": attempt.live_price,
+                },
+            )
+            return {
+                "approved": False, "code": "EXCESSIVE_DRIFT",
+                "retracement_watch": True, "drift_pct": attempt.drift_pct,
+            }
+
+        # Symbol mutex contention / broker silence — blocked before (or
+        # without) a confirmed order. Both are terminal, neither retries.
+        if code in (entry_sm.OUTCOME_SYMBOL_LOCKED, entry_sm.OUTCOME_BROKER_TIMEOUT):
+            block_code = (
+                "SYMBOL_LOCKED"
+                if code == entry_sm.OUTCOME_SYMBOL_LOCKED
+                else "BROKER_TIMEOUT"
+            )
+            await loop.run_in_executor(
+                None, _persist_risk_block,
+                self._session_factory, signal, account.id,
+                block_code, outcome.message,
+            )
+            await event_bus.publish(
+                CHANNEL_RISK_BLOCKED,
+                {
+                    "signal_id": signal.id, "code": block_code,
+                    "message": outcome.message, "symbol": signal.symbol,
+                    "account_id": account.id,
+                },
+            )
+            return {"approved": False, "code": block_code}
+
+        # Broker rejected with no OrderResult (place_order raised).
+        if code == entry_sm.OUTCOME_REJECTED and outcome.result is None:
+            await loop.run_in_executor(
                 None, _persist_trade_placed_only,
                 self._session_factory, signal, account.id,
-                side.value, decision.sizing.qty,
-                0.0, "market", "REJECTED", str(e),
+                attempt.side.value, attempt.quantity,
+                0.0, "market", "REJECTED", outcome.message,
             )
-            return {"approved": True, "code": "PLACE_ORDER_FAILED", "error": str(e)}
+            return {
+                "approved": True, "code": "PLACE_ORDER_FAILED",
+                "error": outcome.message,
+            }
 
-        # Slippage of the fill vs the intended entry (RISK.md §5/§7). The
-        # IOC marketable-limit bounds this to ~the buffer; we record it on
-        # the trade row and warn if it ever exceeds tolerance.
-        slippage_pct: Optional[float] = None
-        if result.average_price is not None and intended_entry and intended_entry > 0:
-            slippage_pct = (
-                abs(float(result.average_price) - intended_entry) / intended_entry * 100.0
+        result = outcome.result
+        assert result is not None  # every remaining outcome carries one
+
+        # Broker rejection (margin / circuit / suspended): persist the
+        # rejected trade row + a RiskEvent for the audit trail (E-09).
+        if code == entry_sm.OUTCOME_REJECTED:
+            await loop.run_in_executor(
+                None, _persist_trade,
+                self._session_factory, signal, account.id, result, None,
             )
+            await loop.run_in_executor(
+                None, _persist_risk_event,
+                self._session_factory, "BROKER_REJECTED", "warning",
+                outcome.message or "broker rejected the order",
+                {
+                    "signal_id": signal.id, "symbol": signal.symbol,
+                    "account_id": account.id,
+                    "broker_order_id": result.broker_order_id or None,
+                    "client_order_id": attempt.client_order_id,
+                },
+            )
+            await self._publish_trade_executed(
+                signal=signal, strategy=strategy, account=account,
+                backend=backend, result=result, quantity=attempt.quantity,
+                entry=attempt.live_price, stop_loss=stop_loss, target=target,
+                event_max_hold=event_max_hold,
+            )
+            return {
+                "approved": True, "code": "BROKER_REJECTED",
+                "broker_order_id": result.broker_order_id,
+                "state": result.state.value,
+                "error": result.error,
+            }
+
+        # Zero fill inside the IOC window: cancelled + expired, NO retry.
+        if code == entry_sm.OUTCOME_EXPIRED:
+            await loop.run_in_executor(
+                None, _persist_trade,
+                self._session_factory, signal, account.id, result, None,
+            )
+            await self._publish_trade_executed(
+                signal=signal, strategy=strategy, account=account,
+                backend=backend, result=result, quantity=attempt.quantity,
+                entry=attempt.live_price, stop_loss=stop_loss, target=target,
+                event_max_hold=event_max_hold,
+            )
+            return {
+                "approved": True, "code": "ENTRY_EXPIRED",
+                "broker_order_id": result.broker_order_id,
+                "state": result.state.value,
+            }
+
+        # Emergency flatten: the fill breached the limit (exchange
+        # glitch) or the market was already through the stop when the
+        # fill confirmed. The entry trade IS persisted (it happened),
+        # then the exit + a critical RiskEvent; no TradeManager handover.
+        if code in (entry_sm.OUTCOME_SLIPPAGE_BREACH, entry_sm.OUTCOME_FLASH_CRASH_EXIT):
+            await loop.run_in_executor(
+                None, _persist_trade,
+                self._session_factory, signal, account.id, result, None,
+            )
+            await loop.run_in_executor(
+                None, _persist_emergency_exit,
+                self._session_factory, signal, account.id,
+                result, outcome.exit_result, code, outcome.message,
+            )
+            await event_bus.publish(
+                CHANNEL_TRADE_CLOSED,
+                {
+                    "signal_id": signal.id,
+                    "symbol": signal.symbol,
+                    "reason": code,
+                    "quantity": attempt.filled_quantity,
+                    "entry": result.average_price,
+                    "exit": (
+                        outcome.exit_result.average_price
+                        if outcome.exit_result is not None
+                        else None
+                    ),
+                    "account_id": account.id,
+                },
+            )
+            return {
+                "approved": True, "code": code,
+                "broker_order_id": result.broker_order_id,
+                "state": result.state.value,
+                "qty": attempt.filled_quantity,
+            }
+
+        # Full or partial fill → ACTIVE_POSITION. Slippage is measured
+        # against the live price the limit was anchored on (RISK.md §5/§7).
+        slippage_pct: Optional[float] = None
+        live = attempt.live_price
+        if result.average_price is not None and live and live > 0:
+            slippage_pct = abs(float(result.average_price) - live) / live * 100.0
             if slippage_pct > float(getattr(settings_obj, "MAX_SLIPPAGE_PCT", 0.25)):
                 log.warning(
                     "execution_manager.slippage_exceeded",
-                    symbol=signal.symbol, intended=round(intended_entry, 2),
+                    symbol=signal.symbol, intended=round(live, 2),
                     fill=round(float(result.average_price), 2),
                     slippage_pct=round(slippage_pct, 3),
                 )
-
-        # Step 6: persist the trade row (status from result).
-        await asyncio.get_running_loop().run_in_executor(
+        skip_position_mirror = attempt.fill_source == "ws"
+        await loop.run_in_executor(
             None, _persist_trade,
             self._session_factory, signal, account.id, result, slippage_pct,
+            skip_position_mirror,
         )
-        # The actual fill price is the authoritative entry — prefer it
-        # over the analysis levels so the TradeManager's P&L matches
-        # what we really paid. Fall back to the computed entry.
         fill_entry = (
             float(result.average_price)
             if result.average_price is not None
-            else (float(entry) if entry is not None else None)
+            else (float(live) if live is not None else None)
         )
+        # The handover quantity is the EXACT filled quantity — on a
+        # partial fill the stop stays put and the rupee risk scales
+        # down with the size (E-06).
+        await self._publish_trade_executed(
+            signal=signal, strategy=strategy, account=account,
+            backend=backend, result=result,
+            quantity=attempt.filled_quantity,
+            entry=fill_entry, stop_loss=stop_loss, target=target,
+            event_max_hold=event_max_hold,
+        )
+        return {
+            "approved": True,
+            "code": code,
+            "broker_order_id": result.broker_order_id,
+            "state": result.state.value,
+            "qty": attempt.filled_quantity,
+            "requested_qty": attempt.quantity,
+            "fill_source": attempt.fill_source,
+            "backend": getattr(backend, "name", type(backend).__name__),
+        }
+
+    async def _publish_trade_executed(
+        self,
+        *,
+        signal: Signal,
+        strategy: Optional[Strategy],
+        account: BrokerAccount,
+        backend: TradingBackend,
+        result: OrderResult,
+        quantity: int,
+        entry: Optional[float],
+        stop_loss: Optional[float],
+        target: Optional[float],
+        event_max_hold: Optional[int],
+    ) -> None:
         await event_bus.publish(
             CHANNEL_TRADE_EXECUTED,
             {
@@ -617,14 +920,14 @@ class Manager:
                 "account_id": account.id,
                 "strategy_id": getattr(strategy, "id", None),
                 "symbol": signal.symbol,
-                "side": side.value,
-                "quantity": int(decision.sizing.qty),
+                "side": result.side.value,
+                "quantity": int(quantity),
                 "broker_order_id": result.broker_order_id,
                 "state": result.state.value,
                 "error": result.error,
                 "backend": getattr(backend, "name", type(backend).__name__),
                 # Coherent trade-management levels (entry = real fill).
-                "entry": fill_entry,
+                "entry": float(entry) if entry is not None else None,
                 "stop_loss": float(stop_loss) if stop_loss is not None else None,
                 "target": float(target) if target is not None else None,
                 # Per-event hold window (None → TradeManager uses the global
@@ -632,13 +935,106 @@ class Manager:
                 "max_hold_seconds": event_max_hold,
             },
         )
+
+    async def _place_market_fallback(
+        self,
+        *,
+        backend: TradingBackend,
+        signal: Signal,
+        strategy: Optional[Strategy],
+        account: BrokerAccount,
+        side: OrderSide,
+        qty: int,
+        stop_loss: Optional[float],
+        target: Optional[float],
+        event_max_hold: Optional[int],
+    ) -> dict[str, Any]:
+        """Pre-state-machine path for signals with no entry price at all
+        (no rationale levels, no quote): a plain MARKET order. No drift
+        check or fill monitoring is possible without a price anchor."""
+        try:
+            result = await backend.place_order(
+                signal=signal,
+                symbol=signal.symbol,
+                side=side,
+                quantity=int(qty),
+                order_type=OrderType.MARKET,
+                limit_price=None,
+                stop_price=None,
+                product_type=ProductType.INTRADAY,
+                validity="DAY",
+            )
+        except Exception as e:  # noqa: BLE001
+            log.exception("execution_manager.place_order_crashed", signal_id=signal.id)
+            await asyncio.get_running_loop().run_in_executor(
+                None, _persist_trade_placed_only,
+                self._session_factory, signal, account.id,
+                side.value, qty, 0.0, "market", "REJECTED", str(e),
+            )
+            return {"approved": True, "code": "PLACE_ORDER_FAILED", "error": str(e)}
+        await asyncio.get_running_loop().run_in_executor(
+            None, _persist_trade,
+            self._session_factory, signal, account.id, result, None,
+        )
+        await self._publish_trade_executed(
+            signal=signal, strategy=strategy, account=account,
+            backend=backend, result=result, quantity=qty,
+            entry=(
+                float(result.average_price)
+                if result.average_price is not None
+                else None
+            ),
+            stop_loss=stop_loss, target=target, event_max_hold=event_max_hold,
+        )
         return {
             "approved": True,
             "broker_order_id": result.broker_order_id,
             "state": result.state.value,
-            "qty": int(decision.sizing.qty),
+            "qty": int(qty),
             "backend": getattr(backend, "name", type(backend).__name__),
         }
+
+    # -- retracement callbacks ---------------------------------------------
+
+    async def _on_retracement_ready(self, w: RetracementWatch) -> None:
+        """The price pulled back inside the drift band: re-run the whole
+        pipeline (gates + risk engine re-evaluate at the new price). The
+        staleness gate is skipped — the retracement window is its own
+        freshness bound — and the ORIGINAL anchor + deadline ride along
+        so a re-drifted signal can't restart its window."""
+        log.info(
+            "execution_manager.retracement_reentry",
+            signal_id=w.signal_id, symbol=w.symbol,
+        )
+        try:
+            await self.process_signal(
+                w.signal_id,
+                retracement=True,
+                retracement_deadline=w.deadline,
+                drift_anchor=w.signal_entry,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "execution_manager.retracement_reentry_failed",
+                signal_id=w.signal_id,
+            )
+
+    async def _on_retracement_expired(self, w: RetracementWatch) -> None:
+        """The window closed without a pullback: the move was real. Mark
+        the signal expired — deliberately NOT traded, never retried."""
+        await asyncio.get_running_loop().run_in_executor(
+            None, _persist_signal_expired,
+            self._session_factory, w.signal_id, w.symbol,
+            f"no retracement within the window (anchor {w.signal_entry:.2f})",
+        )
+        await event_bus.publish(
+            CHANNEL_RISK_BLOCKED,
+            {
+                "signal_id": w.signal_id, "code": "RETRACEMENT_EXPIRED",
+                "message": "price never pulled back into the entry band",
+                "symbol": w.symbol,
+            },
+        )
 
     def _derive_levels(
         self,
@@ -714,13 +1110,17 @@ class Manager:
     async def _pre_entry_gate(
         self, signal: Signal, filed_at: Optional[datetime],
         event_type: Optional[str] = None,
+        *,
+        skip_staleness: bool = False,
     ) -> Optional[tuple[str, str]]:
         """Gate a new auto entry on the portfolio circuit breakers /
         kill-switch, the volatility regime, the per-event confidence floor,
         the IST entry window, and order-time freshness.
 
         Returns (code, message) when blocked, else None. Manual Trade-page
-        orders deliberately do NOT pass through here.
+        orders deliberately do NOT pass through here. `skip_staleness`
+        is set for retracement re-entries — by definition older than the
+        news-age budget; the retracement window bounds their freshness.
         """
         from app.risk import market_clock
 
@@ -766,7 +1166,7 @@ class Manager:
             return ("MARKET_CLOSED",
                     market_clock.entry_block_reason() or "outside entry window")
         # 3. Order-time staleness re-check.
-        if filed_at is not None:
+        if filed_at is not None and not skip_staleness:
             fa = filed_at if filed_at.tzinfo is not None else filed_at.replace(tzinfo=timezone.utc)
             age = (datetime.now(timezone.utc) - fa).total_seconds()
             max_age = float(getattr(settings, "MAX_NEWS_AGE_SECONDS", 90))
@@ -1385,6 +1785,14 @@ class Manager:
     def paper_backend(self) -> PaperBackend:
         return self._paper
 
+    @property
+    def entry_manager(self) -> EntryManager:
+        return self._entry
+
+    @property
+    def retracement_monitor(self) -> RetracementMonitor:
+        return self._retracement
+
 
 # ---- DB helpers (sync, run in executor) --------------------------------
 
@@ -1530,12 +1938,18 @@ def _persist_trade(
     account_id: int,
     result: OrderResult,
     slippage_pct: Optional[float] = None,
+    skip_position_mirror: bool = False,
 ) -> None:
     """Persist the trade row for a placed/filled order.
 
     If a row already exists for the same `broker_order_id` (the
-    paper backend creates one up front, then updates it on
-    fill), UPDATE that row instead of inserting a duplicate.
+    paper backend — and the entry state machine's `on_routed` hook —
+    create one up front, then update it on fill), UPDATE that row
+    instead of inserting a duplicate.
+
+    `skip_position_mirror` is set when the fill was confirmed via the
+    order-WS reconciler, which has ALREADY mirrored the fill into the
+    positions table — mirroring again would double the quantity.
     """
     with session_factory() as session:
         s = session.merge(signal)
@@ -1556,11 +1970,19 @@ def _persist_trade(
                 .filter_by(broker_order_id=result.broker_order_id)
                 .one_or_none()
             )
+        # A row the reconciler already flipped to `filled` must not have
+        # its position re-applied here (dual-confirmation dedup).
+        already_filled = existing is not None and existing.status == "filled"
         if existing is not None:
             existing.status = new_status
-            if result.state == OrderState.FILLED and result.average_price is not None:
-                existing.price = float(result.average_price)
-                existing.executed_at = result.submitted_at
+            if result.state == OrderState.FILLED:
+                if result.average_price is not None:
+                    existing.price = float(result.average_price)
+                    existing.executed_at = result.submitted_at
+                # A partial fill hands over the FILLED quantity; the row
+                # tracks what actually traded, not what was asked for.
+                if result.quantity and int(result.quantity) != existing.quantity:
+                    existing.quantity = int(result.quantity)
             existing.broker_account_id = account_id
             if slippage_pct is not None:
                 existing.slippage_pct = float(slippage_pct)
@@ -1587,7 +2009,13 @@ def _persist_trade(
         is_paper_fill = bool(
             result.broker_order_id and result.broker_order_id.startswith("PAPER-")
         )
-        if result.state == OrderState.FILLED and result.filled_quantity > 0 and not is_paper_fill:
+        if (
+            result.state == OrderState.FILLED
+            and result.filled_quantity > 0
+            and not is_paper_fill
+            and not skip_position_mirror
+            and not already_filled
+        ):
             pos = session.query(PositionRow).filter_by(symbol=result.symbol).one_or_none()
             if pos is None:
                 pos = PositionRow(
@@ -1628,6 +2056,200 @@ def _persist_trade(
                     "quantity": int(result.quantity),
                     "filled_quantity": int(result.filled_quantity),
                     "average_price": result.average_price,
+                },
+            )
+        )
+        session.commit()
+
+
+def _persist_risk_event(
+    session_factory: Callable[[], Session],
+    event_type: str,
+    severity: str,
+    message: str,
+    context: Optional[dict[str, Any]] = None,
+) -> None:
+    """Persist a standalone risk_events row (audit trail for entry
+    outcomes that aren't full risk blocks — e.g. a broker rejection)."""
+    with session_factory() as session:
+        session.add(
+            RiskEvent(
+                event_type=event_type,
+                severity=severity,
+                message=message,
+                context=dict(context or {}),
+                halted=False,
+            )
+        )
+        session.commit()
+
+
+def _persist_retracement_watch(
+    session_factory: Callable[[], Session],
+    signal: Signal,
+    account_id: Optional[int],
+    drift_pct: Optional[float],
+    anchor: float,
+    live: Optional[float],
+) -> None:
+    """Record a drift-blocked signal entering the retracement watch.
+
+    The signal's status stays `pending` — this is NOT a hard block; the
+    watch may re-arm it into a trade inside the window. Expiry (below)
+    is what finally closes it out.
+    """
+    with session_factory() as session:
+        session.add(
+            RiskEvent(
+                event_type="EXCESSIVE_DRIFT",
+                severity="info",
+                message=(
+                    f"{signal.symbol}: live {live if live is not None else '?'} "
+                    f"drifted {drift_pct:.2f}% from signal {anchor:.2f}; "
+                    "entry deferred to retracement watch"
+                    if drift_pct is not None
+                    else f"{signal.symbol}: entry deferred to retracement watch"
+                ),
+                context={
+                    "signal_id": signal.id,
+                    "account_id": account_id,
+                    "symbol": signal.symbol,
+                    "anchor": anchor,
+                    "live": live,
+                    "drift_pct": drift_pct,
+                },
+                halted=False,
+            )
+        )
+        session.add(
+            AuditLog(
+                actor="system",
+                action="entry.retracement_watch",
+                target=f"signal:{signal.id}",
+                after={
+                    "symbol": signal.symbol,
+                    "anchor": anchor,
+                    "live": live,
+                    "drift_pct": drift_pct,
+                },
+            )
+        )
+        session.commit()
+
+
+def _persist_signal_expired(
+    session_factory: Callable[[], Session],
+    signal_id: int,
+    symbol: str,
+    reason: str,
+) -> None:
+    """The retracement window closed without a pullback — mark the
+    signal expired (deliberately untraded, never retried)."""
+    with session_factory() as session:
+        sig = session.get(Signal, signal_id)
+        if sig is not None:
+            sig.status = "expired"
+            if "expired:" not in (sig.rationale or ""):
+                sig.rationale = (sig.rationale or "") + f" | expired: {reason}"
+        session.add(
+            RiskEvent(
+                event_type="RETRACEMENT_EXPIRED",
+                severity="info",
+                message=f"{symbol}: {reason}",
+                context={"signal_id": signal_id, "symbol": symbol},
+                halted=False,
+            )
+        )
+        session.add(
+            AuditLog(
+                actor="system",
+                action="entry.retracement_expired",
+                target=f"signal:{signal_id}",
+                after={"symbol": symbol, "reason": reason},
+            )
+        )
+        session.commit()
+
+
+def _persist_emergency_exit(
+    session_factory: Callable[[], Session],
+    signal: Signal,
+    account_id: Optional[int],
+    entry_result: OrderResult,
+    exit_result: Optional[OrderResult],
+    reason: str,
+    message: str,
+) -> None:
+    """Persist the emergency flatten (SLIPPAGE_BREACH / FLASH_CRASH_EXIT):
+    the exit trade row with realised P&L when known, a CRITICAL risk
+    event, and the signal closed — the position never reached the
+    TradeManager."""
+    qty = int(entry_result.filled_quantity or entry_result.quantity or 0)
+    entry_price = (
+        float(entry_result.average_price)
+        if entry_result.average_price is not None
+        else 0.0
+    )
+    exit_price: Optional[float] = None
+    exit_filled = False
+    if exit_result is not None:
+        exit_filled = exit_result.state == OrderState.FILLED
+        if exit_result.average_price is not None:
+            exit_price = float(exit_result.average_price)
+    pnl: Optional[float] = None
+    if exit_price is not None and entry_price > 0 and qty > 0:
+        signed = qty if entry_result.side == OrderSide.BUY else -qty
+        pnl = (exit_price - entry_price) * signed
+    with session_factory() as session:
+        s = session.merge(signal)
+        s.status = "closed"
+        session.add(
+            TradeRow(
+                signal_id=s.id,
+                broker_account_id=account_id,
+                symbol=entry_result.symbol,
+                side="SELL" if entry_result.side == OrderSide.BUY else "BUY",
+                quantity=qty,
+                price=exit_price or 0.0,
+                order_type="market",
+                status="filled" if exit_filled else "placed",
+                broker_order_id=(
+                    exit_result.broker_order_id if exit_result is not None else None
+                )
+                or None,
+                pnl=pnl,
+                executed_at=datetime.now(timezone.utc) if exit_filled else None,
+            )
+        )
+        session.add(
+            RiskEvent(
+                event_type=reason,
+                severity="critical",
+                message=f"{entry_result.symbol}: {message}",
+                context={
+                    "signal_id": s.id,
+                    "account_id": account_id,
+                    "symbol": entry_result.symbol,
+                    "quantity": qty,
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "pnl": pnl,
+                    "exit_confirmed": exit_filled,
+                },
+                halted=False,
+            )
+        )
+        session.add(
+            AuditLog(
+                actor="system",
+                action=f"entry.{reason.lower()}",
+                target=f"signal:{s.id}",
+                after={
+                    "symbol": entry_result.symbol,
+                    "quantity": qty,
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "pnl": pnl,
                 },
             )
         )

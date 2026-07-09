@@ -185,6 +185,27 @@ class Settings(BaseSettings):
     ENTRY_BUFFER_PCT: float = 0.2
     MAX_SLIPPAGE_PCT: float = 0.25
     ORDER_FILL_TIMEOUT_SECONDS: float = 1.5
+    # §5b Entry state machine (app/execution/entry_manager.py).
+    # Anti-chase drift gate: block the entry when the live price has
+    # moved more than ENTRY_MAX_DRIFT_PCT AGAINST the signal price; the
+    # signal then sits in RETRACEMENT_WATCH for RETRACEMENT_WINDOW_SECONDS
+    # (polled every RETRACEMENT_POLL_SECONDS) and re-arms if the price
+    # pulls back inside the band — else it expires untraded.
+    ENTRY_MAX_DRIFT_PCT: float = 1.5
+    RETRACEMENT_WINDOW_SECONDS: int = 120
+    RETRACEMENT_POLL_SECONDS: float = 1.0
+    # Symbol mutex: a second signal for a symbol already in ORDER_ROUTING
+    # waits this long for the lock, then rejects (SYMBOL_LOCKED) — stops
+    # double entries when NSE + BSE publish the same news.
+    SYMBOL_LOCK_WAIT_SECONDS: float = 0.5
+    # Dual-confirmation fill window: the order-WS fill event is the fast
+    # path; REST /orders is polled at the ORDER_FILL_TIMEOUT mark (above)
+    # and the attempt gives up at ENTRY_FILL_TIMEOUT_SECONDS (zero fill →
+    # EXPIRED, partial → keep the fill, cancel the remainder).
+    # BROKER_ORDER_TIMEOUT_SECONDS caps the place-order call itself; on
+    # timeout the attempt is NEVER retried (duplicate-order risk).
+    ENTRY_FILL_TIMEOUT_SECONDS: float = 2.0
+    BROKER_ORDER_TIMEOUT_SECONDS: float = 3.0
     LLM_TIMEOUT_SECONDS: float = 12.0         # discard the opportunity past this
     # Hard cap on LLM completion tokens. Generation latency scales almost
     # linearly with output length, and a signal JSON needs only a few

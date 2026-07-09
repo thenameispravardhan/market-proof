@@ -77,6 +77,32 @@ async def reconcile_order_update(
         )
         return {"ok": True, "matched": False, "order_id": order_id, "status": new_status}
 
+    # Dual-confirmation dedup: the same fill can arrive via the order
+    # WebSocket, the postback webhook AND the entry state machine's REST
+    # poll. The FIRST confirmation wins; a repeat of the same status is
+    # acknowledged without re-applying (re-applying a fill would double
+    # the position), and a terminal `filled` row is never downgraded by
+    # a late cancel/pending echo (an IOC partial's final broker status
+    # is "cancelled" even though shares traded).
+    if trade.status == new_status:
+        log.info(
+            "fyers.reconcile.deduped",
+            source=source, order_id=order_id, status=new_status,
+        )
+        return {
+            "ok": True, "matched": True, "deduped": True,
+            "trade_id": trade.id, "status": new_status,
+        }
+    if trade.status == "filled" and new_status != "filled":
+        log.info(
+            "fyers.reconcile.kept_fill",
+            source=source, order_id=order_id, ignored_status=new_status,
+        )
+        return {
+            "ok": True, "matched": True, "deduped": True,
+            "trade_id": trade.id, "status": trade.status,
+        }
+
     trade.status = new_status
     if new_status == "filled":
         try:

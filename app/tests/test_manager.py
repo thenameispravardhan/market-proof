@@ -391,8 +391,12 @@ async def test_multi_account_routes_to_right_backend(db_session, isolated_db, mo
     sig_reliance = _make_signal(
         db_session, symbol="RELIANCE", action="BUY", strategy_id=s_reliance.id,
     )
+    # Rationale levels must be coherent with the live quote (4000) —
+    # the entry state machine's anti-chase gate blocks a signal whose
+    # analysis price has drifted >1.5% from the market.
     sig_tcs = _make_signal(
         db_session, symbol="TCS", action="BUY", strategy_id=s_tcs.id,
+        rationale="entry=4000.00 sl=3960.00 target=4120.00 rr=3.00",
     )
 
     risk = RiskEngine(market_data=md, portfolio_value=50_000_000.0)
