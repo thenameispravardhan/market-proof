@@ -36,16 +36,13 @@ from __future__ import annotations
 import json as _stdlib_json
 import re
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import Any, Optional, Union
+
+import anyio.from_thread
+import httpx
 
 from app.logging_config import get_logger
 from app.monitors.base import BaseMonitor, RawAnnouncement
-
-if TYPE_CHECKING:
-    # Type-only: httpx is imported lazily inside the fetchers at runtime
-    # (keeps import cost off the startup path); this makes the quoted
-    # "httpx.AsyncClient" annotations resolvable to type checkers.
-    import httpx
 
 # orjson is ~3-5× faster than stdlib json for exchange payloads (200-500
 # rows). Fall back to stdlib if orjson isn't installed.
@@ -300,8 +297,6 @@ async def _get_nse_client(*, transport: Any = None) -> "httpx.AsyncClient":
     always bound correctly.  For production calls (transport=None)
     the module-level singleton is created once and reused forever.
     """
-    import httpx
-
     global _nse_client
     if transport is not None:
         client_kwargs: dict[str, Any] = {
@@ -334,9 +329,6 @@ def _close_nse_client() -> None:
     """Test / teardown helper — closes the shared client."""
     global _nse_client, _nse_primed
     if _nse_client is not None:
-        # Explicit submodule import — `anyio.from_thread` is not loaded by
-        # a bare `import anyio` and only worked by accident of load order.
-        import anyio.from_thread
         try:
             anyio.from_thread.run(_nse_client.aclose)
         except Exception:  # noqa: BLE001
@@ -412,11 +404,6 @@ async def fetch_nse_with_httpx(url: str, *, transport: Any = None) -> str:
     in the manager.
     """
     from app.monitors.base import _RetryableError
-
-    try:
-        import httpx  # noqa: F401
-    except ImportError as e:  # pragma: no cover
-        raise _RetryableError("httpx not installed") from e
 
     global _nse_primed
     client = await _get_nse_client(transport=transport)

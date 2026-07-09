@@ -155,7 +155,7 @@ async def lifespan(app: FastAPI):
             try:
                 price = await fyers_stream.get_live_price(symbol)
                 if price is not None and price > 0:
-                    return float(price)
+                    return price
             except Exception:  # noqa: BLE001
                 pass
         # REST fallback. Resolve bare short-name -> full Fyers symbol
@@ -204,7 +204,7 @@ async def lifespan(app: FastAPI):
 
     execution_manager.attach_volatility_providers(
         vol_provider=_volatility.FyersCandleVolatilityProvider(
-            _candle_fetch, period=int(settings.ATR_PERIOD),
+            _candle_fetch, period=settings.ATR_PERIOD,
         ),
         vol_regime=_volatility.FyersVolatilityRegime(_vix_fetch),
     )
@@ -264,6 +264,9 @@ async def lifespan(app: FastAPI):
     app.state.quote_feed = quote_feed
     app.state.fyers_stream = fyers_stream
     app.state.execution_manager = execution_manager
+    # Only created when not TESTING; the shutdown path guards on None so
+    # it never depends on re-evaluating settings.TESTING to match startup.
+    risk_monitor_task: asyncio.Task[None] | None = None
     if not settings.TESTING:
         # T3: start the analyzer before the monitors so its event-bus
         # subscription is live before the first `announcements.new`
@@ -332,11 +335,12 @@ async def lifespan(app: FastAPI):
     finally:
         if not settings.TESTING:
             # Stop the breaker monitor first.
-            risk_monitor_task.cancel()
-            try:
-                await risk_monitor_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
+            if risk_monitor_task is not None:
+                risk_monitor_task.cancel()
+                try:
+                    await risk_monitor_task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
             # Stop the producers first so consumers drain cleanly.
             await monitor_manager.stop()
             analyzer_service.stop()
