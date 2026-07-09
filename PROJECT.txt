@@ -47,16 +47,6 @@ template, both are called out (see §11).
  23.  Testing
  24.  Troubleshooting
  25.  Design Philosophy & Invariants
- 26.  Appendices (concrete constants, enums & tables)
-      A. DeepSeek client, models & pricing
-      B. Order / position enums & the order state machine
-      C. Paper backend fill semantics
-      D. Event-type trade-management profile matrix
-      E. Volatility: Wilder ATR, stop distance & VIX throttle
-      F. Market clock (IST session windows)
-      G. Event bus, channels & lifespan services
-      H. Prompt seeding, event detection & noise filter
-      I. Analysis skip/fail reason tags
 
 --------------------------------------------------------------------------------
 1. WHAT IT DOES
@@ -177,9 +167,7 @@ T1 — Infrastructure
 T2 — Monitors (app/monitors/)
   base.py                BaseMonitor loop; reads live POLL_INTERVAL_SECONDS each
                          tick; dedup; publishes "announcements.new".
-  nse.py / bse.py        Exchange-specific fetchers + payload parsers. NSE polls
-                         the light ~20-row most-recent XHR (not the day window);
-                         BSE tolerates a landing-page 403 on cookie priming.
+  nse.py / bse.py        Exchange-specific fetchers + payload parsers.
   manager.py             Owns the NSE+BSE tasks (start/stop, idempotent).
   browser_pool.py        Warm shared Playwright browser (fallback scraping path).
 
@@ -506,68 +494,14 @@ disabling trading keeps prices flowing.
 --------------------------------------------------------------------------------
 NSEMonitor and BSEMonitor each run an independent poll loop at the live
 POLL_INTERVAL_SECONDS (picked up per-tick, so a UI change takes effect on the
-next poll; the value is a float, so fractional cadences like 2.5s are honored).
-They fetch the exchange announcement feed via httpx, with a warm shared
-Playwright browser (browser_pool.py) as a fallback when the CDN blocks the fast
-path.
-
-WHAT WE FETCH PER TICK (the "light poll" rule):
-  - NSE polls the no-parameter corporate-announcements XHR (`_nse_poll_url`),
-    which returns the ~20 MOST-RECENT filings (~14 KB), NOT the date-windowed
-    `_nse_xhr_url(1)` which returns the whole day (~1000 rows / ~720 KB). A speed
-    bot only acts on filings younger than MAX_NEWS_AGE_SECONDS, so re-downloading
-    and re-parsing a full day of history every 1-2.5s is pure waste — and that
-    repeated 720 KB request is exactly what trips NSE's WAF (→ 403 → the slow
-    Playwright path → exponential backoff → MISSED news). The 20-row feed spans
-    ~19 min, comfortably covering the max 60s backoff gap with no dropped rows.
-    Net: ~50× less bandwidth and rows per tick (~720 KB/1010 rows/~120ms →
-    ~14 KB/20 rows/~55ms). `_nse_xhr_url` is retained only for backfill/wide-
-    window use — do NOT switch the poll back to it thinking "more history = safer".
-  - BSE fans out across a curated category set in parallel and merges + dedupes
-    by NEWSID. A landing-page 401/403 during cookie priming is TOLERATED (mirrors
-    NSE): BSE's edge often bot-blocks the HTML home page while the JSON API still
-    answers with held cookies. The real block signal is the category API call
-    itself — if that returns 401/403 the fetcher re-arms priming and bounces to
-    the Playwright fallback. (Previously a prime 403 was fatal, needlessly forcing
-    every tick onto the slow browser path.)
-
-Each new filing is de-duplicated by content_hash =
+next poll). They fetch the exchange announcement feed via httpx, with a warm
+shared Playwright browser (browser_pool.py) as a fallback when the CDN blocks the
+fast path. Each new filing is de-duplicated by content_hash =
 SHA-256(exchange|symbol|filed_at|pdf_url), its PDF is prefetched in the
 background (when fast-track / extracted-text is on and the title isn't
 administrative junk), and an "announcements.new" event is published. Polling too
-aggressively still risks NSE/BSE 403/429 rate-limits — raise the interval if the
-logs show `monitor.retry` spam.
-
-KNOWN WEAKNESSES / HARDENING BACKLOG (from a 2026-07-09 code review; the live
-feed was healthy at review time — ~1,500 filings/day landing, latest row minutes
-old — so these are latent SILENT-GAP risks, not an active outage):
-  1. "200-but-blocked" is invisible. NSE's WAF (Akamai) can answer a bot with
-     HTTP 200 + an HTML challenge page instead of a 403. `fetch_nse_with_httpx`
-     returns any 200 body as-is and `parse_nse_payload` returns [] for non-JSON,
-     so the tick counts as SUCCESS: backoff resets and the Playwright fallback
-     never fires — the monitor polls a challenge page forever showing zero news.
-     Same shape on BSE if every category errors at the network level (each is
-     swallowed to `(cat,0,"")`) → an empty-but-"successful" tick. FIX: treat
-     200-with-non-JSON (NSE) and zero-parseable-categories (BSE) as a bot-block
-     that routes to the Playwright fallback.
-  2. The 5s dedup overlap can drop TRADEABLE rows. base._tick cursors on the
-     newest posted_at seen and skips rows older than newest−5s. BSE merges 8
-     categories with differing dissemination lag and a filing often first APPEARS
-     30–60s after its own DT_TM, so a late row can arrive already behind the
-     cursor and be dropped forever — even at 30–45s old, still inside
-     MAX_NEWS_AGE_SECONDS. FIX: widen the overlap to a few minutes (the light
-     feeds are tiny; the extra DB-existence checks are cheap).
-  3. Double sleep after a retry. base._run sleeps the backoff and then falls
-     through to the normal poll-interval sleep too (no `continue`), so first-retry
-     latency is backoff+interval instead of backoff — slowest exactly when the
-     exchange is rate-limiting and news is arriving.
-  4. h2 not pinned. Both clients build with http2=True but requirements.txt pins
-     plain httpx==0.28.1; the h2 wheel is present in the current .venv but a fresh
-     install would ImportError at client creation and BYPASS the Playwright
-     fallback (both monitors back off forever). FIX: httpx[http2]==0.28.1.
-  Minor: the BSE fetch docstring claims per-tick NEWSID dedup the merge never
-  performs (harmless — content_hash dedups downstream); browser_pool leaks the
-  old Playwright driver process when it replaces a crashed warm browser.
+aggressively risks NSE/BSE 403/429 rate-limits — raise the interval if the logs
+show `monitor.retry` spam.
 
 --------------------------------------------------------------------------------
 14. NOTIFICATIONS & WEBHOOKS
@@ -691,15 +625,6 @@ Infrastructure
   app_settings       key/value store backing /api/settings (UI overrides that
                      survive restart; applied into env on startup).
 
-CURRENT VOLUME (snapshot 2026-07-09; data/trading.db ≈ 40 MB incl. WAL — this
-figure AGES, regenerate from the DB rather than trusting it blindly):
-  announcements 23,045 (NSE 13,555 / BSE 9,490) — steady ~1,500/day on a full
-  trading day (BSE ~55% / NSE ~45%); weekends dip to <100 as expected. Sudden
-  near-zero WEEKDAYS are the tell for the §13 silent-gap failure modes.
-  analyses 23,045 (1:1 with announcements — the pipeline is keeping up, no
-  backlog); signals 10,816; signal_outcomes 3,421 (see §20 Phase 5); trades
-  10,903; risk_events 10,690; audit_log 11,147; positions 92.
-
 --------------------------------------------------------------------------------
 18. CONFIGURATION & SETTINGS (app/config.py + .env + UI overrides)
 --------------------------------------------------------------------------------
@@ -712,7 +637,7 @@ IMPORTANT DRIFT: the shipped `.env.example` template and the code defaults in
 `.env`; `.env.example` is only a starting template. Notable examples:
 
   Parameter                 config.py default   .env.example
-  POLL_INTERVAL_SECONDS     1.0 (float; frac.)  2
+  POLL_INTERVAL_SECONDS     1                   2
   MAX_NEWS_AGE_SECONDS      45                  90
   MAX_HOLD_SECONDS          1080 (18 min)       1800 (30 min)
   LLM_MAX_TOKENS            300                 1024
@@ -807,17 +732,12 @@ frontend toggle defaulting to current behavior; all controls in the UI.
                      hours via the timing logs.
   Phase 4 [WIP]      Passive outcome logger + signal_outcomes table (DONE);
                      a review/export "signal vs what the stock did" view PENDING.
-  Phase 5 [DATA-READY] Local materiality pre-filter (FinBERT/IndicBERT-family)
-                     to kill routine noise before any LLM call. Was BLOCKED on
-                     logged outcomes; signal_outcomes now holds 3,421 rows (as of
-                     2026-07-09), PAST the ~1–2k threshold — the data blocker is
-                     cleared and the pre-filter can now be built/trained. (memory:
-                     "ML phases blocked on data" — now stale, revisit; the
-                     backfill-from-candles unblock is effectively done.)
+  Phase 5 [BLOCKED]  Local materiality pre-filter (FinBERT/IndicBERT-family)
+                     to kill routine noise before any LLM call. Needs ~1–2k
+                     logged outcomes first (memory: "ML phases blocked on data" —
+                     backfill from historical candles is the unblock).
   Phase 6 [BLOCKED]  Fine-tune an LLM for fact/event extraction (not buy/sell
                      direction; the rules engine stays the decision-maker).
-                     Unblocks after Phase 5 lands and more labelled outcomes
-                     accrue.
   Ongoing            Dashboard latency + hit-rate tiles.
 
 --------------------------------------------------------------------------------
@@ -928,162 +848,6 @@ Frontend: 7 vitest suites under frontend/src/tests/ — `npm test` (vitest run).
 • Non-destructive evolution: new pipeline features ship behind toggles that
   default to the existing behavior; saved prompt edits and deleted rules survive
   restarts (no silent re-seeding).
-
---------------------------------------------------------------------------------
-26. APPENDICES (CONCRETE CONSTANTS, ENUMS & TABLES)
---------------------------------------------------------------------------------
-
-A. DEEPSEEK CLIENT, MODELS & PRICING (app/analyzer/deepseek_client.py)
-   Endpoint:  https://api.deepseek.com/v1/chat/completions  (async httpx).
-   Request:   chat/completions with response_format={"type":"json_object"};
-              messages = [system, user]; temperature + max_tokens from the
-              template (max_tokens clamped by LLM_MAX_TOKENS). v4 controls:
-              reasoning_effort (low|medium|high) sent when set; thinking=False →
-              body {"thinking":{"type":"disabled"}}; stream=True consumes the SSE
-              deltas (with stream_options.include_usage) and re-assembles them
-              into the same DeepSeekResult so downstream code is transport-agnostic.
-   Client default request timeout: 20s (the analyzer also wraps the call in its
-              own asyncio.wait_for at LLM_TIMEOUT_SECONDS).
-   Retry:     RETRYABLE_STATUS = {429, 500, 502, 503, 504} and transport/timeout
-              errors → up to LLM_MAX_RETRIES (default 1) with backoff
-              base×2^attempt (base = LLM_RETRY_BACKOFF_SECONDS = 0.5s). Any other
-              4xx (401 bad key, 400 malformed) raises immediately (no retry).
-   Result:    DeepSeekResult{content, model, prompt_tokens, completion_tokens,
-              total_tokens, latency_ms, cost_usd, raw}. Per-call structured log
-              `deepseek.call` (model, tokens, latency_ms, cost_usd). API key and
-              prompt body are NEVER logged.
-   Pricing (USD per 1k tokens, DEFAULT_COST_PER_1K, operator-overridable):
-              deepseek-chat      prompt 0.00014  completion 0.00028
-              deepseek-reasoner  prompt 0.00055  completion 0.00219
-              Unknown models (incl. the seed default deepseek-v4-flash) → cost
-              logged as 0.0 until pricing is configured.
-   NOTE: prompt templates seed with model = "deepseek-v4-flash" (prompts.py
-              DEFAULT_MODEL); the cost table above only knows chat/reasoner, so
-              cost_usd reads 0.0 for the flash model unless you add its rates.
-
-B. ORDER / POSITION ENUMS & THE ORDER STATE MACHINE (app/execution/base.py)
-   OrderSide:    BUY | SELL
-   OrderType:    MARKET | LIMIT | STOP_LOSS | SL-M (STOP_LOSS_MARKET)
-   ProductType:  INTRADAY (MIS, default for the auto-pipeline) | DELIVERY (CNC) |
-                 NORMAL (F&O NRML) | MARGIN | CO (cover) | BO (bracket).
-                 The news pipeline always uses INTRADAY; manual trades choose.
-   OrderState:   PENDING → {FILLED | CANCELLED | REJECTED | EXPIRED} (terminal).
-   OrderResult / OrderStatus carry broker_order_id, state, filled_quantity,
-   average_price, limit/stop price, error, submitted_at. Position.mark_to_market
-   recomputes unrealized_pnl = (last − avg) × qty.
-   TradingBackend protocol (4 async methods): place_order, cancel_order,
-   get_positions, get_order_status. Helpers: qty_to_lots (NSE cash lot = 1),
-   safe_float (NaN/inf → default).
-
-C. PAPER BACKEND FILL SEMANTICS (app/execution/paper.py)
-   MARKET      fills at the latest tick; no quote → PENDING up to
-               pending_timeout_s (default 5s) → EXPIRED.
-   LIMIT       BUY fills when last ≤ limit; SELL fills when last ≥ limit.
-   STOP_LOSS / SL-M  BUY triggers when last ≥ stop; SELL when last ≤ stop; on
-               trigger converts to a MARKET fill (SL-M) or a LIMIT at stop
-               (STOP_LOSS). Never crossed → EXPIRED after the timeout.
-   A background _pending_loop waits on per-symbol MarketDataBus queues and checks
-   pending orders each tick. Every order writes a `trades` row `placed`, updated
-   to `filled` (executed_at + average_price + pnl) on fill; the in-memory book
-   mirrors the `positions` table. Paper orders are identified by a broker_order_id
-   prefixed "PAPER-".
-
-D. EVENT-TYPE TRADE-MANAGEMENT PROFILE MATRIX (app/risk/event_profiles.py)
-   Per-event overrides that shape TRADE MANAGEMENT only (never bet size). Any
-   None field falls back to the global Settings value; the per-event min_confidence
-   can only RAISE the global floor (max of the two).
-     event_type       sl_atr_mult  sl_default_pct  target_rr  max_hold_s  min_conf
-     ORDER_WIN        2.0          (global 6.0)    3.5        1500        0.70
-     ACQUISITION      2.0          –               3.5        1500        0.70
-     MERGER           2.0          –               3.0        1500        0.70
-     Q1..Q4_RESULTS   1.8          –               3.0         900        0.70
-     ANNUAL_RESULTS   1.8          –               3.0         900        0.70
-     BUYBACK          1.8          4.0             2.5         900        0.72
-     DIVIDEND         1.5          3.0             2.0         600        0.75
-     BONUS            1.5          3.0             2.0         600        0.78
-     STOCK_SPLIT      1.5          3.0             2.0         600        0.78
-     RIGHTS_ISSUE     1.8          4.0             2.0         720        0.75
-     BOARD_MEETING    1.8          –               2.0         600        0.75
-     OTHER            2.0          –               2.5        (global)    0.70
-     DEFAULT/unknown  → all-None profile = pure Settings.
-
-E. VOLATILITY: WILDER ATR, STOP DISTANCE & VIX THROTTLE (app/risk/volatility.py,
-   app/risk/position_sizer.py)
-   compute_atr(candles, period): Wilder's ATR; needs > period valid candles;
-   accepts (h,l,c) tuples, Fyers rows [ts,o,h,l,c,v], dicts, or objects; returns
-   None (never raises) on too-few/bad candles.
-   Live ATR: FyersCandleVolatilityProvider — 5-min candles, 5-day lookback,
-   300s per-symbol TTL cache; refresh() awaited before sizing; fail-safe → None.
-   stop_distance: ATR path = atr×mult clamped to [floor, ATR_MAX_STOP_PCT·entry];
-   else default_pct·entry. Floor = DEFAULT_SL_MIN_PCT, or DEFAULT_SL_SMALLCAP_PCT
-   for entry < SMALLCAP_PRICE (200).
-   VIX throttle: vix_risk_multiplier — None → 1.0; VIX < 18 → 1.0; < 25 → 0.75;
-   ≥ 25 → 0.5. Applied to per-trade risk % only (sizing), never to conviction.
-   Live VIX: FyersVolatilityRegime off NSE:INDIAVIX-INDEX, 60s TTL, fail-safe.
-   Equity ledger (compute_equity): starting capital + realised P&L (all closed
-   trades) + unrealised (open positions marked to market); in LIVE with a funds
-   feed the broker balance replaces (capital+realised) and only unrealised is
-   added. FyersFundsProvider caches the balance with a 30s TTL. Graduated ramp:
-   first RISK_RAMP_TRADES (100) filled trades are held to RISK_RAMP_START_PCT
-   (0.5%); RiskState.current_risk_pct (e.g. 0.25% after a weekly breach) always
-   takes the lower value. notional_cap_qty = floor(equity·max_pos%/entry).
-
-F. MARKET CLOCK (app/risk/market_clock.py) — IST = UTC+5:30, no DST
-   is_market_open : weekday within [MARKET_OPEN_IST, MARKET_CLOSE_IST] (09:15–15:30).
-   is_entry_window: weekday within [ENTRY_WINDOW_START, ENTRY_WINDOW_END]
-                    (09:30–15:00) — excludes the opening 15 min and closing 30 min;
-                    disabled (always True) when ENFORCE_MARKET_HOURS is False.
-   square_off_due : ≥ SQUARE_OFF_TIME_IST (15:10) through the close — NOT disabled
-                    by ENFORCE_MARKET_HOURS; drives close_all(reason="EOD_SQUAREOFF").
-   entry_block_reason: market_closed | post_squareoff | outside_entry_window | None.
-   SEAM: no exchange-holiday calendar (weekends only); a holiday trades like an
-   open weekday and the broker's rejection + EOD square-off are the backstops.
-
-G. EVENT BUS, CHANNELS & LIFESPAN SERVICES (app/services/event_bus.py, app/main.py)
-   EventBus: per-subscriber asyncio.Queue (maxsize 1000). publish() is
-   fire-and-forget — a full queue drops the event (logged) so one slow consumer
-   can't block producers; publish_blocking() adds backpressure. Exact channel
-   names, no wildcards. Module singleton `event_bus`.
-   Channels seen in the codebase: announcements.new, signals.new,
-   signal_rules.matched, trade.executed, trade.closed, quotes, settings.updated,
-   breaker.tripped, risk.blocked.
-   Lifespan starts/stops (in order): analyzer → monitors → execution manager →
-   quote feed → trade manager → Fyers stream → notifications → webhook dispatcher
-   → outcome logger, plus a 10s risk-monitor task (evaluate_breakers → flatten on
-   halt). A CorrelationIdMiddleware stamps x-request-id and logs http.request with
-   elapsed_ms. Static SPA is mounted last so API routes win.
-
-H. PROMPT SEEDING, EVENT DETECTION & NOISE FILTER (app/analyzer/prompts.py)
-   Seeding: seed_defaults() writes DEFAULT + 15 per-event templates (16 rows);
-   startup uses overwrite=False (insert-missing-only → never clobbers saved
-   edits); the seed_default_prompts.py script uses overwrite=True (explicit
-   re-seed). Factory defaults: model deepseek-v4-flash, temperature 0.2,
-   max_tokens 2000, reasoning_effort medium, thinking OFF, stream OFF. Every edit
-   bumps `version` and writes a prompt_history row (restore-able).
-   detect_event_type: first case-insensitive keyword hit on the headline (URL as
-   tie-breaker) across the _KEYWORD_MAP (order win/acquisition/merger/dividend/
-   buyback/split/bonus/rights/Q1–Q4/annual/board-meeting) → else OTHER.
-   is_non_material: substring denylist (trading window, compliance certificate,
-   reg 40 / 74 / 7(3), newspaper publication, duplicate/loss of share certificate,
-   reconciliation of share capital, investor complaints, change in registrar) —
-   BUT a strong material marker in the same headline (board meeting, fund raising,
-   acquisition/acquire, merger/amalgamation/demerger, scheme of arrangement, open
-   offer, preferential, buyback, order win/bags order/wins order/awarded) VETOES
-   the skip. Prompt grounding footers force a NO-TRADE-by-default stance: the LLM
-   cannot open URLs, must analyse only the provided metadata/filing text, and must
-   cite a specific fact to justify BUY/SELL (else HOLD, OTHER, low confidence).
-
-I. ANALYSIS SKIP/FAIL REASON TAGS (raw_response.error on placeholder `analyses`)
-   ai_analysis_disabled  — AI master switch OFF (Dashboard).
-   stale_news            — older than MAX_NEWS_AGE_SECONDS (or pre-marked at startup).
-   non_material_filing   — dropped by the pre-LLM noise filter.
-   no_prompt_template    — no DEFAULT template found.
-   llm_timeout           — DeepSeek exceeded LLM_TIMEOUT_SECONDS.
-   deepseek_error / deepseek_unhandled — API/transport failure.
-   invalid_json          — model returned unparseable content.
-   schema_validation_failed — JSON failed the AnalysisResponse schema.
-   (A signal can also be BLOCKED post-analysis with rationale `pipeline_deadline`
-   when PIPELINE_DEADLINE_SECONDS is exceeded — the analysis is still stored.)
 
 ================================================================================
 END OF FILE — AI News Trading Bot

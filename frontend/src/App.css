@@ -466,6 +466,16 @@ body {
 }
 .widget-wide { grid-column: 1 / -1; }
 
+/* P&L widget controls: account scope / time range / view button groups.
+   Reuses the chart-group/chart-btn idiom from the Trade-page toolbar. */
+.pnl-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 8px 12px 4px;
+}
+
 .widgets {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
