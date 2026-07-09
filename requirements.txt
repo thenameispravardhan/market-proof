@@ -18,6 +18,11 @@ structlog==24.4.0
 # HTTP client (used by future tracks; included now so deps are stable)
 httpx==0.28.1
 
+# Fast JSON for the NSE/BSE poll hot path (~3-5x faster than stdlib on
+# exchange payloads). The monitors fall back to stdlib json without it,
+# so it stays soft-optional at runtime — but install it for the speedup.
+orjson==3.10.12
+
 # Fyers broker SDK — used ONLY for the realtime WebSocket feeds
 # (data socket = live prices, order socket = fill updates). REST
 # order placement / quotes stay on httpx (see app/execution/fyers_live.py).

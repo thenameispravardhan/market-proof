@@ -402,6 +402,36 @@ class TradeManager:
     def managed_positions(self) -> list[ManagedPosition]:
         return list(self._book.values())
 
+    def _is_real_quote(self, quote: Any) -> bool:
+        """True when `quote` is a price we may settle / mark a real-entry
+        position against.
+
+        Mirrors the entry guard (`QuoteFeed.seed_symbol`): an entry is only
+        ever filled at a real Fyers price, so the exit and mark-to-market
+        must use the same source — otherwise a real entry gets exited at a
+        synthetic hash anchor and books a phantom P&L (PPLPHARMA
+        ₹172.98→₹1,641, SOLEX ₹1,060→₹654). A quote is real when:
+
+          - no live feed is wired at all (pure offline paper / tests): the
+            synthetic simulator is the only, self-consistent source, so
+            entry AND marking share it — safe to settle against; or
+          - a live feed IS wired and this tick came from Fyers
+            (``source`` in {fyers, fyers_ws}) and is NOT flagged
+            ``simulated``.
+
+        When a live feed is wired but the tick is simulated (feed cold,
+        fell back to the hash walk) this returns False and the caller holds
+        the position rather than settling at a fabricated price.
+        """
+        if quote is None:
+            return False
+        if self._quote_feed is None or not self._quote_feed.has_live_feed():
+            return True
+        extra = quote.extra or {}
+        if extra.get("simulated"):
+            return False
+        return extra.get("source") in ("fyers", "fyers_ws")
+
     # -- main loop -------------------------------------------------------
 
     async def _run(self) -> None:
@@ -526,6 +556,18 @@ class TradeManager:
             quote = await self._md.get_quote(symbol)
             if quote is None:
                 continue
+            # A real entry must be marked AND exited against a REAL price. If
+            # a live feed is wired but this tick is the synthetic fallback
+            # (feed cold → hash walk), HOLD: don't mark a phantom P&L and
+            # don't fire SL/target/TIME_EXIT at a fabricated price. The
+            # position resumes as soon as a real Fyers tick lands (or is
+            # flattened at the last real price by the EOD square-off).
+            if not self._is_real_quote(quote):
+                log.debug(
+                    "trade_manager.skip_synthetic_quote",
+                    symbol=symbol, last=round(float(quote.last_price), 2),
+                )
+                continue
             last = float(quote.last_price)
             # Persist the live price + unrealised P&L (no-op if unchanged).
             await loop.run_in_executor(
@@ -573,22 +615,32 @@ class TradeManager:
         operator can always flatten it from the dashboard.
         """
         symbol = symbol.upper().strip()
+        loop = asyncio.get_running_loop()
         quote = await self._md.get_quote(symbol)
         async with self._lock:
             mp = self._book.get(symbol)
         fallback_price: Optional[float] = None
         if mp is None:
-            loaded = await asyncio.get_running_loop().run_in_executor(
+            loaded = await loop.run_in_executor(
                 None, _open_position_as_managed, self._session_factory, symbol
             )
             if loaded is None:
                 return None
             mp, fallback_price = loaded
-        exit_price = (
-            float(quote.last_price)
-            if quote is not None
-            else (fallback_price if fallback_price is not None else mp.entry)
-        )
+        # A synthetic tick (live feed cold → hash fallback) must NEVER set
+        # the exit basis — that books a phantom P&L. Prefer a REAL live
+        # price; otherwise settle at the last real mark persisted on the
+        # position row (marking skips synthetic ticks, so it stays real),
+        # else the real entry. This keeps a manual close / EOD square-off
+        # coherent even when the feed is down.
+        if quote is not None and self._is_real_quote(quote):
+            exit_price = float(quote.last_price)
+        else:
+            if fallback_price is None:
+                fallback_price = await loop.run_in_executor(
+                    None, _row_exit_fallback, self._session_factory, symbol
+                )
+            exit_price = fallback_price if fallback_price is not None else mp.entry
         return await self._exit(symbol, reason=reason, exit_price=exit_price, mp=mp)
 
     async def close_all(self, *, reason: str = "SQUARE_OFF") -> list[dict[str, Any]]:
@@ -774,6 +826,27 @@ def _persist_position_levels(
         pos.stop_loss = float(stop_loss) if stop_loss is not None else None
         pos.target = float(target) if target is not None else None
         session.commit()
+
+
+def _row_exit_fallback(
+    session_factory: Callable[[], Any], symbol: str
+) -> Optional[float]:
+    """The last REAL price to settle a position at when no live quote is
+    available (feed cold). Prefers the persisted `last_price` (mark-to-
+    market skips synthetic ticks, so it holds the last real mark) and
+    falls back to `average_price` (the real entry). None when the row is
+    gone."""
+    from app.db.models import Position as PositionRow
+
+    with session_factory() as session:
+        pos = session.query(PositionRow).filter_by(symbol=symbol).one_or_none()
+        if pos is None:
+            return None
+        if pos.last_price is not None and float(pos.last_price) > 0:
+            return float(pos.last_price)
+        if pos.average_price is not None and float(pos.average_price) > 0:
+            return float(pos.average_price)
+        return None
 
 
 def _mark_to_market(

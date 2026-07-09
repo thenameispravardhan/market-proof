@@ -53,10 +53,10 @@ class Settings(BaseSettings):
     # How often each monitor re-polls NSE/BSE. Lower = faster detection
     # of a fresh filing, but poll too aggressively and the exchange CDNs
     # start returning 403s / rate-limit your IP (the scraper then falls
-    # back to the slower Playwright path or stalls entirely). 1s is the
-    # floor for a single local operator; raise it if you start seeing
-    # `monitor.retry` 403/429 spam in the logs.
-    POLL_INTERVAL_SECONDS: int = 1
+    # back to the slower Playwright path or stalls entirely). Accepts
+    # fractional seconds (e.g. 2.5). 1s is the floor for a single local
+    # operator; raise it if you start seeing `monitor.retry` 403/429 spam.
+    POLL_INTERVAL_SECONDS: float = 1.0
 
     # ---------- Risk defaults (per-strategy overrides in DB) ----------
     # Per-trade capital-at-risk cap. RISK.md targets 0.75%; the graduated

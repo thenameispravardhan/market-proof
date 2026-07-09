@@ -129,6 +129,19 @@ class QuoteFeed:
     def watched_symbols(self) -> list[str]:
         return list(self._watched.keys())
 
+    def has_live_feed(self) -> bool:
+        """True when a real quote source (``live_quote_fn``) is wired.
+
+        Callers use this to decide whether a SIMULATED quote is a
+        trustworthy price. In pure offline paper mode (no live feed at
+        all) the synthetic simulator is the only source and entry AND
+        marking both use it, so a simulated quote is self-consistent and
+        safe to settle against. Once a live feed is wired, a simulated
+        quote means the real feed was cold and fell back to the hash
+        anchor — settling a real-entry position against it manufactures a
+        phantom P&L (see `seed_symbol` and the CEIGALL note)."""
+        return self._live_quote_fn is not None
+
     # -- lifecycle -------------------------------------------------------
 
     def start(self) -> asyncio.Task[None]:

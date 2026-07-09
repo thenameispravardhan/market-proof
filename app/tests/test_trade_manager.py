@@ -416,6 +416,87 @@ async def test_register_uses_global_max_hold_default(db_session, isolated_db, mo
     assert mp.max_hold_seconds == 1234
 
 
+# -- Phantom-price guard: never exit at a synthetic tick -----------------
+
+
+@pytest.mark.asyncio
+async def test_sweep_holds_position_on_synthetic_quote(db_session, isolated_db):
+    """With a live feed wired, a SIMULATED tick (feed cold → hash anchor)
+    must NOT exit a real-entry position. Otherwise a real ₹172.98 entry
+    gets exited at the synthetic ₹1,641 hash price and books a phantom
+    +₹15L gain (the PPLPHARMA bug). The position is held until a real tick.
+    """
+    md = MarketDataBus()
+
+    async def live_fn(sym):  # feed can't price the symbol right now
+        return None
+
+    qf = QuoteFeed(market_data=md, live_quote_fn=live_fn)
+    tm = TradeManager(market_data=md, quote_feed=qf)
+    await tm.register(
+        symbol="PPLPHARMA", quantity=1040, entry=172.98,
+        stop_loss=150.0, target=200.0, max_hold_seconds=0,
+    )
+    # Synthetic tick at the hash anchor (1641 >= target 200) — a TARGET
+    # exit would fire and book a fake gain if the guard weren't there.
+    assert _base_price_for("PPLPHARMA") == 1641.0
+    await md.publish("PPLPHARMA", 1641.0, extra={"simulated": True})
+    await tm._sweep()
+    # Still managed — no phantom exit, no trade row written.
+    assert any(mp.symbol == "PPLPHARMA" for mp in tm.managed_positions())
+    assert db_session.query(TradeRow).filter_by(symbol="PPLPHARMA").count() == 0
+
+
+@pytest.mark.asyncio
+async def test_sweep_exits_on_real_quote_with_live_feed(db_session, isolated_db):
+    """A REAL Fyers tick (source=fyers) still exits normally — the guard
+    only suppresses synthetic ticks, not real ones."""
+    md = MarketDataBus()
+
+    async def live_fn(sym):
+        return None
+
+    qf = QuoteFeed(market_data=md, live_quote_fn=live_fn)
+    tm = TradeManager(market_data=md, quote_feed=qf)
+    await tm.register(
+        symbol="RELIANCE", quantity=10, entry=100.0, stop_loss=95.0, target=110.0,
+    )
+    await md.publish("RELIANCE", 111.0, extra={"source": "fyers"})
+    await tm._sweep()
+    assert tm.managed_positions() == []
+    trades = db_session.query(TradeRow).filter_by(symbol="RELIANCE").all()
+    assert len(trades) == 1
+    assert trades[0].pnl == pytest.approx(110.0)  # (111-100)*10
+
+
+@pytest.mark.asyncio
+async def test_close_position_uses_last_real_price_when_feed_cold(
+    db_session, isolated_db
+):
+    """A manual close with only a synthetic quote on the bus settles at the
+    last REAL mark persisted on the row, never the hash anchor. SOLEX
+    ₹1,060 entry closes at the last real ₹1,055 mark, not the synthetic
+    ₹654 (which would fabricate a −₹1.38L loss)."""
+    md = MarketDataBus()
+
+    async def live_fn(sym):
+        return None
+
+    qf = QuoteFeed(market_data=md, live_quote_fn=live_fn)
+    db_session.add(
+        PositionRow(symbol="SOLEX", quantity=341, average_price=1060.0, last_price=1055.0)
+    )
+    db_session.commit()
+    tm = TradeManager(market_data=md, quote_feed=qf)
+    assert _base_price_for("SOLEX") == 654.0
+    await md.publish("SOLEX", 654.0, extra={"simulated": True})
+    result = await tm.close_position("SOLEX", reason="MANUAL")
+    assert result is not None
+    # Settled at the last real mark (1055), NOT the synthetic 654.
+    assert result["exit_price"] == pytest.approx(1055.0)
+    assert result["pnl"] == pytest.approx((1055.0 - 1060.0) * 341)
+
+
 # -- Integration: quote feed seeds a fill for a BUY ----------------------
 
 

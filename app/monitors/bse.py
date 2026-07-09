@@ -45,10 +45,16 @@ import asyncio
 import json as _stdlib_json
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 from app.logging_config import get_logger
 from app.monitors.base import BaseMonitor, RawAnnouncement
+
+if TYPE_CHECKING:
+    # Type-only: httpx is imported lazily inside the fetchers at runtime
+    # (keeps import cost off the startup path); this makes the quoted
+    # "httpx.AsyncClient" annotations resolvable to type checkers.
+    import httpx
 
 # orjson is ~3-5× faster than stdlib json for exchange payloads. Fall
 # back to stdlib if orjson isn't installed.
@@ -404,19 +410,28 @@ def _bse_window_url(category: str, lookback_days: int = 1) -> str:
 async def _prime_bse(client: "httpx.AsyncClient") -> None:
     """Seed BSE session cookies via the home page.
 
-    Unlike NSE, a 401/403 here is a hard signal (BSE's edge is blocking
-    us), so it's raised as retryable rather than tolerated.
+    A 401/403 on the *landing page* is tolerated (mirrors NSE): BSE's
+    edge often bot-blocks the HTML home page while the JSON API still
+    answers with the cookies we already hold. Treating a landing-page
+    403 as fatal forced EVERY tick onto the slow Playwright fallback
+    even when the API path was fine. The real block signal is the API
+    call itself — if the category fan-out returns 401/403 the caller
+    re-arms priming and bounces to Playwright. Only a 5xx here (BSE
+    genuinely down) is worth an immediate retry.
     """
     from app.monitors.base import _RetryableError
 
     try:
         primer = await client.get(BSE_COOKIE_SEED_URL)
     except Exception as e:  # noqa: BLE001
-        raise _RetryableError(f"bse cookie primer failed: {e}") from e
+        # Network error priming is not fatal — the API carries its own
+        # cookies from prior ticks. Log and let the API call be the judge.
+        log.debug("bse cookie primer network error", error=str(e))
+        return
     if primer.status_code >= 500:
         raise _RetryableError(f"bse primer {primer.status_code}")
     if primer.status_code in (401, 403):
-        raise _RetryableError(f"bse primer {primer.status_code} (likely IP block)")
+        log.debug("bse primer 403 — proceeding anyway, API call is the real signal")
 
 
 async def fetch_bse_with_httpx(

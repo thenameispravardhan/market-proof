@@ -36,10 +36,16 @@ from __future__ import annotations
 import json as _stdlib_json
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 from app.logging_config import get_logger
 from app.monitors.base import BaseMonitor, RawAnnouncement
+
+if TYPE_CHECKING:
+    # Type-only: httpx is imported lazily inside the fetchers at runtime
+    # (keeps import cost off the startup path); this makes the quoted
+    # "httpx.AsyncClient" annotations resolvable to type checkers.
+    import httpx
 
 # orjson is ~3-5× faster than stdlib json for exchange payloads (200-500
 # rows). Fall back to stdlib if orjson isn't installed.
@@ -198,6 +204,10 @@ def _nse_xhr_url(lookback_days: int = 1) -> str:
     NSE's date params are ``dd-mm-yyyy``. With a 1-day window we get
     the last 24h of filings — usually 200-500 rows on a weekday. A
     wider window pulls more history but takes longer to ship.
+
+    NOTE: this is the *backfill / wide-window* URL. The steady-state
+    poll uses `_nse_poll_url` (the light most-recent endpoint) — see
+    that function for why.
     """
     ist = timezone(timedelta(hours=5, minutes=30))
     today = datetime.now(timezone.utc).astimezone(ist)
@@ -207,6 +217,27 @@ def _nse_xhr_url(lookback_days: int = 1) -> str:
         f"{NSE_XHR_URL}&from_date={start.strftime(fmt)}"
         f"&to_date={today.strftime(fmt)}"
     )
+
+
+def _nse_poll_url() -> str:
+    """URL used for the steady-state poll — the light most-recent feed.
+
+    The date-windowed URL (`_nse_xhr_url`) returns the *entire* day's
+    history — ~1000 rows / ~720 KB — on every single tick. For a
+    speed-news bot that only acts on filings younger than
+    ``MAX_NEWS_AGE_SECONDS`` (tens of seconds), re-downloading and
+    re-parsing a full day of history every 1-5s is pure waste, and the
+    repeated 720 KB request is exactly the pattern NSE's WAF rate-limits
+    (→ 403 → the slow Playwright fallback → backoff → *missed* news).
+
+    NSE's no-parameter endpoint returns the 20 most-recent filings
+    (~14 KB) with the identical newest timestamp — measured live it
+    spans ~19 minutes, so it comfortably covers the longest backoff gap
+    (60s cap) with no chance of dropping a fresh row. ~50× less
+    bandwidth and ~50× fewer rows to parse/dedupe per tick makes each
+    poll near-instant and lets the operator safely poll faster.
+    """
+    return NSE_XHR_URL
 
 
 def parse_nse_payload(
@@ -303,7 +334,9 @@ def _close_nse_client() -> None:
     """Test / teardown helper — closes the shared client."""
     global _nse_client, _nse_primed
     if _nse_client is not None:
-        import anyio
+        # Explicit submodule import — `anyio.from_thread` is not loaded by
+        # a bare `import anyio` and only worked by accident of load order.
+        import anyio.from_thread
         try:
             anyio.from_thread.run(_nse_client.aclose)
         except Exception:  # noqa: BLE001
@@ -395,8 +428,11 @@ async def fetch_nse_with_httpx(url: str, *, transport: Any = None) -> str:
         if is_prod:
             _nse_primed = True
 
-    # Step 2: hit the XHR with the primed cookies.
-    xhr_url = _nse_xhr_url(lookback_days=1)
+    # Step 2: hit the XHR with the primed cookies. We poll the light
+    # most-recent feed (see `_nse_poll_url`) rather than the full-day
+    # window — 50× less to fetch/parse and far less likely to be
+    # rate-limited.
+    xhr_url = _nse_poll_url()
     try:
         resp = await client.get(xhr_url)
     except Exception as e:  # noqa: BLE001
@@ -458,7 +494,8 @@ async def fetch_nse_with_playwright(url: str) -> str:
             raise _RetryableError("nse seed 429")
 
         # Step 2: hit the XHR via context.request so cookies flow.
-        xhr_url = _nse_xhr_url(lookback_days=1)
+        # Same light most-recent feed as the httpx path.
+        xhr_url = _nse_poll_url()
         try:
             api_resp = await context.request.get(
                 xhr_url,

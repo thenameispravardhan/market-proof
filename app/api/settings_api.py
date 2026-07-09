@@ -56,7 +56,7 @@ _GLOBAL_KEYS: dict[str, tuple[type, Any]] = {
     "MAX_SINGLE_POSITION_PCT": (float, 20.0),
     "MIN_LIQUIDITY_CRORE": (float, 5.0),
     "MAX_SIGNALS_PER_DAY": (int, 20),
-    "POLL_INTERVAL_SECONDS": (int, 5),
+    "POLL_INTERVAL_SECONDS": (float, 5.0),
     "PORTFOLIO_VALUE": (float, 1_000_000.0),
     "DEFAULT_SL_PCT": (float, 6.0),
     "DEFAULT_TARGET_RR": (float, 3.0),
@@ -162,7 +162,7 @@ def _coerce(key: str, value: Any) -> Any:
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=f"setting {key}: percent must be in (0, 100]",
             )
-        if key in {"MAX_CONCURRENT_POSITIONS", "MAX_SIGNALS_PER_DAY", "POLL_INTERVAL_SECONDS"} and coerced < 0:
+        if key in {"MAX_CONCURRENT_POSITIONS", "MAX_SIGNALS_PER_DAY"} and coerced < 0:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=f"setting {key}: must be non-negative",
@@ -174,7 +174,10 @@ def _coerce(key: str, value: Any) -> Any:
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="INTRADAY_LEVERAGE must be between 1 and 10",
             )
-        if key in {"LLM_MAX_TOKENS", "MAX_NEWS_AGE_SECONDS"} and coerced < 1:
+        # POLL_INTERVAL_SECONDS accepts fractional seconds (float) but keeps
+        # a >=1 floor, mirroring the Settings validator — an out-of-range
+        # override written to env would make every later get_settings() blow up.
+        if key in {"LLM_MAX_TOKENS", "MAX_NEWS_AGE_SECONDS", "POLL_INTERVAL_SECONDS"} and coerced < 1:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=f"setting {key}: must be >= 1",

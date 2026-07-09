@@ -17,18 +17,24 @@ Usage::
 from __future__ import annotations
 
 import asyncio
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from app.logging_config import get_logger
 
+if TYPE_CHECKING:
+    # Type-only: playwright is an optional runtime dep (lazy import in
+    # get_browser), but annotating the pool gives call sites real types
+    # (browser.new_context etc.) instead of `object`.
+    from playwright.async_api import Browser, Playwright
+
 log = get_logger(__name__)
 
-_WARM_BROWSER: Optional[object] = None  # playwright Browser
+_WARM_BROWSER: Optional["Browser"] = None
 _WARM_BROWSER_LOCK = asyncio.Lock()
-_WARM_BROWSER_PW: Optional[object] = None  # playwright module (for cleanup)
+_WARM_BROWSER_PW: Optional["Playwright"] = None  # driver handle (for cleanup)
 
 
-async def get_browser():
+async def get_browser() -> "Browser":
     """Return a warm (or freshly-launched) headless Chromium browser.
 
     Thread-safe via an async lock — concurrent callers wait for the
