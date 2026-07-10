@@ -1,0 +1,618 @@
+// Dataset — the customizable ML training-set builder.
+//
+// One wide table joining everything the pipeline knows about each
+// signal: the news, the AI verdict, the decision, planned levels,
+// execution facts, the coarse outcome probes, and the 1-minute-candle
+// reaction features + horizon targets from the DatasetBuilder.
+//
+// The column catalog tags every column with its ML role:
+//   FEATURE — knowable at (or within 5 min of) decision time; safe input
+//   TARGET  — only knowable at the horizon; training label ONLY
+//   META    — identity / data-quality
+// Using a TARGET as a model input is look-ahead bias — the picker makes
+// that mistake visually impossible to make silently.
+
+import { useEffect, useMemo, useState } from "react";
+import {
+  datasetQueryString,
+  useDatasetBackfill,
+  useDatasetColumns,
+  useDatasetHealth,
+  useDatasetRows,
+  useDatasetStats,
+  type DatasetColumn,
+  type DatasetFilters,
+} from "../hooks/useApi";
+
+const COLUMNS_KEY = "tradebot.dataset.columns.v1";
+
+const CATEGORY_LABELS: Record<string, string> = {
+  identity: "Identity",
+  news: "News",
+  context: "Session / market context",
+  analysis: "AI analysis",
+  signal: "Signal",
+  levels: "Planned levels",
+  execution: "Execution",
+  outcome_samples: "Outcome probes",
+  reaction: "Market reaction (1-min candles)",
+  targets: "Horizon targets (labels)",
+  quality: "Data quality",
+};
+
+// Numeric label columns offered as the health panel's correlation target.
+const HEALTH_TARGETS = [
+  "ret_15m_pct",
+  "high_15m",
+  "mfe_15m_pct",
+  "mae_15m_pct",
+  "time_to_peak_min",
+  "retrace_from_peak_pct",
+  "move_30m_pct",
+  "r_multiple",
+];
+
+function loadSavedColumns(): string[] | null {
+  try {
+    const raw = localStorage.getItem(COLUMNS_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function RoleBadge({ role }: { role: DatasetColumn["role"] }) {
+  const cls = role === "feature" ? "pnl-pos" : role === "target" ? "pnl-neg" : "";
+  return (
+    <span
+      className={`mono ${cls}`}
+      style={{ fontSize: 9, textTransform: "uppercase", opacity: role === "meta" ? 0.6 : 1 }}
+    >
+      {role}
+    </span>
+  );
+}
+
+function fmtCell(v: unknown): string {
+  if (v === null || v === undefined) return "—";
+  if (typeof v === "boolean") return v ? "✓" : "✗";
+  if (typeof v === "number") {
+    if (Number.isInteger(v)) return String(v);
+    return v.toFixed(Math.abs(v) < 1 ? 4 : 2);
+  }
+  const s = String(v);
+  return s.length > 48 ? s.slice(0, 45) + "…" : s;
+}
+
+export default function Dataset() {
+  const { data: catalog } = useDatasetColumns();
+  const { data: stats } = useDatasetStats();
+  const backfill = useDatasetBackfill();
+
+  const allKeys = useMemo(
+    () => (catalog?.columns ?? []).map((c) => c.key),
+    [catalog]
+  );
+  const [selected, setSelected] = useState<string[]>(() => loadSavedColumns() ?? []);
+  // First load with no saved selection → select everything.
+  useEffect(() => {
+    if (selected.length === 0 && allKeys.length > 0 && loadSavedColumns() === null) {
+      setSelected(allKeys);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allKeys]);
+  useEffect(() => {
+    try {
+      if (selected.length > 0) localStorage.setItem(COLUMNS_KEY, JSON.stringify(selected));
+    } catch {
+      /* ignore */
+    }
+  }, [selected]);
+
+  const [filters, setFilters] = useState<DatasetFilters>({});
+  const [limit, setLimit] = useState(50);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [dedup, setDedup] = useState(true);
+  const [healthOpen, setHealthOpen] = useState(false);
+  const [healthTarget, setHealthTarget] = useState("ret_15m_pct");
+  const { data: health } = useDatasetHealth(healthTarget, healthOpen);
+
+  // Keep the preview's column ORDER canonical (catalog order).
+  const orderedSelection = useMemo(
+    () => allKeys.filter((k) => selected.includes(k)),
+    [allKeys, selected]
+  );
+  const { data: rowsResp, isLoading, error } = useDatasetRows(
+    filters,
+    orderedSelection.length > 0 ? orderedSelection : undefined,
+    limit
+  );
+
+  const byCategory = useMemo(() => {
+    const groups: Record<string, DatasetColumn[]> = {};
+    for (const c of catalog?.columns ?? []) {
+      (groups[c.category] ??= []).push(c);
+    }
+    return groups;
+  }, [catalog]);
+
+  const toggle = (key: string) =>
+    setSelected((cur) =>
+      cur.includes(key) ? cur.filter((k) => k !== key) : [...cur, key]
+    );
+  const toggleGroup = (keys: string[], on: boolean) =>
+    setSelected((cur) => {
+      const set = new Set(cur);
+      keys.forEach((k) => (on ? set.add(k) : set.delete(k)));
+      return allKeys.filter((k) => set.has(k));
+    });
+  const applyPreset = (keys: string[]) =>
+    setSelected(allKeys.filter((k) => keys.includes(k)));
+
+  const exportExtra: Record<string, string | number> = { limit: 20000 };
+  if (dedup) exportExtra.dedup = "true";
+  const exportQs = datasetQueryString(filters, orderedSelection, exportExtra);
+  const splitQs = (split: "train" | "val") =>
+    datasetQueryString(filters, orderedSelection, {
+      ...exportExtra,
+      split,
+      split_ratio: 0.8,
+    });
+  const enrich = stats?.enrichment ?? {};
+  const complete = enrich["complete"] ?? 0;
+  const coveragePct =
+    stats && stats.total_rows > 0
+      ? Math.round((complete / stats.total_rows) * 100)
+      : null;
+
+  return (
+    <div>
+      <div className="dashboard-head">
+        <h1 className="page-title">Dataset</h1>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <button
+            className="chart-btn"
+            style={{ border: "1px solid var(--border)" }}
+            onClick={() => backfill.mutate(200)}
+            disabled={backfill.isPending}
+            data-testid="dataset-backfill"
+            title="Fetch 1-min candles and compute features for signals not yet enriched (needs Fyers)"
+          >
+            {backfill.isPending ? "Enriching…" : "⟳ Enrich now"}
+          </button>
+          <a
+            className="chart-btn"
+            style={{ border: "1px solid var(--border)", textDecoration: "none" }}
+            href={`/api/dataset/export?format=csv&${exportQs}`}
+            download
+          >
+            Export CSV
+          </a>
+          <a
+            className="chart-btn"
+            style={{ border: "1px solid var(--border)", textDecoration: "none" }}
+            href={`/api/dataset/export?format=jsonl&${exportQs}`}
+            download
+          >
+            Export JSONL
+          </a>
+          <a
+            className="chart-btn"
+            style={{ border: "1px solid var(--border)", textDecoration: "none" }}
+            href={`/api/dataset/export?format=csv&${splitQs("train")}`}
+            download
+            title="Oldest 80% of the filtered set, chronological — train on this"
+          >
+            Train CSV
+          </a>
+          <a
+            className="chart-btn"
+            style={{ border: "1px solid var(--border)", textDecoration: "none" }}
+            href={`/api/dataset/export?format=csv&${splitQs("val")}`}
+            download
+            title="Newest 20% — validate on this (never random-split news data)"
+          >
+            Val CSV
+          </a>
+          <label
+            className="meta"
+            style={{ cursor: "pointer", whiteSpace: "nowrap" }}
+            title="Collapse NSE+BSE copies of the same news to one row — twins split across train/val fake your accuracy"
+          >
+            <input
+              type="checkbox"
+              checked={dedup}
+              onChange={(e) => setDedup(e.target.checked)}
+              style={{ marginRight: 4 }}
+            />
+            dedup cross-listings
+          </label>
+        </div>
+      </div>
+
+      {backfill.data && (
+        <p className="meta" style={{ marginBottom: 8 }}>
+          Enrichment batch: {backfill.data.processed} processed (
+          {backfill.data.shadow ?? 0} shadow) — {backfill.data.complete}{" "}
+          complete, {backfill.data.partial} partial,{" "}
+          {backfill.data.no_candles} without candles
+          {backfill.data.no_candles > 0 && " (is Fyers connected?)"},{" "}
+          {backfill.data.too_old} too old, {backfill.data.errors} errors.
+        </p>
+      )}
+
+      {/* Coverage tiles */}
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))",
+          gap: 8,
+          marginBottom: 12,
+        }}
+      >
+        {[
+          {
+            label: "Rows (signal + shadow)",
+            value: stats
+              ? `${stats.total_rows} (${stats.sources?.signal ?? 0}+${
+                  stats.sources?.shadow ?? 0
+                })`
+              : "—",
+          },
+          {
+            label: "Enriched",
+            value:
+              coveragePct !== null ? `${complete} (${coveragePct}%)` : complete,
+          },
+          { label: "Partial", value: enrich["partial"] ?? 0 },
+          {
+            label: "Awaiting candles",
+            value: (enrich["pending"] ?? 0) + (enrich["no_candles"] ?? 0),
+          },
+          {
+            label: "Labels UP / DOWN / FLAT",
+            value: `${stats?.label_balance?.["UP"] ?? 0} / ${
+              stats?.label_balance?.["DOWN"] ?? 0
+            } / ${stats?.label_balance?.["FLAT"] ?? 0}`,
+          },
+          { label: "Columns", value: stats?.column_count ?? "—" },
+        ].map((t) => (
+          <div key={t.label} className="widget" style={{ padding: "10px 12px" }}>
+            <div className="meta" style={{ fontSize: 10 }}>{t.label}</div>
+            <div className="mono" style={{ fontSize: 18 }}>{t.value}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Look-ahead bias warning */}
+      <div className="widget widget-wide" style={{ marginBottom: 12, padding: "10px 14px" }}>
+        <span className="mono pnl-pos" style={{ fontSize: 10 }}>FEATURE</span>{" "}
+        <span className="meta">
+          = knowable at decision time (T0…T+5) — safe model input.
+        </span>{" "}
+        <span className="mono pnl-neg" style={{ fontSize: 10 }}>TARGET</span>{" "}
+        <span className="meta">
+          = only knowable at T+15 — train on it, never feed it in as an input
+          (that's look-ahead bias). Split train/validation by TIME, not randomly.
+        </span>
+      </div>
+
+      {/* Column picker */}
+      <div className="widget widget-wide" style={{ marginBottom: 12 }}>
+        <h3 style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <button
+            className="chart-btn"
+            style={{ border: "1px solid var(--border)" }}
+            onClick={() => setPickerOpen((v) => !v)}
+            data-testid="dataset-column-toggle"
+          >
+            {pickerOpen ? "▾" : "▸"} Columns ({orderedSelection.length}/{allKeys.length})
+          </button>
+          <span className="meta">Presets:</span>
+          {Object.entries(catalog?.presets ?? {}).map(([name, keys]) => (
+            <button
+              key={name}
+              className="chart-btn"
+              style={{ border: "1px solid var(--border)" }}
+              onClick={() => applyPreset(keys)}
+              title={`${keys.length} columns`}
+            >
+              {name.replace(/_/g, " ")}
+            </button>
+          ))}
+        </h3>
+        {pickerOpen && (
+          <div style={{ padding: "4px 12px 12px" }}>
+            {Object.entries(byCategory).map(([cat, cols]) => {
+              const keys = cols.map((c) => c.key);
+              const allOn = keys.every((k) => selected.includes(k));
+              return (
+                <div key={cat} style={{ marginBottom: 10 }}>
+                  <div style={{ marginBottom: 4 }}>
+                    <label className="mono" style={{ fontSize: 11, cursor: "pointer" }}>
+                      <input
+                        type="checkbox"
+                        checked={allOn}
+                        onChange={() => toggleGroup(keys, !allOn)}
+                        style={{ marginRight: 6 }}
+                      />
+                      {CATEGORY_LABELS[cat] ?? cat}
+                    </label>
+                  </div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                    {cols.map((c) => (
+                      <label
+                        key={c.key}
+                        title={`${c.description} — role: ${c.role}`}
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: 4,
+                          border: "1px solid var(--border)",
+                          borderRadius: 4,
+                          padding: "2px 6px",
+                          fontSize: 11,
+                          cursor: "pointer",
+                          opacity: selected.includes(c.key) ? 1 : 0.45,
+                        }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selected.includes(c.key)}
+                          onChange={() => toggle(c.key)}
+                          style={{ margin: 0 }}
+                        />
+                        <span className="mono">{c.key}</span>
+                        <RoleBadge role={c.role} />
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* Column health / leakage report */}
+      <div className="widget widget-wide" style={{ marginBottom: 12 }}>
+        <h3 style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <button
+            className="chart-btn"
+            style={{ border: "1px solid var(--border)" }}
+            onClick={() => setHealthOpen((v) => !v)}
+            data-testid="dataset-health-toggle"
+          >
+            {healthOpen ? "▾" : "▸"} Column health
+          </button>
+          {healthOpen && (
+            <>
+              <span className="meta">correlation vs target:</span>
+              <select
+                value={healthTarget}
+                onChange={(e) => setHealthTarget(e.target.value)}
+                style={{ width: "auto", padding: "2px 6px" }}
+              >
+                {HEALTH_TARGETS.map((t) => (
+                  <option key={t} value={t}>{t}</option>
+                ))}
+              </select>
+              {health && (
+                <span className="meta">{health.rows_sampled} rows sampled</span>
+              )}
+            </>
+          )}
+        </h3>
+        {healthOpen && (
+          !health ? (
+            <p className="empty">Loading…</p>
+          ) : (
+            <div style={{ overflowX: "auto", maxWidth: "100%", padding: "0 12px 12px" }}>
+              <table style={{ whiteSpace: "nowrap" }}>
+                <thead>
+                  <tr>
+                    <th>Column</th>
+                    <th>Role</th>
+                    <th>Null %</th>
+                    <th>Mean</th>
+                    <th>Std</th>
+                    <th>Corr → {health.target}</th>
+                    <th>Flags</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {health.columns.map((c) => {
+                    const nullPct =
+                      c.null_rate !== null ? Math.round(c.null_rate * 100) : null;
+                    return (
+                      <tr key={c.key}>
+                        <td className="mono">{c.key}</td>
+                        <td><RoleBadge role={c.role} /></td>
+                        <td className={`mono ${nullPct !== null && nullPct > 50 ? "pnl-neg" : ""}`}>
+                          {nullPct !== null ? `${nullPct}%` : "—"}
+                        </td>
+                        <td className="mono">{c.mean !== undefined ? c.mean : "—"}</td>
+                        <td className="mono">{c.std !== undefined ? c.std : "—"}</td>
+                        <td className="mono">
+                          {c.corr_target !== undefined && c.corr_target !== null
+                            ? c.corr_target.toFixed(3)
+                            : "—"}
+                        </td>
+                        <td className="mono">
+                          {c.leak_warning && (
+                            <span
+                              className="pnl-neg"
+                              title="This FEATURE tracks the target almost perfectly — that's look-ahead leakage, not alpha. Do not train on it."
+                            >
+                              ⚠ LEAK
+                            </span>
+                          )}
+                          {c.std === 0 && !c.leak_warning && c.numeric && (
+                            <span className="meta" title="Constant — carries no signal">
+                              constant
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )
+        )}
+      </div>
+
+      {/* Preview */}
+      <div className="widget widget-wide">
+        <h3 style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          Preview{" "}
+          <span className="meta">
+            {rowsResp ? `${rowsResp.count} of ${rowsResp.total} rows` : ""}
+          </span>
+          <span style={{ flex: 1 }} />
+          <select
+            value={filters.source ?? ""}
+            onChange={(e) =>
+              setFilters((f) => ({ ...f, source: e.target.value || undefined }))
+            }
+            style={{ width: "auto", padding: "2px 6px" }}
+            title="signal = the bot acted or was risk-blocked; shadow = analyzed but never signaled (the negatives)"
+          >
+            <option value="">Signal + shadow</option>
+            <option value="signal">Signal rows</option>
+            <option value="shadow">Shadow rows</option>
+          </select>
+          <select
+            value={filters.event_type ?? ""}
+            onChange={(e) =>
+              setFilters((f) => ({ ...f, event_type: e.target.value || undefined }))
+            }
+            style={{ width: "auto", padding: "2px 6px" }}
+          >
+            <option value="">All events</option>
+            {(stats?.by_event_type ?? [])
+              .filter((e) => e.event_type !== "UNKNOWN")
+              .map((e) => (
+                <option key={e.event_type} value={e.event_type}>
+                  {e.event_type} ({e.samples})
+                </option>
+              ))}
+          </select>
+          <select
+            value={filters.action ?? ""}
+            onChange={(e) =>
+              setFilters((f) => ({ ...f, action: e.target.value || undefined }))
+            }
+            style={{ width: "auto", padding: "2px 6px" }}
+          >
+            <option value="">BUY + SELL</option>
+            <option value="BUY">BUY</option>
+            <option value="SELL">SELL</option>
+          </select>
+          <select
+            value={filters.taken ?? ""}
+            onChange={(e) =>
+              setFilters((f) => ({ ...f, taken: e.target.value || undefined }))
+            }
+            style={{ width: "auto", padding: "2px 6px" }}
+          >
+            <option value="">Taken + blocked</option>
+            <option value="taken">Taken only</option>
+            <option value="blocked">Blocked only</option>
+          </select>
+          <select
+            value={filters.label ?? ""}
+            onChange={(e) =>
+              setFilters((f) => ({ ...f, label: e.target.value || undefined }))
+            }
+            style={{ width: "auto", padding: "2px 6px" }}
+          >
+            <option value="">Any label</option>
+            <option value="UP">UP</option>
+            <option value="DOWN">DOWN</option>
+            <option value="FLAT">FLAT</option>
+          </select>
+          <label className="meta" style={{ cursor: "pointer" }}>
+            <input
+              type="checkbox"
+              checked={filters.enriched_only ?? false}
+              onChange={(e) =>
+                setFilters((f) => ({
+                  ...f,
+                  enriched_only: e.target.checked || undefined,
+                }))
+              }
+              style={{ marginRight: 4 }}
+            />
+            enriched only
+          </label>
+          <select
+            value={limit}
+            onChange={(e) => setLimit(Number(e.target.value))}
+            style={{ width: "auto", padding: "2px 6px" }}
+          >
+            {[25, 50, 100, 250].map((n) => (
+              <option key={n} value={n}>{n} rows</option>
+            ))}
+          </select>
+        </h3>
+        {isLoading ? (
+          <p className="empty">Loading…</p>
+        ) : error ? (
+          <p className="empty">Failed to load dataset: {error.message}</p>
+        ) : !rowsResp || rowsResp.rows.length === 0 ? (
+          <p className="empty">
+            No rows yet — every signal becomes a dataset row automatically
+            (outcome probes at +5m/+30m, then 1-min-candle enrichment ~16
+            minutes after the signal). Use “Enrich now” to backfill history.
+          </p>
+        ) : (
+          <div style={{ overflowX: "auto", maxWidth: "100%" }}>
+            <table style={{ whiteSpace: "nowrap" }}>
+              <thead>
+                <tr>
+                  {orderedSelection.map((k) => {
+                    const col = catalog?.columns.find((c) => c.key === k);
+                    return (
+                      <th key={k} title={col ? `${col.description} — ${col.role}` : k}>
+                        <span
+                          className={
+                            col?.role === "target"
+                              ? "pnl-neg"
+                              : col?.role === "feature"
+                                ? "pnl-pos"
+                                : undefined
+                          }
+                        >
+                          {k}
+                        </span>
+                      </th>
+                    );
+                  })}
+                </tr>
+              </thead>
+              <tbody>
+                {rowsResp.rows.map((r, i) => (
+                  <tr key={(r["outcome_id"] as number) ?? i}>
+                    {orderedSelection.map((k) => (
+                      <td
+                        key={k}
+                        className="mono"
+                        title={r[k] === null || r[k] === undefined ? "" : String(r[k])}
+                      >
+                        {fmtCell(r[k])}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

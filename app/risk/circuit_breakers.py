@@ -39,12 +39,53 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.db.models import RiskState, Trade as TradeRow
+from app.db.models import RiskEvent, RiskState, Trade as TradeRow
 from app.logging_config import get_logger
 from app.risk import position_sizer
 from app.risk.market_clock import to_ist
 
 log = get_logger(__name__)
+
+# Breaker-history event types (risk_events rows) — the answer to "WHY is
+# the bot halted?" after the fact. GET /api/risk/breaker-history reads
+# them back; keep the BREAKER_ prefix stable, it's the query key.
+BREAKER_EVENT_TYPES = {
+    "daily_loss": "BREAKER_DAILY_LOSS",
+    "monthly_drawdown": "BREAKER_MONTHLY_DRAWDOWN",
+    "weekly_loss": "BREAKER_WEEKLY_LOSS",
+    "consecutive_losers": "BREAKER_CONSECUTIVE_LOSERS",
+    "manual_kill": "BREAKER_MANUAL_KILL",
+    "resumed": "BREAKER_RESUMED",
+}
+
+
+def _record_breaker_event(
+    session: Session,
+    kind: str,
+    *,
+    message: str,
+    threshold_value: Optional[float] = None,
+    current_value: Optional[float] = None,
+    action_taken: str = "",
+    halted: bool = False,
+    extra: Optional[dict[str, Any]] = None,
+) -> None:
+    """One risk_events row per breaker trip / resume — the persistent
+    audit trail behind the breaker-history API."""
+    session.add(
+        RiskEvent(
+            event_type=BREAKER_EVENT_TYPES.get(kind, f"BREAKER_{kind.upper()}"),
+            severity="critical" if halted else "warning",
+            message=message,
+            context={
+                "threshold_value": threshold_value,
+                "current_value": current_value,
+                "action_taken": action_taken,
+                **(extra or {}),
+            },
+            halted=halted,
+        )
+    )
 
 # Disabled-reason tags — used to decide which calendar rollover clears
 # the halt (a daily breach clears next day; monthly next month; a manual
@@ -181,27 +222,68 @@ def evaluate_breakers(
 
     # ---- daily loss ---------------------------------------------------
     if state.day_start_equity and not state.trading_disabled:
-        if _pct_drop(state.day_start_equity, equity) >= settings.DAILY_MAX_LOSS_PCT:
+        day_drop = _pct_drop(state.day_start_equity, equity)
+        if day_drop >= settings.DAILY_MAX_LOSS_PCT:
             state.trading_disabled = True
             state.disabled_reason = REASON_DAILY
             flatten_required = True
             newly.append("daily_loss")
+            _record_breaker_event(
+                session, "daily_loss",
+                message=(
+                    f"daily loss {day_drop:.2f}% >= "
+                    f"{settings.DAILY_MAX_LOSS_PCT:.2f}% — trading halted, "
+                    "positions flattened (clears next IST day)"
+                ),
+                threshold_value=float(settings.DAILY_MAX_LOSS_PCT),
+                current_value=round(day_drop, 3),
+                action_taken="halt + flatten",
+                halted=True,
+                extra={"equity": round(equity, 2)},
+            )
 
     # ---- monthly drawdown --------------------------------------------
     if state.month_start_equity and state.disabled_reason != REASON_MONTHLY:
-        if _pct_drop(state.month_start_equity, equity) >= settings.MONTHLY_MAX_DRAWDOWN_PCT:
+        month_drop = _pct_drop(state.month_start_equity, equity)
+        if month_drop >= settings.MONTHLY_MAX_DRAWDOWN_PCT:
             state.trading_disabled = True
             state.disabled_reason = REASON_MONTHLY
             flatten_required = True
             newly.append("monthly_drawdown")
+            _record_breaker_event(
+                session, "monthly_drawdown",
+                message=(
+                    f"monthly drawdown {month_drop:.2f}% >= "
+                    f"{settings.MONTHLY_MAX_DRAWDOWN_PCT:.2f}% — trading "
+                    "halted, positions flattened (clears next month)"
+                ),
+                threshold_value=float(settings.MONTHLY_MAX_DRAWDOWN_PCT),
+                current_value=round(month_drop, 3),
+                action_taken="halt + flatten + force paper",
+                halted=True,
+                extra={"equity": round(equity, 2)},
+            )
 
     # ---- weekly loss -> throttle risk --------------------------------
     if state.week_peak_equity:
-        if _pct_drop(state.week_peak_equity, equity) >= settings.WEEKLY_MAX_LOSS_PCT:
+        week_drop = _pct_drop(state.week_peak_equity, equity)
+        if week_drop >= settings.WEEKLY_MAX_LOSS_PCT:
             throttle = float(settings.WEEKLY_BREACH_RISK_PCT)
             if state.current_risk_pct is None or state.current_risk_pct > throttle:
                 state.current_risk_pct = throttle
                 newly.append("weekly_loss")
+                _record_breaker_event(
+                    session, "weekly_loss",
+                    message=(
+                        f"weekly loss {week_drop:.2f}% >= "
+                        f"{settings.WEEKLY_MAX_LOSS_PCT:.2f}% — per-trade "
+                        f"risk throttled to {throttle:.2f}%"
+                    ),
+                    threshold_value=float(settings.WEEKLY_MAX_LOSS_PCT),
+                    current_value=round(week_drop, 3),
+                    action_taken=f"throttle risk to {throttle:.2f}%",
+                    extra={"equity": round(equity, 2)},
+                )
 
     # ---- consecutive losers -> cooldown ------------------------------
     losers = trailing_consecutive_losers(session)
@@ -214,6 +296,20 @@ def evaluate_breakers(
                 minutes=int(settings.CONSECUTIVE_LOSER_PAUSE_MINUTES)
             )
             newly.append("consecutive_losers")
+            _record_breaker_event(
+                session, "consecutive_losers",
+                message=(
+                    f"{losers} consecutive losers >= "
+                    f"{settings.MAX_CONSECUTIVE_LOSERS} — cooldown for "
+                    f"{settings.CONSECUTIVE_LOSER_PAUSE_MINUTES} minutes"
+                ),
+                threshold_value=float(settings.MAX_CONSECUTIVE_LOSERS),
+                current_value=float(losers),
+                action_taken=(
+                    f"pause until {state.halted_until.isoformat()}"
+                ),
+                extra={"equity": round(equity, 2)},
+            )
 
     state.updated_at = _utcnow()
     session.commit()
@@ -281,6 +377,12 @@ def trip_manual_kill(session: Session, *, reason: str = REASON_MANUAL) -> RiskSt
     state.trading_disabled = True
     state.disabled_reason = reason
     state.updated_at = _utcnow()
+    _record_breaker_event(
+        session, "manual_kill",
+        message=f"manual kill switch engaged ({reason})",
+        action_taken="halt until explicit resume",
+        halted=True,
+    )
     session.commit()
     log.warning("circuit_breaker.manual_kill", reason=reason)
     return state
@@ -289,10 +391,16 @@ def trip_manual_kill(session: Session, *, reason: str = REASON_MANUAL) -> RiskSt
 def clear_halt(session: Session) -> RiskState:
     """Resume: clear any disable + cooldown (operator action)."""
     state = get_or_create_state(session)
+    was_reason = state.disabled_reason
     state.trading_disabled = False
     state.disabled_reason = None
     state.halted_until = None
     state.updated_at = _utcnow()
+    _record_breaker_event(
+        session, "resumed",
+        message=f"trading resumed by operator (was: {was_reason or 'cooldown'})",
+        action_taken="halt + cooldown cleared",
+    )
     session.commit()
     log.info("circuit_breaker.resumed")
     return state

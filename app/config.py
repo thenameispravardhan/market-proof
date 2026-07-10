@@ -206,6 +206,75 @@ class Settings(BaseSettings):
     # timeout the attempt is NEVER retried (duplicate-order risk).
     ENTRY_FILL_TIMEOUT_SECONDS: float = 2.0
     BROKER_ORDER_TIMEOUT_SECONDS: float = 3.0
+    # §5c Exit execution (TradeManager → broker). Live exits go out as a
+    # marketable limit (bid/ask ∓ EXIT_BUFFER_PCT); anything unfilled at
+    # EXIT_FILL_TIMEOUT is cancelled and chased with a MARKET order. A
+    # rejected exit retries at market up to EXIT_RETRY_MAX times; a
+    # broker call that hangs past EXIT_BROKER_TIMEOUT gets ONE market
+    # retry, then the position is flagged critical for the operator
+    # (system.error → Telegram) and re-tried on the next cycle.
+    EXIT_BUFFER_PCT: float = 0.2
+    EXIT_FILL_TIMEOUT_SECONDS: float = 2.0
+    EXIT_BROKER_TIMEOUT_SECONDS: float = 3.0
+    EXIT_RETRY_MAX: int = 3
+    # §3b Exit rules (TradeManager). Breakeven: once profit reaches
+    # BREAKEVEN_AT_PCT, lock the stop at entry ± BREAKEVEN_LOCK_PCT so a
+    # winner can no longer turn into a loser. Consolidation: profit in
+    # [min, max] band with the price pinned inside CONSOLIDATION_RANGE_PCT
+    # for the whole window → take the small profit, free the capital.
+    # Stall: a bigger winner whose rate-of-change collapses below
+    # STALL_ROC_PCT over the window → capture before the reversion.
+    BREAKEVEN_ENABLED: bool = True
+    BREAKEVEN_AT_PCT: float = 2.0
+    BREAKEVEN_LOCK_PCT: float = 0.2
+    CONSOLIDATION_EXIT_ENABLED: bool = True
+    CONSOLIDATION_WINDOW_SECONDS: int = 120
+    CONSOLIDATION_RANGE_PCT: float = 0.5
+    CONSOLIDATION_MIN_PROFIT_PCT: float = 1.0
+    CONSOLIDATION_MAX_PROFIT_PCT: float = 2.5
+    STALL_EXIT_ENABLED: bool = True
+    STALL_WINDOW_SECONDS: int = 90
+    STALL_ROC_PCT: float = 0.3
+    STALL_MIN_PROFIT_PCT: float = 3.0
+    STALL_MAX_PROFIT_PCT: float = 6.0
+    # Realtime exit safety: price-triggered exits (stop / target / trail /
+    # consolidation / stall) only fire on a LIVE tick younger than
+    # STALE_QUOTE_SECONDS — a frozen feed must never fire an exit at a
+    # stale price (time-based exits still run). Position reconciliation
+    # compares the broker's book with ours every
+    # POSITION_RECONCILE_SECONDS and marks externally-closed positions
+    # CLOSED_EXTERNAL (manual square-off in the Fyers app, margin call).
+    STALE_QUOTE_SECONDS: float = 5.0
+    POSITION_RECONCILE_SECONDS: int = 60
+    # ---------- Performance-weighted sizer (app/risk/perf_sizer.py) ----
+    # Tier the per-trade risk %% on each event type's realised track
+    # record (win rate + avg R over the last LOOKBACK closed trades).
+    # Fail-safe: fewer than MIN_TRADES closed trades → the base
+    # MAX_CAPITAL_RISK_PCT applies unchanged. Demotion (LOW tier) needs
+    # only ONE weak metric; promotion (HIGH tier) needs BOTH strong.
+    PERF_SIZER_ENABLED: bool = True
+    PERF_SIZER_MIN_TRADES: int = 10
+    PERF_SIZER_LOOKBACK_TRADES: int = 200
+    PERF_SIZER_HIGH_WIN_RATE: float = 0.60
+    PERF_SIZER_HIGH_AVG_R: float = 1.5
+    PERF_SIZER_HIGH_RISK_PCT: float = 1.0
+    PERF_SIZER_LOW_WIN_RATE: float = 0.50
+    PERF_SIZER_LOW_AVG_R: float = 1.0
+    PERF_SIZER_LOW_RISK_PCT: float = 0.5
+    # ---------- Sentiment decay curve (target sizing vs news age) ------
+    # News alpha decays in seconds: the target multiple shrinks with the
+    # news age at ORDER time (the stop is never widened). <FULL_SECONDS →
+    # full RR; <PARTIAL_SECONDS → PARTIAL_MULT; older → STALE_MULT.
+    SENTIMENT_DECAY_ENABLED: bool = True
+    SENTIMENT_DECAY_FULL_SECONDS: float = 2.0
+    SENTIMENT_DECAY_PARTIAL_SECONDS: float = 5.0
+    SENTIMENT_DECAY_PARTIAL_MULT: float = 0.8
+    SENTIMENT_DECAY_STALE_MULT: float = 0.6
+    # ---------- Daily health report (app/services/health_report.py) ----
+    # Compiled just after the EOD square-off and pushed through every
+    # notification channel whose events filter includes "report".
+    HEALTH_REPORT_ENABLED: bool = True
+    HEALTH_REPORT_TIME_IST: str = "15:45"
     LLM_TIMEOUT_SECONDS: float = 12.0         # discard the opportunity past this
     # Hard cap on LLM completion tokens. Generation latency scales almost
     # linearly with output length, and a signal JSON needs only a few
@@ -272,6 +341,23 @@ class Settings(BaseSettings):
     # signal_outcomes. Pure telemetry — no trading influence — so it
     # defaults ON; it is the win-rate report and the future ML dataset.
     OUTCOME_LOGGER_ENABLED: bool = True
+    # ---------- Dataset builder (app/services/dataset_builder.py) ------
+    # Enriches every signal_outcomes row with 1-minute-candle reaction
+    # features + horizon targets once the reaction window has elapsed.
+    # Pure telemetry (no trading influence). HORIZON is the label
+    # horizon in minutes; FLAT_THRESHOLD is the |return| below which
+    # the horizon label is FLAT; SPIKE_THRESHOLD feeds the
+    # time-to-first-spike reaction-speed features. Rows older than
+    # MAX_AGE_DAYS are marked too_old instead of fetched (Fyers 1-min
+    # history is finite); PARTIAL/no-candle rows retry MAX_ATTEMPTS
+    # times before the builder stops trying.
+    DATASET_BUILDER_ENABLED: bool = True
+    DATASET_HORIZON_MINUTES: int = 15
+    DATASET_ENRICH_INTERVAL_SECONDS: float = 120.0
+    DATASET_FLAT_THRESHOLD_PCT: float = 0.3
+    DATASET_SPIKE_THRESHOLD_PCT: float = 1.0
+    DATASET_MAX_ATTEMPTS: int = 3
+    DATASET_MAX_AGE_DAYS: int = 30
     # Market session (IST, "HH:MM"). Entry window excludes the first
     # 15 min after open and the last 30 min before close; all intraday
     # positions are force-squared-off at SQUARE_OFF_TIME.

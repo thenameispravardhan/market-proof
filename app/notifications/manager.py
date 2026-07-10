@@ -56,6 +56,9 @@ CHANNELS = (
     ("trades.filled", "trade"),
     ("risk.halt", "risk_halt"),
     ("system.error", "error"),
+    # Daily health report (app/services/health_report.py) — operators
+    # opt in by adding "report" to a channel's events filter.
+    ("system.report", "report"),
 )
 
 RETRY_BACKOFFS_S = (0.0, 1.0, 2.0)  # 3 attempts total
@@ -166,11 +169,19 @@ def _render_error(payload: dict[str, Any]) -> tuple[str, str]:
     return f"ERROR: {where}", str(msg)
 
 
+def _render_report(payload: dict[str, Any]) -> tuple[str, str]:
+    """The daily health report arrives pre-formatted (subject + body)."""
+    subject = str(payload.get("subject") or "Daily health report")
+    body = str(payload.get("body") or "")
+    return subject, body
+
+
 RENDERERS: dict[str, Callable[[dict[str, Any]], tuple[str, str]]] = {
     "signal": _render_signal,
     "trade": _render_trade,
     "risk_halt": _render_risk_halt,
     "error": _render_error,
+    "report": _render_report,
 }
 
 

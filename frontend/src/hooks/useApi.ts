@@ -885,3 +885,267 @@ export function useCancelOrder() {
     },
   });
 }
+
+// ---- Observability: pipeline latency + outcomes + breaker history ----
+
+export interface LatencyStats {
+  count: number;
+  p50: number | null;
+  p95: number | null;
+  p99: number | null;
+  min: number | null;
+  max: number | null;
+}
+
+export interface PipelineLatency {
+  window: number;
+  counts: { total: number; fast_track: number; llm: number };
+  fast_track_pct: number | null;
+  latency: {
+    pdf_fetch_ms: LatencyStats;
+    pdf_extract_ms: LatencyStats;
+    llm_ms: LatencyStats;
+    total_ms: LatencyStats;
+  };
+  news_age_s_at_start: LatencyStats & {
+    histogram: { le: number | null; count: number }[];
+  };
+  deadline: {
+    blocked: number;
+    total_signals: number;
+    hit_rate_pct: number | null;
+  };
+  series: {
+    analysis_id: number;
+    created_at: string | null;
+    total_ms: number | null;
+    llm_ms: number | null;
+    track: "fast" | "llm";
+  }[];
+}
+
+export function usePipelineLatency(window = 100) {
+  return useQuery<PipelineLatency>({
+    queryKey: ["pipeline-latency", window],
+    queryFn: () => api.get(`/api/metrics/pipeline-latency?window=${window}`),
+    refetchInterval: 15000,
+  });
+}
+
+export interface OutcomeRow {
+  outcome_id: number;
+  signal_id: number | null;
+  symbol: string;
+  action: string;
+  event_type: string | null;
+  headline: string | null;
+  sentiment: string | null;
+  sentiment_score: number | null;
+  confidence: number | null;
+  price_at_signal: number | null;
+  price_5m: number | null;
+  price_30m: number | null;
+  move_5m_pct: number | null;
+  move_30m_pct: number | null;
+  ai_was_correct: boolean | null;
+  trade_taken: boolean;
+  signal_status: string | null;
+  note: string | null;
+  created_at: string | null;
+}
+
+export interface OutcomesSummary {
+  total: number;
+  by_event_type: {
+    event_type: string;
+    samples: number;
+    with_5m_data: number;
+    avg_move_5m_pct: number | null;
+    avg_move_30m_pct: number | null;
+    accuracy_5m_pct: number | null;
+    taken: number;
+    blocked: number;
+  }[];
+}
+
+export function useOutcomes(limit = 200, eventType?: string) {
+  const qs = eventType
+    ? `?limit=${limit}&event_type=${encodeURIComponent(eventType)}`
+    : `?limit=${limit}`;
+  return useQuery<OutcomeRow[]>({
+    queryKey: ["outcomes", limit, eventType ?? null],
+    queryFn: () => api.get(`/api/outcomes${qs}`),
+    refetchInterval: 30000,
+  });
+}
+
+export function useOutcomesSummary(limit = 1000) {
+  return useQuery<OutcomesSummary>({
+    queryKey: ["outcomes-summary", limit],
+    queryFn: () => api.get(`/api/outcomes/summary?limit=${limit}`),
+    refetchInterval: 30000,
+  });
+}
+
+// ---- Dataset (the ML training-set builder) ----
+
+export interface DatasetColumn {
+  key: string;
+  label: string;
+  category: string;
+  role: "meta" | "feature" | "target";
+  description: string;
+  source: string;
+}
+
+export interface DatasetColumns {
+  columns: DatasetColumn[];
+  presets: Record<string, string[]>;
+}
+
+export interface DatasetStats {
+  total_rows: number;
+  sources: { signal: number; shadow: number };
+  enrichment: Record<string, number>;
+  label_balance: Record<string, number>;
+  by_event_type: { event_type: string; samples: number }[];
+  first_row_at: string | null;
+  last_row_at: string | null;
+  column_count: number;
+}
+
+export interface DatasetRowsResponse {
+  total: number;
+  count: number;
+  rows: Record<string, unknown>[];
+}
+
+export interface DatasetFilters {
+  event_type?: string;
+  action?: string;
+  symbol?: string;
+  taken?: string;
+  label?: string;
+  enriched_only?: boolean;
+  source?: string; // all | signal | shadow
+  since?: string;
+  until?: string;
+}
+
+export function datasetQueryString(
+  filters: DatasetFilters,
+  columns?: string[],
+  extra?: Record<string, string | number>
+): string {
+  const params = new URLSearchParams();
+  for (const [k, v] of Object.entries(filters)) {
+    if (v !== undefined && v !== "" && v !== false) params.set(k, String(v));
+  }
+  if (columns && columns.length > 0) params.set("columns", columns.join(","));
+  for (const [k, v] of Object.entries(extra ?? {})) params.set(k, String(v));
+  return params.toString();
+}
+
+export function useDatasetColumns() {
+  return useQuery<DatasetColumns>({
+    queryKey: ["dataset-columns"],
+    queryFn: () => api.get("/api/dataset/columns"),
+    staleTime: Infinity, // the catalog is static per build
+  });
+}
+
+export function useDatasetStats() {
+  return useQuery<DatasetStats>({
+    queryKey: ["dataset-stats"],
+    queryFn: () => api.get("/api/dataset/stats"),
+    refetchInterval: 30000,
+  });
+}
+
+export function useDatasetRows(
+  filters: DatasetFilters,
+  columns: string[] | undefined,
+  limit = 50
+) {
+  const qs = datasetQueryString(filters, columns, { limit });
+  return useQuery<DatasetRowsResponse>({
+    queryKey: ["dataset-rows", qs],
+    queryFn: () => api.get(`/api/dataset?${qs}`),
+    refetchInterval: 30000,
+  });
+}
+
+export interface DatasetBackfillResult {
+  ok: boolean;
+  processed: number;
+  shadow: number;
+  complete: number;
+  partial: number;
+  no_candles: number;
+  too_old: number;
+  errors: number;
+}
+
+export interface DatasetHealthColumn {
+  key: string;
+  role: "meta" | "feature" | "target";
+  category: string;
+  null_rate: number | null;
+  numeric: boolean;
+  mean?: number;
+  std?: number;
+  min?: number;
+  max?: number;
+  corr_target?: number | null;
+  corr_n?: number;
+  leak_warning?: boolean;
+  distinct?: number;
+}
+
+export interface DatasetHealth {
+  target: string;
+  rows_sampled: number;
+  columns: DatasetHealthColumn[];
+}
+
+export function useDatasetHealth(target: string, enabled: boolean) {
+  return useQuery<DatasetHealth>({
+    queryKey: ["dataset-health", target],
+    queryFn: () =>
+      api.get(`/api/dataset/health?target=${encodeURIComponent(target)}`),
+    enabled,
+    refetchInterval: 60000,
+  });
+}
+
+export function useDatasetBackfill() {
+  const qc = useQueryClient();
+  return useMutation<DatasetBackfillResult, Error, number | undefined>({
+    mutationFn: (limit) =>
+      api.post(`/api/dataset/backfill?limit=${limit ?? 100}`, {}),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dataset-stats"] });
+      qc.invalidateQueries({ queryKey: ["dataset-rows"] });
+    },
+  });
+}
+
+export interface BreakerEvent {
+  id: number;
+  event_type: string;
+  severity: string;
+  message: string;
+  threshold_value: number | null;
+  current_value: number | null;
+  action_taken: string | null;
+  halted: boolean;
+  created_at: string | null;
+}
+
+export function useBreakerHistory(limit = 100) {
+  return useQuery<BreakerEvent[]>({
+    queryKey: ["breaker-history", limit],
+    queryFn: () => api.get(`/api/risk/breaker-history?limit=${limit}`),
+    refetchInterval: 30000,
+  });
+}

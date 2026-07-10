@@ -8,6 +8,8 @@ export type TabKey =
   | "dashboard"
   | "trade"
   | "trades"
+  | "outcomes"
+  | "dataset"
   | "prompts"
   | "rules"
   | "strategies"
@@ -21,6 +23,8 @@ const VALID_TABS = new Set<TabKey>([
   "dashboard",
   "trade",
   "trades",
+  "outcomes",
+  "dataset",
   "prompts",
   "rules",
   "strategies",

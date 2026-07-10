@@ -5,6 +5,7 @@
 
 import { NewsPipeline } from "../components/dashboard/NewsPipeline";
 import { ActivePositions } from "../components/dashboard/ActivePositions";
+import { PipelineLatency } from "../components/dashboard/PipelineLatency";
 import { PnLChart } from "../components/dashboard/PnLChart";
 import { RiskMetrics } from "../components/dashboard/RiskMetrics";
 import { AccountToggles } from "../components/dashboard/AccountToggles";
@@ -69,6 +70,7 @@ export default function Dashboard() {
         <NewsPipeline />
         <ActivePositions />
         <RiskMetrics />
+        <PipelineLatency />
         <PnLChart />
       </div>
     </div>

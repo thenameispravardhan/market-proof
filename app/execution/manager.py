@@ -538,11 +538,22 @@ class Manager:
                 # Warm the ATR cache (live Fyers candle provider) before we
                 # size the stop; no-op for the Null / paper providers.
                 await self._refresh_atr(signal.symbol)
+                # News age drives the sentiment decay curve: the older the
+                # news at order time, the smaller the target multiple.
+                news_age_s: Optional[float] = None
+                if filed_at is not None:
+                    fa = (
+                        filed_at
+                        if filed_at.tzinfo is not None
+                        else filed_at.replace(tzinfo=timezone.utc)
+                    )
+                    news_age_s = (datetime.now(timezone.utc) - fa).total_seconds()
                 stop_loss, target, rr, event_max_hold = self._derive_levels(
                     symbol=signal.symbol,
                     entry=entry,
                     action=signal.action,
                     event_type=event_type,
+                    news_age_seconds=news_age_s,
                 )
                 await asyncio.get_running_loop().run_in_executor(
                     None, _update_signal_levels,
@@ -583,7 +594,8 @@ class Manager:
             else:
                 stop_loss = float(entry) * 1.05
 
-        # Step 4: risk engine.
+        # Step 4: risk engine. `event_type` feeds the performance-weighted
+        # sizer (per-event-type risk tiering on realised results).
         decision = await self._risk.evaluate(
             signal=signal,
             strategy=strategy,
@@ -591,6 +603,7 @@ class Manager:
             entry=entry,
             stop_loss=stop_loss,
             target=target,
+            event_type=event_type,
         )
         if not decision.approved:
             code = decision.codes[0] if decision.codes else "RISK_BLOCKED"
@@ -1043,6 +1056,7 @@ class Manager:
         entry: float,
         action: str,
         event_type: Optional[str],
+        news_age_seconds: Optional[float] = None,
     ) -> tuple[float, float, float, int]:
         """Compute (stop_loss, target, rr, max_hold_seconds) for an entry.
 
@@ -1052,6 +1066,12 @@ class Manager:
         the ATR multiplier, the RR, and the hold window come from the
         per-event-type profile (`event_profiles`), which falls back to the
         global Settings for anything it doesn't override.
+
+        Sentiment decay curve: news alpha decays within seconds, so the
+        REWARD expectation shrinks with the news age at order time —
+        fresh (< FULL_SECONDS) keeps the full RR, then the partial and
+        stale multipliers cut the target. The STOP is never widened by
+        this; only the target comes in.
         """
         settings = self._settings_provider()
         profile = event_profiles.profile_for(event_type).resolved(settings)
@@ -1071,6 +1091,15 @@ class Manager:
             smallcap_pct=float(settings.DEFAULT_SL_SMALLCAP_PCT),
         )
         rr = float(profile.target_rr)
+        decay = self._sentiment_decay_multiplier(news_age_seconds, settings)
+        if decay < 1.0:
+            log.info(
+                "execution_manager.sentiment_decay",
+                symbol=symbol,
+                news_age_s=round(float(news_age_seconds or 0.0), 2),
+                rr_before=rr, multiplier=decay, rr_after=round(rr * decay, 3),
+            )
+            rr *= decay
         entry = float(entry)
         if str(action).upper() == "BUY":
             stop_loss = entry - dist
@@ -1081,6 +1110,31 @@ class Manager:
         # Guard a degenerate (sub-floor) entry from producing a <=0 stop.
         stop_loss = max(0.01, stop_loss)
         return (stop_loss, target, rr, int(profile.max_hold_seconds))
+
+    @staticmethod
+    def _sentiment_decay_multiplier(
+        news_age_seconds: Optional[float], settings: Settings
+    ) -> float:
+        """Target multiplier for the news age at order time.
+
+        < SENTIMENT_DECAY_FULL_SECONDS    → 1.0 (full target)
+        < SENTIMENT_DECAY_PARTIAL_SECONDS → SENTIMENT_DECAY_PARTIAL_MULT
+        otherwise                         → SENTIMENT_DECAY_STALE_MULT
+
+        Unknown age (no filed_at / tests) → 1.0: the decay only ever acts
+        on real information, never guesses.
+        """
+        if not bool(getattr(settings, "SENTIMENT_DECAY_ENABLED", True)):
+            return 1.0
+        if news_age_seconds is None or news_age_seconds < 0:
+            return 1.0
+        full_s = float(getattr(settings, "SENTIMENT_DECAY_FULL_SECONDS", 2.0))
+        partial_s = float(getattr(settings, "SENTIMENT_DECAY_PARTIAL_SECONDS", 5.0))
+        if news_age_seconds < full_s:
+            return 1.0
+        if news_age_seconds < partial_s:
+            return float(getattr(settings, "SENTIMENT_DECAY_PARTIAL_MULT", 0.8))
+        return float(getattr(settings, "SENTIMENT_DECAY_STALE_MULT", 0.6))
 
     async def _refresh_atr(self, symbol: str) -> None:
         """Warm the ATR cache for `symbol` before sizing (async path).
@@ -1266,6 +1320,32 @@ class Manager:
         """Drop the cached backend for an account (e.g. after the
         Fyers OAuth callback rotates the access_token)."""
         self._backends.pop(int(broker_account_id), None)
+
+    async def exit_backend_for_account(
+        self, broker_account_id: Optional[int]
+    ) -> Optional[TradingBackend]:
+        """Resolve the LIVE backend a TradeManager exit must route
+        through, or None when the position belongs to a paper account /
+        paper mode (the TradeManager then settles directly — the bot IS
+        the paper broker). Pre-seeded backends (test stubs) win, same as
+        `_backend_for`."""
+        if broker_account_id is None:
+            return None
+        cached = self._backends.get(int(broker_account_id))
+        if cached is not None and cached is not self._paper and not isinstance(
+            cached, PaperBackend
+        ):
+            return cached
+        account = await asyncio.get_running_loop().run_in_executor(
+            None, _load_account, self._session_factory, int(broker_account_id)
+        )
+        if account is None:
+            return None
+        settings = self._settings_provider()
+        if bool(getattr(account, "paper_mode", True)) or settings.is_paper:
+            return None
+        backend = self._backend_for(account)
+        return None if backend is self._paper else backend
 
     def register_backend(self, broker_account_id: int, backend: TradingBackend) -> None:
         """Inject a backend (e.g. a stub for tests)."""
@@ -1795,6 +1875,13 @@ class Manager:
 
 
 # ---- DB helpers (sync, run in executor) --------------------------------
+
+
+def _load_account(
+    session_factory: Callable[[], Session], account_id: int
+) -> Optional[BrokerAccount]:
+    with session_factory() as session:
+        return session.get(BrokerAccount, account_id)
 
 
 def _load_signal_context(

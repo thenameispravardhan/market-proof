@@ -63,6 +63,8 @@ _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("thinking_enabled", "BOOLEAN DEFAULT 0"),
         ("stream", "BOOLEAN DEFAULT 0"),
     ],
+    # Shadow-row support (analyzed announcements that never signaled).
+    "dataset_features": [("announcement_id", "INTEGER")],
 }
 
 

@@ -25,13 +25,16 @@ from app.api import (
     backtest,
     broker_accounts as broker_accounts_api,
     core as core_api,
+    dataset as dataset_api,
     fyers_callback,
     fyers_postback,
     health,
     market as market_api,
+    metrics as metrics_api,
     notifications as notifications_api,
     options as options_api,
     orders as orders_api,
+    outcomes as outcomes_api,
     positions as positions_api,
     prompts as prompts_api,
     risk as risk_api,
@@ -135,6 +138,14 @@ async def lifespan(app: FastAPI):
     # signal, +5m, +30m). Pure telemetry — no trading influence.
     from app.services.outcome_logger import OutcomeLogger
     outcome_logger = OutcomeLogger()
+    # Dataset builder: enriches each signal_outcomes row with 1-minute
+    # candle reaction features + horizon targets once the reaction
+    # window has elapsed. Passive telemetry; exposed on app.state so
+    # POST /api/dataset/backfill reuses the same instance (its run lock
+    # keeps the periodic loop and manual backfills from overlapping).
+    from app.services.dataset_builder import DatasetBuilder
+    dataset_builder = DatasetBuilder()
+    app.state.dataset_builder = dataset_builder
     # Quote feed + trade manager share the execution manager's market
     # data bus and paper backend so entries, exits and P&L all see the
     # same prices.
@@ -183,6 +194,25 @@ async def lifespan(app: FastAPI):
         paper_backend=execution_manager.paper_backend,
     )
     execution_manager.attach_quote_feed(quote_feed)
+    # Exit routing: LIVE positions flatten at the broker (marketable
+    # limit → market fallback) before settling locally; paper settles
+    # directly. The reconciliation loop compares the Fyers book with the
+    # managed book so manual closes in the Fyers app / margin-call
+    # square-offs surface as CLOSED_EXTERNAL instead of ghost positions.
+    trade_manager.attach_exit_router(execution_manager.exit_backend_for_account)
+
+    async def _live_positions():
+        from app.api.market import _fyers_backend
+
+        b = _fyers_backend()
+        if b is None:
+            return None
+        try:
+            return await b.get_positions()
+        except Exception:  # noqa: BLE001
+            return None
+
+    trade_manager.attach_live_positions_provider(_live_positions)
     # Live volatility feeds (Phase 5): ATR from Fyers history candles and
     # India VIX from the index quote, both fail-safe. Until a Fyers account
     # is connected the fetches return empty/None and the risk layer falls
@@ -301,6 +331,19 @@ async def lifespan(app: FastAPI):
         webhook_dispatcher.start()
         # Phase 4 outcome logger — subscribe before signals start flowing.
         outcome_logger.start()
+        # Dataset builder — periodic 1-min-candle enrichment batches.
+        dataset_builder.start()
+        # Daily health report — fires once per IST day at
+        # HEALTH_REPORT_TIME_IST (default 15:45) on the `system.report`
+        # channel; operators subscribe a notification channel with the
+        # "report" event type. No-op under TESTING.
+        from app.services.health_report import HealthReportService
+
+        health_report_service = HealthReportService(
+            market_data=execution_manager.market_data
+        )
+        health_report_service.start()
+        app.state.health_report_service = health_report_service
 
         # Portfolio circuit-breaker monitor (RISK.md §4): periodically
         # rolls the day/week/month equity anchors, trips the daily /
@@ -353,6 +396,10 @@ async def lifespan(app: FastAPI):
             notification_manager.stop()
             webhook_dispatcher.stop()
             outcome_logger.stop()
+            dataset_builder.stop()
+            health_report_service.stop()
+            await dataset_builder.wait_until_stopped()
+            await health_report_service.wait_until_stopped()
             await analyzer_service.wait_until_stopped()
             await fyers_stream.wait_until_stopped()
             await trade_manager.wait_until_stopped()
@@ -447,6 +494,9 @@ app.include_router(core_api.router)
 app.include_router(orders_api.router)
 app.include_router(search_api.router)
 app.include_router(options_api.router)
+app.include_router(metrics_api.router)
+app.include_router(outcomes_api.router)
+app.include_router(dataset_api.router)
 
 
 # -------------------------------------------------------------------------

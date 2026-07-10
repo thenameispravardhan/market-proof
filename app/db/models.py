@@ -201,6 +201,50 @@ class SignalOutcome(Base):
 
 
 # =========================================================================
+# Core: dataset features (the ML training-set enrichment per signal)
+# =========================================================================
+#
+# Written by app/services/dataset_builder.py: once a signal's reaction
+# window has fully elapsed, the builder fetches 1-minute Fyers candles
+# around the signal time and computes the price-trajectory features
+# (T+1..T+5 — safe to use as model inputs) and the horizon targets
+# (T+15 high/close/drawdown — training labels ONLY, using them as
+# features is look-ahead bias). Everything lands in the `features`
+# JSON blob so new feature keys never need a schema migration; the
+# /api/dataset column catalog documents each key's feature-vs-target
+# role.
+
+
+class DatasetFeature(Base):
+    __tablename__ = "dataset_features"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Loose references (no FK) — like signal_outcomes, this is training
+    # telemetry and must survive source rows being pruned.
+    # Two row sources share this table:
+    #   signal rows — outcome_id set (one per signal_outcomes row)
+    #   shadow rows — outcome_id NULL, announcement_id set: analyzed
+    #     filings that never produced a signal (noise-filtered, HOLD,
+    #     stale). These are the NEGATIVE examples a materiality
+    #     pre-filter model trains on.
+    outcome_id: Mapped[Optional[int]] = mapped_column(Integer, unique=True, index=True)
+    announcement_id: Mapped[Optional[int]] = mapped_column(Integer, index=True)
+    signal_id: Mapped[Optional[int]] = mapped_column(Integer, index=True)
+    symbol: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    signal_time: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    # complete | partial (early candles but no horizon candle — e.g. a
+    # signal near market close) | no_candles | too_old | error
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    features: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
+    note: Mapped[Optional[str]] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
+# =========================================================================
 # Core: trades (executed orders)
 # =========================================================================
 
@@ -594,6 +638,7 @@ __all__ = [
     "Announcement",
     "Analysis",
     "Signal",
+    "DatasetFeature",
     "Trade",
     "Position",
     "RiskEvent",

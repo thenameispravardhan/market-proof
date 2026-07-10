@@ -81,7 +81,7 @@ from app.db.models import (
     Trade as TradeRow,
 )
 from app.logging_config import get_logger
-from app.risk import position_sizer, volatility
+from app.risk import perf_sizer, position_sizer, volatility
 
 # Type-only import — `MarketDataBus` is used solely in annotations here
 # (the engine reads `self._md._quotes` off the injected instance). With
@@ -264,8 +264,14 @@ class RiskEngine:
         target: Optional[float] = None,
         session: Optional[Session] = None,
         manual_qty: Optional[int] = None,
+        event_type: Optional[str] = None,
     ) -> RiskDecision:
         """Run the full risk check on a signal.
+
+        `event_type` (the originating announcement's event class) feeds
+        the performance-weighted sizer — the per-trade risk %% tiers on
+        the event type's realised track record when enough closed trades
+        exist (PERF_SIZER_*). Absent → the base risk %% applies.
 
         `signal` is the ORM row (we read .action, .symbol,
         .strategy_id, .confidence, .position_size_pct, .rationale,
@@ -298,6 +304,7 @@ class RiskEngine:
                 target=target,
                 session=session,
                 manual_qty=manual_qty,
+                event_type=event_type,
             )
         loop = asyncio.get_running_loop()
         from app.db.session import SessionLocal
@@ -315,6 +322,7 @@ class RiskEngine:
                 target=target,
                 session=factory(),
                 manual_qty=manual_qty,
+                event_type=event_type,
             ),
         )
 
@@ -329,6 +337,7 @@ class RiskEngine:
         target: Optional[float],
         session: Session,
         manual_qty: Optional[int] = None,
+        event_type: Optional[str] = None,
     ) -> RiskDecision:
         settings = get_settings()
         overrides = StrategyOverrides.from_strategy(strategy)
@@ -442,6 +451,42 @@ class RiskEngine:
             else:
                 stop_loss = float(entry) * 1.05
 
+        # ---- R0b. direction-aware stop sanity ---------------------------
+        # A stop at the entry has zero distance (risk undefined → can't
+        # size); a stop on the WRONG side of the entry (above entry for a
+        # BUY, below for a SELL) would trigger instantly / never protect.
+        # Both are malformed signals that must be rejected, not "fixed".
+        if abs(float(entry) - float(stop_loss)) < 1e-9:
+            violations.append({
+                "code": "RISK_INVALID_STOP_DISTANCE",
+                "message": (
+                    f"stop_loss {float(stop_loss):.2f} equals entry "
+                    f"{float(entry):.2f}; zero risk distance cannot be sized."
+                ),
+                "severity": "critical",
+            })
+            return RiskDecision(approved=False, violations=violations, context=context)
+        if action == "BUY" and float(stop_loss) > float(entry):
+            violations.append({
+                "code": "RISK_STOP_ABOVE_ENTRY",
+                "message": (
+                    f"BUY stop_loss {float(stop_loss):.2f} is above entry "
+                    f"{float(entry):.2f}; it would trigger immediately."
+                ),
+                "severity": "critical",
+            })
+            return RiskDecision(approved=False, violations=violations, context=context)
+        if action == "SELL" and float(stop_loss) < float(entry):
+            violations.append({
+                "code": "RISK_STOP_BELOW_ENTRY",
+                "message": (
+                    f"SELL stop_loss {float(stop_loss):.2f} is below entry "
+                    f"{float(entry):.2f}; it would trigger immediately."
+                ),
+                "severity": "critical",
+            })
+            return RiskDecision(approved=False, violations=violations, context=context)
+
         # ---- compute qty -------------------------------------------------
         # Equity is a real ledger now (capital + realised + unrealised),
         # not gross open exposure. An explicit `portfolio_value` override
@@ -484,6 +529,18 @@ class RiskEngine:
             if overrides.max_capital_risk_pct is not None
             else settings.MAX_CAPITAL_RISK_PCT
         )
+        # Performance-weighted sizer: tier the base risk %% on the event
+        # type's realised track record (win rate + avg R over the last N
+        # closed trades). Fail-safe — not enough data / no event type /
+        # disabled → cap_pct unchanged. Applied BEFORE the ramp, weekly
+        # throttle and VIX multiplier, so every protective clamp still
+        # stacks on top. Manual orders (no event type) are never tiered.
+        if manual_qty is None:
+            cap_pct, perf_ctx = perf_sizer.performance_risk_pct(
+                session, event_type, cap_pct, settings
+            )
+            if perf_ctx is not None:
+                context["perf_sizer"] = perf_ctx
         # High-VIX risk throttle (fail-safe): None VIX → 1.0× (no-op). When
         # the India-VIX feed is wired this shrinks the per-trade risk % in a
         # volatile regime. Sizing only — conviction is untouched.

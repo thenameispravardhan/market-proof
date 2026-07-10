@@ -31,6 +31,8 @@ function readSidebarOpen(): boolean {
 const Dashboard = lazy(() => import("./pages/Dashboard"));
 const Trade = lazy(() => import("./pages/Trade"));
 const TradeHistory = lazy(() => import("./pages/TradeHistory"));
+const Outcomes = lazy(() => import("./pages/Outcomes"));
+const Dataset = lazy(() => import("./pages/Dataset"));
 const Prompts = lazy(() => import("./pages/Prompts"));
 const Rules = lazy(() => import("./pages/Rules"));
 const Strategies = lazy(() => import("./pages/Strategies"));
@@ -44,6 +46,8 @@ const TABS: { key: TabKey; label: string; emoji: string; group: "MAIN" | "OPS" |
   { key: "dashboard",      label: "Dashboard",      emoji: "▤", group: "MAIN" },
   { key: "trade",          label: "Trade",          emoji: "▶", group: "MAIN" },
   { key: "trades",         label: "Trade History",  emoji: "₹", group: "MAIN" },
+  { key: "outcomes",       label: "Outcomes",       emoji: "◎", group: "MAIN" },
+  { key: "dataset",        label: "Dataset",        emoji: "▥", group: "MAIN" },
   { key: "prompts",        label: "Prompts",        emoji: "✎", group: "MAIN" },
   { key: "rules",          label: "Rules",          emoji: "≡", group: "MAIN" },
   { key: "strategies",     label: "Strategies",     emoji: "◈", group: "MAIN" },
@@ -59,6 +63,8 @@ function PageContent({ tab }: { tab: TabKey }) {
     case "dashboard": return <Dashboard />;
     case "trade": return <Trade />;
     case "trades": return <TradeHistory />;
+    case "outcomes": return <Outcomes />;
+    case "dataset": return <Dataset />;
     case "prompts": return <Prompts />;
     case "rules": return <Rules />;
     case "strategies": return <Strategies />;

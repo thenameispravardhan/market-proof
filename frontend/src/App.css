@@ -476,6 +476,23 @@ body {
   padding: 8px 12px 4px;
 }
 
+/* Pipeline Latency tile: dense stat grid + sparkline. */
+.lat-body { padding: 8px 12px 10px; }
+.lat-stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px 12px;
+  margin-bottom: 8px;
+}
+.lat-stat { display: flex; justify-content: space-between; gap: 8px; }
+.lat-label {
+  font-size: 10px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.lat-warn { color: #d29922; }
+
 .widgets {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));

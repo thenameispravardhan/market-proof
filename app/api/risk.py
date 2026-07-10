@@ -55,6 +55,45 @@ def risk_state(request: Request, db: Session = Depends(get_db)) -> dict[str, Any
     return _state_snapshot(db, request)
 
 
+@router.get("/breaker-history")
+def breaker_history(
+    limit: int = 100, db: Session = Depends(get_db)
+) -> list[dict[str, Any]]:
+    """Every circuit-breaker trip / manual kill / resume, newest first —
+    the persistent answer to "WHY was the bot halted?". Each row carries
+    the threshold that tripped, the value at trip time, and the action
+    taken (halt / flatten / throttle / cooldown)."""
+    from sqlalchemy import select
+
+    from app.db.models import RiskEvent
+
+    limit = max(1, min(int(limit), 500))
+    rows = (
+        db.execute(
+            select(RiskEvent)
+            .where(RiskEvent.event_type.like("BREAKER_%"))
+            .order_by(RiskEvent.id.desc())
+            .limit(limit)
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        {
+            "id": r.id,
+            "event_type": r.event_type,
+            "severity": r.severity,
+            "message": r.message,
+            "threshold_value": (r.context or {}).get("threshold_value"),
+            "current_value": (r.context or {}).get("current_value"),
+            "action_taken": (r.context or {}).get("action_taken"),
+            "halted": r.halted,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
+
+
 @router.post("/kill")
 async def kill_switch(request: Request, db: Session = Depends(get_db)) -> dict[str, Any]:
     """Engage the kill switch: flatten everything + disable trading."""
