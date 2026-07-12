@@ -552,6 +552,18 @@ class DatasetBuilder:
         # Full-history backfill (run_full) task + live progress snapshot.
         self._full_task: Optional[asyncio.Task[None]] = None
         self.backfill_progress: dict[str, Any] = {"running": False}
+        # Live-collector heartbeat: proof the continuous 2-min enrichment
+        # loop is alive. Surfaced by /api/dataset/backfill/status so the
+        # Dataset page can show "collector active, last ran Ns ago, +N rows".
+        self.collector: dict[str, Any] = {
+            "running": False,
+            "last_run_at": None,
+            "next_run_at": None,
+            "interval_s": None,
+            "runs": 0,
+            "enriched_session": 0,   # complete + partial rows added this session
+            "last_counts": {},
+        }
         # (monotonic_ts, counts) cache for count_pending — status polls
         # must never turn into a query-per-poll load.
         self._pending_cache: Optional[tuple[float, dict[str, int]]] = None
@@ -583,24 +595,38 @@ class DatasetBuilder:
 
     async def _run(self) -> None:
         log.info("dataset_builder.start")
+        self.collector["running"] = True
         try:
             while not self._stop_event.is_set():
                 settings = get_settings()
                 interval = max(
                     10.0, float(getattr(settings, "DATASET_ENRICH_INTERVAL_SECONDS", 120.0))
                 )
+                self.collector["interval_s"] = interval
+                self.collector["next_run_at"] = (
+                    _utcnow_naive() + timedelta(seconds=interval)
+                ).isoformat()
                 try:
                     await asyncio.wait_for(self._stop_event.wait(), timeout=interval)
                     return
                 except asyncio.TimeoutError:
                     pass
                 if not bool(getattr(settings, "DATASET_BUILDER_ENABLED", True)):
+                    self.collector["last_counts"] = {"disabled": True}
                     continue
                 try:
-                    await self.run_once()
+                    counts = await self.run_once()
+                    self.collector["runs"] += 1
+                    self.collector["last_run_at"] = _utcnow_naive().isoformat()
+                    self.collector["last_counts"] = counts
+                    self.collector["enriched_session"] += (
+                        counts.get("complete", 0) + counts.get("partial", 0)
+                    )
                 except Exception:  # noqa: BLE001
                     log.exception("dataset_builder.batch_failed")
         finally:
+            self.collector["running"] = False
+            self.collector["next_run_at"] = None
             log.info("dataset_builder.stop")
 
     # -- one enrichment batch ----------------------------------------------

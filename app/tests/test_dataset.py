@@ -399,6 +399,18 @@ async def test_run_full_backfills_everything(db_session, isolated_db):
     assert builder.count_pending() == {"signal": 0, "shadow": 0}
 
 
+def test_backfill_status_exposes_collector(client, db_session, isolated_db):
+    # The status endpoint carries the live-collector heartbeat so the UI
+    # can prove the continuous stream is running.
+    r = client.get("/api/dataset/backfill/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert "collector" in body
+    c = body["collector"]
+    for k in ("running", "runs", "enriched_session", "interval_s", "last_run_at"):
+        assert k in c
+
+
 @pytest.mark.asyncio
 async def test_rebuild_re_enriches_stale_schema_rows(db_session, isolated_db):
     from app.services.dataset_builder import FEATURES_VERSION

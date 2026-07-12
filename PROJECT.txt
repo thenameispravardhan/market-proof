@@ -58,7 +58,13 @@ look-ahead targets ("trajectory" column category). Feature-schema is
 versioned (features_version, FEATURES_VERSION const): POST
 /api/dataset/backfill?rebuild=true re-enriches already-complete rows whose
 schema predates the current version ("Rebuild schema" button), so a new
-feature set rolls over the whole history without a wipe.
+feature set rolls over the whole history without a wipe. The continuous
+collector (the periodic 2-min DatasetBuilder loop that auto-enriches every
+new signal ~16 min after it fires) now publishes a live HEARTBEAT
+(builder.collector → /api/dataset/backfill/status) — running flag, last-run
+time, next-run ETA, session run count and rows-added — surfaced as a "LIVE
+COLLECTOR ACTIVE" card on the Dataset page so the always-on stream is
+visible and verifiable.
 Also 2026-07-10: the TRADE PAGE wave — full TradingView-style interactive
 charting (lightweight-charts v5, 7 timeframes, 4 chart types, 9 overlays
 incl. SMA/EMA/VWAP/Bollinger/Supertrend/Ichimoku, 9 oscillators incl. RSI/

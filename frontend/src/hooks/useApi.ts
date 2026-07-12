@@ -1103,9 +1103,20 @@ export interface DatasetBackfillProgress {
   finished_at?: string | null;
 }
 
+export interface DatasetCollector {
+  running: boolean;
+  last_run_at: string | null;
+  next_run_at: string | null;
+  interval_s: number | null;
+  runs: number;
+  enriched_session: number;
+  last_counts: Record<string, number | boolean>;
+}
+
 export interface DatasetBackfillStatus {
   progress: DatasetBackfillProgress;
   remaining: { signal: number; shadow: number };
+  collector?: DatasetCollector;
 }
 
 export function useDatasetBackfillStatus() {

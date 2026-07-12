@@ -958,4 +958,8 @@ async def dataset_backfill_status(request: Request) -> dict[str, Any]:
         remaining = await asyncio.get_running_loop().run_in_executor(
             None, builder.count_pending_cached
         )
-    return {"progress": progress, "remaining": remaining}
+    return {
+        "progress": progress,
+        "remaining": remaining,
+        "collector": dict(builder.collector),
+    }

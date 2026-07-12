@@ -54,6 +54,26 @@ const HEALTH_TARGETS = [
   "r_multiple",
 ];
 
+function agoText(iso: string | null | undefined): string {
+  if (!iso) return "never";
+  const t = new Date(iso.endsWith("Z") ? iso : iso + "Z").getTime();
+  if (Number.isNaN(t)) return "—";
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.round(s / 60)}m ago`;
+  return `${Math.round(s / 3600)}h ago`;
+}
+
+function inText(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const t = new Date(iso.endsWith("Z") ? iso : iso + "Z").getTime();
+  if (Number.isNaN(t)) return "—";
+  const s = Math.round((t - Date.now()) / 1000);
+  if (s <= 0) return "due now";
+  if (s < 60) return `in ${s}s`;
+  return `in ${Math.round(s / 60)}m`;
+}
+
 function loadSavedColumns(): string[] | null {
   try {
     const raw = localStorage.getItem(COLUMNS_KEY);
@@ -257,6 +277,49 @@ export default function Dataset() {
           </label>
         </div>
       </div>
+
+      {/* Live collector heartbeat — proof the continuous 2-min stream is on */}
+      {(() => {
+        const c = backfillStatus?.collector;
+        const on = c?.running ?? false;
+        return (
+          <div
+            className="widget widget-wide"
+            style={{
+              marginBottom: 12,
+              padding: "8px 14px",
+              display: "flex",
+              alignItems: "center",
+              gap: 12,
+              flexWrap: "wrap",
+            }}
+            data-testid="dataset-collector"
+          >
+            <span
+              className={`ws-status ${on ? "connected" : "disconnected"}`}
+              title={on ? "Auto-collector is running" : "Auto-collector is stopped"}
+              style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+            >
+              <span className="dot" />
+              <span className="mono" style={{ fontSize: 12 }}>
+                LIVE COLLECTOR {on ? "ACTIVE" : "OFF"}
+              </span>
+            </span>
+            <span className="meta">
+              {on
+                ? `every ${Math.round(c?.interval_s ?? 120)}s — new signals auto-fill with all fields ~16 min after firing`
+                : "not running (restart the bot to start the continuous stream)"}
+            </span>
+            {c && (
+              <span className="meta" style={{ marginLeft: "auto" }}>
+                last run {agoText(c.last_run_at)}
+                {on && c.next_run_at ? ` · next ${inText(c.next_run_at)}` : ""} ·{" "}
+                {c.runs} runs · +{c.enriched_session} enriched this session
+              </span>
+            )}
+          </div>
+        );
+      })()}
 
       {/* Full-backfill live progress / pending line */}
       {(fullRunning || (backfillStatus?.progress?.finished_at && (backfillStatus.progress.processed ?? 0) > 0)) && (
