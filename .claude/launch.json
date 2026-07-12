@@ -1,0 +1,18 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "trading-bot-preview",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": ["-c", "import os; os.environ['DATABASE_URL']='sqlite:///./data/ui_preview.db'; import uvicorn; uvicorn.run('app.main:app', host='127.0.0.1', port=8001)"],
+      "port": 8001
+    },
+    {
+      "name": "frontend",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--", "--port", "5174", "--strictPort"],
+      "cwd": "frontend",
+      "port": 5174
+    }
+  ]
+}
