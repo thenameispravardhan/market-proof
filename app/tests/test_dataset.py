@@ -85,6 +85,14 @@ def test_reaction_features_uptrend_complete():
     assert feats["price_5m"] == pytest.approx(103.0)
     assert feats["ret_1m_pct"] == pytest.approx(1.0)
     assert feats["ret_5m_pct"] == pytest.approx(3.0)
+    # FULL minute-by-minute trajectory (the mid-window T+6..T+14)
+    assert feats["features_version"] == 2
+    assert feats["price_10m"] == pytest.approx(105.5)  # 100 + 0.5*11
+    assert feats["ret_10m_pct"] == pytest.approx(5.5)
+    assert feats["price_14m"] == pytest.approx(107.5)
+    # every minute 1..15 is present
+    assert all(f"price_{m}m" in feats for m in range(1, 16))
+    assert all(f"ret_{m}m_pct" in feats for m in range(1, 16))
     # targets
     assert feats["price_15m"] == pytest.approx(108.0)
     assert feats["ret_15m_pct"] == pytest.approx(8.0)
@@ -187,6 +195,7 @@ def seed_outcome(
     minutes_ago=20,
     price=100.0,
     signal_id=None,
+    created_at=None,
 ) -> SignalOutcome:
     row = SignalOutcome(
         signal_id=signal_id,
@@ -194,7 +203,7 @@ def seed_outcome(
         action=action,
         signal_status="pending",
         price_at_signal=price,
-        created_at=utcnow_naive() - timedelta(minutes=minutes_ago),
+        created_at=created_at or (utcnow_naive() - timedelta(minutes=minutes_ago)),
     )
     db.add(row)
     db.commit()
@@ -266,6 +275,166 @@ async def test_builder_skips_fresh_and_marks_too_old(db_session, isolated_db):
     row = db_session.query(DatasetFeature).one()
     assert row.outcome_id == old.id
     assert row.status == "too_old"
+
+
+def test_reaction_features_sparse_symbol_asof_fill():
+    """Illiquid BSE names trade a few times an hour — 'price at T+k' is
+    the last trade at-or-before minute k, bounded by the session close."""
+    m0 = SIGNAL_EPOCH - (SIGNAL_EPOCH % 60)
+
+    def candle(offset, close, vol=50.0):
+        return [m0 + offset * 60, close, close + 0.02, close - 0.02, close, vol]
+
+    # trades at T-4, T+2 and T+9 only; nothing at the signal minute
+    candles = [candle(-4, 100.0), candle(2, 101.0), candle(9, 103.0)]
+    feats, status = compute_reaction_features(
+        candles,
+        SIGNAL_EPOCH,
+        baseline_price=None,
+        session_close_epoch=m0 + 3600,  # market open well past the horizon
+    )
+    assert status == "complete"
+    # baseline: last pre-signal trade (no minute-0 candle)
+    assert feats["baseline_price"] == pytest.approx(100.0)
+    # as-of fills: T+1 = last trade at T-4; T+3..T+8 = the T+2 trade
+    assert feats["price_1m"] == pytest.approx(100.0)
+    assert feats["price_3m"] == pytest.approx(101.0)
+    assert feats["price_5m"] == pytest.approx(101.0)
+    # horizon beyond the last trade but inside the session → filled
+    assert feats["price_15m"] == pytest.approx(103.0)
+    assert feats["ret_15m_pct"] == pytest.approx(3.0)
+    assert feats["label_15m"] == "UP"
+    # volume at the signal minute is genuinely unknowable — never as-of
+    assert feats["volume_1m"] is None
+    assert feats["volume_surge_1m"] is None
+    assert feats["range_breakout_2m"] is None
+
+    # WITHOUT a session close the fill stops at the last trade (T+9):
+    feats2, status2 = compute_reaction_features(candles, SIGNAL_EPOCH)
+    assert status2 == "partial"
+    assert feats2["price_15m"] is None
+
+
+def test_reaction_features_sparse_no_post_trades_is_no_candles():
+    m0 = SIGNAL_EPOCH - (SIGNAL_EPOCH % 60)
+    only_pre = [[m0 - 300, 100, 100.1, 99.9, 100.0, 10.0]]
+    feats, status = compute_reaction_features(
+        only_pre, SIGNAL_EPOCH, session_close_epoch=m0 + 3600
+    )
+    assert status == "no_candles"
+    assert feats is None
+
+
+def test_reaction_features_day_high_beyond_horizon():
+    # 25 post-signal minutes: the day keeps running past the 15m horizon.
+    candles = make_candles(SIGNAL_EPOCH, post_minutes=25, per_minute_move=0.5)
+    feats, status = compute_reaction_features(
+        candles, SIGNAL_EPOCH, baseline_price=100.0
+    )
+    assert status == "complete"
+    # day high (k=25 → 100 + 0.5*26 + 0.05) exceeds the horizon high
+    assert feats["day_high"] == pytest.approx(113.05)
+    assert feats["day_high"] > feats["high_15m"]
+    assert feats["ret_day_high_pct"] == pytest.approx(13.05)
+
+
+@pytest.mark.asyncio
+async def test_builder_marks_after_hours_without_api_call(db_session, isolated_db):
+    # Last Saturday, 11:30 IST — the market can never have candles there.
+    now = utcnow_naive()
+    days_back = (now.weekday() - 5) % 7 or 7
+    saturday = (now - timedelta(days=days_back)).replace(
+        hour=6, minute=0, second=0, microsecond=0
+    )
+    seed_outcome(db_session, created_at=saturday)
+    calls = {"n": 0}
+
+    async def counting_candles(symbol, signal_time):
+        calls["n"] += 1
+        return []
+
+    builder = DatasetBuilder(candle_fn=counting_candles, market_hours_check=True)
+    counts = await builder.run_once()
+    assert counts["after_hours"] == 1
+    assert calls["n"] == 0  # decided WITHOUT an API call
+    row = db_session.query(DatasetFeature).one()
+    assert row.status == "after_hours"
+    # terminal — never retried
+    counts2 = await builder.run_once()
+    assert counts2["processed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_builder_caches_candles_per_symbol(db_session, isolated_db):
+    # Three same-symbol outcomes in one batch → ONE history fetch.
+    outs = [seed_outcome(db_session, minutes_ago=20 + i * 3) for i in range(3)]
+    epoch = int(outs[-1].created_at.replace(tzinfo=timezone.utc).timestamp())
+    candles = make_candles(epoch, per_minute_move=0.5, pre_minutes=10, post_minutes=30)
+    calls = {"n": 0}
+
+    async def counting_candles(symbol, signal_time):
+        calls["n"] += 1
+        return candles
+
+    builder = DatasetBuilder(candle_fn=counting_candles)
+    counts = await builder.run_once()
+    assert counts["processed"] == 3
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_full_backfills_everything(db_session, isolated_db):
+    for i in range(3):
+        seed_outcome(db_session, symbol=f"F{i}", minutes_ago=25 + i)
+
+    async def candle_fn(symbol, signal_time):
+        epoch = int(signal_time.replace(tzinfo=timezone.utc).timestamp())
+        return make_candles(epoch, per_minute_move=0.5)
+
+    builder = DatasetBuilder(candle_fn=candle_fn)
+    progress = await builder.run_full(batch=1)  # force multiple batches
+    assert progress["running"] is False
+    assert progress["batches"] == 3
+    assert progress["complete"] == 3
+    assert builder.count_pending() == {"signal": 0, "shadow": 0}
+
+
+@pytest.mark.asyncio
+async def test_rebuild_re_enriches_stale_schema_rows(db_session, isolated_db):
+    from app.services.dataset_builder import FEATURES_VERSION
+
+    # A complete row from an OLDER schema (no features_version key).
+    o = seed_outcome(db_session)
+    db_session.add(
+        DatasetFeature(
+            outcome_id=o.id, symbol=o.symbol, signal_time=o.created_at,
+            status="complete", attempts=3,
+            features={"price_1m": 101.0, "ret_15m_pct": 4.0, "label_15m": "UP"},
+        )
+    )
+    db_session.commit()
+
+    async def candle_fn(symbol, signal_time):
+        epoch = int(signal_time.replace(tzinfo=timezone.utc).timestamp())
+        return make_candles(epoch, per_minute_move=0.5)
+
+    builder = DatasetBuilder(candle_fn=candle_fn)
+    # A normal run ignores the complete row (it's not retryable)...
+    assert (await builder.run_once())["processed"] == 0
+    # ...but count_pending / rebuild see it as stale schema.
+    builder._include_stale = True
+    assert builder.count_pending()["signal"] == 1
+    counts = await builder.run_once()
+    assert counts["processed"] == 1 and counts["complete"] == 1
+
+    db_session.expire_all()
+    row = db_session.query(DatasetFeature).filter(
+        DatasetFeature.outcome_id == o.id
+    ).one()
+    assert row.features["features_version"] == FEATURES_VERSION
+    # the new full trajectory is now present
+    assert "price_10m" in row.features
+    assert row.features["price_10m"] is not None
 
 
 def seed_shadow_announcement(
@@ -654,5 +823,67 @@ def test_backfill_endpoint(client, db_session, isolated_db, monkeypatch):
     body = r.json()
     assert body["ok"] is True
     assert body["complete"] == 1
+    row = db_session.query(DatasetFeature).one()
+    assert row.status == "complete"
+
+
+def test_backfill_retry_failed_resets_attempts(client, db_session, isolated_db):
+    # Stranded rows (attempts exhausted) + one complete row.
+    for i, status in enumerate(["no_candles", "no_candles", "partial", "complete"]):
+        o = seed_outcome(db_session, symbol=f"R{i}", minutes_ago=30 + i)
+        db_session.add(
+            DatasetFeature(
+                outcome_id=o.id, symbol=o.symbol, signal_time=o.created_at,
+                status=status, attempts=3,
+                features={"ret_15m_pct": 1.0} if status == "complete" else None,
+            )
+        )
+    db_session.commit()
+
+    r = client.post("/api/dataset/backfill?limit=1&retry_failed=true")
+    assert r.status_code == 200
+    assert r.json()["retried"] == 3  # the two no_candles + the partial
+
+    rows = {r_.symbol: r_ for r_ in db_session.query(DatasetFeature).all()}
+    for row in rows.values():
+        db_session.refresh(row)
+    assert rows["R3"].attempts == 3  # complete row untouched
+    # at least the batch-processed row was retried; none of the failed
+    # rows still carries exhausted attempts EXCEPT any the batch just
+    # re-attempted (attempts restart from 0 → 1 after a re-run)
+    assert all(r_.attempts <= 1 for k, r_ in rows.items() if k != "R3")
+
+
+def test_full_backfill_endpoint_and_status(client, db_session, isolated_db, monkeypatch):
+    import time
+
+    outcome = seed_outcome(db_session)
+    epoch = int(outcome.created_at.replace(tzinfo=timezone.utc).timestamp())
+    candles = make_candles(epoch, per_minute_move=0.5)
+
+    async def stub_candles(symbol, signal_time):
+        return candles
+
+    from app.services import dataset_builder as db_mod
+
+    monkeypatch.setattr(db_mod, "_default_candle_fn", stub_candles)
+
+    r = client.post("/api/dataset/backfill?full=true")
+    assert r.status_code == 200
+    assert r.json()["full"] is True
+
+    # Poll status until the background task drains the queue. Generous
+    # deadline: under full-suite load the shared executor threads are
+    # contended, so a tight timeout flakes.
+    deadline = time.monotonic() + 30.0
+    status = {}
+    while time.monotonic() < deadline:
+        status = client.get("/api/dataset/backfill/status").json()
+        if not status["progress"]["running"] and status["progress"].get("finished_at"):
+            break
+        time.sleep(0.1)
+    assert status["progress"]["running"] is False
+    assert status["progress"]["complete"] == 1
+    assert status["remaining"] == {"signal": 0, "shadow": 0}
     row = db_session.query(DatasetFeature).one()
     assert row.status == "complete"

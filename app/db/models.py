@@ -233,7 +233,9 @@ class DatasetFeature(Base):
     symbol: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
     signal_time: Mapped[Optional[datetime]] = mapped_column(DateTime)
     # complete | partial (early candles but no horizon candle — e.g. a
-    # signal near market close) | no_candles | too_old | error
+    # signal near market close) | no_candles | after_hours (filed
+    # outside the IST session — no reaction window can exist; terminal)
+    # | too_old | error
     status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     features: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)

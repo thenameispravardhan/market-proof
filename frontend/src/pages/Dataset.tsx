@@ -16,6 +16,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   datasetQueryString,
   useDatasetBackfill,
+  useDatasetBackfillStatus,
   useDatasetColumns,
   useDatasetHealth,
   useDatasetRows,
@@ -36,6 +37,7 @@ const CATEGORY_LABELS: Record<string, string> = {
   execution: "Execution",
   outcome_samples: "Outcome probes",
   reaction: "Market reaction (1-min candles)",
+  trajectory: "Minute-by-minute trajectory (T+6…T+14)",
   targets: "Horizon targets (labels)",
   quality: "Data quality",
 };
@@ -90,6 +92,10 @@ export default function Dataset() {
   const { data: catalog } = useDatasetColumns();
   const { data: stats } = useDatasetStats();
   const backfill = useDatasetBackfill();
+  const { data: backfillStatus } = useDatasetBackfillStatus();
+  const fullRunning = backfillStatus?.progress?.running ?? false;
+  const remaining = backfillStatus?.remaining;
+  const remainingTotal = remaining ? remaining.signal + remaining.shadow : null;
 
   const allKeys = useMemo(
     () => (catalog?.columns ?? []).map((c) => c.key),
@@ -175,12 +181,32 @@ export default function Dataset() {
           <button
             className="chart-btn"
             style={{ border: "1px solid var(--border)" }}
-            onClick={() => backfill.mutate(200)}
-            disabled={backfill.isPending}
+            onClick={() => backfill.mutate({ limit: 200 })}
+            disabled={backfill.isPending || fullRunning}
             data-testid="dataset-backfill"
-            title="Fetch 1-min candles and compute features for signals not yet enriched (needs Fyers)"
+            title="Fetch 1-min candles and compute features for one batch of pending rows (needs Fyers)"
           >
             {backfill.isPending ? "Enriching…" : "⟳ Enrich now"}
+          </button>
+          <button
+            className="chart-btn"
+            style={{ border: "1px solid var(--border)" }}
+            onClick={() => backfill.mutate({ full: true, retryFailed: true })}
+            disabled={backfill.isPending || fullRunning}
+            data-testid="dataset-backfill-full"
+            title="Keep running batches in the background until EVERY pending row (signals + shadow) is enriched. Rows stuck at no-candles/partial get fresh attempts. One history call per symbol; after-hours filings settled without any call."
+          >
+            {fullRunning ? "Filling history…" : "⛁ Fill entire history"}
+          </button>
+          <button
+            className="chart-btn"
+            style={{ border: "1px solid var(--border)" }}
+            onClick={() => backfill.mutate({ rebuild: true })}
+            disabled={backfill.isPending || fullRunning}
+            data-testid="dataset-backfill-rebuild"
+            title="Re-enrich already-complete rows whose feature schema is out of date — use after a new feature set ships (e.g. the full minute-by-minute trajectory) to roll it over your existing history."
+          >
+            ↻ Rebuild schema
           </button>
           <a
             className="chart-btn"
@@ -232,13 +258,36 @@ export default function Dataset() {
         </div>
       </div>
 
-      {backfill.data && (
+      {/* Full-backfill live progress / pending line */}
+      {(fullRunning || (backfillStatus?.progress?.finished_at && (backfillStatus.progress.processed ?? 0) > 0)) && (
+        <p className="meta" style={{ marginBottom: 8 }}>
+          {fullRunning ? "⏳ Filling history: " : "History backfill done: "}
+          batch {backfillStatus?.progress?.batches ?? 0} —{" "}
+          {backfillStatus?.progress?.processed ?? 0} processed (
+          {backfillStatus?.progress?.complete ?? 0} complete,{" "}
+          {backfillStatus?.progress?.partial ?? 0} partial,{" "}
+          {backfillStatus?.progress?.after_hours ?? 0} after-hours,{" "}
+          {backfillStatus?.progress?.no_candles ?? 0} no candles)
+          {fullRunning && remainingTotal !== null && (
+            <> — ~{remainingTotal} rows remaining</>
+          )}
+        </p>
+      )}
+      {!fullRunning && remainingTotal !== null && remainingTotal > 0 && (
+        <p className="meta" style={{ marginBottom: 8 }}>
+          {remainingTotal} rows await enrichment ({remaining!.signal} signal +{" "}
+          {remaining!.shadow} shadow) — "Fill entire history" processes them
+          all in the background.
+        </p>
+      )}
+      {backfill.data && !backfill.data.full && (
         <p className="meta" style={{ marginBottom: 8 }}>
           Enrichment batch: {backfill.data.processed} processed (
           {backfill.data.shadow ?? 0} shadow) — {backfill.data.complete}{" "}
           complete, {backfill.data.partial} partial,{" "}
           {backfill.data.no_candles} without candles
           {backfill.data.no_candles > 0 && " (is Fyers connected?)"},{" "}
+          {backfill.data.after_hours ?? 0} after-hours,{" "}
           {backfill.data.too_old} too old, {backfill.data.errors} errors.
         </p>
       )}
@@ -267,6 +316,7 @@ export default function Dataset() {
               coveragePct !== null ? `${complete} (${coveragePct}%)` : complete,
           },
           { label: "Partial", value: enrich["partial"] ?? 0 },
+          { label: "After hours", value: enrich["after_hours"] ?? 0 },
           {
             label: "Awaiting candles",
             value: (enrich["pending"] ?? 0) + (enrich["no_candles"] ?? 0),

@@ -358,6 +358,9 @@ class Settings(BaseSettings):
     DATASET_SPIKE_THRESHOLD_PCT: float = 1.0
     DATASET_MAX_ATTEMPTS: int = 3
     DATASET_MAX_AGE_DAYS: int = 30
+    # Pause before each candle-history fetch (cache misses only) so a
+    # full-history backfill stays far inside Fyers' rate limits.
+    DATASET_FETCH_DELAY_SECONDS: float = 0.25
     # Market session (IST, "HH:MM"). Entry window excludes the first
     # 15 min after open and the last 30 min before close; all intraday
     # positions are force-squared-off at SQUARE_OFF_TIME.

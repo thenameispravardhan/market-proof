@@ -1077,13 +1077,46 @@ export function useDatasetRows(
 
 export interface DatasetBackfillResult {
   ok: boolean;
+  full: boolean;
   processed: number;
   shadow: number;
   complete: number;
   partial: number;
   no_candles: number;
+  after_hours: number;
   too_old: number;
   errors: number;
+}
+
+export interface DatasetBackfillProgress {
+  running: boolean;
+  batches?: number;
+  processed?: number;
+  shadow?: number;
+  complete?: number;
+  partial?: number;
+  no_candles?: number;
+  after_hours?: number;
+  too_old?: number;
+  errors?: number;
+  started_at?: string | null;
+  finished_at?: string | null;
+}
+
+export interface DatasetBackfillStatus {
+  progress: DatasetBackfillProgress;
+  remaining: { signal: number; shadow: number };
+}
+
+export function useDatasetBackfillStatus() {
+  return useQuery<DatasetBackfillStatus>({
+    queryKey: ["dataset-backfill-status"],
+    queryFn: () => api.get("/api/dataset/backfill/status"),
+    // Poll while the full backfill runs, lazily otherwise. Even the
+    // running poll stays modest — the bot is busy enriching.
+    refetchInterval: (query) =>
+      query.state.data?.progress?.running ? 5000 : 30000,
+  });
 }
 
 export interface DatasetHealthColumn {
@@ -1120,12 +1153,24 @@ export function useDatasetHealth(target: string, enabled: boolean) {
 
 export function useDatasetBackfill() {
   const qc = useQueryClient();
-  return useMutation<DatasetBackfillResult, Error, number | undefined>({
-    mutationFn: (limit) =>
-      api.post(`/api/dataset/backfill?limit=${limit ?? 100}`, {}),
+  return useMutation<
+    DatasetBackfillResult,
+    Error,
+    { limit?: number; full?: boolean; retryFailed?: boolean; rebuild?: boolean } | undefined
+  >({
+    mutationFn: (opts) =>
+      api.post(
+        `/api/dataset/backfill?limit=${opts?.limit ?? 100}${
+          opts?.full ? "&full=true" : ""
+        }${opts?.retryFailed ? "&retry_failed=true" : ""}${
+          opts?.rebuild ? "&rebuild=true" : ""
+        }`,
+        {}
+      ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["dataset-stats"] });
       qc.invalidateQueries({ queryKey: ["dataset-rows"] });
+      qc.invalidateQueries({ queryKey: ["dataset-backfill-status"] });
     },
   });
 }

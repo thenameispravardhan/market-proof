@@ -158,11 +158,32 @@ COLUMN_SPECS: list[dict[str, str]] = [
     _C("time_to_peak_min", "Time to peak (min)", "targets", "target", "minute of the favorable extreme", "features"),
     _C("retrace_from_peak_pct", "Retrace from peak %", "targets", "target", "peak given back by horizon close", "features"),
     _C("label_15m", "Label 15m", "targets", "target", "UP / DOWN / FLAT (classification target)", "features"),
+    _C("day_high", "Day high after signal", "targets", "target", "highest price from signal to close (same IST day)", "features"),
+    _C("ret_day_high_pct", "Ret to day high %", "targets", "target", "the full extent of the day's move — beyond the horizon", "features"),
     # ---- data quality ----------------------------------------------------
-    _C("enrich_status", "Enrichment", "quality", "meta", "complete/partial/no_candles/too_old/pending", "df"),
+    _C("enrich_status", "Enrichment", "quality", "meta", "complete/partial/no_candles/after_hours/too_old/pending", "df"),
     _C("outcome_note", "Outcome note", "quality", "meta", "quote-probe data quality", "outcome"),
     _C("candles_post", "Candles found", "quality", "meta", "post-signal 1-min candles aligned", "features"),
+    _C("features_version", "Feature schema ver.", "quality", "meta", "compute schema version of this row", "features"),
 ]
+
+# ---- mid-trajectory minutes 6..14 (the full shape of the move) ----------
+# price_{k}m / ret_{k}m for every minute between the T+5 feature window and
+# the T+15 horizon. These are look-ahead TARGETS (not knowable at a T0/T+5
+# decision) — they let a model learn the trajectory CURVE, not just the
+# endpoints. Generated from the default horizon so there's one source of
+# truth, and appended here so the hand-authored feature/target columns
+# above stay readable. (price_15m/ret_15m live in the targets block.)
+_TRAJECTORY_HORIZON = 15
+for _m in range(6, _TRAJECTORY_HORIZON):
+    COLUMN_SPECS.append(
+        _C(f"price_{_m}m", f"Price +{_m}m", "trajectory", "target",
+           f"close {_m} min after signal (as-of for sparse names)", "features")
+    )
+    COLUMN_SPECS.append(
+        _C(f"ret_{_m}m_pct", f"Ret +{_m}m %", "trajectory", "target",
+           f"return at T+{_m} (trajectory shape)", "features")
+    )
 
 _VALID_KEYS = {c["key"] for c in COLUMN_SPECS}
 _FEATURE_JSON_KEYS = {c["key"] for c in COLUMN_SPECS if c["source"] == "features"}
@@ -862,19 +883,79 @@ def dataset_health(
     return {"target": target, "rows_sampled": n, "columns": report}
 
 
-@router.post("/backfill")
-async def dataset_backfill(
-    request: Request,
-    limit: int = Query(100, ge=1, le=1000),
-) -> dict[str, Any]:
-    """Run an enrichment batch immediately (the background builder also
-    runs one every DATASET_ENRICH_INTERVAL_SECONDS). Needs a connected
-    Fyers account for candles — without one everything lands in
-    no_candles and is retried later."""
+def _get_builder(request: Request):
+    """The lifespan's shared builder (its run lock + progress state make
+    it the single source of truth); created lazily if missing."""
     from app.services.dataset_builder import DatasetBuilder
 
     builder = getattr(request.app.state, "dataset_builder", None)
     if builder is None:
         builder = DatasetBuilder()
+        request.app.state.dataset_builder = builder
+    return builder
+
+
+@router.post("/backfill")
+async def dataset_backfill(
+    request: Request,
+    limit: int = Query(100, ge=1, le=1000),
+    full: bool = Query(
+        False,
+        description="run batches in the background until the WHOLE history "
+        "is enriched; poll /api/dataset/backfill/status for progress",
+    ),
+    retry_failed: bool = Query(
+        False,
+        description="give rows stuck at no_candles/error/partial fresh "
+        "attempts before running (an explicit operator run earns fresh "
+        "retries — e.g. after Fyers reconnects or an enrichment fix)",
+    ),
+    rebuild: bool = Query(
+        False,
+        description="also RE-ENRICH already-complete rows whose feature "
+        "schema is out of date (e.g. to add the full minute-by-minute "
+        "trajectory to rows enriched by an older version). Implies full.",
+    ),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Run an enrichment batch immediately, or (full=true) start the
+    run-until-done history backfill. Needs a connected Fyers account
+    for candles — without one everything lands in no_candles and is
+    retried later. One history fetch covers every pending row of a
+    symbol, and after-hours filings are settled without any API call,
+    so a full backfill is far cheaper than row-count × calls."""
+    builder = _get_builder(request)
+    reset = 0
+    if retry_failed:
+        from sqlalchemy import update
+
+        reset = db.execute(
+            update(DatasetFeature)
+            .where(DatasetFeature.status.in_(("no_candles", "error", "partial")))
+            .values(attempts=0)
+        ).rowcount
+        db.commit()
+    if full or rebuild:
+        progress = builder.start_full_backfill(batch=200, rebuild=rebuild)
+        return {"ok": True, "full": True, "retried": reset, **progress}
     counts = await builder.run_once(limit=limit)
-    return {"ok": True, **counts}
+    return {"ok": True, "full": False, "retried": reset, **counts}
+
+
+@router.get("/backfill/status")
+async def dataset_backfill_status(request: Request) -> dict[str, Any]:
+    """Live progress of the full backfill + how much is still pending.
+
+    Deliberately cheap: while the backfill runs, `remaining` is derived
+    from the start snapshot minus progress (no DB hit — the UI polls
+    this every few seconds); idle, it is a 30s-cached count."""
+    import asyncio
+
+    builder = _get_builder(request)
+    progress = dict(builder.backfill_progress)
+    remaining = builder.remaining_estimate() if progress.get("running") else None
+    if remaining is None:
+        remaining = await asyncio.get_running_loop().run_in_executor(
+            None, builder.count_pending_cached
+        )
+    return {"progress": progress, "remaining": remaining}

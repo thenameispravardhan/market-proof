@@ -37,7 +37,41 @@ materiality pre-filter model needs; typically a 10-100x row multiplier),
 context features (IST session clock, concurrent NIFTY move, excess return),
 cross-listing dedup (NSE+BSE twins share a key), chronological train/val
 split export, and the column-health / leakage report (/api/dataset/health).
-Backend suite: 828 tests.
+Wave 3: FULL-HISTORY backfill — POST /api/dataset/backfill?full=true loops
+batches in the background until every pending row is enriched (live progress
+at GET /api/dataset/backfill/status; "Fill entire history" button + progress
+line on the Dataset page). Efficiency: ONE Fyers history fetch per symbol
+per batch (the range call covers all of a symbol's pending rows),
+DATASET_FETCH_DELAY_SECONDS paces cache-miss fetches, and filings outside
+the IST session are settled terminally as "after_hours" with zero API calls
+(the majority of the shadow universe). Day-high targets (day_high,
+ret_day_high_pct — the peak of the rest of the trading day) joined the
+horizon targets. As-of pricing: illiquid names that don't trade in the
+exact signal minute take the last trade at-or-before each minute (bounded
+by the session close), rescuing rows that were wrongly no_candles. The
+builder runs its DB work on a PRIVATE thread pool so a full backfill never
+starves the HTTP surface.
+Wave 4: the FULL minute-by-minute trajectory — price_1m..price_15m and
+ret_1m..ret_15m for EVERY minute (not just 1-5 + 15) so a model learns the
+SHAPE of the move; minutes 1-5 are decision-time features, 6-14 are
+look-ahead targets ("trajectory" column category). Feature-schema is
+versioned (features_version, FEATURES_VERSION const): POST
+/api/dataset/backfill?rebuild=true re-enriches already-complete rows whose
+schema predates the current version ("Rebuild schema" button), so a new
+feature set rolls over the whole history without a wipe.
+Also 2026-07-10: the TRADE PAGE wave — full TradingView-style interactive
+charting (lightweight-charts v5, 7 timeframes, 4 chart types, 9 overlays
+incl. SMA/EMA/VWAP/Bollinger/Supertrend/Ichimoku, 9 oscillators incl. RSI/
+MACD/Stochastic/ADX/ATR, drawing tools with localStorage persistence, price
+alerts, compare symbols, infinite scroll-back), manual order placement (real-
+money only, risk-gated with operator bypass), option chain panel (live Fyers
+with instrument-master fallback), symbol search + autocomplete (Fyers scrip
+master CSV loader), positions panel with live P&L, and pending-orders
+management. Fyers setup automation (one-click OAuth from the Accounts page,
+pre-validation of app_id, authorize-url CSRF, tunnel + webhook helpers).
+Accounts page overhaul (Paper + Fyers cards, FyersCredentialsCard,
+FyersSetupCard, FyersWebhookCard).
+Backend suite: 61 pytest modules, ~900 tests.
 
 --------------------------------------------------------------------------------
                               TABLE OF CONTENTS
@@ -198,7 +232,12 @@ T1 — Infrastructure
   app/logging_config.py  structlog JSON logging with per-request correlation ids.
   app/db/                session.py (engine/Base), models.py (business tables),
                          infra_models.py (app_settings k/v), init.py (create_all).
-  app/services/          event_bus.py (async pub/sub), instrument_master.py,
+  app/services/          event_bus.py (async pub/sub), instrument_master.py
+                         (Fyers scrip-master CSV loader — NSE/BSE cash + F&O;
+                         in-memory search index with exact/prefix/fuzzy
+                         ranking, option-chain builder per underlying,
+                         downloadable via POST /api/search/refresh; falls
+                         back to a small in-process seed on fresh install),
                          audit_service.py, outcome_logger.py, webhook_service.py,
                          health_report.py (daily 15:45-IST operator summary →
                          system.report → notification channels),
@@ -292,6 +331,14 @@ T5 — Notifications & Webhooks
                          signing.py (HMAC-SHA256 sign/verify).
 
 T6 — Operational surfaces (app/api/) — REST + WS control plane consumed by the UI.
+  25 router modules: core.py, settings_api.py, trading_mode.py, prompts.py,
+  rules.py, strategies.py, broker_accounts.py, fyers_callback.py (OAuth +
+  status + disconnect), fyers_postback.py, market.py (indices + chart history),
+  search.py (symbol autocomplete + option-chain), options.py (live Fyers chain),
+  orders.py (manual order placement + cancel + pending + quote), positions.py
+  (managed book + close + close-all + update levels), risk.py, outcomes.py,
+  dataset.py, metrics.py, backtest.py, notifications.py, webhooks.py,
+  audit_log.py, health.py, ws.py.
 
 --------------------------------------------------------------------------------
 5. TECHNOLOGY STACK
@@ -337,11 +384,14 @@ AI News Trading Bot/
 │   ├── risk/                  # engine, sizer, circuit breakers, volatility, clock
 │   ├── services/              # event bus, instrument master, audit, outcomes
 │   ├── webhooks/              # inbound/outbound webhook dispatch + HMAC signing
-│   └── tests/                 # ~60 pytest modules (805 tests) + conftest
+│   └── tests/                 # 61 pytest modules (~900 tests) + conftest
 ├── frontend/                  # React + Vite dashboard (see §19)
 │   ├── src/pages/             # 13 route views
-│   ├── src/components/        # dashboard/, trade/, rules/, prompts/, settings/, …
-│   ├── src/hooks/  src/api/  src/lib/  themes.ts  router.tsx  App.tsx
+│   ├── src/components/        # dashboard/, trade/, accounts/, rules/, prompts/,
+│   │                          # settings/, common/, positions/, strategies/,
+│   │                          # backtest/, notifications/, webhooks/
+│   ├── src/hooks/  src/api/  src/lib/ (indicators.ts, roundtrips.ts)
+│   ├── themes.ts  router.tsx  App.tsx  types.ts
 │   └── src/tests/             # 7 vitest suites
 ├── scripts/                   # run/dev (ps1+sh), Fyers setup, seeders, smoke tests
 ├── data/                      # SQLite DB + scrip-master caches (gitignored)
@@ -754,7 +804,11 @@ Observability / outcomes
                                  correlation with look-ahead-leak warnings
   GET  /api/dataset/export     — CSV / JSONL download; dedup cross-listings;
                                  split=train|val chronological time split
-  POST /api/dataset/backfill   — run a DatasetBuilder enrichment batch now
+  POST /api/dataset/backfill   — one enrichment batch now; ?full=true loops
+                                 in the background until history is complete;
+                                 ?retry_failed resets stuck rows; ?rebuild
+                                 re-enriches stale-schema complete rows
+  GET  /api/dataset/backfill/status — full-backfill progress + pending counts
   GET  /api/risk/breaker-history       — every breaker trip / kill / resume
 Notifications / webhooks / audit / backtest
   GET/POST /api/notifications/channels  PUT/DELETE .../{id}  POST .../{id}/test
@@ -896,10 +950,10 @@ Startup warns loudly if bound to a non-loopback interface (no auth).
 19. THE FRONTEND (frontend/, React 18 + Vite 6)
 --------------------------------------------------------------------------------
 Bloomberg-terminal-styled SPA. Hash router (router.tsx), lazy-loaded pages, a
-grouped sidebar, and a bottom status bar (WS state, MODE, CAP, live NSE index
-ticker over /ws, IST clock). Theme-aware (themes.ts, useTheme; data-theme on
-<html>). Server state via TanStack Query (hooks/useApi.ts); realtime via
-useWebSocket / useQuotes.
+grouped sidebar (collapsible, state persisted in localStorage), and a bottom
+status bar (WS state, MODE, CAP, live NSE index ticker over /ws, IST clock).
+Theme-aware (themes.ts, useTheme; data-theme on <html>). Server state via
+TanStack Query (hooks/useApi.ts); realtime via useWebSocket / useQuotes.
 
 Nav (App.tsx), grouped MAIN / OPS / CFG:
   MAIN: Dashboard, Trade, Trade History, Outcomes, Dataset, Prompts, Rules,
@@ -908,29 +962,83 @@ Nav (App.tsx), grouped MAIN / OPS / CFG:
   CFG:  Settings
 
 Pages (src/pages/): Dashboard, Trade, TradeHistory, Outcomes, Dataset, Prompts,
-Rules, Strategies, Accounts, Notifications, Webhooks, Backtest, Settings. The
-Outcomes page (Phase 4 complete) shows what every signal's stock ACTUALLY did
+Rules, Strategies, Accounts, Notifications, Webhooks, Backtest, Settings.
+
+Trade page (src/pages/Trade.tsx, ~1050 lines): the operator-driven manual order
+ticket. REAL-MONEY ONLY — paper-mode accounts are filtered out of the broker
+picker (the backend also rejects them with 400). Layout (Bloomberg-style,
+dense, dark): search bar → quote panel + order ticket + pending orders +
+positions + option chain + interactive chart. Features:
+  • Symbol search: autocomplete powered by the instrument master (Fyers scrip-
+    master CSVs — NSE/BSE cash + F&O). POST /api/search/refresh downloads the
+    full master on demand.
+  • Quote panel: real-time LTP, bid/ask, volume from Fyers (/api/orders/quote
+    + /ws live overlay).
+  • Order ticket: BUY/SELL, qty, order type (MARKET/LIMIT/SL/SL-M), product
+    (MIS/CNC/NRML), optional limit/stop price. Risk engine is consulted; on
+    block the ticket surfaces the blocking codes and a "BYPASS" field requiring
+    the operator to type "I ACCEPT THE RISK" before re-submitting.
+  • Pending orders panel: lists PENDING trades from /api/orders/pending with
+    per-row cancel.
+  • Positions panel: live open positions with real-time P&L (overlays /ws
+    ticks over the 5s REST poll); qty is signed (negative for shorts).
+  • Option chain panel: renders when the selected symbol is an index
+    underlying. Live chain from Fyers /data/options-chain-v3 (per-strike CE/PE
+    with LTP, bid/ask, OI, expiry picker); falls back to the static
+    instrument master when Fyers isn't connected. GET /api/options/chain.
+  • ChartPanel (src/components/trade/ChartPanel.tsx, ~2400 lines): TradingView-
+    style interactive chart built on lightweight-charts v5. Candles from
+    GET /api/market/history (Fyers-only), last bar kept live from /ws.
+      Timeframes: 1m, 3m, 5m, 15m, 30m, 1h, 1D.
+      Chart types: candles, bars, line, area.
+      Volume histogram + bar-close countdown timer.
+      Overlays: SMA, EMA, WMA, VWAP, Bollinger Bands, Supertrend, Parabolic
+        SAR, Ichimoku Cloud, Donchian Channel.
+      Oscillator panes: RSI, MACD, Stochastic, ADX/DI, ATR, OBV, CCI, MFI,
+        Williams %R.
+      Drawing tools (src/components/trade/drawings.ts): trend line, ray,
+        horizontal/vertical line, rectangle, fib retracement, text note —
+        click-select + Delete, persisted per symbol in localStorage.
+      Price alerts: click a price, fires on live-tick cross (toast + browser
+        notification), persisted per symbol.
+      Compare symbols on a percentage scale.
+      Price-scale modes (log / percent), crosshair magnet, PNG screenshot,
+        fullscreen, OHLC legend, infinite scroll-back pagination.
+      Times: all Fyers epoch timestamps shifted +05:30 for IST labels.
+  Technical indicators (src/lib/indicators.ts, ~19KB): pure-function
+    implementations for all overlay and oscillator calculations.
+
+Accounts page (src/pages/Accounts.tsx): intentionally minimal. Two accounts:
+  1. Paper Trading — built-in, always available, simulated fills.
+  2. Fyers — connect in one click via OAuth (keys live in .env).
+  No broker-account CRUD; just connect Fyers. Components:
+    ConnectFyers (src/components/accounts/ConnectFyers.tsx): one-click OAuth
+      banner, pre-validates the app_id against Fyers, CSRF state management.
+    FyersCredentialsCard: shows/masks FYERS_APP_ID and SECRET_KEY from .env.
+    FyersSetupCard: step-by-step Fyers API app activation guide with the exact
+      redirect URI to paste into the Fyers dashboard.
+    FyersWebhookCard: postback webhook registration status + secret.
+
+Outcomes page (Phase 4 complete): what every signal's stock ACTUALLY did
 (+5m/+30m moves, AI-verdict correctness, taken vs blocked), a per-event-type
 performance chart + table, an event filter, and a CSV export for offline ML.
-The Dataset page is the ML training-set builder UI: coverage tiles (rows
-split signal+shadow, enrichment %, label balance), a grouped column picker
-where every column carries its FEATURE (safe input) / TARGET (label only —
-look-ahead bias as an input) / META badge, ready-made presets (everything,
-Model A direction, Model B peak, features only), filters (source, event,
-action, taken/blocked, label, enriched-only), a collapsible column-health
-panel (null rates, stats, target correlation, ⚠ LEAK flags), a live preview
-table, CSV/JSONL export plus one-click chronological Train/Val CSVs with a
-dedup-cross-listings toggle (default ON), and an "Enrich now" backfill
-button (column selection persists in localStorage
-`tradebot.dataset.columns.v1`).
+Dataset page: the ML training-set builder UI: coverage tiles (rows split
+signal+shadow, enrichment %, label balance), a grouped column picker where
+every column carries its FEATURE (safe input) / TARGET (label only — look-
+ahead bias as an input) / META badge, ready-made presets (everything, Model A
+direction, Model B peak, features only), filters (source, event, action,
+taken/blocked, label, enriched-only), a collapsible column-health panel (null
+rates, stats, target correlation, ⚠ LEAK flags), a live preview table,
+CSV/JSONL export plus one-click chronological Train/Val CSVs with a dedup-
+cross-listings toggle (default ON), and an "Enrich now" backfill button
+(column selection persists in localStorage `tradebot.dataset.columns.v1`).
 
 Dashboard components: AccountToggles (Paper / Fyers on-off), AiAnalysisToggle,
 NewsPipeline (scrape→analyze→signal table), ActivePositions, PipelineLatency
 (p95 headline + total-latency sparkline, LLM p95, fast-track %, deadline hit
 rate, news-age p95 — backed by /api/metrics/pipeline-latency), PnLChart,
 RiskMetrics, Skeleton. Settings page additionally hosts BreakerHistory (every
-breaker trip with threshold/value/action) beside the AuditLog. Trade page uses
-lightweight-charts (ChartPanel + drawings + indicators). Backtest uses
+breaker trip with threshold/value/action) beside the AuditLog. Backtest uses
 recharts (EquityCurveChart).
 
 PnLChart is customizable: time range (7D/14D/30D/90D), view (cumulative area /
@@ -1030,7 +1138,10 @@ fixes orders rejecting as the old app.
 --------------------------------------------------------------------------------
   run.ps1 / run.sh                 Production single-process launch (builds UI).
   dev.ps1 / dev.sh                 Dev launch (uvicorn --reload; Vite in term 2).
-  setup_fyers.py                   Fyers OAuth authentication.
+  setup_fyers.py                   Full Fyers setup automation (~20KB): OAuth
+                                   token flow, tunnel auto-detection (cloudflared
+                                   / ngrok), webhook registration, status command.
+                                   Called from the Accounts page or CLI.
   register_fyers_webhook.py        Register the Fyers postback webhook + secret.
   start_webhook_tunnel.ps1         Start a cloudflared tunnel for inbound webhooks.
   fix_fyers_app_id.py              Repair a mismatched Fyers app id on orders.
@@ -1042,19 +1153,20 @@ fixes orders rejecting as the old app.
   fix_doubled_trades.py            Data-repair utility.
   smoke_e2e.py, smoke_t2_monitor.py, smoke_t3_analyzer.py, smoke_t4_execution.py
                                    Track-by-track smoke tests.
-  _oauth.py, _tunnel.py, _debug_smoke.py   Internal helpers.
+  _oauth.py, _tunnel.py, _debug_smoke.py   Internal helpers (OAuth flow,
+                                   tunnel management, debug utilities).
 
 --------------------------------------------------------------------------------
 23. TESTING
 --------------------------------------------------------------------------------
-Backend: ~60 pytest modules / 805 tests under app/tests/ (+ conftest.py)
+Backend: 61 pytest modules / ~900 tests under app/tests/ (+ conftest.py)
 covering monitors, dedup, analyzer/service, schemas, fast track, rules, risk
 engine + API, circuit breakers, position sizer, volatility, event profiles,
 market clock/data/history, paper backend, IOC execution, trade exits/manager,
-Fyers auth/live/stream/postback/webhook, notifications (telegram/discord/
-email), webhooks in/out + signing, trading-mode API + routing, backtest engine
-+ API, metrics, prompts + seeding, settings API, e2e, phase-3 latency, hybrid
-+ outcomes, and more. Two scenario suites are canonical for execution changes:
+Fyers auth/live/stream/postback/webhook/data-decoupled, notifications
+(telegram/discord/email), webhooks in/out + signing, trading-mode API +
+routing, backtest engine + API, metrics, prompts + seeding, settings API, e2e,
+phase-3 latency, hybrid + outcomes, dataset, and more. Key test suites:
   test_entry_state_machine.py  E-01..E-15 — the entry plan's definitive cases
       (happy path, drift + retracement re-arm/expiry, partial/zero fill,
       slippage breach, broker rejection/timeout, symbol-lock concurrency,
@@ -1070,6 +1182,13 @@ email), webhooks in/out + signing, trading-mode API + routing, backtest engine
   test_observability.py        pipeline-latency metrics, health report,
       performance-weighted sizer (tiers + engine integration), sentiment
       decay, outcomes API (+ summary + CSV), breaker history.
+  test_trade_page.py           instrument master (seed, search, option chain),
+      symbol search API, option chain endpoint, manual order placement (happy
+      path, paper-account rejection, validation, risk-block + bypass), cancel,
+      pending orders, quote polling.
+  test_setup_automation.py     Fyers setup automation: tunnel backend
+      detection (cloudflared/ngrok), URL extraction from process output, OAuth
+      flow polling, status command — all monkey-patched, no real binaries.
 Run with TESTING=1 (in-memory SQLite): `pytest` (or `python -m pytest`).
 Frontend: 7 vitest suites / 56 tests under frontend/src/tests/ — `npm test`.
 
