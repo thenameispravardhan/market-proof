@@ -299,6 +299,16 @@ export interface GlobalSettings {
   LLM_MAX_TOKENS: number;
   // Staleness gate: filings older than this (seconds) skip the AI entirely.
   MAX_NEWS_AGE_SECONDS: number;
+  // WHICH clock the staleness gate measures. OFF (default) = time since the
+  // exchange's stated filing time, which includes the exchange's OWN publish
+  // lag (measured median ~35s) — so filings get dropped for a delay the bot
+  // didn't cause. ON = time since the bot first SAW the filing; alpha decays
+  // from publication, not submission.
+  NEWS_AGE_FROM_RECEIPT: boolean;
+  // Absolute age ceiling (seconds since filing), used only when
+  // NEWS_AGE_FROM_RECEIPT is on — stops a monitor outage from making a whole
+  // stale backlog look "just received". 0 = no ceiling.
+  MAX_NEWS_AGE_ABSOLUTE_SECONDS: number;
   // Hard end-to-end deadline (seconds from filing to signal). Late signals
   // are stored but blocked. 0 = disabled.
   PIPELINE_DEADLINE_SECONDS: number;

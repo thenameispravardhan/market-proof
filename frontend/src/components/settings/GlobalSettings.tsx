@@ -12,6 +12,7 @@ type NumField = Exclude<
   | "SEND_EXTRACTED_TEXT"
   | "FAST_TRACK_ENABLED"
   | "OUTCOME_LOGGER_ENABLED"
+  | "NEWS_AGE_FROM_RECEIPT"
 >;
 
 const FIELDS: { key: NumField; label: string; min: number; max: number; step: number }[] = [
@@ -29,6 +30,7 @@ const FIELDS: { key: NumField; label: string; min: number; max: number; step: nu
   { key: "QUOTE_REFRESH_SECONDS", label: "Quote refresh (seconds)", min: 1, max: 600, step: 1 },
   { key: "LLM_MAX_TOKENS", label: "AI max output tokens", min: 100, max: 4000, step: 50 },
   { key: "MAX_NEWS_AGE_SECONDS", label: "Max news age (seconds)", min: 5, max: 600, step: 5 },
+  { key: "MAX_NEWS_AGE_ABSOLUTE_SECONDS", label: "Absolute news age ceiling (seconds, 0 = off)", min: 0, max: 86400, step: 60 },
   { key: "PIPELINE_DEADLINE_SECONDS", label: "Signal deadline (seconds, 0 = off)", min: 0, max: 300, step: 1 },
 ];
 
@@ -57,6 +59,8 @@ export function GlobalSettings() {
   const fastTrack = values.FAST_TRACK_ENABLED ?? false;
   // Default ON — passive telemetry, no trading influence.
   const outcomeLogger = values.OUTCOME_LOGGER_ENABLED ?? true;
+  // Default OFF — legacy filed_at clock until the operator opts in.
+  const newsAgeFromReceipt = values.NEWS_AGE_FROM_RECEIPT ?? false;
 
   const handleSave = async () => {
     setError(null);
@@ -89,6 +93,24 @@ export function GlobalSettings() {
               />
             </div>
           ))}
+          <div className="field" style={{ marginTop: 4 }}>
+            <label>Measure news age from receipt</label>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <Toggle
+                on={newsAgeFromReceipt}
+                data-testid="news-age-from-receipt-toggle"
+                onChange={(next) => {
+                  setValues((prev) => ({ ...prev, NEWS_AGE_FROM_RECEIPT: next }));
+                  setSaved(false);
+                }}
+              />
+              <span className="field-hint" style={{ marginTop: 0 }}>
+                {newsAgeFromReceipt
+                  ? "Age = time since the bot first SAW the filing. The exchange's own publish lag no longer counts against you — until it's published, nobody could trade it. The absolute ceiling above still rejects genuinely old news."
+                  : "Age = time since the exchange's stated filing time, which INCLUDES the exchange's publish lag (measured median ~35s) — filings get dropped as stale for a delay the bot didn't cause."}
+              </span>
+            </div>
+          </div>
           <div className="field" style={{ marginTop: 4 }}>
             <label>Pre-LLM noise filter</label>
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>

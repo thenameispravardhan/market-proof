@@ -89,6 +89,14 @@ _GLOBAL_KEYS: dict[str, tuple[type, Any]] = {
     # but blocked.
     "LLM_MAX_TOKENS": (int, 400),
     "MAX_NEWS_AGE_SECONDS": (int, 90),
+    # Which clock the staleness gate measures. OFF (default) = legacy
+    # `now - filed_at`, which bundles in the EXCHANGE's publish lag
+    # (measured median ~35s on live data) and so rejects filings for a
+    # delay the bot didn't cause. ON = `now - received_at` (the bot's own
+    # reaction time) — alpha decays from PUBLICATION, not submission.
+    # Guarded by MAX_NEWS_AGE_ABSOLUTE_SECONDS.
+    "NEWS_AGE_FROM_RECEIPT": (bool, False),
+    "MAX_NEWS_AGE_ABSOLUTE_SECONDS": (int, 1800),
     "PIPELINE_DEADLINE_SECONDS": (int, 0),
     # Intraday buying-power multiplier (Fyers MIS ~5x). Notional caps only —
     # risk-per-trade and loss limits always stay on real equity.

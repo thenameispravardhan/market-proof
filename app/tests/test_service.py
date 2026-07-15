@@ -503,6 +503,203 @@ async def test_handle_event_with_bad_payload_logs_and_returns_none(db_session, i
 # -- Speed-trading: freshness gate --------------------------------------
 
 
+# ---- staleness clock (evaluate_staleness) --------------------------------
+#
+# The gate can measure against two clocks. `filed_at` (legacy) bundles in
+# the EXCHANGE's publish lag — time during which nobody could trade the
+# news, so it costs no alpha. `received_at` measures only the delay the
+# bot itself is responsible for.
+
+def _stale_args(**kw):
+    from datetime import datetime, timezone
+
+    base = dict(
+        filed_at=None,
+        received_at=None,
+        now=datetime.now(timezone.utc),
+        max_age_s=60,
+        from_receipt=False,
+        absolute_max_age_s=1800,
+    )
+    base.update(kw)
+    return base
+
+
+def test_staleness_legacy_clock_uses_filed_at():
+    from datetime import timedelta
+
+    from app.analyzer.service import evaluate_staleness
+
+    a = _stale_args()
+    now = a["now"]
+    # old filing -> stale
+    stale, age, ctx = evaluate_staleness(
+        **_stale_args(filed_at=now - timedelta(seconds=120))
+    )
+    assert stale is True
+    assert age == pytest.approx(120, abs=2)
+    assert ctx["clock"] == "filed_at" and ctx["breached"] == "filed_age"
+    # fresh filing -> not stale
+    stale, _, _ = evaluate_staleness(
+        **_stale_args(filed_at=now - timedelta(seconds=10))
+    )
+    assert stale is False
+
+
+def test_staleness_legacy_clock_ignores_received_at():
+    """Regression guard: the default path must behave EXACTLY as before —
+    a late-published filing is still dropped when the toggle is off."""
+    from datetime import timedelta
+
+    from app.analyzer.service import evaluate_staleness
+
+    a = _stale_args()
+    now = a["now"]
+    stale, _, _ = evaluate_staleness(
+        **_stale_args(
+            filed_at=now - timedelta(seconds=600),   # exchange published late
+            received_at=now - timedelta(seconds=1),  # bot saw it 1s ago
+        )
+    )
+    assert stale is True  # legacy still drops it
+
+
+def test_staleness_receipt_clock_rescues_late_published_filing():
+    """THE FIX: the exchange took 8 minutes to publish, but the bot saw it
+    1s ago. Nobody could trade it before publication, so the edge is
+    intact — it must NOT be stale."""
+    from datetime import timedelta
+
+    from app.analyzer.service import evaluate_staleness
+
+    a = _stale_args()
+    now = a["now"]
+    stale, age, ctx = evaluate_staleness(
+        **_stale_args(
+            filed_at=now - timedelta(seconds=480),
+            received_at=now - timedelta(seconds=1),
+            from_receipt=True,
+        )
+    )
+    assert stale is False
+    assert age == pytest.approx(1, abs=2)
+    assert ctx["clock"] == "received_at"
+    assert ctx["filed_age_seconds"] == pytest.approx(480, abs=2)
+
+
+def test_staleness_receipt_clock_still_blocks_bot_side_lag():
+    """The bot sat on news it could see for 120s — that IS the bot's
+    fault and must still be stale."""
+    from datetime import timedelta
+
+    from app.analyzer.service import evaluate_staleness
+
+    a = _stale_args()
+    now = a["now"]
+    stale, _, ctx = evaluate_staleness(
+        **_stale_args(
+            filed_at=now - timedelta(seconds=130),
+            received_at=now - timedelta(seconds=120),
+            from_receipt=True,
+        )
+    )
+    assert stale is True
+    assert ctx["breached"] == "received_age"
+
+
+def test_staleness_receipt_clock_absolute_ceiling_guards_monitor_downtime():
+    """If the monitor was DOWN for 2h, the whole backlog is 'received just
+    now' and would look fresh. The absolute filed_at ceiling rejects it."""
+    from datetime import timedelta
+
+    from app.analyzer.service import evaluate_staleness
+
+    a = _stale_args()
+    now = a["now"]
+    stale, _, ctx = evaluate_staleness(
+        **_stale_args(
+            filed_at=now - timedelta(hours=2),
+            received_at=now - timedelta(seconds=1),
+            from_receipt=True,
+        )
+    )
+    assert stale is True
+    assert ctx["breached"] == "absolute_age"
+    # ceiling disabled -> it passes (operator opted out explicitly)
+    stale, _, _ = evaluate_staleness(
+        **_stale_args(
+            filed_at=now - timedelta(hours=2),
+            received_at=now - timedelta(seconds=1),
+            from_receipt=True,
+            absolute_max_age_s=0,
+        )
+    )
+    assert stale is False
+
+
+def test_staleness_receipt_clock_falls_back_to_filed_at_when_no_receipt():
+    """Older rows carry no received_at — the gate must not silently open."""
+    from datetime import timedelta
+
+    from app.analyzer.service import evaluate_staleness
+
+    a = _stale_args()
+    now = a["now"]
+    stale, _, ctx = evaluate_staleness(
+        **_stale_args(filed_at=now - timedelta(seconds=300), from_receipt=True)
+    )
+    assert stale is True
+    assert ctx["breached"] == "filed_age"
+
+
+def test_staleness_no_timestamps_does_not_block():
+    """Fail-safe: no usable timestamp -> don't block here (the pipeline
+    deadline + risk engine still apply). Matches legacy behavior."""
+    from app.analyzer.service import evaluate_staleness
+
+    stale, age, _ = evaluate_staleness(**_stale_args())
+    assert stale is False and age is None
+    stale, _, _ = evaluate_staleness(**_stale_args(from_receipt=True))
+    assert stale is False
+
+
+@pytest.mark.asyncio
+async def test_receipt_clock_analyzes_late_published_news_end_to_end(
+    db_session, isolated_db, monkeypatch
+):
+    """Integration: with the receipt clock ON, a filing the exchange
+    published 10 minutes late DOES reach the LLM (legacy would drop it)."""
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setattr(
+        "app.analyzer.service.get_settings",
+        lambda: _settings_with(max_news_age_seconds=60, news_age_from_receipt=True),
+    )
+    seed_defaults(db_session)
+    db_session.commit()
+    ann = _make_announcement(
+        db_session,
+        title="Company bags order worth Rs 500 crore",
+        filed_at=datetime.now(timezone.utc) - timedelta(seconds=600),
+    )
+    # received_at defaults to now() at insert — i.e. the bot just saw it.
+    called = {"n": 0}
+
+    def _ok(req: httpx.Request) -> httpx.Response:
+        called["n"] += 1
+        return httpx.Response(200, json=_deepseek_response(_valid_analysis_json()))
+
+    svc = Service(deepseek_client=_make_deepseek_client(_ok))
+    await svc.process_announcement(ann.id)
+
+    # The LLM WAS called — the filing was not dropped as stale.
+    assert called["n"] == 1
+    analyses = db_session.execute(select(Analysis)).scalars().all()
+    assert len(analyses) == 1
+    raw = analyses[0].raw_response or {}
+    assert raw.get("error") != "stale_news"
+
+
 @pytest.mark.asyncio
 async def test_stale_news_skips_llm_and_writes_placeholder(
     db_session, isolated_db, monkeypatch
@@ -646,7 +843,11 @@ async def test_startup_sweep_premarks_stale_announcements(
 
 
 def _settings_with(
-    *, max_news_age_seconds: int = 90, ai_analysis_enabled: bool = True
+    *,
+    max_news_age_seconds: int = 90,
+    ai_analysis_enabled: bool = True,
+    news_age_from_receipt: bool = False,
+    max_news_age_absolute_seconds: int = 1800,
 ) -> Any:
     """Build a Settings stub with all the fields the analyzer's
     pipeline reads, defaulted to safe values, plus the freshness
@@ -661,6 +862,8 @@ def _settings_with(
     from types import SimpleNamespace
     return SimpleNamespace(
         MAX_NEWS_AGE_SECONDS=max_news_age_seconds,
+        NEWS_AGE_FROM_RECEIPT=news_age_from_receipt,
+        MAX_NEWS_AGE_ABSOLUTE_SECONDS=max_news_age_absolute_seconds,
         AI_ANALYSIS_ENABLED=ai_analysis_enabled,
         MAX_SINGLE_POSITION_PCT=20.0,
         MAX_SIGNALS_PER_DAY=20,

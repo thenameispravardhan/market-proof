@@ -98,6 +98,30 @@ class Settings(BaseSettings):
     # Default 45s gives ~30s of slack inside the 20-second trade
     # budget for downstream latency (LLM + Fyers + fill).
     MAX_NEWS_AGE_SECONDS: int = 45
+    # WHICH CLOCK the staleness gate above measures against.
+    #
+    # False (default, legacy): age = now - filed_at. `filed_at` is the
+    #   EXCHANGE's stated filing time, which includes the exchange's own
+    #   publish lag — the gap between a company submitting a filing and
+    #   NSE/BSE actually exposing it on the API. Measured on live data
+    #   that lag is a MEDIAN ~35s (p90 8-16 min), so this clock rejects a
+    #   large share of filings for a delay the bot did not cause.
+    #
+    # True: age = now - received_at (the bot's own reaction time — how
+    #   long it has sat on news it can actually see). Alpha decays from
+    #   PUBLICATION, not submission: until the exchange publishes it, no
+    #   participant could trade it, so the price has not moved yet and
+    #   the edge is intact. `received_at` ≈ publication + one poll wait.
+    #   Paired with MAX_NEWS_AGE_ABSOLUTE_SECONDS below so genuinely
+    #   ancient filings are still rejected.
+    NEWS_AGE_FROM_RECEIPT: bool = False
+    # Absolute ceiling on `now - filed_at`, applied ONLY when
+    # NEWS_AGE_FROM_RECEIPT is on. This is the safety net that the
+    # receipt clock alone cannot provide: if the monitor was DOWN for an
+    # hour, every backlog row is "received just now" and would look
+    # fresh — this ceiling rejects it. Also catches an exchange
+    # re-publishing genuinely old filings. 0 = no ceiling (not advised).
+    MAX_NEWS_AGE_ABSOLUTE_SECONDS: int = 1800
     # Maximum time (seconds) the trade manager holds an open position
     # regardless of stop-loss / target. Captures the "20-30 min spike
     # capture" rule — when the window closes we exit at the last

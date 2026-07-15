@@ -32,11 +32,23 @@ the DeepSeek API rate limit.
 
 Speed-trading rules (NEW):
   - STALENESS GATE: at step 0.5 (right after idempotency check, before
-    the LLM call), if `(now - announcement.filed_at) > MAX_NEWS_AGE_SECONDS`
-    we skip the DeepSeek call, write a placeholder analyses row tagged
-    `reason="stale_news"`, and return. This implements the "no trades
-    on old queued news" rule — the spike is gone, so even a correct
-    analysis won't catch the move.
+    the LLM call), if the announcement is older than
+    MAX_NEWS_AGE_SECONDS we skip the DeepSeek call, write a placeholder
+    analyses row tagged `reason="stale_news"`, and return. This
+    implements the "no trades on old queued news" rule — the spike is
+    gone, so even a correct analysis won't catch the move.
+
+    WHICH CLOCK (see `evaluate_staleness`, NEWS_AGE_FROM_RECEIPT):
+      filed_at (default/legacy) — `now - announcement.filed_at`. Note
+        this bundles in the EXCHANGE's own publish lag (measured on live
+        data: median ~35s, p90 8-16 min), so it rejects filings for a
+        delay the bot did not cause and that cost no alpha.
+      received_at (opt-in)      — `now - announcement.received_at`, i.e.
+        only the delay the bot is responsible for. Alpha decays from
+        PUBLICATION, not submission: before the exchange publishes, no
+        one can trade it, so the price hasn't moved. Guarded by
+        MAX_NEWS_AGE_ABSOLUTE_SECONDS so a monitor outage (whole backlog
+        "received just now") can't fake freshness.
   - STARTUP SWEEP: when `Service.start()` runs we also pre-mark every
     announcement older than the threshold that has no analyses row.
     This protects against replay paths (a future manual replay tool, a
@@ -154,7 +166,106 @@ def invalidate_pipeline_caches() -> None:
 CHANNEL_NEW_SIGNAL = "signals.new"
 
 # Re-export so callers (e.g. the T3 ws relay) can find it.
-__all__ = ["Service", "CHANNEL_NEW_SIGNAL", "process_announcement"]
+__all__ = [
+    "Service",
+    "CHANNEL_NEW_SIGNAL",
+    "process_announcement",
+    "evaluate_staleness",
+]
+
+
+def _as_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """Normalise a DB datetime to UTC-aware.
+
+    Our SQLite schema stores naive datetimes and the project-wide
+    convention is that a naive datetime IS UTC (monitors normalise
+    before insert).
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def evaluate_staleness(
+    *,
+    filed_at: Optional[datetime],
+    received_at: Optional[datetime],
+    now: datetime,
+    max_age_s: int,
+    from_receipt: bool = False,
+    absolute_max_age_s: int = 1800,
+) -> tuple[bool, Optional[float], dict[str, Any]]:
+    """Decide whether an announcement is too old to trade. PURE.
+
+    Returns ``(is_stale, age_seconds, context)`` where `context` is the
+    blob persisted onto the placeholder analysis (and logged), so the
+    reason a filing was dropped is always auditable.
+
+    TWO CLOCKS
+    ----------
+    legacy (from_receipt=False): age = now - filed_at.
+        `filed_at` is the exchange's stated filing time, which bundles in
+        the exchange's own publish lag. Kept as the default so existing
+        behavior is untouched until the operator opts in.
+
+    receipt (from_receipt=True): age = now - received_at, i.e. how long
+        the bot has sat on news it could actually SEE. Alpha decays from
+        PUBLICATION, not submission — before the exchange publishes a
+        filing nobody can trade it, so the price has not moved and the
+        edge is intact no matter how long the exchange took.
+
+        Guarded by `absolute_max_age_s` on filed_at, which is what stops
+        the receipt clock from being fooled: if the monitor was down for
+        an hour, the whole backlog is "received just now" and would look
+        fresh. The absolute ceiling rejects it. Set 0 to disable the
+        ceiling (not advised).
+
+    Fail-safe: with no usable timestamp on the chosen clock we do NOT
+    block (the legacy gate also skipped when filed_at was None) — the
+    downstream pipeline deadline and risk engine still apply.
+    """
+    ctx: dict[str, Any] = {
+        "clock": "received_at" if from_receipt else "filed_at",
+        "max_age_seconds": max_age_s,
+    }
+    if filed_at is not None:
+        ctx["filed_at"] = filed_at.isoformat()
+    if received_at is not None:
+        ctx["received_at"] = received_at.isoformat()
+
+    filed_age = (now - filed_at).total_seconds() if filed_at is not None else None
+    recv_age = (now - received_at).total_seconds() if received_at is not None else None
+    if filed_age is not None:
+        ctx["filed_age_seconds"] = round(filed_age, 2)
+    if recv_age is not None:
+        ctx["received_age_seconds"] = round(recv_age, 2)
+
+    if not from_receipt:
+        ctx["age_seconds"] = round(filed_age, 2) if filed_age is not None else None
+        if filed_age is not None and filed_age > max_age_s:
+            ctx["breached"] = "filed_age"
+            return True, filed_age, ctx
+        return False, filed_age, ctx
+
+    # --- receipt clock -------------------------------------------------
+    # Fall back to filed_at when the row carries no received_at (older
+    # rows / hand-inserted fixtures) so the gate never silently opens.
+    age = recv_age if recv_age is not None else filed_age
+    ctx["age_seconds"] = round(age, 2) if age is not None else None
+    if age is not None and age > max_age_s:
+        ctx["breached"] = "received_age" if recv_age is not None else "filed_age"
+        return True, age, ctx
+    if (
+        absolute_max_age_s > 0
+        and filed_age is not None
+        and filed_age > absolute_max_age_s
+    ):
+        ctx["breached"] = "absolute_age"
+        ctx["absolute_max_age_seconds"] = absolute_max_age_s
+        return True, age, ctx
+    return False, age, ctx
 
 
 def _default_session_factory() -> Callable[[], Session]:
@@ -236,18 +347,30 @@ class Service:
 
         settings = get_settings()
         max_age_s = int(getattr(settings, "MAX_NEWS_AGE_SECONDS", 90))
+        from_receipt = bool(getattr(settings, "NEWS_AGE_FROM_RECEIPT", False))
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=max_age_s)
 
         with self._session_factory() as session:
             # Find every announcement older than cutoff that has NO
             # analyses row yet. SQLite stores naive UTC datetimes, so
             # we compare against a naive cutoff (assumed UTC).
+            #
+            # The sweep MUST use the same clock as the live gate
+            # (evaluate_staleness). On the receipt clock a backlog row is
+            # old because it was RECEIVED before the restart — while a
+            # filing the exchange published late is received just now and
+            # must NOT be pre-marked. Sweeping by filed_at under the
+            # receipt clock would kill exactly the rows the clock exists
+            # to rescue.
             cutoff_naive = cutoff.replace(tzinfo=None)
+            age_col = (
+                Announcement.received_at if from_receipt else Announcement.filed_at
+            )
             stale_rows = (
                 session.execute(
                     select(Announcement)
-                    .where(Announcement.filed_at.isnot(None))
-                    .where(Announcement.filed_at < cutoff_naive)
+                    .where(age_col.isnot(None))
+                    .where(age_col < cutoff_naive)
                 )
                 .scalars()
                 .all()
@@ -440,35 +563,36 @@ class Service:
         # (same shape as a real failure path) so a future replay won't
         # re-trigger this announcement, and we log the skip.
         max_age_s = int(getattr(settings, "MAX_NEWS_AGE_SECONDS", 90))
-        filed_at = announcement.filed_at
-        age_seconds: Optional[float] = None
-        if filed_at is not None:
-            # filed_at comes back from the DB as a naive datetime in our
-            # SQLite schema; treat naive as UTC (matches monitor + DB
-            # convention) before subtracting now.
-            if filed_at.tzinfo is None:
-                filed_at = filed_at.replace(tzinfo=timezone.utc)
-            age_seconds = (datetime.now(timezone.utc) - filed_at).total_seconds()
-            if age_seconds > max_age_s:
-                log.warning(
-                    "analyzer.stale_news_skipped",
-                    announcement_id=announcement_id,
-                    symbol=announcement.symbol,
-                    age_seconds=round(age_seconds, 2),
-                    max_age_seconds=max_age_s,
-                    headline=announcement.headline,
-                )
-                await loop.run_in_executor(
-                    None, _store_failed_analysis,
-                    self._session_factory, announcement_id,
-                    "stale_news",
-                    {
-                        "age_seconds": round(age_seconds, 2),
-                        "max_age_seconds": max_age_s,
-                        "filed_at": filed_at.isoformat(),
-                    },
-                )
-                return None
+        filed_at = _as_utc(announcement.filed_at)
+        received_at = _as_utc(announcement.received_at)
+        stale, age_seconds, stale_ctx = evaluate_staleness(
+            filed_at=filed_at,
+            received_at=received_at,
+            now=datetime.now(timezone.utc),
+            max_age_s=max_age_s,
+            from_receipt=bool(getattr(settings, "NEWS_AGE_FROM_RECEIPT", False)),
+            absolute_max_age_s=int(
+                getattr(settings, "MAX_NEWS_AGE_ABSOLUTE_SECONDS", 1800)
+            ),
+        )
+        if stale:
+            log.warning(
+                "analyzer.stale_news_skipped",
+                announcement_id=announcement_id,
+                symbol=announcement.symbol,
+                age_seconds=round(age_seconds, 2) if age_seconds is not None else None,
+                max_age_seconds=max_age_s,
+                clock=stale_ctx.get("clock"),
+                breached=stale_ctx.get("breached"),
+                headline=announcement.headline,
+            )
+            await loop.run_in_executor(
+                None, _store_failed_analysis,
+                self._session_factory, announcement_id,
+                "stale_news",
+                stale_ctx,
+            )
+            return None
 
         # Step 1.7: PRE-LLM NOISE FILTER. Clearly-administrative filings
         # (trading-window notices, compliance certificates, newspaper
