@@ -980,6 +980,58 @@ button.ghost:hover { border-color: var(--accent); }
 /* =========================================================================
    23. Status bar (fixed footer — Bloomberg-style)
    ========================================================================= */
+/* ---- Workflow bar — the clickable pipeline strip at the top of every
+   page: NEWS › AI › RULES › RISK › EXEC › DATA. Same Bloomberg idiom as
+   the bottom status bar, but each segment is a nav button with a health
+   dot. ---- */
+.workflowbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: 6px 12px;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.wf-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  color: var(--text-dim);
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  cursor: pointer;
+  transition: background .15s, border-color .15s;
+}
+.wf-chip:hover { background: var(--bg-hover, rgba(255,255,255,0.05)); border-color: var(--border); }
+.wf-chip.active { border-color: var(--border); background: var(--bg-hover, rgba(255,255,255,0.04)); }
+.wf-chip .wf-label { color: var(--text); font-weight: 700; }
+.wf-chip .wf-detail { color: var(--text-dim); font-weight: 600; }
+.wf-chip .wf-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.wf-chip.ok   .wf-dot { background: var(--green); }
+.wf-chip.warn .wf-dot { background: var(--amber); }
+.wf-chip.err  .wf-dot { background: var(--red); animation: blink 1s steps(2) infinite; }
+.wf-chip.off  .wf-dot { background: var(--text-faint); }
+.wf-chip.err  .wf-detail { color: var(--red); }
+.wf-chip.warn .wf-detail { color: var(--amber); }
+.wf-chip.ok   .wf-detail { color: var(--green); }
+.wf-arrow { color: var(--text-faint); padding: 0 2px; }
+
 .statusbar {
   height: var(--statusbar-h);
   display: flex;

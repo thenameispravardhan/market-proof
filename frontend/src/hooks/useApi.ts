@@ -461,6 +461,30 @@ export interface FyersStatus {
   reason: string | null;
 }
 
+// Risk-engine snapshot (kill switch, breaker halts, today's entry
+// budget). Powers the WorkflowBar RISK chip.
+export interface RiskStateSnapshot {
+  trading_disabled: boolean;
+  disabled_reason: string | null;
+  halted_until: string | null;
+  current_risk_pct: number | null;
+  equity: number;
+  trades_today: number;
+  consecutive_losers: number;
+  entries_allowed: boolean;
+  entry_block_reason: string | null;
+}
+
+export function useRiskState() {
+  return useQuery<RiskStateSnapshot>({
+    queryKey: ["risk-state"],
+    queryFn: () => api.get("/api/risk/state"),
+    refetchInterval: 15000,
+    refetchIntervalInBackground: false,
+    retry: false,
+  });
+}
+
 // Polls the Fyers connection status. Used by the "Connect Fyers"
 // banner and the dashboard's status bar.
 export function useFyersStatus() {

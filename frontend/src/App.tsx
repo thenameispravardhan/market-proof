@@ -10,6 +10,7 @@ import {
   type IndexQuote,
 } from "./hooks/useApi";
 import { useTheme } from "./hooks/useTheme";
+import { WorkflowBar } from "./components/common/WorkflowBar";
 
 // Persisted sidebar open/closed state. Default open. Stored in
 // localStorage so the choice survives reloads.
@@ -305,6 +306,7 @@ export default function App() {
             ☰
           </button>
         )}
+        <WorkflowBar tab={tab} navigate={navigate} />
         <div className="content-scroll">
           <Suspense fallback={<div className="empty loading">Loading…</div>}>
             <PageContent tab={tab} />
