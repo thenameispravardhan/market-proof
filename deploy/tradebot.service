@@ -1,0 +1,32 @@
+# systemd unit for the AI News Trading Bot.
+# Template — deploy/setup.sh fills in __PROJECT_ROOT__ / __RUN_USER__ and
+# installs it to /etc/systemd/system/tradebot.service.
+#
+# Deliberate choices:
+#   - Binds to 127.0.0.1 only; Caddy terminates TLS + basic auth in front.
+#   - NO --proxy-headers: the /ws endpoint enforces a loopback-only client
+#     check (app/api/ws.py), and Caddy connects from 127.0.0.1. Enabling
+#     proxy headers would rewrite the client IP and break the WebSocket.
+#   - Single worker, always: the app is one stateful process (in-memory
+#     event bus, schedulers, Fyers sockets). Multiple workers would each
+#     start their own monitors and place duplicate trades.
+#   - WorkingDirectory matters: DATABASE_URL is ./data/trading.db and the
+#     Fyers SDK writes its socket logs relative to cwd.
+
+[Unit]
+Description=AI News Trading Bot (FastAPI + uvicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=__RUN_USER__
+WorkingDirectory=__PROJECT_ROOT__
+ExecStart=__PROJECT_ROOT__/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

@@ -125,6 +125,18 @@ POSIX equivalents: `scripts/run.sh`, `scripts/dev.sh`.
 
 ---
 
+## Deploying to AWS Lightsail
+
+The bot can run 24/7 on a small Lightsail instance in Mumbai (ap-south-1)
+behind a Caddy reverse proxy (HTTPS + basic auth) while the app itself stays
+on `127.0.0.1`. The full runbook — provisioning, DNS, data migration, Fyers
+redirect/IP-whitelist changes, daily ops — is in
+[docs/DEPLOY_AWS.md](docs/DEPLOY_AWS.md); the server artifacts (bootstrap
+script, systemd unit, Caddyfile, update/backup scripts) live in
+[deploy/](deploy/).
+
+---
+
 ## Project structure
 
 ```

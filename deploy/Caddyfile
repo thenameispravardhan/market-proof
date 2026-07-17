@@ -1,0 +1,29 @@
+# Caddy reverse proxy for the AI News Trading Bot.
+# Template — deploy/setup.sh fills in __DOMAIN__ / __BASIC_USER__ /
+# __BASIC_HASH__ and installs it to /etc/caddy/Caddyfile.
+#
+# Everything is protected by basic auth EXCEPT the Fyers order postback,
+# which is called by Fyers' servers (they can't send credentials). That
+# endpoint is protected by its own ?token=<FYERS_POSTBACK_SECRET> check
+# inside the app. Note the matcher is the exact path — the config
+# endpoints under /api/fyers/postback/config stay behind auth.
+#
+# TLS certificates are provisioned automatically via Let's Encrypt as
+# soon as the domain's A record points at this server.
+
+__DOMAIN__ {
+	encode gzip
+
+	@postback path /api/fyers/postback
+	handle @postback {
+		reverse_proxy 127.0.0.1:8000
+	}
+
+	handle {
+		basic_auth {
+			__BASIC_USER__ __BASIC_HASH__
+		}
+		# Same-origin SPA + API + /ws WebSocket upgrade all pass through.
+		reverse_proxy 127.0.0.1:8000
+	}
+}
