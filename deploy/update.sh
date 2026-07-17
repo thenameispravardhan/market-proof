@@ -39,12 +39,15 @@ echo "==> Seeding default prompt templates"
 
 echo "==> Restarting tradebot"
 sudo systemctl restart tradebot
-sleep 3
-systemctl --no-pager --lines=5 status tradebot || true
 
-if curl -fsS http://127.0.0.1:8000/api/health >/dev/null 2>&1; then
-    echo "==> Health check: OK"
-else
-    echo "==> Health check: NOT RESPONDING — journalctl -u tradebot -n 50 --no-pager" >&2
-    exit 1
-fi
+# Startup takes ~15s with a full DB (init + instrument master + services);
+# poll instead of a single premature probe.
+for i in $(seq 1 12); do
+    if curl -fsS http://127.0.0.1:8000/api/health >/dev/null 2>&1; then
+        echo "==> Health check: OK (after ~$((i * 5))s)"
+        exit 0
+    fi
+    sleep 5
+done
+echo "==> Health check: NOT RESPONDING after 60s — journalctl -u tradebot -n 50 --no-pager" >&2
+exit 1
