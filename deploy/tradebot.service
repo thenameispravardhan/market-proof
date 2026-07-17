@@ -4,9 +4,11 @@
 #
 # Deliberate choices:
 #   - Binds to 127.0.0.1 only; Caddy terminates TLS + basic auth in front.
-#   - NO --proxy-headers: the /ws endpoint enforces a loopback-only client
-#     check (app/api/ws.py), and Caddy connects from 127.0.0.1. Enabling
-#     proxy headers would rewrite the client IP and break the WebSocket.
+#   - --no-proxy-headers is REQUIRED: uvicorn processes X-Forwarded-For
+#     by default and trusts 127.0.0.1, so Caddy's forwarded headers would
+#     rewrite each request's client IP to the browser's public IP and trip
+#     the loopback-only guard on /ws (app/api/ws.py) — every dashboard
+#     WebSocket would be rejected with 403.
 #   - Single worker, always: the app is one stateful process (in-memory
 #     event bus, schedulers, Fyers sockets). Multiple workers would each
 #     start their own monitors and place duplicate trades.
@@ -22,7 +24,7 @@ Wants=network-online.target
 Type=exec
 User=__RUN_USER__
 WorkingDirectory=__PROJECT_ROOT__
-ExecStart=__PROJECT_ROOT__/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+ExecStart=__PROJECT_ROOT__/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --no-proxy-headers
 Restart=always
 RestartSec=3
 TimeoutStopSec=30

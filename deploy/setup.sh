@@ -67,6 +67,16 @@ fi
 echo "==> Setting system timezone to Asia/Kolkata"
 sudo timedatectl set-timezone Asia/Kolkata
 
+# ---- 2b. prefer IPv4 for outbound connections ------------------------------
+# The instance is dual-stack; Fyers whitelists the IPv4 static IP, and an
+# order placed over IPv6 is rejected with -50. Pin IPv4 preference.
+if ! grep -q '^precedence ::ffff:0:0/96 100' /etc/gai.conf 2>/dev/null; then
+    echo "==> Preferring IPv4 for outbound connections (/etc/gai.conf)"
+    echo 'precedence ::ffff:0:0/96 100' | sudo tee -a /etc/gai.conf >/dev/null
+else
+    echo "==> IPv4 outbound preference already set"
+fi
+
 # ---- 3. system packages ---------------------------------------------------
 echo "==> Installing system packages"
 export DEBIAN_FRONTEND=noninteractive

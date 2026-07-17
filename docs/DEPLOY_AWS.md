@@ -20,9 +20,18 @@ Deliberate decisions baked into the config (don't undo them):
 - **The app never binds publicly.** It stays on `127.0.0.1:8000`; Caddy is
   the only public listener. The app has no authentication of its own — the
   proxy's basic auth is the lock on the door.
-- **No `--proxy-headers` on uvicorn.** The `/ws` WebSocket endpoint enforces
-  a loopback-only client check; Caddy connects from `127.0.0.1`, which
-  passes. Proxy headers would rewrite the client IP and break it.
+- **uvicorn runs with `--no-proxy-headers`.** uvicorn processes
+  `X-Forwarded-For` by default and trusts `127.0.0.1`, so Caddy's forwarded
+  headers would rewrite each request's client IP to the browser's public
+  IP — tripping the loopback-only guard on `/ws` and rejecting every
+  dashboard WebSocket with 403. With the flag, the app sees Caddy's
+  `127.0.0.1` and the guard passes.
+- **Outbound traffic must prefer IPv4.** The instance is dual-stack; Fyers
+  whitelists the IPv4 static IP, so an order placed over IPv6 is rejected
+  with `-50` naming an IPv6 address. setup.sh pins IPv4 preference via
+  `/etc/gai.conf` (`precedence ::ffff:0:0/96 100`); switching the instance
+  to IPv4-only networking in Lightsail achieves the same thing at the
+  network level.
 - **Single uvicorn worker, always.** The app is one stateful process
   (in-memory event bus, schedulers, Fyers sockets). Two workers = duplicate
   monitors = duplicate trades.
@@ -191,12 +200,21 @@ At [myapi.fyers.in](https://myapi.fyers.in), on your app:
 
 ## Troubleshooting
 
-- **WebSocket fails with 401** — some browsers don't attach cached basic-auth
-  credentials to the `wss://` handshake. Fix: in `/etc/caddy/Caddyfile` add a
-  `@ws path /ws` matcher with its own `handle @ws { reverse_proxy 127.0.0.1:8000 }`
-  block above the authenticated `handle` (the socket is read-only event
-  streaming; control stays behind auth), then `sudo systemctl reload caddy`.
-- **Fyers error `-50`** — server IP not whitelisted in the Fyers dashboard.
+- **Dashboard shows "WS CLOSED" and the app logs `ws.reject_non_loopback`
+  with the browser's IP** — uvicorn is honoring Caddy's proxy headers.
+  Ensure the systemd ExecStart includes `--no-proxy-headers`, then
+  `sudo systemctl daemon-reload && sudo systemctl restart tradebot`.
+- **WebSocket fails with 401 from Caddy** — some browsers don't attach
+  cached basic-auth credentials to the `wss://` handshake. Fix: in
+  `/etc/caddy/Caddyfile` add a `@ws path /ws` matcher with its own
+  `handle @ws { reverse_proxy 127.0.0.1:8000 }` block above the
+  authenticated `handle` (the socket is read-only event streaming; control
+  stays behind auth), then `sudo systemctl reload caddy`.
+- **Fyers error `-50`** — the request's source IP isn't whitelisted in the
+  Fyers dashboard. If the message names an **IPv6** address, the server
+  reached Fyers over IPv6 instead of the whitelisted IPv4 static IP — check
+  `/etc/gai.conf` has `precedence ::ffff:0:0/96 100` (setup.sh adds it), or
+  switch the instance to IPv4-only networking in Lightsail.
 - **OAuth popup lands on an error** — redirect URI mismatch between `.env`
   and the Fyers dashboard, or you started the login from a different origin
   than the one the state was issued on (the CSRF state lives in the app
