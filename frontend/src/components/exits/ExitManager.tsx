@@ -31,7 +31,7 @@ interface NumSpec {
 const CARD_FIELDS: Record<string, NumSpec[]> = {
   entry: [
     {
-      key: "MAX_ENTRY_DRIFT_PCT",
+      key: "ENTRY_MAX_DRIFT_PCT",
       label: "Max entry drift (%)",
       hint: "Anti-chase: if the price already ran more than this past the signal's intended entry, the trade is skipped instead of chased.",
       min: 0.1, max: 10, step: 0.1,
@@ -353,7 +353,7 @@ export function ExitManager() {
     <div>
       <LifecycleStrip v={values} />
 
-      <Card title="1 · Entry Quality" keys={["MAX_ENTRY_DRIFT_PCT"]} values={values}>
+      <Card title="1 · Entry Quality" keys={["ENTRY_MAX_DRIFT_PCT"]} values={values}>
         {F.entry.map((s) => <NumRow key={s.key} spec={s} values={values} onChange={setNum} />)}
       </Card>
 

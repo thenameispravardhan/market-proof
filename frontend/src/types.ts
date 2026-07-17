@@ -281,7 +281,7 @@ export interface GlobalSettings {
   // ---- Exit Manager (Exits page) ----------------------------------------
   // Every exit-engine knob. Defaults mirror the backend; the Exits page is
   // the intended editor. See app/execution/trade_manager.py for behavior.
-  MAX_ENTRY_DRIFT_PCT: number;
+  ENTRY_MAX_DRIFT_PCT: number;
   DEFAULT_SL_MIN_PCT: number;
   DEFAULT_SL_SMALLCAP_PCT: number;
   ATR_ENABLED: boolean;

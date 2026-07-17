@@ -262,7 +262,7 @@ def test_exit_keys_roundtrip_and_hot_apply(client: TestClient) -> None:
     from app.config import get_settings
 
     payload = {
-        "MAX_ENTRY_DRIFT_PCT": 2.0,
+        "ENTRY_MAX_DRIFT_PCT": 2.0,
         "ATR_STOP_MULT": 2.5,
         "BREAKEVEN_AT_PCT": 1.5,
         "TRAIL_DISTANCE_R": 0.75,

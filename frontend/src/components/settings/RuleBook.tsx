@@ -62,7 +62,7 @@ const BREAKERS: Array<{ name: string; trips: string }> = [
 // trade manager).
 const GUARDS: Array<{ name: string; rule: string; knob?: string }> = [
   { name: "Staleness gate", rule: "news older than the freshness limit never trades", knob: "MAX_NEWS_AGE_SECONDS" },
-  { name: "Entry drift (anti-chase)", rule: "price already ran past the intended entry — skip", knob: "MAX_ENTRY_DRIFT_PCT" },
+  { name: "Entry drift (anti-chase)", rule: "price already ran past the intended entry — skip", knob: "ENTRY_MAX_DRIFT_PCT" },
   { name: "No live price", rule: "Fyers feed cold — block; never fill at a synthetic price" },
   { name: "Market hours", rule: "no entries outside the session entry window" },
   { name: "Time exit", rule: "positions force-closed after the max hold", knob: "MAX_HOLD_SECONDS" },

@@ -104,8 +104,10 @@ _GLOBAL_KEYS: dict[str, tuple[type, Any]] = {
     # ---- Exit Manager (UI page) ------------------------------------------
     # Every exit-engine knob, exposed for frontend-only control. Defaults
     # mirror app/config.py so exposing them changes nothing by itself.
-    # Entry quality.
-    "MAX_ENTRY_DRIFT_PCT": (float, 1.5),
+    # Entry quality. NOTE the engine's real key is ENTRY_MAX_DRIFT_PCT
+    # (config.py / entry_manager.py) — .env.example historically documented
+    # a "MAX_ENTRY_DRIFT_PCT" that nothing reads.
+    "ENTRY_MAX_DRIFT_PCT": (float, 1.5),
     # Initial stop-loss.
     "DEFAULT_SL_MIN_PCT": (float, 1.0),
     "DEFAULT_SL_SMALLCAP_PCT": (float, 1.5),
