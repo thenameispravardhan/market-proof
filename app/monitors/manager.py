@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from typing import Optional
 
+from app.config import get_settings
 from app.logging_config import get_logger
 from app.monitors.base import BaseMonitor
 from app.monitors.bse import BSEMonitor, parse_bse_payload
@@ -37,7 +38,15 @@ class MonitorManager:
         if nse_monitor is None:
             nse_monitor = NSEMonitor()
         if bse_monitor is None:
-            bse_monitor = BSEMonitor()
+            # Stagger BSE by half the poll interval so the two exchanges
+            # are polled in anti-phase: a dual-listed filing becomes
+            # visible to SOME monitor within ~interval/2 instead of a
+            # full interval when both poll in lockstep. The offset is
+            # computed once at construction; the per-tick jitter keeps
+            # the phases from re-locking if the interval changes later.
+            bse_monitor = BSEMonitor(
+                start_offset=float(get_settings().POLL_INTERVAL_SECONDS) / 2.0
+            )
         self._nse = nse_monitor
         self._bse = bse_monitor
         self._started = False

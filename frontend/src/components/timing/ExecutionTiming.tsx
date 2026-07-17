@@ -158,6 +158,67 @@ export function ExecutionTiming() {
         )}
       </div>
 
+      {/* ---- detection race: NSE vs BSE ------------------------------- */}
+      <div className="widget" style={{ marginTop: 16 }}>
+        <h3>
+          Detection race — which exchange publishes faster{" "}
+          <span className="mono" style={{ color: "var(--muted, #8b949e)" }}>
+            (last {data?.detection_samples ?? 0} filings)
+          </span>
+        </h3>
+        {data && Object.keys(data.detection_by_exchange).length > 0 ? (
+          (() => {
+            const entries = Object.entries(data.detection_by_exchange);
+            const raceMax = Math.max(1, ...entries.map(([, st]) => st.p50 ?? 0));
+            const colors: Record<string, string> = { NSE: "#f0883e", BSE: "#a371f7" };
+            return (
+              <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 8 }}>
+                {entries.map(([exch, st]) => (
+                  <div key={exch}>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
+                      <span style={{ fontWeight: 600 }}>{exch}</span>
+                      <span className="mono">
+                        p50 {ms(st.p50)} · p95 {ms(st.p95)} · n={st.count}
+                      </span>
+                    </div>
+                    <div style={barTrack}>
+                      <div
+                        style={{
+                          width: `${((st.p50 ?? 0) / raceMax) * 100}%`,
+                          height: "100%",
+                          background: colors[exch] ?? "#8b949e",
+                          transition: "width .3s",
+                        }}
+                      />
+                    </div>
+                  </div>
+                ))}
+                <p className="field-hint" style={{ marginTop: 0 }}>
+                  Publish lag per exchange (filed → scraped), over every recent
+                  filing. Shorter bar = faster publisher. Dual-listed stocks are
+                  effectively detected at the FASTER exchange&apos;s speed — the
+                  monitors race, first one in wins.
+                </p>
+                {Object.keys(data.monitor_ticks).length > 0 && (
+                  <p className="field-hint" style={{ marginTop: 0 }}>
+                    Bot&apos;s own share:{" "}
+                    {Object.entries(data.monitor_ticks)
+                      .map(
+                        ([exch, t]) =>
+                          `${exch} polls every ~${t.last_gap_s ?? "?"}s, fetch ${ms(t.avg_tick_ms)}`,
+                      )
+                      .join(" · ")}{" "}
+                    — everything beyond that is the exchange&apos;s publish lag.
+                  </p>
+                )}
+              </div>
+            );
+          })()
+        ) : (
+          <p className="empty">No filings with timestamps yet.</p>
+        )}
+      </div>
+
       {/* ---- analysis sub-breakdown ----------------------------------- */}
       <div className="widget" style={{ marginTop: 16 }}>
         <h3>

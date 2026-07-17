@@ -395,3 +395,95 @@ async def test_base_monitor_stops_cleanly(monkeypatch):
     mon.stop()
     await asyncio.wait_for(mon.wait_until_stopped(), timeout=2.0)
     assert task.done()
+
+
+# -------------------------------------------------------------------------
+# Start offset (NSE/BSE anti-phase staggering) + tick telemetry
+# -------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_start_offset_delays_first_tick(db_session):
+    """With start_offset the monitor must NOT fetch before the offset
+    elapses, and must fetch after it."""
+    fetcher = _StubFetcher([""] * 50)
+    mon = BaseMonitor(
+        fetcher=fetcher,
+        parser=_stub_parser([]),
+        poll_interval=0.01,
+        source_url="https://stub",
+        start_offset=0.30,
+    )
+    mon.exchange = "STUB-OFF"
+    mon.start()
+    try:
+        await asyncio.sleep(0.10)
+        assert fetcher.call_count == 0, "fetched during the start offset"
+        await asyncio.sleep(0.40)
+        assert fetcher.call_count >= 1, "never fetched after the offset"
+    finally:
+        mon.stop()
+        await mon.wait_until_stopped()
+
+
+@pytest.mark.asyncio
+async def test_start_offset_stop_during_offset_exits(db_session):
+    """stop() during the offset must exit promptly without a fetch."""
+    fetcher = _StubFetcher([""])
+    mon = BaseMonitor(
+        fetcher=fetcher,
+        parser=_stub_parser([]),
+        poll_interval=0.01,
+        source_url="https://stub",
+        start_offset=30.0,
+    )
+    mon.exchange = "STUB-OFF2"
+    mon.start()
+    await asyncio.sleep(0.05)
+    mon.stop()
+    await asyncio.wait_for(mon.wait_until_stopped(), timeout=2.0)
+    assert fetcher.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_tick_stats_recorded(db_session):
+    """Successful ticks publish rolling telemetry into MONITOR_TICK_STATS."""
+    from app.monitors.base import MONITOR_TICK_STATS
+
+    MONITOR_TICK_STATS.pop("STUB-STATS", None)
+    fetcher = _StubFetcher([""] * 50)
+    mon = BaseMonitor(
+        fetcher=fetcher,
+        parser=_stub_parser([]),
+        poll_interval=0.01,
+        source_url="https://stub",
+    )
+    mon.exchange = "STUB-STATS"
+    mon.start()
+    try:
+        for _ in range(100):
+            await asyncio.sleep(0.02)
+            if MONITOR_TICK_STATS.get("STUB-STATS", {}).get("ticks_sampled", 0) >= 2:
+                break
+    finally:
+        mon.stop()
+        await mon.wait_until_stopped()
+    stats = MONITOR_TICK_STATS.get("STUB-STATS")
+    assert stats is not None
+    assert stats["ticks_sampled"] >= 2
+    assert stats["avg_tick_ms"] >= 0.0
+    # The 2nd+ tick has a measured gap close to the poll interval.
+    assert stats["last_gap_s"] is not None
+
+
+def test_manager_staggers_bse_by_half_interval():
+    """The default MonitorManager gives BSE a start offset of half the
+    live poll interval and NSE none."""
+    from app.monitors.manager import MonitorManager
+
+    m = MonitorManager()
+    assert m.nse._start_offset == 0.0
+    expected = float(
+        __import__("app.config", fromlist=["get_settings"]).get_settings().POLL_INTERVAL_SECONDS
+    ) / 2.0
+    assert m.bse._start_offset == pytest.approx(expected)

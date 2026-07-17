@@ -209,6 +209,19 @@ def test_execution_latency_stage_breakdown(client, db_session, isolated_db):
     )
     db_session.commit()
 
+    # A BSE announcement with a faster publish lag — no trade attached;
+    # it must still show up in the per-exchange detection race.
+    db_session.add(
+        Announcement(
+            symbol="TCS", exchange="BSE", event_type="ORDER_WIN",
+            headline="TCS ORDER_WIN filing",
+            filed_at=t0,
+            received_at=t0 + timedelta(seconds=3),  # BSE detection = 3000 ms
+            content_hash="exec-lat-2",
+        )
+    )
+    db_session.commit()
+
     r = client.get("/api/metrics/execution-latency?window=50")
     assert r.status_code == 200
     body = r.json()
@@ -221,6 +234,14 @@ def test_execution_latency_stage_breakdown(client, db_session, isolated_db):
     # Per-trade detail row carries every stage for the table.
     assert body["series"][0]["symbol"] == "RELIANCE"
     assert body["series"][0]["detection_ms"] == pytest.approx(8000.0)
+    # Detection race: per-exchange publish-lag percentiles over ALL
+    # recent announcements (not just traded ones).
+    race = body["detection_by_exchange"]
+    assert race["NSE"]["p50"] == pytest.approx(8000.0)
+    assert race["BSE"]["p50"] == pytest.approx(3000.0)
+    assert body["detection_samples"] == 2
+    # monitor_ticks is present (may be empty when no monitor ran in-test).
+    assert "monitor_ticks" in body
 
 
 def test_execution_latency_ignores_unfilled_and_empty(client, db_session, isolated_db):

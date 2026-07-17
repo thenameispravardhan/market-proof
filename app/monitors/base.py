@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional, Union
@@ -56,6 +58,12 @@ def _default_session_factory():
     return SessionLocal()
 
 log = get_logger(__name__)
+
+# Rolling per-exchange tick telemetry (in-process; one monitor per
+# exchange per process). The metrics API reads this to show the
+# BOT-side share of detection latency (poll wait + fetch/parse/store)
+# next to the exchange-side publish lag it cannot control.
+MONITOR_TICK_STATS: dict[str, dict[str, Any]] = {}
 
 # Channel for "newly inserted" announcements. Subscribers (T3 analyzer
 # etc.) bind to this and process the payload.
@@ -188,6 +196,7 @@ class BaseMonitor:
         poll_interval: Optional[float] = None,
         source_url: Optional[str] = None,
         session_factory: Optional[Callable[[], Session]] = None,
+        start_offset: float = 0.0,
     ) -> None:
         self._fetcher = fetcher
         self._parser = parser
@@ -210,6 +219,15 @@ class BaseMonitor:
         # avoiding redundant DB existence checks for 99% of the
         # day-long response window.
         self._last_seen: Optional[datetime] = None
+        # Phase offset before the FIRST tick. The manager staggers the
+        # NSE and BSE monitors by half the poll interval so a dual-listed
+        # filing is seen by SOME monitor within ~interval/2 instead of a
+        # full interval when both poll in lockstep.
+        self._start_offset = max(0.0, float(start_offset))
+        # Tick telemetry: rolling fetch+parse+store durations feeding
+        # MONITOR_TICK_STATS (see module docstring on that dict).
+        self._tick_durations: deque[float] = deque(maxlen=50)
+        self._last_tick_start: Optional[float] = None
 
     @property
     def _poll_interval(self) -> float:
@@ -270,11 +288,32 @@ class BaseMonitor:
             exchange=self.exchange,
             source_url=self.source_url,
             poll_interval_s=self._poll_interval,
+            start_offset_s=self._start_offset,
         )
+        # Phase stagger: wait out the offset before the first tick
+        # (cancellable so stop() during the offset exits immediately).
+        if self._start_offset > 0:
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(), timeout=self._start_offset
+                )
+                return  # stop was signalled during the offset
+            except asyncio.TimeoutError:
+                pass
         try:
             while not self._stop_event.is_set():
                 try:
+                    t_tick = time.monotonic()
+                    gap_s = (
+                        t_tick - self._last_tick_start
+                        if self._last_tick_start is not None
+                        else None
+                    )
+                    self._last_tick_start = t_tick
                     await self._tick()
+                    self._record_tick_stats(
+                        (time.monotonic() - t_tick) * 1000.0, gap_s
+                    )
                     # Success: reset backoff state.
                     self._consecutive_failures = 0
                     self._current_backoff = reset_backoff()
@@ -345,6 +384,19 @@ class BaseMonitor:
                         pass  # interval elapsed, tick again
         finally:
             log.info("monitor.stop", exchange=self.exchange)
+
+    def _record_tick_stats(self, tick_ms: float, gap_s: Optional[float]) -> None:
+        """Publish rolling tick telemetry into MONITOR_TICK_STATS."""
+        self._tick_durations.append(tick_ms)
+        MONITOR_TICK_STATS[self.exchange] = {
+            "last_tick_ms": round(tick_ms, 1),
+            "avg_tick_ms": round(
+                sum(self._tick_durations) / len(self._tick_durations), 1
+            ),
+            "ticks_sampled": len(self._tick_durations),
+            "last_gap_s": round(gap_s, 2) if gap_s is not None else None,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
 
     async def _tick(self) -> None:
         """One poll cycle: fetch -> parse -> early-exit -> insert -> publish -> webhook."""

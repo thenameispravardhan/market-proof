@@ -264,10 +264,43 @@ def execution_latency(
     def _vals(key: str) -> list[float]:
         return [float(r[key]) for r in rows if r[key] is not None]
 
+    # ---- detection race: per-exchange publish lag ----------------------
+    # Computed over recent ANNOUNCEMENTS (not just traded ones) — far more
+    # samples, and it answers "which exchange publishes faster?" directly.
+    # received_at - filed_at ≈ exchange publish lag + our poll wait.
+    recent_anns = (
+        db.execute(
+            select(Announcement)
+            .where(Announcement.filed_at.is_not(None))
+            .order_by(Announcement.id.desc())
+            .limit(300)
+        )
+        .scalars()
+        .all()
+    )
+    by_exchange: dict[str, list[float]] = {}
+    for n in recent_anns:
+        d = _ms_between(n.received_at, n.filed_at)
+        if d is not None:
+            by_exchange.setdefault((n.exchange or "?").upper(), []).append(d)
+    detection_by_exchange = {
+        exch: _stat_block(vals) for exch, vals in sorted(by_exchange.items())
+    }
+
+    # ---- bot-side share: live tick telemetry from the monitors ---------
+    # avg fetch+parse+store per tick, plus the actual gap between ticks.
+    # The bot's worst-case detection contribution ≈ gap + tick duration;
+    # everything beyond that in `detection_by_exchange` is the exchange's
+    # own publish lag, which no amount of polling can remove.
+    from app.monitors.base import MONITOR_TICK_STATS
+
     stages = ("detection_ms", "analysis_ms", "signal_to_order_ms", "order_to_fill_ms")
     return {
         "window": len(rows),
         "stages": {s: _stat_block(_vals(s)) for s in stages},
+        "detection_by_exchange": detection_by_exchange,
+        "detection_samples": len(recent_anns),
+        "monitor_ticks": dict(MONITOR_TICK_STATS),
         # Newest-first, capped, for the per-trade detail table.
         "series": rows[:40],
     }
