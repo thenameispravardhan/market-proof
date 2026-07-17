@@ -16,7 +16,7 @@ alembic==1.14.0
 structlog==24.4.0
 
 # HTTP client (used by future tracks; included now so deps are stable)
-httpx==0.28.1
+httpx[http2]==0.28.1
 
 # Fast JSON for the NSE/BSE poll hot path (~3-5x faster than stdlib on
 # exchange payloads). The monitors fall back to stdlib json without it,
