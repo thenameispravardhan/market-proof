@@ -278,6 +278,35 @@ export interface GlobalSettings {
   DEFAULT_SL_PCT: number;
   DEFAULT_TARGET_RR: number;
   QUOTE_REFRESH_SECONDS: number;
+  // ---- Exit Manager (Exits page) ----------------------------------------
+  // Every exit-engine knob. Defaults mirror the backend; the Exits page is
+  // the intended editor. See app/execution/trade_manager.py for behavior.
+  MAX_ENTRY_DRIFT_PCT: number;
+  DEFAULT_SL_MIN_PCT: number;
+  DEFAULT_SL_SMALLCAP_PCT: number;
+  ATR_ENABLED: boolean;
+  ATR_PERIOD: number;
+  ATR_STOP_MULT: number;
+  ATR_MAX_STOP_PCT: number;
+  BREAKEVEN_ENABLED: boolean;
+  BREAKEVEN_AT_PCT: number;
+  BREAKEVEN_LOCK_PCT: number;
+  SCALE_OUT_ENABLED: boolean;
+  SCALE_OUT_R: number;
+  TRAIL_ACTIVATE_R: number;
+  TRAIL_DISTANCE_R: number;
+  CONSOLIDATION_EXIT_ENABLED: boolean;
+  CONSOLIDATION_WINDOW_SECONDS: number;
+  CONSOLIDATION_RANGE_PCT: number;
+  CONSOLIDATION_MIN_PROFIT_PCT: number;
+  CONSOLIDATION_MAX_PROFIT_PCT: number;
+  STALL_EXIT_ENABLED: boolean;
+  STALL_WINDOW_SECONDS: number;
+  STALL_ROC_PCT: number;
+  STALL_MIN_PROFIT_PCT: number;
+  STALL_MAX_PROFIT_PCT: number;
+  MAX_HOLD_SECONDS: number;
+  SQUARE_OFF_TIME_IST: string;
   // When ON, clearly-administrative filings are skipped before the LLM
   // call. OFF sends every filing to the AI (more cost, slower queue).
   PRE_LLM_FILTER_ENABLED: boolean;

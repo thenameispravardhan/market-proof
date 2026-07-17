@@ -101,6 +101,43 @@ _GLOBAL_KEYS: dict[str, tuple[type, Any]] = {
     # Intraday buying-power multiplier (Fyers MIS ~5x). Notional caps only —
     # risk-per-trade and loss limits always stay on real equity.
     "INTRADAY_LEVERAGE": (float, 5.0),
+    # ---- Exit Manager (UI page) ------------------------------------------
+    # Every exit-engine knob, exposed for frontend-only control. Defaults
+    # mirror app/config.py so exposing them changes nothing by itself.
+    # Entry quality.
+    "MAX_ENTRY_DRIFT_PCT": (float, 1.5),
+    # Initial stop-loss.
+    "DEFAULT_SL_MIN_PCT": (float, 1.0),
+    "DEFAULT_SL_SMALLCAP_PCT": (float, 1.5),
+    "ATR_ENABLED": (bool, True),
+    "ATR_PERIOD": (int, 14),
+    "ATR_STOP_MULT": (float, 2.0),
+    "ATR_MAX_STOP_PCT": (float, 8.0),
+    # Breakeven lock.
+    "BREAKEVEN_ENABLED": (bool, True),
+    "BREAKEVEN_AT_PCT": (float, 2.0),
+    "BREAKEVEN_LOCK_PCT": (float, 0.2),
+    # Trailing stop + scale-out (open-ended positions only — an explicit
+    # rule/AI target always exits the full position instead).
+    "SCALE_OUT_ENABLED": (bool, True),
+    "SCALE_OUT_R": (float, 2.0),
+    "TRAIL_ACTIVATE_R": (float, 1.5),
+    "TRAIL_DISTANCE_R": (float, 0.5),
+    # Momentum-death exits.
+    "CONSOLIDATION_EXIT_ENABLED": (bool, True),
+    "CONSOLIDATION_WINDOW_SECONDS": (int, 120),
+    "CONSOLIDATION_RANGE_PCT": (float, 0.5),
+    "CONSOLIDATION_MIN_PROFIT_PCT": (float, 1.0),
+    "CONSOLIDATION_MAX_PROFIT_PCT": (float, 2.5),
+    "STALL_EXIT_ENABLED": (bool, True),
+    "STALL_WINDOW_SECONDS": (int, 90),
+    "STALL_ROC_PCT": (float, 0.3),
+    "STALL_MIN_PROFIT_PCT": (float, 3.0),
+    "STALL_MAX_PROFIT_PCT": (float, 6.0),
+    # Time limits. SQUARE_OFF_TIME_IST is bounded (earlier is allowed,
+    # later than 15:15 is not) and can never be disabled — intraday only.
+    "MAX_HOLD_SECONDS": (int, 1080),
+    "SQUARE_OFF_TIME_IST": (str, "15:10"),
 }
 
 
@@ -185,7 +222,7 @@ def _coerce(key: str, value: Any) -> Any:
         # POLL_INTERVAL_SECONDS accepts fractional seconds (float) but keeps
         # a >=1 floor, mirroring the Settings validator — an out-of-range
         # override written to env would make every later get_settings() blow up.
-        if key in {"LLM_MAX_TOKENS", "MAX_NEWS_AGE_SECONDS", "POLL_INTERVAL_SECONDS"} and coerced < 1:
+        if key in {"LLM_MAX_TOKENS", "MAX_NEWS_AGE_SECONDS", "POLL_INTERVAL_SECONDS", "ATR_PERIOD"} and coerced < 1:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=f"setting {key}: must be >= 1",
@@ -195,11 +232,50 @@ def _coerce(key: str, value: Any) -> Any:
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="PIPELINE_DEADLINE_SECONDS must be >= 0 (0 = disabled)",
             )
+        # Exit-engine bounds. R-multiples must be positive and a >10 value
+        # is a typo, not a strategy; Settings' own validator only enforces
+        # >0 for ATR_STOP_MULT, so mirror + tighten here at the UI door.
+        if key in {"ATR_STOP_MULT", "SCALE_OUT_R", "TRAIL_ACTIVATE_R", "TRAIL_DISTANCE_R"} and not (
+            0 < coerced <= 10
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"setting {key}: must be in (0, 10]",
+            )
+        # A sub-minute forced exit or sub-10s observation window is churn,
+        # not a strategy.
+        if key == "MAX_HOLD_SECONDS" and coerced < 60:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="MAX_HOLD_SECONDS must be >= 60",
+            )
+        if key in {"CONSOLIDATION_WINDOW_SECONDS", "STALL_WINDOW_SECONDS"} and coerced < 10:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"setting {key}: must be >= 10",
+            )
     if key == "TRADING_MODE" and coerced not in {"paper", "live"}:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="TRADING_MODE must be 'paper' or 'live'",
         )
+    if key == "SQUARE_OFF_TIME_IST":
+        parts = str(coerced).split(":")
+        if len(parts) != 2 or not (parts[0].isdigit() and parts[1].isdigit()):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"SQUARE_OFF_TIME_IST must be 'HH:MM', got {coerced!r}",
+            )
+        hh, mm = int(parts[0]), int(parts[1])
+        # Earlier is always allowed; later than 15:15 would collide with
+        # the 15:30 close and the broker's own MIS auto-square-off.
+        # There is deliberately NO way to disable the square-off.
+        if not (9 * 60 + 30 <= hh * 60 + mm <= 15 * 60 + 15):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="SQUARE_OFF_TIME_IST must be between 09:30 and 15:15 IST",
+            )
+        coerced = f"{hh:02d}:{mm:02d}"
     return coerced
 
 

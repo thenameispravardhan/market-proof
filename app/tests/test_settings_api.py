@@ -234,3 +234,104 @@ def test_send_extracted_text_toggle_roundtrip(client: TestClient) -> None:
         else:
             os.environ["SEND_EXTRACTED_TEXT"] = saved
         get_settings.cache_clear()
+
+
+# -------------------------------------------------------------------------
+# Exit Manager keys (Exits page)
+# -------------------------------------------------------------------------
+
+
+def _delete_overrides(keys: list[str]) -> None:
+    """Remove app_settings override rows so they can't leak into later
+    tests via the next apply_overrides_to_env()."""
+    from app.db.infra_models import AppSetting
+    from app.db.session import SessionLocal
+
+    with SessionLocal() as s:
+        for k in keys:
+            row = s.get(AppSetting, k)
+            if row is not None:
+                s.delete(row)
+        s.commit()
+
+
+def test_exit_keys_roundtrip_and_hot_apply(client: TestClient) -> None:
+    """Every Exit Manager knob PUT via the settings API round-trips through
+    GET and hot-applies to the live Settings without a restart."""
+    import os
+    from app.config import get_settings
+
+    payload = {
+        "MAX_ENTRY_DRIFT_PCT": 2.0,
+        "ATR_STOP_MULT": 2.5,
+        "BREAKEVEN_AT_PCT": 1.5,
+        "TRAIL_DISTANCE_R": 0.75,
+        "SCALE_OUT_ENABLED": False,
+        "CONSOLIDATION_WINDOW_SECONDS": 180,
+        "STALL_ROC_PCT": 0.5,
+        "MAX_HOLD_SECONDS": 900,
+        "SQUARE_OFF_TIME_IST": "14:45",
+    }
+    saved = {k: os.environ.get(k) for k in payload}
+    try:
+        r = client.put("/api/settings", json={"global": payload})
+        assert r.status_code == 200, r.text
+        g = r.json()["global"]
+        for k, v in payload.items():
+            assert g[k] == v, k
+        # Hot-applied: the engine reads these via get_settings() per tick.
+        s = get_settings()
+        assert s.SCALE_OUT_ENABLED is False
+        assert s.MAX_HOLD_SECONDS == 900
+        assert s.SQUARE_OFF_TIME_IST == "14:45"
+        assert s.TRAIL_DISTANCE_R == 0.75
+    finally:
+        # Remove the DB override rows too — any later PUT re-applies ALL
+        # overrides to env, which would leak these values into unrelated
+        # tests (e.g. disable scale-out for the trade-exit tests).
+        _delete_overrides(list(payload))
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        get_settings.cache_clear()
+
+
+def test_exit_keys_bounds_rejected(client: TestClient) -> None:
+    """Out-of-range exit values are refused at the API door so a typo can
+    never poison get_settings() for the whole process."""
+    cases = [
+        {"SQUARE_OFF_TIME_IST": "15:25"},   # later than 15:15 collides with close
+        {"SQUARE_OFF_TIME_IST": "09:00"},   # before the session
+        {"SQUARE_OFF_TIME_IST": "banana"},  # not HH:MM
+        {"TRAIL_DISTANCE_R": 0},            # R-multiples must be > 0
+        {"SCALE_OUT_R": 11},                # > 10 is a typo, not a strategy
+        {"MAX_HOLD_SECONDS": 30},           # sub-minute forced exit is churn
+        {"STALL_WINDOW_SECONDS": 5},        # sub-10s observation window
+        {"BREAKEVEN_AT_PCT": 0},            # percent must be in (0, 100]
+        {"ATR_PERIOD": 0},                  # must be >= 1
+    ]
+    for body in cases:
+        r = client.put("/api/settings", json={"global": body})
+        assert r.status_code == 422, f"{body} should be rejected, got {r.status_code}"
+
+
+def test_square_off_time_normalized(client: TestClient) -> None:
+    """'9:45' is accepted and stored zero-padded, matching the config
+    validator's normalization."""
+    import os
+    from app.config import get_settings
+
+    saved = os.environ.get("SQUARE_OFF_TIME_IST")
+    try:
+        r = client.put("/api/settings", json={"global": {"SQUARE_OFF_TIME_IST": "9:45"}})
+        assert r.status_code == 200, r.text
+        assert r.json()["global"]["SQUARE_OFF_TIME_IST"] == "09:45"
+    finally:
+        _delete_overrides(["SQUARE_OFF_TIME_IST"])
+        if saved is None:
+            os.environ.pop("SQUARE_OFF_TIME_IST", None)
+        else:
+            os.environ["SQUARE_OFF_TIME_IST"] = saved
+        get_settings.cache_clear()

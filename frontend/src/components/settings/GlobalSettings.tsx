@@ -13,6 +13,13 @@ type NumField = Exclude<
   | "FAST_TRACK_ENABLED"
   | "OUTCOME_LOGGER_ENABLED"
   | "NEWS_AGE_FROM_RECEIPT"
+  // Exit Manager keys (edited on the Exits page, not here).
+  | "ATR_ENABLED"
+  | "BREAKEVEN_ENABLED"
+  | "SCALE_OUT_ENABLED"
+  | "CONSOLIDATION_EXIT_ENABLED"
+  | "STALL_EXIT_ENABLED"
+  | "SQUARE_OFF_TIME_IST"
 >;
 
 const FIELDS: { key: NumField; label: string; min: number; max: number; step: number }[] = [
