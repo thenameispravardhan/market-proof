@@ -43,11 +43,13 @@ const Webhooks = lazy(() => import("./pages/Webhooks"));
 const Backtest = lazy(() => import("./pages/Backtest"));
 const Settings = lazy(() => import("./pages/Settings"));
 const Exits = lazy(() => import("./pages/Exits"));
+const Timing = lazy(() => import("./pages/Timing"));
 
 const TABS: { key: TabKey; label: string; emoji: string; group: "MAIN" | "OPS" | "CFG" }[] = [
   { key: "dashboard",      label: "Dashboard",      emoji: "▤", group: "MAIN" },
   { key: "trade",          label: "Trade",          emoji: "▶", group: "MAIN" },
   { key: "exits",          label: "Exits",          emoji: "⇥", group: "MAIN" },
+  { key: "timing",         label: "Timing",         emoji: "◷", group: "MAIN" },
   { key: "trades",         label: "Trade History",  emoji: "₹", group: "MAIN" },
   { key: "outcomes",       label: "Outcomes",       emoji: "◎", group: "MAIN" },
   { key: "dataset",        label: "Dataset",        emoji: "▥", group: "MAIN" },
@@ -77,6 +79,7 @@ function PageContent({ tab }: { tab: TabKey }) {
     case "backtest": return <Backtest />;
     case "settings": return <Settings />;
     case "exits": return <Exits />;
+    case "timing": return <Timing />;
     default: return <Dashboard />;
   }
 }

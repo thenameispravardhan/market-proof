@@ -956,6 +956,36 @@ export function usePipelineLatency(window = 100) {
   });
 }
 
+export interface ExecutionLatencyRow {
+  trade_id: number;
+  symbol: string;
+  side: string;
+  executed_at: string | null;
+  detection_ms: number | null;
+  analysis_ms: number | null;
+  signal_to_order_ms: number | null;
+  order_to_fill_ms: number | null;
+}
+
+export interface ExecutionLatency {
+  window: number;
+  stages: {
+    detection_ms: LatencyStats;
+    analysis_ms: LatencyStats;
+    signal_to_order_ms: LatencyStats;
+    order_to_fill_ms: LatencyStats;
+  };
+  series: ExecutionLatencyRow[];
+}
+
+export function useExecutionLatency(window = 100) {
+  return useQuery<ExecutionLatency>({
+    queryKey: ["execution-latency", window],
+    queryFn: () => api.get(`/api/metrics/execution-latency?window=${window}`),
+    refetchInterval: 15000,
+  });
+}
+
 export interface OutcomeRow {
   outcome_id: number;
   signal_id: number | null;

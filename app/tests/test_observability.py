@@ -171,6 +171,75 @@ def test_pipeline_latency_empty_db(client, isolated_db):
     assert body["latency"]["total_ms"]["p95"] is None
 
 
+def test_execution_latency_stage_breakdown(client, db_session, isolated_db):
+    """A full Trade→Signal→Analysis→Announcement chain with controlled
+    timestamps must yield the right per-layer millisecond deltas."""
+    t0 = datetime(2026, 7, 18, 6, 0, 0)  # naive UTC, matches storage
+    ann = Announcement(
+        symbol="RELIANCE", exchange="NSE", event_type="ORDER_WIN",
+        headline="RELIANCE ORDER_WIN filing",
+        filed_at=t0,
+        received_at=t0 + timedelta(seconds=8),   # detection = 8000 ms
+        content_hash="exec-lat-1",
+    )
+    db_session.add(ann)
+    db_session.flush()
+    a = Analysis(
+        announcement_id=ann.id, model="deepseek-chat",
+        sentiment="positive", sentiment_score=80.0, confidence=0.9,
+        recommendation="BUY",
+        raw_response={"timings": {"total_ms": 2500.0, "llm_ms": 2000.0}},
+    )
+    db_session.add(a)
+    db_session.flush()
+    sig = Signal(
+        analysis_id=a.id, symbol="RELIANCE", action="BUY",
+        confidence=0.9, status="filled",
+        created_at=t0 + timedelta(seconds=10),
+    )
+    db_session.add(sig)
+    db_session.flush()
+    db_session.add(
+        TradeRow(
+            signal_id=sig.id, symbol="RELIANCE", side="BUY", quantity=10,
+            price=100.0, order_type="market", status="filled",
+            created_at=t0 + timedelta(seconds=10, milliseconds=500),  # signal→order = 500 ms
+            executed_at=t0 + timedelta(seconds=11),                   # order→fill  = 500 ms
+        )
+    )
+    db_session.commit()
+
+    r = client.get("/api/metrics/execution-latency?window=50")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["window"] == 1
+    stages = body["stages"]
+    assert stages["detection_ms"]["p50"] == pytest.approx(8000.0)
+    assert stages["analysis_ms"]["p50"] == pytest.approx(2500.0)
+    assert stages["signal_to_order_ms"]["p50"] == pytest.approx(500.0)
+    assert stages["order_to_fill_ms"]["p50"] == pytest.approx(500.0)
+    # Per-trade detail row carries every stage for the table.
+    assert body["series"][0]["symbol"] == "RELIANCE"
+    assert body["series"][0]["detection_ms"] == pytest.approx(8000.0)
+
+
+def test_execution_latency_ignores_unfilled_and_empty(client, db_session, isolated_db):
+    """Trades with no executed_at are excluded; an empty result is well-formed."""
+    r = client.get("/api/metrics/execution-latency")
+    assert r.status_code == 200
+    assert r.json()["window"] == 0
+
+    # A placed-but-unfilled trade (executed_at is NULL) must not appear.
+    db_session.add(
+        TradeRow(
+            signal_id=None, symbol="TCS", side="BUY", quantity=1,
+            price=100.0, order_type="market", status="placed",
+        )
+    )
+    db_session.commit()
+    assert client.get("/api/metrics/execution-latency").json()["window"] == 0
+
+
 # =========================================================================
 # Daily health report
 # =========================================================================
