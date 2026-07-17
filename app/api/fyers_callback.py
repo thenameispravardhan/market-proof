@@ -152,10 +152,19 @@ async def fyers_callback(
             code=code,
         )
     except FyersAuthError as e:
-        log.error("fyers.callback.token_exchange_failed", error=str(e), status=e.status_code)
+        # e.body is Fyers' own error JSON, already truncated and
+        # token-redacted by _safe_body — surfacing it tells the
+        # operator WHY (bad appIdHash vs expired code vs ...).
+        log.error(
+            "fyers.callback.token_exchange_failed",
+            error=str(e),
+            status=e.status_code,
+            fyers_body=e.body,
+        )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"fyers token exchange failed: {e}",
+            detail=f"fyers token exchange failed: {e}"
+            + (f" — fyers said: {e.body}" if e.body else ""),
         )
     # Persist.
     account.access_token = token.access_token
