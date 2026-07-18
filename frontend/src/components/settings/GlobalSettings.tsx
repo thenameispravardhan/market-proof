@@ -13,6 +13,10 @@ type NumField = Exclude<
   | "FAST_TRACK_ENABLED"
   | "OUTCOME_LOGGER_ENABLED"
   | "NEWS_AGE_FROM_RECEIPT"
+  // News-source toggles (edited on the News Sources card, not here).
+  | "NSE_API_ENABLED"
+  | "BSE_API_ENABLED"
+  | "NSE_RSS_ENABLED"
   // Exit Manager keys (edited on the Exits page, not here).
   | "ATR_ENABLED"
   | "BREAKEVEN_ENABLED"

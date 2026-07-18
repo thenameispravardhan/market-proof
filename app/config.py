@@ -58,6 +58,18 @@ class Settings(BaseSettings):
     # operator; raise it if you start seeing `monitor.retry` 403/429 spam.
     POLL_INTERVAL_SECONDS: float = 1.0
 
+    # ---------- News sources (multi-channel detection racing) ----------
+    # Each source is an independent monitor; enabled flags are read live
+    # every loop iteration, so UI toggles apply within one interval.
+    # Detection = min(lag of enabled sources); dedupe collapses repeats.
+    NSE_API_ENABLED: bool = True
+    BSE_API_ENABLED: bool = True
+    # The NSE RSS racer (nsearchives Online_announcements.xml) was
+    # measured publishing filings BEFORE the corporate-announcements
+    # API. Default OFF: new behavior ships behind a toggle that
+    # preserves current behavior until the operator opts in.
+    NSE_RSS_ENABLED: bool = False
+
     # ---------- Risk defaults (per-strategy overrides in DB) ----------
     # Per-trade capital-at-risk cap. RISK.md targets 0.75%; the graduated
     # ramp (RISK_RAMP_*) starts a fresh account lower and works up to this.

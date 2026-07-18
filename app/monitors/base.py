@@ -188,6 +188,10 @@ class BaseMonitor:
     exchange: str = "BASE"
     source_url: str = ""
 
+    # Channel label distinguishing multiple monitors on the SAME
+    # exchange (API poller vs RSS racer). Used for telemetry keys.
+    channel: str = "API"
+
     def __init__(
         self,
         *,
@@ -197,6 +201,7 @@ class BaseMonitor:
         source_url: Optional[str] = None,
         session_factory: Optional[Callable[[], Session]] = None,
         start_offset: float = 0.0,
+        enabled_fn: Optional[Callable[[], bool]] = None,
     ) -> None:
         self._fetcher = fetcher
         self._parser = parser
@@ -224,6 +229,10 @@ class BaseMonitor:
         # filing is seen by SOME monitor within ~interval/2 instead of a
         # full interval when both poll in lockstep.
         self._start_offset = max(0.0, float(start_offset))
+        # Live on/off switch (frontend toggle). Checked every loop
+        # iteration, so enabling/disabling a source applies within one
+        # poll interval — no restart. None = always enabled.
+        self._enabled_fn = enabled_fn
         # Tick telemetry: rolling fetch+parse+store durations feeding
         # MONITOR_TICK_STATS (see module docstring on that dict).
         self._tick_durations: deque[float] = deque(maxlen=50)
@@ -302,6 +311,16 @@ class BaseMonitor:
                 pass
         try:
             while not self._stop_event.is_set():
+                # Frontend toggle: when this source is disabled, idle for
+                # one interval and re-check. Not a failure; no backoff.
+                if self._enabled_fn is not None and not self._enabled_fn():
+                    try:
+                        await asyncio.wait_for(
+                            self._stop_event.wait(), timeout=self._poll_interval
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        continue
                 try:
                     t_tick = time.monotonic()
                     gap_s = (
@@ -388,7 +407,7 @@ class BaseMonitor:
     def _record_tick_stats(self, tick_ms: float, gap_s: Optional[float]) -> None:
         """Publish rolling tick telemetry into MONITOR_TICK_STATS."""
         self._tick_durations.append(tick_ms)
-        MONITOR_TICK_STATS[self.exchange] = {
+        MONITOR_TICK_STATS[f"{self.exchange}-{self.channel}"] = {
             "last_tick_ms": round(tick_ms, 1),
             "avg_tick_ms": round(
                 sum(self._tick_durations) / len(self._tick_durations), 1
@@ -540,7 +559,14 @@ class BaseMonitor:
     def _insert_one(self, announcement: Announcement, content_hash: str) -> Optional[int]:
         """Synchronous insert — runs in the executor.
 
-        Returns the new row's id, or None on duplicate.
+        Returns the new row's id, or None on duplicate. Two dedupe
+        layers:
+          1. content_hash — exact repeats within one channel.
+          2. cross-source: the SAME filing arriving via a different
+             channel (RSS racer vs API) carries the same headline but a
+             timestamp that can differ by ~1s, so the hash misses it.
+             Same exchange + symbol + normalized headline within a 30
+             minute window = the same filing; skip.
         """
         with self._session_factory() as session:
             existing = (
@@ -550,10 +576,48 @@ class BaseMonitor:
             )
             if existing is not None:
                 return None
+            # Cross-source dedupe (cheap: runs only for hash-new rows,
+            # scans a handful of same-symbol rows).
+            norm_new = _normalize_headline(announcement.headline)
+            filed = announcement.filed_at
+            if filed is not None and filed.tzinfo is not None:
+                filed = filed.astimezone(timezone.utc).replace(tzinfo=None)
+            recent = (
+                session.query(Announcement)
+                .filter(
+                    Announcement.exchange == announcement.exchange,
+                    Announcement.symbol == announcement.symbol,
+                )
+                .order_by(Announcement.id.desc())
+                .limit(10)
+                .all()
+            )
+            for r in recent:
+                if _normalize_headline(r.headline) != norm_new:
+                    continue
+                r_filed = r.filed_at
+                if filed is None or r_filed is None:
+                    return None  # same headline, timestamps unknown: dupe
+                if abs((r_filed - filed).total_seconds()) <= 1800:
+                    log.debug(
+                        "monitor.cross_source_dedup",
+                        exchange=self.exchange,
+                        channel=self.channel,
+                        symbol=announcement.symbol,
+                        existing_id=r.id,
+                    )
+                    return None
             session.add(announcement)
             session.commit()
             session.refresh(announcement)
             return announcement.id
+
+
+def _normalize_headline(s: Optional[str]) -> str:
+    """Case/whitespace-insensitive headline identity for cross-source
+    dedupe (RSS and API render the same filing text identically apart
+    from stray whitespace)."""
+    return " ".join((s or "").upper().split())
 
 
 # -- error categories ---------------------------------------------------

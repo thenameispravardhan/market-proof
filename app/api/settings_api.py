@@ -101,6 +101,10 @@ _GLOBAL_KEYS: dict[str, tuple[type, Any]] = {
     # Intraday buying-power multiplier (Fyers MIS ~5x). Notional caps only —
     # risk-per-trade and loss limits always stay on real equity.
     "INTRADAY_LEVERAGE": (float, 5.0),
+    # ---- News sources (multi-channel detection racing) -------------------
+    "NSE_API_ENABLED": (bool, True),
+    "BSE_API_ENABLED": (bool, True),
+    "NSE_RSS_ENABLED": (bool, False),
     # ---- Exit Manager (UI page) ------------------------------------------
     # Every exit-engine knob, exposed for frontend-only control. Defaults
     # mirror app/config.py so exposing them changes nothing by itself.

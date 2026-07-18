@@ -279,12 +279,19 @@ def execution_latency(
         .all()
     )
     by_exchange: dict[str, list[float]] = {}
+    by_source: dict[str, list[float]] = {}
     for n in recent_anns:
         d = _ms_between(n.received_at, n.filed_at)
         if d is not None:
             by_exchange.setdefault((n.exchange or "?").upper(), []).append(d)
+            by_source.setdefault(
+                _source_label(n.source, n.exchange), []
+            ).append(d)
     detection_by_exchange = {
         exch: _stat_block(vals) for exch, vals in sorted(by_exchange.items())
+    }
+    detection_by_source = {
+        src: _stat_block(vals) for src, vals in sorted(by_source.items())
     }
 
     # ---- bot-side share: live tick telemetry from the monitors ---------
@@ -299,11 +306,24 @@ def execution_latency(
         "window": len(rows),
         "stages": {s: _stat_block(_vals(s)) for s in stages},
         "detection_by_exchange": detection_by_exchange,
+        "detection_by_source": detection_by_source,
         "detection_samples": len(recent_anns),
         "monitor_ticks": dict(MONITOR_TICK_STATS),
         # Newest-first, capped, for the per-trade detail table.
         "series": rows[:40],
     }
+
+
+def _source_label(source: Optional[str], exchange: Optional[str]) -> str:
+    """Announcement.source (the monitor's source_url) -> short channel
+    label for the detection race: NSE-API / NSE-RSS / BSE-API / ..."""
+    exch = (exchange or "?").upper()
+    s = (source or "").lower()
+    if "rss" in s or ".xml" in s:
+        return f"{exch}-RSS"
+    if not s:
+        return exch
+    return f"{exch}-API"
 
 
 @router.get("/health-report")

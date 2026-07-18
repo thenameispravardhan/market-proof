@@ -984,6 +984,7 @@ export interface ExecutionLatency {
     order_to_fill_ms: LatencyStats;
   };
   detection_by_exchange: Record<string, LatencyStats>;
+  detection_by_source: Record<string, LatencyStats>;
   detection_samples: number;
   monitor_ticks: Record<string, MonitorTickStats>;
   series: ExecutionLatencyRow[];

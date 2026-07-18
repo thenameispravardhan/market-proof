@@ -166,11 +166,25 @@ export function ExecutionTiming() {
             (last {data?.detection_samples ?? 0} filings)
           </span>
         </h3>
-        {data && Object.keys(data.detection_by_exchange).length > 0 ? (
+        {data &&
+        Object.keys(data.detection_by_source ?? data.detection_by_exchange).length > 0 ? (
           (() => {
-            const entries = Object.entries(data.detection_by_exchange);
+            // Prefer the per-source split (NSE-API vs NSE-RSS vs BSE-API);
+            // fall back to per-exchange for pre-upgrade data.
+            const entries = Object.entries(
+              Object.keys(data.detection_by_source ?? {}).length > 0
+                ? data.detection_by_source
+                : data.detection_by_exchange,
+            );
             const raceMax = Math.max(1, ...entries.map(([, st]) => st.p50 ?? 0));
-            const colors: Record<string, string> = { NSE: "#f0883e", BSE: "#a371f7" };
+            const colors: Record<string, string> = {
+              NSE: "#f0883e",
+              BSE: "#a371f7",
+              "NSE-API": "#f0883e",
+              "NSE-RSS": "#3fb950",
+              "BSE-API": "#a371f7",
+              "BSE-RSS": "#d2a8ff",
+            };
             return (
               <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 8 }}>
                 {entries.map(([exch, st]) => (

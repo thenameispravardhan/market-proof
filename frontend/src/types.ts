@@ -278,6 +278,12 @@ export interface GlobalSettings {
   DEFAULT_SL_PCT: number;
   DEFAULT_TARGET_RR: number;
   QUOTE_REFRESH_SECONDS: number;
+  // ---- News sources (multi-channel detection racing) --------------------
+  // Each source is an independent monitor; toggles apply live within one
+  // poll interval. Detection speed = fastest enabled source.
+  NSE_API_ENABLED: boolean;
+  BSE_API_ENABLED: boolean;
+  NSE_RSS_ENABLED: boolean;
   // ---- Exit Manager (Exits page) ----------------------------------------
   // Every exit-engine knob. Defaults mirror the backend; the Exits page is
   // the intended editor. See app/execution/trade_manager.py for behavior.
