@@ -105,6 +105,7 @@ _GLOBAL_KEYS: dict[str, tuple[type, Any]] = {
     "NSE_API_ENABLED": (bool, True),
     "BSE_API_ENABLED": (bool, True),
     "NSE_RSS_ENABLED": (bool, False),
+    "NSE_RSS_POLL_SECONDS": (float, 1.0),
     # ---- Edge Memory (self-learning conviction gate) ---------------------
     "EDGE_GATE_ENABLED": (bool, False),
     "EDGE_GATE_MIN_SAMPLES": (int, 30),
@@ -275,6 +276,13 @@ def _coerce(key: str, value: Any) -> Any:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=f"setting {key}: must be >= 10",
+            )
+        # RSS poll interval: 0 = follow the global setting; otherwise a
+        # 0.5s floor keeps the racer from hammering the CDN.
+        if key == "NSE_RSS_POLL_SECONDS" and coerced != 0 and not (0.5 <= coerced <= 60):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="NSE_RSS_POLL_SECONDS must be 0 (follow global) or 0.5–60",
             )
     if key == "TRADING_MODE" and coerced not in {"paper", "live"}:
         raise HTTPException(

@@ -68,6 +68,11 @@ class MonitorManager:
                 enabled_fn=lambda: bool(
                     getattr(get_settings(), "NSE_RSS_ENABLED", False)
                 ),
+                # The RSS channel polls on its own (faster) interval —
+                # conditional GET makes an unchanged feed nearly free.
+                interval_fn=lambda: float(
+                    getattr(get_settings(), "NSE_RSS_POLL_SECONDS", 0.0) or 0.0
+                ),
             )
         self._nse = nse_monitor
         self._bse = bse_monitor

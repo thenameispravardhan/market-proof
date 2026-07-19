@@ -69,6 +69,11 @@ class Settings(BaseSettings):
     # API. Default OFF: new behavior ships behind a toggle that
     # preserves current behavior until the operator opts in.
     NSE_RSS_ENABLED: bool = False
+    # Per-source poll interval for the RSS racer (seconds). The RSS feed
+    # is a plain CDN with conditional-GET (304s are ~free), so it can be
+    # polled faster than the Akamai-fronted APIs without a ban risk.
+    # 0 = follow the global POLL_INTERVAL_SECONDS.
+    NSE_RSS_POLL_SECONDS: float = 1.0
 
     # ---------- Edge Memory (self-learning conviction gate) ----------
     # When ON, a signal is blocked if the bot's OWN track record on

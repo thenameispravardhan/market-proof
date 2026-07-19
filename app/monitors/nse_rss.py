@@ -170,6 +170,11 @@ def parse_nse_rss_payload(
     resolver = resolver or _default_resolver
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8", errors="replace")
+    # A conditional-GET 304 (nothing changed) returns an empty body — that
+    # is not an error, just "no new items". Parse it as zero items so the
+    # monitor's tick stays cheap and the cursor/telemetry advance normally.
+    if not raw or not raw.strip():
+        return []
     root = ET.fromstring(raw)
     out: list[RawAnnouncement] = []
     for item in root.findall(".//item"):
@@ -199,13 +204,50 @@ def parse_nse_rss_payload(
 
 
 async def fetch_nse_rss(url: str, *, resolver: Optional[NameResolver] = None) -> str:
-    """Fetch the RSS XML. Also keeps the name->symbol master fresh so the
-    sync parser can resolve with pure dict lookups. nsearchives is a
-    plain CDN — no cookie warmup, no HTTP/2 requirement."""
+    """Fetch the RSS XML unconditionally (stateless helper for tests /
+    ad-hoc use). Production uses ConditionalRSSFetcher below."""
     await (resolver or _default_resolver).ensure_loaded()
     async with httpx.AsyncClient(timeout=10.0, headers={"User-Agent": _UA}) as client:
         r = await client.get(url)
         r.raise_for_status()
+        return r.text
+
+
+class ConditionalRSSFetcher:
+    """Fetch the RSS with an HTTP conditional GET (measured: the feed
+    returns ETag + Last-Modified). Remembers the last validators and sends
+    If-None-Match / If-Modified-Since; a 304 (nothing changed) returns ""
+    — which the parser reads as zero items — so an unchanged feed costs a
+    tiny header-only round-trip instead of re-downloading + re-parsing the
+    ~23 KB XML. That makes it safe to poll the RSS channel FASTER than the
+    Akamai-fronted API (see NSE_RSS_POLL_SECONDS), which is the real,
+    evidence-backed detection win: the exchange's own publish lag can't be
+    cache-busted away (the API sends no cache headers at all), but polling
+    the cheapest channel more often shortens the wait when RSS wins.
+
+    Stateful (holds the validators), so it's one instance per monitor.
+    """
+
+    def __init__(self, resolver: Optional[NameResolver] = None) -> None:
+        self._resolver = resolver or _default_resolver
+        self._etag: Optional[str] = None
+        self._last_modified: Optional[str] = None
+
+    async def __call__(self, url: str) -> str:
+        await self._resolver.ensure_loaded()
+        headers = {"User-Agent": _UA}
+        if self._etag:
+            headers["If-None-Match"] = self._etag
+        if self._last_modified:
+            headers["If-Modified-Since"] = self._last_modified
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(url, headers=headers)
+        if r.status_code == 304:
+            return ""  # unchanged — parsed as zero items
+        r.raise_for_status()
+        # Remember the new validators for the next poll.
+        self._etag = r.headers.get("ETag") or self._etag
+        self._last_modified = r.headers.get("Last-Modified") or self._last_modified
         return r.text
 
 
@@ -219,8 +261,7 @@ class NSERSSMonitor(BaseMonitor):
     def __init__(self, *, fetcher=None, parser=None, resolver=None, **kwargs) -> None:
         res = resolver or _default_resolver
         if fetcher is None:
-            async def fetcher(url: str) -> str:  # type: ignore[misc]
-                return await fetch_nse_rss(url, resolver=res)
+            fetcher = ConditionalRSSFetcher(resolver=res)
         if parser is None:
             def parser(raw, url):  # type: ignore[misc]
                 return parse_nse_rss_payload(raw, url, resolver=res)

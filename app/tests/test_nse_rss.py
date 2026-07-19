@@ -233,3 +233,82 @@ def test_nse_rss_monitor_defaults():
     assert mon.exchange == "NSE"
     assert mon.channel == "RSS"
     assert "Online_announcements.xml" in mon.source_url
+
+
+# ---- conditional GET (ETag / 304) --------------------------------------
+
+
+def test_parse_empty_payload_is_zero_items():
+    """A 304 returns an empty body — the parser must read it as no items,
+    not raise."""
+    assert parse_nse_rss_payload("", "https://stub", resolver=_resolver()) == []
+    assert parse_nse_rss_payload("   \n  ", "https://stub", resolver=_resolver()) == []
+
+
+@pytest.mark.asyncio
+async def test_conditional_fetcher_sends_validators_and_handles_304():
+    """The fetcher stores ETag/Last-Modified from a 200 and sends them on
+    the next request; a 304 returns '' (parsed as zero items)."""
+    import httpx
+    from app.monitors.nse_rss import ConditionalRSSFetcher
+
+    calls: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(dict(request.headers))
+        if len(calls) == 1:
+            return httpx.Response(
+                200,
+                text=RSS_FIXTURE,
+                headers={"ETag": 'W/"abc"', "Last-Modified": "Sun, 19 Jul 2026 17:46:52 GMT"},
+            )
+        # Second call must carry the validators -> server says 304.
+        assert request.headers.get("If-None-Match") == 'W/"abc"'
+        assert request.headers.get("If-Modified-Since") == "Sun, 19 Jul 2026 17:46:52 GMT"
+        return httpx.Response(304)
+
+    r = _resolver()
+    r._loaded_at = 9e18  # skip ensure_loaded network path
+    fetcher = ConditionalRSSFetcher(resolver=r)
+
+    # Patch the client factory to use the mock transport.
+    import app.monitors.nse_rss as mod
+    orig = httpx.AsyncClient
+
+    def _client(**kw):
+        kw.pop("timeout", None)
+        return orig(transport=httpx.MockTransport(handler), timeout=10.0)
+
+    mod.httpx.AsyncClient = _client  # type: ignore[assignment]
+    try:
+        first = await fetcher("https://stub")
+        assert "Vedant" in first
+        second = await fetcher("https://stub")
+        assert second == ""  # 304 -> empty -> zero items
+    finally:
+        mod.httpx.AsyncClient = orig  # type: ignore[assignment]
+
+
+# ---- per-source poll interval ------------------------------------------
+
+
+def test_rss_monitor_follows_its_own_interval():
+    """interval_fn overrides the global POLL_INTERVAL_SECONDS when > 0."""
+    mon = NSERSSMonitor(interval_fn=lambda: 0.5)
+    assert mon._poll_interval == pytest.approx(0.5)
+
+
+def test_rss_interval_zero_falls_back_to_global():
+    from app.config import get_settings
+
+    mon = NSERSSMonitor(interval_fn=lambda: 0.0)
+    assert mon._poll_interval == pytest.approx(
+        float(get_settings().POLL_INTERVAL_SECONDS)
+    )
+
+
+def test_manager_wires_rss_interval_fn():
+    from app.monitors.manager import MonitorManager
+
+    m = MonitorManager()
+    assert m.nse_rss._interval_fn is not None

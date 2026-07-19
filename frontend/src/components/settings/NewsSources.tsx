@@ -69,6 +69,9 @@ export function NewsSources() {
     for (const s of SOURCES) {
       if (values[s.key] !== undefined) (slice as Record<string, unknown>)[s.key] = values[s.key];
     }
+    if (values.NSE_RSS_POLL_SECONDS !== undefined) {
+      slice.NSE_RSS_POLL_SECONDS = Number(values.NSE_RSS_POLL_SECONDS);
+    }
     try {
       await update.mutateAsync({ global: slice as GS });
       setSaved(true);
@@ -117,6 +120,29 @@ export function NewsSources() {
               </div>
             );
           })}
+          {Boolean(values.NSE_RSS_ENABLED) && (
+            <div className="field">
+              <label htmlFor="rss-poll">NSE RSS poll interval (seconds)</label>
+              <input
+                id="rss-poll"
+                type="number"
+                min={0.5}
+                max={60}
+                step={0.5}
+                value={values.NSE_RSS_POLL_SECONDS ?? 1}
+                onChange={(e) => {
+                  setValues((prev) => ({ ...prev, NSE_RSS_POLL_SECONDS: Number(e.target.value) }));
+                  setSaved(false);
+                }}
+              />
+              <span className="field-hint">
+                The RSS feed is a plain CDN with conditional-GET (unchanged =
+                near-free), so it can poll FASTER than the rate-limited APIs —
+                lower = faster detection when RSS wins. 0 follows the global
+                poll interval. Floor 0.5s to stay polite to the CDN.
+              </span>
+            </div>
+          )}
           <p className="empty">
             Per-source detection latency is on the Timing page (&quot;Detection
             race&quot;) — judge a new source there before trusting it.

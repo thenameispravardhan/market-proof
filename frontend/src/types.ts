@@ -284,6 +284,7 @@ export interface GlobalSettings {
   NSE_API_ENABLED: boolean;
   BSE_API_ENABLED: boolean;
   NSE_RSS_ENABLED: boolean;
+  NSE_RSS_POLL_SECONDS: number;
   // ---- Edge Memory (self-learning conviction gate) ----------------------
   EDGE_GATE_ENABLED: boolean;
   EDGE_GATE_MIN_SAMPLES: number;

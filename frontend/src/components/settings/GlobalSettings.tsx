@@ -17,6 +17,7 @@ type NumField = Exclude<
   | "NSE_API_ENABLED"
   | "BSE_API_ENABLED"
   | "NSE_RSS_ENABLED"
+  | "NSE_RSS_POLL_SECONDS"
   // Edge Memory controls (edited on the Edge Memory card, not here).
   | "EDGE_GATE_ENABLED"
   | "EDGE_GATE_MIN_SAMPLES"

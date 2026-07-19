@@ -202,6 +202,7 @@ class BaseMonitor:
         session_factory: Optional[Callable[[], Session]] = None,
         start_offset: float = 0.0,
         enabled_fn: Optional[Callable[[], bool]] = None,
+        interval_fn: Optional[Callable[[], float]] = None,
     ) -> None:
         self._fetcher = fetcher
         self._parser = parser
@@ -233,6 +234,11 @@ class BaseMonitor:
         # iteration, so enabling/disabling a source applies within one
         # poll interval — no restart. None = always enabled.
         self._enabled_fn = enabled_fn
+        # Optional per-source poll interval (live). A cheap channel (the
+        # conditional-GET RSS feed) can safely poll faster than the
+        # Akamai-fronted APIs. Returns seconds; <=0 or None → follow the
+        # global POLL_INTERVAL_SECONDS.
+        self._interval_fn = interval_fn
         # Tick telemetry: rolling fetch+parse+store durations feeding
         # MONITOR_TICK_STATS (see module docstring on that dict).
         self._tick_durations: deque[float] = deque(maxlen=50)
@@ -249,6 +255,13 @@ class BaseMonitor:
         """
         if self._poll_interval_fixed is not None:
             return self._poll_interval_fixed
+        if self._interval_fn is not None:
+            try:
+                v = float(self._interval_fn())
+                if v > 0:
+                    return v
+            except Exception:  # noqa: BLE001 — fall back to the global setting
+                pass
         return float(get_settings().POLL_INTERVAL_SECONDS)
 
     def _jittered_interval(self) -> float:
