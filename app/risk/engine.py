@@ -412,6 +412,39 @@ class RiskEngine:
             })
             return RiskDecision(approved=False, violations=violations, context=context)
 
+        # ---- R14. Edge Memory gate (self-learning; opt-in) -------------
+        # Consult the bot's OWN track record on signals like this one. The
+        # edge is ALWAYS computed and surfaced in context; it only VETOES
+        # a trade when EDGE_GATE_ENABLED and there's enough evidence that
+        # this cohort loses money. FAIL-OPEN: thin history never blocks,
+        # and any error degrades to "no opinion".
+        try:
+            from app.services import historical_edge as _he
+
+            edge = _he.compute_edge(session, symbol=symbol, action=action)
+            if edge is not None:
+                context["edge"] = edge.to_dict()
+            if bool(getattr(settings, "EDGE_GATE_ENABLED", False)):
+                verdict, reason = _he.edge_verdict(
+                    edge,
+                    min_n=int(getattr(settings, "EDGE_GATE_MIN_SAMPLES", 30)),
+                    min_expectancy_pct=float(
+                        getattr(settings, "EDGE_GATE_MIN_EXPECTANCY_PCT", 0.0)
+                    ),
+                )
+                context["edge_verdict"] = verdict
+                if verdict == "block":
+                    violations.append({
+                        "code": "RISK_EDGE_NEGATIVE",
+                        "message": f"Edge Memory: {reason}",
+                        "severity": "critical",
+                    })
+                    return RiskDecision(
+                        approved=False, violations=violations, context=context
+                    )
+        except Exception:  # noqa: BLE001 — advisory; never break a trade
+            pass
+
         # ---- R11. shorting toggle (RISK.md) ----------------------------
         # A SELL that OPENS a short (no existing long to close) is only
         # allowed when shorting is enabled. Closing/reducing a long is

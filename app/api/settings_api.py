@@ -105,6 +105,10 @@ _GLOBAL_KEYS: dict[str, tuple[type, Any]] = {
     "NSE_API_ENABLED": (bool, True),
     "BSE_API_ENABLED": (bool, True),
     "NSE_RSS_ENABLED": (bool, False),
+    # ---- Edge Memory (self-learning conviction gate) ---------------------
+    "EDGE_GATE_ENABLED": (bool, False),
+    "EDGE_GATE_MIN_SAMPLES": (int, 30),
+    "EDGE_GATE_MIN_EXPECTANCY_PCT": (float, 0.0),
     # ---- Exit Manager (UI page) ------------------------------------------
     # Every exit-engine knob, exposed for frontend-only control. Defaults
     # mirror app/config.py so exposing them changes nothing by itself.
@@ -208,10 +212,22 @@ def _coerce(key: str, value: Any) -> Any:
             detail=f"setting {key}: cannot coerce {value!r} to {typ.__name__}: {e}",
         ) from e
     if typ in (int, float):
-        if key.endswith("_PCT") and not (0 < coerced <= 100):
+        # EDGE_GATE_MIN_EXPECTANCY_PCT is a signed threshold (a losing
+        # cohort has negative expectancy; 0 = block only proven losers),
+        # so it is exempt from the strict (0, 100] percent rule.
+        if (
+            key.endswith("_PCT")
+            and key != "EDGE_GATE_MIN_EXPECTANCY_PCT"
+            and not (0 < coerced <= 100)
+        ):
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=f"setting {key}: percent must be in (0, 100]",
+            )
+        if key == "EDGE_GATE_MIN_EXPECTANCY_PCT" and not (-50 <= coerced <= 50):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="EDGE_GATE_MIN_EXPECTANCY_PCT must be between -50 and 50",
             )
         if key in {"MAX_CONCURRENT_POSITIONS", "MAX_SIGNALS_PER_DAY"} and coerced < 0:
             raise HTTPException(

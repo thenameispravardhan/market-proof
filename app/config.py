@@ -70,6 +70,17 @@ class Settings(BaseSettings):
     # preserves current behavior until the operator opts in.
     NSE_RSS_ENABLED: bool = False
 
+    # ---------- Edge Memory (self-learning conviction gate) ----------
+    # When ON, a signal is blocked if the bot's OWN track record on
+    # signals like it (same symbol, else same action) shows a losing
+    # 30-minute expectancy over at least EDGE_GATE_MIN_SAMPLES outcomes.
+    # FAIL-OPEN: thin history never blocks. Default OFF (non-destructive)
+    # — the edge is computed and surfaced regardless; the toggle only
+    # decides whether it can veto a trade. See app/services/historical_edge.py.
+    EDGE_GATE_ENABLED: bool = False
+    EDGE_GATE_MIN_SAMPLES: int = 30
+    EDGE_GATE_MIN_EXPECTANCY_PCT: float = 0.0
+
     # ---------- Risk defaults (per-strategy overrides in DB) ----------
     # Per-trade capital-at-risk cap. RISK.md targets 0.75%; the graduated
     # ramp (RISK_RAMP_*) starts a fresh account lower and works up to this.

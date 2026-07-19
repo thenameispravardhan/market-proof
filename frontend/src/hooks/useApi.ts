@@ -998,6 +998,30 @@ export function useExecutionLatency(window = 100) {
   });
 }
 
+export interface EdgeStats {
+  basis: "symbol" | "action";
+  symbol: string | null;
+  action: string;
+  n: number;
+  win_rate: number;
+  avg_move_5m: number;
+  expectancy: number;
+  best: number;
+  worst: number;
+}
+
+export interface EdgeBook {
+  book: { BUY: EdgeStats | null; SELL: EdgeStats | null };
+}
+
+export function useEdgeBook() {
+  return useQuery<EdgeBook>({
+    queryKey: ["edge-book"],
+    queryFn: () => api.get("/api/metrics/edge/book"),
+    refetchInterval: 30000,
+  });
+}
+
 export interface OutcomeRow {
   outcome_id: number;
   signal_id: number | null;

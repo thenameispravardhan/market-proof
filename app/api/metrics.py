@@ -326,6 +326,32 @@ def _source_label(source: Optional[str], exchange: Optional[str]) -> str:
     return f"{exch}-API"
 
 
+@router.get("/edge")
+def edge_lookup(
+    symbol: str = Query(...),
+    action: str = Query(...),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Edge Memory: the bot's own track record on signals like this one.
+    `null` edge = not enough history yet (the engine fails open)."""
+    from app.services import historical_edge as he
+
+    edge = he.compute_edge(db, symbol=symbol, action=action)
+    return {
+        "symbol": symbol.upper(),
+        "action": action.upper(),
+        "edge": edge.to_dict() if edge is not None else None,
+    }
+
+
+@router.get("/edge/book")
+def edge_book(db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Overall track record by action — the whole book's expectancy."""
+    from app.services import historical_edge as he
+
+    return {"book": he.book_expectancy(db)}
+
+
 @router.get("/health-report")
 def health_report(db: Session = Depends(get_db)) -> dict[str, Any]:
     """The daily health report, compiled on demand (read-only)."""
