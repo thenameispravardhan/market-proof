@@ -451,6 +451,21 @@ body {
   background: transparent;
   border: none;
 }
+/* Sub-group heading INSIDE a settings widget — splits a long form into
+   labelled sections (Capital & risk / Detection & speed / …) without
+   making each one look like its own card. */
+.settings-group-title {
+  font-size: 9.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--text-faint);
+  margin: 18px 0 6px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+}
+.settings-group-title:first-of-type { margin-top: 4px; }
+
 .widget h3 .meta {
   font-size: 10px;
   font-weight: 400;

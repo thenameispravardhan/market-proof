@@ -31,23 +31,50 @@ type NumField = Exclude<
   | "SQUARE_OFF_TIME_IST"
 >;
 
-const FIELDS: { key: NumField; label: string; min: number; max: number; step: number }[] = [
-  { key: "MAX_CAPITAL_RISK_PCT", label: "Max capital risk (%)", min: 0.1, max: 100, step: 0.1 },
-  { key: "DAILY_MAX_LOSS_PCT", label: "Daily max loss (%)", min: 0.1, max: 100, step: 0.1 },
-  { key: "MAX_CONCURRENT_POSITIONS", label: "Max concurrent positions", min: 1, max: 100, step: 1 },
-  { key: "MAX_SINGLE_POSITION_PCT", label: "Max single position (%)", min: 0.1, max: 100, step: 0.1 },
-  { key: "INTRADAY_LEVERAGE", label: "Intraday leverage (×)", min: 1, max: 10, step: 0.5 },
-  { key: "MIN_LIQUIDITY_CRORE", label: "Min liquidity (₹ crore)", min: 1, max: 10000, step: 1 },
-  { key: "MAX_SIGNALS_PER_DAY", label: "Max signals per day", min: 1, max: 500, step: 1 },
-  { key: "POLL_INTERVAL_SECONDS", label: "Poll interval (seconds)", min: 5, max: 3600, step: 5 },
-  { key: "PORTFOLIO_VALUE", label: "Portfolio value (₹)", min: 1000, max: 1e12, step: 10000 },
-  { key: "DEFAULT_SL_PCT", label: "Default stop-loss (%)", min: 0.5, max: 50, step: 0.5 },
-  { key: "DEFAULT_TARGET_RR", label: "Default target R:R", min: 0.5, max: 10, step: 0.5 },
-  { key: "QUOTE_REFRESH_SECONDS", label: "Quote refresh (seconds)", min: 1, max: 600, step: 1 },
-  { key: "LLM_MAX_TOKENS", label: "AI max output tokens", min: 100, max: 4000, step: 50 },
-  { key: "MAX_NEWS_AGE_SECONDS", label: "Max news age (seconds)", min: 5, max: 600, step: 5 },
-  { key: "MAX_NEWS_AGE_ABSOLUTE_SECONDS", label: "Absolute news age ceiling (seconds, 0 = off)", min: 0, max: 86400, step: 60 },
-  { key: "PIPELINE_DEADLINE_SECONDS", label: "Signal deadline (seconds, 0 = off)", min: 0, max: 300, step: 1 },
+interface FieldSpec {
+  key: NumField;
+  label: string;
+  min: number;
+  max: number;
+  step: number;
+}
+
+// Fields grouped by WHAT YOU'RE TUNING, so this stops being a wall of
+// sixteen identical number boxes. Order within a group runs from the
+// most-often adjusted to the most-rarely.
+const FIELD_GROUPS: { title: string; note?: string; fields: FieldSpec[] }[] = [
+  {
+    title: "Capital & risk",
+    note: "How much of the account any single trade — or the whole day — can put at risk.",
+    fields: [
+      { key: "PORTFOLIO_VALUE", label: "Portfolio value (₹)", min: 1000, max: 1e12, step: 10000 },
+      { key: "MAX_CAPITAL_RISK_PCT", label: "Max capital risk per trade (%)", min: 0.1, max: 100, step: 0.1 },
+      { key: "DAILY_MAX_LOSS_PCT", label: "Daily max loss (%)", min: 0.1, max: 100, step: 0.1 },
+      { key: "MAX_CONCURRENT_POSITIONS", label: "Max concurrent positions", min: 1, max: 100, step: 1 },
+      { key: "MAX_SINGLE_POSITION_PCT", label: "Max single position (%)", min: 0.1, max: 100, step: 0.1 },
+      { key: "INTRADAY_LEVERAGE", label: "Intraday leverage (×)", min: 1, max: 10, step: 0.5 },
+      { key: "MIN_LIQUIDITY_CRORE", label: "Min liquidity (₹ crore)", min: 1, max: 10000, step: 1 },
+      { key: "MAX_SIGNALS_PER_DAY", label: "Max signals per day", min: 1, max: 500, step: 1 },
+    ],
+  },
+  {
+    title: "Detection & speed",
+    note: "How fast news is picked up and how stale a filing may be before it's dropped.",
+    fields: [
+      { key: "POLL_INTERVAL_SECONDS", label: "Poll interval (seconds)", min: 5, max: 3600, step: 5 },
+      { key: "MAX_NEWS_AGE_SECONDS", label: "Max news age (seconds)", min: 5, max: 600, step: 5 },
+      { key: "MAX_NEWS_AGE_ABSOLUTE_SECONDS", label: "Absolute news age ceiling (seconds, 0 = off)", min: 0, max: 86400, step: 60 },
+      { key: "PIPELINE_DEADLINE_SECONDS", label: "Signal deadline (seconds, 0 = off)", min: 0, max: 300, step: 1 },
+      { key: "QUOTE_REFRESH_SECONDS", label: "Quote refresh (seconds)", min: 1, max: 600, step: 1 },
+    ],
+  },
+  {
+    title: "AI analysis",
+    note: "What the DeepSeek analyzer is allowed to spend per filing.",
+    fields: [
+      { key: "LLM_MAX_TOKENS", label: "AI max output tokens", min: 100, max: 4000, step: 50 },
+    ],
+  },
 ];
 
 export function GlobalSettings() {
@@ -91,24 +118,39 @@ export function GlobalSettings() {
   return (
     <div className="widget" data-testid="global-settings">
       <h3>Risk &amp; Execution Settings</h3>
+      <p className="empty">
+        Stop-loss, target and every other exit control now live on the{" "}
+        <strong>Exits</strong> page.
+      </p>
       {isLoading ? (
         <p className="empty">Loading…</p>
       ) : (
         <>
-          {FIELDS.map(({ key, label, min, max, step }) => (
-            <div className="field" key={key}>
-              <label htmlFor={`gs-${key}`}>{label}</label>
-              <input
-                id={`gs-${key}`}
-                type="number"
-                min={min}
-                max={max}
-                step={step}
-                value={values[key] ?? ""}
-                onChange={(e) => handleChange(key, e.target.value)}
-              />
+          {FIELD_GROUPS.map((group) => (
+            <div key={group.title}>
+              <div className="settings-group-title">{group.title}</div>
+              {group.note && (
+                <span className="field-hint" style={{ display: "block", marginBottom: 6 }}>
+                  {group.note}
+                </span>
+              )}
+              {group.fields.map(({ key, label, min, max, step }) => (
+                <div className="field" key={key}>
+                  <label htmlFor={`gs-${key}`}>{label}</label>
+                  <input
+                    id={`gs-${key}`}
+                    type="number"
+                    min={min}
+                    max={max}
+                    step={step}
+                    value={values[key] ?? ""}
+                    onChange={(e) => handleChange(key, e.target.value)}
+                  />
+                </div>
+              ))}
             </div>
           ))}
+          <div className="settings-group-title">Pipeline behaviour</div>
           <div className="field" style={{ marginTop: 4 }}>
             <label>Measure news age from receipt</label>
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>

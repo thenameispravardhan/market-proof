@@ -45,22 +45,38 @@ const Settings = lazy(() => import("./pages/Settings"));
 const Exits = lazy(() => import("./pages/Exits"));
 const Timing = lazy(() => import("./pages/Timing"));
 
-const TABS: { key: TabKey; label: string; emoji: string; group: "MAIN" | "OPS" | "CFG" }[] = [
-  { key: "dashboard",      label: "Dashboard",      emoji: "▤", group: "MAIN" },
-  { key: "trade",          label: "Trade",          emoji: "▶", group: "MAIN" },
-  { key: "exits",          label: "Exits",          emoji: "⇥", group: "MAIN" },
-  { key: "timing",         label: "Timing",         emoji: "◷", group: "MAIN" },
-  { key: "trades",         label: "Trade History",  emoji: "₹", group: "MAIN" },
-  { key: "outcomes",       label: "Outcomes",       emoji: "◎", group: "MAIN" },
-  { key: "dataset",        label: "Dataset",        emoji: "▥", group: "MAIN" },
-  { key: "prompts",        label: "Prompts",        emoji: "✎", group: "MAIN" },
-  { key: "rules",          label: "Rules",          emoji: "≡", group: "MAIN" },
-  { key: "strategies",     label: "Strategies",     emoji: "◈", group: "MAIN" },
-  { key: "backtest",       label: "Backtest",       emoji: "↻", group: "OPS"  },
-  { key: "accounts",       label: "Accounts",       emoji: "▦", group: "OPS"  },
-  { key: "notifications",  label: "Notifications",  emoji: "◉", group: "OPS"  },
-  { key: "webhooks",       label: "Webhooks",       emoji: "⇄", group: "OPS"  },
-  { key: "settings",       label: "Settings",       emoji: "⚙", group: "CFG"  },
+// Nav grouped by the OPERATOR'S WORKFLOW, not by module:
+//   LIVE        — what is happening right now
+//   STRATEGY    — how the bot decides (in pipeline order: AI → rules →
+//                 strategies → how trades are closed)
+//   PERFORMANCE — how it actually did
+//   SYSTEM      — plumbing and configuration
+// Order within each group follows that same flow, so reading the sidebar
+// top-to-bottom tells the story of one trade.
+type NavGroup = "LIVE" | "STRATEGY" | "PERFORMANCE" | "SYSTEM";
+
+const NAV_GROUPS: NavGroup[] = ["LIVE", "STRATEGY", "PERFORMANCE", "SYSTEM"];
+
+const TABS: { key: TabKey; label: string; emoji: string; group: NavGroup }[] = [
+  // What's happening now
+  { key: "dashboard",      label: "Dashboard",      emoji: "▤", group: "LIVE" },
+  { key: "trade",          label: "Trade",          emoji: "▶", group: "LIVE" },
+  // How the bot decides — pipeline order
+  { key: "prompts",        label: "Prompts",        emoji: "✎", group: "STRATEGY" },
+  { key: "rules",          label: "Rules",          emoji: "≡", group: "STRATEGY" },
+  { key: "strategies",     label: "Strategies",     emoji: "◈", group: "STRATEGY" },
+  { key: "exits",          label: "Exits",          emoji: "⇥", group: "STRATEGY" },
+  // How it did
+  { key: "trades",         label: "Trade History",  emoji: "₹", group: "PERFORMANCE" },
+  { key: "outcomes",       label: "Outcomes",       emoji: "◎", group: "PERFORMANCE" },
+  { key: "timing",         label: "Timing",         emoji: "◷", group: "PERFORMANCE" },
+  { key: "backtest",       label: "Backtest",       emoji: "↻", group: "PERFORMANCE" },
+  { key: "dataset",        label: "Dataset",        emoji: "▥", group: "PERFORMANCE" },
+  // Plumbing
+  { key: "accounts",       label: "Accounts",       emoji: "▦", group: "SYSTEM" },
+  { key: "notifications",  label: "Notifications",  emoji: "◉", group: "SYSTEM" },
+  { key: "webhooks",       label: "Webhooks",       emoji: "⇄", group: "SYSTEM" },
+  { key: "settings",       label: "Settings",       emoji: "⚙", group: "SYSTEM" },
 ];
 
 function PageContent({ tab }: { tab: TabKey }) {
@@ -239,7 +255,7 @@ export default function App() {
   const toggleSidebar = () => setSidebarOpen((v) => !v);
 
   // Group the nav by section for the Bloomberg-style grouped sidebar.
-  const sections: ("MAIN" | "OPS" | "CFG")[] = ["MAIN", "OPS", "CFG"];
+  const sections: NavGroup[] = NAV_GROUPS;
 
   return (
     <div className="app">

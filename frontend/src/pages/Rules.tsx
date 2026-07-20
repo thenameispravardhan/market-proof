@@ -3,6 +3,7 @@ import { useState } from "react";
 import { RuleList } from "../components/rules/RuleList";
 import { RuleEditor } from "../components/rules/RuleEditor";
 import { RuleDryRun } from "../components/rules/RuleDryRun";
+import { RuleBook } from "../components/settings/RuleBook";
 import { useStrategies } from "../hooks/useApi";
 
 export default function Rules() {
@@ -57,6 +58,11 @@ export default function Rules() {
           />
           <div style={{ marginTop: 16 }}>
             <RuleDryRun strategyId={strategyId} />
+          </div>
+          {/* The full reference of everything that can stop a trade —
+              lives here, next to the rules it explains. */}
+          <div style={{ marginTop: 16 }}>
+            <RuleBook />
           </div>
         </div>
       </div>

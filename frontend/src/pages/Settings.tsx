@@ -1,11 +1,34 @@
-// Settings page: global settings, breaker history, and the audit log.
+// Settings page — organised by PURPOSE, not by whatever was built last.
+//
+// Left column  : the trading parameters you actually tune (one grouped form).
+// Right column : three clearly-labelled areas, in decreasing edit frequency —
+//                  Detection & Conviction  (what the bot watches / trusts)
+//                  Appearance              (theme)
+//                  History & Audit         (read-only; NOT settings)
+// The Rule Book moved to the Rules page, where a rules reference belongs.
+
 import { GlobalSettings } from "../components/settings/GlobalSettings";
 import { AuditLog } from "../components/settings/AuditLog";
 import { BreakerHistory } from "../components/settings/BreakerHistory";
 import { EdgeMemory } from "../components/settings/EdgeMemory";
 import { NewsSources } from "../components/settings/NewsSources";
-import { RuleBook } from "../components/settings/RuleBook";
 import { ThemeSwitcher } from "../components/settings/ThemeSwitcher";
+
+function SectionLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <div
+      style={{
+        textTransform: "uppercase",
+        letterSpacing: "0.08em",
+        fontSize: 11,
+        opacity: 0.6,
+        margin: "20px 0 8px",
+      }}
+    >
+      {children}
+    </div>
+  );
+}
 
 export default function Settings() {
   return (
@@ -13,22 +36,21 @@ export default function Settings() {
       <h1 className="page-title">Settings</h1>
       <div className="layout-2">
         <div>
+          <SectionLabel>Trading parameters</SectionLabel>
           <GlobalSettings />
         </div>
         <div>
-          <ThemeSwitcher />
-          <div style={{ marginTop: 16 }}>
-            <NewsSources />
-          </div>
+          <SectionLabel>Detection &amp; conviction</SectionLabel>
+          <NewsSources />
           <div style={{ marginTop: 16 }}>
             <EdgeMemory />
           </div>
-          <div style={{ marginTop: 16 }}>
-            <BreakerHistory />
-          </div>
-          <div style={{ marginTop: 16 }}>
-            <RuleBook />
-          </div>
+
+          <SectionLabel>Appearance</SectionLabel>
+          <ThemeSwitcher />
+
+          <SectionLabel>History &amp; audit (read-only)</SectionLabel>
+          <BreakerHistory />
           <div style={{ marginTop: 16 }}>
             <AuditLog />
           </div>
