@@ -40,6 +40,16 @@ from app.monitors.base import BaseMonitor, RawAnnouncement
 
 log = get_logger(__name__)
 
+# HTTP/2 needs the optional `h2` wheel (pulled in by `httpx[http2]`).
+# Production ships it; probe once so an env without it degrades to
+# HTTP/1.1 keep-alive instead of raising at client construction.
+try:
+    import h2  # noqa: F401
+
+    _HTTP2_AVAILABLE = True
+except ImportError:  # pragma: no cover - depends on the install extras
+    _HTTP2_AVAILABLE = False
+
 NSE_RSS_URL = "https://nsearchives.nseindia.com/content/RSS/Online_announcements.xml"
 NSE_EQUITY_MASTER_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 
@@ -225,23 +235,51 @@ class ConditionalRSSFetcher:
     cache-busted away (the API sends no cache headers at all), but polling
     the cheapest channel more often shortens the wait when RSS wins.
 
-    Stateful (holds the validators), so it's one instance per monitor.
+    Stateful (holds the validators AND a persistent client), so it's one
+    instance per monitor.
+
+    The client is created once, lazily, and reused across every poll:
+    the TCP + TLS (+ HTTP/2) session to the CDN is set up a single time
+    per process instead of on every tick. Combined with the conditional
+    GET above, a steady-state poll becomes a header-only round trip on an
+    already-open, kept-warm connection — the cheapest possible way to
+    poll the fastest channel more often. `keepalive_expiry` is set wide
+    enough that the connection survives whatever NSE_RSS_POLL_SECONDS the
+    operator picks (not just the sub-5s default httpx would allow).
     """
 
     def __init__(self, resolver: Optional[NameResolver] = None) -> None:
         self._resolver = resolver or _default_resolver
         self._etag: Optional[str] = None
         self._last_modified: Optional[str] = None
+        self._client: Optional[httpx.AsyncClient] = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """Lazily build the shared client, bound to the running loop on
+        first use (inside the monitor's tick)."""
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                timeout=10.0,
+                headers={"User-Agent": _UA},
+                http2=_HTTP2_AVAILABLE,
+                follow_redirects=True,
+                limits=httpx.Limits(
+                    max_keepalive_connections=4, keepalive_expiry=90.0
+                ),
+            )
+        return self._client
 
     async def __call__(self, url: str) -> str:
         await self._resolver.ensure_loaded()
-        headers = {"User-Agent": _UA}
+        # Per-request conditional-GET validators; the persistent client
+        # already carries the User-Agent as a default header.
+        headers: dict[str, str] = {}
         if self._etag:
             headers["If-None-Match"] = self._etag
         if self._last_modified:
             headers["If-Modified-Since"] = self._last_modified
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(url, headers=headers)
+        client = self._get_client()
+        r = await client.get(url, headers=headers)
         if r.status_code == 304:
             return ""  # unchanged — parsed as zero items
         r.raise_for_status()
@@ -249,6 +287,15 @@ class ConditionalRSSFetcher:
         self._etag = r.headers.get("ETag") or self._etag
         self._last_modified = r.headers.get("Last-Modified") or self._last_modified
         return r.text
+
+    async def aclose(self) -> None:
+        """Close the persistent client (teardown / tests). Safe to call
+        when no client was ever created."""
+        if self._client is not None:
+            try:
+                await self._client.aclose()
+            finally:
+                self._client = None
 
 
 class NSERSSMonitor(BaseMonitor):
