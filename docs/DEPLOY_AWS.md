@@ -194,9 +194,34 @@ At [myapi.fyers.in](https://myapi.fyers.in), on your app:
 | Fyers token re-auth (daily, pre-market) | UI → Connect Fyers |
 | Watch logs | `journalctl -u tradebot -f` |
 | Restart app | `sudo systemctl restart tradebot` |
-| Deploy new code | `cd ~/tradebot && bash deploy/update.sh` |
+| Deploy new code (on the server) | `cd ~/tradebot && bash deploy/update.sh` |
+| Deploy new code (from your dev machine) | `bash deploy/push.sh` (or `.\deploy\push.ps1`) — see below |
 | DB backup (weekdays 18:30 IST) | `crontab -e` → `30 18 * * 1-5 /home/ubuntu/tradebot/deploy/backup.sh >> /home/ubuntu/tradebot/logs/backup.log 2>&1` |
 | Pull a backup down to Windows | `scp -i $KEY ubuntu@${IP}:~/tradebot/data/backups/<file> .` |
+
+### One-command redeploy from your dev machine
+
+So no session ever gets stuck not knowing the server address, the concrete
+target (IP, domain, SSH user, key path) lives in **`deploy/target.local.env`**
+— a **gitignored** file, private to each machine. The committed
+[`deploy/target.local.env.example`](../deploy/target.local.env.example) shows
+its shape.
+
+- **First time on a machine:** copy the example to `deploy/target.local.env`
+  and fill in the four values (they're in this runbook + the project memory).
+- **Every deploy after that:**
+  ```bash
+  bash deploy/push.sh          # Git Bash / WSL / macOS / Linux
+  .\deploy\push.ps1            # Windows PowerShell
+  ```
+  Both `git push` the current branch, SSH in, run `deploy/update.sh` (pull +
+  deps + rebuild-if-changed + restart), and print the health check. Add
+  `--frontend` / `-Frontend` to force a dashboard rebuild.
+
+The private file holds only the *address*, never a secret — the SSH key stays
+at `TRADEBOT_SSH_KEY`'s path and the dashboard password lives only in Caddy.
+Security rests on the key + password, not on the address being hidden; still,
+keep port 22 restricted to your IP where you can.
 
 ## Troubleshooting
 

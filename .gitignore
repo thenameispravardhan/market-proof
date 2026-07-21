@@ -55,3 +55,7 @@ fyersRequests.log
 
 # Live-trading safety sentinel (operator-created, not committed)
 .i_accept_live_risk
+
+# Concrete deploy target (server IP / domain / SSH key path) — private to
+# each operator's machine; the committed template is target.local.env.example.
+deploy/target.local.env
