@@ -738,6 +738,135 @@ def test_silence_watchdog_does_not_fire_before_first_tick():
     assert all(e != "fyers_stream.silent" for e, _ in cap.warnings)
 
 
+# ---- silence-triggered self-heal reconnect -----------------------------
+
+
+@pytest.mark.asyncio
+async def test_silent_feed_forces_reconnect_during_market_hours(monkeypatch):
+    """A connected+subscribed socket silent past `silence_reconnect_s`
+    during market hours must be torn down so the run loop rebuilds it —
+    this is the fix for a socket that connected pre-market and never began
+    ticking after the open."""
+    monkeypatch.setattr(
+        "app.risk.market_clock.is_market_open", lambda now=None: True
+    )
+    md = MarketDataBus()
+    holder, df, of = _factories()
+    mgr = FyersStreamManager(
+        market_data=md,
+        quote_feed=_FakeQuoteFeed(["SBIN"]),
+        backend_provider=lambda: _FakeBackend(),
+        data_socket_factory=df,
+        order_socket_factory=of,
+        resolve_fn=lambda s: f"NSE:{s}-EQ",
+        silence_reconnect_s=0.5,
+        reconnect_cooldown_s=0.0,
+    )
+    mgr._loop = asyncio.get_running_loop()
+    await mgr._ensure_connected()
+    mgr._subscribed = {"SBIN": "NSE:SBIN-EQ"}
+    mgr._last_rx_ts = 0.0  # a frame long ago, then silence
+
+    await mgr._recover_if_silent()
+
+    assert mgr._data_socket is None            # sockets dropped
+    assert mgr._subscribed == {}               # cleared by _close_sockets
+    assert mgr._last_forced_reconnect > 0.0    # cooldown timestamp armed
+    assert holder["data"].connected is False   # the fake socket was closed
+
+
+@pytest.mark.asyncio
+async def test_silent_feed_does_not_reconnect_off_market(monkeypatch):
+    """Off-market silence is normal (no trades = no frames); the self-heal
+    must stay hands-off so it doesn't reconnect all night."""
+    monkeypatch.setattr(
+        "app.risk.market_clock.is_market_open", lambda now=None: False
+    )
+    md = MarketDataBus()
+    holder, df, of = _factories()
+    mgr = FyersStreamManager(
+        market_data=md,
+        quote_feed=_FakeQuoteFeed(["SBIN"]),
+        backend_provider=lambda: _FakeBackend(),
+        data_socket_factory=df,
+        order_socket_factory=of,
+        resolve_fn=lambda s: f"NSE:{s}-EQ",
+        silence_reconnect_s=0.0,  # would fire instantly if allowed
+        reconnect_cooldown_s=0.0,
+    )
+    mgr._loop = asyncio.get_running_loop()
+    await mgr._ensure_connected()
+    mgr._subscribed = {"SBIN": "NSE:SBIN-EQ"}
+    mgr._last_rx_ts = 0.0
+
+    await mgr._recover_if_silent()
+
+    assert mgr._data_socket is not None  # untouched off-market
+    assert mgr._subscribed == {"SBIN": "NSE:SBIN-EQ"}
+
+
+@pytest.mark.asyncio
+async def test_silent_reconnect_respects_cooldown(monkeypatch):
+    """Within `reconnect_cooldown_s` of the last forced reconnect, a still-
+    silent feed must NOT reconnect again — no storm on a dead feed."""
+    monkeypatch.setattr(
+        "app.risk.market_clock.is_market_open", lambda now=None: True
+    )
+    import time as _t
+
+    md = MarketDataBus()
+    holder, df, of = _factories()
+    mgr = FyersStreamManager(
+        market_data=md,
+        quote_feed=_FakeQuoteFeed(["SBIN"]),
+        backend_provider=lambda: _FakeBackend(),
+        data_socket_factory=df,
+        order_socket_factory=of,
+        resolve_fn=lambda s: f"NSE:{s}-EQ",
+        silence_reconnect_s=0.0,
+        reconnect_cooldown_s=9e9,  # effectively forever
+    )
+    mgr._loop = asyncio.get_running_loop()
+    await mgr._ensure_connected()
+    mgr._subscribed = {"SBIN": "NSE:SBIN-EQ"}
+    mgr._last_rx_ts = 0.0
+    mgr._last_forced_reconnect = _t.monotonic()  # just reconnected
+
+    await mgr._recover_if_silent()
+
+    assert mgr._data_socket is not None  # cooldown blocked a second teardown
+    assert mgr._subscribed == {"SBIN": "NSE:SBIN-EQ"}
+
+
+@pytest.mark.asyncio
+async def test_silent_reconnect_waits_for_first_tick(monkeypatch):
+    """Before any frame on this connection (`_last_rx_ts is None`) — the
+    pre-open startup window — the self-heal must stay quiet."""
+    monkeypatch.setattr(
+        "app.risk.market_clock.is_market_open", lambda now=None: True
+    )
+    md = MarketDataBus()
+    holder, df, of = _factories()
+    mgr = FyersStreamManager(
+        market_data=md,
+        quote_feed=_FakeQuoteFeed(["SBIN"]),
+        backend_provider=lambda: _FakeBackend(),
+        data_socket_factory=df,
+        order_socket_factory=of,
+        resolve_fn=lambda s: f"NSE:{s}-EQ",
+        silence_reconnect_s=0.0,
+        reconnect_cooldown_s=0.0,
+    )
+    mgr._loop = asyncio.get_running_loop()
+    await mgr._ensure_connected()
+    mgr._subscribed = {"SBIN": "NSE:SBIN-EQ"}
+    mgr._last_rx_ts = None  # no frame yet on this connection
+
+    await mgr._recover_if_silent()
+
+    assert mgr._data_socket is not None  # startup window: no reconnect
+
+
 def test_unmapped_tick_logs_warning_with_drop_count():
     """Each unmapped tick must increment drop_count and log at WARNING
     (not info) so a parser-broken condition surfaces in production logs."""

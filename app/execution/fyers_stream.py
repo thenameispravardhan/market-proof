@@ -147,6 +147,8 @@ class FyersStreamManager:
         fresh_window_s: float = 6.0,
         ondemand_ttl_s: float = 12.0,
         silence_watchdog_s: float = 30.0,
+        silence_reconnect_s: float = 60.0,
+        reconnect_cooldown_s: float = 90.0,
     ) -> None:
         self._md = market_data
         self._quote_feed = quote_feed
@@ -172,6 +174,17 @@ class FyersStreamManager:
         # fire too — the operator filters. During market hours a 30s gap
         # across multiple subscribed symbols means something is wrong.
         self._silence_watchdog_s = float(silence_watchdog_s)
+        # SELF-HEAL: a data socket can stay OPEN yet stop delivering frames
+        # — e.g. it connected during pre-market (a deploy restart before
+        # 09:15) and never started ticking after the open, or a blip the SDK
+        # swallowed without firing on_close. The watchdog above only WARNS;
+        # these thresholds drive an actual reconnect. When connected +
+        # subscribed during market hours with no frame for
+        # `silence_reconnect_s`, force a reconnect — capped to one per
+        # `reconnect_cooldown_s` so a genuinely dead feed can't storm.
+        self._silence_reconnect_s = float(silence_reconnect_s)
+        self._reconnect_cooldown_s = float(reconnect_cooldown_s)
+        self._last_forced_reconnect: float = 0.0
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._data_socket: Optional[Any] = None
@@ -231,6 +244,7 @@ class FyersStreamManager:
                     if self._data_connected:
                         await self._reconcile_subscriptions()
                         self._log_stats()
+                        await self._recover_if_silent()
                 except Exception:  # noqa: BLE001
                     log.exception("fyers_stream.iteration_failed")
                 try:
@@ -273,6 +287,47 @@ class FyersStreamManager:
                 last_rx_age_s=round(now - (self._last_rx_ts or now), 1),
                 subscribed=len(self._subscribed),
             )
+
+    async def _recover_if_silent(self) -> None:
+        """Force a reconnect when a connected socket has gone silent.
+
+        A data socket that is OPEN but delivering no frames is invisible to
+        `_ensure_connected` (the token hasn't changed) and to `_on_data_close`
+        (the SDK never fired a close), so the feed would stay dead until a
+        process restart. This is the missing self-heal: during market hours,
+        if we're connected + subscribed and have seen no frame for
+        `silence_reconnect_s`, close the sockets so the next
+        `_ensure_connected` rebuilds them from scratch. `_close_sockets`
+        clears `_subscribed`, so this early-returns during the reconnect
+        window; a `reconnect_cooldown_s` cap plus the market-hours gate keep
+        a genuinely dead feed (or an off-market lull) from reconnecting in a
+        loop.
+        """
+        # No frame seen yet on this connection → still the startup window;
+        # the plain watchdog stays quiet here too. Nothing to recover.
+        if not self._subscribed or self._last_rx_ts is None:
+            return
+        now = time.monotonic()
+        if (now - self._last_rx_ts) <= self._silence_reconnect_s:
+            return
+        if (now - self._last_forced_reconnect) < self._reconnect_cooldown_s:
+            return
+        # Off-market silence is expected (no trades = no frames); only a
+        # silent feed DURING the session is a fault worth reconnecting.
+        from app.risk.market_clock import is_market_open
+
+        if not is_market_open():
+            return
+        log.warning(
+            "fyers_stream.silent_reconnect",
+            last_rx_age_s=round(now - self._last_rx_ts, 1),
+            subscribed=len(self._subscribed),
+            threshold_s=self._silence_reconnect_s,
+        )
+        self._last_forced_reconnect = now
+        # Drop the sockets; the next loop iteration's `_ensure_connected`
+        # rebuilds them and the fresh connection's snapshot restarts ticks.
+        await self._close_sockets()
 
     async def _ensure_connected(self) -> None:
         """Lazily (re)connect: open the sockets once a live account exists,
