@@ -28,8 +28,23 @@ if [ ! -f "$ENV_FILE" ]; then
     echo "  Copy deploy/target.local.env.example to deploy/target.local.env and fill it in." >&2
     exit 1
 fi
-# shellcheck disable=SC1090
-source "$ENV_FILE"
+
+# Parse KEY=value WITHOUT `source`: a bash assignment tilde-expands `~` to the
+# LOCAL home, which would wreck a REMOTE path like ~/tradebot. Reading the raw
+# strings keeps `~` literal so the remote shell expands it.
+TRADEBOT_SERVER_IP="" TRADEBOT_DOMAIN="" TRADEBOT_SSH_USER=""
+TRADEBOT_SSH_KEY="" TRADEBOT_REMOTE_DIR=""
+while IFS='=' read -r _k _v; do
+    case "$_k" in ''|\#*) continue ;; esac
+    _v="${_v%$'\r'}"                    # strip a trailing CR (Windows checkouts)
+    case "$_k" in
+        TRADEBOT_SERVER_IP)  TRADEBOT_SERVER_IP="$_v" ;;
+        TRADEBOT_DOMAIN)     TRADEBOT_DOMAIN="$_v" ;;
+        TRADEBOT_SSH_USER)   TRADEBOT_SSH_USER="$_v" ;;
+        TRADEBOT_SSH_KEY)    TRADEBOT_SSH_KEY="$_v" ;;
+        TRADEBOT_REMOTE_DIR) TRADEBOT_REMOTE_DIR="$_v" ;;
+    esac
+done < "$ENV_FILE"
 
 DO_GIT=1
 FRONTEND=""
