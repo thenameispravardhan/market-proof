@@ -66,6 +66,13 @@ class Recommendation(str, Enum):
     HOLD = "HOLD"
 
 
+# LLM-invented "don't trade" synonyms mapped onto HOLD (module-level so
+# pydantic doesn't mistake it for a model field / private attr).
+_HOLD_SYNONYMS: frozenset[str] = frozenset(
+    {"NEUTRAL", "AVOID", "NONE", "WAIT", "WATCH", "NO_TRADE"}
+)
+
+
 class KeyNumbers(BaseModel):
     """Numeric data points we care about for trading decisions.
 
@@ -129,12 +136,44 @@ class AnalysisResponse(BaseModel):
         return v.strip()
 
     # LLMs are unreliable about casing ("buy" vs "BUY"); normalise
-    # before enum validation rather than rejecting the analysis.
+    # before enum validation rather than rejecting the analysis. They
+    # also invent no-trade synonyms — measured in production: 100+
+    # analyses/day discarded because DeepSeek said "NEUTRAL" or
+    # "AVOID". Those all MEAN "don't trade", which is exactly HOLD —
+    # map them instead of throwing the whole analysis away (see
+    # module-level _HOLD_SYNONYMS). A value outside this set still
+    # fails loudly (a garbled response should not be silently traded on).
     @field_validator("recommendation", mode="before")
     @classmethod
     def _upper_enum(cls, v: Any) -> Any:
         if isinstance(v, str):
-            return v.strip().upper()
+            up = v.strip().upper()
+            if up in _HOLD_SYNONYMS:
+                return Recommendation.HOLD.value
+            return up
+        return v
+
+    @field_validator("key_numbers", mode="before")
+    @classmethod
+    def _key_numbers_shape(cls, v: Any) -> Any:
+        """Tolerate the list/null shapes DeepSeek actually emits.
+
+        Measured in production: 100+ analyses/day rejected because the
+        model returned ``"key_numbers": []`` (an empty LIST) instead of
+        an object. An empty list and an explicit null both mean "no
+        numbers"; a list of objects (another observed variant) is merged
+        into one dict. Any other malformed shape degrades to "no
+        numbers" too — key_numbers is auxiliary, and dropping a bad
+        sub-object must never discard an otherwise-valid analysis."""
+        if v is None:
+            return {}
+        if isinstance(v, list):
+            if all(isinstance(item, dict) for item in v):
+                merged: dict[str, Any] = {}
+                for item in v:
+                    merged.update(item)
+                return merged
+            return {}
         return v
 
     @field_validator("event_type", mode="before")

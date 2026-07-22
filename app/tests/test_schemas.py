@@ -310,3 +310,59 @@ def test_to_db_columns_maps_to_orm_columns():
     assert set(cols.keys()) == expected
     assert cols["rationale"] == a.reasoning
     assert cols["summary"] == a.summary
+
+
+# -- production-observed LLM shape coercions -----------------------------
+# Measured on the live server (2026-07-20..22): 100+ analyses/day were
+# discarded because DeepSeek returned "NEUTRAL"/"AVOID" for
+# recommendation or a bare list for key_numbers. These lock in the
+# coercions that recover them.
+
+
+def test_recommendation_neutral_coerces_to_hold():
+    a = AnalysisResponse.model_validate(_valid_payload(recommendation="NEUTRAL"))
+    assert a.recommendation == Recommendation.HOLD
+
+
+def test_recommendation_avoid_and_casing_coerce_to_hold():
+    for raw in ("AVOID", "avoid", " Neutral ", "no_trade", "WAIT", "WATCH", "NONE"):
+        a = AnalysisResponse.model_validate(_valid_payload(recommendation=raw))
+        assert a.recommendation == Recommendation.HOLD, raw
+
+
+def test_recommendation_garbage_still_rejected():
+    """Coercion covers known no-trade synonyms ONLY — a garbled value
+    must still fail loudly, never silently become a trade signal."""
+    with pytest.raises(ValidationError):
+        AnalysisResponse.model_validate(_valid_payload(recommendation="STRONG_BUY?"))
+
+
+def test_key_numbers_empty_list_means_no_numbers():
+    a = AnalysisResponse.model_validate(_valid_payload(key_numbers=[]))
+    assert a.key_numbers.deal_value_inr_crore is None
+    assert a.key_numbers.dividend_per_share is None
+
+
+def test_key_numbers_null_means_no_numbers():
+    a = AnalysisResponse.model_validate(_valid_payload(key_numbers=None))
+    assert a.key_numbers.deal_value_inr_crore is None
+
+
+def test_key_numbers_list_of_dicts_is_merged():
+    a = AnalysisResponse.model_validate(
+        _valid_payload(
+            key_numbers=[
+                {"deal_value_inr_crore": 120.0},
+                {"dividend_per_share": 2.5},
+            ]
+        )
+    )
+    assert a.key_numbers.deal_value_inr_crore == 120.0
+    assert a.key_numbers.dividend_per_share == 2.5
+
+
+def test_key_numbers_junk_list_degrades_to_no_numbers():
+    """A list of non-dicts (['5000 crore']) can't be mapped — degrade to
+    empty numbers rather than discarding the whole analysis."""
+    a = AnalysisResponse.model_validate(_valid_payload(key_numbers=["5000 crore"]))
+    assert a.key_numbers.deal_value_inr_crore is None
