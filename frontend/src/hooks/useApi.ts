@@ -1252,6 +1252,57 @@ export function useDatasetHealth(target: string, enabled: boolean) {
   });
 }
 
+// ---- HOLD calibration: are we passing on movers? ----------------------
+
+export interface CalibrationBucket {
+  key: string;
+  n: number;
+  movers: number;
+  mover_rate: number;
+  big_movers: number;
+  big_mover_rate: number;
+  avg_abs_excursion: number | null;
+  median_abs_excursion: number | null;
+  avg_ret_15m: number | null;
+  up: number;
+  down: number;
+  flat: number;
+}
+
+export interface HoldCalibration {
+  thresholds: { move_pct: number; big_pct: number };
+  sample: { total_complete: number; hold: number; taken: number; declined: number };
+  hold_overall: CalibrationBucket;
+  by_event_type: CalibrationBucket[];
+  by_confidence: CalibrationBucket[];
+  by_sentiment: CalibrationBucket[];
+  comparison: { taken: CalibrationBucket; declined: CalibrationBucket };
+  top_missed: {
+    symbol: string | null;
+    event_type: string | null;
+    confidence: number | null;
+    sentiment: string | null;
+    abs_excursion: number;
+    ret_15m_pct: number | null;
+    label_15m: string | null;
+  }[];
+  verdict: string;
+  rows_analysed: number;
+}
+
+export function useDatasetCalibration(
+  movePct: number,
+  enabled: boolean,
+) {
+  return useQuery<HoldCalibration>({
+    queryKey: ["dataset-calibration", movePct],
+    queryFn: () =>
+      api.get(`/api/dataset/calibration?move_threshold_pct=${movePct}`),
+    enabled,
+    refetchInterval: 120000,
+  });
+}
+
 export function useDatasetBackfill() {
   const qc = useQueryClient();
   return useMutation<

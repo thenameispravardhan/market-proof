@@ -17,10 +17,12 @@ import {
   datasetQueryString,
   useDatasetBackfill,
   useDatasetBackfillStatus,
+  useDatasetCalibration,
   useDatasetColumns,
   useDatasetHealth,
   useDatasetRows,
   useDatasetStats,
+  type CalibrationBucket,
   type DatasetColumn,
   type DatasetFilters,
 } from "../hooks/useApi";
@@ -144,6 +146,9 @@ export default function Dataset() {
   const [healthOpen, setHealthOpen] = useState(false);
   const [healthTarget, setHealthTarget] = useState("ret_15m_pct");
   const { data: health } = useDatasetHealth(healthTarget, healthOpen);
+  const [calibOpen, setCalibOpen] = useState(true);
+  const [calibMove, setCalibMove] = useState(1.5);
+  const { data: calib } = useDatasetCalibration(calibMove, calibOpen);
 
   // Keep the preview's column ORDER canonical (catalog order).
   const orderedSelection = useMemo(
@@ -397,6 +402,182 @@ export default function Dataset() {
             <div className="mono" style={{ fontSize: 18 }}>{t.value}</div>
           </div>
         ))}
+      </div>
+
+      {/* HOLD calibration — is the bot passing on movers? */}
+      <div className="widget widget-wide" style={{ marginBottom: 12 }}>
+        <h3 style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <button
+            className="chart-btn"
+            style={{ border: "1px solid var(--border)" }}
+            onClick={() => setCalibOpen((v) => !v)}
+            data-testid="dataset-calibration-toggle"
+          >
+            {calibOpen ? "▾" : "▸"} HOLD calibration
+          </button>
+          <span className="meta">
+            of the filings the bot DECLINED, how many actually moved?
+          </span>
+          {calibOpen && (
+            <>
+              <span style={{ flex: 1 }} />
+              <span className="meta">“moved” ≥</span>
+              <select
+                value={calibMove}
+                onChange={(e) => setCalibMove(Number(e.target.value))}
+                style={{ width: "auto", padding: "2px 6px" }}
+              >
+                {[1.0, 1.5, 2.0, 3.0].map((n) => (
+                  <option key={n} value={n}>{n.toFixed(1)}% in 15m</option>
+                ))}
+              </select>
+            </>
+          )}
+        </h3>
+        {calibOpen &&
+          (!calib ? (
+            <p className="empty">Loading… (needs enriched rows — run “Fill entire history” first)</p>
+          ) : calib.sample.total_complete === 0 ? (
+            <p className="empty">
+              No enriched rows yet. Calibration reads the real 15-minute
+              forward reaction the DatasetBuilder labels — click “Fill entire
+              history” to backfill, then check back.
+            </p>
+          ) : (
+            <div style={{ padding: "0 12px 12px" }}>
+              <p
+                className="mono"
+                data-testid="calibration-verdict"
+                style={{ fontSize: 13, marginBottom: 10 }}
+              >
+                {calib.verdict}
+              </p>
+
+              {/* taken vs declined comparison */}
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
+                  gap: 8,
+                  marginBottom: 12,
+                }}
+              >
+                {[
+                  { label: "Declined — moved", b: calib.comparison.declined, warn: true },
+                  { label: "Taken — moved", b: calib.comparison.taken, warn: false },
+                  {
+                    label: "HOLD filings labeled",
+                    plain: `${calib.sample.hold}`,
+                    sub: `${calib.rows_analysed} complete rows`,
+                  },
+                ].map((t) => (
+                  <div key={t.label} className="widget" style={{ padding: "10px 12px" }}>
+                    <div className="meta" style={{ fontSize: 10 }}>{t.label}</div>
+                    {"b" in t && t.b ? (
+                      <>
+                        <div className="mono" style={{ fontSize: 18 }}>
+                          {(t.b.mover_rate * 100).toFixed(0)}%
+                        </div>
+                        <div className="meta" style={{ fontSize: 10 }}>
+                          {t.b.movers}/{t.b.n} · {t.b.big_mover_rate
+                            ? `${(t.b.big_mover_rate * 100).toFixed(0)}% ≥${calib.thresholds.big_pct}%`
+                            : ""}
+                        </div>
+                      </>
+                    ) : (
+                      <>
+                        <div className="mono" style={{ fontSize: 18 }}>{t.plain}</div>
+                        <div className="meta" style={{ fontSize: 10 }}>{t.sub}</div>
+                      </>
+                    )}
+                  </div>
+                ))}
+              </div>
+
+              {/* by event type — the actionable breakdown */}
+              <div style={{ overflowX: "auto", maxWidth: "100%" }}>
+                <table style={{ whiteSpace: "nowrap" }}>
+                  <thead>
+                    <tr>
+                      <th>Declined event type</th>
+                      <th>n</th>
+                      <th>% moved</th>
+                      <th>% big</th>
+                      <th>avg swing</th>
+                      <th>up / down / flat</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {calib.by_event_type
+                      .filter((b: CalibrationBucket) => b.n >= 3)
+                      .map((b: CalibrationBucket) => (
+                        <tr key={b.key}>
+                          <td className="mono">{b.key}</td>
+                          <td className="mono">{b.n}</td>
+                          <td className={`mono ${b.mover_rate >= 0.3 ? "pnl-neg" : ""}`}>
+                            {(b.mover_rate * 100).toFixed(0)}%
+                          </td>
+                          <td className="mono">{(b.big_mover_rate * 100).toFixed(0)}%</td>
+                          <td className="mono">
+                            {b.avg_abs_excursion !== null ? `${b.avg_abs_excursion}%` : "—"}
+                          </td>
+                          <td className="mono">{b.up} / {b.down} / {b.flat}</td>
+                        </tr>
+                      ))}
+                  </tbody>
+                </table>
+              </div>
+              <p className="meta" style={{ fontSize: 10, marginTop: 6 }}>
+                A high “% moved” on a declined event type = the rules are too
+                tight there. Red = ≥30% of declined filings moved.
+              </p>
+
+              {/* biggest missed movers */}
+              {calib.top_missed.length > 0 && (
+                <div style={{ marginTop: 12 }}>
+                  <div className="meta" style={{ fontSize: 11, marginBottom: 4 }}>
+                    Biggest movers the bot passed on (HOLD):
+                  </div>
+                  <div style={{ overflowX: "auto", maxWidth: "100%" }}>
+                    <table style={{ whiteSpace: "nowrap" }}>
+                      <thead>
+                        <tr>
+                          <th>Symbol</th>
+                          <th>Event</th>
+                          <th>Conf</th>
+                          <th>Swing</th>
+                          <th>Net 15m</th>
+                          <th>Label</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {calib.top_missed.map((m, i) => (
+                          <tr key={`${m.symbol}-${i}`}>
+                            <td className="mono">{m.symbol ?? "—"}</td>
+                            <td className="mono">{m.event_type ?? "—"}</td>
+                            <td className="mono">
+                              {m.confidence !== null ? m.confidence.toFixed(2) : "—"}
+                            </td>
+                            <td className="mono">{m.abs_excursion}%</td>
+                            <td
+                              className={`mono ${
+                                m.ret_15m_pct !== null
+                                  ? m.ret_15m_pct >= 0 ? "pnl-pos" : "pnl-neg"
+                                  : ""
+                              }`}
+                            >
+                              {m.ret_15m_pct !== null ? `${m.ret_15m_pct}%` : "—"}
+                            </td>
+                            <td className="mono">{m.label_15m ?? "—"}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </div>
+          ))}
       </div>
 
       {/* Look-ahead bias warning */}

@@ -883,6 +883,57 @@ def dataset_health(
     return {"target": target, "rows_sampled": n, "columns": report}
 
 
+# ---- HOLD calibration: is the bot passing on movers? ----------------------
+
+
+@router.get("/calibration")
+def dataset_calibration(
+    move_threshold_pct: float = Query(
+        1.5, gt=0.0, le=50.0,
+        description="a filing 'moved' if its 15m swing (max of MFE/MAE) >= this",
+    ),
+    big_threshold_pct: float = Query(3.0, gt=0.0, le=100.0),
+    limit: int = Query(20000, ge=100, le=100000),
+    event_type: Optional[str] = Query(None),
+    since: Optional[str] = Query(None, description="ISO date/datetime (UTC)"),
+    until: Optional[str] = Query(None, description="ISO date/datetime (UTC)"),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """HOLD calibration — of the filings the bot DECLINED, how many
+    actually moved?
+
+    Uses the real 15-minute forward reaction the DatasetBuilder already
+    labels on each row (enriched/complete rows only), broken down by event
+    type, LLM confidence, and sentiment, plus the taken-vs-declined mover-
+    rate comparison that says whether the selection is discriminating.
+    NSE/BSE cross-listings are collapsed so one move isn't counted twice.
+    """
+    from app.services.hold_calibration import (
+        compute_calibration,
+        normalise_dataset_row,
+    )
+
+    result = _dataset_rows(
+        db,
+        limit=limit,
+        source="all",
+        dedup=True,            # collapse NSE/BSE twins
+        enriched_only=True,    # only rows with a complete 15m label
+        event_type=event_type,
+        action=None, symbol=None, taken=None, label=None,
+        since=since, until=until,
+    )
+    normalised = [normalise_dataset_row(r) for r in result["rows"]]
+    report = compute_calibration(
+        normalised,
+        move_threshold_pct=move_threshold_pct,
+        big_threshold_pct=big_threshold_pct,
+    )
+    report["rows_analysed"] = len(normalised)
+    report["window"] = {"since": since, "until": until}
+    return report
+
+
 def _get_builder(request: Request):
     """The lifespan's shared builder (its run lock + progress state make
     it the single source of truth); created lazily if missing."""
