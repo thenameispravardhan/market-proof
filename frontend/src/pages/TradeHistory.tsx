@@ -72,6 +72,7 @@ function Section({
                 <th className="mono">Exit</th>
                 <th className="mono">SL / Target</th>
                 <th className="mono">P&amp;L</th>
+                <th>Entry (IST)</th>
                 <th>Closed (IST)</th>
               </tr>
             </thead>
@@ -103,6 +104,7 @@ function Section({
                     <td className={`mono ${pnlClass(r.pnl)}`}>
                       {r.open ? "—" : fmtMoney(r.pnl)}
                     </td>
+                    <td className="mono">{fmtTime(r.entryTime)}</td>
                     <td className="mono">{r.open ? "—" : fmtTime(r.exitTime)}</td>
                   </tr>
                 );

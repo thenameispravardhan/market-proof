@@ -19,6 +19,7 @@ export interface RoundTrip {
   quantity: number;
   entryPrice: number | null;
   exitPrice: number | null;
+  entryTime: string | null;
   exitTime: string | null;
   pnl: number | null;
   open: boolean;
@@ -81,6 +82,7 @@ export function buildRoundTrips(
           quantity: matched,
           entryPrice: entryP,
           exitPrice: exitP,
+          entryTime: lot.t.executed_at ?? lot.t.created_at ?? null,
           exitTime: t.executed_at ?? t.created_at ?? null,
           pnl,
           open: false,
@@ -102,6 +104,7 @@ export function buildRoundTrips(
         quantity: lot.qty,
         entryPrice: lot.price,
         exitPrice: null,
+        entryTime: lot.t.executed_at ?? lot.t.created_at ?? null,
         exitTime: lot.t.executed_at ?? lot.t.created_at ?? null,
         pnl: null,
         open: true,
