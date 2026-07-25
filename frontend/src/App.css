@@ -742,49 +742,59 @@ body {
 [data-testid="trade-signals"] .table th:nth-child(5),
 [data-testid="trade-signals"] .table td:nth-child(5) { width: 53%; }
 
-/* Active Positions column widths */
+/* Active Positions column widths.
+   Symbol | Cap | Qty | Avg | LTP | SL/Target | uPnL | (close) */
 [data-testid="active-positions"] .table th:nth-child(1),
 [data-testid="active-positions"] .table td:nth-child(1) { width: 16%; }
 [data-testid="active-positions"] .table th:nth-child(2),
-[data-testid="active-positions"] .table td:nth-child(2) { width: 7%;  }
+[data-testid="active-positions"] .table td:nth-child(2) { width: 8%;  }
 [data-testid="active-positions"] .table th:nth-child(3),
-[data-testid="active-positions"] .table td:nth-child(3) { width: 11%; }
+[data-testid="active-positions"] .table td:nth-child(3) { width: 7%;  }
 [data-testid="active-positions"] .table th:nth-child(4),
 [data-testid="active-positions"] .table td:nth-child(4) { width: 11%; }
 [data-testid="active-positions"] .table th:nth-child(5),
-[data-testid="active-positions"] .table td:nth-child(5) { width: 18%; }
+[data-testid="active-positions"] .table td:nth-child(5) { width: 11%; }
 [data-testid="active-positions"] .table th:nth-child(6),
-[data-testid="active-positions"] .table td:nth-child(6) { width: 11%; }
+[data-testid="active-positions"] .table td:nth-child(6) { width: 18%; }
 [data-testid="active-positions"] .table th:nth-child(7),
-[data-testid="active-positions"] .table td:nth-child(7) { width: 8%;  }
+[data-testid="active-positions"] .table td:nth-child(7) { width: 11%; }
+[data-testid="active-positions"] .table th:nth-child(8),
+[data-testid="active-positions"] .table td:nth-child(8) { width: 8%;  }
 
-/* News Pipeline column widths + horizontal scroll on narrow */
+/* News Pipeline column widths + horizontal scroll on narrow.
+   Symbol | Cap | Exch | Event | Headline | Processed | AI Sentiment |
+   AI Reco | AI Conf | Signal | Sig Conf | Status | Rationale
+   The 13 widths must total 100%: table-layout is fixed, so a column with
+   no width left over collapses to zero (that is how Rationale vanished
+   when Cap was inserted). */
 [data-testid="news-pipeline"] .table-scroll { overflow: auto; }
-[data-testid="news-pipeline"] .table { min-width: 1100px; }
+[data-testid="news-pipeline"] .table { min-width: 1200px; }
 [data-testid="news-pipeline"] .table th:nth-child(1),
 [data-testid="news-pipeline"] .table td:nth-child(1) { width: 8%;  }
 [data-testid="news-pipeline"] .table th:nth-child(2),
 [data-testid="news-pipeline"] .table td:nth-child(2) { width: 5%;  }
 [data-testid="news-pipeline"] .table th:nth-child(3),
-[data-testid="news-pipeline"] .table td:nth-child(3) { width: 9%;  }
+[data-testid="news-pipeline"] .table td:nth-child(3) { width: 4%;  }
 [data-testid="news-pipeline"] .table th:nth-child(4),
-[data-testid="news-pipeline"] .table td:nth-child(4) { width: 18%; }
+[data-testid="news-pipeline"] .table td:nth-child(4) { width: 8%;  }
 [data-testid="news-pipeline"] .table th:nth-child(5),
-[data-testid="news-pipeline"] .table td:nth-child(5) { width: 10%; }
+[data-testid="news-pipeline"] .table td:nth-child(5) { width: 17%; }
 [data-testid="news-pipeline"] .table th:nth-child(6),
-[data-testid="news-pipeline"] .table td:nth-child(6) { width: 8%;  }
+[data-testid="news-pipeline"] .table td:nth-child(6) { width: 9%;  }
 [data-testid="news-pipeline"] .table th:nth-child(7),
 [data-testid="news-pipeline"] .table td:nth-child(7) { width: 7%;  }
 [data-testid="news-pipeline"] .table th:nth-child(8),
 [data-testid="news-pipeline"] .table td:nth-child(8) { width: 6%;  }
 [data-testid="news-pipeline"] .table th:nth-child(9),
-[data-testid="news-pipeline"] .table td:nth-child(9) { width: 7%;  }
+[data-testid="news-pipeline"] .table td:nth-child(9) { width: 5%;  }
 [data-testid="news-pipeline"] .table th:nth-child(10),
 [data-testid="news-pipeline"] .table td:nth-child(10) { width: 6%;  }
 [data-testid="news-pipeline"] .table th:nth-child(11),
-[data-testid="news-pipeline"] .table td:nth-child(11) { width: 7%;  }
+[data-testid="news-pipeline"] .table td:nth-child(11) { width: 5%;  }
 [data-testid="news-pipeline"] .table th:nth-child(12),
-[data-testid="news-pipeline"] .table td:nth-child(12) { width: 9%;  }
+[data-testid="news-pipeline"] .table td:nth-child(12) { width: 7%;  }
+[data-testid="news-pipeline"] .table th:nth-child(13),
+[data-testid="news-pipeline"] .table td:nth-child(13) { width: 13%; }
 [data-testid="news-pipeline"] h3 .meta {
   font-size: 10px; font-weight: 400; color: var(--text-faint);
   text-transform: none; letter-spacing: 0;
