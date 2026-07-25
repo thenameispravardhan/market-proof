@@ -14,6 +14,7 @@ import { useLiveQuote } from "../../hooks/useQuotes";
 import type { ManagedPosition, Position } from "../../types";
 import { ApiClientError } from "../../api/client";
 import { LevelsCell } from "../positions/LevelsCell";
+import { CAP_BADGE_CLASS, capTier } from "../../lib/marketCap";
 import { SkeletonList } from "./Skeleton";
 
 function fmtMoney(v: number | null | undefined): string {
@@ -52,6 +53,11 @@ function PositionRow({
   return (
     <tr>
       <td className="mono symbol">{p.symbol}</td>
+      <td>
+        <span className={`badge ${CAP_BADGE_CLASS[capTier(p.symbol)]}`}>
+          {capTier(p.symbol)}
+        </span>
+      </td>
       <td className="mono">{p.quantity}</td>
       <td className="mono">{fmtMoney(p.average_price)}</td>
       <td className="mono">{fmtMoney(ltp)}</td>
@@ -128,6 +134,7 @@ export function ActivePositions() {
           <thead>
             <tr>
               <th>Symbol</th>
+              <th>Cap</th>
               <th className="mono">Qty</th>
               <th className="mono">Avg</th>
               <th className="mono">LTP</th>

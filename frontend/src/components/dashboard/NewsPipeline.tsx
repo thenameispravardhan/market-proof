@@ -12,6 +12,7 @@ import { useMemo } from "react";
 import { useAnalyses, useAnnouncements, useSignals } from "../../hooks/useApi";
 import { ApiClientError } from "../../api/client";
 import { SkeletonList } from "./Skeleton";
+import { CAP_BADGE_CLASS, capTier } from "../../lib/marketCap";
 import type { Analysis, Announcement, Signal } from "../../types";
 
 function fmtTime(iso?: string | null): string {
@@ -135,6 +136,7 @@ export function NewsPipeline() {
             <thead>
               <tr>
                 <th>Symbol</th>
+                <th>Cap</th>
                 <th>Exch</th>
                 <th>Event</th>
                 <th>Headline</th>
@@ -152,6 +154,11 @@ export function NewsPipeline() {
               {rows.map(({ announcement: a, analysis: x, signal: s }) => (
                 <tr key={a.id}>
                   <td className="mono" title={a.symbol}>{a.symbol}</td>
+                  <td>
+                    <span className={`badge ${CAP_BADGE_CLASS[capTier(a.symbol)]}`}>
+                      {capTier(a.symbol)}
+                    </span>
+                  </td>
                   <td title={a.exchange}>{a.exchange}</td>
                   <td>
                     <span className={`badge ${actionClass(a.event_type)}`} title={a.event_type}>
