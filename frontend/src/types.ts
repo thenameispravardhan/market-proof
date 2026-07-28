@@ -265,6 +265,37 @@ export interface EquityPoint {
 
 // ---- Settings ----
 
+// ---- Self-describing settings schema (GET /api/settings/schema) ----------
+// Mirrors app/api/settings_schema.py. The All Settings card renders these
+// generically, so a knob added to config.py needs no change on this side.
+export interface SettingsField {
+  key: string;
+  type: "bool" | "int" | "float" | "str";
+  default: unknown;
+  value: unknown;
+  label: string;
+  widget: "number" | "toggle" | "time" | "text" | "select";
+  min: number | null;
+  max: number | null;
+  step: number | null;
+  choices: string[] | null;
+  group: string;
+  read_only: boolean;
+  restart_required: boolean;
+}
+
+export interface SettingsGroup {
+  id: string;
+  title: string;
+  note: string;
+  fields: SettingsField[];
+}
+
+export interface SettingsSchema {
+  groups: SettingsGroup[];
+  version: string;
+}
+
 export interface GlobalSettings {
   TRADING_MODE: "paper" | "live";
   MAX_CAPITAL_RISK_PCT: number;

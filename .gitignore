@@ -30,6 +30,8 @@ data/
 .idea/
 .DS_Store
 Thumbs.db
+# Word owner/lock files (~$Foo.docx) — orphaned when a .docx is moved
+~$*
 
 # Runtime / mavis / opencode state (NOT part of the project)
 .mavis/
@@ -59,3 +61,7 @@ fyersRequests.log
 # Concrete deploy target (server IP / domain / SSH key path) — private to
 # each operator's machine; the committed template is target.local.env.example.
 deploy/target.local.env
+
+*.docx
+
+AIdataset/

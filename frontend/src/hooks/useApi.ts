@@ -12,6 +12,7 @@ import type {
   BrokerAccount,
   DashboardSummary,
   GlobalSettings,
+  SettingsSchema,
   NotificationChannel,
   OptionChainResponse,
   PendingOrder,
@@ -750,6 +751,16 @@ export function useGlobalSettings() {
   return useQuery<{ global: GlobalSettings }>({
     queryKey: ["settings"],
     queryFn: () => api.get("/api/settings"),
+  });
+}
+
+// The full settings surface, grouped, straight from the backend registry.
+// Nothing here names a setting: adding a knob in config.py makes it appear
+// on the All Settings card with no frontend change.
+export function useSettingsSchema() {
+  return useQuery<SettingsSchema>({
+    queryKey: ["settings", "schema"],
+    queryFn: () => api.get("/api/settings/schema"),
   });
 }
 

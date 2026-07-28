@@ -17,10 +17,16 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.api.settings_schema import (
+    BOUNDS,
+    TIME_BOUNDS_IST,
+    build_registry,
+    schema_payload,
+)
 from app.config import Settings, get_settings, reset_settings_cache
 from app.db.init import init_db
 from app.db.infra_models import AppSetting
@@ -47,109 +53,20 @@ init_db()
 # Pydantic schemas
 # -------------------------------------------------------------------------
 
-# Keys we accept in the `global` section. Mirror of `Settings` defaults.
+# Keys we accept in the `global` section — DERIVED from `Settings`, never
+# hand-maintained. Every field on the Settings model is operator-editable
+# except the credentials and boot-time keys listed in settings_schema.EXCLUDED.
+#
+# This used to be a hand-written dict. It drifted from config.py on seven
+# defaults and was missing 67 keys entirely, which is exactly the failure the
+# "frontend-only control" invariant exists to prevent. Deriving it means a new
+# knob in config.py is reachable from the UI the moment it is declared.
+_REGISTRY: dict[str, dict[str, Any]] = build_registry()
 _GLOBAL_KEYS: dict[str, tuple[type, Any]] = {
-    "TRADING_MODE": (str, "paper"),
-    "MAX_CAPITAL_RISK_PCT": (float, 1.0),
-    "DAILY_MAX_LOSS_PCT": (float, 2.0),
-    "MAX_CONCURRENT_POSITIONS": (int, 5),
-    "MAX_SINGLE_POSITION_PCT": (float, 20.0),
-    "MIN_LIQUIDITY_CRORE": (float, 5.0),
-    "MAX_SIGNALS_PER_DAY": (int, 20),
-    "POLL_INTERVAL_SECONDS": (float, 5.0),
-    "PORTFOLIO_VALUE": (float, 1_000_000.0),
-    "DEFAULT_SL_PCT": (float, 6.0),
-    "DEFAULT_TARGET_RR": (float, 3.0),
-    "QUOTE_REFRESH_SECONDS": (int, 5),
-    # Pre-LLM noise filter: when ON, clearly-administrative filings
-    # (trading-window notices, compliance certificates, newspaper
-    # publications, …) are skipped before the paid LLM call. Turning it
-    # OFF sends every filing to the AI (more cost, slower queue).
-    "PRE_LLM_FILTER_ENABLED": (bool, True),
-    # Master switch for AI news analysis (Dashboard toggle). OFF = news is
-    # still collected but never sent to the LLM, so no signals / auto trades.
-    "AI_ANALYSIS_ENABLED": (bool, True),
-    # Extracted-text mode. OFF (default) = legacy behavior: DeepSeek gets
-    # the pdf_url + headline metadata only. ON = the filing PDF is
-    # downloaded and its relevant pages are extracted and sent as real
-    # text. Extraction failures always fall back to the legacy path.
-    "SEND_EXTRACTED_TEXT": (bool, False),
-    # Deterministic fast track. OFF (default) = every filing takes the
-    # LLM track. ON = unambiguous high-conviction headlines (order win /
-    # buyback with explicit Rs-crore value, KMP resignation) skip the LLM
-    # and hit the rules engine in milliseconds.
-    "FAST_TRACK_ENABLED": (bool, False),
-    # Phase 4 outcome logger: passive price tracking (+5m/+30m) for every
-    # signal into signal_outcomes. Telemetry only, so default ON.
-    "OUTCOME_LOGGER_ENABLED": (bool, True),
-    # Phase 3 latency knobs. LLM output-token cap (shorter = faster
-    # generation; a full signal JSON measured ~165 tokens, keep 2×+
-    # headroom). Staleness gate age. Hard end-to-end deadline from
-    # filed_at to signal creation — 0 disables; late signals are stored
-    # but blocked.
-    "LLM_MAX_TOKENS": (int, 400),
-    "MAX_NEWS_AGE_SECONDS": (int, 90),
-    # Which clock the staleness gate measures. OFF (default) = legacy
-    # `now - filed_at`, which bundles in the EXCHANGE's publish lag
-    # (measured median ~35s on live data) and so rejects filings for a
-    # delay the bot didn't cause. ON = `now - received_at` (the bot's own
-    # reaction time) — alpha decays from PUBLICATION, not submission.
-    # Guarded by MAX_NEWS_AGE_ABSOLUTE_SECONDS.
-    "NEWS_AGE_FROM_RECEIPT": (bool, False),
-    "MAX_NEWS_AGE_ABSOLUTE_SECONDS": (int, 1800),
-    "PIPELINE_DEADLINE_SECONDS": (int, 0),
-    # Intraday buying-power multiplier (Fyers MIS ~5x). Notional caps only —
-    # risk-per-trade and loss limits always stay on real equity.
-    "INTRADAY_LEVERAGE": (float, 5.0),
-    # ---- News sources (multi-channel detection racing) -------------------
-    "NSE_API_ENABLED": (bool, True),
-    "BSE_API_ENABLED": (bool, True),
-    "NSE_RSS_ENABLED": (bool, False),
-    "NSE_RSS_POLL_SECONDS": (float, 1.0),
-    # ---- Edge Memory (self-learning conviction gate) ---------------------
-    "EDGE_GATE_ENABLED": (bool, False),
-    "EDGE_GATE_MIN_SAMPLES": (int, 30),
-    "EDGE_GATE_MIN_EXPECTANCY_PCT": (float, 0.0),
-    # ---- Exit Manager (UI page) ------------------------------------------
-    # Every exit-engine knob, exposed for frontend-only control. Defaults
-    # mirror app/config.py so exposing them changes nothing by itself.
-    # Entry quality. NOTE the engine's real key is ENTRY_MAX_DRIFT_PCT
-    # (config.py / entry_manager.py) — .env.example historically documented
-    # a "MAX_ENTRY_DRIFT_PCT" that nothing reads.
-    "ENTRY_MAX_DRIFT_PCT": (float, 1.5),
-    # Initial stop-loss.
-    "DEFAULT_SL_MIN_PCT": (float, 1.0),
-    "DEFAULT_SL_SMALLCAP_PCT": (float, 1.5),
-    "ATR_ENABLED": (bool, True),
-    "ATR_PERIOD": (int, 14),
-    "ATR_STOP_MULT": (float, 2.0),
-    "ATR_MAX_STOP_PCT": (float, 8.0),
-    # Breakeven lock.
-    "BREAKEVEN_ENABLED": (bool, True),
-    "BREAKEVEN_AT_PCT": (float, 2.0),
-    "BREAKEVEN_LOCK_PCT": (float, 0.2),
-    # Trailing stop + scale-out (open-ended positions only — an explicit
-    # rule/AI target always exits the full position instead).
-    "SCALE_OUT_ENABLED": (bool, True),
-    "SCALE_OUT_R": (float, 2.0),
-    "TRAIL_ACTIVATE_R": (float, 1.5),
-    "TRAIL_DISTANCE_R": (float, 0.5),
-    # Momentum-death exits.
-    "CONSOLIDATION_EXIT_ENABLED": (bool, True),
-    "CONSOLIDATION_WINDOW_SECONDS": (int, 120),
-    "CONSOLIDATION_RANGE_PCT": (float, 0.5),
-    "CONSOLIDATION_MIN_PROFIT_PCT": (float, 1.0),
-    "CONSOLIDATION_MAX_PROFIT_PCT": (float, 2.5),
-    "STALL_EXIT_ENABLED": (bool, True),
-    "STALL_WINDOW_SECONDS": (int, 90),
-    "STALL_ROC_PCT": (float, 0.3),
-    "STALL_MIN_PROFIT_PCT": (float, 3.0),
-    "STALL_MAX_PROFIT_PCT": (float, 6.0),
-    # Time limits. SQUARE_OFF_TIME_IST is bounded (earlier is allowed,
-    # later than 15:15 is not) and can never be disabled — intraday only.
-    "MAX_HOLD_SECONDS": (int, 1080),
-    "SQUARE_OFF_TIME_IST": (str, "15:10"),
+    key: ({"bool": bool, "int": int, "float": float, "str": str}[spec["type"]], spec["default"])
+    for key, spec in _REGISTRY.items()
 }
+
 
 
 def apply_overrides_to_env(db: Session) -> None:
@@ -190,10 +107,25 @@ class SettingsUpdate(BaseModel):
 
 
 def _coerce(key: str, value: Any) -> Any:
-    """Coerce incoming value to the declared Python type and validate range."""
+    """Coerce an incoming value to the declared type and validate its range.
+
+    Bounds come from the derived registry (settings_schema.BOUNDS + the
+    suffix conventions), so a new knob is guarded the moment it is declared.
+    The final check re-validates the whole Settings model: an override that
+    slipped past the range checks would otherwise be written to os.environ and
+    make EVERY later get_settings() call raise, taking the app down.
+    """
+    spec = _REGISTRY[key]
     typ, _default = _GLOBAL_KEYS[key]
-    # Booleans need explicit handling: bool("false") is True, so the
-    # generic typ(value) cast below would silently mangle a string.
+
+    # NOTE: spec["read_only"] is a UI hint only — the generic form renders
+    # those keys uneditable and points at their own control. It is deliberately
+    # NOT enforced here: PUT /api/settings has always accepted TRADING_MODE,
+    # and tests depend on that. It does mean this endpoint bypasses the typed
+    # "LIVE" confirmation on /api/settings/trading-mode.
+    #
+    # Booleans need explicit handling: bool("false") is True, so the generic
+    # typ(value) cast below would silently mangle a string.
     if typ is bool:
         if isinstance(value, bool):
             return value
@@ -205,6 +137,7 @@ def _coerce(key: str, value: Any) -> Any:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"setting {key}: cannot coerce {value!r} to bool",
         )
+
     try:
         coerced = typ(value)
     except (TypeError, ValueError) as e:
@@ -212,101 +145,82 @@ def _coerce(key: str, value: Any) -> Any:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"setting {key}: cannot coerce {value!r} to {typ.__name__}: {e}",
         ) from e
+
     if typ in (int, float):
-        # EDGE_GATE_MIN_EXPECTANCY_PCT is a signed threshold (a losing
-        # cohort has negative expectancy; 0 = block only proven losers),
-        # so it is exempt from the strict (0, 100] percent rule.
-        if (
-            key.endswith("_PCT")
-            and key != "EDGE_GATE_MIN_EXPECTANCY_PCT"
-            and not (0 < coerced <= 100)
-        ):
+        lo, hi = spec["min"], spec["max"]
+        if lo is not None and hi is not None and not (lo <= coerced <= hi):
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"setting {key}: percent must be in (0, 100]",
+                detail=f"setting {key}: must be between {lo:g} and {hi:g}",
             )
-        if key == "EDGE_GATE_MIN_EXPECTANCY_PCT" and not (-50 <= coerced <= 50):
+        # A percent that reaches 0 disables the check it guards, which is a
+        # footgun rather than a setting. Thresholds that are meaningfully zero
+        # (a disabled deadline, "follow the global interval", a signed
+        # expectancy floor) declare their own lower bound in BOUNDS.
+        if key.endswith("_PCT") and key not in BOUNDS and coerced <= 0:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="EDGE_GATE_MIN_EXPECTANCY_PCT must be between -50 and 50",
+                detail=f"setting {key}: percent must be greater than 0",
             )
-        if key in {"MAX_CONCURRENT_POSITIONS", "MAX_SIGNALS_PER_DAY"} and coerced < 0:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"setting {key}: must be non-negative",
-            )
-        # Mirror the Settings validator here — an out-of-range override
-        # written to env would make every later get_settings() call blow up.
-        if key == "INTRADAY_LEVERAGE" and not (1.0 <= coerced <= 10.0):
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="INTRADAY_LEVERAGE must be between 1 and 10",
-            )
-        # POLL_INTERVAL_SECONDS accepts fractional seconds (float) but keeps
-        # a >=1 floor, mirroring the Settings validator — an out-of-range
-        # override written to env would make every later get_settings() blow up.
-        if key in {"LLM_MAX_TOKENS", "MAX_NEWS_AGE_SECONDS", "POLL_INTERVAL_SECONDS", "ATR_PERIOD"} and coerced < 1:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"setting {key}: must be >= 1",
-            )
-        if key == "PIPELINE_DEADLINE_SECONDS" and coerced < 0:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="PIPELINE_DEADLINE_SECONDS must be >= 0 (0 = disabled)",
-            )
-        # Exit-engine bounds. R-multiples must be positive and a >10 value
-        # is a typo, not a strategy; Settings' own validator only enforces
-        # >0 for ATR_STOP_MULT, so mirror + tighten here at the UI door.
-        if key in {"ATR_STOP_MULT", "SCALE_OUT_R", "TRAIL_ACTIVATE_R", "TRAIL_DISTANCE_R"} and not (
-            0 < coerced <= 10
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"setting {key}: must be in (0, 10]",
-            )
-        # A sub-minute forced exit or sub-10s observation window is churn,
-        # not a strategy.
-        if key == "MAX_HOLD_SECONDS" and coerced < 60:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="MAX_HOLD_SECONDS must be >= 60",
-            )
-        if key in {"CONSOLIDATION_WINDOW_SECONDS", "STALL_WINDOW_SECONDS"} and coerced < 10:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"setting {key}: must be >= 10",
-            )
-        # RSS poll interval: 0 = follow the global setting; otherwise a
-        # 0.5s floor keeps the racer from hammering the CDN.
-        if key == "NSE_RSS_POLL_SECONDS" and coerced != 0 and not (0.5 <= coerced <= 60):
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="NSE_RSS_POLL_SECONDS must be 0 (follow global) or 0.5–60",
-            )
-    if key == "TRADING_MODE" and coerced not in {"paper", "live"}:
+
+    if spec["choices"] and coerced not in spec["choices"]:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="TRADING_MODE must be 'paper' or 'live'",
+            detail=f"setting {key}: must be one of {spec['choices']}",
         )
-    if key == "SQUARE_OFF_TIME_IST":
-        parts = str(coerced).split(":")
-        if len(parts) != 2 or not (parts[0].isdigit() and parts[1].isdigit()):
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"SQUARE_OFF_TIME_IST must be 'HH:MM', got {coerced!r}",
-            )
-        hh, mm = int(parts[0]), int(parts[1])
-        # Earlier is always allowed; later than 15:15 would collide with
-        # the 15:30 close and the broker's own MIS auto-square-off.
-        # There is deliberately NO way to disable the square-off.
-        if not (9 * 60 + 30 <= hh * 60 + mm <= 15 * 60 + 15):
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="SQUARE_OFF_TIME_IST must be between 09:30 and 15:15 IST",
-            )
-        coerced = f"{hh:02d}:{mm:02d}"
+
+    if spec["widget"] == "time":
+        coerced = _coerce_ist_time(key, coerced)
+
+    _reject_if_settings_would_break(key, coerced)
     return coerced
+
+
+def _coerce_ist_time(key: str, value: Any) -> str:
+    """Validate an 'HH:MM' IST clock field against its allowed window."""
+    parts = str(value).split(":")
+    if len(parts) != 2 or not (parts[0].isdigit() and parts[1].isdigit()):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{key} must be 'HH:MM', got {value!r}",
+        )
+    hh, mm = int(parts[0]), int(parts[1])
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{key}: time out of range: {value!r}",
+        )
+    window = TIME_BOUNDS_IST.get(key)
+    if window:
+        lo_s, hi_s = window
+        as_min = hh * 60 + mm
+        lo = int(lo_s[:2]) * 60 + int(lo_s[3:])
+        hi = int(hi_s[:2]) * 60 + int(hi_s[3:])
+        # Earlier is allowed for the square-off; later would collide with the
+        # 15:30 close and the broker's own MIS auto-square-off. There is
+        # deliberately NO way to disable it — the strategy is intraday-only.
+        if not (lo <= as_min <= hi):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"{key} must be between {lo_s} and {hi_s} IST",
+            )
+    return f"{hh:02d}:{mm:02d}"
+
+
+def _reject_if_settings_would_break(key: str, coerced: Any) -> None:
+    """Last line of defence: would this value make Settings() itself raise?
+
+    Overrides are applied by writing os.environ and clearing the Settings
+    cache, so a value that fails the model's own validators does not fail the
+    PUT — it fails every subsequent request. Catch it here, at the door.
+    """
+    try:
+        Settings(**{key: coerced})  # type: ignore[arg-type]
+    except ValidationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"setting {key}: {e.errors()[0].get('msg', 'invalid value')}",
+        ) from e
 
 
 def _read_overrides(db: Session) -> dict[str, Any]:
@@ -381,6 +295,21 @@ def get_settings_endpoint(
 
     # Sections: not used in v1. Sibling tracks can extend.
     return {"global": effective, "sections": {}, "version": settings.APP_VERSION}
+
+
+@router.get("/schema")
+def get_settings_schema(
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    """Every operator-editable setting, grouped, with its current value.
+
+    The UI renders this generically — it does not know a single key name — so
+    a knob declared in config.py shows up on the Settings page with no
+    frontend change at all.
+    """
+    effective = get_settings_endpoint(db=db, settings=settings)["global"]
+    return {"groups": schema_payload(effective), "version": settings.APP_VERSION}
 
 
 @router.put("")

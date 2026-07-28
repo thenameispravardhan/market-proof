@@ -8,6 +8,7 @@
 // The Rule Book moved to the Rules page, where a rules reference belongs.
 
 import { GlobalSettings } from "../components/settings/GlobalSettings";
+import { AllSettings } from "../components/settings/AllSettings";
 import { AuditLog } from "../components/settings/AuditLog";
 import { BreakerHistory } from "../components/settings/BreakerHistory";
 import { EdgeMemory } from "../components/settings/EdgeMemory";
@@ -38,6 +39,9 @@ export default function Settings() {
         <div>
           <SectionLabel>Trading parameters</SectionLabel>
           <GlobalSettings />
+
+          <SectionLabel>Everything else</SectionLabel>
+          <AllSettings />
         </div>
         <div>
           <SectionLabel>Detection &amp; conviction</SectionLabel>
