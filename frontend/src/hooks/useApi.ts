@@ -764,6 +764,37 @@ export function useSettingsSchema() {
   });
 }
 
+// Drop one override so the key falls back to the config.py default.
+export function useResetSetting() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (key: string) => api.delete(`/api/settings/overrides/${key}`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["settings"] }),
+  });
+}
+
+// Reset a whole group, or everything when `group` is omitted.
+export function useResetSettings() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { group?: string; confirm: boolean }) =>
+      api.post("/api/settings/reset", body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["settings"] }),
+  });
+}
+
+export function useImportSettings() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { overrides: Record<string, unknown>; replace?: boolean }) =>
+      api.post<{ imported: string[]; ignored: string[]; reset: string[] }>(
+        "/api/settings/import",
+        body,
+      ),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["settings"] }),
+  });
+}
+
 export function useUpdateSettings() {
   const qc = useQueryClient();
   return useMutation({

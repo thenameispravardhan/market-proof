@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -251,6 +252,31 @@ def _write_overrides(db: Session, updates: dict[str, Any]) -> dict[str, Any]:
     return _read_overrides(db)
 
 
+def _clear_overrides(db: Session, keys: list[str]) -> list[str]:
+    """Delete override rows so the key falls back to .env / the code default.
+
+    Deleting the row is only half the job: `apply_overrides_to_env` only ever
+    SETS os.environ, so a stale value would keep winning until the next
+    restart. Pop it here and let pydantic re-read the .env file.
+
+    (If a key was set in the real process environment — a systemd
+    `Environment=` line rather than the UI — popping it loses that value until
+    the service restarts. None of the current unit's vars are in the registry.)
+    """
+    cleared: list[str] = []
+    for key in keys:
+        row = db.get(AppSetting, key)
+        if row is None:
+            continue
+        db.delete(row)
+        os.environ.pop(key, None)
+        cleared.append(key)
+    if cleared:
+        db.flush()
+        reset_settings_cache()
+    return cleared
+
+
 def _audit(
     db: Session,
     *,
@@ -309,7 +335,148 @@ def get_settings_schema(
     frontend change at all.
     """
     effective = get_settings_endpoint(db=db, settings=settings)["global"]
-    return {"groups": schema_payload(effective), "version": settings.APP_VERSION}
+    overridden = set(_read_overrides(db))
+    groups = schema_payload(effective)
+    for group in groups:
+        for field in group["fields"]:
+            # "Overridden" means an explicit row exists — NOT merely that the
+            # value differs from the default. A key can be pinned to its own
+            # default value, and that still blocks a future default change.
+            field["overridden"] = field["key"] in overridden
+    return {
+        "groups": groups,
+        "overridden_count": len(overridden),
+        "version": settings.APP_VERSION,
+    }
+
+
+def _fresh_state(db: Session) -> dict[str, Any]:
+    """Effective settings read AFTER a mutation.
+
+    The request-scoped `Settings` from Depends(get_settings) is resolved before
+    the handler runs, so it still carries the pre-reset values. That is
+    invisible on a PUT (the override row wins over the env value anyway) but
+    wrong on a delete, where the row is gone and the stale object IS the
+    answer. Re-resolve past the cleared cache.
+    """
+    return get_settings_endpoint(db=db, settings=get_settings())
+
+
+@router.delete("/overrides/{key}")
+async def reset_setting(
+    key: str,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    """Drop one override so the key falls back to .env / the code default."""
+    if key not in _GLOBAL_KEYS:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown setting: {key}"
+        )
+    before = _read_overrides(db)
+    cleared = _clear_overrides(db, [key])
+    if cleared:
+        _audit(db, actor="ui", action="settings.reset", target=key,
+               before={key: before.get(key)}, after=None)
+    db.commit()
+    apply_overrides_to_env(db)
+    await event_bus.publish("settings.updated", {"changed_keys": cleared})
+    return {"reset": cleared, **_fresh_state(db)}
+
+
+class ResetRequest(BaseModel):
+    """Empty group = every override. `confirm` is required either way — this
+    discards operator tuning that has no other copy."""
+    group: Optional[str] = None
+    confirm: bool = False
+
+
+@router.post("/reset")
+async def reset_settings(
+    body: ResetRequest,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    """Reset a whole group (or everything) to the config.py defaults."""
+    if not body.confirm:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="reset requires confirm=true",
+        )
+    registry = _REGISTRY
+    targets = [
+        key for key in _read_overrides(db)
+        # Keys with their own guarded control (TRADING_MODE) are left alone:
+        # a bulk reset must never be a back door into changing the mode.
+        if not registry[key]["read_only"]
+        and (body.group is None or registry[key]["group"] == body.group)
+    ]
+    before = {k: v for k, v in _read_overrides(db).items() if k in targets}
+    cleared = _clear_overrides(db, targets)
+    if cleared:
+        _audit(db, actor="ui", action="settings.reset",
+               target=body.group or "all", before=before, after=None)
+    db.commit()
+    apply_overrides_to_env(db)
+    await event_bus.publish("settings.updated", {"changed_keys": cleared})
+    return {"reset": cleared, **_fresh_state(db)}
+
+
+@router.get("/export")
+def export_settings(db: Session = Depends(get_db)) -> dict[str, Any]:
+    """The overrides only — not the whole effective config.
+
+    Exporting effective values would bake today's defaults into the file, so
+    importing it later would pin every key and silently block future default
+    changes. Only what the operator actually set travels.
+    """
+    return {
+        "version": get_settings().APP_VERSION,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "overrides": _read_overrides(db),
+    }
+
+
+class ImportRequest(BaseModel):
+    overrides: dict[str, Any]
+    # Default False = merge onto what is already there. True = the imported
+    # file becomes the complete override set (anything absent goes to default).
+    replace: bool = False
+
+
+@router.post("/import")
+async def import_settings(
+    body: ImportRequest,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    """Apply an exported settings file.
+
+    Unknown keys are reported, not fatal — an export from a newer build (or one
+    carrying another module's app_settings rows) should still import the keys
+    this build understands. Every accepted value goes through the same
+    validation as a normal PUT.
+    """
+    known = {k: v for k, v in body.overrides.items() if k in _GLOBAL_KEYS}
+    ignored = sorted(set(body.overrides) - set(known))
+
+    before = _read_overrides(db)
+    cleared: list[str] = []
+    if body.replace:
+        cleared = _clear_overrides(db, [k for k in before if k not in known])
+    after = _write_overrides(db, known)
+
+    _audit(db, actor="ui", action="settings.import", target="global",
+           before=before, after=after)
+    db.commit()
+    apply_overrides_to_env(db)
+    await event_bus.publish("settings.updated", {"changed_keys": sorted(known)})
+    return {
+        "imported": sorted(known),
+        "reset": cleared,
+        "ignored": ignored,
+        **_fresh_state(db),
+    }
 
 
 @router.put("")

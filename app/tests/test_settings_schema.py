@@ -85,3 +85,89 @@ def test_defaults_sit_inside_their_own_declared_bounds():
         if not (spec["min"] <= spec["default"] <= spec["max"]):
             bad.append(f"{key}={spec['default']} not in [{spec['min']}, {spec['max']}]")
     assert not bad, "defaults outside their bounds: " + "; ".join(bad)
+
+
+# ---------------------------------------------------------------------------
+# Reset / export / import — the customisation surface on top of PUT.
+# ---------------------------------------------------------------------------
+
+
+def test_reset_one_falls_back_to_the_code_default(client):
+    default = Settings.model_fields["MAX_HOLD_SECONDS"].default
+    client.put("/api/settings", json={"global": {"MAX_HOLD_SECONDS": 600}})
+    assert client.get("/api/settings").json()["global"]["MAX_HOLD_SECONDS"] == 600
+
+    r = client.delete("/api/settings/overrides/MAX_HOLD_SECONDS")
+    assert r.status_code == 200, r.text
+    # Regression: the handler used to return the request-scoped Settings, which
+    # is resolved BEFORE the override row is deleted, so it echoed the stale
+    # value and the UI showed the reset as a no-op.
+    assert r.json()["global"]["MAX_HOLD_SECONDS"] == default
+
+
+def test_reset_unknown_key_404s(client):
+    assert client.delete("/api/settings/overrides/NOT_A_SETTING").status_code == 404
+
+
+def test_bulk_reset_requires_confirmation(client):
+    client.put("/api/settings", json={"global": {"MAX_HOLD_SECONDS": 600}})
+    assert client.post("/api/settings/reset", json={}).status_code == 422
+    assert client.get("/api/settings").json()["global"]["MAX_HOLD_SECONDS"] == 600
+
+
+def test_group_reset_leaves_other_groups_alone(client):
+    # Overrides persist across tests in this module, so start from a known
+    # state rather than asserting on an exact reset list.
+    client.post("/api/settings/reset", json={"confirm": True})
+    client.put(
+        "/api/settings",
+        json={"global": {"STALL_ROC_PCT": 0.9, "WEEKLY_MAX_LOSS_PCT": 3.0}},
+    )
+    r = client.post("/api/settings/reset", json={"group": "exit_rules", "confirm": True})
+    assert r.status_code == 200, r.text
+    # STALL_ROC_PCT is in exit_rules; WEEKLY_MAX_LOSS_PCT is in breakers.
+    assert "STALL_ROC_PCT" in r.json()["reset"]
+    assert "WEEKLY_MAX_LOSS_PCT" not in r.json()["reset"]
+    assert r.json()["global"]["WEEKLY_MAX_LOSS_PCT"] == 3.0
+
+
+def test_export_carries_only_overrides_not_the_whole_config(client):
+    client.put("/api/settings", json={"global": {"MAX_HOLD_SECONDS": 600}})
+    overrides = client.get("/api/settings/export").json()["overrides"]
+    assert overrides["MAX_HOLD_SECONDS"] == 600
+    # Exporting effective values would pin every key on import, silently
+    # freezing them against future default changes.
+    assert "STALL_ROC_PCT" not in overrides
+
+
+def test_import_round_trips_and_reports_unknown_keys(client):
+    client.put("/api/settings", json={"global": {"MAX_HOLD_SECONDS": 600}})
+    exported = client.get("/api/settings/export").json()
+    client.post("/api/settings/reset", json={"confirm": True})
+
+    exported["overrides"]["SOME_REMOVED_KEY"] = 1
+    r = client.post("/api/settings/import", json={"overrides": exported["overrides"]})
+    assert r.status_code == 200, r.text
+    assert "MAX_HOLD_SECONDS" in r.json()["imported"]
+    assert r.json()["ignored"] == ["SOME_REMOVED_KEY"]
+    assert r.json()["global"]["MAX_HOLD_SECONDS"] == 600
+
+
+def test_import_validates_like_a_normal_put(client):
+    assert client.post(
+        "/api/settings/import", json={"overrides": {"INTRADAY_LEVERAGE": 99}}
+    ).status_code == 422
+
+
+def test_schema_reports_which_keys_are_overridden(client):
+    client.post("/api/settings/reset", json={"confirm": True})
+    client.put("/api/settings", json={"global": {"MAX_HOLD_SECONDS": 600}})
+    body = client.get("/api/settings/schema").json()
+    fields = {f["key"]: f for g in body["groups"] for f in g["fields"]}
+    assert fields["MAX_HOLD_SECONDS"]["overridden"] is True
+    assert fields["STALL_ROC_PCT"]["overridden"] is False
+    # Not an exact count: a bulk reset deliberately spares read-only keys like
+    # TRADING_MODE, which other test modules set.
+    assert body["overridden_count"] == sum(
+        1 for f in fields.values() if f["overridden"]
+    )

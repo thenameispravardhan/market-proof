@@ -9,8 +9,14 @@
 // The purpose-built cards (Exits page, News Sources, Edge Memory) are better
 // UX for their own keys and stay as they are; this is the complete surface
 // underneath them, collapsed by default so it informs without shouting.
-import { useEffect, useMemo, useState } from "react";
-import { useSettingsSchema, useUpdateSettings } from "../../hooks/useApi";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  useImportSettings,
+  useResetSetting,
+  useResetSettings,
+  useSettingsSchema,
+  useUpdateSettings,
+} from "../../hooks/useApi";
 import { Toggle } from "../common/Toggle";
 import type { SettingsField } from "../../types";
 
@@ -20,10 +26,12 @@ function FieldRow({
   field,
   value,
   onChange,
+  onReset,
 }: {
   field: SettingsField;
   value: unknown;
   onChange: (key: string, value: unknown) => void;
+  onReset: (key: string) => void;
 }) {
   const id = `set-${field.key}`;
   const disabled = field.read_only;
@@ -36,6 +44,35 @@ function FieldRow({
           <span className="field-hint" style={{ marginLeft: 6 }}>
             (restart)
           </span>
+        )}
+        {field.overridden && !disabled && (
+          <>
+            <span
+              className="field-hint"
+              style={{ marginLeft: 6 }}
+              title={`Default: ${String(field.default)}`}
+            >
+              · changed from {String(field.default)}
+            </span>
+            <button
+              type="button"
+              onClick={() => onReset(field.key)}
+              data-testid={`reset-${field.key}`}
+              title="Reset this setting to its default"
+              style={{
+                marginLeft: 6,
+                background: "none",
+                border: "none",
+                padding: 0,
+                cursor: "pointer",
+                fontSize: 11,
+                textDecoration: "underline",
+                opacity: 0.75,
+              }}
+            >
+              reset
+            </button>
+          </>
         )}
       </label>
 
@@ -101,10 +138,16 @@ function FieldRow({
 export function AllSettings() {
   const { data: schema, isLoading } = useSettingsSchema();
   const update = useUpdateSettings();
+  const resetOne = useResetSetting();
+  const resetMany = useResetSettings();
+  const importSettings = useImportSettings();
+  const fileInput = useRef<HTMLInputElement>(null);
   const [values, setValues] = useState<Values>({});
   const [open, setOpen] = useState<Record<string, boolean>>({});
   const [filter, setFilter] = useState("");
+  const [onlyModified, setOnlyModified] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -142,26 +185,97 @@ export function AllSettings() {
   const groups = useMemo(() => {
     if (!schema) return [];
     const q = filter.trim().toLowerCase();
-    if (!q) return schema.groups;
+    if (!q && !onlyModified) return schema.groups;
     return schema.groups
       .map((g) => ({
         ...g,
         fields: g.fields.filter(
           (f) =>
-            f.key.toLowerCase().includes(q) || f.label.toLowerCase().includes(q),
+            (!onlyModified || f.overridden) &&
+            (!q ||
+              f.key.toLowerCase().includes(q) ||
+              f.label.toLowerCase().includes(q)),
         ),
       }))
       .filter((g) => g.fields.length > 0);
-  }, [schema, filter]);
+  }, [schema, filter, onlyModified]);
 
-  const handleSave = async () => {
+  const run = async (fn: () => Promise<unknown>, message?: string) => {
     setError(null);
+    setNote(null);
     try {
-      await update.mutateAsync({ global: dirty as never });
-      setSaved(true);
+      await fn();
+      if (message) setNote(message);
+      return true;
     } catch (e) {
       setError((e as Error).message);
+      return false;
     }
+  };
+
+  const handleSave = () =>
+    run(async () => {
+      await update.mutateAsync({ global: dirty as never });
+      setSaved(true);
+    });
+
+  const handleResetOne = (key: string) =>
+    run(() => resetOne.mutateAsync(key), `${key} reset to its default.`);
+
+  const handleResetGroup = (group: string, title: string) => {
+    if (!confirm(`Reset every changed setting in "${title}" to its default?`)) return;
+    void run(
+      () => resetMany.mutateAsync({ group, confirm: true }),
+      `${title} reset to defaults.`,
+    );
+  };
+
+  const handleResetAll = () => {
+    if (
+      !confirm(
+        `Reset all ${schema?.overridden_count ?? 0} changed settings to their defaults?\n\n` +
+          "This discards your tuning. Export first if you might want it back.",
+      )
+    )
+      return;
+    void run(
+      () => resetMany.mutateAsync({ confirm: true }),
+      "All settings reset to defaults.",
+    );
+  };
+
+  // Export hits the endpoint directly rather than reconstructing the file from
+  // the schema: the server decides what an override is, and only overrides
+  // travel (exporting effective values would pin every key on import).
+  const handleExport = () =>
+    run(async () => {
+      const res = await fetch("/api/settings/export", { credentials: "same-origin" });
+      if (!res.ok) throw new Error(`export failed: ${res.status}`);
+      const blob = new Blob([JSON.stringify(await res.json(), null, 2)], {
+        type: "application/json",
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `tradebot-settings-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    }, "Settings exported.");
+
+  const handleImportFile = async (file: File) => {
+    await run(async () => {
+      const parsed = JSON.parse(await file.text());
+      const overrides = parsed.overrides ?? parsed;
+      if (typeof overrides !== "object" || overrides === null) {
+        throw new Error("not a settings export — expected an 'overrides' object");
+      }
+      const r = await importSettings.mutateAsync({ overrides });
+      setNote(
+        `Imported ${r.imported.length} setting${r.imported.length === 1 ? "" : "s"}` +
+          (r.ignored.length ? ` · ignored ${r.ignored.length} unknown` : ""),
+      );
+    });
+    if (fileInput.current) fileInput.current.value = "";
   };
 
   const total = schema?.groups.reduce((n, g) => n + g.fields.length, 0) ?? 0;
@@ -190,9 +304,65 @@ export function AllSettings() {
             />
           </div>
 
+          <div
+            style={{
+              display: "flex",
+              flexWrap: "wrap",
+              gap: 8,
+              alignItems: "center",
+              margin: "10px 0 4px",
+            }}
+          >
+            <button
+              type="button"
+              onClick={() => setOnlyModified((v) => !v)}
+              data-testid="toggle-only-modified"
+              aria-pressed={onlyModified}
+            >
+              {onlyModified ? "Showing changed only" : "Show changed only"} (
+              {schema?.overridden_count ?? 0})
+            </button>
+            <button type="button" onClick={handleExport} data-testid="export-settings">
+              Export
+            </button>
+            <button
+              type="button"
+              onClick={() => fileInput.current?.click()}
+              data-testid="import-settings"
+            >
+              Import
+            </button>
+            <input
+              ref={fileInput}
+              type="file"
+              accept="application/json,.json"
+              style={{ display: "none" }}
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) void handleImportFile(f);
+              }}
+            />
+            <button
+              type="button"
+              onClick={handleResetAll}
+              disabled={(schema?.overridden_count ?? 0) === 0}
+              data-testid="reset-all-settings"
+              title="Drop every override and fall back to the shipped defaults"
+            >
+              Reset all
+            </button>
+          </div>
+
+          <span className="field-hint" style={{ display: "block", marginBottom: 8 }}>
+            Export writes only the values you changed, so importing it on
+            another machine — or on the server — will not pin everything else to
+            today's defaults.
+          </span>
+
           {groups.map((group) => {
             // A search always reveals its hits; otherwise the operator decides.
-            const expanded = filter.trim() !== "" || open[group.id];
+            const expanded = filter.trim() !== "" || onlyModified || open[group.id];
+            const changedHere = group.fields.filter((f) => f.overridden).length;
             return (
               <div key={group.id} data-testid={`settings-group-${group.id}`}>
                 <button
@@ -215,7 +385,10 @@ export function AllSettings() {
                 >
                   <span>
                     {group.title}{" "}
-                    <span className="field-hint">({group.fields.length})</span>
+                    <span className="field-hint">
+                      ({group.fields.length}
+                      {changedHere > 0 && `, ${changedHere} changed`})
+                    </span>
                   </span>
                   <span aria-hidden>{expanded ? "−" : "+"}</span>
                 </button>
@@ -236,8 +409,19 @@ export function AllSettings() {
                         field={f}
                         value={values[f.key]}
                         onChange={handleChange}
+                        onReset={handleResetOne}
                       />
                     ))}
+                    {changedHere > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => handleResetGroup(group.id, group.title)}
+                        data-testid={`reset-group-${group.id}`}
+                        style={{ marginTop: 4 }}
+                      >
+                        Reset {group.title} to defaults
+                      </button>
+                    )}
                   </>
                 )}
               </div>
@@ -245,6 +429,7 @@ export function AllSettings() {
           })}
 
           {error && <p className="pnl-neg">{error}</p>}
+          {note && <p className="pnl-pos">{note}</p>}
           {saved && <p className="pnl-pos">✓ Saved</p>}
           <button
             className="primary"

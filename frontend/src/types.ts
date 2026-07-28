@@ -282,6 +282,10 @@ export interface SettingsField {
   group: string;
   read_only: boolean;
   restart_required: boolean;
+  // True when an explicit override row exists — NOT merely "differs from
+  // default". A key pinned to its own default is still overridden, and still
+  // blocks a future default change.
+  overridden: boolean;
 }
 
 export interface SettingsGroup {
@@ -293,7 +297,14 @@ export interface SettingsGroup {
 
 export interface SettingsSchema {
   groups: SettingsGroup[];
+  overridden_count: number;
   version: string;
+}
+
+export interface SettingsExport {
+  version: string;
+  exported_at: string;
+  overrides: Record<string, unknown>;
 }
 
 export interface GlobalSettings {
