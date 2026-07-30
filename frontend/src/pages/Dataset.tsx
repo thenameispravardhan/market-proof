@@ -286,6 +286,16 @@ export default function Dataset() {
             className="chart-btn"
             style={{ border: "1px solid var(--border)" }}
             disabled={downloading !== null}
+            data-testid="dataset-export-parquet"
+            title="All 303k announcements as Parquet — typed, columnar and ~4x smaller than CSV. This is the one to train from: pandas/polars/DuckDB read it natively and a model can load 6 of the 97 columns without touching the rest."
+            onClick={() => doExport(`/api/dataset/export?format=parquet&${exportQs}`, "Export Parquet")}
+          >
+            {downloading === "Export Parquet" ? "Preparing…" : "⤓ Export Parquet"}
+          </button>
+          <button
+            className="chart-btn"
+            style={{ border: "1px solid var(--border)" }}
+            disabled={downloading !== null}
             onClick={() => doExport(`/api/dataset/export?format=csv&${exportQs}`, "Export CSV")}
           >
             {downloading === "Export CSV" ? "Preparing…" : "Export CSV"}

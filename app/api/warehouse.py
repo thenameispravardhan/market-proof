@@ -473,8 +473,19 @@ def announcement_export_path(fmt: str, columns: Optional[list[str]] = None,
             pass
 
     tmp = Path(tempfile.gettempdir()) / f"tradebot_export_{os.getpid()}_{int(time.time())}.{fmt}"
-    opts = ("FORMAT csv, HEADER" if fmt == "csv"
-            else "FORMAT json")  # DuckDB's json export is newline-delimited
+    opts = {
+        # Parquet is the one to train from: types survive the round trip (no
+        # re-parsing dates and floats out of text), it is columnar so a model
+        # can load 6 of 97 columns without reading the rest, and zstd puts the
+        # whole dataset under 100 MB instead of 335.
+        # ROW_GROUP_SIZE is not cosmetic: parquet buffers a whole row group
+        # before flushing, and 97 columns x the 122,880-row default exceeded the
+        # 256 MB cap with OutOfMemory. 20k rows keeps each buffer small enough
+        # to flush inside the limit.
+        "parquet": "FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 20000",
+        "csv": "FORMAT csv, HEADER",
+        "json": "FORMAT json",   # DuckDB writes newline-delimited JSON
+    }[fmt]
     # Deliberately NOT sorted. Sorting 303k x 97 needs the whole result
     # materialised and blew the 256 MB cap with OutOfMemory; unsorted, COPY
     # streams row groups straight to disk at flat memory. A full dump is going

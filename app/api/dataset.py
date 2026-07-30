@@ -760,7 +760,7 @@ def dataset_stats(
 
 @router.get("/export")
 def dataset_export(
-    format: str = Query("csv", pattern="^(csv|jsonl)$"),
+    format: str = Query("csv", pattern="^(csv|jsonl|parquet)$"),
     limit: int = Query(20000, ge=1, le=100000),
     columns: Optional[str] = Query(None),
     source: str = Query("all", pattern="^(all|signal|shadow|announcements)$"),
@@ -796,12 +796,12 @@ def dataset_export(
 
         from app.api.warehouse import announcement_export_path
 
+        kind = {"csv": "csv", "jsonl": "json", "parquet": "parquet"}[format]
         path = announcement_export_path(
-            "csv" if format == "csv" else "json",
-            columns=_parse_columns(columns), symbol=symbol,
+            kind, columns=_parse_columns(columns), symbol=symbol,
             event_type=event_type, since=since, until=until)
         stamp = datetime.utcnow().strftime("%Y%m%d")
-        ext = "csv" if format == "csv" else "jsonl"
+        ext = {"csv": "csv", "jsonl": "jsonl", "parquet": "parquet"}[format]
 
         def _stream():
             try:
@@ -817,7 +817,9 @@ def dataset_export(
 
         return StreamingResponse(
             _stream(),
-            media_type="text/csv" if format == "csv" else "application/x-ndjson",
+            media_type={"csv": "text/csv",
+                        "jsonl": "application/x-ndjson",
+                        "parquet": "application/vnd.apache.parquet"}[format],
             headers={
                 "Content-Disposition": f"attachment; filename=announcements_{stamp}.{ext}",
                 "Content-Length": str(path.stat().st_size),
