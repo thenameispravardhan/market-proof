@@ -42,6 +42,14 @@ log = get_logger(__name__)
 # (input $0.14 / 1M tokens, output $0.28 / 1M tokens → $0.00014 and
 # $0.00028 per 1k). Operators can override at construction time.
 DEFAULT_COST_PER_1K = {
+    # v4 is what the API actually serves. `deepseek-chat` / `deepseek-reasoner`
+    # were deprecated 2026-07-24 and now resolve to v4-flash — and because the
+    # cost lookup keys on the model the RESPONSE reports, not the one requested,
+    # their absence here meant every call was logged at $0.00.
+    # Published rates: flash $0.14/M in, $0.28/M out; pro $0.435/M, $0.87/M.
+    "deepseek-v4-flash": {"prompt": 0.00014, "completion": 0.00028},
+    "deepseek-v4-pro": {"prompt": 0.000435, "completion": 0.00087},
+    # Kept so historical rows and any pinned caller still price correctly.
     "deepseek-chat": {"prompt": 0.00014, "completion": 0.00028},
     "deepseek-reasoner": {"prompt": 0.00055, "completion": 0.00219},
 }

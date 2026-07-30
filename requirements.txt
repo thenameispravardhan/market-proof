@@ -41,3 +41,7 @@ PyMuPDF==1.25.1
 # Testing
 pytest==8.3.4
 pytest-asyncio==0.24.0
+
+# Analytics engine: streams parquet from disk instead of loading it, so the
+# 276k-row dataset can be queried on the 2 GB server without an OOM.
+duckdb>=1.1
