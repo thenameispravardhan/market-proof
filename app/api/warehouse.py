@@ -35,19 +35,26 @@ LIST_COLUMNS = [
 
 
 def _con():
-    """A fresh read-only connection per request.
+    """A per-request cursor over the process's single DuckDB connection.
 
-    Read-only is the whole safety story here: the API physically cannot write to
-    the dataset, so a bad query can waste time but never damage data.
+    It cannot be an independent read-only connection: the monitor already holds
+    a read-write handle on this file to mirror incoming filings, and DuckDB
+    refuses to open one file twice with different configurations in the same
+    process ("Can't open a connection to same database file with a different
+    configuration").
+
+    `cursor()` returns an independent execution context over the SAME database
+    instance — safe for concurrent reads and correct under FastAPI's threadpool.
+    Write protection therefore comes from the statement screen in /query rather
+    than from the connection, which is why that screen rejects anything that is
+    not a bare SELECT/WITH.
     """
-    import duckdb
+    from app.services.warehouse_store import connect as store_connect
 
     if not STORE.exists():
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
-                            "warehouse not built — run app.services.warehouse_store")
-    con = duckdb.connect(str(STORE), read_only=True)
-    con.execute("SET memory_limit='256MB'; SET threads=2;")
-    return con
+                            "warehouse not built — POST /api/warehouse/rebuild")
+    return store_connect().cursor()
 
 
 @router.get("/stats")

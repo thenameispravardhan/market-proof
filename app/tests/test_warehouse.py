@@ -17,8 +17,15 @@ from app.services import warehouse_store as W  # noqa: E402
 
 @pytest.fixture()
 def store(tmp_path, monkeypatch):
-    monkeypatch.setattr(W, "STORE", tmp_path / "wh.duckdb")
+    """A throwaway store per test.
+
+    The module caches its connection in a thread-local, and other tests in the
+    suite may have opened the REAL store on this thread already. Closing on both
+    sides of the test keeps that cache from leaking a stale handle either way —
+    without it the suite passes alone and fails intermittently in full runs.
+    """
     W.close()
+    monkeypatch.setattr(W, "STORE", tmp_path / "wh.duckdb")
     con = W.connect()
     yield con
     W.close()
