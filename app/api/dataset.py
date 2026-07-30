@@ -583,8 +583,30 @@ def _parse_columns(columns: Optional[str]) -> Optional[list[str]]:
 
 
 @router.get("/columns")
-def dataset_columns() -> dict[str, Any]:
-    """The column catalog, plus ready-made column presets."""
+def dataset_columns(
+    source: str = Query("signals", pattern="^(signals|announcements)$"),
+) -> dict[str, Any]:
+    """The column catalog, plus ready-made column presets.
+
+    Two datasets share this page. `signals` is the per-SIGNAL training set built
+    from the trading DB; `announcements` is the merged per-ANNOUNCEMENT dataset
+    (history + everything collected live). They are different grains, not two
+    views of one table, so each brings its own catalog.
+    """
+    if source == "announcements":
+        from app.api.warehouse import announcement_column_specs
+        specs = announcement_column_specs()
+        feats = [c["key"] for c in specs if c["role"] == "feature"]
+        meta = [c["key"] for c in specs if c["role"] == "meta"]
+        return {
+            "columns": specs,
+            "presets": {
+                "everything": [c["key"] for c in specs],
+                "features_only": meta[:4] + feats,
+                "targets": [c["key"] for c in specs if c["role"] == "target"],
+            },
+        }
+
     features = [c["key"] for c in COLUMN_SPECS if c["role"] == "feature"]
     meta = [c["key"] for c in COLUMN_SPECS if c["role"] == "meta"]
     targets = [c["key"] for c in COLUMN_SPECS if c["role"] == "target"]
@@ -612,7 +634,7 @@ def dataset_rows(
     limit: int = Query(200, ge=1, le=5000),
     offset: int = Query(0, ge=0),
     columns: Optional[str] = Query(None, description="csv of column keys"),
-    source: str = Query("all", pattern="^(all|signal|shadow)$"),
+    source: str = Query("all", pattern="^(all|signal|shadow|announcements)$"),
     dedup: bool = Query(False, description="collapse NSE/BSE cross-listings"),
     event_type: Optional[str] = Query(None),
     action: Optional[str] = Query(None, description="BUY | SELL"),
@@ -624,6 +646,11 @@ def dataset_rows(
     until: Optional[str] = Query(None, description="ISO date/datetime (UTC)"),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    if source == "announcements":
+        from app.api.warehouse import announcement_rows
+        return announcement_rows(
+            limit=limit, offset=offset, columns=_parse_columns(columns),
+            symbol=symbol, event_type=event_type, since=since, until=until)
     return _dataset_rows(
         db,
         limit=limit,
@@ -643,8 +670,15 @@ def dataset_rows(
 
 
 @router.get("/stats")
-def dataset_stats(db: Session = Depends(get_db)) -> dict[str, Any]:
+def dataset_stats(
+    source: str = Query("signals", pattern="^(signals|announcements)$"),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
     """Coverage report: how much of the dataset is enriched + labeled."""
+    if source == "announcements":
+        from app.api.warehouse import announcement_stats
+        return announcement_stats()
+
     signal_total = db.execute(select(func.count(SignalOutcome.id))).scalar_one()
     shadow_stmt = _shadow_stmt(
         event_type=None, action=None, symbol=None, taken=None,
@@ -729,7 +763,7 @@ def dataset_export(
     format: str = Query("csv", pattern="^(csv|jsonl)$"),
     limit: int = Query(20000, ge=1, le=100000),
     columns: Optional[str] = Query(None),
-    source: str = Query("all", pattern="^(all|signal|shadow)$"),
+    source: str = Query("all", pattern="^(all|signal|shadow|announcements)$"),
     dedup: bool = Query(False, description="collapse NSE/BSE cross-listings"),
     split: Optional[str] = Query(
         None, pattern="^(train|val)$",
@@ -750,6 +784,19 @@ def dataset_export(
     split=train|val the rows come out in CHRONOLOGICAL order — the
     oldest `split_ratio` of the filtered set trains, the newest
     remainder validates (a random split leaks regime)."""
+    if source == "announcements":
+        # The merged announcement dataset lives in DuckDB, not the trading DB,
+        # so it is fetched through the warehouse and then rendered by the same
+        # CSV/JSONL writer below — one export path, two sources.
+        from app.api.warehouse import announcement_rows
+
+        payload = announcement_rows(
+            limit=limit, offset=0, columns=_parse_columns(columns),
+            symbol=symbol, event_type=event_type, since=since, until=until)
+        selected = payload["columns"]
+        result = {"rows": payload["rows"]}
+        return _write_export(result, selected, format, split)
+
     selected = _parse_columns(columns) or [c["key"] for c in COLUMN_SPECS]
     result = _dataset_rows(
         db,
@@ -768,6 +815,13 @@ def dataset_export(
         since=since,
         until=until,
     )
+    return _write_export(result, selected, format, split)
+
+
+def _write_export(result: dict, selected: list[str], format: str,
+                  split: Optional[str] = None) -> PlainTextResponse:
+    """Render rows as CSV or JSONL. Shared by both dataset sources so the
+    announcement export and the signal export cannot drift apart."""
     stamp = datetime.utcnow().strftime("%Y%m%d")
     name = f"dataset_{split}_{stamp}" if split else f"dataset_{stamp}"
     if format == "jsonl":

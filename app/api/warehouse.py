@@ -334,6 +334,145 @@ def rebuild(body: RebuildRequest) -> dict[str, Any]:
     return out
 
 
+# --------------------------------------------------------------------------
+# Catalog + row access shaped for the Dataset page, which renders both this
+# announcement-level dataset and the signal-level one through the same table.
+# --------------------------------------------------------------------------
+
+# Where each column belongs, and whether it is safe as a model input.
+#   feature — knowable at decision time
+#   target  — only knowable later; a label, never an input
+#   meta    — identity / provenance / data quality
+_CATEGORY_RULES: list[tuple[str, str, str]] = [
+    # (category, role, matcher-prefix or exact name)
+    ("identity", "meta", "uid"), ("identity", "meta", "event_id"),
+    ("identity", "meta", "seq_id"), ("identity", "meta", "symbol"),
+    ("identity", "meta", "company"), ("identity", "meta", "isin"),
+    ("identity", "meta", "exchange"), ("identity", "meta", "content_hash"),
+    ("company", "feature", "cap_tier"), ("company", "feature", "market_cap_cr"),
+    ("company", "feature", "mcap_rank"), ("company", "feature", "is_smallcap"),
+    ("news", "feature", "announced_at"), ("news", "feature", "disseminated_at"),
+    ("news", "feature", "category"), ("news", "feature", "headline"),
+    ("news", "meta", "attachment_url"), ("news", "meta", "attachment_size"),
+    ("analysis", "feature", "ai_"),
+    ("context", "meta", "anchor_time"), ("context", "feature", "session_offset"),
+    ("prices", "target", "px_"), ("prices", "target", "vol_"),
+    ("prices", "target", "day_"),
+    ("targets", "target", "ret_"), ("targets", "target", "mkt_"),
+    ("targets", "target", "adj_"),
+    ("targets", "target", "usable"), ("targets", "target", "mover_"),
+    ("quality", "meta", "data_quality"), ("quality", "meta", "price_source"),
+    ("quality", "meta", "price_status"), ("quality", "meta", "source_layer"),
+    ("quality", "meta", "ingested_at"), ("quality", "meta", "px_t0_age_min"),
+]
+
+
+def _classify(name: str) -> tuple[str, str]:
+    for cat, role, match in _CATEGORY_RULES:
+        if name == match or (match.endswith("_") and name.startswith(match)):
+            return cat, role
+    return "other", "meta"
+
+
+def announcement_column_specs() -> list[dict[str, Any]]:
+    """The dataset's columns in the same shape the Dataset page already renders.
+
+    px_*/ret_*/adj_* are tagged `target`, not `feature`: they are only knowable
+    after the announcement, and feeding one to a model is look-ahead bias. The
+    page's picker makes that mistake visible rather than silent.
+    """
+    con = _con()
+    try:
+        out = []
+        for name, dtype, *_ in con.execute(f"describe {TABLE}").fetchall():
+            cat, role = _classify(name)
+            out.append({"key": name, "label": name.replace("_", " "),
+                        "category": cat, "role": role, "type": str(dtype)})
+        return out
+    finally:
+        pass
+
+
+def announcement_rows(*, limit: int, offset: int, columns: Optional[list[str]],
+                      symbol: Optional[str] = None, event_type: Optional[str] = None,
+                      since: Optional[str] = None, until: Optional[str] = None,
+                      q: Optional[str] = None) -> dict[str, Any]:
+    """Rows for the Dataset page, using the same filters it already sends."""
+    con = _con()
+    schema = [r[0] for r in con.execute(f"describe {TABLE}").fetchall()]
+    sel = [c for c in (columns or schema) if c in set(schema)] or schema
+    where, params = [], []
+    if symbol:
+        where.append("upper(symbol) = upper(?)")
+        params.append(symbol)
+    if event_type:
+        where.append("upper(ai_event_type) = upper(?)")
+        params.append(event_type)
+    if since:
+        where.append("announced_at >= ?")
+        params.append(since)
+    if until:
+        where.append("announced_at <= ?")
+        params.append(until)
+    if q:
+        where.append("(headline ILIKE ? OR company ILIKE ?)")
+        params += [f"%{q}%"] * 2
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+    total = con.execute(f"SELECT count(*) FROM {TABLE} {clause}", params).fetchone()[0]
+    cur = con.execute(
+        f"SELECT {', '.join(sel)} FROM {TABLE} {clause} "
+        f"ORDER BY announced_at DESC LIMIT {limit} OFFSET {offset}", params)
+    return {"total": total, "returned": 0, "limit": limit, "offset": offset,
+            "columns": sel, "rows": _records(cur)}
+
+
+def announcement_stats() -> dict[str, Any]:
+    """Coverage tiles in the EXACT shape the Dataset page already renders.
+
+    Field names mirror the signal-level stats (`sources`, `enrichment`,
+    `label_balance`) so the same tiles work for both datasets without the page
+    branching on which one it is showing. The meanings differ, which is why the
+    page relabels them: here `sources` splits historical vs live-collected, and
+    UP/DOWN/FLAT are the market-adjusted 30-minute move rather than a horizon
+    label.
+    """
+    con = _con()
+    one = lambda s: con.execute(s).fetchone()  # noqa: E731
+    by_src = dict(con.execute(
+        f"select source_layer, count(*) from {TABLE} group by 1").fetchall())
+    enrich = dict(con.execute(
+        f"select price_status, count(*) from {TABLE} group by 1").fetchall())
+    rng = one(f"select min(announced_at), max(announced_at) from {TABLE}")
+    ncols = len(con.execute(f"describe {TABLE}").fetchall())
+    by_event = con.execute(
+        f"select coalesce(ai_event_type,'—') e, count(*) n FROM {TABLE} "
+        "group by 1 order by n desc limit 20").fetchall()
+    return {
+        "total_rows": one(f"select count(*) from {TABLE}")[0],
+        "sources": {"signal": by_src.get("history", 0),
+                    "shadow": by_src.get("live", 0)},
+        "enrichment": {
+            "complete": enrich.get("filled", 0),
+            "pending": enrich.get("pending", 0),
+            "no_candles": enrich.get("no_candles", 0),
+            "after_hours": one(
+                f"select count(*) from {TABLE} where session_offset='next_session'")[0],
+        },
+        "label_balance": {
+            "UP": one(f"select count(*) from {TABLE} where adj_30m > 1.5")[0],
+            "DOWN": one(f"select count(*) from {TABLE} where adj_30m < -1.5")[0],
+            "FLAT": one(f"select count(*) from {TABLE} where adj_30m is not null "
+                        "and abs(adj_30m) <= 1.5")[0],
+        },
+        "by_event_type": [{"event_type": e, "samples": n} for e, n in by_event],
+        "first_row_at": str(rng[0]) if rng and rng[0] else None,
+        "last_row_at": str(rng[1]) if rng and rng[1] else None,
+        "column_count": ncols,
+        "with_ai_label": one(
+            f"select count(*) from {TABLE} where ai_sentiment is not null")[0],
+    }
+
+
 @router.get("/columns")
 def columns() -> dict[str, Any]:
     """The schema, so the UI can build filters without hard-coding column names."""

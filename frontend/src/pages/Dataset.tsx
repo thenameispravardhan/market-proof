@@ -13,7 +13,6 @@
 // that mistake visually impossible to make silently.
 
 import { useEffect, useMemo, useState } from "react";
-import { WarehousePreview } from "../components/dataset/WarehousePreview";
 import {
   datasetQueryString,
   useDatasetBackfill,
@@ -25,6 +24,7 @@ import {
   useDatasetStats,
   type CalibrationBucket,
   type DatasetColumn,
+  type DatasetSource,
   type DatasetFilters,
 } from "../hooks/useApi";
 
@@ -111,9 +111,19 @@ function fmtCell(v: unknown): string {
   return s.length > 48 ? s.slice(0, 45) + "…" : s;
 }
 
+const SOURCE_KEY = "tradebot.dataset.source.v1";
+
 export default function Dataset() {
-  const { data: catalog } = useDatasetColumns();
-  const { data: stats } = useDatasetStats();
+  // Which dataset the page is showing. `announcements` is the merged corpus
+  // (historical + everything collected live, ~300k rows); `signals` is the
+  // per-signal training set. Different grains, so switching also swaps the
+  // column catalog, the stats and the export.
+  const [source, setSource] = useState<DatasetSource>(
+    () => (localStorage.getItem(SOURCE_KEY) as DatasetSource) || "announcements");
+  useEffect(() => { localStorage.setItem(SOURCE_KEY, source); }, [source]);
+
+  const { data: catalog } = useDatasetColumns(source);
+  const { data: stats } = useDatasetStats(source);
   const backfill = useDatasetBackfill();
   const { data: backfillStatus } = useDatasetBackfillStatus();
   const fullRunning = backfillStatus?.progress?.running ?? false;
@@ -125,6 +135,12 @@ export default function Dataset() {
     [catalog]
   );
   const [selected, setSelected] = useState<string[]>(() => loadSavedColumns() ?? []);
+  // The two catalogs share almost no column names, so a selection saved for one
+  // dataset selects nothing in the other. Reset to "all" whenever the source
+  // changes rather than rendering an empty table.
+  useEffect(() => {
+    if (allKeys.length > 0) setSelected(allKeys);
+  }, [source, allKeys.length]);  // eslint-disable-line react-hooks/exhaustive-deps
   // First load with no saved selection → select everything.
   useEffect(() => {
     if (selected.length === 0 && allKeys.length > 0 && loadSavedColumns() === null) {
@@ -157,7 +173,7 @@ export default function Dataset() {
     [allKeys, selected]
   );
   const { data: rowsResp, isLoading, error } = useDatasetRows(
-    filters,
+    { ...filters, source },
     orderedSelection.length > 0 ? orderedSelection : undefined,
     limit
   );
@@ -183,7 +199,37 @@ export default function Dataset() {
   const applyPreset = (keys: string[]) =>
     setSelected(allKeys.filter((k) => keys.includes(k)));
 
-  const exportExtra: Record<string, string | number> = { limit: 20000 };
+  // Exports are fetched rather than linked. The server spends ~9s building a
+  // 9 MB CSV, and a plain <a download> gives no feedback for that whole time —
+  // indistinguishable from a dead button, which is exactly how it was reported.
+  const [downloading, setDownloading] = useState<string | null>(null);
+  const [exportErr, setExportErr] = useState<string | null>(null);
+  const doExport = async (url: string, label: string) => {
+    setDownloading(label);
+    setExportErr(null);
+    try {
+      const res = await fetch(url, { credentials: "same-origin" });
+      if (!res.ok) throw new Error(`${res.status} ${(await res.text()).slice(0, 160)}`);
+      const blob = await res.blob();
+      if (blob.size === 0) throw new Error("the server returned an empty file");
+      const name = /filename=([^;]+)/.exec(
+        res.headers.get("content-disposition") ?? "")?.[1]?.trim();
+      const href = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = href;
+      a.download = name || `dataset.${url.includes("jsonl") ? "jsonl" : "csv"}`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(href);
+    } catch (e) {
+      setExportErr(`${label} failed — ${(e as Error).message}`);
+    } finally {
+      setDownloading(null);
+    }
+  };
+
+  const exportExtra: Record<string, string | number> = { limit: 20000, source };
   if (dedup) exportExtra.dedup = "true";
   const exportQs = datasetQueryString(filters, orderedSelection, exportExtra);
   const splitQs = (split: "train" | "val") =>
@@ -201,13 +247,33 @@ export default function Dataset() {
 
   return (
     <div>
-      {/* The unified announcement dataset. Sits above the signal-level builder
-          because it is the wider view: every announcement, not just the ones
-          that became signals. */}
-      <WarehousePreview />
-
-      <div className="dashboard-head" style={{ marginTop: 18 }}>
-        <h1 className="page-title">Dataset</h1>
+      {exportErr && (
+        <p className="pnl-neg" data-testid="dataset-export-error">{exportErr}</p>
+      )}
+      <div className="dashboard-head">
+        <h1 className="page-title">
+          Dataset
+          <span style={{ display: "inline-flex", gap: 6, marginLeft: 14, verticalAlign: "middle" }}>
+            {([
+              ["announcements", "Announcements"],
+              ["signals", "Signals"],
+            ] as const).map(([key, label]) => (
+              <button
+                key={key}
+                className={source === key ? "primary" : "chart-btn"}
+                style={source === key ? undefined : { border: "1px solid var(--border)" }}
+                onClick={() => setSource(key)}
+                aria-pressed={source === key}
+                data-testid={`dataset-source-${key}`}
+                title={key === "announcements"
+                  ? "Every NSE/BSE announcement — the historical corpus merged with everything collected live. One row per announcement."
+                  : "The per-signal training set built from the trading database. One row per signal, with planned levels, execution and horizon targets."}
+              >
+                {label}
+              </button>
+            ))}
+          </span>
+        </h1>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <button
             className="chart-btn"
@@ -239,40 +305,40 @@ export default function Dataset() {
           >
             ↻ Rebuild schema
           </button>
-          <a
+          <button
             className="chart-btn"
-            style={{ border: "1px solid var(--border)", textDecoration: "none" }}
-            href={`/api/dataset/export?format=csv&${exportQs}`}
-            download
+            style={{ border: "1px solid var(--border)" }}
+            disabled={downloading !== null}
+            onClick={() => doExport(`/api/dataset/export?format=csv&${exportQs}`, "Export CSV")}
           >
-            Export CSV
-          </a>
-          <a
+            {downloading === "Export CSV" ? "Preparing…" : "Export CSV"}
+          </button>
+          <button
             className="chart-btn"
-            style={{ border: "1px solid var(--border)", textDecoration: "none" }}
-            href={`/api/dataset/export?format=jsonl&${exportQs}`}
-            download
+            style={{ border: "1px solid var(--border)" }}
+            disabled={downloading !== null}
+            onClick={() => doExport(`/api/dataset/export?format=jsonl&${exportQs}`, "Export JSONL")}
           >
-            Export JSONL
-          </a>
-          <a
+            {downloading === "Export JSONL" ? "Preparing…" : "Export JSONL"}
+          </button>
+          <button
             className="chart-btn"
-            style={{ border: "1px solid var(--border)", textDecoration: "none" }}
-            href={`/api/dataset/export?format=csv&${splitQs("train")}`}
-            download
+            style={{ border: "1px solid var(--border)" }}
+            disabled={downloading !== null}
             title="Oldest 80% of the filtered set, chronological — train on this"
+            onClick={() => doExport(`/api/dataset/export?format=csv&${splitQs("train")}`, "Train CSV")}
           >
-            Train CSV
-          </a>
-          <a
+            {downloading === "Train CSV" ? "Preparing…" : "Train CSV"}
+          </button>
+          <button
             className="chart-btn"
-            style={{ border: "1px solid var(--border)", textDecoration: "none" }}
-            href={`/api/dataset/export?format=csv&${splitQs("val")}`}
-            download
+            style={{ border: "1px solid var(--border)" }}
+            disabled={downloading !== null}
             title="Newest 20% — validate on this (never random-split news data)"
+            onClick={() => doExport(`/api/dataset/export?format=csv&${splitQs("val")}`, "Val CSV")}
           >
-            Val CSV
-          </a>
+            {downloading === "Val CSV" ? "Preparing…" : "Val CSV"}
+          </button>
           <label
             className="meta"
             style={{ cursor: "pointer", whiteSpace: "nowrap" }}

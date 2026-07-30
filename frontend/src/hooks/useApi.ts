@@ -1178,18 +1178,23 @@ export function datasetQueryString(
   return params.toString();
 }
 
-export function useDatasetColumns() {
+// `source` picks which dataset the page is showing: the per-SIGNAL training set
+// or the merged per-ANNOUNCEMENT dataset. They are different grains with
+// different catalogs, so it is part of every dataset query key.
+export type DatasetSource = "signals" | "announcements";
+
+export function useDatasetColumns(source: DatasetSource = "signals") {
   return useQuery<DatasetColumns>({
-    queryKey: ["dataset-columns"],
-    queryFn: () => api.get("/api/dataset/columns"),
+    queryKey: ["dataset-columns", source],
+    queryFn: () => api.get(`/api/dataset/columns?source=${source}`),
     staleTime: Infinity, // the catalog is static per build
   });
 }
 
-export function useDatasetStats() {
+export function useDatasetStats(source: DatasetSource = "signals") {
   return useQuery<DatasetStats>({
-    queryKey: ["dataset-stats"],
-    queryFn: () => api.get("/api/dataset/stats"),
+    queryKey: ["dataset-stats", source],
+    queryFn: () => api.get(`/api/dataset/stats?source=${source}`),
     refetchInterval: 30000,
   });
 }
