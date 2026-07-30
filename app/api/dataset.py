@@ -785,17 +785,44 @@ def dataset_export(
     oldest `split_ratio` of the filtered set trains, the newest
     remainder validates (a random split leaks regime)."""
     if source == "announcements":
-        # The merged announcement dataset lives in DuckDB, not the trading DB,
-        # so it is fetched through the warehouse and then rendered by the same
-        # CSV/JSONL writer below — one export path, two sources.
-        from app.api.warehouse import announcement_rows
+        # The whole dataset, not a page of it. 303k rows x 97 columns is ~330 MB
+        # of CSV: DuckDB COPYs it straight to a temp file with flat memory and
+        # we stream that back in chunks. Building it as a Python string (what
+        # the signal path does) would allocate it twice on a box with ~1 GB
+        # free and take the trading process with it.
+        import os as _os
 
-        payload = announcement_rows(
-            limit=limit, offset=0, columns=_parse_columns(columns),
-            symbol=symbol, event_type=event_type, since=since, until=until)
-        selected = payload["columns"]
-        result = {"rows": payload["rows"]}
-        return _write_export(result, selected, format, split)
+        from fastapi.responses import StreamingResponse
+
+        from app.api.warehouse import announcement_export_path
+
+        path = announcement_export_path(
+            "csv" if format == "csv" else "json",
+            columns=_parse_columns(columns), symbol=symbol,
+            event_type=event_type, since=since, until=until)
+        stamp = datetime.utcnow().strftime("%Y%m%d")
+        ext = "csv" if format == "csv" else "jsonl"
+
+        def _stream():
+            try:
+                with open(path, "rb") as fh:
+                    while chunk := fh.read(1 << 20):   # 1 MB at a time
+                        yield chunk
+            finally:
+                # The temp file is this request's alone; drop it either way.
+                try:
+                    _os.remove(path)
+                except OSError:
+                    pass
+
+        return StreamingResponse(
+            _stream(),
+            media_type="text/csv" if format == "csv" else "application/x-ndjson",
+            headers={
+                "Content-Disposition": f"attachment; filename=announcements_{stamp}.{ext}",
+                "Content-Length": str(path.stat().st_size),
+            },
+        )
 
     selected = _parse_columns(columns) or [c["key"] for c in COLUMN_SPECS]
     result = _dataset_rows(

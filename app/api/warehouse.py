@@ -9,8 +9,11 @@ process. Every list endpoint paginates and every query is wrapped in a LIMIT.
 """
 from __future__ import annotations
 
+import os
 import re
+import tempfile
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
@@ -424,6 +427,62 @@ def announcement_rows(*, limit: int, offset: int, columns: Optional[list[str]],
         f"ORDER BY announced_at DESC LIMIT {limit} OFFSET {offset}", params)
     return {"total": total, "returned": 0, "limit": limit, "offset": offset,
             "columns": sel, "rows": _records(cur)}
+
+
+def announcement_export_path(fmt: str, columns: Optional[list[str]] = None,
+                             symbol: Optional[str] = None,
+                             event_type: Optional[str] = None,
+                             since: Optional[str] = None,
+                             until: Optional[str] = None) -> Path:
+    """Write the WHOLE dataset to a temp file and return its path.
+
+    303,505 rows x 97 columns is roughly 150 MB of CSV. Building that as a
+    Python string — which is what the signal-side export does — would allocate
+    it twice over on a box with ~1 GB free and take the trading process down
+    with it. DuckDB's COPY writes straight from the table to disk with flat
+    memory, and the caller streams the file back in chunks.
+    """
+    con = _con()
+    schema = [r[0] for r in con.execute(f"describe {TABLE}").fetchall()]
+    sel = [c for c in (columns or schema) if c in set(schema)] or schema
+
+    where, params = [], []
+    if symbol:
+        where.append("upper(symbol) = upper(?)")
+        params.append(symbol)
+    if event_type:
+        where.append("upper(ai_event_type) = upper(?)")
+        params.append(event_type)
+    if since:
+        where.append("announced_at >= ?")
+        params.append(since)
+    if until:
+        where.append("announced_at <= ?")
+        params.append(until)
+    clause = f"WHERE {' AND '.join(where)}" if where else ""
+
+    # Sweep exports older than an hour before writing a new one. The streaming
+    # response deletes its own file, but a crash or a client that disconnects
+    # mid-download leaves a 300 MB+ orphan, and enough of those fill the disk.
+    cutoff = time.time() - 3600
+    for stale in Path(tempfile.gettempdir()).glob("tradebot_export_*"):
+        try:
+            if stale.stat().st_mtime < cutoff:
+                stale.unlink()
+        except OSError:
+            pass
+
+    tmp = Path(tempfile.gettempdir()) / f"tradebot_export_{os.getpid()}_{int(time.time())}.{fmt}"
+    opts = ("FORMAT csv, HEADER" if fmt == "csv"
+            else "FORMAT json")  # DuckDB's json export is newline-delimited
+    # Deliberately NOT sorted. Sorting 303k x 97 needs the whole result
+    # materialised and blew the 256 MB cap with OutOfMemory; unsorted, COPY
+    # streams row groups straight to disk at flat memory. A full dump is going
+    # into pandas or Excel anyway, where sorting is one line.
+    con.execute(
+        f"COPY (SELECT {', '.join(sel)} FROM {TABLE} {clause}) "
+        f"TO '{tmp.as_posix()}' ({opts})", params)
+    return tmp
 
 
 def announcement_stats() -> dict[str, Any]:

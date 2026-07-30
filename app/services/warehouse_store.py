@@ -127,6 +127,14 @@ def connect(read_only: bool = False):
     con = duckdb.connect(str(STORE), read_only=read_only)
     # Bounded: this shares a 2 GB box with a live trading process.
     con.execute("SET memory_limit='256MB'; SET threads=2;")
+    # A full-table export sorts 303k x 97, which does not fit in 256 MB and
+    # raised OutOfMemory. Giving DuckDB a spill directory lets it page the sort
+    # to disk instead — the box has 47 GB free and 256 MB of RAM to spare, so
+    # trading against disk for memory is the right way round here.
+    tmp = STORE.parent / "duckdb_tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    con.execute(f"SET temp_directory='{tmp.as_posix()}'")
+    con.execute("SET preserve_insertion_order=false")
     if not read_only:
         con.execute(SCHEMA)
         con.execute(f"CREATE INDEX IF NOT EXISTS idx_sym ON {TABLE}(symbol)")

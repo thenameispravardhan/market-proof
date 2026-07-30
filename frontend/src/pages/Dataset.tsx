@@ -111,16 +111,11 @@ function fmtCell(v: unknown): string {
   return s.length > 48 ? s.slice(0, 45) + "…" : s;
 }
 
-const SOURCE_KEY = "tradebot.dataset.source.v1";
-
 export default function Dataset() {
-  // Which dataset the page is showing. `announcements` is the merged corpus
-  // (historical + everything collected live, ~300k rows); `signals` is the
-  // per-signal training set. Different grains, so switching also swaps the
-  // column catalog, the stats and the export.
-  const [source, setSource] = useState<DatasetSource>(
-    () => (localStorage.getItem(SOURCE_KEY) as DatasetSource) || "announcements");
-  useEffect(() => { localStorage.setItem(SOURCE_KEY, source); }, [source]);
+  // The page shows the merged announcement dataset — every NSE/BSE filing,
+  // historical plus everything collected live. The per-signal training set is
+  // still served by the same endpoints (source=all) but is not surfaced here.
+  const source: DatasetSource = "announcements";
 
   const { data: catalog } = useDatasetColumns(source);
   const { data: stats } = useDatasetStats(source);
@@ -135,12 +130,14 @@ export default function Dataset() {
     [catalog]
   );
   const [selected, setSelected] = useState<string[]>(() => loadSavedColumns() ?? []);
-  // The two catalogs share almost no column names, so a selection saved for one
-  // dataset selects nothing in the other. Reset to "all" whenever the source
-  // changes rather than rendering an empty table.
+  // A column selection saved before the page moved to the announcement dataset
+  // names columns that no longer exist, which would render an empty table.
+  // Fall back to "all" whenever the saved set matches nothing in the catalog.
   useEffect(() => {
-    if (allKeys.length > 0) setSelected(allKeys);
-  }, [source, allKeys.length]);  // eslint-disable-line react-hooks/exhaustive-deps
+    if (allKeys.length > 0 && !selected.some((k) => allKeys.includes(k))) {
+      setSelected(allKeys);
+    }
+  }, [allKeys, selected]);
   // First load with no saved selection → select everything.
   useEffect(() => {
     if (selected.length === 0 && allKeys.length > 0 && loadSavedColumns() === null) {
@@ -253,26 +250,6 @@ export default function Dataset() {
       <div className="dashboard-head">
         <h1 className="page-title">
           Dataset
-          <span style={{ display: "inline-flex", gap: 6, marginLeft: 14, verticalAlign: "middle" }}>
-            {([
-              ["announcements", "Announcements"],
-              ["signals", "Signals"],
-            ] as const).map(([key, label]) => (
-              <button
-                key={key}
-                className={source === key ? "primary" : "chart-btn"}
-                style={source === key ? undefined : { border: "1px solid var(--border)" }}
-                onClick={() => setSource(key)}
-                aria-pressed={source === key}
-                data-testid={`dataset-source-${key}`}
-                title={key === "announcements"
-                  ? "Every NSE/BSE announcement — the historical corpus merged with everything collected live. One row per announcement."
-                  : "The per-signal training set built from the trading database. One row per signal, with planned levels, execution and horizon targets."}
-              >
-                {label}
-              </button>
-            ))}
-          </span>
         </h1>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <button
