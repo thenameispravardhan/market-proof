@@ -516,6 +516,15 @@ class BaseMonitor:
         except Exception as e:  # noqa: BLE001
             raise _RetryableError(f"db insert failed: {e}") from e
 
+        if new_id is not None:
+            # Mirror the filing into the unified dataset. Deliberately
+            # fire-and-forget in a worker thread: this is the detection hot path
+            # and the warehouse must never add latency to it or fail a trade.
+            # Anything missed here is picked up by warehouse_sync.
+            loop.run_in_executor(
+                None, _mirror_to_warehouse, announcement, new_id
+            ).add_done_callback(lambda f: f.exception())
+
         if new_id is None:
             # Insert returned None — concurrent insert beat us. Treat
             # as dedup.
@@ -624,6 +633,35 @@ class BaseMonitor:
             session.commit()
             session.refresh(announcement)
             return announcement.id
+
+
+def _mirror_to_warehouse(announcement, new_id: int) -> None:
+    """Copy one announcement into the unified dataset. Never raises.
+
+    Monitors record `filed_at` in UTC; the dataset is IST throughout, so the
+    conversion happens here. Getting it wrong does not error — it silently
+    stores the same filing twice, 5h30m apart, which is why it is done once at
+    the boundary rather than at each call site.
+    """
+    try:
+        from datetime import timedelta
+
+        from app.services.warehouse_store import ingest_live
+
+        to_ist = lambda t: (t + timedelta(hours=5, minutes=30)) if t else None  # noqa: E731
+        ingest_live(
+            symbol=announcement.symbol,
+            headline=announcement.headline,
+            announced_at=to_ist(announcement.filed_at),
+            disseminated_at=to_ist(getattr(announcement, "received_at", None)),
+            exchange=announcement.exchange,
+            category=announcement.event_type,
+            attachment_url=announcement.pdf_url,
+            content_hash=announcement.content_hash,
+            event_id=new_id,
+        )
+    except Exception as e:  # noqa: BLE001 — the dataset is never worth a lost trade
+        log.debug("monitor.warehouse_mirror_failed", error=str(e)[:160])
 
 
 def _normalize_headline(s: Optional[str]) -> str:

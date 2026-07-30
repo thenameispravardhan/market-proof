@@ -43,6 +43,7 @@ from app.api import (
     settings_api,
     strategies as strategies_api,
     trading_mode,
+    warehouse as warehouse_api,
     webhooks as webhooks_api,
     ws,
 )
@@ -497,6 +498,7 @@ app.include_router(options_api.router)
 app.include_router(metrics_api.router)
 app.include_router(outcomes_api.router)
 app.include_router(dataset_api.router)
+app.include_router(warehouse_api.router)
 
 
 # -------------------------------------------------------------------------
