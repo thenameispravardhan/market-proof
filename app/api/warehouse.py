@@ -248,6 +248,42 @@ def sql_query(body: SqlRequest) -> dict[str, Any]:
         con.close()
 
 
+class RebuildRequest(BaseModel):
+    history: bool = True
+    live: bool = True
+    prices: bool = False
+    price_limit: int = Field(0, ge=0, le=200_000)
+
+
+@router.post("/rebuild")
+def rebuild(body: RebuildRequest) -> dict[str, Any]:
+    """Load history / live / prices into the dataset, in-process.
+
+    DuckDB allows exactly one read-write process. The running service owns that
+    lock the moment the first announcement is mirrored, so a separate CLI run
+    fails with 'Conflicting lock is held'. Admin operations therefore go through
+    the service that already holds the connection rather than fighting it.
+
+    All three steps are idempotent — existing uids are skipped and already-filled
+    prices are not refetched — so this is safe to call repeatedly.
+    """
+    from app.services import warehouse_store as store
+
+    out: dict[str, Any] = {}
+    t = time.time()
+    if body.history:
+        out["history_loaded"] = store.load_history()
+    if body.live:
+        out["live_loaded"] = store.load_live()
+    if body.prices:
+        from app.services import warehouse_prices
+        out["prices"] = warehouse_prices.fill(body.price_limit)
+    out["elapsed_s"] = round(time.time() - t, 1)
+    out["stats"] = store.stats()
+    log.info("warehouse.rebuild", **{k: v for k, v in out.items() if k != "stats"})
+    return out
+
+
 @router.get("/columns")
 def columns() -> dict[str, Any]:
     """The schema, so the UI can build filters without hard-coding column names."""
