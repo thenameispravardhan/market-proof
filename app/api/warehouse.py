@@ -128,8 +128,15 @@ def search(
     desc: bool = True,
     limit: int = Query(50, ge=1, le=MAX_LIMIT),
     offset: int = Query(0, ge=0),
+    columns: Optional[str] = Query(
+        None, description="comma-separated column names, or 'all' for every column"),
 ) -> dict[str, Any]:
-    """Filtered, paginated search. Every filter is optional and they compose."""
+    """Filtered, paginated search. Every filter is optional and they compose.
+
+    `columns` widens the projection beyond the default preview set — the UI uses
+    it to show all 91. Names are validated against the real schema rather than
+    interpolated blind, since they land in the SELECT list.
+    """
     where: list[str] = []
     params: list[Any] = []
 
@@ -160,16 +167,28 @@ def search(
     clause = f"WHERE {' AND '.join(where)}" if where else ""
     con = _con()
     try:
-        cols = {r[0] for r in con.execute(f"describe {TABLE}").fetchall()}
+        schema = [r[0] for r in con.execute(f"describe {TABLE}").fetchall()]
+        cols = set(schema)
         if order_by not in cols:
             raise HTTPException(422, f"cannot order by unknown column {order_by!r}")
+        if not columns:
+            select = LIST_COLUMNS
+        elif columns.strip().lower() == "all":
+            select = schema
+        else:
+            asked = [c.strip() for c in columns.split(",") if c.strip()]
+            unknown = [c for c in asked if c not in cols]
+            if unknown:
+                raise HTTPException(422, f"unknown column(s): {unknown}")
+            select = asked or LIST_COLUMNS
         t = time.time()
         total = con.execute(f"SELECT count(*) FROM {TABLE} {clause}", params).fetchone()[0]
         rows = con.execute(
-            f"SELECT {', '.join(LIST_COLUMNS)} FROM {TABLE} {clause} "
+            f"SELECT {', '.join(select)} FROM {TABLE} {clause} "
             f"ORDER BY {order_by} {'DESC' if desc else 'ASC'} NULLS LAST "
             f"LIMIT {limit} OFFSET {offset}", params)
         return {"total": total, "limit": limit, "offset": offset,
+                "columns": select,
                 "elapsed_ms": round((time.time() - t) * 1000, 1),
                 "rows": _records(rows)}
     finally:

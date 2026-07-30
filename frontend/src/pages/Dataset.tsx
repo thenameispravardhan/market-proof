@@ -13,6 +13,7 @@
 // that mistake visually impossible to make silently.
 
 import { useEffect, useMemo, useState } from "react";
+import { WarehousePreview } from "../components/dataset/WarehousePreview";
 import {
   datasetQueryString,
   useDatasetBackfill,
@@ -200,7 +201,12 @@ export default function Dataset() {
 
   return (
     <div>
-      <div className="dashboard-head">
+      {/* The unified announcement dataset. Sits above the signal-level builder
+          because it is the wider view: every announcement, not just the ones
+          that became signals. */}
+      <WarehousePreview />
+
+      <div className="dashboard-head" style={{ marginTop: 18 }}>
         <h1 className="page-title">Dataset</h1>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
           <button
