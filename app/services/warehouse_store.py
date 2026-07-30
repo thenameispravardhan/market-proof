@@ -117,36 +117,73 @@ UID_BASE = ("lower(coalesce({ex},'NSE')) || ':' || upper({sym}) || ':' || "
             "substr(md5(coalesce({hl},'')), 1, 10)")
 
 
+_root = None  # the single process-wide DuckDB instance
+
+
 def connect(read_only: bool = False):
+    """A per-thread cursor over ONE process-wide DuckDB instance.
+
+    DuckDB's model is one instance with many cursors, not many connections.
+    Opening a fresh connection per thread and re-applying the settings raised
+    "Cannot switch temporary directory after the current one has been used" the
+    moment a second thread arrived, which 500'd every dataset endpoint.
+
+    The instance is therefore created once, under a lock, with its settings
+    applied exactly once; every caller after that gets a cursor. Cursors are
+    independent execution contexts, which is what makes this safe under
+    FastAPI's threadpool.
+    """
+    global _root
     con = getattr(_local, "con", None)
     if con is not None:
         return con
-    import duckdb
 
-    STORE.parent.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect(str(STORE), read_only=read_only)
-    # Bounded: this shares a 2 GB box with a live trading process.
-    con.execute("SET memory_limit='256MB'; SET threads=2;")
-    # A full-table export sorts 303k x 97, which does not fit in 256 MB and
-    # raised OutOfMemory. Giving DuckDB a spill directory lets it page the sort
-    # to disk instead — the box has 47 GB free and 256 MB of RAM to spare, so
-    # trading against disk for memory is the right way round here.
-    tmp = STORE.parent / "duckdb_tmp"
-    tmp.mkdir(parents=True, exist_ok=True)
-    con.execute(f"SET temp_directory='{tmp.as_posix()}'")
-    con.execute("SET preserve_insertion_order=false")
-    if not read_only:
-        con.execute(SCHEMA)
-        con.execute(f"CREATE INDEX IF NOT EXISTS idx_sym ON {TABLE}(symbol)")
-        con.execute(f"CREATE INDEX IF NOT EXISTS idx_at  ON {TABLE}(announced_at)")
+    with _lock:
+        if _root is None:
+            import duckdb
+
+            STORE.parent.mkdir(parents=True, exist_ok=True)
+            root = duckdb.connect(str(STORE), read_only=read_only)
+            # Bounded: this shares a 2 GB box with a live trading process.
+            root.execute("SET memory_limit='256MB'; SET threads=2;")
+            # A full-table export does not fit in 256 MB and raised
+            # OutOfMemory. A spill directory lets DuckDB page to disk instead —
+            # the box has 46 GB free and 256 MB of RAM to spare, so trading
+            # disk for memory is the right way round. These are instance-level
+            # and settable only before first use, hence "exactly once".
+            tmp = STORE.parent / "duckdb_tmp"
+            tmp.mkdir(parents=True, exist_ok=True)
+            root.execute(f"SET temp_directory='{tmp.as_posix()}'")
+            root.execute("SET preserve_insertion_order=false")
+            if not read_only:
+                root.execute(SCHEMA)
+                root.execute(f"CREATE INDEX IF NOT EXISTS idx_sym ON {TABLE}(symbol)")
+                root.execute(f"CREATE INDEX IF NOT EXISTS idx_at  ON {TABLE}(announced_at)")
+            _root = root
+
+    con = _root.cursor()
     _local.con = con
     return con
 
 
+def shutdown() -> None:
+    """Close the process-wide instance. Tests use this between temp stores."""
+    global _root
+    close()
+    with _lock:
+        if _root is not None:
+            _root.close()
+            _root = None
+
+
 def close() -> None:
+    """Drop this thread's cursor. The shared instance stays open."""
     con = getattr(_local, "con", None)
     if con is not None:
-        con.close()
+        try:
+            con.close()
+        except Exception:  # noqa: BLE001 — an already-closed cursor is fine
+            pass
         _local.con = None
 
 

@@ -24,11 +24,13 @@ def store(tmp_path, monkeypatch):
     sides of the test keeps that cache from leaking a stale handle either way —
     without it the suite passes alone and fails intermittently in full runs.
     """
-    W.close()
+    # shutdown(), not close(): the instance is process-wide now, and pointing
+    # STORE at a temp file means nothing while the old instance is still open.
+    W.shutdown()
     monkeypatch.setattr(W, "STORE", tmp_path / "wh.duckdb")
     con = W.connect()
     yield con
-    W.close()
+    W.shutdown()
 
 
 def _row(**kw):
@@ -89,10 +91,45 @@ def test_symbol_and_time_are_required(store):
         W.ingest_live(symbol="", headline="x", announced_at=None)
 
 
-def test_read_only_connection_cannot_write(store, tmp_path):
+def test_cursors_are_independent_across_threads(store):
+    """One instance, many cursors — the model the API depends on.
+
+    Opening a second CONNECTION per thread is what raised "Cannot switch
+    temporary directory after the current one has been used" and 500'd every
+    dataset endpoint as soon as a second request arrived.
+    """
+    import threading
+
     W.ingest_live(**_row(content_hash="h1"))
-    W.close()
-    ro = duckdb.connect(str(W.STORE), read_only=True)
-    with pytest.raises(Exception):
-        ro.execute(f"delete from {W.TABLE}")
-    ro.close()
+    errors: list[str] = []
+
+    def read():
+        try:
+            W.connect().execute(f"select count(*) from {W.TABLE}").fetchone()
+        except Exception as e:  # noqa: BLE001
+            errors.append(str(e)[:120])
+
+    threads = [threading.Thread(target=read) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, f"concurrent cursors failed: {errors}"
+
+
+def test_sql_console_rejects_writes():
+    """Write protection lives in the statement screen, not the connection.
+
+    The API shares the process's read-write instance (it has to — the monitor
+    holds it to mirror filings), so this screen is the only thing standing
+    between a typed query and the dataset.
+    """
+    from app.api.warehouse import _FORBIDDEN
+
+    for bad in ("delete from announcements",
+                "update announcements set symbol='x'",
+                "drop table announcements",
+                "attach '/etc/passwd' as x",
+                "copy announcements to '/tmp/x.csv'",
+                "select * from read_parquet('/etc/hosts')"):
+        assert _FORBIDDEN.search(bad), f"not blocked: {bad}"
