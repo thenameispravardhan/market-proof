@@ -34,6 +34,30 @@ LIST_COLUMNS = [
 ]
 
 
+def _records(cur) -> list[dict[str, Any]]:
+    """Rows as dicts, without pandas.
+
+    DuckDB's fetch_df() builds a pandas DataFrame, and this service has no
+    pandas — pulling it in just to serialise JSON would cost more memory on the
+    2 GB box than every query it serves. Locally the endpoints looked fine
+    because pandas happens to be installed; on the server they 500'd.
+    cursor.description carries the column names, which is all this needs.
+    """
+    rows = cur.fetchall()
+    cols = [d[0] for d in cur.description]
+    out = []
+    for r in rows:
+        rec: dict[str, Any] = {}
+        for k, v in zip(cols, r):
+            if isinstance(v, float) and v != v:      # NaN is not JSON
+                v = None
+            elif hasattr(v, "isoformat"):            # datetime / date
+                v = v.isoformat()
+            rec[k] = v
+        out.append(rec)
+    return out
+
+
 def _con():
     """A per-request cursor over the process's single DuckDB connection.
 
@@ -144,10 +168,10 @@ def search(
         rows = con.execute(
             f"SELECT {', '.join(LIST_COLUMNS)} FROM {TABLE} {clause} "
             f"ORDER BY {order_by} {'DESC' if desc else 'ASC'} NULLS LAST "
-            f"LIMIT {limit} OFFSET {offset}", params).fetch_df()
+            f"LIMIT {limit} OFFSET {offset}", params)
         return {"total": total, "limit": limit, "offset": offset,
                 "elapsed_ms": round((time.time() - t) * 1000, 1),
-                "rows": rows.to_dict(orient="records")}
+                "rows": _records(rows)}
     finally:
         con.close()
 
@@ -157,11 +181,10 @@ def row(uid: str) -> dict[str, Any]:
     """Every column for one announcement."""
     con = _con()
     try:
-        d = con.execute(f"SELECT * FROM {TABLE} WHERE uid = ?", [uid]).fetch_df()
-        if d.empty:
+        recs = _records(con.execute(f"SELECT * FROM {TABLE} WHERE uid = ?", [uid]))
+        if not recs:
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"no announcement {uid!r}")
-        rec = d.to_dict(orient="records")[0]
-        return {k: (None if v != v else v) for k, v in rec.items()}  # NaN -> None
+        return recs[0]
     finally:
         con.close()
 
@@ -173,14 +196,15 @@ def by_symbol(symbol: str, limit: int = Query(100, ge=1, le=MAX_LIMIT)) -> dict[
     try:
         rows = con.execute(
             f"SELECT {', '.join(LIST_COLUMNS)} FROM {TABLE} WHERE upper(symbol)=upper(?) "
-            f"ORDER BY announced_at DESC LIMIT {limit}", [symbol]).fetch_df()
+            f"ORDER BY announced_at DESC LIMIT {limit}", [symbol])
+        row_recs = _records(rows)
         agg = con.execute(
             f"SELECT count(*) n, count(adj_30m) with_outcome, avg(adj_30m) avg_move, "
             f"sum(CASE WHEN mover_1_5 THEN 1 ELSE 0 END) movers "
-            f"FROM {TABLE} WHERE upper(symbol)=upper(?)", [symbol]).fetch_df()
+            f"FROM {TABLE} WHERE upper(symbol)=upper(?)", [symbol])
         return {"symbol": symbol.upper(),
-                "summary": agg.to_dict(orient="records")[0],
-                "rows": rows.to_dict(orient="records")}
+                "summary": _records(agg)[0],
+                "rows": row_recs}
     finally:
         con.close()
 
@@ -208,8 +232,8 @@ def aggregate(
             WHERE {group_by} IS NOT NULL
             GROUP BY 1 HAVING count(*) >= {min_count}
             ORDER BY n DESC LIMIT 100
-        """).fetch_df()
-        return {"group_by": group_by, "rows": rows.to_dict(orient="records")}
+        """)
+        return {"group_by": group_by, "rows": _records(rows)}
     finally:
         con.close()
 
@@ -242,11 +266,11 @@ def sql_query(body: SqlRequest) -> dict[str, Any]:
     con = _con()
     try:
         t = time.time()
-        rows = con.execute(f"SELECT * FROM ({sql}) LIMIT {body.limit}").fetch_df()
+        cur = con.execute(f"SELECT * FROM ({sql}) LIMIT {body.limit}")
+        cols = [d[0] for d in cur.description]
+        recs = _records(cur)
         return {"elapsed_ms": round((time.time() - t) * 1000, 1),
-                "row_count": len(rows),
-                "columns": list(rows.columns),
-                "rows": rows.to_dict(orient="records")}
+                "row_count": len(recs), "columns": cols, "rows": recs}
     except HTTPException:
         raise
     except Exception as e:  # noqa: BLE001 — surface DuckDB's own message
