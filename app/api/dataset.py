@@ -568,13 +568,36 @@ def _dataset_rows(
 
 
 def _parse_columns(columns: Optional[str]) -> Optional[list[str]]:
-    """Validate a csv column selection against the catalog, preserving
-    catalog order. None/empty → all columns."""
+    """Validate a csv column selection against the SIGNAL catalog, preserving
+    catalog order. None/empty → all columns.
+
+    Signal-grain only. The announcement dataset has its own 97-column schema
+    and must go through `_split_columns` — see the note there.
+    """
     if not columns:
         return None
     wanted = {c.strip() for c in columns.split(",") if c.strip()}
     selected = [c["key"] for c in COLUMN_SPECS if c["key"] in wanted]
     return selected or None
+
+
+def _split_columns(columns: Optional[str]) -> Optional[list[str]]:
+    """Split a csv column selection WITHOUT filtering it against COLUMN_SPECS.
+
+    The announcement dataset is a different grain with a different catalog, and
+    `_parse_columns` keeps only names present in the SIGNAL specs. Running the
+    announcement page's 97 columns through it left the three names the two
+    schemas happen to share — symbol, exchange, headline — and silently dropped
+    uid, announced_at, attachment_url and everything else, so the table
+    rendered a wall of "—" under correct headers.
+
+    Validation still happens, just against the right schema: announcement_rows
+    and announcement_export_path both intersect with `describe <table>`, so an
+    unknown name is dropped there rather than reaching the SELECT.
+    """
+    if not columns:
+        return None
+    return [c.strip() for c in columns.split(",") if c.strip()] or None
 
 
 # =========================================================================
@@ -649,7 +672,7 @@ def dataset_rows(
     if source == "announcements":
         from app.api.warehouse import announcement_rows
         return announcement_rows(
-            limit=limit, offset=offset, columns=_parse_columns(columns),
+            limit=limit, offset=offset, columns=_split_columns(columns),
             symbol=symbol, event_type=event_type, since=since, until=until,
             enriched_only=enriched_only)
     return _dataset_rows(
@@ -799,7 +822,7 @@ def dataset_export(
 
         kind = {"csv": "csv", "jsonl": "json", "parquet": "parquet"}[format]
         path = announcement_export_path(
-            kind, columns=_parse_columns(columns), symbol=symbol,
+            kind, columns=_split_columns(columns), symbol=symbol,
             event_type=event_type, since=since, until=until,
             enriched_only=enriched_only)
         stamp = datetime.utcnow().strftime("%Y%m%d")
