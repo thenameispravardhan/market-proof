@@ -480,6 +480,9 @@ export default function Dataset() {
           {calibOpen && (
             <>
               <span style={{ flex: 1 }} />
+          {/* No action / taken / label / source pickers here: this page shows
+              the ANNOUNCEMENT grain and a filing has none of those. The API
+              now 422s them rather than silently returning unfiltered rows. */}
               <span className="meta">“moved” ≥</span>
               <select
                 value={calibMove}
@@ -827,18 +830,6 @@ export default function Dataset() {
           </span>
           <span style={{ flex: 1 }} />
           <select
-            value={filters.source ?? ""}
-            onChange={(e) =>
-              setFilters((f) => ({ ...f, source: e.target.value || undefined }))
-            }
-            style={{ width: "auto", padding: "2px 6px" }}
-            title="signal = the bot acted or was risk-blocked; shadow = analyzed but never signaled (the negatives)"
-          >
-            <option value="">Signal + shadow</option>
-            <option value="signal">Signal rows</option>
-            <option value="shadow">Shadow rows</option>
-          </select>
-          <select
             value={filters.event_type ?? ""}
             onChange={(e) =>
               setFilters((f) => ({ ...f, event_type: e.target.value || undefined }))
@@ -853,40 +844,6 @@ export default function Dataset() {
                   {e.event_type} ({e.samples})
                 </option>
               ))}
-          </select>
-          <select
-            value={filters.action ?? ""}
-            onChange={(e) =>
-              setFilters((f) => ({ ...f, action: e.target.value || undefined }))
-            }
-            style={{ width: "auto", padding: "2px 6px" }}
-          >
-            <option value="">BUY + SELL</option>
-            <option value="BUY">BUY</option>
-            <option value="SELL">SELL</option>
-          </select>
-          <select
-            value={filters.taken ?? ""}
-            onChange={(e) =>
-              setFilters((f) => ({ ...f, taken: e.target.value || undefined }))
-            }
-            style={{ width: "auto", padding: "2px 6px" }}
-          >
-            <option value="">Taken + blocked</option>
-            <option value="taken">Taken only</option>
-            <option value="blocked">Blocked only</option>
-          </select>
-          <select
-            value={filters.label ?? ""}
-            onChange={(e) =>
-              setFilters((f) => ({ ...f, label: e.target.value || undefined }))
-            }
-            style={{ width: "auto", padding: "2px 6px" }}
-          >
-            <option value="">Any label</option>
-            <option value="UP">UP</option>
-            <option value="DOWN">DOWN</option>
-            <option value="FLAT">FLAT</option>
           </select>
           <label className="meta" style={{ cursor: "pointer" }}>
             <input

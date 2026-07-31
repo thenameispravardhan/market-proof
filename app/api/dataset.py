@@ -31,7 +31,7 @@ import json
 from datetime import datetime
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -581,6 +581,29 @@ def _parse_columns(columns: Optional[str]) -> Optional[list[str]]:
     return selected or None
 
 
+# Filters that only mean something on the SIGNAL grain. The announcement
+# dataset has no action, no taken/blocked decision and no UP/DOWN/FLAT label —
+# a filing is not a trade. Passing one used to be ignored in silence, which
+# handed back UNFILTERED rows to a caller who believed they were filtered. For
+# something being exported as training data that is worse than an error, so it
+# is now an error.
+_SIGNAL_ONLY_FILTERS = ("action", "taken", "label")
+
+
+def _reject_signal_filters(**kwargs: Any) -> None:
+    used = sorted(k for k, v in kwargs.items() if v not in (None, ""))
+    if used:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{', '.join(used)} {'is' if len(used) == 1 else 'are'} a "
+                "signal-dataset filter and does not apply to source=announcements "
+                "(a filing has no action, no taken/blocked decision and no label). "
+                "Use symbol, event_type, since, until or enriched_only."
+            ),
+        )
+
+
 def _split_columns(columns: Optional[str]) -> Optional[list[str]]:
     """Split a csv column selection WITHOUT filtering it against COLUMN_SPECS.
 
@@ -670,6 +693,7 @@ def dataset_rows(
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     if source == "announcements":
+        _reject_signal_filters(action=action, taken=taken, label=label)
         from app.api.warehouse import announcement_rows
         return announcement_rows(
             limit=limit, offset=offset, columns=_split_columns(columns),
@@ -809,6 +833,7 @@ def dataset_export(
     oldest `split_ratio` of the filtered set trains, the newest
     remainder validates (a random split leaks regime)."""
     if source == "announcements":
+        _reject_signal_filters(action=action, taken=taken, label=label)
         # The whole dataset, not a page of it. 303k rows x 97 columns is ~330 MB
         # of CSV: DuckDB COPYs it straight to a temp file with flat memory and
         # we stream that back in chunks. Building it as a Python string (what
