@@ -105,7 +105,7 @@ ssh -i LightsailDefaultKey-ap-south-1.pem ubuntu@<STATIC_IP>
 Then:
 
 ```bash
-git clone -b aws https://github.com/thenameispravardhan/AI-News-Trading-Bot.git tradebot
+git clone https://github.com/thenameispravardhan/AI-News-Trading-Bot.git tradebot
 cd tradebot
 bash deploy/setup.sh
 ```
