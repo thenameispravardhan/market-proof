@@ -102,6 +102,19 @@ def _append(symbol: str, rows: list[tuple]) -> int:
     return after - before
 
 
+def _convert_and_append(symbol: str, raw: list[Any]) -> Optional[int]:
+    """Parse + persist one symbol's candles. None when there was nothing.
+
+    The blocking half of a sync, kept together so it is one hop to a worker
+    thread instead of two. `connect()` hands out a thread-local cursor, so a
+    threadpool worker gets its own — which is exactly what that design is for.
+    """
+    rows = _candle_rows(raw)
+    if not rows:
+        return None
+    return _append(symbol, rows)
+
+
 async def _fetch(fyers_symbol: str, days: int) -> list[Any]:
     from app.api.market import fetch_history
 
@@ -125,17 +138,24 @@ async def sync_symbols(symbols: list[str], days: int = 5) -> dict:
                 await asyncio.sleep(delay)
             broker = (NIFTY_FYERS if sym == NIFTY_SYMBOL
                       else (resolve_fyers_symbol(sym) or f"NSE:{sym}-EQ"))
-            rows = _candle_rows(await _fetch(broker, days))
-            if rows:
-                added += _append(sym, rows)
-                ok += 1
-            else:
+            raw = await _fetch(broker, days)
+            # Everything after the fetch is blocking: _candle_rows walks up to
+            # ~35k candles and _append rewrites a multi-MB parquet. Run on the
+            # event loop it starves the bot — measured 2026-07-31, monitor polls
+            # fell 147/min -> 13/min and the tick heartbeat stopped. The fetch
+            # itself stays awaited here, on the loop the Fyers client belongs to.
+            added_now = await asyncio.to_thread(_convert_and_append, sym, raw)
+            if added_now is None:
                 failed += 1
+            else:
+                added += added_now
+                ok += 1
         except Exception as e:  # noqa: BLE001 — one bad symbol must not stop the run
             failed += 1
             log.warning("candle_sync.symbol_failed", symbol=sym, error=str(e)[:140])
-        if i % 100 == 0:
-            log.info("candle_sync.progress", done=i, of=len(symbols), added=added)
+        if i % 50 == 0:
+            log.info("candle_sync.progress", done=i, of=len(symbols),
+                     ok=ok, failed=failed, added=added)
     out = {"symbols": len(symbols), "ok": ok, "failed": failed, "candles_added": added}
     log.info("candle_sync.done", **out)
     return out
