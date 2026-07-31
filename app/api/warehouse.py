@@ -475,8 +475,13 @@ def announcement_rows(*, limit: int, offset: int, columns: Optional[list[str]],
     cur = con.execute(
         f"SELECT {', '.join(sel)} FROM {TABLE} {clause} "
         f"ORDER BY announced_at DESC LIMIT {limit} OFFSET {offset}", params)
-    return {"total": total, "returned": 0, "limit": limit, "offset": offset,
-            "columns": sel, "rows": _records(cur)}
+    rows = _records(cur)
+    # `count`, not `returned`: the Dataset page renders "{count} of {total}
+    # rows", and the signal/shadow branch already returns `count`. This branch
+    # returned a hard-coded `returned: 0`, so the header read
+    # "undefined of 305434 rows" while the table below it showed 50.
+    return {"total": total, "count": len(rows), "limit": limit, "offset": offset,
+            "columns": sel, "rows": rows}
 
 
 def announcement_export_path(fmt: str, columns: Optional[list[str]] = None,
