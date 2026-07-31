@@ -45,7 +45,6 @@ import type {
   OrderType,
   PlaceOrderRequest,
   Position,
-  ProductType,
 } from "../types";
 
 function fmtMoney(v: number | null | undefined): string {
@@ -187,7 +186,6 @@ export default function Trade() {
   const [side, setSide] = useState<"BUY" | "SELL">("BUY");
   const [quantity, setQuantity] = useState<number>(1);
   const [orderType, setOrderType] = useState<OrderType>("MARKET");
-  const [productType, setProductType] = useState<ProductType>("INTRADAY");
   const [limitPrice, setLimitPrice] = useState<string>("");
   const [stopPrice, setStopPrice] = useState<string>("");
   const [lastResult, setLastResult] = useState<{
@@ -291,16 +289,9 @@ export default function Trade() {
       }
       return next;
     });
-    if (h.instrument_type === "CE" || h.instrument_type === "PE") {
-      setOrderType("MARKET");
-      setProductType("NORMAL"); // F&O options default to NRML
-    } else if (h.instrument_type === "FUT") {
-      setOrderType("MARKET");
-      setProductType("NORMAL");
-    } else {
-      setOrderType("MARKET");
-      setProductType("INTRADAY");
-    }
+    // Intraday-only bot — F&O included. Every ticket is MIS/INTRADAY; the
+    // backend rejects anything else, so there is nothing per-instrument to set.
+    setOrderType("MARKET");
   };
 
   // The strike nearest the spot — highlighted as ATM in the chain.
@@ -351,7 +342,7 @@ export default function Trade() {
       order_type: orderType,
       limit_price: requiresLimit && limitPrice ? Number(limitPrice) : null,
       stop_price: requiresStop && stopPrice ? Number(stopPrice) : null,
-      product_type: productType,
+      product_type: "INTRADAY",
       bypass_risk: opts?.bypassRisk ?? false,
       operator: "ui_trade_page",
     };
@@ -715,20 +706,17 @@ export default function Trade() {
             </label>
           )}
 
-          <label className="ticket-row">
+          {/* Intraday-only bot: no delivery / carry-forward, ever. One value,
+              so it reads as a fact rather than a choice you cannot make. */}
+          <div className="ticket-row">
             <span>Product</span>
-            {/* Intraday-only bot: no delivery / carry-forward, ever. The
-                backend rejects anything else, so don't offer it. */}
-            <select
-              value={productType}
-              onChange={(e) => setProductType(e.target.value as ProductType)}
+            <span
               data-testid="ticket-product"
-              disabled
               title="Intraday-only bot — every position is squared off the same day"
             >
-              <option value="INTRADAY">INTRADAY (MIS)</option>
-            </select>
-          </label>
+              INTRADAY (MIS)
+            </span>
+          </div>
 
           {/* Submit */}
           <div className="ticket-submit">

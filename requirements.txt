@@ -1,16 +1,16 @@
-# Web framework
+# Web framework. uvicorn[standard] already pins a compatible `websockets`,
+# which is the only thing that speaks the /ws protocol here — pinning it
+# separately just gives the two a chance to disagree.
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
-websockets==13.1
-python-multipart==0.0.19
 
 # Settings & validation
 pydantic==2.10.3
 pydantic-settings==2.7.0
 
-# ORM & migrations
+# ORM. Schema changes go through app/db/init.py (create_all + additive
+# ALTERs), not migrations — no alembic.
 SQLAlchemy==2.0.36
-alembic==1.14.0
 
 # Logging
 structlog==24.4.0

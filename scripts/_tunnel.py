@@ -23,10 +23,9 @@ import shutil
 import signal
 import subprocess
 import sys
-import threading
 import time
 from dataclasses import dataclass, field
-from typing import Optional, Protocol
+from typing import Optional
 
 
 # Regexes for the public URL line in each tool's startup output.
@@ -274,36 +273,8 @@ def _start_ngrok(
     )
 
 
-# ---------------------------------------------------------------------------
-# Test seam
-# ---------------------------------------------------------------------------
-
-
-class _FakeTunnelFactory(Protocol):
-    """Anything that yields a Tunnel when called. Tests pass a
-    function that returns a Tunnel(proc=None, ...) to skip the
-    subprocess entirely."""
-
-    def __call__(self, *, local_port: int, **kw: object) -> Tunnel: ...
-
-
-def install_fake_tunnel(factory: Optional[_FakeTunnelFactory]) -> None:
-    """Monkey-patch `start_tunnel` so subprocess spawning is bypassed.
-    Pass None to restore the real implementation."""
-    global start_tunnel
-    if factory is None:
-        start_tunnel = _REAL_START_TUNNEL  # type: ignore[assignment]
-    else:
-        start_tunnel = factory  # type: ignore[assignment]
-
-
-_REAL_START_TUNNEL = start_tunnel  # captured for restore
-
-
 # A small helper used by the setup script to make sure the tunnel
 # is killed if the parent process is killed (best-effort).
-_installed_atexit = False
-_tunnel_lock = threading.Lock()
 
 
 def _atexit_kill(t: Tunnel) -> None:
@@ -314,8 +285,5 @@ def _atexit_kill(t: Tunnel) -> None:
 
 
 def track_for_atexit(t: Tunnel) -> None:
-    global _installed_atexit
-    with _tunnel_lock:
-        import atexit
-        atexit.register(_atexit_kill, t)
-        _installed_atexit = True
+    import atexit
+    atexit.register(_atexit_kill, t)

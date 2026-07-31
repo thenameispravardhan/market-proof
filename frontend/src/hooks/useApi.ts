@@ -381,39 +381,6 @@ export function useBrokerAccounts() {
   });
 }
 
-export function useCreateBrokerAccount() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (body: Partial<BrokerAccount>) =>
-      api.post<BrokerAccount>("/api/broker-accounts", body),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["broker-accounts"] }),
-  });
-}
-
-export function useUpdateBrokerAccount(id: number | null) {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (body: Partial<BrokerAccount>) =>
-      api.put<BrokerAccount>(`/api/broker-accounts/${id}`, body),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["broker-accounts"] }),
-  });
-}
-
-export function useDeleteBrokerAccount() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (id: number) => api.delete(`/api/broker-accounts/${id}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["broker-accounts"] }),
-  });
-}
-
-export function useTestBrokerAccount() {
-  return useMutation({
-    mutationFn: (id: number) =>
-      api.post<{ ok: boolean; message: string }>(`/api/broker-accounts/${id}/test`, {}),
-  });
-}
-
 // Flip a broker account's `enabled` flag — backs the dashboard
 // Paper / Fyers on-off switches. A disabled account is skipped by the
 // execution manager (signals route to it are blocked).
@@ -800,15 +767,6 @@ export function useUpdateSettings() {
   return useMutation({
     mutationFn: (body: { global: Partial<GlobalSettings> }) =>
       api.put<{ global: GlobalSettings }>("/api/settings", body),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["settings"] }),
-  });
-}
-
-export function useSetTradingMode() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (body: { mode: "paper" | "live"; confirm: boolean }) =>
-      api.post("/api/settings/trading-mode", body),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["settings"] }),
   });
 }

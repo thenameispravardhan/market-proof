@@ -213,16 +213,6 @@ def parse_nse_rss_payload(
     return out
 
 
-async def fetch_nse_rss(url: str, *, resolver: Optional[NameResolver] = None) -> str:
-    """Fetch the RSS XML unconditionally (stateless helper for tests /
-    ad-hoc use). Production uses ConditionalRSSFetcher below."""
-    await (resolver or _default_resolver).ensure_loaded()
-    async with httpx.AsyncClient(timeout=10.0, headers={"User-Agent": _UA}) as client:
-        r = await client.get(url)
-        r.raise_for_status()
-        return r.text
-
-
 class ConditionalRSSFetcher:
     """Fetch the RSS with an HTTP conditional GET (measured: the feed
     returns ETag + Last-Modified). Remembers the last validators and sends

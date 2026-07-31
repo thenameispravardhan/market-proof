@@ -262,33 +262,6 @@ def _table_columns(con) -> set[str]:
     return {r[0] for r in con.execute(f"describe {TABLE}").fetchall()}
 
 
-def insert_announcement(row: dict[str, Any]) -> bool:
-    """Insert one freshly collected announcement. Returns False if already present.
-
-    Called from the live collector the moment a filing arrives — prices and the
-    AI label are absent at that point and get filled in place later.
-    """
-    con = connect()
-    cols = _table_columns(con)
-    payload = {k: v for k, v in row.items() if k in cols and k != "uid"}
-    if not payload.get("symbol") or not payload.get("announced_at"):
-        raise ValueError("symbol and announced_at are required")
-    names = ", ".join(payload)
-    marks = ", ".join("?" for _ in payload)
-    uid = UID_SQL.format(ex="?", sym="?", ts="?", hl="?")
-    with _lock:
-        r = con.execute(
-            f"INSERT INTO {TABLE} (uid, {names}) SELECT {uid}, {marks} "
-            f"WHERE {uid} NOT IN (SELECT uid FROM {TABLE})",
-            [payload.get("exchange", "NSE"), payload["symbol"],
-             payload["announced_at"], payload.get("headline", "")]
-            + list(payload.values())
-            + [payload.get("exchange", "NSE"), payload["symbol"],
-               payload["announced_at"], payload.get("headline", "")],
-        ).fetchone()
-    return bool(r and r[0])
-
-
 def ingest_live(*, symbol: str, headline: str, announced_at, exchange: str = "NSE",
                 category: Optional[str] = None, attachment_url: Optional[str] = None,
                 content_hash: Optional[str] = None, disseminated_at=None,

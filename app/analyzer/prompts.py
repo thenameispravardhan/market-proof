@@ -18,7 +18,7 @@ Operators can override it later via a setting or per-monitor override.
 from __future__ import annotations
 
 import re
-from typing import Iterable, Optional
+from typing import Optional
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -567,8 +567,3 @@ def seed_defaults(
         )
         touched.append(t)
     return touched
-
-
-def list_event_types() -> Iterable[str]:
-    """Convenience for tests / scripts."""
-    return EVENT_TYPES

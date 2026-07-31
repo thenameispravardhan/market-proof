@@ -520,7 +520,8 @@ class BaseMonitor:
             # Mirror the filing into the unified dataset. Deliberately
             # fire-and-forget in a worker thread: this is the detection hot path
             # and the warehouse must never add latency to it or fail a trade.
-            # Anything missed here is picked up by warehouse_sync.
+            # Anything missed here is picked up by POST /api/warehouse/rebuild
+            # (store.load_live() re-reads SQLite and skips existing uids).
             loop.run_in_executor(
                 None, _mirror_to_warehouse, announcement, new_id
             ).add_done_callback(lambda f: f.exception())

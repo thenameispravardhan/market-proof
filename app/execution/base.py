@@ -203,14 +203,6 @@ class TradingBackend(Protocol):
 # ---- Helpers ------------------------------------------------------------
 
 
-def qty_to_lots(qty: int, lot_size: int = 1) -> int:
-    """Round a quantity DOWN to the nearest lot. Lot size 1 (default)
-    is a no-op; Fyers NSE cash segment is 1 share per lot."""
-    if lot_size < 1:
-        raise ValueError(f"lot_size must be >= 1, got {lot_size}")
-    return (qty // lot_size) * lot_size
-
-
 def safe_float(x: Any, default: float = 0.0) -> float:
     """Coerce to float; NaN / inf → default. Defensive against bad
     LLM numerics making it into a sizing call."""

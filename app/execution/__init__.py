@@ -20,7 +20,8 @@ Public API:
                       override anywhere.
     MarketDataBus     Last-price / quote cache that the paper backend
                       uses to trigger pending SL / LIMIT orders.
-    fyers_login       One-shot CLI that prints the Fyers OAuth URL.
+    fyers_auth        One-shot CLI that prints the Fyers OAuth URL
+                      (`python -m app.execution.fyers_auth`).
 
 The execution layer never calls out to the network in tests; sibling
 backends are constructed with stubbed transports / fake market data.

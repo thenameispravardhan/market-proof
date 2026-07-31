@@ -416,7 +416,8 @@ export interface ManagedPosition {
 // ---- Trade page ----
 
 export type OrderType = "MARKET" | "LIMIT" | "STOP_LOSS" | "SL-M";
-export type ProductType = "INTRADAY" | "DELIVERY" | "NORMAL" | "MARGIN" | "CO" | "BO";
+// Intraday-only bot — the backend 422s anything else, so there is one value.
+export type ProductType = "INTRADAY";
 
 export interface InstrumentHit {
   symbol: string;          // "NSE:SBIN-EQ" or "NSE:NIFTY2561424500CE"
