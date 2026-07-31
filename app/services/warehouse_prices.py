@@ -75,6 +75,21 @@ def candle_source(symbol: str) -> Optional[str]:
     return f"read_parquet([{files}], union_by_name=true)"
 
 
+def _condemn_covered(con, symbol: str, last_candle) -> None:
+    """Mark `no_candles` only where the candles genuinely cover the filing.
+
+    A row filed after `last_candle` stays `pending`: its session has not
+    happened yet, so the next pass (or next week) will price it. This is what
+    keeps an after-hours or long-weekend filing from being dropped for good.
+    """
+    with _lock:
+        con.execute(
+            f"UPDATE {TABLE} SET price_status='no_candles' "
+            "WHERE price_status='pending' AND symbol = ? "
+            "AND date_trunc('minute', announced_at) <= ?",
+            [symbol, last_candle])
+
+
 def fill_symbol(con, symbol: str) -> int:
     """Fill every pending row for one symbol. One query, one UPDATE."""
     src = candle_source(symbol)
@@ -84,6 +99,15 @@ def fill_symbol(con, symbol: str) -> int:
                 f"UPDATE {TABLE} SET price_status='no_candles' "
                 "WHERE price_status='pending' AND symbol = ?", [symbol])
         return 0
+
+    # The newest candle we hold. Everything below turns on it: a filing AFTER
+    # this point has no session yet (after-hours, weekend, holiday, or the bot
+    # was down) and is "not yet", not "never". Marking those no_candles parks
+    # them, and they only come back if the retry window happens to catch them —
+    # over a long weekend it does not, and the row is lost in silence.
+    last_candle = con.execute(f"SELECT max(ts) FROM (SELECT CAST(datetime AS TIMESTAMP) AS ts FROM {src})").fetchone()[0]
+    if last_candle is None:
+        return 0            # empty candle file: retry later, do not condemn
 
     nif_src = candle_source(NIFTY_SYMBOL) or f"read_parquet('{NIFTY.as_posix()}')"
     con.execute(f"""
@@ -147,10 +171,7 @@ def fill_symbol(con, symbol: str) -> int:
 
     n = con.execute("SELECT count(*) FROM _fill").fetchone()[0]
     if not n:
-        with _lock:
-            con.execute(
-                f"UPDATE {TABLE} SET price_status='no_candles' "
-                "WHERE price_status='pending' AND symbol = ?", [symbol])
+        _condemn_covered(con, symbol, last_candle)
         return 0
 
     px_cols = ["px_pre", "vol_pre", "px_t0", "vol_t0"]
@@ -202,9 +223,9 @@ def fill_symbol(con, symbol: str) -> int:
     with _lock:
         con.execute(f"UPDATE {TABLE} t SET {', '.join(sets)} "
                     f"FROM _fill f WHERE t.uid = f.uid")
-        # Anything still pending for this symbol had no candle at its anchor.
-        con.execute(f"UPDATE {TABLE} SET price_status='no_candles' "
-                    "WHERE price_status='pending' AND symbol = ?", [symbol])
+    # Anything still pending had no candle at its anchor — but only condemn
+    # the ones the candle series actually reaches.
+    _condemn_covered(con, symbol, last_candle)
     return n
 
 

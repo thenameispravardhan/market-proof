@@ -211,7 +211,7 @@ def pending_symbols(days: int, limit: int = 0) -> list[str]:
     return [NIFTY_SYMBOL] + syms
 
 
-def ripe_symbols(max_age_days: int = 3, min_age_minutes: int = 61,
+def ripe_symbols(max_age_days: int = 7, min_age_minutes: int = 61,
                  limit: int = 0) -> list[str]:
     """Symbols whose fresh announcements are old enough to be fully priced.
 
@@ -240,7 +240,32 @@ def ripe_symbols(max_age_days: int = 3, min_age_minutes: int = 61,
     return [NIFTY_SYMBOL] + [r[0] for r in con.execute(q).fetchall()]
 
 
-async def run_incremental(max_age_days: int = 3, days: int = 2,
+def fetch_window_open(now=None) -> bool:
+    """True when new candles could plausibly exist since the last pass.
+
+    Candles are only produced while the market trades, so polling Fyers on a
+    Saturday cannot return anything the last pass did not already have. The
+    window runs from the open to two hours past the close — wide enough for the
+    session's final minutes to settle and for the 15:45 sweep, closed for the
+    whole weekend.
+
+    This is what makes leaving after-hours rows `pending` cheap: they wait
+    without being re-fetched every ten minutes until Monday.
+    """
+    from app.risk.market_clock import _is_trading_day, _parse_hhmm, to_ist
+
+    from app.config import get_settings
+
+    s = get_settings()
+    ist = to_ist(now)
+    if not _is_trading_day(ist):
+        return False
+    close = _parse_hhmm(s.MARKET_CLOSE_IST)
+    tail = (close.hour + 2) % 24
+    return _parse_hhmm(s.MARKET_OPEN_IST) <= ist.time() <= close.replace(hour=tail)
+
+
+async def run_incremental(max_age_days: int = 7, days: int = 2,
                           limit: int = 0) -> dict:
     """The real-time pass: price the day's news as soon as it is priceable.
 
@@ -249,6 +274,9 @@ async def run_incremental(max_age_days: int = 3, days: int = 2,
     same symbols instead of sweeping the whole pending set.
     """
     from app.services import warehouse_prices, warehouse_store
+
+    if not fetch_window_open():
+        return {"skipped": "outside trading hours — no new candles can exist"}
 
     syms = ripe_symbols(max_age_days=max_age_days, limit=limit)
     out: dict[str, Any] = {"candles": await sync_symbols(syms, days=days)}
