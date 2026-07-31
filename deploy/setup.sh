@@ -179,8 +179,8 @@ echo "   App:     http://127.0.0.1:8000 (loopback only, via systemd)"
 echo "   Public:  https://${DOMAIN}  (basic auth: ${BASIC_USER})"
 echo ""
 sleep 3
-if curl -fsS http://127.0.0.1:8000/api/health >/dev/null 2>&1; then
-    echo "   Health check: OK (http://127.0.0.1:8000/api/health)"
+if curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; then
+    echo "   Health check: OK (http://127.0.0.1:8000/health)"
 else
     echo "   Health check: NOT RESPONDING yet — inspect with:"
     echo "     journalctl -u tradebot -n 50 --no-pager"

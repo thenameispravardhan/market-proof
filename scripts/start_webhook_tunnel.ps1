@@ -39,7 +39,7 @@ $LogFile = Join-Path $ProjectRoot 'logs\cloudflared.log'
 $Bot = 'http://127.0.0.1:8000'
 
 function Test-PublicUrl {
-    <# True when https://<host>/api/health answers 200 through the
+    <# True when https://<host>/health answers 200 through the
        Cloudflare edge. Resolves via 1.1.1.1 + curl --resolve so a
        stale local/ISP resolver can't produce a false negative. #>
     param([string]$BaseUrl, [int]$Attempts = 5, [int]$DelaySeconds = 5)
@@ -53,7 +53,7 @@ function Test-PublicUrl {
         } catch {}
         if ($ip) {
             $code = & curl.exe -s -o NUL -w '%{http_code}' --max-time 10 `
-                --resolve "${hostName}:443:${ip}" "https://$hostName/api/health"
+                --resolve "${hostName}:443:${ip}" "https://$hostName/health"
             if ($code -eq '200') { return $true }
         }
         if ($i -lt $Attempts) { Start-Sleep -Seconds $DelaySeconds }
@@ -63,7 +63,7 @@ function Test-PublicUrl {
 
 # ---- 0. the bot must be up ------------------------------------------------
 try {
-    Invoke-RestMethod "$Bot/api/health" -TimeoutSec 5 | Out-Null
+    Invoke-RestMethod "$Bot/health" -TimeoutSec 5 | Out-Null
 } catch {
     Write-Error "Bot is not responding on $Bot — start it first (scripts/run.ps1 or dev.ps1)."
 }
@@ -130,7 +130,7 @@ $config = Invoke-RestMethod "$Bot/api/fyers/postback/config" -Method Post `
 # Fresh names can take a while at the edge; be patient (up to ~2 min).
 Write-Host "==> Verifying the public round-trip (can take a minute for a fresh URL)…"
 if (-not (Test-PublicUrl $publicUrl -Attempts 20 -DelaySeconds 6)) {
-    Write-Error "Tunnel is up but $publicUrl/api/health does not reach the bot. See $LogFile."
+    Write-Error "Tunnel is up but $publicUrl/health does not reach the bot. See $LogFile."
 }
 
 Write-Host ""
