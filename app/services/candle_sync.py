@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from app.logging_config import get_logger
-from app.services.warehouse_store import TABLE, connect
+from app.services.warehouse_store import TABLE, _lock, connect
 
 log = get_logger(__name__)
 
@@ -141,17 +141,25 @@ async def sync_symbols(symbols: list[str], days: int = 5) -> dict:
     return out
 
 
-def pending_symbols(limit: int = 0) -> list[str]:
+def pending_symbols(days: int, limit: int = 0) -> list[str]:
     """Symbols with a row still waiting on prices, NIFTY always first.
 
-    `no_candles` is included, not just `pending`: those rows were marked when
-    the file was missing, and the whole point of this module is that the file
-    can now exist. They are reset to `pending` so the price fill reconsiders
-    them — otherwise the backlog is permanently frozen.
+    `no_candles` rows are reconsidered, not just `pending` ones: they were
+    marked when the file was missing, and the point of this module is that the
+    file can now exist. Otherwise the backlog is frozen forever.
+
+    But only within the window this run can actually reach. Fyers serves a
+    bounded range of 1-minute history, so a filing older than that will never
+    price no matter how often it is retried — and retrying it costs a history
+    call per symbol, every single day. Bounding the reset by `days` is what
+    keeps the daily job proportional to the day's news instead of re-walking
+    the whole archive.
     """
     con = connect()
-    con.execute(f"UPDATE {TABLE} SET price_status='pending' "
-                "WHERE price_status='no_candles'")
+    with _lock:
+        con.execute(f"UPDATE {TABLE} SET price_status='pending' "
+                    "WHERE price_status='no_candles' "
+                    f"AND announced_at >= current_date - INTERVAL {int(days)} DAY")
     q = (f"SELECT DISTINCT symbol FROM {TABLE} WHERE price_status='pending' "
          "AND symbol IS NOT NULL AND symbol <> '' ORDER BY symbol")
     if limit:
@@ -171,7 +179,7 @@ async def run_eod(days: int = 5, limit: int = 0) -> dict:
     from app.services import warehouse_prices, warehouse_store
 
     out: dict[str, Any] = {}
-    out["candles"] = await sync_symbols(pending_symbols(limit), days=days)
+    out["candles"] = await sync_symbols(pending_symbols(days, limit), days=days)
     # Live AI labels live in SQLite until something folds them in; without
     # this the ai_* columns only move when someone hits /rebuild by hand.
     out["ai_labels"] = warehouse_store.load_live()
@@ -190,7 +198,7 @@ def main() -> int:
     a = ap.parse_args()
 
     if a.candles_only:
-        res = asyncio.run(sync_symbols(pending_symbols(a.limit), days=a.days))
+        res = asyncio.run(sync_symbols(pending_symbols(a.days, a.limit), days=a.days))
     else:
         res = asyncio.run(run_eod(days=a.days, limit=a.limit))
     for k, v in res.items():

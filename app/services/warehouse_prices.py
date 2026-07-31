@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 
 from app.logging_config import get_logger
-from app.services.warehouse_store import TABLE, connect
+from app.services.warehouse_store import TABLE, _lock, connect
 
 log = get_logger(__name__)
 
@@ -53,9 +53,10 @@ def fill_symbol(con, symbol: str) -> int:
     """Fill every pending row for one symbol. One query, one UPDATE."""
     f = CANDLES / f"{symbol}.parquet"
     if not f.exists():
-        con.execute(
-            f"UPDATE {TABLE} SET price_status='no_candles' "
-            "WHERE price_status='pending' AND symbol = ?", [symbol])
+        with _lock:
+            con.execute(
+                f"UPDATE {TABLE} SET price_status='no_candles' "
+                "WHERE price_status='pending' AND symbol = ?", [symbol])
         return 0
 
     con.execute(f"""
@@ -119,9 +120,10 @@ def fill_symbol(con, symbol: str) -> int:
 
     n = con.execute("SELECT count(*) FROM _fill").fetchone()[0]
     if not n:
-        con.execute(
-            f"UPDATE {TABLE} SET price_status='no_candles' "
-            "WHERE price_status='pending' AND symbol = ?", [symbol])
+        with _lock:
+            con.execute(
+                f"UPDATE {TABLE} SET price_status='no_candles' "
+                "WHERE price_status='pending' AND symbol = ?", [symbol])
         return 0
 
     px_cols = ["px_pre", "vol_pre", "px_t0", "vol_t0"]
@@ -167,11 +169,15 @@ def fill_symbol(con, symbol: str) -> int:
                ELSE 'stale' END""",
     ]
 
-    con.execute(f"UPDATE {TABLE} t SET {', '.join(sets)} "
-                f"FROM _fill f WHERE t.uid = f.uid")
-    # Anything still pending for this symbol had no candle at its anchor.
-    con.execute(f"UPDATE {TABLE} SET price_status='no_candles' "
-                "WHERE price_status='pending' AND symbol = ?", [symbol])
+    # Held per SYMBOL, not for the whole run: this shares the table with live
+    # ingestion, and the fill walks thousands of symbols. One lock around the
+    # loop would stall the monitors for the length of the backfill.
+    with _lock:
+        con.execute(f"UPDATE {TABLE} t SET {', '.join(sets)} "
+                    f"FROM _fill f WHERE t.uid = f.uid")
+        # Anything still pending for this symbol had no candle at its anchor.
+        con.execute(f"UPDATE {TABLE} SET price_status='no_candles' "
+                    "WHERE price_status='pending' AND symbol = ?", [symbol])
     return n
 
 
