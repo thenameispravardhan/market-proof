@@ -308,6 +308,40 @@ def ingest_live(*, symbol: str, headline: str, announced_at, exchange: str = "NS
     return bool(r and r[0])
 
 
+# Company facts are properties of the SYMBOL, not of the filing, so a live row
+# can inherit them from any row that already carries them. The historical
+# dataset is that source — it shipped with all six populated. Measured
+# 2026-07-31: this reaches 8,101 of 12,936 live rows; the rest are symbols with
+# no historical filing, and they stay NULL until one arrives (there is no
+# market-cap feed in this repo to invent them from).
+_META_COLUMNS = ("company", "isin", "cap_tier", "market_cap_cr",
+                 "mcap_rank", "is_smallcap")
+
+
+def fill_metadata() -> dict[str, int]:
+    """Backfill per-symbol company facts onto rows that lack them."""
+    con = connect()
+    picks = ", ".join(f"any_value({c}) AS {c}" for c in _META_COLUMNS)
+    sets = ", ".join(f"{c} = coalesce(t.{c}, m.{c})" for c in _META_COLUMNS)
+    with _lock:
+        con.execute(f"""
+            CREATE OR REPLACE TEMP TABLE _meta AS
+            SELECT symbol, {picks} FROM {TABLE}
+            WHERE company IS NOT NULL AND symbol IS NOT NULL
+            GROUP BY symbol
+        """)
+        con.execute(f"UPDATE {TABLE} t SET {sets} FROM _meta m "
+                    "WHERE t.symbol = m.symbol AND t.company IS NULL")
+        # One vocabulary for one feature: the historical rows say
+        # 'nse_candles', so the live fill's old 'candles' is renamed rather
+        # than left as a second spelling the model would treat as a category.
+        con.execute(f"UPDATE {TABLE} SET price_source='nse_candles' "
+                    "WHERE price_source = 'candles'")
+        n = con.execute(f"SELECT count(*) FROM {TABLE} "
+                        "WHERE company IS NULL").fetchone()[0]
+    return {"still_missing": n}
+
+
 def apply_analysis(uid_or_event_id: Any, analysis: dict[str, Any]) -> int:
     """Attach an AI label to a row already in the dataset (analysis arrives later)."""
     con = connect()

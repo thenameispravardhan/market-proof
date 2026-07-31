@@ -141,7 +141,31 @@ def fill_symbol(con, symbol: str) -> int:
     sets += [f"usable = (f.px_30m IS NOT NULL)",
              f"mover_1_5 = (abs({adj30}) > 1.5)",
              f"mover_3 = (abs({adj30}) > 3.0)",
-             "price_status = 'filled'", "price_source = 'candles'"]
+             "price_status = 'filled'", "price_source = 'nse_candles'"]
+
+    # The three columns the historical dataset carries that this fill used to
+    # leave NULL. They are derived from what _fill already computed — no extra
+    # scan — and use the SAME vocabulary as history, or the model sees two
+    # encodings of one feature.
+    #   session_offset  where the filing sits relative to its pricing session
+    #   px_t0_age_min   minutes from the filing to the anchor candle
+    #   data_quality    did the anchor candle actually trade
+    # `_fill` carries t0 but not the filing minute, so the age is measured
+    # against the target row's own announced_at rather than widening the CTE.
+    filed = "date_trunc('minute', t.announced_at)"
+    sets += [
+        f"px_t0_age_min = date_diff('minute', {filed}, f.t0)",
+        f"""session_offset = CASE
+               WHEN date_diff('minute', {filed}, f.t0) <= 0 THEN 'same_session'
+               WHEN CAST(f.t0 AS DATE) = CAST({filed} AS DATE)
+                    THEN CASE WHEN CAST({filed} AS TIME) < TIME '09:15'
+                              THEN 'same_day_preopen' ELSE 'same_session' END
+               ELSE 'next_session' END""",
+        """data_quality = CASE
+               WHEN f.px_t0 IS NULL THEN 'no_price'
+               WHEN coalesce(f.vol_t0, 0) > 0 THEN 'traded'
+               ELSE 'stale' END""",
+    ]
 
     con.execute(f"UPDATE {TABLE} t SET {', '.join(sets)} "
                 f"FROM _fill f WHERE t.uid = f.uid")

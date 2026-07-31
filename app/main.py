@@ -298,6 +298,7 @@ async def lifespan(app: FastAPI):
     # Only created when not TESTING; the shutdown path guards on None so
     # it never depends on re-evaluating settings.TESTING to match startup.
     risk_monitor_task: asyncio.Task[None] | None = None
+    dataset_eod_task: asyncio.Task[None] | None = None
     if not settings.TESTING:
         # T3: start the analyzer before the monitors so its event-bus
         # subscription is live before the first `announcements.new`
@@ -374,17 +375,50 @@ async def lifespan(app: FastAPI):
 
         risk_monitor_task = asyncio.create_task(_risk_monitor(), name="risk-monitor")
 
+        # Dataset completion (once per trading day, after the close).
+        # Announcements land with only the columns known at arrival; the
+        # price/label/metadata columns the model trains on need the day's
+        # candles, which do not exist until the session ends. Off by default
+        # — it is new behaviour and costs one Fyers history call per symbol.
+        async def _dataset_eod() -> None:
+            from app.risk.market_clock import _is_trading_day, _parse_hhmm, to_ist
+            from app.services.candle_sync import run_eod
+
+            done_for: Optional[str] = None
+            while True:
+                try:
+                    await asyncio.sleep(300.0)
+                    if not get_settings().DATASET_EOD_ENABLED:
+                        continue
+                    ist = to_ist(None)
+                    day = ist.date().isoformat()
+                    if done_for == day or not _is_trading_day(ist):
+                        continue
+                    if ist.time() < _parse_hhmm(get_settings().DATASET_EOD_TIME_IST):
+                        continue
+                    done_for = day          # set before the run: a failure
+                    log.info("dataset_eod.start", day=day)   # must not retry-loop
+                    log.info("dataset_eod.done", **{
+                        k: str(v)[:120] for k, v in (await run_eod()).items()})
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 — never kill the loop
+                    log.exception("dataset_eod.failed")
+
+        dataset_eod_task = asyncio.create_task(_dataset_eod(), name="dataset-eod")
+
     try:
         yield
     finally:
         if not settings.TESTING:
             # Stop the breaker monitor first.
-            if risk_monitor_task is not None:
-                risk_monitor_task.cancel()
-                try:
-                    await risk_monitor_task
-                except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                    pass
+            for _t in (risk_monitor_task, dataset_eod_task):
+                if _t is not None:
+                    _t.cancel()
+                    try:
+                        await _t
+                    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                        pass
             # Stop the producers first so consumers drain cleanly.
             await monitor_manager.stop()
             analyzer_service.stop()

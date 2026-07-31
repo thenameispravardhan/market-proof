@@ -413,6 +413,15 @@ class Settings(BaseSettings):
     # Pause before each candle-history fetch (cache misses only) so a
     # full-history backfill stays far inside Fyers' rate limits.
     DATASET_FETCH_DELAY_SECONDS: float = 0.25
+    # Once per trading day after the close, pull the day's 1-minute candles
+    # for every symbol the dataset is still waiting on, then fill prices,
+    # AI labels and company metadata. Without it those columns stay NULL
+    # forever — the candle store is a static export, so a filing made after
+    # it has nothing to be priced against. Default OFF: new behaviour ships
+    # behind a toggle, and this one costs a Fyers history call per symbol.
+    DATASET_EOD_ENABLED: bool = False
+    # After the 15:30 close, with room for the last candles to settle.
+    DATASET_EOD_TIME_IST: str = "15:45"
     # Market session (IST, "HH:MM"). Entry window excludes the first
     # 15 min after open and the last 30 min before close; all intraday
     # positions are force-squared-off at SQUARE_OFF_TIME.
