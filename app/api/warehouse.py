@@ -9,6 +9,7 @@ process. Every list endpoint paginates and every query is wrapped in a LIMIT.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import tempfile
@@ -306,6 +307,55 @@ class RebuildRequest(BaseModel):
     live: bool = True
     prices: bool = False
     price_limit: int = Field(0, ge=0, le=200_000)
+
+
+class CandleRequest(BaseModel):
+    days: int = Field(5, ge=1, le=90)
+    limit: int = Field(0, ge=0)
+
+
+# The in-flight EOD run. One at a time: two concurrent runs would fetch the
+# same symbols twice and fight over the same write lock for no gain.
+_eod_task: Optional["asyncio.Task[dict[str, Any]]"] = None
+
+
+@router.post("/candles")
+async def candles(body: CandleRequest) -> dict[str, Any]:
+    """Run the candle sync + fill chain now, in-process.
+
+    Same reason /rebuild exists: DuckDB gives its write lock to one process and
+    the service holds it, so `python -m app.services.candle_sync` cannot run
+    while the bot is up (verified: "Conflicting lock is held"). Otherwise the
+    chain is only reachable from the after-close scheduler.
+
+    Returns immediately — a full backfill is thousands of paced Fyers calls and
+    would outlive any HTTP timeout. Poll /candles/status.
+
+    `async def` on purpose: the Fyers client lives on the main event loop, so
+    the history calls have to be awaited there rather than from a threadpool
+    worker with its own loop.
+    """
+    global _eod_task
+    if _eod_task is not None and not _eod_task.done():
+        raise HTTPException(status.HTTP_409_CONFLICT, "a candle sync is already running")
+
+    from app.services.candle_sync import run_eod
+
+    _eod_task = asyncio.create_task(run_eod(days=body.days, limit=body.limit))
+    log.info("warehouse.candles_started", days=body.days, limit=body.limit)
+    return {"started": True, "days": body.days, "limit": body.limit}
+
+
+@router.get("/candles/status")
+async def candles_status() -> dict[str, Any]:
+    if _eod_task is None:
+        return {"state": "idle"}
+    if not _eod_task.done():
+        return {"state": "running"}
+    try:
+        return {"state": "done", "result": _eod_task.result()}
+    except Exception as e:  # noqa: BLE001 — report the failure, don't re-raise it
+        return {"state": "failed", "error": str(e)[:300]}
 
 
 @router.post("/rebuild")
