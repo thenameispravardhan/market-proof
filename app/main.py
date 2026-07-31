@@ -382,19 +382,34 @@ async def lifespan(app: FastAPI):
         # — it is new behaviour and costs one Fyers history call per symbol.
         async def _dataset_eod() -> None:
             from app.risk.market_clock import _is_trading_day, _parse_hhmm, to_ist
-            from app.services.candle_sync import run_eod
+            from app.services.candle_sync import run_eod, run_incremental
 
             done_for: Optional[str] = None
+            last_incr = 0.0
             while True:
                 try:
-                    await asyncio.sleep(300.0)
-                    if not get_settings().DATASET_EOD_ENABLED:
+                    await asyncio.sleep(60.0)
+                    s = get_settings()
+                    if not s.DATASET_EOD_ENABLED:
                         continue
                     ist = to_ist(None)
                     day = ist.date().isoformat()
+
+                    # Real-time pass. A filing cannot be fully priced until 60
+                    # minutes of trading have passed, so this is as live as the
+                    # data allows: the moment px_60m exists, the row is filled.
+                    now = asyncio.get_running_loop().time()
+                    if now - last_incr >= s.DATASET_AUTOFILL_MINUTES * 60:
+                        last_incr = now
+                        log.info("dataset_autofill.done", **{
+                            k: str(v)[:120]
+                            for k, v in (await run_incremental()).items()})
+
+                    # Daily sweep: the wider window, plus the AI labels and
+                    # metadata that the light pass does not chase.
                     if done_for == day or not _is_trading_day(ist):
                         continue
-                    if ist.time() < _parse_hhmm(get_settings().DATASET_EOD_TIME_IST):
+                    if ist.time() < _parse_hhmm(s.DATASET_EOD_TIME_IST):
                         continue
                     done_for = day          # set before the run: a failure
                     log.info("dataset_eod.start", day=day)   # must not retry-loop

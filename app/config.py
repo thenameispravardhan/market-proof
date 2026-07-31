@@ -422,6 +422,11 @@ class Settings(BaseSettings):
     DATASET_EOD_ENABLED: bool = False
     # After the 15:30 close, with room for the last candles to settle.
     DATASET_EOD_TIME_IST: str = "15:45"
+    # How often the real-time pass runs. It prices the day's announcements as
+    # soon as they are priceable — px_60m needs 60 minutes of trading to exist,
+    # so that delay is the data's, not the pipeline's. Small by construction:
+    # only symbols with fresh unfilled rows, a couple of days of candles each.
+    DATASET_AUTOFILL_MINUTES: int = 10
     # Market session (IST, "HH:MM"). Entry window excludes the first
     # 15 min after open and the last 30 min before close; all intraday
     # positions are force-squared-off at SQUARE_OFF_TIME.

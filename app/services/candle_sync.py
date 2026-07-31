@@ -72,34 +72,57 @@ def _candle_rows(raw: list[Any]) -> list[tuple]:
 
 
 def _append(symbol: str, rows: list[tuple]) -> int:
-    """Merge rows into <SYMBOL>.parquet, deduped on ts. Returns rows added."""
+    """Merge rows into the symbol's MONTHLY increment files. Rows added.
+
+    Not into the base export. Rewriting <SYMBOL>.parquet to add one day cost
+    the symbol's whole history every time — measured on the server, that made a
+    full pass under 5 symbols/minute, ~15 hours for the backlog. A month of
+    1-minute candles is ~7.5k rows, so an append now rewrites that instead of
+    1.5 years, and warehouse_prices.candle_source() reads base + increments as
+    one table.
+
+    Per-symbol DIRECTORY, not a SYMBOL*.parquet glob: the glob would also match
+    RELIANCEPOWER when reading RELIANCE.
+    """
     if not rows:
         return 0
     con = connect()
-    f = CANDLES / f"{symbol}.parquet"
-    CANDLES.mkdir(parents=True, exist_ok=True)
+    inc_dir = CANDLES / "_inc" / symbol
+    inc_dir.mkdir(parents=True, exist_ok=True)
 
     con.execute("""CREATE OR REPLACE TEMP TABLE _new
                    (ts BIGINT, datetime TIMESTAMP, open DOUBLE, high DOUBLE,
                     low DOUBLE, close DOUBLE, volume BIGINT)""")
     con.executemany("INSERT INTO _new VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
 
-    if f.exists():
-        # anti-join on ts so a re-run of the same day is a no-op
-        src = (f"SELECT * FROM read_parquet('{f.as_posix()}') "
-               f"UNION ALL SELECT * FROM _new WHERE ts NOT IN "
-               f"(SELECT ts FROM read_parquet('{f.as_posix()}'))")
-        before = con.execute(
-            f"SELECT count(*) FROM read_parquet('{f.as_posix()}')").fetchone()[0]
-    else:
-        src, before = "SELECT * FROM _new", 0
+    # Already in the base export? Then it is not new. Checked once here rather
+    # than per month, so a re-fetch overlapping the export adds nothing.
+    base = CANDLES / f"{symbol}.parquet"
+    if base.exists():
+        con.execute(f"DELETE FROM _new WHERE ts IN "
+                    f"(SELECT ts FROM read_parquet('{base.as_posix()}'))")
 
-    tmp = f.with_suffix(".parquet.tmp")
-    con.execute(f"COPY ({src} ORDER BY ts) TO '{tmp.as_posix()}' (FORMAT parquet)")
-    after = con.execute(
-        f"SELECT count(*) FROM read_parquet('{tmp.as_posix()}')").fetchone()[0]
-    tmp.replace(f)      # atomic swap — a crash mid-write never truncates the store
-    return after - before
+    added = 0
+    months = [r[0] for r in con.execute(
+        "SELECT DISTINCT strftime(datetime, '%Y%m') FROM _new ORDER BY 1").fetchall()]
+    for ym in months:
+        f = inc_dir / f"{ym}.parquet"
+        month = f"SELECT * FROM _new WHERE strftime(datetime, '%Y%m') = '{ym}'"
+        if f.exists():
+            src = (f"SELECT * FROM read_parquet('{f.as_posix()}') UNION ALL "
+                   f"{month} AND ts NOT IN "
+                   f"(SELECT ts FROM read_parquet('{f.as_posix()}'))")
+            before = con.execute(
+                f"SELECT count(*) FROM read_parquet('{f.as_posix()}')").fetchone()[0]
+        else:
+            src, before = month, 0
+        tmp = f.with_suffix(".parquet.tmp")
+        con.execute(f"COPY ({src} ORDER BY ts) TO '{tmp.as_posix()}' (FORMAT parquet)")
+        after = con.execute(
+            f"SELECT count(*) FROM read_parquet('{tmp.as_posix()}')").fetchone()[0]
+        tmp.replace(f)  # atomic swap — a crash mid-write never truncates the store
+        added += after - before
+    return added
 
 
 def _convert_and_append(symbol: str, raw: list[Any]) -> Optional[int]:
@@ -186,6 +209,53 @@ def pending_symbols(days: int, limit: int = 0) -> list[str]:
         q += f" LIMIT {int(limit)}"
     syms = [r[0] for r in con.execute(q).fetchall()]
     return [NIFTY_SYMBOL] + syms
+
+
+def ripe_symbols(max_age_days: int = 3, min_age_minutes: int = 61,
+                 limit: int = 0) -> list[str]:
+    """Symbols whose fresh announcements are old enough to be fully priced.
+
+    px_60m cannot exist until 60 minutes of trading have passed, so a filing is
+    only worth fetching once it is `min_age_minutes` old — asking sooner just
+    marks it no_candles and burns a call. `max_age_days` keeps each pass to
+    recent news; the daily sweep handles anything older.
+
+    NIFTY rides along on every pass: mkt_*/adj_* are measured against it, so a
+    stale index silently zeroes the market adjustment for every other symbol.
+    """
+    con = connect()
+    with _lock:
+        con.execute(f"""
+            UPDATE {TABLE} SET price_status='pending'
+            WHERE price_status='no_candles'
+              AND announced_at >= current_date - INTERVAL {int(max_age_days)} DAY
+        """)
+    q = (f"SELECT DISTINCT symbol FROM {TABLE} "
+         "WHERE price_status='pending' AND symbol IS NOT NULL AND symbol <> '' "
+         f"AND announced_at >= current_date - INTERVAL {int(max_age_days)} DAY "
+         f"AND announced_at <= now() - INTERVAL {int(min_age_minutes)} MINUTE "
+         "ORDER BY symbol")
+    if limit:
+        q += f" LIMIT {int(limit)}"
+    return [NIFTY_SYMBOL] + [r[0] for r in con.execute(q).fetchall()]
+
+
+async def run_incremental(max_age_days: int = 3, days: int = 2,
+                          limit: int = 0) -> dict:
+    """The real-time pass: price the day's news as soon as it is priceable.
+
+    Small by construction — only symbols with fresh unfilled rows, only a
+    couple of days of candles each, and the price fill is restricted to those
+    same symbols instead of sweeping the whole pending set.
+    """
+    from app.services import warehouse_prices, warehouse_store
+
+    syms = ripe_symbols(max_age_days=max_age_days, limit=limit)
+    out: dict[str, Any] = {"candles": await sync_symbols(syms, days=days)}
+    out["prices"] = await asyncio.to_thread(warehouse_prices.fill, 0, syms)
+    out["metadata"] = warehouse_store.fill_metadata()
+    log.info("candle_sync.incremental_done", **{k: str(v)[:120] for k, v in out.items()})
+    return out
 
 
 async def run_eod(days: int = 5, limit: int = 0) -> dict:

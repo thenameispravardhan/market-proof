@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Optional
 
 from app.logging_config import get_logger
 from app.services.warehouse_store import TABLE, _lock, connect
@@ -31,7 +32,8 @@ log = get_logger(__name__)
 
 ROOT = Path(__file__).resolve().parents[2]
 CANDLES = ROOT / "AIdataset" / "stockdata"
-NIFTY = CANDLES / "NIFTY50-INDEX.parquet"
+NIFTY_SYMBOL = "NIFTY50-INDEX"
+NIFTY = CANDLES / f"{NIFTY_SYMBOL}.parquet"
 
 OFFSETS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 30, 45, 60)
 HORIZONS = (5, 15, 30, 60)
@@ -49,21 +51,46 @@ def _pivot_columns() -> str:
     return ",\n           ".join(parts)
 
 
+def candle_source(symbol: str) -> Optional[str]:
+    """A read_parquet() over one symbol's base export plus its increments.
+
+    The base file is the original one-time export. Everything collected since
+    lands in `_inc/<SYMBOL>/<YYYYMM>.parquet`, so appending a day costs one
+    month of candles to rewrite instead of the symbol's whole history.
+
+    They live in a per-symbol DIRECTORY rather than a `SYMBOL*.parquet` glob on
+    purpose: `RELIANCE*.parquet` would also match RELIANCEPOWER and silently
+    price one company off another's candles.
+    """
+    parts = []
+    base = CANDLES / f"{symbol}.parquet"
+    if base.exists():
+        parts.append(base)
+    inc_dir = CANDLES / "_inc" / symbol
+    if inc_dir.is_dir():
+        parts += sorted(inc_dir.glob("*.parquet"))
+    if not parts:
+        return None
+    files = ", ".join(f"'{p.as_posix()}'" for p in parts)
+    return f"read_parquet([{files}], union_by_name=true)"
+
+
 def fill_symbol(con, symbol: str) -> int:
     """Fill every pending row for one symbol. One query, one UPDATE."""
-    f = CANDLES / f"{symbol}.parquet"
-    if not f.exists():
+    src = candle_source(symbol)
+    if src is None:
         with _lock:
             con.execute(
                 f"UPDATE {TABLE} SET price_status='no_candles' "
                 "WHERE price_status='pending' AND symbol = ?", [symbol])
         return 0
 
+    nif_src = candle_source(NIFTY_SYMBOL) or f"read_parquet('{NIFTY.as_posix()}')"
     con.execute(f"""
     CREATE OR REPLACE TEMP TABLE _fill AS
     WITH cand AS (
         SELECT CAST(datetime AS TIMESTAMP) AS ts, close, volume, high, low
-        FROM read_parquet('{f.as_posix()}')
+        FROM {src}
     ),
     raw_pend AS (
         SELECT uid, anchor_time, date_trunc('minute', announced_at) AS filed_min
@@ -105,7 +132,7 @@ def fill_symbol(con, symbol: str) -> int:
     ),
     nif AS (
         SELECT CAST(datetime AS TIMESTAMP) AS ts, close
-        FROM read_parquet('{NIFTY.as_posix()}')
+        FROM {nif_src}
     )
     SELECT px.*, day.day_high, day.day_low, day.day_volume,
            n0.close AS nif0,
@@ -181,13 +208,24 @@ def fill_symbol(con, symbol: str) -> int:
     return n
 
 
-def fill(limit: int = 0) -> dict:
+def fill(limit: int = 0, symbols: Optional[list[str]] = None) -> dict:
+    """Fill pending rows. `symbols` restricts the sweep to those symbols.
+
+    The real-time pass only ever touches the handful it just fetched candles
+    for; walking all ~4,600 pending symbols every few minutes would burn far
+    more time than the fill it performs.
+    """
     con = connect()
-    q = (f"SELECT DISTINCT symbol FROM {TABLE} "
-         "WHERE price_status = 'pending' AND symbol IS NOT NULL ORDER BY symbol")
-    if limit:
-        q += f" LIMIT {limit}"
-    symbols = [r[0] for r in con.execute(q).fetchall()]
+    if symbols is not None:
+        symbols = sorted({s for s in symbols if s})
+        if not symbols:
+            return {"symbols": 0, "filled": 0}
+    else:
+        q = (f"SELECT DISTINCT symbol FROM {TABLE} "
+             "WHERE price_status = 'pending' AND symbol IS NOT NULL ORDER BY symbol")
+        if limit:
+            q += f" LIMIT {limit}"
+        symbols = [r[0] for r in con.execute(q).fetchall()]
     if not symbols:
         return {"symbols": 0, "filled": 0}
 

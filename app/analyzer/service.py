@@ -1156,6 +1156,29 @@ def _persist_analysis_and_signal(
         session.add(a)
         session.flush()
 
+        # Mirror the label onto the dataset row the monitor already inserted.
+        # Without this the ai_* columns only appear for rows imported in bulk
+        # by load_live(); a filing that arrived live kept them NULL forever,
+        # because load_live only INSERTs rows whose uid is new. Fire-and-forget
+        # and never raises — same rule as the monitor's mirror, the dataset is
+        # not worth failing an analysis over.
+        try:
+            from app.services.warehouse_store import apply_analysis
+
+            apply_analysis(announcement.id, {
+                "event_type": cols["event_type"],
+                "sentiment": cols["sentiment"],
+                "sentiment_score": cols["sentiment_score"],
+                "confidence": cols["confidence"],
+                "recommendation": cols["recommendation"],
+                "summary": cols["summary"],
+                "reasoning": cols["rationale"],
+                "model": ds_result.model,
+                "label_source": "live",
+            })
+        except Exception as e:  # noqa: BLE001
+            log.debug("analyzer.warehouse_label_failed", error=str(e)[:160])
+
         # Rules engine. Evaluate against every ENABLED strategy's enabled
         # rules (priority ASC, first match wins).  Rules are cached for 5
         # minutes (they change only when the operator edits them in the UI).

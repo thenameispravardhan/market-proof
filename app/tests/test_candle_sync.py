@@ -49,17 +49,17 @@ def test_append_is_idempotent(tmp_path, monkeypatch):
     more = candle_sync._candle_rows([[1784864700 + 5 * 60, 1.0, 2.0, 0.5, 1.5, 7]])
     assert candle_sync._append("TESTSYM", more) == 1
 
-    import duckdb
-    f = tmp_path / "TESTSYM.parquet"
+    from app.services import warehouse_prices as P
+
+    monkeypatch.setattr(P, "CANDLES", tmp_path)
+    src = P.candle_source("TESTSYM")
     con = duckdb.connect()
     n, distinct = con.execute(
-        f"SELECT count(*), count(DISTINCT ts) FROM read_parquet('{f.as_posix()}')"
-    ).fetchone()
+        f"SELECT count(*), count(DISTINCT ts) FROM {src}").fetchone()
     assert n == distinct == 6, "duplicate ts rows survived the merge"
     # ordered by ts, so the price fill's BETWEEN window scans cleanly
     assert con.execute(
-        f"SELECT ts FROM read_parquet('{f.as_posix()}') ORDER BY ts LIMIT 1"
-    ).fetchone()[0] == 1784864700
+        f"SELECT ts FROM {src} ORDER BY ts LIMIT 1").fetchone()[0] == 1784864700
 
 
 def test_retry_window_is_bounded(tmp_path, monkeypatch):
@@ -90,5 +90,59 @@ def test_retry_window_is_bounded(tmp_path, monkeypatch):
         # and the out-of-window row keeps its status rather than churning
         assert con.execute("SELECT price_status FROM announcements "
                            "WHERE symbol='ANCIENT'").fetchone()[0] == "no_candles"
+    finally:
+        W.shutdown()
+
+
+def test_increments_read_back_as_one_series(tmp_path, monkeypatch):
+    """Appends land in monthly increment files, and candle_source() stitches
+    base + increments back into one table. If that read is wrong the price fill
+    silently sees a gap and marks perfectly good rows no_candles.
+    """
+    from app.services import warehouse_prices as P
+
+    monkeypatch.setattr(candle_sync, "CANDLES", tmp_path)
+    monkeypatch.setattr(P, "CANDLES", tmp_path)
+
+    # two different months, appended separately
+    jul = [[1784864700 + i * 60, 1.0, 2.0, 0.5, 100.0 + i, 10] for i in range(3)]
+    aug = [[1787543100 + i * 60, 1.0, 2.0, 0.5, 200.0 + i, 20] for i in range(3)]
+    assert candle_sync._append("ACME", candle_sync._candle_rows(jul)) == 3
+    assert candle_sync._append("ACME", candle_sync._candle_rows(aug)) == 3
+    assert candle_sync._append("ACME", candle_sync._candle_rows(jul)) == 0  # idempotent
+
+    months = sorted(p.name for p in (tmp_path / "_inc" / "ACME").glob("*.parquet"))
+    assert len(months) == 2, f"expected one file per month, got {months}"
+
+    con = duckdb.connect()
+    n = con.execute(f"SELECT count(*) FROM {P.candle_source('ACME')}").fetchone()[0]
+    assert n == 6, "base + increments did not read back as one series"
+
+    # the glob must not bleed across symbols with a shared prefix
+    assert candle_sync._append("ACMEPOWER", candle_sync._candle_rows(jul)) == 3
+    assert con.execute(
+        f"SELECT count(*) FROM {P.candle_source('ACME')}").fetchone()[0] == 6
+
+
+def test_ripe_excludes_announcements_too_new_to_price(tmp_path, monkeypatch):
+    """px_60m needs 60 minutes of trading. Fetching sooner cannot fill the row,
+    it just marks it no_candles and spends a Fyers call to do so.
+    """
+    from app.services import warehouse_store as W
+
+    W.shutdown()
+    monkeypatch.setattr(W, "STORE", tmp_path / "wh.duckdb")
+    W.connect()
+    try:
+        now = dt.datetime.now()
+        W.ingest_live(symbol="RIPE", headline="filed two hours ago",
+                      announced_at=now - dt.timedelta(hours=2))
+        W.ingest_live(symbol="TOONEW", headline="filed five minutes ago",
+                      announced_at=now - dt.timedelta(minutes=5))
+
+        syms = candle_sync.ripe_symbols(max_age_days=3, min_age_minutes=61)
+
+        assert "RIPE" in syms
+        assert "TOONEW" not in syms, "fetched before px_60m could possibly exist"
     finally:
         W.shutdown()
