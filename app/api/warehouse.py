@@ -449,7 +449,8 @@ def announcement_column_specs() -> list[dict[str, Any]]:
 def announcement_rows(*, limit: int, offset: int, columns: Optional[list[str]],
                       symbol: Optional[str] = None, event_type: Optional[str] = None,
                       since: Optional[str] = None, until: Optional[str] = None,
-                      q: Optional[str] = None) -> dict[str, Any]:
+                      q: Optional[str] = None,
+                      enriched_only: bool = False) -> dict[str, Any]:
     """Rows for the Dataset page, using the same filters it already sends."""
     con = _con()
     schema = [r[0] for r in con.execute(f"describe {TABLE}").fetchall()]
@@ -470,6 +471,8 @@ def announcement_rows(*, limit: int, offset: int, columns: Optional[list[str]],
     if q:
         where.append("(headline ILIKE ? OR company ILIKE ?)")
         params += [f"%{q}%"] * 2
+    if enriched_only:
+        where.append("price_status = 'filled'")
     clause = f"WHERE {' AND '.join(where)}" if where else ""
     total = con.execute(f"SELECT count(*) FROM {TABLE} {clause}", params).fetchone()[0]
     cur = con.execute(
@@ -488,7 +491,8 @@ def announcement_export_path(fmt: str, columns: Optional[list[str]] = None,
                              symbol: Optional[str] = None,
                              event_type: Optional[str] = None,
                              since: Optional[str] = None,
-                             until: Optional[str] = None) -> Path:
+                             until: Optional[str] = None,
+                             enriched_only: bool = False) -> Path:
     """Write the WHOLE dataset to a temp file and return its path.
 
     303,505 rows x 97 columns is roughly 150 MB of CSV. Building that as a
@@ -514,6 +518,8 @@ def announcement_export_path(fmt: str, columns: Optional[list[str]] = None,
     if until:
         where.append("announced_at <= ?")
         params.append(until)
+    if enriched_only:
+        where.append("price_status = 'filled'")
     clause = f"WHERE {' AND '.join(where)}" if where else ""
 
     # Sweep exports older than an hour before writing a new one. The streaming

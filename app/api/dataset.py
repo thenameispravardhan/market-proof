@@ -650,7 +650,8 @@ def dataset_rows(
         from app.api.warehouse import announcement_rows
         return announcement_rows(
             limit=limit, offset=offset, columns=_parse_columns(columns),
-            symbol=symbol, event_type=event_type, since=since, until=until)
+            symbol=symbol, event_type=event_type, since=since, until=until,
+            enriched_only=enriched_only)
     return _dataset_rows(
         db,
         limit=limit,
@@ -799,7 +800,8 @@ def dataset_export(
         kind = {"csv": "csv", "jsonl": "json", "parquet": "parquet"}[format]
         path = announcement_export_path(
             kind, columns=_parse_columns(columns), symbol=symbol,
-            event_type=event_type, since=since, until=until)
+            event_type=event_type, since=since, until=until,
+            enriched_only=enriched_only)
         stamp = datetime.utcnow().strftime("%Y%m%d")
         ext = {"csv": "csv", "jsonl": "jsonl", "parquet": "parquet"}[format]
 
