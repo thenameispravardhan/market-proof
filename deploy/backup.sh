@@ -19,9 +19,30 @@ DEST_DIR="$PROJECT_ROOT/data/backups"
 mkdir -p "$DEST_DIR"
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
-sqlite3 "$DB" ".backup '$DEST_DIR/trading-$STAMP.db'"
 
-# Keep the 7 newest backups.
+# Stage under a DOTTED name first: the rotation glob below is
+# `trading-*.db`, so a half-written or corrupt attempt must not carry that
+# name until it has been verified. On 2026-08-07 a corrupt source DB left a
+# 0-byte `trading-20260807-183001.db` sitting in the rotation set — one more
+# night and it would have evicted a GOOD backup to keep an empty one.
+TMP="$DEST_DIR/.trading-$STAMP.db.partial"
+trap 'rm -f "$TMP"' EXIT
+
+sqlite3 "$DB" ".backup '$TMP'"
+
+# A backup nobody verified is not a backup. `.backup` against a malformed
+# source can exit non-zero *after* creating the file, so check the copy
+# itself rather than trusting the exit code.
+[ -s "$TMP" ] || { echo "BACKUP FAILED: $TMP is empty (source DB corrupt?)" >&2; exit 1; }
+if [ "$(sqlite3 "$TMP" 'PRAGMA integrity_check;' 2>&1)" != "ok" ]; then
+    echo "BACKUP FAILED: integrity_check did not return ok — source DB is damaged" >&2
+    exit 1
+fi
+
+mv "$TMP" "$DEST_DIR/trading-$STAMP.db"
+trap - EXIT
+
+# Keep the 7 newest backups. Only verified files ever reach this glob.
 ls -1t "$DEST_DIR"/trading-*.db 2>/dev/null | tail -n +8 | xargs -r rm --
 
 echo "$(date -Is) backup written: $DEST_DIR/trading-$STAMP.db"

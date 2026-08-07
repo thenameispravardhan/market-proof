@@ -20,6 +20,17 @@ Description=AI News Trading Bot (FastAPI + uvicorn)
 After=network-online.target
 Wants=network-online.target
 
+# Give up after 5 failed starts in 5 minutes instead of retrying forever.
+# A PERMANENT failure — a corrupt data/trading.db, a broken .env, a bad
+# import — cannot be fixed by trying again, and `Restart=always` with no
+# limit hides it: the unit sits in `activating (auto-restart)`, which reads
+# like a slow boot, not like an outage. On 2026-08-07 that cost a full
+# trading day, 9,000+ restarts deep, because nothing ever said "failed".
+# With a limit the unit lands in `failed`, `systemctl is-active` reports it,
+# and the health report / monitoring has something to see.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 [Service]
 Type=exec
 User=__RUN_USER__
