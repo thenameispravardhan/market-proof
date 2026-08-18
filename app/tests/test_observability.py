@@ -310,6 +310,86 @@ def test_health_report_reflects_halt(client, db_session, isolated_db):
 
 
 # =========================================================================
+# Pre-market preflight
+# =========================================================================
+
+
+def _preflight_env(monkeypatch, *, ai_on: bool, quote):
+    """AI toggle + Fyers quote probe, both faked."""
+    monkeypatch.setattr(
+        hr, "get_settings",
+        lambda: SimpleNamespace(AI_ANALYSIS_ENABLED=ai_on),
+    )
+
+    async def _fake_quote(_symbol):
+        return quote
+
+    import app.api.market as market_mod
+    monkeypatch.setattr(market_mod, "fetch_quote", _fake_quote)
+
+
+@pytest.mark.asyncio
+async def test_preflight_flags_dead_token_and_ai_off(monkeypatch):
+    """The two silent day-killers: an expired Fyers token (quote probe
+    returns None) and AI analysis switched off."""
+    _preflight_env(monkeypatch, ai_on=False, quote=None)
+    problems = await hr.compile_preflight()
+    assert len(problems) == 2
+    assert any("AI analysis is OFF" in p for p in problems)
+    assert any("NO_LIVE_PRICE" in p for p in problems)
+
+
+@pytest.mark.asyncio
+async def test_preflight_silent_when_healthy(monkeypatch):
+    """A healthy morning publishes nothing — an alarm that fires daily
+    gets muted."""
+    _preflight_env(monkeypatch, ai_on=True, quote={"last_price": 24000.0})
+    published: list = []
+
+    async def _spy(channel, payload):
+        published.append((channel, payload))
+        return 0
+
+    monkeypatch.setattr(hr.event_bus, "publish", _spy)
+    svc = hr.HealthReportService()
+    assert await svc.run_preflight() == []
+    assert published == []
+
+
+@pytest.mark.asyncio
+async def test_preflight_alerts_once_per_trading_day(monkeypatch):
+    """Fires on `system.error` when broken, then not again that day; and
+    never on a weekend."""
+    _preflight_env(monkeypatch, ai_on=True, quote=None)
+    published: list = []
+
+    async def _spy(channel, payload):
+        published.append((channel, payload))
+        return 1
+
+    monkeypatch.setattr(hr.event_bus, "publish", _spy)
+    monkeypatch.setattr(
+        hr, "get_settings",
+        lambda: SimpleNamespace(
+            AI_ANALYSIS_ENABLED=True, HEALTH_REPORT_PREFLIGHT_TIME_IST="09:05"
+        ),
+    )
+    svc = hr.HealthReportService()
+
+    # 2026-08-17 is a Monday; 09:10 IST = 03:40 UTC.
+    monday = datetime(2026, 8, 17, 3, 40, tzinfo=timezone.utc)
+    assert svc._preflight_due(monday) is True
+    assert len(await svc.run_preflight(monday)) == 1
+    assert published[0][0] == hr.CHANNEL_SYSTEM_ERROR
+    assert svc._preflight_due(monday) is False          # already fired today
+
+    # Before the fire time, and on the weekend, it stays quiet.
+    svc._last_preflight_date = None
+    assert svc._preflight_due(datetime(2026, 8, 17, 3, 0, tzinfo=timezone.utc)) is False
+    assert svc._preflight_due(datetime(2026, 8, 15, 3, 40, tzinfo=timezone.utc)) is False
+
+
+# =========================================================================
 # Performance-weighted sizer
 # =========================================================================
 

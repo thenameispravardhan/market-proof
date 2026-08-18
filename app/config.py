@@ -327,6 +327,14 @@ class Settings(BaseSettings):
     # notification channel whose events filter includes "report".
     HEALTH_REPORT_ENABLED: bool = True
     HEALTH_REPORT_TIME_IST: str = "15:45"
+    # Pre-open preflight, fired by the same service. Publishes on
+    # `system.error` ONLY when something is wrong, so a silent morning
+    # means "good to trade". Guards the two failures that have each cost
+    # a whole trading day without showing up until the market was
+    # already running: an expired Fyers token (every entry blocks
+    # NO_LIVE_PRICE) and AI analysis left switched off (skipped filings
+    # are placeholder-marked and never re-analysed). Empty = off.
+    HEALTH_REPORT_PREFLIGHT_TIME_IST: str = "09:05"
     LLM_TIMEOUT_SECONDS: float = 12.0         # discard the opportunity past this
     # Hard cap on LLM completion tokens. Generation latency scales almost
     # linearly with output length, and a signal JSON needs only a few

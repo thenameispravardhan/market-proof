@@ -38,6 +38,10 @@ echo "==> Seeding default prompt templates"
     || echo "    WARNING: seed_default_prompts.py failed; continuing"
 
 echo "==> Restarting tradebot"
+# daemon-reload FIRST: `restart` alone re-runs the unit systemd already
+# has loaded, so an edited tradebot.service (e.g. the --no-proxy-headers
+# guard) silently doesn't take effect.
+sudo systemctl daemon-reload
 sudo systemctl restart tradebot
 
 # Startup takes ~15s with a full DB (init + instrument master + services);

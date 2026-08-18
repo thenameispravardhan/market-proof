@@ -18,6 +18,10 @@ Report contents (IST trading day):
 `compile_health_report(db)` is pure-read and also serves
 GET /api/metrics/health-report; POST .../health-report/send triggers the
 same publish path manually.
+
+The same service also runs a PRE-OPEN preflight at
+HEALTH_REPORT_PREFLIGHT_TIME_IST (default 09:05) and publishes on
+`system.error` only when it finds a problem — see `compile_preflight`.
 """
 from __future__ import annotations
 
@@ -37,12 +41,18 @@ from app.db.models import (
     Trade as TradeRow,
 )
 from app.logging_config import get_logger
-from app.risk.market_clock import IST, to_ist
+from app.risk.market_clock import IST, _is_trading_day, to_ist
 from app.services.event_bus import event_bus
 
 log = get_logger(__name__)
 
 CHANNEL_SYSTEM_REPORT = "system.report"
+CHANNEL_SYSTEM_ERROR = "system.error"
+
+# The preflight probe: any live Fyers quote proves the daily OAuth token
+# is still good. NIFTY 50 always trades, so a None here is the token, not
+# the symbol.
+PREFLIGHT_PROBE_SYMBOL = "NSE:NIFTY50-INDEX"
 
 # Risk-event types that mean "deferred by the entry state machine's
 # anti-chase gate", as opposed to a hard risk block.
@@ -206,6 +216,45 @@ def format_report(report: dict[str, Any]) -> tuple[str, str]:
     return subject, "\n".join(lines)
 
 
+async def compile_preflight() -> list[str]:
+    """Pre-open readiness problems, or [] when the bot is good to trade.
+
+    Both checks cover failures that are invisible until the market is
+    already running, and both have cost a full trading day:
+
+      - the Fyers access token expires DAILY and is re-authed by hand;
+        without it every entry blocks NO_LIVE_PRICE while REST, the LLM
+        and the rules engine all keep looking healthy.
+      - AI analysis switched off skips filings permanently — they are
+        placeholder-marked and never re-analysed.
+
+    Read-only and never raises: a broken probe reads as a problem, which
+    is the safe direction for an alarm."""
+    problems: list[str] = []
+
+    if not bool(getattr(get_settings(), "AI_ANALYSIS_ENABLED", True)):
+        problems.append(
+            "AI analysis is OFF — filings will be skipped and are never re-analysed."
+        )
+
+    # Lazy import: app.api.market reaches back into app.main for the
+    # shared ExecutionManager.
+    from app.api.market import fetch_quote
+
+    try:
+        quote = await fetch_quote(PREFLIGHT_PROBE_SYMBOL)
+    except Exception as e:  # noqa: BLE001
+        log.warning("preflight.probe_failed", error=str(e))
+        quote = None
+    if quote is None:
+        problems.append(
+            f"Fyers is not serving quotes ({PREFLIGHT_PROBE_SYMBOL}) — re-auth in the "
+            "UI or every entry today blocks with NO_LIVE_PRICE."
+        )
+
+    return problems
+
+
 def _default_session_factory() -> Callable[[], Session]:
     from app.db.session import SessionLocal
     return SessionLocal
@@ -229,6 +278,7 @@ class HealthReportService:
         self._stop_event = asyncio.Event()
         self._task: Optional[asyncio.Task[None]] = None
         self._last_sent_date: Optional[str] = None
+        self._last_preflight_date: Optional[str] = None
 
     def start(self) -> Optional[asyncio.Task[None]]:
         if getattr(get_settings(), "TESTING", 0):
@@ -267,6 +317,47 @@ class HealthReportService:
             return False
         return ist_now.time() >= fire_at
 
+    def _preflight_due(self, now: Optional[datetime] = None) -> bool:
+        raw = str(
+            getattr(get_settings(), "HEALTH_REPORT_PREFLIGHT_TIME_IST", "") or ""
+        ).strip()
+        if not raw:
+            return False
+        try:
+            hh, mm = raw.split(":")
+            fire_at = dt_time(hour=int(hh), minute=int(mm))
+        except (TypeError, ValueError):
+            return False
+        ist_now = to_ist(now)
+        if not _is_trading_day(ist_now):
+            return False
+        if ist_now.date().isoformat() == self._last_preflight_date:
+            return False
+        return ist_now.time() >= fire_at
+
+    async def run_preflight(self, now: Optional[datetime] = None) -> list[str]:
+        """Run the pre-open checks and alert ONLY on problems — a daily
+        all-clear ping is an alarm that gets muted. `now` is the same
+        clock `_preflight_due` was asked about, so the once-per-day stamp
+        can't land on a different date than the check."""
+        problems = await compile_preflight()
+        self._last_preflight_date = to_ist(now).date().isoformat()
+        if not problems:
+            log.info("preflight.ok", date_ist=self._last_preflight_date)
+            return problems
+        body = "\n".join(f"- {p}" for p in problems)
+        await event_bus.publish(
+            CHANNEL_SYSTEM_ERROR,
+            {
+                "subject": "Pre-market preflight FAILED",
+                "body": f"The bot is not ready to trade today:\n{body}",
+                "error": "preflight_failed",
+                "problems": problems,
+            },
+        )
+        log.warning("preflight.failed", problems=problems)
+        return problems
+
     async def send_now(self) -> dict[str, Any]:
         """Compile + publish immediately (the scheduler's firing path)."""
         loop = asyncio.get_running_loop()
@@ -296,6 +387,8 @@ class HealthReportService:
                 try:
                     if self._due():
                         await self.send_now()
+                    if self._preflight_due():
+                        await self.run_preflight()
                 except Exception:  # noqa: BLE001
                     log.exception("health_report.tick_failed")
                 try:
