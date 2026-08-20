@@ -788,3 +788,58 @@ def test_manager_rejects_zero_quantity(
                 quantity=0,
             )
         )
+
+
+# =========================================================================
+# DELETE /api/trades/{id} — operator housekeeping on the history page
+# =========================================================================
+
+
+def test_delete_trade_removes_row_and_audits(client: TestClient, db_session, isolated_db):
+    """A closed trade deletes, and the full row lands in audit_log so the
+    deletion can be reconstructed."""
+    from app.db.models import AuditLog
+
+    t = Trade(symbol="SBIN", side="BUY", quantity=10, price=100.0,
+              order_type="market", status="filled", pnl=50.0)
+    db_session.add(t)
+    db_session.commit()
+    tid = t.id
+
+    r = client.delete(f"/api/trades/{tid}")
+    assert r.status_code == 200, r.text
+    assert r.json() == {"ok": True, "deleted": tid}
+    db_session.expire_all()  # the API used its own session; drop our cache
+    assert db_session.get(Trade, tid) is None
+
+    entry = (
+        db_session.query(AuditLog)
+        .filter(AuditLog.target == f"trade:{tid}")
+        .one()
+    )
+    assert entry.action == "trade.delete"
+    assert entry.before["symbol"] == "SBIN"
+    assert entry.before["pnl"] == 50.0
+
+
+def test_delete_trade_refused_while_position_open(client: TestClient, db_session, isolated_db):
+    """The live book's entry legs are protected — deleting one would
+    strand a position the trade manager is still managing."""
+    from app.db.models import Position
+
+    t = Trade(symbol="TCS", side="BUY", quantity=5, price=200.0,
+              order_type="market", status="filled")
+    db_session.add(t)
+    db_session.add(Position(symbol="TCS", quantity=5, average_price=200.0))
+    db_session.commit()
+    tid = t.id
+
+    r = client.delete(f"/api/trades/{tid}")
+    assert r.status_code == 409
+    assert "open position" in r.json()["detail"]
+    db_session.expire_all()
+    assert db_session.get(Trade, tid) is not None  # still there
+
+
+def test_delete_trade_unknown_id_404s(client: TestClient, isolated_db):
+    assert client.delete("/api/trades/999999").status_code == 404

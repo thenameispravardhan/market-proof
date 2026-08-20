@@ -7,6 +7,7 @@ Endpoints:
   GET  /api/signals/recent?limit=N
   GET  /api/positions
   GET  /api/trades?limit=N
+  DELETE /api/trades/{trade_id}              # operator housekeeping
   GET  /api/dashboard/summary
   POST /api/analyses/run/{announcement_id}   # queue one announcement
   POST /api/analyses/backfill?limit=N        # queue N most recent unanalyzed
@@ -24,6 +25,7 @@ from app.db.init import init_db
 from app.db.models import (
     Analysis,
     Announcement,
+    AuditLog,
     Position,
     Signal,
     Trade,
@@ -212,6 +214,54 @@ def list_trades(
         stmt = stmt.where(Trade.status == status)
     rows = db.execute(stmt.limit(limit)).scalars().all()
     return [_ser_trade(t) for t in rows]
+
+
+@router.delete("/api/trades/{trade_id}")
+def delete_trade(trade_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Delete one trade row from the history. Operator housekeeping.
+
+    This is a HOUSEKEEPING tool for junk rows (test fills, duplicates),
+    not an accounting one. The risk engine derives the performance-tier
+    sizing, the daily-loss breaker and the health report's P&L from
+    these rows, so deleting a real fill changes how the bot sizes and
+    when it halts. Every deletion is written to `audit_log` with the
+    full row, so it can be reconstructed.
+
+    Refuses while the symbol still holds an open position: those rows
+    are the live book's entry legs, and deleting one strands a position
+    the trade manager is still managing.
+    """
+    t = db.get(Trade, trade_id)
+    if t is None:
+        raise HTTPException(status_code=404, detail="trade not found")
+
+    open_qty = db.execute(
+        select(Position.quantity).where(
+            Position.symbol == t.symbol, Position.quantity != 0
+        )
+    ).scalars().first()
+    if open_qty:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{t.symbol} still has an open position ({open_qty}). "
+                "Close it before deleting its trade rows."
+            ),
+        )
+
+    before = _ser_trade(t)
+    db.delete(t)
+    db.add(
+        AuditLog(
+            actor="ui",
+            action="trade.delete",
+            target=f"trade:{trade_id}",
+            before=before,
+        )
+    )
+    db.commit()
+    log.info("trade.deleted", trade_id=trade_id, symbol=before["symbol"])
+    return {"ok": True, "deleted": trade_id}
 
 
 def _publish_payload(a: Announcement) -> dict[str, Any]:

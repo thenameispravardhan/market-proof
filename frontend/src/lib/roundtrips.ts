@@ -23,6 +23,9 @@ export interface RoundTrip {
   exitTime: string | null;
   pnl: number | null;
   open: boolean;
+  // The trade rows behind this row: [entry] or [entry, exit]. Lets the
+  // history page delete a round-trip without re-deriving the pairing.
+  tradeIds: number[];
 }
 
 export function acctMeta(
@@ -86,6 +89,7 @@ export function buildRoundTrips(
           exitTime: t.executed_at ?? t.created_at ?? null,
           pnl,
           open: false,
+          tradeIds: [lot.t.id, t.id],
         });
         lot.qty -= matched;
         qty -= matched;
@@ -108,6 +112,7 @@ export function buildRoundTrips(
         exitTime: lot.t.executed_at ?? lot.t.created_at ?? null,
         pnl: null,
         open: true,
+        tradeIds: [lot.t.id],
       });
     }
   }

@@ -2,13 +2,12 @@
 
 WIPES the operational / trade data:
     trades, positions, signals, analyses, announcements, risk_events,
-    audit_log, backtest_runs, prompt_history, notification_log,
-    webhook_deliveries
+    audit_log, prompt_history, notification_log
 
 KEEPS your setup / config so you don't have to reconnect or reconfigure:
     broker_accounts (Fyers connection + token), app_settings (settings,
     postback config), prompt_templates, signal_rules, strategies,
-    webhooks, notification_channels
+    notification_channels
 
 Usage:
     python scripts/clear_trading_data.py            # clear trade data, keep setup
@@ -36,10 +35,8 @@ _DATA_TABLES = [
     "analyses",
     "announcements",
     "audit_log",
-    "backtest_runs",
     "prompt_history",
     "notification_log",
-    "webhook_deliveries",
 ]
 
 # Only cleared with --all.
@@ -49,7 +46,6 @@ _CONFIG_TABLES = [
     "prompt_templates",
     "signal_rules",
     "strategies",
-    "webhooks",
     "notification_channels",
 ]
 

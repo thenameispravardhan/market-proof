@@ -8,7 +8,12 @@
 // with no exit/P&L — its stop-loss / target is editable inline.
 
 import { useMemo } from "react";
-import { useBrokerAccounts, useManagedPositions, useTrades } from "../hooks/useApi";
+import {
+  useBrokerAccounts,
+  useDeleteTrade,
+  useManagedPositions,
+  useTrades,
+} from "../hooks/useApi";
 import { LevelsCell } from "../components/positions/LevelsCell";
 import { buildRoundTrips, type RoundTrip } from "../lib/roundtrips";
 import type { ManagedPosition } from "../types";
@@ -43,10 +48,12 @@ function Section({
   title,
   rows,
   managedBy,
+  onDelete,
 }: {
   title: string;
   rows: RoundTrip[];
   managedBy: Map<string, ManagedPosition>;
+  onDelete: (r: RoundTrip) => void;
 }) {
   const realised = rows.reduce((acc, r) => acc + (r.pnl ?? 0), 0);
   return (
@@ -74,6 +81,7 @@ function Section({
                 <th className="mono">P&amp;L</th>
                 <th>Entry (IST)</th>
                 <th>Closed (IST)</th>
+                <th></th>
               </tr>
             </thead>
             <tbody>
@@ -106,6 +114,22 @@ function Section({
                     </td>
                     <td className="mono">{fmtTime(r.entryTime)}</td>
                     <td className="mono">{r.open ? "—" : fmtTime(r.exitTime)}</td>
+                    <td>
+                      {/* Open round-trips are the live book — the API
+                          refuses those anyway, so don't offer the button. */}
+                      {r.open ? (
+                        <span className="text-dim">—</span>
+                      ) : (
+                        <button
+                          className="btn-sm danger"
+                          title="Delete this round-trip from history"
+                          aria-label={`Delete ${r.symbol} round-trip`}
+                          onClick={() => onDelete(r)}
+                        >
+                          ✕
+                        </button>
+                      )}
+                    </td>
                   </tr>
                 );
               })}
@@ -122,6 +146,7 @@ export default function TradeHistory() {
   // (especially older entry legs) out of the newest-N window, or a closed
   // round-trip would lose its entry and show as a phantom open position.
   const { data: trades, isLoading, error } = useTrades(500, "filled");
+  const del = useDeleteTrade();
   const { data: accounts } = useBrokerAccounts();
   const { data: managed } = useManagedPositions();
 
@@ -139,6 +164,26 @@ export default function TradeHistory() {
   );
   const fyers = roundtrips.filter((r) => !r.isPaper);
   const paper = roundtrips.filter((r) => r.isPaper);
+
+  // A round-trip is 1-2 trade rows; delete them together or the survivor
+  // re-pairs with an older leg and shows as a phantom position.
+  async function handleDelete(r: RoundTrip) {
+    if (
+      !confirm(
+        `Delete the ${r.symbol} ${r.side} round-trip (P&L ₹${fmtMoney(r.pnl)}) from history?
+
+` +
+          "This removes it from win rate, performance sizing and the daily-loss " +
+          "breaker. It is recorded in the audit log."
+      )
+    )
+      return;
+    try {
+      for (const id of r.tradeIds) await del.mutateAsync(id);
+    } catch (e) {
+      alert(`Could not delete: ${(e as Error).message}`);
+    }
+  }
 
   const realised = roundtrips.reduce((a, r) => a + (r.pnl ?? 0), 0);
   const closed = roundtrips.filter((r) => !r.open && r.pnl !== null);
@@ -184,8 +229,18 @@ export default function TradeHistory() {
       </div>
 
       <div className="dashboard-grid">
-        <Section title="Fyers — Executed Trades" rows={fyers} managedBy={managedBy} />
-        <Section title="Paper Trading — Executed Trades" rows={paper} managedBy={managedBy} />
+        <Section
+          title="Fyers — Executed Trades"
+          rows={fyers}
+          managedBy={managedBy}
+          onDelete={handleDelete}
+        />
+        <Section
+          title="Paper Trading — Executed Trades"
+          rows={paper}
+          managedBy={managedBy}
+          onDelete={handleDelete}
+        />
       </div>
     </div>
   );

@@ -167,6 +167,17 @@ export function useTrades(limit = 200, status?: string) {
   });
 }
 
+export function useDeleteTrade() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => api.delete(`/api/trades/${id}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["trades"] });
+      qc.invalidateQueries({ queryKey: ["dashboard-summary"] });
+    },
+  });
+}
+
 export function useDashboardSummary() {
   return useQuery<DashboardSummary>({
     queryKey: ["dashboard-summary"],
