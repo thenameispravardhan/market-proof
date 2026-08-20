@@ -8,7 +8,6 @@ import type {
   Analysis,
   Announcement,
   AuditLogEntry,
-  BacktestRun,
   BrokerAccount,
   DashboardSummary,
   GlobalSettings,
@@ -28,7 +27,6 @@ import type {
   SignalRule,
   Strategy,
   Trade,
-  Webhook,
 } from "../types";
 
 // ---- Dashboard / core ----
@@ -544,34 +542,6 @@ export function useUpdateCredentials() {
   });
 }
 
-// ---- Fyers order postback (webhook) config ----
-
-export interface FyersPostbackConfig {
-  public_base_url: string;
-  secret: string | null;
-  path: string;
-  url: string | null;
-  preference: string;
-  configured: boolean;
-  secret_present: boolean;
-}
-
-export function useFyersPostbackConfig() {
-  return useQuery<FyersPostbackConfig>({
-    queryKey: ["fyers-postback-config"],
-    queryFn: () => api.get("/api/fyers/postback/config"),
-  });
-}
-
-export function useUpdateFyersPostbackConfig() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (body: { public_base_url?: string; regenerate_secret?: boolean }) =>
-      api.post<FyersPostbackConfig>("/api/fyers/postback/config", body),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["fyers-postback-config"] }),
-  });
-}
-
 // ---- Notifications (T6) ----
 
 export function useNotificationChannels() {
@@ -614,101 +584,6 @@ export function useTestNotificationChannel() {
   return useMutation({
     mutationFn: (id: number) =>
       api.post<{ ok: boolean; error?: string }>(`/api/notifications/channels/${id}/test`, {}),
-  });
-}
-
-// ---- Webhooks (T6) ----
-
-export function useWebhooks() {
-  return useQuery<Webhook[]>({
-    queryKey: ["webhooks"],
-    queryFn: async () => {
-      const r = await api.get<{ webhooks: Webhook[] }>("/api/webhooks");
-      return r.webhooks;
-    },
-  });
-}
-
-export function useCreateWebhook() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (body: Partial<Webhook>) => api.post<Webhook>("/api/webhooks", body),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["webhooks"] }),
-  });
-}
-
-export function useUpdateWebhook(id: number | null) {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (body: Partial<Webhook>) => api.put<Webhook>(`/api/webhooks/${id}`, body),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["webhooks"] }),
-  });
-}
-
-export function useDeleteWebhook() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (id: number) => api.delete(`/api/webhooks/${id}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["webhooks"] }),
-  });
-}
-
-// ---- Backtest (T7) ----
-
-export function useBacktestRuns() {
-  return useQuery<BacktestRun[]>({
-    queryKey: ["backtest-runs"],
-    queryFn: () => api.get("/api/backtest/runs"),
-    refetchInterval: 5000,
-  });
-}
-
-export function useBacktestRun(id: number | null) {
-  return useQuery<BacktestRun>({
-    queryKey: ["backtest-run", id],
-    queryFn: () => api.get(`/api/backtest/runs/${id}`),
-    enabled: id !== null,
-    refetchInterval: (q) =>
-      q.state.data && ["pending", "running"].includes(q.state.data.status) ? 2000 : false,
-  });
-}
-
-export function useCreateBacktestRun() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (body: {
-      name?: string;
-      strategy_id?: number;
-      broker_account_id?: number;
-      start_date: string;
-      end_date: string;
-      initial_capital: number;
-    }) => api.post<BacktestRun>("/api/backtest/runs", body),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["backtest-runs"] }),
-  });
-}
-
-export function useDeleteBacktestRun() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (id: number) => api.delete(`/api/backtest/runs/${id}`),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["backtest-runs"] }),
-  });
-}
-
-export function useBacktestEquityCurve(id: number | null) {
-  return useQuery<{ curve: Array<{ date: string; equity: number }> }>({
-    queryKey: ["backtest-equity", id],
-    queryFn: () => api.get(`/api/backtest/runs/${id}/equity-curve`),
-    enabled: id !== null,
-  });
-}
-
-export function useBacktestTrades(id: number | null) {
-  return useQuery<{ trades: Array<Record<string, unknown>> }>({
-    queryKey: ["backtest-trades", id],
-    queryFn: () => api.get(`/api/backtest/runs/${id}/trades`),
-    enabled: id !== null,
   });
 }
 

@@ -206,57 +206,11 @@ export interface NotificationLog {
   sent_at: string;
 }
 
-export interface Webhook {
-  id: number;
-  name: string;
-  direction: "in" | "out";
-  event_filter: string | null;
-  url: string;
-  secret: string | null; // "***" when set
-  enabled: boolean;
-  created_at: string;
-}
 
-export interface WebhookDelivery {
-  id: number;
-  webhook_id: number;
-  direction: string;
-  event_type: string | null;
-  payload: Record<string, unknown> | null;
-  status_code: number | null;
-  response_body: string | null;
-  error: string | null;
-  attempted_at: string;
-}
 
 // ---- T7 types ----
 
-export interface BacktestRun {
-  id: number;
-  name: string | null;
-  strategy_id: number | null;
-  broker_account_id: number | null;
-  start_date: string;
-  end_date: string;
-  initial_capital: number;
-  status: "pending" | "running" | "done" | "failed";
-  created_at: string;
-  finished_at: string | null;
-  config?: Record<string, unknown> | null;
-  metrics?: Record<string, unknown> | null;
-  announcements_processed?: number | null;
-  signals_generated?: number | null;
-  blocked_trades?: number | null;
-}
 
-export interface BacktestTrade {
-  symbol: string;
-  side: string;
-  quantity: number;
-  price: number;
-  pnl: number;
-  executed_at: string;
-}
 
 export interface EquityPoint {
   date: string;

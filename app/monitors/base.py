@@ -47,7 +47,6 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.db.models import Announcement
 from app.logging_config import get_logger
-from app.services import webhook_service
 from app.services.event_bus import event_bus
 
 
@@ -106,7 +105,7 @@ class RawAnnouncement:
 
 
 # A fetcher returns the raw payload (HTML / JSON) that the parser will
-# then turn into RawAnnouncements. Async so we can use Playwright /
+# then turn into RawAnnouncements. Async so we can use
 # aiohttp under the hood. Accepts the monitor's `source_url` for
 # convenience — some fetchers want the URL as a hint.
 Fetcher = Callable[[str], Awaitable[Union[str, bytes]]]
@@ -574,10 +573,6 @@ class BaseMonitor:
         except Exception:  # noqa: BLE001
             # A failed publish should not lose the row — log and move on.
             log.exception("monitor.publish_failed", announcement_id=new_id)
-        try:
-            await webhook_service.emit("announcement", payload)
-        except Exception:  # noqa: BLE001
-            log.exception("monitor.webhook_failed", announcement_id=new_id)
 
     def _insert_one(self, announcement: Announcement, content_hash: str) -> Optional[int]:
         """Synchronous insert — runs in the executor.

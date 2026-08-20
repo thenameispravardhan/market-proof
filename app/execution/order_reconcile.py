@@ -1,9 +1,8 @@
 """Shared Fyers order reconciliation.
 
-A Fyers order update — whether it arrives via the **postback webhook**
-(`app.api.fyers_postback`) or the **order WebSocket**
-(`app.execution.fyers_stream`) — carries the same order object. Both
-paths funnel through `reconcile_order_update` so they behave identically:
+A Fyers order update arrives via the **order WebSocket**
+(`app.execution.fyers_stream`) or the REST reconcile sweep. Everything
+funnels through `reconcile_order_update` so every path behaves the same:
 
   - Match the existing `trades` row by ``broker_order_id`` (NEVER create a
     signal — that would risk a re-trade feedback loop).
@@ -30,9 +29,65 @@ from sqlalchemy.orm import Session
 from app.db.models import AuditLog, Position as PositionRow, Trade as TradeRow
 from app.logging_config import get_logger
 from app.services.event_bus import event_bus
-from app.webhooks.fyers import _split_symbol, _status_text, _unwrap_fyers
 
 log = get_logger(__name__)
+
+# Fyers numeric order-status codes -> text labels.
+FYERS_STATUS_HINTS: dict[str, str] = {
+    "1": "CANCELLED",
+    "2": "FILLED",
+    "4": "REJECTED",
+    "5": "AMO_MODIFIED",
+    "6": "AMO_CANCELLED",
+    "7": "MODIFIED",
+    "8": "EXPIRED",
+    "10": "TRIGGERED",
+    "11": "AMO_FROZEN",
+}
+
+
+def _split_symbol(raw: str) -> tuple[str, str]:
+    """Split a Fyers-style symbol like "NSE:SBIN-EQ" into
+    ("NSE", "SBIN-EQ"). Defaults to ("NSE", raw) when no prefix."""
+    if not raw:
+        return ("NSE", "")
+    s = str(raw).strip()
+    if ":" in s:
+        exch, _, sym = s.partition(":")
+        return (exch.strip().upper(), sym.strip())
+    return ("NSE", s)
+
+
+def _status_text(raw: Any) -> str:
+    """Map a Fyers numeric status code to its text label. Falls back
+    to the raw value as a string when it doesn't match the known set."""
+    if raw is None:
+        return "UNKNOWN"
+    key = str(raw).strip()
+    if key in FYERS_STATUS_HINTS:
+        return FYERS_STATUS_HINTS[key]
+    if key.isalpha():
+        return key.upper()
+    return key
+
+
+def _unwrap_fyers(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """If the payload wraps the actual order object under `orders`,
+    return the inner order. Otherwise return the payload unchanged.
+
+    Fyers uses BOTH wrapper shapes: the order WebSocket delivers
+    ``{"s": "ok", "orders": {<order>}}`` (a single dict), while other
+    surfaces wrap a list (``{"orders": [{<order>}, ...]}``)."""
+    inner = payload.get("orders")
+    if isinstance(inner, list) and inner and isinstance(inner[0], dict):
+        inner = inner[0]
+    if isinstance(inner, dict):
+        # Merge: wrapper-level fields first, then order-level fields
+        # (order-level wins on collisions).
+        merged: dict[str, Any] = {k: v for k, v in payload.items() if k != "orders"}
+        merged.update(inner)
+        return merged
+    return dict(payload)
 
 # Fyers status text (from `_status_text`) -> our internal trade status.
 _STATUS_MAP = {
@@ -48,8 +103,9 @@ async def reconcile_order_update(
     """Reconcile a single Fyers order update against the trades table.
 
     `payload` is the raw Fyers order object (or a wrapper around it).
-    `source` tags where the update came from (``fyers_postback`` /
-    ``fyers_order_ws``) for the audit trail and the published event.
+    `source` tags where the update came from (e.g. ``fyers_order_ws``)
+    for the audit trail and the published event. Historical rows may
+    carry ``fyers_postback`` from the since-removed webhook receiver.
     Commits `db` on a match. Returns a result dict describing the outcome.
     """
     order = _unwrap_fyers(payload)

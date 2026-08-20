@@ -10,7 +10,6 @@ from app.db.models import (
     Analysis,
     Announcement,
     AuditLog,
-    BacktestRun,
     BrokerAccount,
     NotificationChannel,
     NotificationLog,
@@ -22,8 +21,6 @@ from app.db.models import (
     SignalRule,
     Strategy,
     Trade,
-    Webhook,
-    WebhookDelivery,
 )
 from app.db.session import Base
 from app.db import session as db_session_mod
@@ -43,11 +40,8 @@ EXPECTED_TABLES = {
     "signal_rules",
     "prompt_templates",
     "prompt_history",
-    "webhooks",
-    "webhook_deliveries",
     "notification_channels",
     "notification_log",
-    "backtest_runs",
     "audit_log",
     # infra
     "app_settings",
@@ -79,11 +73,8 @@ def test_base_metadata_covers_all_models() -> None:
         SignalRule,
         PromptTemplate,
         PromptHistory,
-        Webhook,
-        WebhookDelivery,
         NotificationChannel,
         NotificationLog,
-        BacktestRun,
         AuditLog,
     ):
         assert cls.__tablename__ in tables, f"model {cls.__name__} not registered"
@@ -356,16 +347,6 @@ def test_prompt_template_unique_event_type(db_session) -> None:
     db_session.rollback()
 
 
-def test_crud_webhook_and_delivery(db_session) -> None:
-    w = Webhook(name="Slack", direction="out", event_filter="signal,trade", url="https://x")
-    db_session.add(w)
-    db_session.flush()
-    d = WebhookDelivery(webhook_id=w.id, direction="out", event_type="signal", status_code=200)
-    db_session.add(d)
-    db_session.flush()
-    assert d.id is not None
-
-
 def test_crud_notification_channel_and_log(db_session) -> None:
     ch = NotificationChannel(
         name="TG-Alerts",
@@ -379,25 +360,6 @@ def test_crud_notification_channel_and_log(db_session) -> None:
     db_session.add(log)
     db_session.flush()
     assert log.id is not None
-
-
-def test_crud_backtest_run(db_session) -> None:
-    from datetime import date
-
-    s = Strategy(name="BT")
-    db_session.add(s)
-    db_session.flush()
-    run = BacktestRun(
-        name="trial",
-        strategy_id=s.id,
-        start_date=date(2024, 1, 1),
-        end_date=date(2024, 12, 31),
-        initial_capital=1_000_000.0,
-        status="pending",
-    )
-    db_session.add(run)
-    db_session.flush()
-    assert run.id is not None
 
 
 def test_crud_audit_log(db_session) -> None:

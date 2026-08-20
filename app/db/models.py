@@ -7,8 +7,7 @@ Table list (14):
 
   Advanced (8):
     strategies, broker_accounts, signal_rules, prompt_templates,
-    prompt_history, webhooks, webhook_deliveries, notification_channels,
-    notification_log, backtest_runs, audit_log
+    prompt_history, notification_channels, notification_log, audit_log
 
 Naming convention: every table has an explicit `__tablename__` and the
 columns mirror the schema in `t1-infra` task spec.
@@ -496,55 +495,6 @@ class PromptHistory(Base):
 
 
 # =========================================================================
-# Advanced: webhooks
-# =========================================================================
-
-
-class Webhook(Base):
-    __tablename__ = "webhooks"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str] = mapped_column(String(128), nullable=False)
-    direction: Mapped[str] = mapped_column(String(8), nullable=False)       # in | out
-    event_filter: Mapped[Optional[str]] = mapped_column(String(512))       # csv or "*"
-    url: Mapped[str] = mapped_column(String(1024), nullable=False)
-    secret: Mapped[Optional[str]] = mapped_column(Text)                    # HMAC key for out, bearer for in
-    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
-
-    deliveries: Mapped[list["WebhookDelivery"]] = relationship(
-        back_populates="webhook", cascade="all, delete-orphan"
-    )
-
-    __table_args__ = (Index("ix_webhooks_direction_enabled", "direction", "enabled"),)
-
-
-# =========================================================================
-# Advanced: webhook_deliveries
-# =========================================================================
-
-
-class WebhookDelivery(Base):
-    __tablename__ = "webhook_deliveries"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    webhook_id: Mapped[int] = mapped_column(
-        ForeignKey("webhooks.id", ondelete="CASCADE"), nullable=False
-    )
-    direction: Mapped[str] = mapped_column(String(8), nullable=False)
-    event_type: Mapped[Optional[str]] = mapped_column(String(64))
-    payload: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
-    status_code: Mapped[Optional[int]] = mapped_column(Integer)
-    response_body: Mapped[Optional[str]] = mapped_column(Text)
-    error: Mapped[Optional[str]] = mapped_column(Text)
-    attempted_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
-
-    webhook: Mapped["Webhook"] = relationship(back_populates="deliveries")
-
-    __table_args__ = (Index("ix_webhook_deliveries_webhook_time", "webhook_id", "attempted_at"),)
-
-
-# =========================================================================
 # Advanced: notification_channels
 # =========================================================================
 
@@ -589,32 +539,6 @@ class NotificationLog(Base):
 
 
 # =========================================================================
-# Advanced: backtest_runs
-# =========================================================================
-
-
-class BacktestRun(Base):
-    __tablename__ = "backtest_runs"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[Optional[str]] = mapped_column(String(128))
-    strategy_id: Mapped[Optional[int]] = mapped_column(
-        ForeignKey("strategies.id", ondelete="SET NULL"), index=True
-    )
-    broker_account_id: Mapped[Optional[int]] = mapped_column(
-        ForeignKey("broker_accounts.id", ondelete="SET NULL")
-    )
-    start_date: Mapped[date] = mapped_column(Date, nullable=False)
-    end_date: Mapped[date] = mapped_column(Date, nullable=False)
-    initial_capital: Mapped[float] = mapped_column(Float, nullable=False)
-    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
-    config: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
-    results: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
-    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
-
-
-# =========================================================================
 # Advanced: audit_log
 # =========================================================================
 
@@ -650,10 +574,7 @@ __all__ = [
     "SignalRule",
     "PromptTemplate",
     "PromptHistory",
-    "Webhook",
-    "WebhookDelivery",
     "NotificationChannel",
     "NotificationLog",
-    "BacktestRun",
     "AuditLog",
 ]

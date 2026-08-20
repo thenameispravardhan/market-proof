@@ -39,8 +39,6 @@ const Rules = lazy(() => import("./pages/Rules"));
 const Strategies = lazy(() => import("./pages/Strategies"));
 const Accounts = lazy(() => import("./pages/Accounts"));
 const Notifications = lazy(() => import("./pages/Notifications"));
-const Webhooks = lazy(() => import("./pages/Webhooks"));
-const Backtest = lazy(() => import("./pages/Backtest"));
 const Settings = lazy(() => import("./pages/Settings"));
 const Exits = lazy(() => import("./pages/Exits"));
 const Timing = lazy(() => import("./pages/Timing"));
@@ -70,12 +68,10 @@ const TABS: { key: TabKey; label: string; emoji: string; group: NavGroup }[] = [
   { key: "trades",         label: "Trade History",  emoji: "₹", group: "PERFORMANCE" },
   { key: "outcomes",       label: "Outcomes",       emoji: "◎", group: "PERFORMANCE" },
   { key: "timing",         label: "Timing",         emoji: "◷", group: "PERFORMANCE" },
-  { key: "backtest",       label: "Backtest",       emoji: "↻", group: "PERFORMANCE" },
   { key: "dataset",        label: "Dataset",        emoji: "▥", group: "PERFORMANCE" },
   // Plumbing
   { key: "accounts",       label: "Accounts",       emoji: "▦", group: "SYSTEM" },
   { key: "notifications",  label: "Notifications",  emoji: "◉", group: "SYSTEM" },
-  { key: "webhooks",       label: "Webhooks",       emoji: "⇄", group: "SYSTEM" },
   { key: "settings",       label: "Settings",       emoji: "⚙", group: "SYSTEM" },
 ];
 
@@ -91,8 +87,6 @@ function PageContent({ tab }: { tab: TabKey }) {
     case "strategies": return <Strategies />;
     case "accounts": return <Accounts />;
     case "notifications": return <Notifications />;
-    case "webhooks": return <Webhooks />;
-    case "backtest": return <Backtest />;
     case "settings": return <Settings />;
     case "exits": return <Exits />;
     case "timing": return <Timing />;

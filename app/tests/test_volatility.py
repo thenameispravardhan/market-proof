@@ -87,22 +87,6 @@ def test_null_provider_returns_none():
     assert volatility.resolve_atr(None, "X") is None
 
 
-def test_tick_window_provider_estimates_after_enough_ticks():
-    p = volatility.TickWindowVolatilityProvider(window=20, min_ticks=5)
-    assert p.atr("ABC") is None  # no data yet
-    for px in (100, 102, 101, 103, 102, 104):
-        p.record("ABC", px)
-    est = p.atr("ABC")
-    assert est is not None and est > 0
-
-
-def test_tick_window_provider_ignores_bad_prices():
-    p = volatility.TickWindowVolatilityProvider(min_ticks=3)
-    p.record("ABC", 0)
-    p.record("ABC", -5)
-    assert p.atr("ABC") is None
-
-
 # -- VIX regime -----------------------------------------------------------
 
 

@@ -35,10 +35,10 @@ Deliberate decisions baked into the config (don't undo them):
 - **Single uvicorn worker, always.** The app is one stateful process
   (in-memory event bus, schedulers, Fyers sockets). Two workers = duplicate
   monitors = duplicate trades.
-- **The Fyers postback path (`/api/fyers/postback`) bypasses basic auth** —
-  Fyers' servers call it and can't send credentials. It is protected by its
-  own `?token=<FYERS_POSTBACK_SECRET>` check inside the app. The config
-  endpoints under `/api/fyers/postback/config` stay behind auth.
+- **Every path is behind basic auth.** There used to be an exemption for the
+  Fyers order postback; that endpoint was removed — the new Fyers API
+  dashboard has no webhook field, so it could never fire. Order updates come
+  from the Fyers order WebSocket plus the 60s REST reconcile sweep.
 
 ## What you need before starting
 
@@ -112,7 +112,7 @@ bash deploy/setup.sh
 
 The script prompts for the domain and a dashboard username/password, then
 does everything in [deploy/setup.sh](../deploy/setup.sh)'s header comment:
-swap, Python 3.11, Node 20, Caddy, venv + requirements, Playwright Chromium,
+swap, Python 3.11, Node 20, Caddy, venv + requirements,
 frontend build, `.env` bootstrap, systemd unit, HTTPS. Re-running it is safe.
 
 ## Step 5 — Migrate your local data
@@ -173,10 +173,6 @@ At [myapi.fyers.in](https://myapi.fyers.in), on your app:
 3. In the bot UI → accounts, click **Connect Fyers** and complete the OAuth
    popup. Tokens expire daily — this re-connect is a **daily manual step**,
    same as it was locally, just from any browser now.
-4. Postback: in the UI's postback config, set the public base URL to
-   `https://<your-domain>` so Fyers order webhooks reach
-   `/api/fyers/postback`. The cloudflared tunnel from the Windows setup is
-   no longer needed.
 
 ## Step 8 — Smoke test (stay in paper mode)
 

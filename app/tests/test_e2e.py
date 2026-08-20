@@ -297,34 +297,6 @@ def test_notification_channels_list(client):
 
 
 # ═════════════════════════════════════════════════════════════════════════
-# T6: Webhooks list (empty)
 # ═════════════════════════════════════════════════════════════════════════
 
 
-def test_webhooks_list(client):
-    r = client.get("/api/webhooks")
-    assert r.status_code == 200
-    assert "webhooks" in r.json()
-
-
-# ═════════════════════════════════════════════════════════════════════════
-# T7: Backtest run creation
-# ═════════════════════════════════════════════════════════════════════════
-
-
-def test_backtest_run_create_and_list(client):
-    r = client.post("/api/backtest/runs", json={
-        "name": "E2E test run",
-        "start_date": "2026-01-01",
-        "end_date": "2026-03-31",
-        "initial_capital": 50000,
-    })
-    assert r.status_code in (200, 201)
-    run = r.json()
-    run_id = run["id"]
-
-    r = client.get("/api/backtest/runs")
-    assert r.status_code == 200
-
-    # Cleanup
-    client.delete(f"/api/backtest/runs/{run_id}")

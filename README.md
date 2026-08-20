@@ -72,7 +72,7 @@ Everything is controlled from a browser dashboard — no CLI-only gates, no conf
 - **ML dataset builder**: enriches every signal (and every analyzed-but-unsignaled filing) with 1-minute-candle reaction features + horizon targets for future model training — CSV/JSONL export with look-ahead-leak checks.
 
 **Frontend (Bloomberg-terminal-style SPA)**
-- Live dashboard, TradingView-style interactive charts (lightweight-charts, 9 overlays + 9 oscillators, drawing tools, price alerts), manual order ticket, option chain, positions with live P&L, backtest viewer.
+- Live dashboard, TradingView-style interactive charts (lightweight-charts, 9 overlays + 9 oscillators, drawing tools, price alerts), manual order ticket, option chain, positions with live P&L.
 
 ---
 
@@ -82,7 +82,7 @@ Everything is controlled from a browser dashboard — no CLI-only gates, no conf
 |--------------|------|
 | Backend      | Python 3.11, FastAPI, Uvicorn, SQLAlchemy 2, SQLite (WAL), structlog, httpx |
 | Realtime     | Fyers API v3 (WebSocket data + order sockets), in-memory async event bus |
-| AI / parsing | DeepSeek (news classification), PyMuPDF (PDF text), Playwright (scrape fallback) |
+| AI / parsing | DeepSeek (news classification), PyMuPDF (PDF text) |
 | Frontend     | React 18, TypeScript 5, Vite 6, TanStack Query, Recharts, lightweight-charts |
 | Testing      | pytest (~900 tests) + vitest (56 tests) |
 
@@ -147,10 +147,9 @@ app/                 FastAPI backend
 ├── monitors/         NSE / BSE scrapers
 ├── risk/             risk engine, position sizer, circuit breakers, volatility
 ├── services/         event bus, instrument master, outcome logger, dataset builder
-├── notifications/    telegram / discord / email / webhook channels
-└── webhooks/         inbound / outbound webhook dispatch + HMAC signing
+└── notifications/    telegram / discord / email / webhook channels
 frontend/            React + Vite dashboard
-scripts/             run / dev, Fyers setup, seeders, smoke tests
+scripts/             run / dev, prompt + rule seeders, maintenance
 PROJECT.txt          full internal system specification
 plan.txt             improvement roadmap
 ```

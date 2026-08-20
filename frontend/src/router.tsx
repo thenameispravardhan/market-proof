@@ -17,8 +17,6 @@ export type TabKey =
   | "strategies"
   | "accounts"
   | "notifications"
-  | "webhooks"
-  | "backtest"
   | "settings";
 
 const VALID_TABS = new Set<TabKey>([
@@ -34,8 +32,6 @@ const VALID_TABS = new Set<TabKey>([
   "strategies",
   "accounts",
   "notifications",
-  "webhooks",
-  "backtest",
   "settings",
 ]);
 

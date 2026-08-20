@@ -15,16 +15,14 @@ percentage stop / no-op — we never fabricate a number, matching the
 `RISK.md` "never a phantom guard" philosophy. The live ATR path is the
 Fyers history-candle provider, which the lifespan wires in for every mode;
 with no connected Fyers account it returns nothing and the caller falls
-back to the percentage stop. `TickWindowVolatilityProvider` is a
-candle-free estimator a caller can opt into (e.g. to drive the ATR path
-off the tick bus) but is not the active default.
+back to the percentage stop.
 
 Design:
   - `compute_atr(candles, period)` — Wilder's ATR over OHLC candles.
   - `VolatilityProvider` — `atr(symbol) -> float | None`. Two impls:
         `NullVolatilityProvider`      (always None — the safe default)
-        `TickWindowVolatilityProvider`(rough ATR from MarketDataBus ticks;
-                                       opt-in, not the active default)
+        `FyersCandleVolatilityProvider` (real ATR from Fyers history
+                                       candles — the live default)
   - `stop_distance(...)` — the ATR×mult stop distance, clamped to a sane
     band of entry and falling back to the percentage stop when ATR is None.
   - `VolatilityRegime` — `india_vix() -> float | None` + `vix_risk_multiplier`
@@ -128,43 +126,6 @@ class NullVolatilityProvider:
 
     def atr(self, symbol: str) -> Optional[float]:  # noqa: D401
         return None
-
-
-class TickWindowVolatilityProvider:
-    """Rough ATR estimate from a rolling window of recent last-prices.
-
-    True ATR needs OHLC bars; we don't have intraday candles until the
-    Fyers history feed is wired. As an interim that lets paper mode
-    exercise the ATR path, we approximate the average true range by the
-    mean absolute tick-to-tick price change over the last `window` ticks.
-    It is intentionally a coarse proxy — documented as such, not a claim
-    about real volatility — and is only the default in paper mode.
-    """
-
-    def __init__(self, *, window: int = 20, min_ticks: int = 8) -> None:
-        self._window = int(window)
-        self._min_ticks = int(min_ticks)
-        self._prices: dict[str, Deque[float]] = {}
-
-    def record(self, symbol: str, price: float) -> None:
-        if price is None or price <= 0:
-            return
-        sym = symbol.upper().strip()
-        dq = self._prices.get(sym)
-        if dq is None:
-            dq = deque(maxlen=self._window)
-            self._prices[sym] = dq
-        dq.append(float(price))
-
-    def atr(self, symbol: str) -> Optional[float]:
-        dq = self._prices.get(symbol.upper().strip())
-        if dq is None or len(dq) < self._min_ticks:
-            return None
-        diffs = [abs(b - a) for a, b in zip(dq, list(dq)[1:])]
-        if not diffs:
-            return None
-        est = sum(diffs) / len(diffs)
-        return float(est) if est > 0 else None
 
 
 def resolve_atr(

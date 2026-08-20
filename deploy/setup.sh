@@ -118,10 +118,6 @@ fi
 .venv/bin/pip install --upgrade pip wheel
 .venv/bin/pip install -r requirements.txt
 
-echo "==> Playwright Chromium (NSE/BSE scrape fallback)"
-sudo "$PROJECT_ROOT/.venv/bin/python" -m playwright install-deps chromium
-.venv/bin/python -m playwright install chromium
-
 # ---- 5. frontend build ----------------------------------------------------
 if [ ! -f frontend/dist/index.html ]; then
     echo "==> Building the React dashboard (this takes a few minutes)"

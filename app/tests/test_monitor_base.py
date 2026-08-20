@@ -196,7 +196,7 @@ def _stub_parser(payloads_by_call):
 @pytest.mark.asyncio
 async def test_base_monitor_inserts_and_publishes(db_session):
     """One tick with one announcement => 1 row, 1 event_bus publish,
-    1 webhook_service enqueue (if a matching webhook exists)."""
+    the event bus."""
     from app.services.event_bus import event_bus
     sub = event_bus.subscribe("announcements.new")
     try:

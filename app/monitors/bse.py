@@ -8,7 +8,7 @@ miss a filing just because it landed in a different bucket.
 The endpoint requires the cookies set by a prior GET to the BSE
 home page, plus the right headers (Referer + Origin). The
 ``fetch_bse_with_httpx`` fast path handles the common case; we
-fall back to Playwright when the API returns 4xx (IP block / CORS).
+and back off when the API returns 4xx (IP block / CORS).
 
 Endpoints hit per tick (all in parallel)::
 
@@ -378,7 +378,7 @@ async def _get_bse_client(*, transport: Any = None) -> "httpx.AsyncClient":
 
 
 # -------------------------------------------------------------------------
-# Wire-level fetchers — httpx fast path, Playwright fallback.
+# Wire-level fetcher — httpx.
 # -------------------------------------------------------------------------
 
 
@@ -413,10 +413,10 @@ async def _prime_bse(client: "httpx.AsyncClient") -> None:
     A 401/403 on the *landing page* is tolerated (mirrors NSE): BSE's
     edge often bot-blocks the HTML home page while the JSON API still
     answers with the cookies we already hold. Treating a landing-page
-    403 as fatal forced EVERY tick onto the slow Playwright fallback
+    403 as fatal forced EVERY tick into backoff
     even when the API path was fine. The real block signal is the API
     call itself — if the category fan-out returns 401/403 the caller
-    re-arms priming and bounces to Playwright. Only a 5xx here (BSE
+    re-arms priming and backs off. Only a 5xx here (BSE
     genuinely down) is worth an immediate retry.
     """
     from app.monitors.base import _RetryableError
@@ -526,107 +526,11 @@ async def fetch_bse_with_httpx(
     return _json_dumps({"Table": merged, "Table1": []})
 
 
-async def fetch_bse_with_playwright(
-    url: str, *, categories: tuple[str, ...] = BSE_CATEGORIES
-) -> str:
-    """Open Chromium, seed cookies, hit the announcements API.
 
-    BSE's CORS preflight rejects raw HTTP clients on some endpoints
-    — Playwright is the durable path because the browser handles
-    the preflight transparently.
-
-    Uses the persistent warm browser shared with NSE so the fallback
-    doesn't pay a Chromium cold-start penalty.
-    """
-    from app.monitors.base import _RetryableError
-    from app.monitors.browser_pool import get_browser
-
-    try:
-        browser = await get_browser()
-    except Exception as e:
-        raise _RetryableError(f"chromium launch failed: {e}") from e
-
-    context = await browser.new_context(
-        user_agent=BSE_REQUEST_HEADERS["User-Agent"],
-        extra_http_headers={
-            "Accept-Language": BSE_REQUEST_HEADERS["Accept-Language"],
-        },
-    )
-    try:
-        page = await context.new_page()
-        try:
-            response = await page.goto(
-                BSE_COOKIE_SEED_URL, wait_until="domcontentloaded", timeout=8000
-            )
-        except Exception as e:  # noqa: BLE001
-            raise _RetryableError(f"bse seed goto failed: {e}") from e
-        if response is not None and response.status >= 500:
-            raise _RetryableError(f"bse seed {response.status}")
-        if response is not None and response.status == 429:
-            raise _RetryableError("bse seed 429")
-
-        async def _one(cat: str) -> tuple[str, int, str]:
-            api_url = _bse_window_url(cat)
-            try:
-                api_resp = await context.request.get(
-                    api_url,
-                    headers={
-                        "Accept": BSE_REQUEST_HEADERS["Accept"],
-                        "Referer": BSE_REQUEST_HEADERS["Referer"],
-                        "Origin": BSE_REQUEST_HEADERS["Origin"],
-                    },
-                )
-                return (cat, api_resp.status, await api_resp.text())
-            except Exception as e:  # noqa: BLE001
-                return (cat, 0, "")
-
-        results = await asyncio.gather(*(_one(c) for c in categories), return_exceptions=True)
-
-        merged: list[dict[str, Any]] = []
-        any_success = False
-        for cat, result in zip(categories, results):
-            if isinstance(result, Exception):
-                log.debug("bse category failed (playwright)", category=cat, error=str(result))
-                continue
-            # See the sibling httpx path above for the cast rationale.
-            cat_name, status, text = cast(
-                tuple[str, int, str], result
-            )
-            if status == 429 or status >= 500:
-                raise _RetryableError(f"bse api {status}")
-            if status >= 400:
-                continue
-            try:
-                payload = _parse_json(text)
-            except Exception:
-                continue
-            if isinstance(payload, dict) and isinstance(payload.get("Table"), list):
-                merged.extend(payload["Table"])
-                if payload["Table"]:
-                    any_success = True
-
-        if not any_success and not merged:
-            return _json_dumps({"Table": [], "Table1": []})
-        return _json_dumps({"Table": merged, "Table1": []})
-    finally:
-        # Close the context but NOT the browser — it stays warm.
-        try:
-            await context.close()
-        except Exception:  # noqa: BLE001
-            pass
-
-
-async def fetch_bse(url: str) -> str:
-    """Try httpx first, fall back to Playwright on persistent 4xx."""
-    from app.monitors.base import _RetryableError
-
-    try:
-        return await fetch_bse_with_httpx(url)
-    except _RetryableError as e:
-        err = str(e)
-        if "403" in err or "401" in err or "CORS" in err or "IP block" in err:
-            return await fetch_bse_with_playwright(url)
-        raise
+# The monitors' default fetcher. Was a dual-path dispatcher (httpx, then
+# a Chromium fallback on 403); the Playwright path was removed after it
+# never fired once in production, so httpx IS the path now.
+fetch_bse = fetch_bse_with_httpx
 
 
 class BSEMonitor(BaseMonitor):

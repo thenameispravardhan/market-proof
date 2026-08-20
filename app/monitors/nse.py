@@ -5,7 +5,7 @@ server-rendered, but the table is hydrated by an XHR call. We hit the
 XHR endpoint for stability and a smaller payload, and we fall back to
 the page itself if the XHR fails.
 
-Endpoints (used in production by the Playwright fetcher):
+Endpoints:
 
   - https://www.nseindia.com/companies-listing/corporate-filings-announcements
   - https://www.nseindia.com/api/corporate-announcements?index=equities
@@ -222,7 +222,7 @@ def _nse_poll_url() -> str:
     ``MAX_NEWS_AGE_SECONDS`` (tens of seconds), re-downloading and
     re-parsing a full day of history every 1-5s is pure waste, and the
     repeated 720 KB request is exactly the pattern NSE's WAF rate-limits
-    (→ 403 → the slow Playwright fallback → backoff → *missed* news).
+    (→ 403 → backoff → *missed* news).
 
     NSE's no-parameter endpoint returns the 20 most-recent filings
     (~14 KB) with the identical newest timestamp — measured live it
@@ -347,13 +347,12 @@ def _close_nse_client() -> None:
 #      GET the XHR with the same cookie jar).  The httpx **client**
 #      is now persistent across ticks so TCP/SSL setup is a one-time
 #      cost; only the cookie-primer GET runs per tick.
-#   2. `fetch_nse_with_playwright` — slow path, launches Chromium to
-#      seed cookies via the in-page fetch() and also shares the
-#      cookie jar across the request.
 #
-# The httpx path fails clean with a 403 in many environments because
-# the cookie jar is incomplete; the Playwright path is the durable
-# fallback.
+# A Chromium (Playwright) fallback used to sit behind this for the 403
+# case. It never fired once in production and cost 863 MB on the box,
+# so it was removed — httpx is the only path now. A persistent 403
+# means the server IP is blocked, which Chromium from the same IP
+# would not have fixed anyway.
 # -------------------------------------------------------------------------
 
 
@@ -399,9 +398,8 @@ async def fetch_nse_with_httpx(url: str, *, transport: Any = None) -> str:
     a fresh one (so the mock transport is always correctly bound).
 
     Returns the raw JSON text. Raises `_RetryableError` on network /
-    5xx / 429 / 403. The monitor loop will back off and retry; if
-    403s persist, the `fetch_nse_with_playwright` fallback is wired
-    in the manager.
+    5xx / 429 / 403. The monitor loop backs off and retries; a
+    persistent 403 means the IP is blocked and needs operator action.
     """
     from app.monitors.base import _RetryableError
 
@@ -432,8 +430,7 @@ async def fetch_nse_with_httpx(url: str, *, transport: Any = None) -> str:
     if resp.status_code == 429 or resp.status_code >= 500:
         raise _RetryableError(f"nse xhr {resp.status_code}")
     if resp.status_code in (401, 403):
-        # Cookies likely went stale — re-arm priming for the next tick
-        # before we bounce to the Playwright fallback.
+        # Cookies likely went stale — re-arm priming for the next tick.
         if is_prod:
             _nse_primed = False
         raise _RetryableError(f"nse xhr {resp.status_code} (likely bot block)")
@@ -442,103 +439,11 @@ async def fetch_nse_with_httpx(url: str, *, transport: Any = None) -> str:
     return resp.text
 
 
-async def fetch_nse_with_playwright(url: str) -> str:
-    """Open Chromium, seed cookies via a small page, hit the XHR.
 
-    Uses a persistent warm browser shared across NSE/BSE monitors so
-    the fallback path doesn't pay a 1-2s cold-start Chromium penalty
-    every time the httpx fast path gets blocked.
-
-    Uses `context.request` (Playwright's HTTP client) for the XHR
-    call so the cookie jar is shared with the browser. Falls back
-    to a 2nd in-page fetch() if `context.request` is blocked by
-    NSE's CDN.
-
-    Returns the raw JSON text. Raises `_RetryableError` on network /
-    5xx / 429 / 4xx.
-    """
-    from app.monitors.base import _RetryableError
-    from app.monitors.browser_pool import get_browser
-
-    try:
-        browser = await get_browser()
-    except Exception as e:
-        raise _RetryableError(f"chromium launch failed: {e}") from e
-
-    context = await browser.new_context(
-        user_agent=NSE_REQUEST_HEADERS["User-Agent"],
-        extra_http_headers={
-            "Accept-Language": NSE_REQUEST_HEADERS["Accept-Language"],
-        },
-    )
-    try:
-        # Step 1: hit a light URL to seed cookies.
-        page = await context.new_page()
-        try:
-            response = await page.goto(
-                NSE_COOKIE_SEED_URL, wait_until="domcontentloaded", timeout=8000
-            )
-        except Exception as e:  # noqa: BLE001
-            raise _RetryableError(f"nse seed goto failed: {e}") from e
-        if response is not None and response.status >= 500:
-            raise _RetryableError(f"nse seed {response.status}")
-        if response is not None and response.status == 429:
-            raise _RetryableError("nse seed 429")
-
-        # Step 2: hit the XHR via context.request so cookies flow.
-        # Same light most-recent feed as the httpx path.
-        xhr_url = _nse_poll_url()
-        try:
-            api_resp = await context.request.get(
-                xhr_url,
-                headers={
-                    "Accept": NSE_REQUEST_HEADERS["Accept"],
-                    "Referer": NSE_REQUEST_HEADERS["Referer"],
-                    "Origin": NSE_REQUEST_HEADERS["Origin"],
-                },
-            )
-        except Exception as e:  # noqa: BLE001
-            raise _RetryableError(f"nse xhr request failed: {e}") from e
-        status = api_resp.status
-        if status == 429 or status >= 500:
-            raise _RetryableError(f"nse xhr {status}")
-        if status >= 400:
-            # 4xx other than 429 — usually means our IP / cookies
-            # are blocked. Back off and retry.
-            raise _RetryableError(f"nse xhr {status}")
-        try:
-            return await api_resp.text()
-        except Exception as e:  # noqa: BLE001
-            raise _RetryableError(f"nse xhr read failed: {e}") from e
-    finally:
-        # Close the context (cleans up pages/cookies) but NOT the
-        # browser — it stays warm for the next monitor tick.
-        try:
-            await context.close()
-        except Exception:  # noqa: BLE001
-            pass
-
-
-async def fetch_nse(url: str) -> str:
-    """Try httpx first, fall back to Playwright on persistent 4xx.
-
-    NSE's bot detection flips between strategies; this dual approach
-    keeps the monitor running in more environments than a single
-    path would.
-    """
-    from app.monitors.base import _RetryableError
-
-    # First attempt: httpx (fast).
-    try:
-        return await fetch_nse_with_httpx(url)
-    except _RetryableError as e:
-        err = str(e)
-        # 5xx, network, or 429 — worth retrying. 403 is a hard block;
-        # the cookie jar is incomplete; try the Playwright path.
-        if "403" in err or "401" in err or "bot block" in err or "IP block" in err:
-            return await fetch_nse_with_playwright(url)
-        # 5xx / network / 429 — bubble up so the monitor's backoff kicks in.
-        raise
+# The monitors' default fetcher. Was a dual-path dispatcher (httpx, then
+# a Chromium fallback on 403); the Playwright path was removed after it
+# never fired once in production, so httpx IS the path now.
+fetch_nse = fetch_nse_with_httpx
 
 
 class NSEMonitor(BaseMonitor):

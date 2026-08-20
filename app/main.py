@@ -22,12 +22,10 @@ from app import __version__
 from app.analyzer.service import Service as AnalyzerService
 from app.api import (
     audit_log as audit_log_api,
-    backtest,
     broker_accounts as broker_accounts_api,
     core as core_api,
     dataset as dataset_api,
     fyers_callback,
-    fyers_postback,
     health,
     market as market_api,
     metrics as metrics_api,
@@ -44,7 +42,6 @@ from app.api import (
     strategies as strategies_api,
     trading_mode,
     warehouse as warehouse_api,
-    webhooks as webhooks_api,
     ws,
 )
 from app.config import get_settings
@@ -56,7 +53,6 @@ from app.execution.trade_manager import TradeManager
 from app.logging_config import configure_logging, correlation_id_var, get_logger
 from app.monitors.manager import MonitorManager
 from app.notifications.manager import NotificationManager
-from app.webhooks.dispatcher import WebhookDispatcher
 
 
 @asynccontextmanager
@@ -134,7 +130,6 @@ async def lifespan(app: FastAPI):
     analyzer_service = AnalyzerService()
     execution_manager = ExecutionManager()
     notification_manager = NotificationManager()
-    webhook_dispatcher = WebhookDispatcher()
     # Phase 4: passive signals.new → signal_outcomes recorder (price at
     # signal, +5m, +30m). Pure telemetry — no trading influence.
     from app.services.outcome_logger import OutcomeLogger
@@ -325,12 +320,10 @@ async def lifespan(app: FastAPI):
         # FYERS_STREAMING_ENABLED to fall back to pure REST polling.
         if settings.FYERS_STREAMING_ENABLED:
             fyers_stream.start()
-        # T6: start the notification + outbound webhook managers.
-        # Both subscribe to the event bus; the dispatcher POSTs to
-        # registered webhook URLs, the notification manager fans
-        # events out to operator-curated channels (Telegram, etc.).
+        # T6: start the notification manager — it subscribes to the
+        # event bus and fans events out to operator-curated channels
+        # (Telegram, etc.).
         notification_manager.start()
-        webhook_dispatcher.start()
         # Phase 4 outcome logger — subscribe before signals start flowing.
         outcome_logger.start()
         # Dataset builder — periodic 1-min-candle enrichment batches.
@@ -444,7 +437,6 @@ async def lifespan(app: FastAPI):
             quote_feed.stop()
             execution_manager.stop()
             notification_manager.stop()
-            webhook_dispatcher.stop()
             outcome_logger.stop()
             dataset_builder.stop()
             health_report_service.stop()
@@ -456,13 +448,8 @@ async def lifespan(app: FastAPI):
             await quote_feed.wait_until_stopped()
             await execution_manager.wait_until_stopped()
             await notification_manager.wait_until_stopped()
-            await webhook_dispatcher.wait_until_stopped()
             await outcome_logger.wait_until_stopped()
             await analyzer_service.aclose()
-            await webhook_dispatcher.aclose()
-            # Close the warm Playwright browser shared by NSE/BSE monitors.
-            from app.monitors.browser_pool import shutdown_browser
-            await shutdown_browser()
         log.info("app.shutdown")
 
 
@@ -527,11 +514,8 @@ app.include_router(health.router)
 app.include_router(settings_api.router)
 app.include_router(trading_mode.router)
 app.include_router(fyers_callback.router)
-app.include_router(fyers_postback.router)
 app.include_router(ws.router)
-app.include_router(backtest.router)
 app.include_router(notifications_api.router)
-app.include_router(webhooks_api.router)
 app.include_router(prompts_api.router)
 app.include_router(rules_api.router)
 app.include_router(strategies_api.router)

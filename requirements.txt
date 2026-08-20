@@ -31,7 +31,6 @@ fyers-apiv3==3.1.6
 
 # Scraping — NSE / BSE monitors (T2). Optional at runtime; the import
 # is lazy so tests + non-scraping envs don't need it.
-playwright==1.49.1
 
 # PDF text extraction — extracted-text mode (SEND_EXTRACTED_TEXT toggle).
 # Import is lazy; without the wheel the analyzer falls back to the

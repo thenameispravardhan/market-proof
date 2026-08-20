@@ -2,7 +2,7 @@
 
 We don't hit NSE from CI. Instead we mock httpx at the transport level
 so the cookie-priming + XHR sequence runs end-to-end against a
-recorded shape. Playwright path is covered by the parser tests; we
+recorded shape. The parser tests cover the response shape; we
 don't try to spin up a browser here.
 """
 from __future__ import annotations
@@ -117,56 +117,6 @@ async def test_fetch_nse_httpx_primer_5xx_raises_retryable() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fetch_nse_falls_back_to_playwright_on_403(monkeypatch) -> None:
-    """When httpx gets a 403, fetch_nse delegates to the Playwright path."""
-    # Capture a stable reference to the original httpx fetcher so the
-    # patched wrapper doesn't recurse into itself.
-    original_httpx_fetcher = nse_mod.fetch_nse_with_httpx
-
-    def _responder(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(403, content=b"blocked")
-
-    async def _failing_httpx(url: str, *, transport=None) -> str:
-        return await original_httpx_fetcher(url, transport=_make_mock_transport(_responder))
-
-    called = {"n": 0}
-
-    async def _stub(url: str) -> str:
-        called["n"] += 1
-        return "[]"
-
-    monkeypatch.setattr(nse_mod, "fetch_nse_with_httpx", _failing_httpx)
-    monkeypatch.setattr(nse_mod, "fetch_nse_with_playwright", _stub)
-    out = await nse_mod.fetch_nse("https://nse/landing")
-    assert out == "[]"
-    assert called["n"] == 1
-
-
-@pytest.mark.asyncio
-async def test_fetch_nse_does_not_fall_back_on_5xx(monkeypatch) -> None:
-    """5xx is retryable, not a hard block — we should NOT fall back."""
-    original_httpx_fetcher = nse_mod.fetch_nse_with_httpx
-
-    def _responder(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(500, content=b"err")
-
-    async def _failing_httpx(url: str, *, transport=None) -> str:
-        return await original_httpx_fetcher(url, transport=_make_mock_transport(_responder))
-
-    called = {"n": 0}
-
-    async def _stub(url: str) -> str:
-        called["n"] += 1
-        return "[]"
-
-    monkeypatch.setattr(nse_mod, "fetch_nse_with_httpx", _failing_httpx)
-    monkeypatch.setattr(nse_mod, "fetch_nse_with_playwright", _stub)
-    with pytest.raises(_RetryableError, match="500"):
-        await nse_mod.fetch_nse("https://nse/landing")
-    assert called["n"] == 0  # no fallback attempted
-
-
-@pytest.mark.asyncio
 async def test_fetch_nse_sets_required_headers() -> None:
     """NSE's required headers (Referer, Origin, User-Agent) must be on both calls."""
     seen: list[dict[str, str]] = []
@@ -192,7 +142,7 @@ async def test_fetch_nse_sets_required_headers() -> None:
 
 
 def test_nse_monitor_uses_combined_fetcher_by_default() -> None:
-    """The default NSEMonitor uses `fetch_nse` (httpx + Playwright fallback)."""
+    """The default NSEMonitor uses `fetch_nse` (the httpx fetcher)."""
     from app.monitors.nse import NSEMonitor, fetch_nse
 
     mon = NSEMonitor()

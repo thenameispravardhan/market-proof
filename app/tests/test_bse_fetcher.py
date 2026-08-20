@@ -116,52 +116,6 @@ async def test_fetch_bse_httpx_primer_5xx_raises_retryable() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fetch_bse_falls_back_to_playwright_on_403(monkeypatch) -> None:
-    original_httpx_fetcher = bse_mod.fetch_bse_with_httpx
-
-    def _responder(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(403, content=b"blocked")
-
-    async def _failing_httpx(url: str, *, transport=None) -> str:
-        return await original_httpx_fetcher(url, transport=_make_mock_transport(_responder))
-
-    called = {"n": 0}
-
-    async def _stub(url: str) -> str:
-        called["n"] += 1
-        return "{}"
-
-    monkeypatch.setattr(bse_mod, "fetch_bse_with_httpx", _failing_httpx)
-    monkeypatch.setattr(bse_mod, "fetch_bse_with_playwright", _stub)
-    out = await bse_mod.fetch_bse("https://bse/landing")
-    assert out == "{}"
-    assert called["n"] == 1
-
-
-@pytest.mark.asyncio
-async def test_fetch_bse_does_not_fall_back_on_5xx(monkeypatch) -> None:
-    original_httpx_fetcher = bse_mod.fetch_bse_with_httpx
-
-    def _responder(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(500, content=b"err")
-
-    async def _failing_httpx(url: str, *, transport=None) -> str:
-        return await original_httpx_fetcher(url, transport=_make_mock_transport(_responder))
-
-    called = {"n": 0}
-
-    async def _stub(url: str) -> str:
-        called["n"] += 1
-        return "{}"
-
-    monkeypatch.setattr(bse_mod, "fetch_bse_with_httpx", _failing_httpx)
-    monkeypatch.setattr(bse_mod, "fetch_bse_with_playwright", _stub)
-    with pytest.raises(_RetryableError, match="500"):
-        await bse_mod.fetch_bse("https://bse/landing")
-    assert called["n"] == 0
-
-
-@pytest.mark.asyncio
 async def test_fetch_bse_sets_required_headers() -> None:
     """BSE needs Referer set to the corporate-announcements page."""
     seen: list[dict[str, str]] = []
