@@ -10,7 +10,7 @@
 import { useMemo } from "react";
 import {
   useBrokerAccounts,
-  useDeleteTrade,
+  useDeleteTrades,
   useManagedPositions,
   useTrades,
 } from "../hooks/useApi";
@@ -150,7 +150,7 @@ export default function TradeHistory() {
   // (especially older entry legs) out of the newest-N window, or a closed
   // round-trip would lose its entry and show as a phantom open position.
   const { data: trades, isLoading, error } = useTrades(500, "filled");
-  const del = useDeleteTrade();
+  const del = useDeleteTrades();
   const { data: accounts } = useBrokerAccounts();
   const { data: managed } = useManagedPositions();
 
@@ -169,42 +169,55 @@ export default function TradeHistory() {
   const fyers = roundtrips.filter((r) => !r.isPaper);
   const paper = roundtrips.filter((r) => r.isPaper);
 
-  // A round-trip is 1-2 trade rows; delete them together or the survivor
-  // re-pairs with an older leg and shows as a phantom position.
-  async function handleDelete(r: RoundTrip) {
-    // A partially-closed lot shares its entry leg with the round-trips it
-    // already paid for (BUY 10 / SELL 4 leaves an open 6 pointing at the
-    // same trade row). Deleting that leg takes those rows with it, so say
-    // so instead of letting them vanish unexplained.
-    const alsoAffected = roundtrips.filter(
-      (o) => o !== r && o.tradeIds.some((id) => r.tradeIds.includes(id))
-    ).length;
+  // A displayed row is a *slice* of trade rows, not a row itself: a
+  // partially closed lot (BUY 10 / SELL 4 leaves an open 6) puts the same
+  // trade behind two displayed rows. So delete the whole connected
+  // cluster — every row reachable through a shared leg — and name it up
+  // front, instead of letting the neighbours vanish unexplained.
+  function clusterOf(r: RoundTrip): RoundTrip[] {
+    const picked = [r];
+    const ids = new Set(r.tradeIds);
+    for (let grew = true; grew; ) {
+      grew = false;
+      for (const o of roundtrips) {
+        if (picked.includes(o)) continue;
+        if (o.tradeIds.some((id) => ids.has(id))) {
+          picked.push(o);
+          o.tradeIds.forEach((id) => ids.add(id));
+          grew = true;
+        }
+      }
+    }
+    return picked;
+  }
 
-    const what = r.open
-      ? `the OPEN ${r.symbol} ${r.side} entry leg (qty ${r.quantity})`
-      : `the ${r.symbol} ${r.side} round-trip (P&L ₹${fmtMoney(r.pnl)})`;
+  async function handleDelete(r: RoundTrip) {
+    const group = clusterOf(r);
+    const ids = [...new Set(group.flatMap((g) => g.tradeIds))];
+    const pnl = group.reduce((a, g) => a + (g.pnl ?? 0), 0);
+
+    const what =
+      group.length === 1
+        ? r.open
+          ? `the OPEN ${r.symbol} ${r.side} entry leg (qty ${r.quantity})`
+          : `the ${r.symbol} ${r.side} round-trip (P&L ₹${fmtMoney(r.pnl)})`
+        : `${group.length} linked ${r.symbol} rows (P&L ₹${fmtMoney(pnl)})`;
 
     if (
       !confirm(
-        `Delete ${what} from history?
-
-` +
-          (alsoAffected > 0
-            ? `WARNING: this leg is shared with ${alsoAffected} other row(s), ` +
-              "which will disappear too.\n\n"
+        `Delete ${what} from history?\n\n` +
+          (group.length > 1
+            ? `These rows share ${ids.length} trade record(s) and cannot be ` +
+              "separated, so they go together.\n\n"
             : "") +
-          (r.open
-            ? "If this is a genuinely live position the server will refuse. " +
-              "Most open rows here are phantoms — an entry whose exit was " +
-              "never recorded.\n\n"
-            : "") +
-          "This removes it from win rate, performance sizing and the daily-loss " +
-          "breaker. It is recorded in the audit log."
+          "This removes them from win rate, performance sizing and the " +
+          "daily-loss breaker. Each row is recorded in the audit log."
       )
     )
       return;
+
     try {
-      for (const id of r.tradeIds) await del.mutateAsync(id);
+      await del.mutateAsync(ids);
     } catch (e) {
       alert(`Could not delete: ${(e as Error).message}`);
     }

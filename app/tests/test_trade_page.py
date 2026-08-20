@@ -791,13 +791,13 @@ def test_manager_rejects_zero_quantity(
 
 
 # =========================================================================
-# DELETE /api/trades/{id} — operator housekeeping on the history page
+# POST /api/trades/delete — operator housekeeping on the history page
 # =========================================================================
 
 
-def test_delete_trade_removes_row_and_audits(client: TestClient, db_session, isolated_db):
-    """A closed trade deletes, and the full row lands in audit_log so the
-    deletion can be reconstructed."""
+def test_delete_trades_removes_rows_and_audits(client: TestClient, db_session, isolated_db):
+    """Trades delete, and each full row lands in audit_log so the deletion
+    can be reconstructed."""
     from app.db.models import AuditLog
 
     t = Trade(symbol="SBIN", side="BUY", quantity=10, price=100.0,
@@ -806,40 +806,64 @@ def test_delete_trade_removes_row_and_audits(client: TestClient, db_session, iso
     db_session.commit()
     tid = t.id
 
-    r = client.delete(f"/api/trades/{tid}")
+    r = client.post("/api/trades/delete", json={"ids": [tid]})
     assert r.status_code == 200, r.text
-    assert r.json() == {"ok": True, "deleted": tid}
+    assert r.json() == {"ok": True, "deleted": [tid], "count": 1}
+
     db_session.expire_all()  # the API used its own session; drop our cache
     assert db_session.get(Trade, tid) is None
 
     entry = (
-        db_session.query(AuditLog)
-        .filter(AuditLog.target == f"trade:{tid}")
-        .one()
+        db_session.query(AuditLog).filter(AuditLog.target == f"trade:{tid}").one()
     )
     assert entry.action == "trade.delete"
     assert entry.before["symbol"] == "SBIN"
     assert entry.before["pnl"] == 50.0
 
 
-def test_delete_trade_refused_while_position_open(client: TestClient, db_session, isolated_db):
-    """The live book's entry legs are protected — deleting one would
-    strand a position the trade manager is still managing."""
+def test_delete_trades_is_atomic_across_the_cluster(client: TestClient, db_session, isolated_db):
+    """A shared leg means several displayed rows ride on the same trade
+    rows. The batch must be all-or-nothing: if ONE symbol is blocked,
+    nothing at all is deleted — a partial delete is what strands an exit
+    whose entry already went."""
     from app.db.models import Position
 
-    t = Trade(symbol="TCS", side="BUY", quantity=5, price=200.0,
+    free = Trade(symbol="WIPRO", side="BUY", quantity=5, price=10.0,
+                 order_type="market", status="filled")
+    guarded = Trade(symbol="TCS", side="BUY", quantity=5, price=200.0,
+                    order_type="market", status="filled")
+    db_session.add_all([free, guarded])
+    db_session.add(Position(symbol="TCS", quantity=5, average_price=200.0))
+    db_session.commit()
+    ids = [free.id, guarded.id]
+
+    r = client.post("/api/trades/delete", json={"ids": ids})
+    assert r.status_code == 409
+    assert "TCS" in r.json()["detail"]
+
+    db_session.expire_all()
+    # Neither row went — not even the unguarded one.
+    assert db_session.get(Trade, ids[0]) is not None
+    assert db_session.get(Trade, ids[1]) is not None
+
+
+def test_delete_trades_unknown_id_404s_and_deletes_nothing(
+    client: TestClient, db_session, isolated_db
+):
+    """An unknown id fails the whole batch before anything is removed."""
+    t = Trade(symbol="INFY", side="BUY", quantity=1, price=1.0,
               order_type="market", status="filled")
     db_session.add(t)
-    db_session.add(Position(symbol="TCS", quantity=5, average_price=200.0))
     db_session.commit()
     tid = t.id
 
-    r = client.delete(f"/api/trades/{tid}")
-    assert r.status_code == 409
-    assert "open position" in r.json()["detail"]
+    r = client.post("/api/trades/delete", json={"ids": [tid, 999999999]})
+    assert r.status_code == 404
+    assert "999999999" in r.json()["detail"]
+
     db_session.expire_all()
-    assert db_session.get(Trade, tid) is not None  # still there
+    assert db_session.get(Trade, tid) is not None
 
 
-def test_delete_trade_unknown_id_404s(client: TestClient, isolated_db):
-    assert client.delete("/api/trades/999999").status_code == 404
+def test_delete_trades_rejects_empty_id_list(client: TestClient, isolated_db):
+    assert client.post("/api/trades/delete", json={"ids": []}).status_code == 422

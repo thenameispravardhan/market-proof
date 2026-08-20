@@ -167,10 +167,16 @@ export function useTrades(limit = 200, status?: string) {
   });
 }
 
-export function useDeleteTrade() {
+export function useDeleteTrades() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (id: number) => api.delete(`/api/trades/${id}`),
+    // One request, one transaction. Deleting legs one call at a time is
+    // what strands an exit whose entry already went.
+    mutationFn: (ids: number[]) =>
+      api.post<{ ok: boolean; deleted: number[]; count: number }>(
+        "/api/trades/delete",
+        { ids }
+      ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["trades"] });
       qc.invalidateQueries({ queryKey: ["dashboard-summary"] });

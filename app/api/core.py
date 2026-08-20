@@ -7,7 +7,7 @@ Endpoints:
   GET  /api/signals/recent?limit=N
   GET  /api/positions
   GET  /api/trades?limit=N
-  DELETE /api/trades/{trade_id}              # operator housekeeping
+  POST /api/trades/delete                    # operator housekeeping
   GET  /api/dashboard/summary
   POST /api/analyses/run/{announcement_id}   # queue one announcement
   POST /api/analyses/backfill?limit=N        # queue N most recent unanalyzed
@@ -18,6 +18,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -216,52 +217,74 @@ def list_trades(
     return [_ser_trade(t) for t in rows]
 
 
-@router.delete("/api/trades/{trade_id}")
-def delete_trade(trade_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
-    """Delete one trade row from the history. Operator housekeeping.
+class TradeDeleteRequest(BaseModel):
+    ids: list[int] = Field(..., min_length=1, max_length=500)
 
-    This is a HOUSEKEEPING tool for junk rows (test fills, duplicates),
-    not an accounting one. The risk engine derives the performance-tier
-    sizing, the daily-loss breaker and the health report's P&L from
-    these rows, so deleting a real fill changes how the bot sizes and
-    when it halts. Every deletion is written to `audit_log` with the
-    full row, so it can be reconstructed.
 
-    Refuses while the symbol still holds an open position: those rows
-    are the live book's entry legs, and deleting one strands a position
-    the trade manager is still managing.
+@router.post("/api/trades/delete")
+def delete_trades(
+    body: TradeDeleteRequest, db: Session = Depends(get_db)
+) -> dict[str, Any]:
+    """Delete a set of trade rows in ONE transaction. Operator housekeeping.
+
+    Takes a set rather than a single id because the history page shows
+    round-trips, which are *derived slices* of these rows: a partially
+    closed lot (BUY 10 / SELL 4 leaves an open 6) puts the SAME trade row
+    behind two displayed rows. There is no way to delete one slice, so the
+    caller sends the whole cluster and it lives or dies together. Deleting
+    them one request at a time is what creates orphans — drop an entry leg,
+    fail on its exit, and the exit becomes the phantom this tool exists to
+    clear.
+
+    HOUSEKEEPING, not accounting: the risk engine derives performance-tier
+    sizing, the daily-loss breaker and the health report's P&L from these
+    rows. Every deletion is written to `audit_log` with the full row.
+
+    Refuses (409) if ANY symbol in the set still holds an open position —
+    those rows are the live book's entry legs — and refuses (404) if any
+    id is unknown. Both checks run before a single row is removed, so a
+    rejected request changes nothing.
     """
-    t = db.get(Trade, trade_id)
-    if t is None:
-        raise HTTPException(status_code=404, detail="trade not found")
+    ids = list(dict.fromkeys(body.ids))  # de-dupe, keep order
+    rows = db.execute(select(Trade).where(Trade.id.in_(ids))).scalars().all()
 
-    open_qty = db.execute(
-        select(Position.quantity).where(
-            Position.symbol == t.symbol, Position.quantity != 0
+    missing = set(ids) - {t.id for t in rows}
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail=f"unknown trade id(s): {sorted(missing)}",
         )
-    ).scalars().first()
-    if open_qty:
+
+    symbols = {t.symbol for t in rows}
+    blocked = db.execute(
+        select(Position.symbol, Position.quantity).where(
+            Position.symbol.in_(symbols), Position.quantity != 0
+        )
+    ).all()
+    if blocked:
+        names = ", ".join(f"{sym} ({qty})" for sym, qty in blocked)
         raise HTTPException(
             status_code=409,
             detail=(
-                f"{t.symbol} still has an open position ({open_qty}). "
+                f"still holding an open position in {names}. "
                 "Close it before deleting its trade rows."
             ),
         )
 
-    before = _ser_trade(t)
-    db.delete(t)
-    db.add(
-        AuditLog(
-            actor="ui",
-            action="trade.delete",
-            target=f"trade:{trade_id}",
-            before=before,
+    for t in rows:
+        db.add(
+            AuditLog(
+                actor="ui",
+                action="trade.delete",
+                target=f"trade:{t.id}",
+                before=_ser_trade(t),
+            )
         )
-    )
-    db.commit()
-    log.info("trade.deleted", trade_id=trade_id, symbol=before["symbol"])
-    return {"ok": True, "deleted": trade_id}
+        db.delete(t)
+    db.commit()  # one transaction: all of them, or none
+
+    log.info("trades.deleted", count=len(rows), symbols=sorted(symbols))
+    return {"ok": True, "deleted": sorted(t.id for t in rows), "count": len(rows)}
 
 
 def _publish_payload(a: Announcement) -> dict[str, Any]:
