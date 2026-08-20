@@ -115,20 +115,24 @@ function Section({
                     <td className="mono">{fmtTime(r.entryTime)}</td>
                     <td className="mono">{r.open ? "—" : fmtTime(r.exitTime)}</td>
                     <td>
-                      {/* Open round-trips are the live book — the API
-                          refuses those anyway, so don't offer the button. */}
-                      {r.open ? (
-                        <span className="text-dim">—</span>
-                      ) : (
-                        <button
-                          className="btn-sm danger"
-                          title="Delete this round-trip from history"
-                          aria-label={`Delete ${r.symbol} round-trip`}
-                          onClick={() => onDelete(r)}
-                        >
-                          ✕
-                        </button>
-                      )}
+                      {/* Open rows are deletable too: most are phantoms —
+                          an entry leg whose exit never got recorded — not
+                          live positions. The API still refuses (409) if the
+                          symbol has a real open position, so a genuinely
+                          live one cannot be removed from under the trade
+                          manager. */}
+                      <button
+                        className="btn-sm danger"
+                        title={
+                          r.open
+                            ? "Delete this open entry leg from history"
+                            : "Delete this round-trip from history"
+                        }
+                        aria-label={`Delete ${r.symbol} ${r.open ? "open leg" : "round-trip"}`}
+                        onClick={() => onDelete(r)}
+                      >
+                        ✕
+                      </button>
                     </td>
                   </tr>
                 );
@@ -168,11 +172,32 @@ export default function TradeHistory() {
   // A round-trip is 1-2 trade rows; delete them together or the survivor
   // re-pairs with an older leg and shows as a phantom position.
   async function handleDelete(r: RoundTrip) {
+    // A partially-closed lot shares its entry leg with the round-trips it
+    // already paid for (BUY 10 / SELL 4 leaves an open 6 pointing at the
+    // same trade row). Deleting that leg takes those rows with it, so say
+    // so instead of letting them vanish unexplained.
+    const alsoAffected = roundtrips.filter(
+      (o) => o !== r && o.tradeIds.some((id) => r.tradeIds.includes(id))
+    ).length;
+
+    const what = r.open
+      ? `the OPEN ${r.symbol} ${r.side} entry leg (qty ${r.quantity})`
+      : `the ${r.symbol} ${r.side} round-trip (P&L ₹${fmtMoney(r.pnl)})`;
+
     if (
       !confirm(
-        `Delete the ${r.symbol} ${r.side} round-trip (P&L ₹${fmtMoney(r.pnl)}) from history?
+        `Delete ${what} from history?
 
 ` +
+          (alsoAffected > 0
+            ? `WARNING: this leg is shared with ${alsoAffected} other row(s), ` +
+              "which will disappear too.\n\n"
+            : "") +
+          (r.open
+            ? "If this is a genuinely live position the server will refuse. " +
+              "Most open rows here are phantoms — an entry whose exit was " +
+              "never recorded.\n\n"
+            : "") +
           "This removes it from win rate, performance sizing and the daily-loss " +
           "breaker. It is recorded in the audit log."
       )
