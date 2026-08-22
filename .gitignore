@@ -13,6 +13,11 @@ htmlcov/
 *.pptx
 *.pdf
 *.txt
+# ...but the C++ build files are source, not documents. The blanket *.txt above
+# silently excluded cpp/CMakeLists.txt: everything built locally and on the
+# server, and CI failed with "does not appear to contain CMakeLists.txt".
+!**/CMakeLists.txt
+!**/CMakePresets.json
 
 # Local data
 data/
