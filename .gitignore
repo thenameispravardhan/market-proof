@@ -70,3 +70,5 @@ deploy/target.local.env
 *.docx
 
 AIdataset/
+# C++ build trees (cmake/ninja output)
+cpp/build*/
