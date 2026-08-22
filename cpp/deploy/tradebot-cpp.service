@@ -12,7 +12,10 @@ Wants=network-online.target
 Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/tradebot
-ExecStart=/home/ubuntu/tradebot/cpp/build-http/tradebot
+# One build dir. A second (build-http) existed only to keep Drogon out of
+# the test build; cpp-httplib is cheap enough that the split bought nothing
+# and cost a 203/EXEC when the two drifted apart.
+ExecStart=/home/ubuntu/tradebot/cpp/build/tradebot
 Restart=on-failure
 RestartSec=5
 
