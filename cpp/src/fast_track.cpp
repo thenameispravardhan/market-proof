@@ -26,11 +26,17 @@ const RE2& inr_value_re() {
 
 // Word-boundary, not substring: short tokens like "won" / "loa" would
 // otherwise match inside unrelated words ("wonder", "upload").
+//
+// The outer group is a CAPTURE group and has to stay one. RE2::FindAndConsume
+// silently matches NOTHING when handed more submatch arguments than the
+// pattern has capture groups, so writing this as `(?:...)` turns
+// order_value_near_context() into a function that always returns nullopt --
+// no compiler error, no runtime error, just a fast track that never fires.
 const RE2& order_context_re() {
   static const RE2 re{
-      R"((?i)\b(?:orders?|contracts?|work order|purchase order|)"
+      R"((?i)(\b(?:orders?|contracts?|work order|purchase order|)"
       R"(letter of award|letter of intent|loa|loi|)"
-      R"(bags?|bagged|secures?|secured|wins?|won|awarded)\b)"};
+      R"(bags?|bagged|secures?|secured|wins?|won|awarded)\b))"};
   return re;
 }
 

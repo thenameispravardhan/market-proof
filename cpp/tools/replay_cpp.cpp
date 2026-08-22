@@ -13,6 +13,7 @@
 #include <glaze/glaze.hpp>
 
 #include <chrono>
+#include <cstdlib>
 #include <format>
 #include <iostream>
 #include <iterator>
@@ -22,6 +23,7 @@
 
 #include "tb/config.hpp"
 #include "tb/fast_track.hpp"
+#include "tb/hist.hpp"
 #include "tb/market_clock.hpp"
 #include "tb/rules_engine.hpp"
 #include "tb/schemas.hpp"
@@ -177,7 +179,25 @@ std::string dump(const tb::Object& o) {
 }
 
 std::string dump(const tb::AnalysisResponse& a) {
-  return dump(a.to_dict());
+  // analysis_to_dict() is to_db_columns() PLUS a nested `key_numbers` object:
+  //
+  //     cols = a.to_db_columns()
+  //     cols["key_numbers"] = a.key_numbers.model_dump()
+  //
+  // The flat columns are what the rules engine gates on (tb::Object carries
+  // only those, see DIFFS D4), but the nested copy is part of the stored shape
+  // and therefore part of the parity contract, so it is re-attached on output.
+  std::string out = dump(a.to_dict());
+  const auto n = [](const std::optional<double>& d) {
+    return d ? num(*d) : std::string("null");
+  };
+  const std::string nested =
+      "\"key_numbers\":{\"deal_value_inr_crore\":" + n(a.key_numbers.deal_value_inr_crore) +
+      ",\"stake_change_pct\":" + n(a.key_numbers.stake_change_pct) +
+      ",\"dividend_per_share\":" + n(a.key_numbers.dividend_per_share) +
+      ",\"buyback_value_inr_crore\":" + n(a.key_numbers.buyback_value_inr_crore) + "}";
+  out.insert(out.size() - 1, (out.size() > 2 ? "," : "") + nested);
+  return out;
 }
 
 void apply_settings(const json_t& j) {
@@ -202,6 +222,28 @@ void apply_settings(const json_t& j) {
 
 }  // namespace
 
+// TB_BENCH=N re-runs the fast-track decision N times over the same case and
+// reports the distribution instead of a decision. §9 PHASE 2 exists so that
+// every performance claim in this migration is measured on the target box
+// rather than asserted; this is the smallest thing that does that for Phase 5.
+int bench(const std::string& headline, const std::string& extracted, long iters) {
+  tb::Histogram h;
+  volatile double sink = 0;
+  for (long i = 0; i < iters; ++i) {
+    const auto t0 = std::chrono::steady_clock::now();
+    auto m = tb::evaluate_fast_track(headline);
+    if (!m && !extracted.empty()) m = tb::evaluate_fast_track_text(headline, extracted);
+    const auto t1 = std::chrono::steady_clock::now();
+    if (m) sink = sink + m->response.confidence;
+    h.record(static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
+  }
+  std::cout << std::format(
+      "{{\"iters\":{},\"ns_p50\":{},\"ns_p99\":{},\"ns_p999\":{},\"ns_max\":{},\"ns_mean\":{:.0f}}}\n",
+      h.count(), h.percentile(0.5), h.percentile(0.99), h.percentile(0.999), h.max(), h.mean());
+  return 0;
+}
+
 int main() {
   const std::string input{std::istreambuf_iterator<char>(std::cin), std::istreambuf_iterator<char>()};
   json_t root;
@@ -218,6 +260,9 @@ int main() {
   };
   const std::string headline = get_str("headline");
   const std::string extracted = get_str("extracted_text");
+
+  if (const char* n = std::getenv("TB_BENCH"); n != nullptr && std::atol(n) > 0)
+    return bench(headline, extracted, std::atol(n));
 
   std::string out = "{";
 

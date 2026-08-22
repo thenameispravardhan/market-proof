@@ -8,18 +8,24 @@ here and kept current.
 places no orders, and writes to no table. Every phase below is either done,
 partially done with the gap named, or not started.
 
+**Verified on the live Lightsail box (13.200.57.14), 2026-08-23, market closed
+(Sunday IST):** toolchain installed, everything compiled with GCC 14.2, all 5
+unit tests pass, and the parity harness is **GREEN over 28,226 cases** built
+from the live 74,419-row DB. The trading service was never restarted and its
+`/health` still answers 200.
+
 ---
 
 ## Phase status
 
 | # | Phase | Status | Note |
 |---|-------|--------|------|
-| 0 | Baseline + golden corpus | **partial** | Backfill works (1,889 replayable cases). Forward instrumentation and the Fyers tick recording are **not** done — see *Phase 0's outstanding debt* below. |
-| 1 | Toolchain + skeleton | **done, unverified on target** | CMake/vcpkg/Drogon `/health` on :8001, structlog-shaped spdlog, systemd unit, CI. Never compiled — no toolchain on the dev box. |
-| 2 | Measurement infrastructure | **partial** | `tb::Histogram` + `/metrics` exist. TSC calibration, the telemetry ring and the `perf` recipes are not written — nothing on the hot path exists to measure yet. |
+| 0 | Baseline + golden corpus | **exit criterion met** | 28,226 replayable cases from the live DB (§9 PHASE 0 wants ≥ 5,000). Forward instrumentation and the Fyers tick recording are still **not** done — see *Phase 0's outstanding debt*. |
+| 1 | Toolchain + skeleton | **partial** | Toolchain installed and building on the server. The Drogon `/health` binary is **not** built — see *The Drogon detour* below. |
+| 2 | Measurement infrastructure | **partial** | `tb::Histogram` works and `scripts/bench_fast_track.py` produces real numbers on the target box. TSC calibration, the telemetry ring and the `perf` recipes are not written — there is no hot path to measure yet. |
 | 3 | Config, logging, DB layer | **not started** | Only the seven Settings keys the Phase 5 leaves read are ported (`cpp/include/tb/config.hpp`), deliberately. |
 | 4 | Hot-path primitives | **not started** | Consumed only by Phase 9. §9 PHASE 4 already advises taking a proven SPSC queue rather than hand-rolling one — do that when Phase 9 needs it, not before. |
-| 5 | Pure logic leaves | **code complete, parity unrun** | fast_track, schemas, rules_engine, event_profiles, market_clock, the pure half of position_sizer. Exit criterion is zero corpus diffs, which needs a compiler. |
+| 5 | Pure logic leaves | **EXIT CRITERION MET** | Zero diffs over 28,226 live-DB cases; 5/5 unit tests green. Measured 9.0× faster than the Python on the target box. |
 | 6–14 | — | **not started** | Each needs the live server, the live DB, Fyers credentials, or a recorded tick day. |
 
 ### What Phase 5 actually ported
@@ -63,7 +69,7 @@ The backfill covers what the DB already holds. These gaps are **measured, not
 assumed**, and two of them cannot be closed retroactively:
 
 1. **Extracted PDF text is never persisted.** `announcements.body` is NULL for
-   all 28,381 rows. So the corpus exercises the headline path only — the hybrid
+   all 74,419 rows on the live server. So the corpus exercises the headline path only — the hybrid
    PDF fast track (`evaluate_fast_track_text`) and all of Phase 8 have no
    reference data. Fix forward: dump extracted text at analysis time.
 2. **The raw DeepSeek reply is never persisted.** See DIFFS D6. Without it the
@@ -76,6 +82,55 @@ assumed**, and two of them cannot be closed retroactively:
    swings Phase 13 by 8 weeks and removes the largest technical risk in the
    project. It is a support ticket, not an engineering task, and it should be
    raised before any more C++ is written.
+
+---
+
+## The Drogon detour (§9 PHASE 1's `/health`)
+
+**Not built. Deliberately abandoned after four rounds of dependency chasing.**
+
+Ubuntu 24.04 packages Drogon 1.8.7, but its shipped `DrogonConfig.cmake` calls
+`find_dependency` unconditionally for jsoncpp, **PostgreSQL**, MySQL, sqlite3,
+brotli and hiredis. Satisfying it meant installing `libpq-dev`,
+`libmysqlclient-dev`, `libhiredis-dev` and friends onto a live trading server —
+and after all of them, `FindMySQL.cmake` still fails, because it searches
+hardcoded paths that do not match Ubuntu's layout.
+
+At that point the cost/benefit is not close. Phase 1's exit criterion is a
+`/health` endpoint on a process that **owns nothing**, that nothing monitors,
+and whose real justification (§9 PHASE 6's 89 routes) is 28 weeks away. The
+toolchain is already proven by five green unit tests and a 28,226-case parity
+run, which is a far better proof than a static `{"status":"ok"}`.
+
+`src/main.cpp`, the systemd unit and `TB_WITH_HTTP` are kept as-is. When Phase 6
+actually needs routes, resolve it then — vcpkg's Drogon port, or `-DMySQL_DIR`
+pointing at a shim, or a different framework. Do not pay this cost early.
+
+**Cleanup available.** These dev packages were installed on the server chasing
+this and nothing now uses them. They are inert headers plus one shared library —
+no daemon runs — so they were left in place rather than risking `apt remove` on a
+live box. To remove them during a maintenance window:
+
+```bash
+sudo apt-get remove --purge libdrogon-dev libpq-dev libmysqlclient-dev libhiredis-dev libbrotli-dev
+```
+
+Still needed, do NOT remove: `g++-14 cmake ninja-build libre2-dev libspdlog-dev pkg-config`.
+
+---
+
+## Findings that contradict the plan
+
+- **§11.1 says Ubuntu 24.04 needs the `ubuntu-toolchain-r/test` PPA for GCC 14.**
+  It does not — `g++-14` (14.2.0) is in the base noble repos. One less PPA on a
+  production box.
+- **Ubuntu's `libre2-dev` ships no CMake config**, only `re2.pc`. `CMakeLists.txt`
+  falls back to `pkg_check_modules` so the server does not need vcpkg.
+- **§9 PHASE 5's Hyperscan note points at the wrong pattern** — see DIFFS D7. The
+  plain RE2 port already measures **9.0× faster** than the Python
+  (1633 µs → 182 µs mean, 11.6k-char document, on the live Cascade Lake box).
+  That is below the 10–50× the plan projected, and consistent with D7: what is
+  left on the table is the order-context scan, not the INR scan.
 
 ---
 
@@ -103,6 +158,12 @@ PYTHONPATH=. TESTING=1 python scripts/build_corpus.py --out corpus/ --limit 3000
 PYTHONPATH=. TESTING=1 python scripts/parity_check.py corpus/ --replay cpp/build/replay_cpp
 ```
 
+Benchmark both stacks on the same text (this is where the 9.0× comes from):
+
+```bash
+PYTHONPATH=. TESTING=1 python scripts/bench_fast_track.py --replay cpp/build/replay_cpp
+```
+
 Regenerate the recorded answers the C++ unit tests assert against:
 
 ```bash
@@ -117,8 +178,8 @@ PYTHONPATH=. TESTING=1 python scripts/gen_fast_track_cases.py
 roughly **8 years at 15 h/week**. Two of the five criteria are worth checking
 early rather than late:
 
-- **A1** — Phase 5 parity cannot reach zero diffs in 3 weeks. Not yet testable:
-  the harness is built, the corpus is built, and it needs a compiler.
+- **A1** — Phase 5 parity cannot reach zero diffs in 3 weeks. **Cleared.** Zero
+  diffs over 28,226 cases on the first green run.
 - **A2** — Phase 9 tick→dispatch p99 does not beat 200 µs. Not yet testable, and
   §17 notes the memory win alone (1.36 GB → <150 MB, which is the *live* OOM
   risk given 127 MB free) is achievable in Python for a fraction of the effort.

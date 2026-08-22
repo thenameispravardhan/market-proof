@@ -85,6 +85,12 @@ nested object is reconstructed on output by `AnalysisResponse::to_dict()`.
 rules engine's `SUPPORTED_FIELDS` is flat by design, so this would be a spec
 change, not a port bug.
 
+**Note on the OUTPUT shape:** `analysis_to_dict()` emits the flat columns *and*
+a nested `key_numbers` object. The flat internal representation above is an
+implementation detail; `replay_cpp` re-attaches the nested copy so the emitted
+JSON matches the Python's byte-for-byte. This was caught by the first parity run
+against the live corpus — it failed all 200 smoke cases — not by review.
+
 ---
 
 ## D5 — `in` / `not_in` with a string value raises instead of iterating characters
@@ -184,3 +190,28 @@ rather than as a silent one on the money path.
 **Stops being acceptable when:** the operator decides it is a bug. Then it gets
 fixed in the **Python first**, and the C++ follows — never the other way round,
 or the parity harness stops meaning anything.
+
+---
+
+## D9 — landmine: RE2 submatch count must equal the pattern's capture-group count
+
+**Where:** `order_context_re()` (`cpp/src/fast_track.cpp`)
+
+Not a Python/C++ difference — a **silent failure mode** recorded so nobody
+reintroduces it.
+
+`RE2::FindAndConsume(&input, re, &m)` matches **nothing** — returns false
+immediately, no error, no exception, no compiler warning — when the pattern has
+fewer capture groups than the submatch arguments passed. Writing the
+order-context alternation as `(?:…)` instead of `(…)` therefore turns
+`order_value_near_context()` into a function that unconditionally returns
+`nullopt`: the hybrid PDF fast track would never fire, and nothing anywhere
+would say so.
+
+This shipped in the first version of the port. It was caught by the **first
+compile-and-run on the server**, by the one unit test that exercised the hybrid
+path — not by review, and not by anything static.
+
+**Guard:** `cpp/tests/test_fast_track.cpp` asserts a non-null hybrid match and
+three window cases. Keep them. Any new `FindAndConsume` call gets a test that
+asserts a *positive* match, because the failure mode is silence.

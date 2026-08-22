@@ -27,7 +27,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build cmake ${{ matrix.cxx }} \
-            libre2-dev libspdlog-dev
+            libre2-dev libspdlog-dev pkg-config
 
       # Drogon is a heavy dependency and Phase 6 is 28 weeks out, so the
       # default job builds the logic + parity harness only. See TB_WITH_HTTP.
@@ -59,7 +59,7 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build cmake g++-14 libre2-dev libspdlog-dev
+          sudo apt-get install -y ninja-build cmake g++-14 libre2-dev libspdlog-dev pkg-config pkg-config
           pip install -r requirements.txt
 
       - name: Build replay harness
