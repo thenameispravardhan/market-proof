@@ -396,22 +396,6 @@ class Settings(BaseSettings):
     # order-context headline without a value → value parsed from the
     # filing PDF text (still no LLM). See app/analyzer/fast_track.py.
     FAST_TRACK_ENABLED: bool = True
-    # Phase 0 corpus capture for the C++ migration (c++.text §9 PHASE 0,
-    # §10.2). When ON, every analysis additionally stores the RAW DeepSeek
-    # reply and the extracted filing text inside `analyses.raw_response`.
-    # Neither is persisted today, neither can be backfilled, and without them
-    # the analyzer port (§9 PHASE 8) has no reference to be verified against —
-    # see cpp/DIFFS.md D6.
-    #
-    # Defaults OFF per invariant I8: with it off the stored shape is
-    # byte-identical to today. Pure telemetry either way — nothing reads these
-    # fields at runtime, so they cannot influence a trade.
-    #
-    # Cost when ON: ~12 KB per analysis, ~2,700 analyses/day ≈ 31 MB/day. The
-    # cap below stops it running forever; §9 PHASE 0's exit criterion is 5,000
-    # announcements, so the default collects well past what parity needs.
-    CORPUS_CAPTURE_ENABLED: bool = False
-    CORPUS_CAPTURE_MAX_ROWS: int = 20_000
     # Phase 4 outcome logger: records the Fyers price at signal time and
     # +5m/+30m for EVERY signal (approved and blocked) into
     # signal_outcomes. Pure telemetry — no trading influence — so it
