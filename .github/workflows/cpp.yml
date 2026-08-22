@@ -44,12 +44,19 @@ jobs:
         env:
           CC: ${{ matrix.cc }}
           CXX: ${{ matrix.cxx }}
-        run: >
-          cmake -S cpp -B cpp/build -G Ninja
-          -DCMAKE_BUILD_TYPE=RelWithDebInfo
-          -DTB_WITH_HTTP=${{ matrix.http }}
-          -DTB_WITH_REPLAY=${{ matrix.replay }}
-          -DTB_SANITIZE=${{ matrix.sanitize }}
+        # The tail of the failure is re-emitted as a ::error:: annotation.
+        # Job logs need an authenticated API call; annotations do not, so this
+        # is what makes a red build diagnosable from outside.
+        run: |
+          set -o pipefail
+          cmake -S cpp -B cpp/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DTB_WITH_HTTP=${{ matrix.http }} \
+            -DTB_WITH_REPLAY=${{ matrix.replay }} \
+            -DTB_SANITIZE=${{ matrix.sanitize }} 2>&1 | tee /tmp/cfg.log || {
+              echo "::error::configure failed: $(tail -c 900 /tmp/cfg.log | tr '\n' '~')"
+              exit 1
+            }
 
       - name: Build
         run: cmake --build cpp/build
