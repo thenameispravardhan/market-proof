@@ -12,6 +12,12 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # gate every later phase -- build in seconds.
 option(TB_WITH_HTTP "Build the Drogon HTTP server (Phase 1 /health)" ON)
 option(TB_SANITIZE   "Build with ASan+UBSan (invariant I11)"          OFF)
+# glaze (used only by the parity harness driver) requires std::expected, which
+# libstdc++ gates behind __cpp_concepts >= 202002L -- a value clang 18 does not
+# define. The clang leg of CI exists for a sanitiser/UB second opinion on OUR
+# code (§11.1), not to vet a third-party JSON library, so it builds with this
+# OFF. gcc builds everything.
+option(TB_WITH_REPLAY "Build replay_cpp, the parity harness driver (needs glaze)" ON)
 
 # §11.3: pin the microarchitecture. NEVER -march=native -- AWS can move the
 # instance to different silicon between reboots and the binary would fault.
@@ -54,6 +60,7 @@ endif()
 # -- parity harness driver (c++.text §10) -------------------------------------
 # The single most important artifact in the migration: reads one corpus case
 # on stdin as JSON, writes this stack's decision to stdout as JSON.
+if(TB_WITH_REPLAY)
 find_package(glaze CONFIG QUIET)
 if(NOT glaze_FOUND)
   include(FetchContent)
@@ -65,6 +72,7 @@ if(NOT glaze_FOUND)
 endif()
 add_executable(replay_cpp tools/replay_cpp.cpp)
 target_link_libraries(replay_cpp PRIVATE tb_core glaze::glaze)
+endif()
 
 # -- tests --------------------------------------------------------------------
 # Plain assert-based mains: no framework, no fixtures, runs anywhere, and a

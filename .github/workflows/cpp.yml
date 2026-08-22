@@ -21,8 +21,9 @@ jobs:
           # `pkg` is the apt package, which is NOT the compiler binary name for
           # clang: installing "clang++-18" silently resolves to libclang-18-dev,
           # which ships no compiler at all.
-          - { pkg: g++-14,   cc: gcc-14,   cxx: g++-14,     sanitize: 'OFF' }
-          - { pkg: clang-18, cc: clang-18, cxx: clang++-18, sanitize: 'ON'  }   # invariant I11
+          - { pkg: g++-14,   cc: gcc-14,   cxx: g++-14,     sanitize: 'OFF', replay: 'ON'  }
+          # libclang-rt-18-dev carries the ASan/UBSan runtimes; clang-18 alone links nothing.
+          - { pkg: 'clang-18 libclang-rt-18-dev', cc: clang-18, cxx: clang++-18, sanitize: 'ON', replay: 'OFF' }  # I11
     steps:
       - uses: actions/checkout@v4
 
@@ -42,6 +43,7 @@ jobs:
           cmake -S cpp -B cpp/build -G Ninja
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DTB_WITH_HTTP=OFF
+          -DTB_WITH_REPLAY=${{ matrix.replay }}
           -DTB_SANITIZE=${{ matrix.sanitize }}
 
       - name: Build

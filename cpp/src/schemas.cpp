@@ -17,13 +17,13 @@ bool is_hold_synonym(std::string_view s) {
 
 // Mirrors pydantic's `Field(..., min_length=1)` + the `_non_blank` validator:
 // strip, then reject an empty result.
-std::expected<std::string, ParseError> non_blank(const Object& o, const char* key) {
+Result<std::string> non_blank(const Object& o, const char* key) {
   const Value* v = find(o, key);
   if (v == nullptr || !v->is_str())
-    return std::unexpected(ParseError{std::string(key) + ": field required"});
+    return unexpected(ParseError{std::string(key) + ": field required"});
   const std::string_view s = strip(v->str());
   if (s.empty())
-    return std::unexpected(ParseError{std::string(key) + ": must be a non-empty string"});
+    return unexpected(ParseError{std::string(key) + ": must be a non-empty string"});
   return std::string(s);
 }
 
@@ -58,56 +58,56 @@ double normalise_sentiment_score(double raw) {
   return raw;
 }
 
-std::expected<AnalysisResponse, ParseError> validate_analysis(const Object& raw) {
+Result<AnalysisResponse> validate_analysis(const Object& raw) {
   AnalysisResponse a;
 
   const Value* et = find(raw, "event_type");
-  if (et == nullptr) return std::unexpected(ParseError{"event_type: field required"});
+  if (et == nullptr) return unexpected(ParseError{"event_type: field required"});
   // A non-string event_type reaches pydantic's enum check unchanged and fails.
-  if (!et->is_str()) return std::unexpected(ParseError{"event_type: not a valid enumeration member"});
+  if (!et->is_str()) return unexpected(ParseError{"event_type: not a valid enumeration member"});
   a.event_type = normalise_event_type(et->str());
 
   auto summary = non_blank(raw, "summary");
-  if (!summary) return std::unexpected(summary.error());
+  if (!summary) return unexpected(summary.error());
   a.summary = *summary;
 
   auto reasoning = non_blank(raw, "reasoning");
-  if (!reasoning) return std::unexpected(reasoning.error());
+  if (!reasoning) return unexpected(reasoning.error());
   a.reasoning = *reasoning;
 
   const Value* sent = find(raw, "sentiment");
   if (sent == nullptr || !sent->is_str())
-    return std::unexpected(ParseError{"sentiment: field required"});
+    return unexpected(ParseError{"sentiment: field required"});
   auto sentiment = normalise_sentiment(sent->str());
   if (!sentiment)
-    return std::unexpected(ParseError{"sentiment: not a valid enumeration member"});
+    return unexpected(ParseError{"sentiment: not a valid enumeration member"});
   a.sentiment = *sentiment;
 
   const Value* rec = find(raw, "recommendation");
   if (rec == nullptr || !rec->is_str())
-    return std::unexpected(ParseError{"recommendation: field required"});
+    return unexpected(ParseError{"recommendation: field required"});
   auto recommendation = normalise_recommendation(rec->str());
   if (!recommendation)
-    return std::unexpected(ParseError{"recommendation: not a valid enumeration member"});
+    return unexpected(ParseError{"recommendation: not a valid enumeration member"});
   a.recommendation = *recommendation;
 
   const Value* score = find(raw, "sentiment_score");
-  if (score == nullptr) return std::unexpected(ParseError{"sentiment_score: field required"});
+  if (score == nullptr) return unexpected(ParseError{"sentiment_score: field required"});
   // _normalise_score runs in `mode="before"`, so a non-numeric value is passed
   // through untouched and then fails the float check.
   auto sv = score->as_double();
-  if (!sv) return std::unexpected(ParseError{"sentiment_score: not a valid float"});
+  if (!sv) return unexpected(ParseError{"sentiment_score: not a valid float"});
   a.sentiment_score = normalise_sentiment_score(*sv);
   if (a.sentiment_score < -100.0 || a.sentiment_score > 100.0)
-    return std::unexpected(ParseError{"sentiment_score: out of range [-100, 100]"});
+    return unexpected(ParseError{"sentiment_score: out of range [-100, 100]"});
 
   const Value* conf = find(raw, "confidence");
-  if (conf == nullptr) return std::unexpected(ParseError{"confidence: field required"});
+  if (conf == nullptr) return unexpected(ParseError{"confidence: field required"});
   auto cv = conf->as_double();
-  if (!cv) return std::unexpected(ParseError{"confidence: not a valid float"});
+  if (!cv) return unexpected(ParseError{"confidence: not a valid float"});
   a.confidence = *cv;
   if (a.confidence < 0.0 || a.confidence > 1.0)
-    return std::unexpected(ParseError{"confidence: out of range [0, 1]"});
+    return unexpected(ParseError{"confidence: out of range [0, 1]"});
 
   // _key_numbers_shape: DeepSeek emits `[]`, `null` and `[{...}, {...}]` in
   // production. All of them mean "no numbers" or "merge these"; none of them

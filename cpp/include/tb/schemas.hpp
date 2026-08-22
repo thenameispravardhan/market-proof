@@ -9,10 +9,10 @@
 #pragma once
 
 #include <array>
-#include <expected>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "tb/value.hpp"
 
@@ -77,8 +77,40 @@ struct ParseError {
   std::string what;
 };
 
+// A stand-in for std::expected, which §11.2 wants but which cannot be used
+// here yet: libstdc++ gates <expected> behind `__cpp_concepts >= 202002L`, and
+// clang 18 reports 201907 (it does not implement conditionally-trivial special
+// members). Building clang against libc++ instead is not an option either —
+// re2 and spdlog come from the distro built against libstdc++, and mixing the
+// two standard libraries in one binary is an ABI break.
+//
+// Deliberately API-compatible with std::expected for the operations actually
+// used, so switching back is a typedef change once clang catches up.
+struct Unexpected {
+  ParseError e;
+};
+inline Unexpected unexpected(ParseError e) { return Unexpected{std::move(e)}; }
+
+template <class T>
+class Result {
+ public:
+  Result(T v) : value_(std::move(v)) {}
+  Result(Unexpected u) : error_(std::move(u.e)) {}
+
+  explicit operator bool() const noexcept { return value_.has_value(); }
+  bool has_value() const noexcept { return value_.has_value(); }
+  const T& operator*() const& { return *value_; }
+  T& operator*() & { return *value_; }
+  const T* operator->() const { return &*value_; }
+  const ParseError& error() const noexcept { return error_; }
+
+ private:
+  std::optional<T> value_;
+  ParseError error_;
+};
+
 // Validate an already-parsed analysis object (the LLM's JSON, or the fast
 // track's construction) into an AnalysisResponse.
-std::expected<AnalysisResponse, ParseError> validate_analysis(const Object& raw);
+Result<AnalysisResponse> validate_analysis(const Object& raw);
 
 }  // namespace tb
