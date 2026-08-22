@@ -161,9 +161,29 @@ def main() -> int:
     if errors:
         print(f"errors                   : {errors[:5]}")
 
+    # Not every error is a rejection. A clean close (code 200 / s: ok) and a
+    # TypeError raised inside this script or the SDK say nothing about
+    # entitlement, and concluding "not entitled" from them would send Phase 13
+    # down the 16-week path for no reason. Only auth-shaped failures count.
+    auth_words = ("invalid", "unauthor", "forbidden", "denied", "token",
+                  "not subscribed", "not entitled", "permission", "401", "403")
+    rejections = [e for e in errors
+                  if any(w in e.lower() for w in auth_words)
+                  and "'s': 'ok'" not in e]
+    script_bugs = [e for e in errors
+                   if "cannot be instantiated" in e or "TypeError" in e]
+
     print("\nVERDICT")
-    if errors and seen["messages"] == 0:
-        print("  NOT entitled, or the subscription was rejected — see errors above.")
+    if script_bugs:
+        print("  INCONCLUSIVE — this probe errored before it could subscribe:")
+        for e in script_bugs[:2]:
+            print(f"    {e}")
+        print("  That is a bug in the probe or the SDK call, NOT a rejection.")
+        print("  Fix it and re-run before drawing any conclusion about §7.6.")
+    elif rejections:
+        print("  NOT entitled, or the subscription was rejected:")
+        for e in rejections[:2]:
+            print(f"    {e}")
         print("  §9 PHASE 13 stays the 16-week HSM binary decoder path.")
     elif seen["messages"] == 0 and not open_now:
         print("  INCONCLUSIVE — market closed. Re-run during session hours.")
