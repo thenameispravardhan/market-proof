@@ -138,7 +138,7 @@ GROUPS: list[dict[str, Any]] = [
         "note": "What the analyzer is allowed to spend, and how much of the filing it sees.",
         "prefixes": [
             "AI_ANALYSIS_ENABLED", "PRE_LLM_FILTER_ENABLED", "SEND_EXTRACTED_TEXT",
-            "FAST_TRACK_ENABLED", "LLM_", "PDF_",
+            "FAST_TRACK_ENABLED", "LLM_", "PDF_", "CORPUS_CAPTURE_",
         ],
     },
     {

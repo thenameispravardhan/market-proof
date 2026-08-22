@@ -734,6 +734,7 @@ class Service:
                     t_start=t_start, age_seconds=age_seconds,
                     pdf_fetch_ms=pdf_fetch_ms, pdf_extract_ms=pdf_extract_ms,
                     pdf_extraction_meta=extraction.meta(),
+                    corpus_text=extraction.text,
                 )
 
         # The LLM prompt uses the filing text only when the operator's
@@ -935,6 +936,7 @@ class Service:
             timings,
             extraction.meta() if extraction is not None else None,
             force_block_reason,
+            extraction.text if extraction is not None else None,
         )
 
         # Step 9: publish.
@@ -970,6 +972,7 @@ class Service:
         pdf_fetch_ms: Optional[float] = None,
         pdf_extract_ms: Optional[float] = None,
         pdf_extraction_meta: Optional[dict[str, Any]] = None,
+        corpus_text: Optional[str] = None,
     ) -> Signal:
         """Persist + publish a fast-track analysis/signal (no LLM).
 
@@ -978,6 +981,7 @@ class Service:
         model="fast-track" for provenance.
         """
         loop = asyncio.get_running_loop()
+        ft_corpus_text = corpus_text
         ft_elapsed_ms = (time.perf_counter() - t_start) * 1000.0
         ft_timings: dict[str, Any] = {
             "pdf_fetch_ms": round(pdf_fetch_ms, 1) if pdf_fetch_ms is not None else None,
@@ -1011,6 +1015,8 @@ class Service:
             producer, self._signals_today,
             ft_timings,
             pdf_extraction_meta,
+            None,               # force_block_reason
+            ft_corpus_text,
         )
         await event_bus.publish(
             CHANNEL_NEW_SIGNAL,
@@ -1102,6 +1108,59 @@ def _store_failed_analysis(
         session.commit()
 
 
+def _corpus_capture(
+    session: Session, ds_result: Any, corpus_text: Optional[str]
+) -> dict[str, Any]:
+    """Extra `raw_response` keys for the C++ migration's golden corpus.
+
+    Returns {} unless `CORPUS_CAPTURE_ENABLED` is on — so with the toggle off
+    the stored shape is byte-identical to what it was before (invariant I8).
+
+    Captures the two things the pipeline currently throws away and that cannot
+    be recovered later (c++.text §10.2, cpp/DIFFS.md D6):
+
+      llm_raw         the RAW DeepSeek reply, BEFORE pydantic validation. This
+                      is what makes the schema coercions (NEUTRAL→HOLD, the
+                      key_numbers list/null shapes, the 0..1 score rescale)
+                      verifiable; the stored columns are all post-validation.
+      extracted_text  the filing text the analyzer actually saw, which is what
+                      the hybrid fast track parses. `announcements.body` is
+                      NULL for every row in the DB.
+
+    Never raises: this is telemetry for a migration, and it must not be able to
+    take down an analysis. Nothing reads these keys at runtime.
+    """
+    settings = get_settings()
+    # getattr, matching FAST_TRACK_ENABLED's handling: tests inject a
+    # SimpleNamespace for Settings and it will not carry a newly added key.
+    if not getattr(settings, "CORPUS_CAPTURE_ENABLED", False):
+        return {}
+    try:
+        # Stop once there is comfortably more than the parity harness needs;
+        # ~12 KB/analysis adds up on a 2 GB box with a 58 GB disk.
+        captured = int(
+            session.execute(
+                select(func.count(Analysis.id)).where(
+                    Analysis.raw_response.like('%"llm_raw"%')
+                )
+            ).scalar_one()
+            or 0
+        )
+        if captured >= int(getattr(settings, "CORPUS_CAPTURE_MAX_ROWS", 20_000)):
+            return {}
+        out: dict[str, Any] = {}
+        # The fast track's producer has no `content` — only the LLM track does.
+        raw = getattr(ds_result, "content", None)
+        if isinstance(raw, str) and raw:
+            out["llm_raw"] = raw
+        if corpus_text:
+            out["extracted_text"] = corpus_text
+        return out
+    except Exception:  # noqa: BLE001 — telemetry must never break the pipeline
+        log.exception("analyzer.corpus_capture_failed")
+        return {}
+
+
 def _persist_analysis_and_signal(
     session_factory: Callable[[], Session],
     announcement: Announcement,
@@ -1112,6 +1171,7 @@ def _persist_analysis_and_signal(
     timings: Optional[dict[str, Any]] = None,
     pdf_extraction_meta: Optional[dict[str, Any]] = None,
     force_block_reason: Optional[str] = None,
+    corpus_text: Optional[str] = None,
 ) -> tuple[Signal, bool]:
     """Persist the analysis, run rules, persist signal.
 
@@ -1122,6 +1182,7 @@ def _persist_analysis_and_signal(
     with session_factory() as session:
         # Persist analysis row.
         cols = response.to_db_columns()
+        corpus = _corpus_capture(session, ds_result, corpus_text)
         a = Analysis(
             announcement_id=announcement.id,
             model=ds_result.model,
@@ -1151,6 +1212,7 @@ def _persist_analysis_and_signal(
                 # real filing text (and why not, when it didn't).
                 "timings": timings,
                 "pdf_extraction": pdf_extraction_meta,
+                **corpus,
             },
         )
         session.add(a)

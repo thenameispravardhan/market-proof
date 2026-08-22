@@ -918,3 +918,90 @@ async def test_ai_analysis_disabled_skips_llm_and_writes_placeholder(
         assert signals == []
     finally:
         await svc.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Phase 0 corpus capture (c++.text §9 PHASE 0 / cpp/DIFFS.md D6)
+# ---------------------------------------------------------------------------
+# The raw DeepSeek reply and the extracted filing text are the two things the
+# pipeline throws away that CANNOT be backfilled, and without them the C++
+# analyzer port has nothing to be verified against. The toggle defaults OFF
+# (invariant I8), so the important case is that OFF changes nothing.
+
+
+class _FakeScalar:
+    def __init__(self, n):
+        self._n = n
+
+    def scalar_one(self):
+        return self._n
+
+
+class _FakeSession:
+    """Only `_corpus_capture`'s count query is exercised, so this is all it needs."""
+
+    def __init__(self, captured=0):
+        self._captured = captured
+
+    def execute(self, _stmt):
+        return _FakeScalar(self._captured)
+
+
+def _settings_with(**kw):
+    from types import SimpleNamespace
+
+    base = {"CORPUS_CAPTURE_ENABLED": True, "CORPUS_CAPTURE_MAX_ROWS": 10}
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+def test_corpus_capture_off_by_default_adds_nothing(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.analyzer import service as svc
+
+    monkeypatch.setattr(svc, "get_settings", lambda: SimpleNamespace())
+    out = svc._corpus_capture(_FakeSession(), SimpleNamespace(content="{}"), "text")
+    assert out == {}, "with the toggle off the stored shape must be unchanged"
+
+
+def test_corpus_capture_records_raw_reply_and_text(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.analyzer import service as svc
+
+    monkeypatch.setattr(svc, "get_settings", _settings_with)
+    out = svc._corpus_capture(
+        _FakeSession(), SimpleNamespace(content='{"recommendation":"NEUTRAL"}'), "filing body"
+    )
+    # The RAW reply, pre-validation -- that is the whole point: NEUTRAL is what
+    # the schema coerces to HOLD, and the stored columns only keep the result.
+    assert out["llm_raw"] == '{"recommendation":"NEUTRAL"}'
+    assert out["extracted_text"] == "filing body"
+
+
+def test_corpus_capture_skips_fast_track_producer_and_honours_cap(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.analyzer import service as svc
+
+    monkeypatch.setattr(svc, "get_settings", _settings_with)
+    # FastTrackProducer has no `content` -- there was no LLM call to record.
+    out = svc._corpus_capture(_FakeSession(), SimpleNamespace(model="fast-track"), "body")
+    assert "llm_raw" not in out and out["extracted_text"] == "body"
+
+    # Cap reached -> stop growing the DB.
+    assert svc._corpus_capture(_FakeSession(captured=10), SimpleNamespace(content="x"), "b") == {}
+
+
+def test_corpus_capture_never_breaks_the_pipeline(monkeypatch):
+    from types import SimpleNamespace
+
+    from app.analyzer import service as svc
+
+    class _Exploding:
+        def execute(self, _stmt):
+            raise RuntimeError("db is having a day")
+
+    monkeypatch.setattr(svc, "get_settings", _settings_with)
+    assert svc._corpus_capture(_Exploding(), SimpleNamespace(content="x"), "b") == {}
