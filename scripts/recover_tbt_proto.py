@@ -51,6 +51,13 @@ def render(fdp) -> str:
     out.append("// FileDescriptorProto shipped inside fyers_apiv3.FyersWebsocket.msg_pb2.")
     out.append("// Source of truth is the descriptor, not this rendering.")
     out.append("")
+    # Every scalar in this schema is a google.protobuf wrapper type, so the
+    # import is mandatory -- without it protoc rejects the file and the whole
+    # point of §7.6 (generated bindings, not hand-written decoding) is lost.
+    for dep in fdp.dependency:
+        out.append(f'import "{dep}";')
+    if fdp.dependency:
+        out.append("")
 
     def render_msg(m, indent: int = 0) -> None:
         pad = "  " * indent
@@ -69,6 +76,8 @@ def render(fdp) -> str:
             if f.type in (11, 14):  # message / enum -> use the type name
                 tname = f.type_name.lstrip(".")
                 short = tname.rsplit(".", 1)[-1]
+                # google.protobuf.Int64Value etc. MUST stay qualified.
+                external = tname.startswith("google.protobuf.")
                 entry = maps.get(short.lower().replace("entry", ""))
                 if entry is not None and f.label == 3:
                     kt = TYPE_NAMES.get(entry.field[0].type, "string")
@@ -77,7 +86,7 @@ def render(fdp) -> str:
                         else TYPE_NAMES.get(entry.field[1].type, "string")
                     out.append(f"{pad}  map<{kt}, {vt}> {f.name} = {f.number};")
                     continue
-                tname = short
+                tname = tname if external else short
             label = "" if f.label == 1 and syntax == "proto3" else LABELS.get(f.label, "") + " "
             if f.label == 3:
                 label = "repeated "
