@@ -1,0 +1,28 @@
+{
+  "analysis": {
+    "buyback_value_inr_crore": null,
+    "confidence": 0.9,
+    "deal_value_inr_crore": null,
+    "dividend_per_share": null,
+    "event_type": "ANNUAL_RESULTS",
+    "key_numbers": {
+      "buyback_value_inr_crore": null,
+      "deal_value_inr_crore": null,
+      "dividend_per_share": null,
+      "stake_change_pct": null
+    },
+    "rationale": "Record revenue and profit, strong double-digit growth, and improved margins indicate robust financial health. The company also highlighted premiumisation and EV growth, supporting a positive outlook.",
+    "recommendation": "BUY",
+    "sentiment": "positive",
+    "sentiment_score": 80.0,
+    "stake_change_pct": null,
+    "summary": "Hero MotoCorp reported record revenue of ₹46,830 crore and PAT of ₹5,268 crore for FY2025-26, with 14.9% revenue growth and 14.3% PAT growth YoY."
+  },
+  "fast_track": null,
+  "rule": {
+    "action": "BUY",
+    "action_params": {},
+    "rationale": "Rule 'buy' matched (action=BUY).",
+    "rule_id": 3
+  }
+}

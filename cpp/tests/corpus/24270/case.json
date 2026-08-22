@@ -1,0 +1,91 @@
+{
+  "announcement_id": 24270,
+  "context": {
+    "exchange": "BSE",
+    "symbol": "RAAJMEDI"
+  },
+  "extracted_text": "",
+  "headline": "We forward herewith resignation letter dated July 10, 2026 received From Kanije Fatema Dadani Patel resigning from the post of Chief Financial Officer of the Company wef July 14, 2026",
+  "llm_response": {
+    "confidence": 0.75,
+    "event_type": "OTHER",
+    "key_numbers": {
+      "buyback_value_inr_crore": null,
+      "deal_value_inr_crore": null,
+      "dividend_per_share": null,
+      "stake_change_pct": null
+    },
+    "reasoning": "Deterministic fast track: headline reports the resignation of the chief financial officer with no accompanying appointment. Headline: \"We forward herewith resignation letter dated July 10, 2026 received From Kanije Fatema Dadani Patel resigning from the post of Chief Financial Officer of the Company wef July 14, 2026\"",
+    "recommendation": "SELL",
+    "sentiment": "negative",
+    "sentiment_score": -65.0,
+    "summary": "Resignation of a key managerial person (chief financial officer) per the exchange headline."
+  },
+  "recorded_model": "fast-track",
+  "rules": [
+    {
+      "action": "SELL",
+      "action_params": null,
+      "conditions": {
+        "all_of": [
+          {
+            "field": "sentiment_score",
+            "op": ">=",
+            "value": 70
+          },
+          {
+            "field": "confidence",
+            "op": ">=",
+            "value": 0.7
+          },
+          {
+            "field": "recommendation",
+            "op": "==",
+            "value": "SELL"
+          },
+          {
+            "field": "sentiment",
+            "op": "==",
+            "value": "negative"
+          }
+        ]
+      },
+      "enabled": true,
+      "id": 2,
+      "name": "sell",
+      "priority": 100
+    },
+    {
+      "action": "BUY",
+      "action_params": null,
+      "conditions": {
+        "all_of": [
+          {
+            "field": "sentiment_score",
+            "op": ">=",
+            "value": 70
+          },
+          {
+            "field": "sentiment",
+            "op": "==",
+            "value": "positive"
+          },
+          {
+            "field": "confidence",
+            "op": ">=",
+            "value": 0.7
+          },
+          {
+            "field": "recommendation",
+            "op": "==",
+            "value": "BUY"
+          }
+        ]
+      },
+      "enabled": true,
+      "id": 3,
+      "name": "buy",
+      "priority": 100
+    }
+  ]
+}

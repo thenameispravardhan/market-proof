@@ -1,0 +1,91 @@
+{
+  "announcement_id": 25759,
+  "context": {
+    "exchange": "BSE",
+    "symbol": "PURVA"
+  },
+  "extracted_text": "",
+  "headline": "Operational update for the quarter ended June 30, 2026",
+  "llm_response": {
+    "confidence": 0.9,
+    "event_type": "OTHER",
+    "key_numbers": {
+      "buyback_value_inr_crore": null,
+      "deal_value_inr_crore": null,
+      "dividend_per_share": null,
+      "stake_change_pct": null
+    },
+    "reasoning": "Strong operational performance with double-digit growth in pre-sales and collections, plus significant land acquisitions, indicating robust demand and future revenue visibility.",
+    "recommendation": "BUY",
+    "sentiment": "positive",
+    "sentiment_score": 80.0,
+    "summary": "Puravankara reports 28% YoY growth in pre-sales to ₹1,439 crore, 40% surge in collections to ₹1,199 crore, and adds ₹5,200 crore GDV pipeline in Q1 FY27."
+  },
+  "recorded_model": "deepseek-v4-flash",
+  "rules": [
+    {
+      "action": "SELL",
+      "action_params": null,
+      "conditions": {
+        "all_of": [
+          {
+            "field": "sentiment_score",
+            "op": ">=",
+            "value": 70
+          },
+          {
+            "field": "confidence",
+            "op": ">=",
+            "value": 0.7
+          },
+          {
+            "field": "recommendation",
+            "op": "==",
+            "value": "SELL"
+          },
+          {
+            "field": "sentiment",
+            "op": "==",
+            "value": "negative"
+          }
+        ]
+      },
+      "enabled": true,
+      "id": 2,
+      "name": "sell",
+      "priority": 100
+    },
+    {
+      "action": "BUY",
+      "action_params": null,
+      "conditions": {
+        "all_of": [
+          {
+            "field": "sentiment_score",
+            "op": ">=",
+            "value": 70
+          },
+          {
+            "field": "sentiment",
+            "op": "==",
+            "value": "positive"
+          },
+          {
+            "field": "confidence",
+            "op": ">=",
+            "value": 0.7
+          },
+          {
+            "field": "recommendation",
+            "op": "==",
+            "value": "BUY"
+          }
+        ]
+      },
+      "enabled": true,
+      "id": 3,
+      "name": "buy",
+      "priority": 100
+    }
+  ]
+}

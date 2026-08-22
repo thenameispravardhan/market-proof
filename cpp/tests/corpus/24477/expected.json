@@ -1,0 +1,28 @@
+{
+  "analysis": {
+    "buyback_value_inr_crore": null,
+    "confidence": 0.9,
+    "deal_value_inr_crore": null,
+    "dividend_per_share": 4.5,
+    "event_type": "ANNUAL_RESULTS",
+    "key_numbers": {
+      "buyback_value_inr_crore": null,
+      "deal_value_inr_crore": null,
+      "dividend_per_share": 4.5,
+      "stake_change_pct": null
+    },
+    "rationale": "Revenue and profit growth are strong, with record highs and a 42.75% EBITDA increase. Capacity expansions and robust order book support sustained growth.",
+    "recommendation": "BUY",
+    "sentiment": "positive",
+    "sentiment_score": 85.0,
+    "stake_change_pct": null,
+    "summary": "Universal Cables reported highest-ever revenue of ₹3,022.67 crore, up 25.5% YoY, with net profit rising 68.5% to ₹96.53 crore, and recommended a dividend of ₹4.50 per share."
+  },
+  "fast_track": null,
+  "rule": {
+    "action": "BUY",
+    "action_params": {},
+    "rationale": "Rule 'buy' matched (action=BUY).",
+    "rule_id": 3
+  }
+}

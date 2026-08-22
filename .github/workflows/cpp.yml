@@ -1,0 +1,79 @@
+# c++.text §9 PHASE 1 ("CI: build + test on every commit") and §10.6 ("Run the
+# full parity suite in CI on every commit. A phase is not done when the code
+# compiles; it is done when parity is green.")
+name: cpp
+
+on:
+  push:
+    paths: ['cpp/**', 'scripts/**', 'app/analyzer/**', 'app/risk/**', '.github/workflows/cpp.yml']
+  pull_request:
+    paths: ['cpp/**', 'scripts/**', 'app/analyzer/**', 'app/risk/**', '.github/workflows/cpp.yml']
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # §11.1: build with BOTH front-ends. "Two front-ends find roughly twice
+        # the bugs, and they disagree about UB in useful ways."
+        include:
+          - { cc: gcc-14,   cxx: g++-14,     sanitize: 'OFF' }
+          - { cc: clang-18, cxx: clang++-18, sanitize: 'ON'  }   # invariant I11
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake ${{ matrix.cxx }} \
+            libre2-dev libspdlog-dev
+
+      # Drogon is a heavy dependency and Phase 6 is 28 weeks out, so the
+      # default job builds the logic + parity harness only. See TB_WITH_HTTP.
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: >
+          cmake -S cpp -B cpp/build -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DTB_WITH_HTTP=OFF
+          -DTB_SANITIZE=${{ matrix.sanitize }}
+
+      - name: Build
+        run: cmake --build cpp/build
+
+      - name: Unit tests
+        run: ctest --test-dir cpp/build --output-on-failure
+
+  parity:
+    # §10 -- the artifact the whole migration rests on. Runs the SAME corpus
+    # through both stacks and fails the build on any unapproved difference.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake g++-14 libre2-dev libspdlog-dev
+          pip install -r requirements.txt
+
+      - name: Build replay harness
+        env: { CXX: g++-14 }
+        run: |
+          cmake -S cpp -B cpp/build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DTB_WITH_HTTP=OFF
+          cmake --build cpp/build --target replay_cpp
+
+      # The live DB is not in the repo, so CI replays the checked-in fixture
+      # corpus. The full 1,889-case corpus runs on the server, where the DB is.
+      - name: Parity (fixture corpus)
+        env: { PYTHONPATH: '.', TESTING: '1' }
+        run: python scripts/parity_check.py cpp/tests/corpus --replay cpp/build/replay_cpp
+
+      - name: Single-pass equivalence fuzz
+        env: { PYTHONPATH: '.', TESTING: '1' }
+        run: python scripts/verify_single_pass.py --limit 1 --fuzz 20000

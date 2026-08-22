@@ -1,0 +1,28 @@
+{
+  "analysis": {
+    "buyback_value_inr_crore": null,
+    "confidence": 0.9,
+    "deal_value_inr_crore": null,
+    "dividend_per_share": 1.25,
+    "event_type": "ANNUAL_RESULTS",
+    "key_numbers": {
+      "buyback_value_inr_crore": null,
+      "deal_value_inr_crore": null,
+      "dividend_per_share": 1.25,
+      "stake_change_pct": null
+    },
+    "rationale": "Revenue and PAT grew strongly by 34.8% and 72.4% respectively, with EPS rising to Rs. 8.58 from Rs. 5.04. The company also raised funds via preferential issue and converted warrants, strengthening capital structure.",
+    "recommendation": "BUY",
+    "sentiment": "positive",
+    "sentiment_score": 80.0,
+    "stake_change_pct": null,
+    "summary": "Precision Wires India reported FY2025-26 revenue of Rs. 541,018.05 lakhs (up 34.8% YoY) and PAT of Rs. 15,526.80 lakhs (up 72.4% YoY), with EPS of Rs. 8.58 and total dividend of Rs. 1.25 per share."
+  },
+  "fast_track": null,
+  "rule": {
+    "action": "BUY",
+    "action_params": {},
+    "rationale": "Rule 'buy' matched (action=BUY).",
+    "rule_id": 3
+  }
+}

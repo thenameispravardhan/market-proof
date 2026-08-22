@@ -1,0 +1,28 @@
+{
+  "analysis": {
+    "buyback_value_inr_crore": null,
+    "confidence": 0.8,
+    "deal_value_inr_crore": null,
+    "dividend_per_share": null,
+    "event_type": "OTHER",
+    "key_numbers": {
+      "buyback_value_inr_crore": null,
+      "deal_value_inr_crore": null,
+      "dividend_per_share": null,
+      "stake_change_pct": null
+    },
+    "rationale": "The credit rating upgrade from CRISIL indicates improved creditworthiness and lower default risk, which is a positive signal for investors. This material improvement in rating can lead to increased investor confidence and potential stock price appreciation.",
+    "recommendation": "BUY",
+    "sentiment": "positive",
+    "sentiment_score": 70.0,
+    "stake_change_pct": null,
+    "summary": "Univastu India Limited announced that CRISIL Ratings upgraded its long-term rating to 'CRISIL BBB-/Stable' from 'CRISIL BB+/Stable' and short-term rating to 'CRISIL A3' from 'CRISIL A4+' for bank facilities of Rs. 113 crore."
+  },
+  "fast_track": null,
+  "rule": {
+    "action": "BUY",
+    "action_params": {},
+    "rationale": "Rule 'buy' matched (action=BUY).",
+    "rule_id": 3
+  }
+}

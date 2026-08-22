@@ -1,0 +1,28 @@
+{
+  "analysis": {
+    "buyback_value_inr_crore": null,
+    "confidence": 0.85,
+    "deal_value_inr_crore": null,
+    "dividend_per_share": null,
+    "event_type": "Q1_RESULTS",
+    "key_numbers": {
+      "buyback_value_inr_crore": null,
+      "deal_value_inr_crore": null,
+      "dividend_per_share": null,
+      "stake_change_pct": null
+    },
+    "rationale": "Revenue and PAT grew 15% and 36% YoY respectively, with EBITDA margin expansion of 123 bps. The company also completed the acquisition of Kumarakom Resort and signed 8 new hotels, indicating strong growth momentum.",
+    "recommendation": "BUY",
+    "sentiment": "positive",
+    "sentiment_score": 75.0,
+    "stake_change_pct": null,
+    "summary": "ITC Hotels reported consolidated revenue of ₹936 Cr (up 15% YoY), EBITDA of ₹292 Cr (up 19%), and PAT of ₹182 Cr (up 36%) for Q1 FY27, with strong RevPAR growth and accelerated asset-right expansion."
+  },
+  "fast_track": null,
+  "rule": {
+    "action": "BUY",
+    "action_params": {},
+    "rationale": "Rule 'buy' matched (action=BUY).",
+    "rule_id": 3
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "analysis": {
+    "buyback_value_inr_crore": null,
+    "confidence": 0.9,
+    "deal_value_inr_crore": null,
+    "dividend_per_share": null,
+    "event_type": "BOARD_MEETING",
+    "key_numbers": {
+      "buyback_value_inr_crore": null,
+      "deal_value_inr_crore": null,
+      "dividend_per_share": null,
+      "stake_change_pct": null
+    },
+    "rationale": "Strong YoY growth in PAT (156%) and total income (141%) across key segments like NBFC AUM (2.6x YoY) and payments bank deposits (1.7x YoY) indicate accelerating business momentum.",
+    "recommendation": "BUY",
+    "sentiment": "positive",
+    "sentiment_score": 80.0,
+    "stake_change_pct": null,
+    "summary": "Jio Financial Services reported Q1 FY27 consolidated PAT of ₹830 crore, up 156% YoY, with total income (ex-dividend) up 141% YoY to ₹1,496 crore."
+  },
+  "fast_track": null,
+  "rule": {
+    "action": "BUY",
+    "action_params": {},
+    "rationale": "Rule 'buy' matched (action=BUY).",
+    "rule_id": 3
+  }
+}

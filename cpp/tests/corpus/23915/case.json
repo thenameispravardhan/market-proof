@@ -1,0 +1,91 @@
+{
+  "announcement_id": 23915,
+  "context": {
+    "exchange": "BSE",
+    "symbol": "63MOONS"
+  },
+  "extracted_text": "",
+  "headline": "Information update for Q1 (FY 2026-27) received from our Subsidiary - 63SATS Cybertech Ltd.",
+  "llm_response": {
+    "confidence": 0.7,
+    "event_type": "Q1_RESULTS",
+    "key_numbers": {
+      "buyback_value_inr_crore": null,
+      "deal_value_inr_crore": null,
+      "dividend_per_share": null,
+      "stake_change_pct": null
+    },
+    "reasoning": "Order book of ₹288 Cr in Q1 covers 82% of FY27 target, indicating strong demand and growth trajectory. IP revenue (CYBX AI CyberOps) compounding at ₹53 Cr+ cumulative, shifting from services to IP-led model.",
+    "recommendation": "BUY",
+    "sentiment": "positive",
+    "sentiment_score": 80.0,
+    "summary": "63SATS Cybertech reports ₹288 Cr order book in Q1 FY27, achieving 82% of FY27 target, with CYBX AI CyberOps cumulative order value at ₹53 Cr+ and 2 Mn+ downloads."
+  },
+  "recorded_model": "deepseek-v4-flash",
+  "rules": [
+    {
+      "action": "SELL",
+      "action_params": null,
+      "conditions": {
+        "all_of": [
+          {
+            "field": "sentiment_score",
+            "op": ">=",
+            "value": 70
+          },
+          {
+            "field": "confidence",
+            "op": ">=",
+            "value": 0.7
+          },
+          {
+            "field": "recommendation",
+            "op": "==",
+            "value": "SELL"
+          },
+          {
+            "field": "sentiment",
+            "op": "==",
+            "value": "negative"
+          }
+        ]
+      },
+      "enabled": true,
+      "id": 2,
+      "name": "sell",
+      "priority": 100
+    },
+    {
+      "action": "BUY",
+      "action_params": null,
+      "conditions": {
+        "all_of": [
+          {
+            "field": "sentiment_score",
+            "op": ">=",
+            "value": 70
+          },
+          {
+            "field": "sentiment",
+            "op": "==",
+            "value": "positive"
+          },
+          {
+            "field": "confidence",
+            "op": ">=",
+            "value": 0.7
+          },
+          {
+            "field": "recommendation",
+            "op": "==",
+            "value": "BUY"
+          }
+        ]
+      },
+      "enabled": true,
+      "id": 3,
+      "name": "buy",
+      "priority": 100
+    }
+  ]
+}

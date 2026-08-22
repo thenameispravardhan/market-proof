@@ -1,0 +1,28 @@
+{
+  "analysis": {
+    "buyback_value_inr_crore": null,
+    "confidence": 0.85,
+    "deal_value_inr_crore": null,
+    "dividend_per_share": null,
+    "event_type": "ANNUAL_RESULTS",
+    "key_numbers": {
+      "buyback_value_inr_crore": null,
+      "deal_value_inr_crore": null,
+      "dividend_per_share": null,
+      "stake_change_pct": null
+    },
+    "rationale": "Net profit surged 235% YoY despite weak optical fibre cable market, indicating strong operational performance and diversification. Early signs of recovery in optical fibre cable market and robust demand outlook support positive momentum.",
+    "recommendation": "BUY",
+    "sentiment": "positive",
+    "sentiment_score": 75.0,
+    "stake_change_pct": null,
+    "summary": "Birla Cable reported standalone net profit of ₹16.87 crore for FY2025-26, up 235% from ₹5.03 crore in FY2024-25, driven by strong Structured LAN Cable sales."
+  },
+  "fast_track": null,
+  "rule": {
+    "action": "BUY",
+    "action_params": {},
+    "rationale": "Rule 'buy' matched (action=BUY).",
+    "rule_id": 3
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "analysis": {
+    "buyback_value_inr_crore": null,
+    "confidence": 0.72,
+    "deal_value_inr_crore": 28.21,
+    "dividend_per_share": null,
+    "event_type": "ORDER_WIN",
+    "key_numbers": {
+      "buyback_value_inr_crore": null,
+      "deal_value_inr_crore": 28.21,
+      "dividend_per_share": null,
+      "stake_change_pct": null
+    },
+    "rationale": "Deterministic fast track: headline contains an order-win context and an explicit value of Rs 28.21 crore. Headline: \"Received Export Order from North America amounted to US$2.96 million (INR 28.21 crores)\"",
+    "recommendation": "BUY",
+    "sentiment": "positive",
+    "sentiment_score": 60.0,
+    "stake_change_pct": null,
+    "summary": "Order win with explicit value of Rs 28.21 crore in the exchange headline."
+  },
+  "fast_track": {
+    "pattern": "order_win_value",
+    "response": {
+      "buyback_value_inr_crore": null,
+      "confidence": 0.72,
+      "deal_value_inr_crore": 28.21,
+      "dividend_per_share": null,
+      "event_type": "ORDER_WIN",
+      "key_numbers": {
+        "buyback_value_inr_crore": null,
+        "deal_value_inr_crore": 28.21,
+        "dividend_per_share": null,
+        "stake_change_pct": null
+      },
+      "rationale": "Deterministic fast track: headline contains an order-win context and an explicit value of Rs 28.21 crore. Headline: \"Received Export Order from North America amounted to US$2.96 million (INR 28.21 crores)\"",
+      "recommendation": "BUY",
+      "sentiment": "positive",
+      "sentiment_score": 60.0,
+      "stake_change_pct": null,
+      "summary": "Order win with explicit value of Rs 28.21 crore in the exchange headline."
+    }
+  },
+  "rule": {
+    "action": "HOLD",
+    "action_params": {
+      "reason": "no_matching_rule"
+    },
+    "rationale": "No signal rule matched the analysis; defaulting to HOLD.",
+    "rule_id": null
+  }
+}

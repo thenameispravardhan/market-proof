@@ -1,0 +1,28 @@
+{
+  "analysis": {
+    "buyback_value_inr_crore": null,
+    "confidence": 0.7,
+    "deal_value_inr_crore": null,
+    "dividend_per_share": null,
+    "event_type": "Q1_RESULTS",
+    "key_numbers": {
+      "buyback_value_inr_crore": null,
+      "deal_value_inr_crore": null,
+      "dividend_per_share": null,
+      "stake_change_pct": null
+    },
+    "rationale": "Order book of ₹288 Cr in Q1 covers 82% of FY27 target, indicating strong demand and growth trajectory. IP revenue (CYBX AI CyberOps) compounding at ₹53 Cr+ cumulative, shifting from services to IP-led model.",
+    "recommendation": "BUY",
+    "sentiment": "positive",
+    "sentiment_score": 80.0,
+    "stake_change_pct": null,
+    "summary": "63SATS Cybertech reports ₹288 Cr order book in Q1 FY27, achieving 82% of FY27 target, with CYBX AI CyberOps cumulative order value at ₹53 Cr+ and 2 Mn+ downloads."
+  },
+  "fast_track": null,
+  "rule": {
+    "action": "BUY",
+    "action_params": {},
+    "rationale": "Rule 'buy' matched (action=BUY).",
+    "rule_id": 3
+  }
+}

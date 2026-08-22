@@ -1,0 +1,28 @@
+{
+  "analysis": {
+    "buyback_value_inr_crore": null,
+    "confidence": 0.85,
+    "deal_value_inr_crore": null,
+    "dividend_per_share": null,
+    "event_type": "ANNUAL_RESULTS",
+    "key_numbers": {
+      "buyback_value_inr_crore": null,
+      "deal_value_inr_crore": null,
+      "dividend_per_share": null,
+      "stake_change_pct": null
+    },
+    "rationale": "Strong revenue and profit growth, expanding margins, and robust cash generation indicate improving fundamentals. International revenue share increased to 42%, diversifying revenue streams.",
+    "recommendation": "BUY",
+    "sentiment": "positive",
+    "sentiment_score": 75.0,
+    "stake_change_pct": null,
+    "summary": "Nephrocare Health Services reported consolidated revenue growth of 32.2% to ₹998.8 crore, adjusted EBITDA up 37.6% to ₹238.1 crore with 23.8% margin, and adjusted PAT up 74.6% to ₹128.3 crore for FY 2025-26."
+  },
+  "fast_track": null,
+  "rule": {
+    "action": "BUY",
+    "action_params": {},
+    "rationale": "Rule 'buy' matched (action=BUY).",
+    "rule_id": 3
+  }
+}
