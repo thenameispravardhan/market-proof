@@ -171,10 +171,10 @@ Still needed, do NOT remove: `g++-14 cmake ninja-build libre2-dev libspdlog-dev 
 
 ## How to run what exists
 
-Build and unit-test (needs GCC 14 / Clang 18, CMake ≥ 3.25, re2, spdlog):
+Build and unit-test (needs GCC 14, CMake ≥ 3.25, `libre2-dev libspdlog-dev pkg-config libcpp-httplib-dev`):
 
 ```bash
-cmake -S cpp -B cpp/build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DTB_WITH_HTTP=OFF && cmake --build cpp/build && ctest --test-dir cpp/build --output-on-failure
+cmake -S cpp -B cpp/build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake --build cpp/build && ctest --test-dir cpp/build --output-on-failure
 ```
 
 Prove the fast-track rewrite is exact (pure Python, no toolchain needed):
@@ -235,3 +235,19 @@ reduction, and deep C++ expertise. It does not buy faster signals.
 
 The daily Fyers token expires; both live scripts stop with a clear message
 rather than recording an empty file.
+
+---
+
+## Running services on the box
+
+| Unit | Port | Owns | State |
+|------|------|------|-------|
+| `tradebot` (Python) | 8000 | **everything** | active |
+| `tradebot-cpp` | 8001 | nothing | active, localhost-only, `MemoryMax=200M`, cgroup RSS ~1.6 MB |
+
+`tradebot-cpp` serves `/health` and `/metrics` and is deliberately not routed
+through Caddy. To remove it entirely:
+
+```bash
+sudo systemctl disable --now tradebot-cpp && sudo rm /etc/systemd/system/tradebot-cpp.service && sudo systemctl daemon-reload
+```
