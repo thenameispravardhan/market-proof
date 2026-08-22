@@ -21,11 +21,11 @@ from the live 74,419-row DB. The trading service was never restarted and its
 | # | Phase | Status | Note |
 |---|-------|--------|------|
 | 0 | Baseline + golden corpus | **exit criterion met** | 28,226 replayable cases from the live DB (§9 PHASE 0 wants ≥ 5,000). Forward instrumentation is written but **not deployed**; the Fyers tick recording is **not** done — see *Phase 0's outstanding debt*. |
-| 1 | Toolchain + skeleton | **partial** | Toolchain installed and building on the server. The Drogon `/health` binary is **not** built — see *The Drogon detour* below. |
-| 2 | Measurement infrastructure | **partial** | `tb::Histogram` works and `scripts/bench_fast_track.py` produces real numbers on the target box. TSC calibration, the telemetry ring and the `perf` recipes are not written — there is no hot path to measure yet. |
+| 1 | Toolchain + skeleton | **EXIT CRITERION MET** | `curl :8001/health` returns ok on the server with both stacks running. cpp-httplib, not Drogon — see *The Drogon detour*. RSS 8.5 MB. |
+| 2 | Measurement infrastructure | **partial** | `tb::Histogram` + a live `/metrics` endpoint; `scripts/bench_fast_track.py` gives real numbers on the target box. TSC calibration, the lock-free telemetry ring and the `perf` recipes are **not** written — there is no hot path to measure yet, so building them now would be scaffolding. |
 | 3 | Config, logging, DB layer | **not started** | Only the seven Settings keys the Phase 5 leaves read are ported (`cpp/include/tb/config.hpp`), deliberately. |
 | 4 | Hot-path primitives | **not started** | Consumed only by Phase 9. §9 PHASE 4 already advises taking a proven SPSC queue rather than hand-rolling one — do that when Phase 9 needs it, not before. |
-| 5 | Pure logic leaves | **EXIT CRITERION MET** | Zero diffs over 28,226 live-DB cases; 5/5 unit tests green. Measured 9.0× faster than the Python on the target box. |
+| 5 | Pure logic leaves | **Parity met; 2 files unported** | Zero diffs over 28,226 live-DB cases, 6/6 unit tests, ASan/UBSan clean on real data. 9.0× faster on target hardware. `perf_sizer.py` and `symbols.py` are **not** pure leaves and were misfiled by the plan — see below. |
 | 13 | Native Fyers data socket | **de-risked, not started** | §7.6's protobuf escape hatch is proven end-to-end (schema → protoc → compiling C++ that round-trips a tick). Entitlement still unverified — needs a login. |
 | 6–12, 14 | — | **not started** | Each needs the live server, the live DB, Fyers credentials, or a recorded tick day. |
 
@@ -39,9 +39,9 @@ from the live 74,419-row DB. The trading service was never restarted and its
 | `risk/event_profiles.py` | 129 | `src/event_profiles.cpp` | constexpr table, as specified. |
 | `risk/market_clock.py` | 125 | `src/market_clock.cpp` | Fixed +5:30, no tzdb. |
 | `risk/position_sizer.py` | 193 | `include/tb/sizing.hpp` | **Only `notional_cap_qty`.** The rest reads the DB — Phase 3/9. Deliberately not stubbed: a stub on the sizing path sizes real orders wrong. |
-| `risk/perf_sizer.py` | 140 | — | not ported |
-| `risk/volatility.py` | 317 | — | not ported |
-| `execution/symbols.py` | 80 | — | not ported: it calls the instrument master, so it is not a pure leaf. The compile-time perfect hash §9 suggests needs a fixed symbol set, which this does not have. |
+| `risk/volatility.py` | 317 | `include/tb/volatility.hpp` | Pure half: `compute_atr`, `stop_distance`, `vix_risk_multiplier`. The Fyers candle/VIX providers wrap a live feed — Phase 9. |
+| `risk/perf_sizer.py` | 140 | — | **Not portable in Phase 5.** It imports SQLAlchemy and queries Analysis/Announcement/Signal/Trade, so it is not a pure leaf at all — the plan misfiled it. Belongs to Phase 3/9. |
+| `execution/symbols.py` | 80 | — | **Not portable in Phase 5** either: it calls the instrument master. §9's compile-time perfect hash needs a fixed symbol set, which this does not have. |
 
 ---
 
@@ -123,7 +123,7 @@ added to the build until Phase 13 actually needs it.
 
 ## The Drogon detour (§9 PHASE 1's `/health`)
 
-**Not built. Deliberately abandoned after four rounds of dependency chasing.**
+**Resolved: `/health` ships on cpp-httplib. Drogon returns at Phase 6.**
 
 Ubuntu 24.04 packages Drogon 1.8.7, but its shipped `DrogonConfig.cmake` calls
 `find_dependency` unconditionally for jsoncpp, **PostgreSQL**, MySQL, sqlite3,
@@ -132,18 +132,17 @@ brotli and hiredis. Satisfying it meant installing `libpq-dev`,
 and after all of them, `FindMySQL.cmake` still fails, because it searches
 hardcoded paths that do not match Ubuntu's layout.
 
-At that point the cost/benefit is not close. Phase 1's exit criterion is a
-`/health` endpoint on a process that **owns nothing**, that nothing monitors,
-and whose real justification (§9 PHASE 6's 89 routes) is 28 weeks away. The
-toolchain is already proven by five green unit tests and a 28,226-case parity
-run, which is a far better proof than a static `{"status":"ok"}`.
+At that point the cost/benefit is not close for a process that owns nothing.
+The answer was to stop climbing: **cpp-httplib** is one header (Ubuntu ships it
+split, so link `libcpp-httplib.so` via pkg-config), no dependency chain, and it
+serves the two routes Phase 1 needs. `src/main.cpp` is ~100 lines and is not
+what will make Phase 6 hard.
 
-`src/main.cpp`, the systemd unit and `TB_WITH_HTTP` are kept as-is. When Phase 6
-actually needs routes, resolve it then — vcpkg's Drogon port, or `-DMySQL_DIR`
-pointing at a shim, or a different framework. Do not pay this cost early.
+When §9 PHASE 6 actually needs 89 routes and a WebSocket, revisit Drogon then —
+vcpkg's port, or a `MySQL_DIR` shim. Do not pay that cost 28 weeks early.
 
 **Cleanup available.** These dev packages were installed on the server chasing
-this and nothing now uses them. They are inert headers plus one shared library —
+Drogon and nothing uses them now. They are inert headers plus one shared library —
 no daemon runs — so they were left in place rather than risking `apt remove` on a
 live box. To remove them during a maintenance window:
 
@@ -151,7 +150,7 @@ live box. To remove them during a maintenance window:
 sudo apt-get remove --purge libdrogon-dev libpq-dev libmysqlclient-dev libhiredis-dev libbrotli-dev
 ```
 
-Still needed, do NOT remove: `g++-14 cmake ninja-build libre2-dev libspdlog-dev pkg-config`.
+Still needed, do NOT remove: `g++-14 cmake ninja-build libre2-dev libspdlog-dev pkg-config libcpp-httplib-dev` (plus `clang-18 libclang-rt-18-dev protobuf-compiler libprotobuf-dev` for the sanitiser and §7.6 work).
 
 ---
 

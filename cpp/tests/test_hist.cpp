@@ -27,6 +27,18 @@ int main() {
   e.record(0);
   assert(e.percentile(0.50) == 0);
 
+  // A percentile must never exceed the maximum. The bucket upper bound can,
+  // and /metrics reporting p99 > max reads as a broken exporter.
+  Histogram m;
+  for (int i = 0; i < 50; ++i) m.record(17416);
+  assert(m.percentile(0.99) <= m.max());
+  assert(m.percentile(0.999) <= m.max());
+  assert(m.percentile(0.50) <= m.max());
+  Histogram spread;
+  for (std::uint64_t v : {1ULL, 7ULL, 999ULL, 100000ULL, 3000001ULL}) spread.record(v);
+  assert(spread.percentile(1.0) <= spread.max());
+  assert(spread.percentile(0.99) >= 100000);  // still not optimistic
+
   std::puts("test_hist OK");
   return 0;
 }

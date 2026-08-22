@@ -81,7 +81,7 @@ enable_testing()
 # -UNDEBUG is load-bearing: RelWithDebInfo defines NDEBUG, which compiles
 # assert() to nothing -- every test below would then "pass" without checking
 # anything at all.
-foreach(t test_fast_track test_rules_engine test_market_clock test_sizing test_hist)
+foreach(t test_fast_track test_rules_engine test_market_clock test_sizing test_hist test_volatility)
   add_executable(${t} tests/${t}.cpp)
   target_link_libraries(${t} PRIVATE tb_core)
   target_compile_options(${t} PRIVATE -UNDEBUG)
@@ -89,8 +89,26 @@ foreach(t test_fast_track test_rules_engine test_market_clock test_sizing test_h
 endforeach()
 
 # -- HTTP server (Phase 1 exit criterion: curl :8001/health) ------------------
+# cpp-httplib, not Drogon -- see the comment at the top of src/main.cpp. One
+# header, no dependency chain, two routes. Drogon returns at Phase 6.
 if(TB_WITH_HTTP)
-  find_package(Drogon CONFIG REQUIRED)
   add_executable(tradebot src/main.cpp)
-  target_link_libraries(tradebot PRIVATE tb_core Drogon::Drogon)
+  find_package(Threads REQUIRED)
+  target_link_libraries(tradebot PRIVATE tb_core Threads::Threads)
+
+  # Upstream cpp-httplib is header-only; Debian/Ubuntu ships it SPLIT (a
+  # declaring header plus libcpp-httplib.so), so including the header alone
+  # leaves every symbol undefined. Prefer the packaged library via pkg-config,
+  # and fall back to the header-only mode upstream still supports.
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(CPPHTTPLIB IMPORTED_TARGET cpp-httplib)
+  endif()
+  if(TARGET PkgConfig::CPPHTTPLIB)
+    target_link_libraries(tradebot PRIVATE PkgConfig::CPPHTTPLIB)
+  else()
+    find_path(CPP_HTTPLIB_INCLUDE_DIR httplib.h REQUIRED)
+    target_include_directories(tradebot PRIVATE ${CPP_HTTPLIB_INCLUDE_DIR})
+    target_compile_definitions(tradebot PRIVATE CPPHTTPLIB_HEADER_ONLY)
+  endif()
 endif()

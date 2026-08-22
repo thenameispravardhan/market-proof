@@ -21,9 +21,9 @@ jobs:
           # `pkg` is the apt package, which is NOT the compiler binary name for
           # clang: installing "clang++-18" silently resolves to libclang-18-dev,
           # which ships no compiler at all.
-          - { pkg: g++-14,   cc: gcc-14,   cxx: g++-14,     sanitize: 'OFF', replay: 'ON'  }
+          - { pkg: 'g++-14 libcpp-httplib-dev', cc: gcc-14, cxx: g++-14, sanitize: 'OFF', replay: 'ON', http: 'ON' }
           # libclang-rt-18-dev carries the ASan/UBSan runtimes; clang-18 alone links nothing.
-          - { pkg: 'clang-18 libclang-rt-18-dev', cc: clang-18, cxx: clang++-18, sanitize: 'ON', replay: 'OFF' }  # I11
+          - { pkg: 'clang-18 libclang-rt-18-dev', cc: clang-18, cxx: clang++-18, sanitize: 'ON', replay: 'OFF', http: 'OFF' }  # I11
     steps:
       - uses: actions/checkout@v4
 
@@ -42,7 +42,7 @@ jobs:
         run: >
           cmake -S cpp -B cpp/build -G Ninja
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
-          -DTB_WITH_HTTP=OFF
+          -DTB_WITH_HTTP=${{ matrix.http }}
           -DTB_WITH_REPLAY=${{ matrix.replay }}
           -DTB_SANITIZE=${{ matrix.sanitize }}
 
@@ -51,6 +51,17 @@ jobs:
 
       - name: Unit tests
         run: ctest --test-dir cpp/build --output-on-failure
+
+      # §9 PHASE 1's exit criterion is "curl :8001/health returns ok". Assert it
+      # here so the endpoint cannot rot between now and Phase 6.
+      - name: /health responds (Phase 1 exit criterion)
+        if: matrix.http == 'ON'
+        run: |
+          ./cpp/build/tradebot &
+          for i in $(seq 20); do curl -sf http://127.0.0.1:8001/health && break || sleep 0.5; done
+          curl -sf http://127.0.0.1:8001/health | tee /dev/stderr | grep -q '"status":"ok"'
+          curl -sf http://127.0.0.1:8001/metrics | grep -q tradebot_up
+          kill %1
 
   parity:
     # §10 -- the artifact the whole migration rests on. Runs the SAME corpus

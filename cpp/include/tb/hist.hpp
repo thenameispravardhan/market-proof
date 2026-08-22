@@ -38,14 +38,16 @@ class Histogram {
   double mean() const noexcept { return count_ ? static_cast<double>(sum_) / count_ : 0.0; }
 
   // Value at `p` in [0, 1]. Returns the bucket's upper bound, so a reported
-  // p99 is never optimistic.
+  // percentile is never optimistic -- but capped at the true maximum, because
+  // a bucket's upper bound can exceed every value actually recorded. Without
+  // the cap /metrics reports p99 > max, which reads as a broken exporter.
   std::uint64_t percentile(double p) const noexcept {
     if (count_ == 0) return 0;
     const auto target = static_cast<std::uint64_t>(p * static_cast<double>(count_) + 0.5);
     std::uint64_t seen = 0;
     for (std::size_t i = 0; i < buckets_.size(); ++i) {
       seen += buckets_[i];
-      if (seen >= target && buckets_[i] != 0) return upper_bound(i);
+      if (seen >= target && buckets_[i] != 0) return std::min(upper_bound(i), max_);
     }
     return max_;
   }
