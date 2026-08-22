@@ -20,7 +20,7 @@ from the live 74,419-row DB. The trading service was never restarted and its
 
 | # | Phase | Status | Note |
 |---|-------|--------|------|
-| 0 | Baseline + golden corpus | **exit criterion met** | 28,226 replayable cases from the live DB (§9 PHASE 0 wants ≥ 5,000). Forward instrumentation and the Fyers tick recording are still **not** done — see *Phase 0's outstanding debt*. |
+| 0 | Baseline + golden corpus | **exit criterion met** | 28,226 replayable cases from the live DB (§9 PHASE 0 wants ≥ 5,000). Forward instrumentation is written but **not deployed**; the Fyers tick recording is **not** done — see *Phase 0's outstanding debt*. |
 | 1 | Toolchain + skeleton | **partial** | Toolchain installed and building on the server. The Drogon `/health` binary is **not** built — see *The Drogon detour* below. |
 | 2 | Measurement infrastructure | **partial** | `tb::Histogram` works and `scripts/bench_fast_track.py` produces real numbers on the target box. TSC calibration, the telemetry ring and the `perf` recipes are not written — there is no hot path to measure yet. |
 | 3 | Config, logging, DB layer | **not started** | Only the seven Settings keys the Phase 5 leaves read are ported (`cpp/include/tb/config.hpp`), deliberately. |
@@ -74,7 +74,9 @@ assumed**, and two of them cannot be closed retroactively:
    reference data. Fix forward: dump extracted text at analysis time.
 2. **The raw DeepSeek reply is never persisted.** See DIFFS D6. Without it the
    schema validators cannot be verified, which blocks Phase 8's exit criterion.
-   Fix forward.
+   **Written, not deployed:** `CORPUS_CAPTURE_ENABLED` (default OFF) now stores
+   the raw reply and the extracted text in `analyses.raw_response`. It needs a
+   deploy AND the operator to turn it on — until then items 1 and 2 stay open.
 3. **No recorded Fyers tick day.** §9 PHASE 0 is explicit: *"You cannot capture
    the past. Without this, Phase 13 is blocked."* Still true.
 4. **The `tbt_ws` entitlement question is unanswered.** §7.6 / §9 PHASE 0 calls
