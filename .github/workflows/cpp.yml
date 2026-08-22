@@ -30,8 +30,13 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build cmake ${{ matrix.cxx }} \
+          sudo apt-get install -y ninja-build cmake ${{ matrix.pkg }} \
             libre2-dev libspdlog-dev pkg-config
+          # Fail here, loudly, if the compiler is missing. The runner image
+          # preinstalls both gcc-14 and clang-18, which previously masked an
+          # install line that named the wrong packages entirely.
+          ${{ matrix.cxx }} --version
+          pkg-config --exists cpp-httplib && echo "cpp-httplib: $(pkg-config --modversion cpp-httplib)" || echo "cpp-httplib: absent (http=${{ matrix.http }})"
 
       # Drogon is a heavy dependency and Phase 6 is 28 weeks out, so the
       # default job builds the logic + parity harness only. See TB_WITH_HTTP.
