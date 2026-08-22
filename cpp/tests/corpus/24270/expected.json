@@ -1,0 +1,51 @@
+{
+  "analysis": {
+    "buyback_value_inr_crore": null,
+    "confidence": 0.75,
+    "deal_value_inr_crore": null,
+    "dividend_per_share": null,
+    "event_type": "OTHER",
+    "key_numbers": {
+      "buyback_value_inr_crore": null,
+      "deal_value_inr_crore": null,
+      "dividend_per_share": null,
+      "stake_change_pct": null
+    },
+    "rationale": "Deterministic fast track: headline reports the resignation of the chief financial officer with no accompanying appointment. Headline: \"We forward herewith resignation letter dated July 10, 2026 received From Kanije Fatema Dadani Patel resigning from the post of Chief Financial Officer of the Company wef July 14, 2026\"",
+    "recommendation": "SELL",
+    "sentiment": "negative",
+    "sentiment_score": -65.0,
+    "stake_change_pct": null,
+    "summary": "Resignation of a key managerial person (chief financial officer) per the exchange headline."
+  },
+  "fast_track": {
+    "pattern": "kmp_resignation",
+    "response": {
+      "buyback_value_inr_crore": null,
+      "confidence": 0.75,
+      "deal_value_inr_crore": null,
+      "dividend_per_share": null,
+      "event_type": "OTHER",
+      "key_numbers": {
+        "buyback_value_inr_crore": null,
+        "deal_value_inr_crore": null,
+        "dividend_per_share": null,
+        "stake_change_pct": null
+      },
+      "rationale": "Deterministic fast track: headline reports the resignation of the chief financial officer with no accompanying appointment. Headline: \"We forward herewith resignation letter dated July 10, 2026 received From Kanije Fatema Dadani Patel resigning from the post of Chief Financial Officer of the Company wef July 14, 2026\"",
+      "recommendation": "SELL",
+      "sentiment": "negative",
+      "sentiment_score": -65.0,
+      "stake_change_pct": null,
+      "summary": "Resignation of a key managerial person (chief financial officer) per the exchange headline."
+    }
+  },
+  "rule": {
+    "action": "HOLD",
+    "action_params": {
+      "reason": "no_matching_rule"
+    },
+    "rationale": "No signal rule matched the analysis; defaulting to HOLD.",
+    "rule_id": null
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "analysis": {
+    "buyback_value_inr_crore": null,
+    "confidence": 0.8,
+    "deal_value_inr_crore": null,
+    "dividend_per_share": null,
+    "event_type": "ANNUAL_RESULTS",
+    "key_numbers": {
+      "buyback_value_inr_crore": null,
+      "deal_value_inr_crore": null,
+      "dividend_per_share": null,
+      "stake_change_pct": null
+    },
+    "rationale": "Revenue grew 35.6% YoY, EBITDA margin expanded from 8.27% to 13.68%, and debt-equity ratio dropped from 0.41 to 0.06 post-IPO deleveraging, indicating strong operational and financial improvement.",
+    "recommendation": "BUY",
+    "sentiment": "positive",
+    "sentiment_score": 70.0,
+    "stake_change_pct": null,
+    "summary": "Aditya Infotech reported FY26 total revenue of ₹42,336.52 million, EBITDA of ₹5,789.74 million (13.68% margin), and PAT of ₹3,679.61 million (8.69% margin), with a recommended final dividend of ₹1.64 per share."
+  },
+  "fast_track": null,
+  "rule": {
+    "action": "BUY",
+    "action_params": {},
+    "rationale": "Rule 'buy' matched (action=BUY).",
+    "rule_id": 3
+  }
+}

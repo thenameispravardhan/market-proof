@@ -1,0 +1,28 @@
+{
+  "analysis": {
+    "buyback_value_inr_crore": null,
+    "confidence": 0.8,
+    "deal_value_inr_crore": null,
+    "dividend_per_share": null,
+    "event_type": "ANNUAL_RESULTS",
+    "key_numbers": {
+      "buyback_value_inr_crore": null,
+      "deal_value_inr_crore": null,
+      "dividend_per_share": null,
+      "stake_change_pct": null
+    },
+    "rationale": "Net profit more than doubled YoY from Rs 11.43 lakhs to Rs 28.89 lakhs, and revenue grew 73% YoY from Rs 350.86 lakhs to Rs 608.29 lakhs, indicating strong operational performance.",
+    "recommendation": "BUY",
+    "sentiment": "positive",
+    "sentiment_score": 70.0,
+    "stake_change_pct": null,
+    "summary": "Machhar Industries reported Q1 FY27 standalone net profit of Rs 28.89 lakhs, up from Rs 11.43 lakhs in the same quarter last year, with revenue from operations at Rs 608.29 lakhs."
+  },
+  "fast_track": null,
+  "rule": {
+    "action": "BUY",
+    "action_params": {},
+    "rationale": "Rule 'buy' matched (action=BUY).",
+    "rule_id": 3
+  }
+}

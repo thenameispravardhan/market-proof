@@ -1,0 +1,28 @@
+{
+  "analysis": {
+    "buyback_value_inr_crore": null,
+    "confidence": 0.8,
+    "deal_value_inr_crore": null,
+    "dividend_per_share": null,
+    "event_type": "Q1_RESULTS",
+    "key_numbers": {
+      "buyback_value_inr_crore": null,
+      "deal_value_inr_crore": null,
+      "dividend_per_share": null,
+      "stake_change_pct": null
+    },
+    "rationale": "Strong operational growth with 27% capacity addition and 30% increase in energy sales, indicating robust execution and demand.",
+    "recommendation": "BUY",
+    "sentiment": "positive",
+    "sentiment_score": 70.0,
+    "stake_change_pct": null,
+    "summary": "AGEL reported Q1 FY27 operational capacity up 27% YoY to 20,142 MW and sale of energy up 30% YoY to 13,657 mn units."
+  },
+  "fast_track": null,
+  "rule": {
+    "action": "BUY",
+    "action_params": {},
+    "rationale": "Rule 'buy' matched (action=BUY).",
+    "rule_id": 3
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "analysis": {
+    "buyback_value_inr_crore": null,
+    "confidence": 0.9,
+    "deal_value_inr_crore": null,
+    "dividend_per_share": null,
+    "event_type": "ANNUAL_RESULTS",
+    "key_numbers": {
+      "buyback_value_inr_crore": null,
+      "deal_value_inr_crore": null,
+      "dividend_per_share": null,
+      "stake_change_pct": null
+    },
+    "rationale": "Standalone profit swung from loss to profit of Rs. 8,770.55 lakhs, revenue grew 22% YoY to Rs. 40,569.07 lakhs, and no exceptional losses this quarter.",
+    "recommendation": "BUY",
+    "sentiment": "positive",
+    "sentiment_score": 80.0,
+    "stake_change_pct": null,
+    "summary": "Borosil Renewables reported strong Q1 FY27 standalone net profit of Rs. 8,770.55 lakhs vs loss of Rs. 27,234.57 lakhs in Q1 FY26, driven by revenue growth and absence of exceptional items."
+  },
+  "fast_track": null,
+  "rule": {
+    "action": "BUY",
+    "action_params": {},
+    "rationale": "Rule 'buy' matched (action=BUY).",
+    "rule_id": 3
+  }
+}

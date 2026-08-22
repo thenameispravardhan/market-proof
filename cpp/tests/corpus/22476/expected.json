@@ -1,0 +1,30 @@
+{
+  "analysis": {
+    "buyback_value_inr_crore": null,
+    "confidence": 0.6,
+    "deal_value_inr_crore": null,
+    "dividend_per_share": null,
+    "event_type": "MERGER",
+    "key_numbers": {
+      "buyback_value_inr_crore": null,
+      "deal_value_inr_crore": null,
+      "dividend_per_share": null,
+      "stake_change_pct": null
+    },
+    "rationale": "NCLT approval is a positive regulatory milestone, but lack of details on merger terms limits conviction.",
+    "recommendation": "HOLD",
+    "sentiment": "positive",
+    "sentiment_score": 70.0,
+    "stake_change_pct": null,
+    "summary": "Godrej Properties Limited informed the Exchange about NCLT approval of a merger."
+  },
+  "fast_track": null,
+  "rule": {
+    "action": "HOLD",
+    "action_params": {
+      "reason": "no_matching_rule"
+    },
+    "rationale": "No signal rule matched the analysis; defaulting to HOLD.",
+    "rule_id": null
+  }
+}

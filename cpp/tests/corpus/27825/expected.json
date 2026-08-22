@@ -1,0 +1,28 @@
+{
+  "analysis": {
+    "buyback_value_inr_crore": null,
+    "confidence": 0.8,
+    "deal_value_inr_crore": null,
+    "dividend_per_share": null,
+    "event_type": "ANNUAL_RESULTS",
+    "key_numbers": {
+      "buyback_value_inr_crore": null,
+      "deal_value_inr_crore": null,
+      "dividend_per_share": null,
+      "stake_change_pct": null
+    },
+    "rationale": "Double-digit revenue and profit growth with margin expansion, supported by operating leverage and new high-value contracts like a US umbrella supplier. The company is listed on BSE SME and has a strong growth trajectory.",
+    "recommendation": "BUY",
+    "sentiment": "positive",
+    "sentiment_score": 70.0,
+    "stake_change_pct": null,
+    "summary": "Sampark India Logistics reported FY26 revenue of ₹223.3 Cr (+11% YoY), EBITDA of ₹20.0 Cr (+23%), PAT of ₹10.5 Cr (+26%), with EBITDA margin expanding 90 bps to 9.0% and PAT margin improving to 4.7%."
+  },
+  "fast_track": null,
+  "rule": {
+    "action": "BUY",
+    "action_params": {},
+    "rationale": "Rule 'buy' matched (action=BUY).",
+    "rule_id": 3
+  }
+}

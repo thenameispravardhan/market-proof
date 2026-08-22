@@ -1,0 +1,30 @@
+{
+  "analysis": {
+    "buyback_value_inr_crore": null,
+    "confidence": 0.3,
+    "deal_value_inr_crore": null,
+    "dividend_per_share": null,
+    "event_type": "Q1_RESULTS",
+    "key_numbers": {
+      "buyback_value_inr_crore": null,
+      "deal_value_inr_crore": null,
+      "dividend_per_share": null,
+      "stake_change_pct": null
+    },
+    "rationale": "No actual financial figures are provided in the metadata; only the announcement of results is confirmed. Without key numbers, a confident assessment is not possible.",
+    "recommendation": "HOLD",
+    "sentiment": "neutral",
+    "sentiment_score": 0.0,
+    "stake_change_pct": null,
+    "summary": "Indian Bank reported unaudited reviewed standalone and consolidated financial results for Q1 FY2026-27 ended June 30, 2026."
+  },
+  "fast_track": null,
+  "rule": {
+    "action": "HOLD",
+    "action_params": {
+      "reason": "no_matching_rule"
+    },
+    "rationale": "No signal rule matched the analysis; defaulting to HOLD.",
+    "rule_id": null
+  }
+}

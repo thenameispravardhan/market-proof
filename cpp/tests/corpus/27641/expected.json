@@ -1,0 +1,28 @@
+{
+  "analysis": {
+    "buyback_value_inr_crore": null,
+    "confidence": 0.8,
+    "deal_value_inr_crore": null,
+    "dividend_per_share": null,
+    "event_type": "ACQUISITION",
+    "key_numbers": {
+      "buyback_value_inr_crore": null,
+      "deal_value_inr_crore": null,
+      "dividend_per_share": null,
+      "stake_change_pct": null
+    },
+    "rationale": "The acquisition strengthens HCLTech's insurance domain expertise and AI capabilities, with a clear revenue contribution from Guardian India (FY26 revenue Rs. 578.8 crores). The low acquisition cost relative to revenue suggests value creation.",
+    "recommendation": "BUY",
+    "sentiment": "positive",
+    "sentiment_score": 70.0,
+    "stake_change_pct": null,
+    "summary": "HCLTech announces a seven-year expanded partnership with Guardian and will acquire 100% of Guardian India Operations Private Limited for $10.5 million cash, integrating ~2,000 employees."
+  },
+  "fast_track": null,
+  "rule": {
+    "action": "BUY",
+    "action_params": {},
+    "rationale": "Rule 'buy' matched (action=BUY).",
+    "rule_id": 3
+  }
+}
