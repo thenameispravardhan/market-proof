@@ -44,6 +44,40 @@ from datetime import datetime, time as dtime, timezone
 from pathlib import Path
 
 MAGIC = b"TBRAW1\n"
+
+
+def load_ws_token() -> str:
+    """The `<app_id>:<access_token>` string the Fyers WebSocket SDK expects.
+
+    The token lives on the `broker_accounts` row the OAuth callback writes --
+    NOT in .env, which only holds FYERS_APP_ID / FYERS_SECRET_KEY. Reading
+    settings.FYERS_ACCESS_TOKEN reports "no token" even when the operator is
+    perfectly well logged in; that false negative is what this prevents.
+
+    Returns "" when there is no usable token.
+    """
+    from sqlalchemy import select
+
+    from app.db.models import BrokerAccount
+    from app.db.session import SessionLocal
+
+    with SessionLocal() as db:
+        row = (
+            db.execute(
+                select(BrokerAccount)
+                .where(BrokerAccount.broker == "fyers")
+                .where(BrokerAccount.access_token.is_not(None))
+                .order_by(BrokerAccount.id.asc())
+            )
+            .scalars()
+            .first()
+        )
+        if row is None or not row.access_token:
+            return ""
+        token = str(row.access_token)
+        app_id = str(row.app_id or "")
+    return token if ":" in token else f"{app_id}:{token}"
+
 IST = timezone.utc  # replaced below; IST is UTC+5:30 and has no DST
 
 
@@ -133,14 +167,9 @@ def main() -> int:
     ap.add_argument("--max-seconds", type=int, default=0, help="stop after N seconds (0 = use --until)")
     args = ap.parse_args()
 
-    from app.config import get_settings
-
-    settings = get_settings()
-    token = getattr(settings, "FYERS_ACCESS_TOKEN", "") or ""
-    app_id = getattr(settings, "FYERS_APP_ID", "") or ""
-    if not token:
-        print("No FYERS_ACCESS_TOKEN. The daily token has expired -- log in via the\n"
-              "dashboard's Fyers panel first, then re-run. Nothing was recorded.",
+    access = load_ws_token()
+    if not access:
+        print("No Fyers access token on any broker_accounts row. Log in via the dashboard's Fyers panel first, then re-run. Nothing was recorded.",
               file=sys.stderr)
         return 2
 
@@ -161,7 +190,7 @@ def main() -> int:
     from app.execution.fyers_stream import _default_data_socket_factory
 
     sock = _default_data_socket_factory(
-        access_token=f"{app_id}:{token}" if ":" not in token else token,
+        access_token=access,
         on_message=on_message,
         on_connect=lambda: (sock.subscribe(symbols=symbols, data_type="SymbolUpdate"),
                             print(f"subscribed to {len(symbols)} symbols")),

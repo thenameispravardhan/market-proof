@@ -35,20 +35,51 @@ import time
 from datetime import datetime, timezone
 
 
+def load_ws_token() -> str:
+    """The `<app_id>:<access_token>` string the Fyers WebSocket SDK expects.
+
+    The token lives on the `broker_accounts` row the OAuth callback writes --
+    NOT in .env, which only holds FYERS_APP_ID / FYERS_SECRET_KEY. Reading
+    settings.FYERS_ACCESS_TOKEN reports "no token" even when the operator is
+    perfectly well logged in; that false negative is what this prevents.
+
+    Returns "" when there is no usable token.
+    """
+    from sqlalchemy import select
+
+    from app.db.models import BrokerAccount
+    from app.db.session import SessionLocal
+
+    with SessionLocal() as db:
+        row = (
+            db.execute(
+                select(BrokerAccount)
+                .where(BrokerAccount.broker == "fyers")
+                .where(BrokerAccount.access_token.is_not(None))
+                .order_by(BrokerAccount.id.asc())
+            )
+            .scalars()
+            .first()
+        )
+        if row is None or not row.access_token:
+            return ""
+        token = str(row.access_token)
+        app_id = str(row.app_id or "")
+    return token if ":" in token else f"{app_id}:{token}"
+
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbols", default="NSE:RELIANCE-EQ,NSE:SBIN-EQ")
     ap.add_argument("--seconds", type=int, default=120)
     args = ap.parse_args()
 
-    from app.config import get_settings
     from app.risk.market_clock import is_market_open
 
-    settings = get_settings()
-    token = getattr(settings, "FYERS_ACCESS_TOKEN", "") or ""
-    app_id = getattr(settings, "FYERS_APP_ID", "") or ""
-    if not token:
-        print("No FYERS_ACCESS_TOKEN — the daily token has expired.\n"
+    access = load_ws_token()
+    if not access:
+        print("No Fyers access token on any broker_accounts row. "
               "Log in via the dashboard's Fyers panel, then re-run.", file=sys.stderr)
         return 2
 
@@ -60,7 +91,6 @@ def main() -> int:
               "         data is not. Re-run between 09:15 and 15:30 IST.\n")
 
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
-    access = f"{app_id}:{token}" if ":" not in token else token
 
     seen: collections.Counter[str] = collections.Counter()
     fields: collections.Counter[str] = collections.Counter()
