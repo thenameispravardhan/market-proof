@@ -947,7 +947,7 @@ class _FakeSession:
         return _FakeScalar(self._captured)
 
 
-def _settings_with(**kw):
+def _corpus_settings(**kw):
     from types import SimpleNamespace
 
     base = {"CORPUS_CAPTURE_ENABLED": True, "CORPUS_CAPTURE_MAX_ROWS": 10}
@@ -970,7 +970,7 @@ def test_corpus_capture_records_raw_reply_and_text(monkeypatch):
 
     from app.analyzer import service as svc
 
-    monkeypatch.setattr(svc, "get_settings", _settings_with)
+    monkeypatch.setattr(svc, "get_settings", _corpus_settings)
     out = svc._corpus_capture(
         _FakeSession(), SimpleNamespace(content='{"recommendation":"NEUTRAL"}'), "filing body"
     )
@@ -985,7 +985,7 @@ def test_corpus_capture_skips_fast_track_producer_and_honours_cap(monkeypatch):
 
     from app.analyzer import service as svc
 
-    monkeypatch.setattr(svc, "get_settings", _settings_with)
+    monkeypatch.setattr(svc, "get_settings", _corpus_settings)
     # FastTrackProducer has no `content` -- there was no LLM call to record.
     out = svc._corpus_capture(_FakeSession(), SimpleNamespace(model="fast-track"), "body")
     assert "llm_raw" not in out and out["extracted_text"] == "body"
@@ -1003,5 +1003,5 @@ def test_corpus_capture_never_breaks_the_pipeline(monkeypatch):
         def execute(self, _stmt):
             raise RuntimeError("db is having a day")
 
-    monkeypatch.setattr(svc, "get_settings", _settings_with)
+    monkeypatch.setattr(svc, "get_settings", _corpus_settings)
     assert svc._corpus_capture(_Exploding(), SimpleNamespace(content="x"), "b") == {}
