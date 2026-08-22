@@ -26,7 +26,8 @@ from the live 74,419-row DB. The trading service was never restarted and its
 | 3 | Config, logging, DB layer | **not started** | Only the seven Settings keys the Phase 5 leaves read are ported (`cpp/include/tb/config.hpp`), deliberately. |
 | 4 | Hot-path primitives | **not started** | Consumed only by Phase 9. §9 PHASE 4 already advises taking a proven SPSC queue rather than hand-rolling one — do that when Phase 9 needs it, not before. |
 | 5 | Pure logic leaves | **EXIT CRITERION MET** | Zero diffs over 28,226 live-DB cases; 5/5 unit tests green. Measured 9.0× faster than the Python on the target box. |
-| 6–14 | — | **not started** | Each needs the live server, the live DB, Fyers credentials, or a recorded tick day. |
+| 13 | Native Fyers data socket | **de-risked, not started** | §7.6's protobuf escape hatch is proven end-to-end (schema → protoc → compiling C++ that round-trips a tick). Entitlement still unverified — needs a login. |
+| 6–12, 14 | — | **not started** | Each needs the live server, the live DB, Fyers credentials, or a recorded tick day. |
 
 ### What Phase 5 actually ported
 
@@ -79,11 +80,44 @@ assumed**, and two of them cannot be closed retroactively:
    deploy AND the operator to turn it on — until then items 1 and 2 stay open.
 3. **No recorded Fyers tick day.** §9 PHASE 0 is explicit: *"You cannot capture
    the past. Without this, Phase 13 is blocked."* Still true.
-4. **The `tbt_ws` entitlement question is unanswered.** §7.6 / §9 PHASE 0 calls
-   this the one-day task with the highest leverage in the plan — the answer
-   swings Phase 13 by 8 weeks and removes the largest technical risk in the
-   project. It is a support ticket, not an engineering task, and it should be
-   raised before any more C++ is written.
+4. **The `tbt_ws` question is HALF ANSWERED — see the section below.** The
+   technical half is done and the answer is yes; the entitlement half needs a
+   live Fyers login.
+
+---
+
+## §7.6 — the tbt_ws escape hatch: technical half PROVEN
+
+§7.6 calls this "the one-day task with the highest leverage in the plan… One
+day of checking can save three months of work and the largest risk in the
+project." The offline half is now done, on the server, end to end:
+
+1. **Schema recovered.** `scripts/recover_tbt_proto.py` pulls the
+   `FileDescriptorProto` out of the `msg_pb2` shipped inside `fyers-apiv3` and
+   reconstructs `cpp/proto/msg.proto`. The 9 messages match §7.6's documented
+   shape exactly — `SocketMessage`, `MarketFeed`, `Quote(ltp, ltt, ltq, vtt,
+   vtt_diff, oi, ltpc)`, `ExtendedQuote`, `DailyQuote`, `OHLCV`, `Depth`,
+   `MarketLevel`, `SymDetail`. Every scalar is a `google.protobuf` wrapper
+   type, so the file needs `import "google/protobuf/wrappers.proto"`.
+2. **`protoc --cpp_out=.` generates clean bindings** (msg.pb.h/.cc).
+3. **They compile with GCC 14 and round-trip a realistic tick** — LTP plus a
+   depth level, serialise and parse back, values intact.
+
+**What this means:** if the account is entitled, §9 PHASE 13 is *generated*
+protobuf decoding, not a hand-written stateful HSM binary decoder — no delta
+accumulation, no positional field ordering, no scale-factor guessing. That is
+the difference between the 8-week and 16-week branch, and it removes the
+single largest technical risk in the plan.
+
+**What is still open (needs a live session, not engineering):** §7.6 items 1–3
+— is the account entitled, does the feed carry LTP for NSE *cash equities*
+rather than derivatives-only depth, and how does its latency compare.
+`scripts/probe_tbt_entitlement.py` answers all three and prints a verdict; it
+needs a valid daily Fyers token and must run **during market hours** (it says
+so rather than reporting a false negative on a closed market).
+
+`cpp/proto/` is checked in but wired into nothing — no protobuf dependency is
+added to the build until Phase 13 actually needs it.
 
 ---
 
@@ -189,3 +223,16 @@ early rather than late:
 And the honest note from §17 has not changed: signal latency is 93% exchange lag
 and 6% DeepSeek. This rewrite buys determinism on the exit path, a ~10× memory
 reduction, and deep C++ expertise. It does not buy faster signals.
+
+---
+
+## Phase 0's remaining tooling (written, waiting on a session)
+
+| Script | Answers | Needs |
+|--------|---------|-------|
+| `scripts/record_ticks.py` | §9 PHASE 0's "record a full trading day of raw WS frames" — writes `.raw` (bytes off the wire = the decoder's input) paired with `.jsonl` (the SDK's decoded output = expected), which is the only shape Phase 13 can be verified against | a valid daily token **and** market hours |
+| `scripts/probe_tbt_entitlement.py` | §7.6 items 1–3 | same |
+| `scripts/recover_tbt_proto.py` | §7.6's schema half | nothing — already run, output checked in |
+
+The daily Fyers token expires; both live scripts stop with a clear message
+rather than recording an empty file.
