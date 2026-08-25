@@ -151,3 +151,68 @@ def test_verdict_insufficient_when_few_declined():
         [_hold(2.0, taken=False) for _ in range(5)], move_threshold_pct=1.5
     )
     assert "Not enough" in rep["verdict"]
+
+
+# ---- min_bucket_n noise floor -------------------------------------------
+
+
+def test_min_bucket_n_hides_thin_buckets_and_reports_how_many():
+    """A bucket of n=1 that "moved 100% of the time" is noise, not a finding."""
+    rows = (
+        [_hold(2.0, event="ORDER_WIN") for _ in range(10)]
+        + [_hold(2.0, event="ONE_OFF")]          # n=1, 100% mover rate
+        + [_hold(2.0, event="TWO_OFF") for _ in range(2)]
+    )
+    loose = compute_calibration(rows, min_bucket_n=1)
+    assert {b["key"] for b in loose["by_event_type"]} == {
+        "ORDER_WIN", "ONE_OFF", "TWO_OFF"
+    }
+    assert loose["dropped_buckets"] == 0
+
+    tight = compute_calibration(rows, min_bucket_n=3)
+    assert [b["key"] for b in tight["by_event_type"]] == ["ORDER_WIN"]
+    # Silently truncating would read as "there was nothing else".
+    assert tight["dropped_buckets"] == 2
+
+
+def test_top_n_bounds_the_missed_list():
+    rows = [_hold(float(i), event="OTHER") for i in range(1, 30)]
+    assert len(compute_calibration(rows, top_n=5)["top_missed"]) == 5
+    # Biggest first, so a shorter list never drops the worst miss.
+    assert compute_calibration(rows, top_n=5)["top_missed"][0]["abs_excursion"] == 29.0
+
+
+# ---- confidence verdict --------------------------------------------------
+
+
+def _conf(exc, confidence):
+    return {
+        "symbol": "X", "recommendation": "HOLD", "taken": False,
+        "event_type": "OTHER", "confidence": confidence, "sentiment": "neutral",
+        "abs_excursion": exc, "ret_15m_pct": exc, "label_15m": "UP",
+    }
+
+
+def test_confidence_verdict_detects_inversion():
+    """The live 2026-08-26 shape: most-confident band moves LEAST."""
+    rows = (
+        [_conf(2.0, 0.1) for _ in range(40)]     # low conf, 100% movers
+        + [_conf(0.2, 0.95) for _ in range(40)]  # high conf, 0% movers
+    )
+    v = compute_calibration(rows, move_threshold_pct=1.5)["confidence_verdict"]
+    assert v is not None and "INVERTED" in v
+
+
+def test_confidence_verdict_detects_tracking():
+    rows = (
+        [_conf(0.2, 0.1) for _ in range(40)]
+        + [_conf(2.0, 0.95) for _ in range(40)]
+    )
+    v = compute_calibration(rows, move_threshold_pct=1.5)["confidence_verdict"]
+    assert v is not None and "tracks reality" in v
+
+
+def test_confidence_verdict_none_when_bands_too_thin():
+    # Under 30 samples a band cannot support a claim either way.
+    rows = [_conf(2.0, 0.1) for _ in range(5)] + [_conf(0.2, 0.95) for _ in range(5)]
+    assert compute_calibration(rows)["confidence_verdict"] is None

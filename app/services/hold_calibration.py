@@ -186,12 +186,42 @@ def _verdict(
     return head + tail
 
 
+def _confidence_verdict(by_conf: list[dict[str, Any]]) -> Optional[str]:
+    """Does the LLM's own confidence track reality on the filings it passed?
+
+    Compares the mover rate of the most-confident band against the least-
+    confident one. If high confidence does not mean "more likely to move",
+    the number is decoration and any rule thresholding on it is thresholding
+    on noise — which is worth one sentence, because a five-row table does
+    not make an inversion obvious.
+    """
+    ranked = [b for b in by_conf if b["key"] != "unknown" and b["n"] >= 30]
+    if len(ranked) < 2:
+        return None
+    ranked.sort(key=lambda b: b["key"])          # bands are lexically ordered
+    lo, hi = ranked[0], ranked[-1]
+    lo_r, hi_r = lo["mover_rate"] * 100, hi["mover_rate"] * 100
+    head = (
+        f"Confidence {hi['key']}: {hi_r:.0f}% moved (n={hi['n']}) vs "
+        f"{lo['key']}: {lo_r:.0f}% (n={lo['n']}) — "
+    )
+    if hi["mover_rate"] >= lo["mover_rate"] * 1.25:
+        return head + "confidence tracks reality; thresholding on it is sound."
+    if lo["mover_rate"] >= hi["mover_rate"] * 1.25:
+        return head + (
+            "INVERTED. The LLM is most confident about filings that move "
+            "LEAST, so a high-confidence gate selects against movers."
+        )
+    return head + "flat; confidence carries no information about movement."
+
+
 def compute_calibration(
     rows: list[dict[str, Any]],
     *,
     move_threshold_pct: float = 1.5,
     big_threshold_pct: float = 3.0,
     top_n: int = 10,
+    min_bucket_n: int = 1,
 ) -> dict[str, Any]:
     """The full HOLD-calibration report over normalised dataset rows.
 
@@ -209,13 +239,25 @@ def compute_calibration(
     taken = [r for r in complete if r.get("taken")]
     declined = [r for r in complete if not r.get("taken")]
 
-    by_event = _group(hold, lambda r: r.get("event_type") or "UNKNOWN", **kw)
+    # A bucket of n=1 that "moved 100% of the time" is noise, not a finding.
+    # Filtering here rather than in the UI keeps every consumer honest and
+    # lets `dropped_buckets` say what was hidden instead of silently
+    # truncating.
+    def _floor(buckets: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+        keep = [b for b in buckets if b["n"] >= min_bucket_n]
+        return keep, len(buckets) - len(keep)
+
+    by_event, dropped_event = _floor(
+        _group(hold, lambda r: r.get("event_type") or "UNKNOWN", **kw)
+    )
     by_event.sort(key=lambda b: (b["mover_rate"], b["n"]), reverse=True)
 
-    by_conf = _group(hold, lambda r: _conf_band(r.get("confidence")), **kw)
+    by_conf, _ = _floor(_group(hold, lambda r: _conf_band(r.get("confidence")), **kw))
     by_conf.sort(key=lambda b: b["key"])
 
-    by_sent = _group(hold, lambda r: str(r.get("sentiment") or "unknown"), **kw)
+    by_sent, _ = _floor(
+        _group(hold, lambda r: str(r.get("sentiment") or "unknown"), **kw)
+    )
     by_sent.sort(key=lambda b: b["n"], reverse=True)
 
     # Concrete examples: the biggest movers the LLM passed on. These make
@@ -259,7 +301,9 @@ def compute_calibration(
         "by_sentiment": by_sent,
         "comparison": comparison,
         "top_missed": top_missed,
+        "dropped_buckets": dropped_event,
         "verdict": _verdict(
             comparison["declined"], comparison["taken"], float(move_threshold_pct)
         ),
+        "confidence_verdict": _confidence_verdict(by_conf),
     }

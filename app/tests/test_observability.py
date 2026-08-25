@@ -314,12 +314,19 @@ def test_health_report_reflects_halt(client, db_session, isolated_db):
 # =========================================================================
 
 
-def _preflight_env(monkeypatch, *, ai_on: bool, quote):
-    """AI toggle + Fyers quote probe, both faked."""
+def _preflight_env(monkeypatch, *, ai_on: bool, quote, resources=None):
+    """AI toggle + Fyers quote probe + host resources, all faked.
+
+    The resource probe reads the REAL disk and RAM of whatever machine runs
+    the suite, so without stubbing it these tests pass or fail depending on
+    how full the developer's drive is (they started failing at 85.1%). Pass
+    `resources` to exercise the resource path deliberately.
+    """
     monkeypatch.setattr(
         hr, "get_settings",
         lambda: SimpleNamespace(AI_ANALYSIS_ENABLED=ai_on),
     )
+    monkeypatch.setattr(hr, "_resource_problems", lambda: list(resources or []))
 
     async def _fake_quote(_symbol):
         return quote
@@ -605,3 +612,16 @@ def test_manual_kill_writes_history(client, db_session, isolated_db):
     assert rows[0]["event_type"] == "BREAKER_MANUAL_KILL"
     assert rows[0]["halted"] is True
     cb.clear_halt(db_session)
+
+
+@pytest.mark.asyncio
+async def test_preflight_surfaces_resource_warnings(monkeypatch):
+    """A full disk / exhausted RAM is a day-killer like the other two, so it
+    has to reach the same alarm rather than only the dashboard."""
+    _preflight_env(
+        monkeypatch, ai_on=True, quote={"last_price": 24000.0},
+        resources=["Disk 91.0% used (warn at 85%) — SQLite corrupts when it cannot write."],
+    )
+    problems = await hr.compile_preflight()
+    assert len(problems) == 1
+    assert "Disk 91.0%" in problems[0]

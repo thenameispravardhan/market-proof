@@ -899,3 +899,23 @@ def test_full_backfill_endpoint_and_status(client, db_session, isolated_db, monk
     assert status["remaining"] == {"signal": 0, "shadow": 0}
     row = db_session.query(DatasetFeature).one()
     assert row.status == "complete"
+
+
+def test_event_type_prefers_analyzer_detection_over_the_constant_column():
+    """`announcements.event_type` is the literal constant "ANNOUNCEMENT" on
+    every live row; the real type lives in analyses.raw_response."""
+    from types import SimpleNamespace
+
+    from app.api.dataset import _event_type
+
+    ann = SimpleNamespace(event_type="ANNOUNCEMENT")
+
+    analysed = SimpleNamespace(raw_response={"event_type": "order_win"})
+    assert _event_type(ann, analysed) == "ORDER_WIN"
+
+    # No analysis, empty detection, or a non-dict payload → fall back rather
+    # than lose the row from the breakdown entirely.
+    assert _event_type(ann, None) == "ANNOUNCEMENT"
+    assert _event_type(ann, SimpleNamespace(raw_response={"event_type": ""})) == "ANNOUNCEMENT"
+    assert _event_type(ann, SimpleNamespace(raw_response=None)) == "ANNOUNCEMENT"
+    assert _event_type(None, None) is None

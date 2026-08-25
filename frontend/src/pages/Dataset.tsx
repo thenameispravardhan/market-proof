@@ -111,6 +111,55 @@ function fmtCell(v: unknown): string {
   return s.length > 48 ? s.slice(0, 45) + "…" : s;
 }
 
+// One shape for all three calibration breakdowns (event type, confidence,
+// sentiment). The API filters thin buckets via min_bucket_n, so this just
+// renders — no hidden noise floor baked into the markup.
+function BucketTable({
+  label,
+  buckets,
+}: {
+  label: string;
+  buckets: CalibrationBucket[];
+}) {
+  if (!buckets.length) return null;
+  return (
+    <div style={{ overflowX: "auto", maxWidth: "100%", marginTop: 8 }}>
+      <table style={{ whiteSpace: "nowrap" }}>
+        <thead>
+          <tr>
+            <th>{label}</th>
+            <th>n</th>
+            <th>% moved</th>
+            <th>% big</th>
+            <th>avg swing</th>
+            <th>median</th>
+            <th>up / down / flat</th>
+          </tr>
+        </thead>
+        <tbody>
+          {buckets.map((b) => (
+            <tr key={b.key}>
+              <td className="mono">{b.key}</td>
+              <td className="mono">{b.n}</td>
+              <td className={`mono ${b.mover_rate >= 0.3 ? "pnl-neg" : ""}`}>
+                {(b.mover_rate * 100).toFixed(0)}%
+              </td>
+              <td className="mono">{(b.big_mover_rate * 100).toFixed(0)}%</td>
+              <td className="mono">
+                {b.avg_abs_excursion !== null ? `${b.avg_abs_excursion}%` : "—"}
+              </td>
+              <td className="mono">
+                {b.median_abs_excursion !== null ? `${b.median_abs_excursion}%` : "—"}
+              </td>
+              <td className="mono">{b.up} / {b.down} / {b.flat}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 export default function Dataset() {
   // The page shows the merged announcement dataset — every NSE/BSE filing,
   // historical plus everything collected live. The per-signal training set is
@@ -162,7 +211,22 @@ export default function Dataset() {
   const { data: health } = useDatasetHealth(healthTarget, healthOpen);
   const [calibOpen, setCalibOpen] = useState(true);
   const [calibMove, setCalibMove] = useState(1.5);
-  const { data: calib } = useDatasetCalibration(calibMove, calibOpen);
+  const [calibBig, setCalibBig] = useState(3.0);
+  const [calibSince, setCalibSince] = useState("");
+  const [calibUntil, setCalibUntil] = useState("");
+  const [calibMinN, setCalibMinN] = useState(3);
+  const [calibTopN, setCalibTopN] = useState(10);
+  const { data: calib } = useDatasetCalibration(
+    {
+      movePct: calibMove,
+      bigPct: calibBig,
+      since: calibSince,
+      until: calibUntil,
+      minBucketN: calibMinN,
+      topN: calibTopN,
+    },
+    calibOpen,
+  );
 
   // Keep the preview's column ORDER canonical (catalog order).
   const orderedSelection = useMemo(
@@ -488,9 +552,21 @@ export default function Dataset() {
                 value={calibMove}
                 onChange={(e) => setCalibMove(Number(e.target.value))}
                 style={{ width: "auto", padding: "2px 6px" }}
+                title="A filing counts as a mover if its 15m swing (max of MFE/MAE) reaches this."
               >
-                {[1.0, 1.5, 2.0, 3.0].map((n) => (
+                {[0.5, 1.0, 1.5, 2.0, 3.0, 5.0].map((n) => (
                   <option key={n} value={n}>{n.toFixed(1)}% in 15m</option>
+                ))}
+              </select>
+              <span className="meta">“big” ≥</span>
+              <select
+                value={calibBig}
+                onChange={(e) => setCalibBig(Number(e.target.value))}
+                style={{ width: "auto", padding: "2px 6px" }}
+                title="The second, stricter bar — the moves actually worth a trade after costs."
+              >
+                {[2.0, 3.0, 5.0, 8.0].map((n) => (
+                  <option key={n} value={n}>{n.toFixed(1)}%</option>
                 ))}
               </select>
             </>
@@ -507,6 +583,64 @@ export default function Dataset() {
             </p>
           ) : (
             <div style={{ padding: "0 12px 12px" }}>
+              {/* Window + noise floor. Native date inputs — no picker library
+                  for something the platform already ships. */}
+              <div
+                style={{
+                  display: "flex", gap: 8, alignItems: "center",
+                  flexWrap: "wrap", marginBottom: 10,
+                }}
+              >
+                <span className="meta">Window</span>
+                <input
+                  type="date"
+                  value={calibSince}
+                  onChange={(e) => setCalibSince(e.target.value)}
+                  style={{ width: "auto", padding: "2px 6px" }}
+                  aria-label="From date"
+                />
+                <span className="meta">→</span>
+                <input
+                  type="date"
+                  value={calibUntil}
+                  onChange={(e) => setCalibUntil(e.target.value)}
+                  style={{ width: "auto", padding: "2px 6px" }}
+                  aria-label="To date"
+                />
+                {(calibSince || calibUntil) && (
+                  <button
+                    className="chart-btn"
+                    style={{ border: "1px solid var(--border)" }}
+                    onClick={() => { setCalibSince(""); setCalibUntil(""); }}
+                  >
+                    clear
+                  </button>
+                )}
+                <span style={{ flex: 1 }} />
+                <span className="meta">min bucket n</span>
+                <select
+                  value={calibMinN}
+                  onChange={(e) => setCalibMinN(Number(e.target.value))}
+                  style={{ width: "auto", padding: "2px 6px" }}
+                  title="Hide breakdown rows thinner than this. A bucket of n=1 that 'moved 100% of the time' is noise, not a finding."
+                >
+                  {[1, 3, 10, 25, 50].map((n) => (
+                    <option key={n} value={n}>{n}</option>
+                  ))}
+                </select>
+                <span className="meta">missed list</span>
+                <select
+                  value={calibTopN}
+                  onChange={(e) => setCalibTopN(Number(e.target.value))}
+                  style={{ width: "auto", padding: "2px 6px" }}
+                  title="How many of the biggest passed-on movers to list."
+                >
+                  {[10, 25, 50, 100].map((n) => (
+                    <option key={n} value={n}>{n}</option>
+                  ))}
+                </select>
+              </div>
+
               <p
                 className="mono"
                 data-testid="calibration-verdict"
@@ -514,6 +648,21 @@ export default function Dataset() {
               >
                 {calib.verdict}
               </p>
+              {calib.confidence_verdict && (
+                <p
+                  className="mono"
+                  data-testid="calibration-confidence-verdict"
+                  style={{
+                    fontSize: 12,
+                    marginBottom: 10,
+                    color: calib.confidence_verdict.includes("INVERTED")
+                      ? "var(--danger, #f85149)"
+                      : undefined,
+                  }}
+                >
+                  {calib.confidence_verdict}
+                </p>
+              )}
 
               {/* taken vs declined comparison */}
               <div
@@ -556,42 +705,18 @@ export default function Dataset() {
                 ))}
               </div>
 
-              {/* by event type — the actionable breakdown */}
-              <div style={{ overflowX: "auto", maxWidth: "100%" }}>
-                <table style={{ whiteSpace: "nowrap" }}>
-                  <thead>
-                    <tr>
-                      <th>Declined event type</th>
-                      <th>n</th>
-                      <th>% moved</th>
-                      <th>% big</th>
-                      <th>avg swing</th>
-                      <th>up / down / flat</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {calib.by_event_type
-                      .filter((b: CalibrationBucket) => b.n >= 3)
-                      .map((b: CalibrationBucket) => (
-                        <tr key={b.key}>
-                          <td className="mono">{b.key}</td>
-                          <td className="mono">{b.n}</td>
-                          <td className={`mono ${b.mover_rate >= 0.3 ? "pnl-neg" : ""}`}>
-                            {(b.mover_rate * 100).toFixed(0)}%
-                          </td>
-                          <td className="mono">{(b.big_mover_rate * 100).toFixed(0)}%</td>
-                          <td className="mono">
-                            {b.avg_abs_excursion !== null ? `${b.avg_abs_excursion}%` : "—"}
-                          </td>
-                          <td className="mono">{b.up} / {b.down} / {b.flat}</td>
-                        </tr>
-                      ))}
-                  </tbody>
-                </table>
-              </div>
+              {/* Three breakdowns of the SAME shape. by_confidence and
+                  by_sentiment were computed by the API and thrown away by
+                  this page until now — they carry the findings that
+                  by_event_type does not. */}
+              <BucketTable label="Declined event type" buckets={calib.by_event_type} />
+              <BucketTable label="LLM confidence" buckets={calib.by_confidence} />
+              <BucketTable label="LLM sentiment" buckets={calib.by_sentiment} />
               <p className="meta" style={{ fontSize: 10, marginTop: 6 }}>
-                A high “% moved” on a declined event type = the rules are too
-                tight there. Red = ≥30% of declined filings moved.
+                A high “% moved” on a declined bucket = the rules are too tight
+                there. Red = ≥30% of declined filings moved.
+                {calib.dropped_buckets > 0 &&
+                  ` ${calib.dropped_buckets} event bucket(s) hidden below n=${calib.filters.min_bucket_n}.`}
               </p>
 
               {/* biggest missed movers */}

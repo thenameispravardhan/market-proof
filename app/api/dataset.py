@@ -363,6 +363,31 @@ def _cross_listing_key(
     return None
 
 
+def _event_type(
+    ann: Optional[Announcement],
+    analysis: Optional[Analysis],
+) -> Optional[str]:
+    """The filing's real event type, preferring the analyzer's detection.
+
+    `announcements.event_type` is written by the monitors and is the
+    literal constant "ANNOUNCEMENT" on all 77,749 live rows — it carries
+    zero information. The type the pipeline actually reasons about
+    (ORDER_WIN, DIVIDEND, BOARD_MEETING, …) is detected in the analyzer
+    and lands in `analyses.raw_response["event_type"]`.
+
+    Fixing it here rather than in each consumer: the HOLD calibration's
+    per-event breakdown, the CSV export and the column picker all read
+    this one row builder, and all three were showing a single useless
+    bucket. Falls back to the announcement column so a row with no
+    analysis still reports something.
+    """
+    if analysis is not None and isinstance(analysis.raw_response, dict):
+        detected = analysis.raw_response.get("event_type")
+        if detected and str(detected).strip():
+            return str(detected).strip().upper()
+    return getattr(ann, "event_type", None)
+
+
 def _assemble_row(
     outcome: Optional[SignalOutcome],
     signal: Optional[Signal],
@@ -420,7 +445,7 @@ def _assemble_row(
         ),
         "signal_time": _iso(anchor),
         "exchange": getattr(ann, "exchange", None),
-        "event_type": getattr(ann, "event_type", None),
+        "event_type": _event_type(ann, analysis),
         "headline": getattr(ann, "headline", None),
         "filed_at": _iso(getattr(ann, "filed_at", None)),
         "news_age_s": news_age_s,
@@ -1030,6 +1055,14 @@ def dataset_calibration(
     event_type: Optional[str] = Query(None),
     since: Optional[str] = Query(None, description="ISO date/datetime (UTC)"),
     until: Optional[str] = Query(None, description="ISO date/datetime (UTC)"),
+    top_n: int = Query(
+        10, ge=1, le=200,
+        description="how many of the biggest passed-on movers to list",
+    ),
+    min_bucket_n: int = Query(
+        3, ge=1, le=1000,
+        description="hide breakdown buckets thinner than this (noise floor)",
+    ),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """HOLD calibration — of the filings the bot DECLINED, how many
@@ -1061,9 +1094,12 @@ def dataset_calibration(
         normalised,
         move_threshold_pct=move_threshold_pct,
         big_threshold_pct=big_threshold_pct,
+        top_n=top_n,
+        min_bucket_n=min_bucket_n,
     )
     report["rows_analysed"] = len(normalised)
     report["window"] = {"since": since, "until": until}
+    report["filters"] = {"event_type": event_type, "min_bucket_n": min_bucket_n}
     return report
 
 

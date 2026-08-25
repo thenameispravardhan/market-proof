@@ -1282,17 +1282,36 @@ export interface HoldCalibration {
     label_15m: string | null;
   }[];
   verdict: string;
+  confidence_verdict: string | null;
+  dropped_buckets: number;
   rows_analysed: number;
+  window: { since: string | null; until: string | null };
+  filters: { event_type: string | null; min_bucket_n: number };
 }
 
-export function useDatasetCalibration(
-  movePct: number,
-  enabled: boolean,
-) {
+export interface CalibrationParams {
+  movePct: number;
+  bigPct?: number;
+  since?: string;
+  until?: string;
+  eventType?: string;
+  topN?: number;
+  minBucketN?: number;
+}
+
+export function useDatasetCalibration(p: CalibrationParams, enabled: boolean) {
+  const qs = new URLSearchParams({ move_threshold_pct: String(p.movePct) });
+  if (p.bigPct !== undefined) qs.set("big_threshold_pct", String(p.bigPct));
+  // Dates come from <input type="date"> as YYYY-MM-DD; the API parses ISO.
+  if (p.since) qs.set("since", p.since);
+  if (p.until) qs.set("until", p.until);
+  if (p.eventType) qs.set("event_type", p.eventType);
+  if (p.topN !== undefined) qs.set("top_n", String(p.topN));
+  if (p.minBucketN !== undefined) qs.set("min_bucket_n", String(p.minBucketN));
+  const query = qs.toString();
   return useQuery<HoldCalibration>({
-    queryKey: ["dataset-calibration", movePct],
-    queryFn: () =>
-      api.get(`/api/dataset/calibration?move_threshold_pct=${movePct}`),
+    queryKey: ["dataset-calibration", query],
+    queryFn: () => api.get(`/api/dataset/calibration?${query}`),
     enabled,
     refetchInterval: 120000,
   });
