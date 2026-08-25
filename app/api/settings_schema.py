@@ -190,6 +190,14 @@ GROUPS: list[dict[str, Any]] = [
         "prefixes": ["MODEL_"],
     },
     {
+        "id": "resources",
+        "title": "Host resources",
+        "note": "RAM and disk watchdog for the 2 GB server. Drives the Dashboard's "
+                "Resources section and the 09:05 preflight alarm — an OOM kill and a "
+                "full disk have each cost a full trading day. 0 disables a check.",
+        "prefixes": ["RESOURCE_"],
+    },
+    {
         "id": "perf_sizer",
         "title": "Performance-weighted sizing",
         "note": "Tiers per-trade risk on each event type's realised record. Below the "
@@ -288,6 +296,8 @@ LABELS: dict[str, str] = {
     "TRAIL_ACTIVATE_R": "Arm trailing stop at (R)",
     "TRAIL_DISTANCE_R": "Trail distance (R)",
     "ATR_STOP_MULT": "ATR stop multiple (×)",
+    "RESOURCE_WARN_MEM_PCT": "Warn when memory used exceeds (%)",
+    "RESOURCE_WARN_DISK_PCT": "Warn when disk used exceeds (%)",
     "MODEL_ENABLED": "Score filings with the mover model (telemetry only)",
     "MODEL_GATE_ENABLED": "Let a low model score BLOCK a trade",
     "MODEL_VARIANT": "Model variant (blank = artifact default)",

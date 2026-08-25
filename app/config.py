@@ -103,6 +103,16 @@ class Settings(BaseSettings):
     # mostly the training mean wearing a probability. 0 = never abstain.
     MODEL_MIN_COVERAGE: float = 0.5
 
+    # ---------- Host resources (RAM / disk watchdog) ------------------
+    # The box is a 2 GB Lightsail instance. Both of its exhaustible
+    # resources have already cost a trading day: an OOM kill on
+    # 2026-08-15 (uvicorn at 1.5 GB anon-rss) and three SQLite
+    # corruptions. These two thresholds drive the Dashboard's Resources
+    # section AND the 09:05 preflight alarm, so the warning arrives
+    # before the open rather than during it. 0 disables a check.
+    RESOURCE_WARN_MEM_PCT: float = 85.0
+    RESOURCE_WARN_DISK_PCT: float = 85.0
+
     # ---------- Risk defaults (per-strategy overrides in DB) ----------
     # Per-trade capital-at-risk cap. RISK.md targets 0.75%; the graduated
     # ramp (RISK_RAMP_*) starts a fresh account lower and works up to this.

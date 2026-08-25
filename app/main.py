@@ -41,6 +41,7 @@ from app.api import (
     search as search_api,
     settings_api,
     strategies as strategies_api,
+    system as system_api,
     trading_mode,
     warehouse as warehouse_api,
     ws,
@@ -534,6 +535,7 @@ app.include_router(outcomes_api.router)
 app.include_router(dataset_api.router)
 app.include_router(warehouse_api.router)
 app.include_router(model_api.router)
+app.include_router(system_api.router)
 
 
 # -------------------------------------------------------------------------

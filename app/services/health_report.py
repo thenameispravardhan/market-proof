@@ -243,6 +243,23 @@ def _db_integrity_problem() -> Optional[str]:
     return None
 
 
+def _resource_problems() -> list[str]:
+    """RAM/disk warnings from the same source the Dashboard reads.
+
+    Reuses `app.api.system` rather than re-deriving the numbers, so the
+    alarm and the on-screen bars can never disagree. Never raises — a
+    broken probe is silent here because the DB and Fyers checks above are
+    the ones worth waking someone for.
+    """
+    try:
+        from app.api.system import system_resources
+
+        return list(system_resources().get("warnings", []))
+    except Exception as e:  # noqa: BLE001
+        log.warning("preflight.resource_probe_failed", error=str(e))
+        return []
+
+
 async def compile_preflight() -> list[str]:
     """Pre-open readiness problems, or [] when the bot is good to trade.
 
@@ -270,6 +287,11 @@ async def compile_preflight() -> list[str]:
     corrupt = _db_integrity_problem()
     if corrupt:
         problems.append(corrupt)
+
+    # RAM/disk headroom. Both have already cost a full trading day (an OOM
+    # kill on 2026-08-15, and three SQLite corruptions on a box that was
+    # paging), and both are gradual — 09:05 is early enough to act.
+    problems.extend(_resource_problems())
 
     # Lazy import: app.api.market reaches back into app.main for the
     # shared ExecutionManager.

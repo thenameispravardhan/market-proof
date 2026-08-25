@@ -1341,3 +1341,40 @@ export function useBreakerHistory(limit = 100) {
     refetchInterval: 30000,
   });
 }
+
+// ---- Host resources (RAM / disk) ----
+
+export interface SystemResources {
+  memory: {
+    total_mb: number;
+    available_mb: number;
+    used_mb: number;
+    used_pct: number;
+    cached_mb: number;
+    swap_total_mb: number;
+    swap_used_mb: number;
+    swap_used_pct: number;
+  } | null;
+  process_rss_mb: number | null;
+  disk: {
+    total_gb: number | null;
+    used_gb: number | null;
+    free_gb: number | null;
+    used_pct: number | null;
+  };
+  dirs: { name: string; size_mb: number | null }[];
+  files: { name: string; size_mb: number | null }[];
+  thresholds: { mem_pct: number; disk_pct: number };
+  warnings: string[];
+}
+
+// `intervalMs` is operator-chosen (the Resources card has a picker); 0
+// pauses polling entirely, for when the dashboard is left open all day.
+export function useSystemResources(intervalMs = 5000) {
+  return useQuery<SystemResources>({
+    queryKey: ["system", "resources"],
+    queryFn: () => api.get("/api/system/resources"),
+    refetchInterval: intervalMs > 0 ? intervalMs : false,
+    refetchIntervalInBackground: false,
+  });
+}
