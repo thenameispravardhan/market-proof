@@ -6,7 +6,7 @@
 // the 67 settings that used to exist only in config.py, unreachable from the
 // frontend despite "frontend-only control" being a design invariant.
 //
-// The purpose-built cards (Exits page, News Sources, Edge Memory) are better
+// The purpose-built cards (Exits page, News Sources) are better
 // UX for their own keys and stay as they are; this is the complete surface
 // underneath them, collapsed by default so it informs without shouting.
 import { useEffect, useMemo, useRef, useState } from "react";

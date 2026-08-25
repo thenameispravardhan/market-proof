@@ -64,4 +64,20 @@ deploy/target.local.env
 
 *.docx
 
-AIdataset/
+# The research corpus (12 GB of parquet, raw dumps, trained boosters) never
+# goes in git. The ONE exception is the exported model: a ~300 KB JSON that
+# the RUNNING BOT reads (app/services/mover_model.py), so it has to travel
+# with the deploy like any other build artifact. Git cannot re-include a file
+# under an excluded DIRECTORY, so each level is excluded by content (`/*`)
+# and then re-included. Regenerate with AIdataset/model/export_live.py.
+AIdataset/*
+!AIdataset/model/
+AIdataset/model/*
+!AIdataset/model/live_model.json
+# The scripts that BUILD it, too. train.py has always lived outside git, but
+# an artifact the bot depends on must not become unreproducible if this
+# machine dies — these two are the only way to regenerate it.
+!AIdataset/model/export_live.py
+!AIdataset/model/train.py
+
+c++.text

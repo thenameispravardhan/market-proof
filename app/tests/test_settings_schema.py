@@ -64,7 +64,7 @@ def test_group_ids_are_unique():
 
 @pytest.mark.parametrize(
     "key",
-    ["MAX_CAPITAL_RISK_PCT", "SQUARE_OFF_TIME_IST", "EDGE_GATE_ENABLED", "MAX_HOLD_SECONDS"],
+    ["MAX_CAPITAL_RISK_PCT", "SQUARE_OFF_TIME_IST", "MAX_HOLD_SECONDS"],
 )
 def test_known_keys_carry_usable_widget_metadata(key):
     spec = build_registry()[key]

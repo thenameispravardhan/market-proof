@@ -281,10 +281,14 @@ export interface GlobalSettings {
   BSE_API_ENABLED: boolean;
   NSE_RSS_ENABLED: boolean;
   NSE_RSS_POLL_SECONDS: number;
-  // ---- Edge Memory (self-learning conviction gate) ----------------------
-  EDGE_GATE_ENABLED: boolean;
-  EDGE_GATE_MIN_SAMPLES: number;
-  EDGE_GATE_MIN_EXPECTANCY_PCT: number;
+  // ---- Mover model (Model page) -----------------------------------------
+  // MODEL_ENABLED only computes and surfaces the score; MODEL_GATE_ENABLED
+  // is the separate switch that lets a low score veto a trade.
+  MODEL_ENABLED: boolean;
+  MODEL_GATE_ENABLED: boolean;
+  MODEL_VARIANT: string;
+  MODEL_MIN_PROBABILITY: number;
+  MODEL_MIN_COVERAGE: number;
   // ---- Exit Manager (Exits page) ----------------------------------------
   // Every exit-engine knob. Defaults mirror the backend; the Exits page is
   // the intended editor. See app/execution/trade_manager.py for behavior.

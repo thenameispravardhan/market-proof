@@ -11,7 +11,6 @@ import { GlobalSettings } from "../components/settings/GlobalSettings";
 import { AllSettings } from "../components/settings/AllSettings";
 import { AuditLog } from "../components/settings/AuditLog";
 import { BreakerHistory } from "../components/settings/BreakerHistory";
-import { EdgeMemory } from "../components/settings/EdgeMemory";
 import { NewsSources } from "../components/settings/NewsSources";
 import { ThemeSwitcher } from "../components/settings/ThemeSwitcher";
 
@@ -46,9 +45,6 @@ export default function Settings() {
         <div>
           <SectionLabel>Detection &amp; conviction</SectionLabel>
           <NewsSources />
-          <div style={{ marginTop: 16 }}>
-            <EdgeMemory />
-          </div>
 
           <SectionLabel>Appearance</SectionLabel>
           <ThemeSwitcher />

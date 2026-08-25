@@ -34,6 +34,7 @@ const Trade = lazy(() => import("./pages/Trade"));
 const TradeHistory = lazy(() => import("./pages/TradeHistory"));
 const Outcomes = lazy(() => import("./pages/Outcomes"));
 const Dataset = lazy(() => import("./pages/Dataset"));
+const Model = lazy(() => import("./pages/Model"));
 const Prompts = lazy(() => import("./pages/Prompts"));
 const Rules = lazy(() => import("./pages/Rules"));
 const Strategies = lazy(() => import("./pages/Strategies"));
@@ -69,6 +70,7 @@ const TABS: { key: TabKey; label: string; emoji: string; group: NavGroup }[] = [
   { key: "outcomes",       label: "Outcomes",       emoji: "◎", group: "PERFORMANCE" },
   { key: "timing",         label: "Timing",         emoji: "◷", group: "PERFORMANCE" },
   { key: "dataset",        label: "Dataset",        emoji: "▥", group: "PERFORMANCE" },
+  { key: "model",          label: "Model",          emoji: "◭", group: "PERFORMANCE" },
   // Plumbing
   { key: "accounts",       label: "Accounts",       emoji: "▦", group: "SYSTEM" },
   { key: "notifications",  label: "Notifications",  emoji: "◉", group: "SYSTEM" },
@@ -82,6 +84,7 @@ function PageContent({ tab }: { tab: TabKey }) {
     case "trades": return <TradeHistory />;
     case "outcomes": return <Outcomes />;
     case "dataset": return <Dataset />;
+    case "model": return <Model />;
     case "prompts": return <Prompts />;
     case "rules": return <Rules />;
     case "strategies": return <Strategies />;

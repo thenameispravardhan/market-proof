@@ -41,5 +41,15 @@ RestartSec=3
 TimeoutStopSec=30
 LimitNOFILE=65535
 
+# Memory ceiling. The box is 1.9 GB and the process drifts upward over a
+# multi-day run (707 MB RSS + 1 GB swap after two days, 2026-08-25). On
+# 2026-08-15 the GLOBAL oom-killer fired — an unrelated `appstreamcli`
+# starved the box and the kernel picked uvicorn, taking the whole server
+# with it. A cgroup ceiling turns that into a 3-second restart of one
+# unit: MemoryHigh throttles and reclaims first, MemoryMax kills only if
+# reclaim fails. Sized above the ~1.0 GB peak of a full gap re-ingest.
+MemoryHigh=1G
+MemoryMax=1400M
+
 [Install]
 WantedBy=multi-user.target

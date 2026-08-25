@@ -26,7 +26,10 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 # 0-byte `trading-20260807-183001.db` sitting in the rotation set — one more
 # night and it would have evicted a GOOD backup to keep an empty one.
 TMP="$DEST_DIR/.trading-$STAMP.db.partial"
-trap 'rm -f "$TMP"' EXIT
+# Clean the sidecars too: sqlite3 opens the destination in WAL mode, so a
+# failed run left `.partial-shm` / `.partial-wal` behind (three pairs were
+# still sitting there on 2026-08-25).
+trap 'rm -f "$TMP" "$TMP-shm" "$TMP-wal"' EXIT
 
 sqlite3 "$DB" ".backup '$TMP'"
 

@@ -412,38 +412,45 @@ class RiskEngine:
             })
             return RiskDecision(approved=False, violations=violations, context=context)
 
-        # ---- R14. Edge Memory gate (self-learning; opt-in) -------------
-        # Consult the bot's OWN track record on signals like this one. The
-        # edge is ALWAYS computed and surfaced in context; it only VETOES
-        # a trade when EDGE_GATE_ENABLED and there's enough evidence that
-        # this cohort loses money. FAIL-OPEN: thin history never blocks,
-        # and any error degrades to "no opinion".
-        try:
-            from app.services import historical_edge as _he
+        # ---- R14. Mover model gate (offline-trained; opt-in) ------------
+        # Score the filing with the exported logistic model and attach the
+        # result to the decision context. MODEL_ENABLED alone is telemetry:
+        # the number is surfaced on the signal and can never block. Only
+        # MODEL_GATE_ENABLED lets a low score veto, and even then a score
+        # built on too little live data abstains rather than blocking.
+        # FAIL-OPEN throughout — any error degrades to "no opinion".
+        if bool(getattr(settings, "MODEL_ENABLED", False)):
+            try:
+                from app.services import mover_model as _mm
 
-            edge = _he.compute_edge(session, symbol=symbol, action=action)
-            if edge is not None:
-                context["edge"] = edge.to_dict()
-            if bool(getattr(settings, "EDGE_GATE_ENABLED", False)):
-                verdict, reason = _he.edge_verdict(
-                    edge,
-                    min_n=int(getattr(settings, "EDGE_GATE_MIN_SAMPLES", 30)),
-                    min_expectancy_pct=float(
-                        getattr(settings, "EDGE_GATE_MIN_EXPECTANCY_PCT", 0.0)
-                    ),
+                mscore = _mm.score(
+                    self._model_features(signal, symbol, entry, event_type, session),
+                    (getattr(settings, "MODEL_VARIANT", "") or None),
                 )
-                context["edge_verdict"] = verdict
-                if verdict == "block":
-                    violations.append({
-                        "code": "RISK_EDGE_NEGATIVE",
-                        "message": f"Edge Memory: {reason}",
-                        "severity": "critical",
-                    })
-                    return RiskDecision(
-                        approved=False, violations=violations, context=context
+                if mscore is not None:
+                    context["model"] = mscore.to_dict()
+                if bool(getattr(settings, "MODEL_GATE_ENABLED", False)):
+                    mverdict, mreason = _mm.verdict(
+                        mscore,
+                        min_probability=float(
+                            getattr(settings, "MODEL_MIN_PROBABILITY", 0.15)
+                        ),
+                        min_coverage=float(
+                            getattr(settings, "MODEL_MIN_COVERAGE", 0.5)
+                        ),
                     )
-        except Exception:  # noqa: BLE001 — advisory; never break a trade
-            pass
+                    context["model_verdict"] = mverdict
+                    if mverdict == "block":
+                        violations.append({
+                            "code": "RISK_MODEL_LOW_SCORE",
+                            "message": f"Mover model: {mreason}",
+                            "severity": "critical",
+                        })
+                        return RiskDecision(
+                            approved=False, violations=violations, context=context
+                        )
+            except Exception:  # noqa: BLE001 — advisory; never break a trade
+                pass
 
         # ---- R11. shorting toggle (RISK.md) ----------------------------
         # A SELL that OPENS a short (no existing long to close) is only
@@ -956,6 +963,49 @@ class RiskEngine:
                 select(func.count(PositionRow.id)).where(PositionRow.quantity != 0)
             ).scalar_one()
             or 0
+        )
+
+    def _model_features(
+        self,
+        signal: Any,
+        symbol: str,
+        entry: Optional[float],
+        event_type: Optional[str],
+        session: Optional[Session],
+    ) -> dict[str, Any]:
+        """Assemble the mover model's inputs from what this signal already
+        carries. Nothing here is allowed to query anything expensive: the
+        analysis and announcement are already loaded on the relationship, and
+        the model's historical features come from its own frozen prior table.
+
+        Every field is best-effort — `build_features` drops the ones that
+        come back None and the scorer treats them as neutral, so a sparse
+        signal produces a low-coverage score rather than a wrong one."""
+        from app.services import mover_model as _mm
+
+        analysis = getattr(signal, "analysis", None)
+        ann = getattr(analysis, "announcement", None) if analysis is not None else None
+        filed = getattr(ann, "filed_at", None) or getattr(ann, "received_at", None)
+        age = None
+        if filed is not None:
+            try:
+                age = max(0.0, (datetime.now(timezone.utc).replace(tzinfo=None)
+                                - filed).total_seconds())
+            except Exception:  # noqa: BLE001 — tz-aware/naive mismatch is not fatal
+                age = None
+        return _mm.build_features(
+            symbol=symbol,
+            headline=getattr(ann, "headline", None),
+            event_type=event_type or getattr(ann, "event_type", None),
+            category=getattr(ann, "event_type", None),
+            sentiment=getattr(analysis, "sentiment", None),
+            sentiment_score=getattr(analysis, "sentiment_score", None),
+            confidence=(getattr(analysis, "confidence", None)
+                        if analysis is not None else getattr(signal, "confidence", None)),
+            recommendation=getattr(analysis, "recommendation", None),
+            filed_at=filed,
+            last_price=entry,
+            news_age_seconds=age,
         )
 
     def _holds_position(self, session: Session, symbol: str) -> bool:

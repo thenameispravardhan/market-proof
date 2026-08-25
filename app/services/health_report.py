@@ -40,6 +40,7 @@ from app.db.models import (
     Signal,
     Trade as TradeRow,
 )
+from app.db.session import engine
 from app.logging_config import get_logger
 from app.risk.market_clock import IST, _is_trading_day, to_ist
 from app.services.event_bus import event_bus
@@ -216,6 +217,32 @@ def format_report(report: dict[str, Any]) -> tuple[str, str]:
     return subject, "\n".join(lines)
 
 
+def _db_integrity_problem() -> Optional[str]:
+    """`PRAGMA quick_check` on the live SQLite file; None when it is clean.
+
+    A malformed page is a SILENT outage. Reads keep succeeding from the
+    healthy btrees, so the dashboard, the monitors and the LLM all look
+    fine, while every INSERT fails with "disk I/O error" and the nightly
+    backup refuses to rotate. On 2026-08-25 a corrupt `risk_state` page
+    ran five days that way — 1,715 failed inserts and three skipped
+    backups — because nothing ever checked. quick_check skips the index
+    cross-checks, so it is cheap enough to run daily on a 160 MB file.
+    """
+    try:
+        with engine.connect() as conn:
+            result = conn.exec_driver_sql("PRAGMA quick_check(1)").scalar()
+    except Exception as e:  # noqa: BLE001
+        log.warning("preflight.integrity_probe_failed", error=str(e))
+        return f"Database integrity check could not run ({e})."
+    if str(result).strip().lower() != "ok":
+        return (
+            f"Database is CORRUPT (quick_check: {result}) — inserts are failing "
+            "and backups have stopped rotating. Restore per the runbook before "
+            "the open."
+        )
+    return None
+
+
 async def compile_preflight() -> list[str]:
     """Pre-open readiness problems, or [] when the bot is good to trade.
 
@@ -227,6 +254,9 @@ async def compile_preflight() -> list[str]:
         and the rules engine all keep looking healthy.
       - AI analysis switched off skips filings permanently — they are
         placeholder-marked and never re-analysed.
+      - a corrupt SQLite page fails every INSERT while every READ still
+        works, so the whole dashboard reads healthy while nothing is
+        recorded and the nightly backup silently stops rotating.
 
     Read-only and never raises: a broken probe reads as a problem, which
     is the safe direction for an alarm."""
@@ -236,6 +266,10 @@ async def compile_preflight() -> list[str]:
         problems.append(
             "AI analysis is OFF — filings will be skipped and are never re-analysed."
         )
+
+    corrupt = _db_integrity_problem()
+    if corrupt:
+        problems.append(corrupt)
 
     # Lazy import: app.api.market reaches back into app.main for the
     # shared ExecutionManager.

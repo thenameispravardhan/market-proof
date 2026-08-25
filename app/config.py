@@ -75,16 +75,33 @@ class Settings(BaseSettings):
     # 0 = follow the global POLL_INTERVAL_SECONDS.
     NSE_RSS_POLL_SECONDS: float = 1.0
 
-    # ---------- Edge Memory (self-learning conviction gate) ----------
-    # When ON, a signal is blocked if the bot's OWN track record on
-    # signals like it (same symbol, else same action) shows a losing
-    # 30-minute expectancy over at least EDGE_GATE_MIN_SAMPLES outcomes.
-    # FAIL-OPEN: thin history never blocks. Default OFF (non-destructive)
-    # — the edge is computed and surfaced regardless; the toggle only
-    # decides whether it can veto a trade. See app/services/historical_edge.py.
-    EDGE_GATE_ENABLED: bool = False
-    EDGE_GATE_MIN_SAMPLES: int = 30
-    EDGE_GATE_MIN_EXPECTANCY_PCT: float = 0.0
+    # ---------- Mover model (offline-trained P(mover), scored live) ----
+    # The artifact is AIdataset/model/live_model.json; scoring is a dot
+    # product in pure Python (app/services/mover_model.py) so nothing new
+    # is installed on the server. Two independent switches, on purpose:
+    #
+    #   MODEL_ENABLED       compute the score and attach it to the decision
+    #                       context. Pure telemetry — it can never block.
+    #   MODEL_GATE_ENABLED  additionally allow a low score to VETO a trade.
+    #
+    # Both default OFF, so shipping this changes nothing until the operator
+    # opts in (non-destructive evolution, PROJECT.txt §25). The gate is the
+    # one that needs the argument: Phase 5 measured the pooled headroom over
+    # the base rate at under 1pp, so a hard pre-filter is a real risk of
+    # throwing away trades for a model that cannot see much.
+    MODEL_ENABLED: bool = False
+    MODEL_GATE_ENABLED: bool = False
+    # Which trained variant to score with. Empty = the artifact's own
+    # default_variant. The Model page lists every key with its holdout AUC.
+    MODEL_VARIANT: str = ""
+    # A signal scoring below this P(mover) is vetoed when the GATE is on.
+    # Calibrate against the percentile table on the Model page, not by feel —
+    # the same_session base rate is ~10.7%, so 0.15 is already selective.
+    MODEL_MIN_PROBABILITY: float = 0.15
+    # Refuse to gate on a score built from too little live data. The hot path
+    # cannot always populate price/market-cap, and a 20%-covered score is
+    # mostly the training mean wearing a probability. 0 = never abstain.
+    MODEL_MIN_COVERAGE: float = 0.5
 
     # ---------- Risk defaults (per-strategy overrides in DB) ----------
     # Per-trade capital-at-risk cap. RISK.md targets 0.75%; the graduated

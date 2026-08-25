@@ -18,10 +18,12 @@ type NumField = Exclude<
   | "BSE_API_ENABLED"
   | "NSE_RSS_ENABLED"
   | "NSE_RSS_POLL_SECONDS"
-  // Edge Memory controls (edited on the Edge Memory card, not here).
-  | "EDGE_GATE_ENABLED"
-  | "EDGE_GATE_MIN_SAMPLES"
-  | "EDGE_GATE_MIN_EXPECTANCY_PCT"
+  // Mover model controls (edited on the Model page, not here).
+  | "MODEL_ENABLED"
+  | "MODEL_GATE_ENABLED"
+  | "MODEL_VARIANT"
+  | "MODEL_MIN_PROBABILITY"
+  | "MODEL_MIN_COVERAGE"
   // Exit Manager keys (edited on the Exits page, not here).
   | "ATR_ENABLED"
   | "BREAKEVEN_ENABLED"

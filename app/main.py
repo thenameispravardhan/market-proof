@@ -29,6 +29,7 @@ from app.api import (
     health,
     market as market_api,
     metrics as metrics_api,
+    model as model_api,
     notifications as notifications_api,
     options as options_api,
     orders as orders_api,
@@ -532,6 +533,7 @@ app.include_router(metrics_api.router)
 app.include_router(outcomes_api.router)
 app.include_router(dataset_api.router)
 app.include_router(warehouse_api.router)
+app.include_router(model_api.router)
 
 
 # -------------------------------------------------------------------------

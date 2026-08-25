@@ -182,11 +182,12 @@ GROUPS: list[dict[str, Any]] = [
         ],
     },
     {
-        "id": "edge",
-        "title": "Edge Memory",
-        "note": "Self-learning conviction from the bot's own outcomes. Fail-open: thin "
-                "history never blocks a trade.",
-        "prefixes": ["EDGE_GATE_"],
+        "id": "model",
+        "title": "Mover model",
+        "note": "Offline-trained P(mover), scored live from live_model.json. "
+                "MODEL_ENABLED only surfaces the score; MODEL_GATE_ENABLED is "
+                "what lets a low score veto a trade. Tune on the Model page.",
+        "prefixes": ["MODEL_"],
     },
     {
         "id": "perf_sizer",
@@ -234,9 +235,9 @@ _OTHER_GROUP = {"id": "other", "title": "Other", "note": "Not yet classified.", 
 # guards that used to live inline in settings_api._coerce; they are the UI door,
 # and several are stricter than Settings' own validators on purpose.
 BOUNDS: dict[str, tuple[float, float]] = {
-    # A signed threshold: a losing cohort has negative expectancy, 0 = block
-    # only proven losers. Exempt from the (0, 100] percent rule.
-    "EDGE_GATE_MIN_EXPECTANCY_PCT": (-50, 50),
+    # Probabilities and coverage fractions, not percents.
+    "MODEL_MIN_PROBABILITY": (0.0, 1.0),
+    "MODEL_MIN_COVERAGE": (0.0, 1.0),
     "INTRADAY_LEVERAGE": (1.0, 10.0),          # 1x unleveraged, Fyers MIS ~5x
     # R-multiples: must be positive, and >10 is a typo not a strategy.
     "ATR_STOP_MULT": (0.1, 10),
@@ -287,7 +288,11 @@ LABELS: dict[str, str] = {
     "TRAIL_ACTIVATE_R": "Arm trailing stop at (R)",
     "TRAIL_DISTANCE_R": "Trail distance (R)",
     "ATR_STOP_MULT": "ATR stop multiple (×)",
-    "EDGE_GATE_MIN_EXPECTANCY_PCT": "Min 30-min expectancy (%, may be negative)",
+    "MODEL_ENABLED": "Score filings with the mover model (telemetry only)",
+    "MODEL_GATE_ENABLED": "Let a low model score BLOCK a trade",
+    "MODEL_VARIANT": "Model variant (blank = artifact default)",
+    "MODEL_MIN_PROBABILITY": "Min P(mover) to allow (0-1)",
+    "MODEL_MIN_COVERAGE": "Min feature coverage to gate on (0-1, 0 = never abstain)",
     "NSE_RSS_POLL_SECONDS": "NSE RSS poll (seconds, 0 = follow global)",
     "PIPELINE_DEADLINE_SECONDS": "Signal deadline (seconds, 0 = off)",
     "MAX_NEWS_AGE_ABSOLUTE_SECONDS": "Absolute news age ceiling (seconds, 0 = off)",

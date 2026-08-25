@@ -663,6 +663,128 @@ export function useUpdateSettings() {
   });
 }
 
+// ---- Mover model ----
+//
+// The offline-trained P(mover) scorer. `status` is the whole Model page in
+// one call (artifact metadata + every variant's holdout metrics + the live
+// toggle state); `preview` replays the current threshold over recorded
+// outcomes so a gate is never switched on blind.
+
+export interface ModelMetrics {
+  n_train: number;
+  n_test: number;
+  base_rate: number;
+  roc_auc: number;
+  top_decile_lift: number;
+}
+
+export interface ModelVariant {
+  key: string;
+  label: string;
+  session: string | null;
+  n_features: number;
+  metrics: ModelMetrics;
+  percentiles: Record<string, number>;
+}
+
+export interface ModelStatus {
+  available: boolean;
+  error: string | null;
+  path: string;
+  built_at: string | null;
+  target: string | null;
+  default_variant: string | null;
+  n_symbols: number;
+  n_categories: number;
+  variants: ModelVariant[];
+  settings: {
+    MODEL_ENABLED: boolean;
+    MODEL_GATE_ENABLED: boolean;
+    MODEL_VARIANT: string;
+    MODEL_MIN_PROBABILITY: number;
+    MODEL_MIN_COVERAGE: number;
+  };
+}
+
+export interface ModelScore {
+  variant: string;
+  probability: number;
+  percentile: number | null;
+  coverage: number;
+  n_features: number;
+  missing: string[];
+}
+
+export interface ModelPreviewRow {
+  symbol: string;
+  action: string;
+  probability: number;
+  percentile: number | null;
+  coverage: number;
+  verdict: "allow" | "block" | "insufficient";
+  move_30m_pct: number;
+  mover: boolean;
+}
+
+export interface ModelPreview {
+  variant: string | null;
+  min_probability: number;
+  min_coverage: number;
+  n_scored: number;
+  base_mover_rate: number | null;
+  blocked: { n: number; mover_rate: number | null };
+  allowed: { n: number; mover_rate: number | null };
+  insufficient: { n: number; mover_rate: number | null };
+  rows: ModelPreviewRow[];
+}
+
+export function useModelStatus() {
+  return useQuery<ModelStatus>({
+    queryKey: ["model", "status"],
+    queryFn: () => api.get("/api/model/status"),
+  });
+}
+
+export function useModelPreview(params: {
+  variant?: string;
+  min_probability?: number;
+  min_coverage?: number;
+  limit?: number;
+  enabled?: boolean;
+}) {
+  const qs = new URLSearchParams();
+  if (params.variant) qs.set("variant", params.variant);
+  if (params.min_probability !== undefined)
+    qs.set("min_probability", String(params.min_probability));
+  if (params.min_coverage !== undefined)
+    qs.set("min_coverage", String(params.min_coverage));
+  if (params.limit) qs.set("limit", String(params.limit));
+  return useQuery<ModelPreview>({
+    queryKey: ["model", "preview", params],
+    queryFn: () => api.get(`/api/model/preview?${qs.toString()}`),
+    enabled: params.enabled !== false,
+  });
+}
+
+export function useModelScore() {
+  return useMutation<
+    { features: Record<string, unknown>; score: ModelScore | null; verdict: string; reason: string },
+    Error,
+    Record<string, unknown>
+  >({
+    mutationFn: (body) => api.post("/api/model/score", body),
+  });
+}
+
+// Re-read live_model.json after a re-export, without restarting the bot.
+export function useModelReload() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post<ModelStatus>("/api/model/reload", {}),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["model"] }),
+  });
+}
+
 // ---- Audit log ----
 
 export function useAuditLog(params?: { action?: string; target?: string; limit?: number }) {
@@ -887,30 +1009,6 @@ export function useExecutionLatency(window = 100) {
     queryKey: ["execution-latency", window],
     queryFn: () => api.get(`/api/metrics/execution-latency?window=${window}`),
     refetchInterval: 15000,
-  });
-}
-
-export interface EdgeStats {
-  basis: "symbol" | "action";
-  symbol: string | null;
-  action: string;
-  n: number;
-  win_rate: number;
-  avg_move_5m: number;
-  expectancy: number;
-  best: number;
-  worst: number;
-}
-
-export interface EdgeBook {
-  book: { BUY: EdgeStats | null; SELL: EdgeStats | null };
-}
-
-export function useEdgeBook() {
-  return useQuery<EdgeBook>({
-    queryKey: ["edge-book"],
-    queryFn: () => api.get("/api/metrics/edge/book"),
-    refetchInterval: 30000,
   });
 }
 
