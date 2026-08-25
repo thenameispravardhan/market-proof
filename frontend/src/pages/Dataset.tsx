@@ -77,6 +77,20 @@ function inText(iso: string | null | undefined): string {
   return `in ${Math.round(s / 60)}m`;
 }
 
+// Stored timestamps are naive UTC; the operator reads charts in IST, so
+// render in Asia/Kolkata rather than the browser's zone — a bot that only
+// trades NSE/BSE has exactly one meaningful clock.
+function fmtIst(iso: string | null | undefined): string {
+  if (!iso) return "—";
+  const d = new Date(iso.endsWith("Z") ? iso : iso + "Z");
+  if (Number.isNaN(d.getTime())) return "—";
+  return d.toLocaleString("en-IN", {
+    timeZone: "Asia/Kolkata",
+    day: "2-digit", month: "short",
+    hour: "2-digit", minute: "2-digit", hour12: false,
+  });
+}
+
 function loadSavedColumns(): string[] | null {
   try {
     const raw = localStorage.getItem(COLUMNS_KEY);
@@ -729,6 +743,7 @@ export default function Dataset() {
                     <table style={{ whiteSpace: "nowrap" }}>
                       <thead>
                         <tr>
+                          <th>When (IST)</th>
                           <th>Symbol</th>
                           <th>Event</th>
                           <th>Conf</th>
@@ -740,6 +755,9 @@ export default function Dataset() {
                       <tbody>
                         {calib.top_missed.map((m, i) => (
                           <tr key={`${m.symbol}-${i}`}>
+                            <td className="mono" title={m.filed_at ?? undefined}>
+                              {fmtIst(m.filed_at)}
+                            </td>
                             <td className="mono">{m.symbol ?? "—"}</td>
                             <td className="mono">{m.event_type ?? "—"}</td>
                             <td className="mono">

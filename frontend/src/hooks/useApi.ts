@@ -1274,6 +1274,7 @@ export interface HoldCalibration {
   comparison: { taken: CalibrationBucket; declined: CalibrationBucket };
   top_missed: {
     symbol: string | null;
+    filed_at: string | null;
     event_type: string | null;
     confidence: number | null;
     sentiment: string | null;

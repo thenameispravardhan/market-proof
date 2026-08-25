@@ -68,6 +68,10 @@ def normalise_dataset_row(row: dict[str, Any]) -> dict[str, Any]:
     calibration math needs. Pure — no DB, safe on partial rows."""
     return {
         "symbol": row.get("symbol"),
+        # When the exchange published it — the timestamp you need to pull up
+        # a chart and check whether a passed-on mover was really tradeable.
+        # Falls back to the decision time for rows with no filing stamp.
+        "filed_at": row.get("filed_at") or row.get("signal_time"),
         "recommendation": (str(row.get("recommendation") or "").upper() or None),
         "taken": bool(row.get("trade_taken")),
         "event_type": row.get("event_type") or "UNKNOWN",
@@ -267,6 +271,7 @@ def compute_calibration(
     top_missed = [
         {
             "symbol": r.get("symbol"),
+            "filed_at": r.get("filed_at"),
             "event_type": r.get("event_type"),
             "confidence": r.get("confidence"),
             "sentiment": r.get("sentiment"),

@@ -39,13 +39,34 @@ def test_normalise_uppercases_recommendation_and_computes_excursion():
         "symbol": "sbin", "recommendation": "hold", "trade_taken": False,
         "event_type": "ORDER_WIN", "confidence": 0.4, "sentiment": "positive",
         "mfe_15m_pct": 0.5, "mae_15m_pct": -2.8, "ret_15m_pct": -2.1,
-        "label_15m": "DOWN",
+        "label_15m": "DOWN", "filed_at": "2026-08-26T04:12:00",
     }
     out = normalise_dataset_row(row)
     assert out["recommendation"] == "HOLD"
     assert out["taken"] is False
     assert out["abs_excursion"] == 2.8
     assert out["label_15m"] == "DOWN"
+    assert out["filed_at"] == "2026-08-26T04:12:00"
+
+
+def test_normalise_falls_back_to_signal_time_when_unfiled():
+    """Shadow rows carry no exchange stamp; the decision time still locates
+    the filing on a chart, so it beats showing a dash."""
+    out = normalise_dataset_row(
+        {"recommendation": "HOLD", "signal_time": "2026-08-26T05:00:00"}
+    )
+    assert out["filed_at"] == "2026-08-26T05:00:00"
+
+
+def test_top_missed_carries_the_timestamp():
+    rows = [{
+        "symbol": "X", "recommendation": "HOLD", "taken": False,
+        "event_type": "Q1_RESULTS", "confidence": 0.2, "sentiment": "neutral",
+        "abs_excursion": 6.0, "ret_15m_pct": 6.0, "label_15m": "UP",
+        "filed_at": "2026-08-26T04:12:00",
+    }]
+    top = compute_calibration(rows)["top_missed"]
+    assert top[0]["filed_at"] == "2026-08-26T04:12:00"
 
 
 def test_normalise_missing_event_type_becomes_unknown():
