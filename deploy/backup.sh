@@ -31,7 +31,14 @@ TMP="$DEST_DIR/.trading-$STAMP.db.partial"
 # still sitting there on 2026-08-25).
 trap 'rm -f "$TMP" "$TMP-shm" "$TMP-wal"' EXIT
 
-sqlite3 "$DB" ".backup '$TMP'"
+# `VACUUM INTO` rather than `.backup`. The online-backup API copies
+# page-by-page and RESTARTS THE WHOLE COPY every time a writer touches the
+# source — on a live 160 MB DB during a news burst that turns a 3-second
+# job into a minutes-long read-lock fight (2026-08-14 took 29s; on
+# 2026-08-25 the DB corrupted 90 seconds after the run). VACUUM INTO takes
+# one read snapshot and writes once, so it cannot loop, and the output is
+# compacted for free.
+sqlite3 "$DB" "VACUUM INTO '$TMP'"
 
 # A backup nobody verified is not a backup. `.backup` against a malformed
 # source can exit non-zero *after* creating the file, so check the copy
