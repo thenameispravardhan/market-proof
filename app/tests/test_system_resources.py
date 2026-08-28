@@ -54,3 +54,27 @@ def test_warns_when_over_threshold(monkeypatch) -> None:
         lambda: {"total_gb": 58.0, "used_gb": 6.0, "free_gb": 52.0, "used_pct": 10.0},
     )
     assert system.system_resources()["warnings"] == []
+
+
+def test_memory_breakdown_sums_to_total() -> None:
+    """A breakdown you can draw as a bar must add up, or it lies."""
+    r = system.system_resources()
+    if r["memory"] is None:
+        return  # no /proc on this host (Windows dev box)
+    m = r["memory"]
+    parts = m["breakdown"]
+    assert [p["key"] for p in parts] == ["apps", "cache", "slab", "free"]
+    assert abs(sum(p["mb"] for p in parts) - m["total_mb"]) < 2.0
+    assert all(p["mb"] >= -1.0 for p in parts)
+    # Only `apps` survives memory pressure; the rest the kernel can take.
+    assert [p["reclaimable"] for p in parts] == [False, True, True, True]
+
+
+def test_top_processes_are_sorted_and_bounded() -> None:
+    procs = system._top_processes(5)
+    if not procs:
+        return  # no /proc
+    assert len(procs) <= 5
+    rss = [p["rss_mb"] for p in procs]
+    assert rss == sorted(rss, reverse=True)
+    assert all(p["name"] and p["pid"] > 0 for p in procs)

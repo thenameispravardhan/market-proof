@@ -39,6 +39,7 @@ def init_db() -> None:
         log.info("init_db.start", tables=len(Base.metadata.tables))
     Base.metadata.create_all(bind=engine)
     _ensure_columns(engine)
+    _ensure_indexes(engine)
     if first_time:
         _logged_engines.add(engine)
         log.info("init_db.done", tables=len(Base.metadata.tables))
@@ -87,3 +88,42 @@ def _ensure_columns(engine: object) -> None:
             log.info("init_db.added_columns", table=table, columns=[n for n, _ in missing])
     except Exception:  # noqa: BLE001 — never block startup on a migration hiccup
         log.exception("init_db.ensure_columns_failed")
+
+
+def _ensure_indexes(engine: object) -> None:
+    """Create model-declared indexes missing from an existing table.
+
+    `create_all` builds a table's indexes only when it builds the table.
+    A column added later through `_ADDED_COLUMNS` arrives by ALTER TABLE,
+    which carries no index — so `index=True` on the model is silently
+    ignored for every database that already existed.
+
+    That gap cost 9 seconds per HOLD-calibration request. `dataset_features
+    .announcement_id` has declared `index=True` since shadow rows shipped,
+    but the live table never had it, so SQLite rebuilt an AUTOMATIC PARTIAL
+    COVERING INDEX over 81,820 rows on every single call:
+
+        SEARCH dataset_features USING AUTOMATIC PARTIAL COVERING INDEX
+
+    Reading the indexes off `Base.metadata` rather than a hand-kept list
+    means the next ALTER-added column gets its index without anyone
+    remembering to add it here.
+    """
+    from sqlalchemy import inspect as _inspect
+
+    try:
+        insp = _inspect(engine)
+        tables = set(insp.get_table_names())
+        created: list[str] = []
+        for table in Base.metadata.sorted_tables:
+            if table.name not in tables:
+                continue
+            have = {i["name"] for i in insp.get_indexes(table.name)}
+            for index in table.indexes:
+                if index.name and index.name not in have:
+                    index.create(bind=engine)  # type: ignore[arg-type]
+                    created.append(index.name)
+        if created:
+            log.info("init_db.added_indexes", indexes=created)
+    except Exception:  # noqa: BLE001 — never block startup on a migration hiccup
+        log.exception("init_db.ensure_indexes_failed")

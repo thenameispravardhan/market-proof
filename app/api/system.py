@@ -80,18 +80,72 @@ def _meminfo() -> Optional[dict[str, float]]:
     available = kb.get("MemAvailable", kb.get("MemFree", 0.0)) / 1024
     swap_total = kb.get("SwapTotal", 0.0) / 1024
     swap_free = kb.get("SwapFree", 0.0) / 1024
+
+    # A breakdown whose four parts SUM TO TOTAL, which is the only way a
+    # bar chart of it is honest. The split that matters operationally is
+    # reclaimable vs not: `apps` is the only part the kernel cannot take
+    # back under pressure, so it is the number that predicts an OOM.
+    free = kb.get("MemFree", 0.0) / 1024
+    buffers = kb.get("Buffers", 0.0) / 1024
+    cached = kb.get("Cached", 0.0) / 1024
+    shmem = kb.get("Shmem", 0.0) / 1024
+    sreclaim = kb.get("SReclaimable", 0.0) / 1024
+    # Cached includes Shmem, which is NOT reclaimable page cache — it is
+    # tmpfs/shared memory and behaves like an allocation. Move it to apps.
+    page_cache = cached + buffers - shmem
+    apps = total - free - page_cache - sreclaim
+
     return {
         "total_mb": round(total, 1),
         "available_mb": round(available, 1),
         "used_mb": round(total - available, 1),
         "used_pct": round((total - available) / total * 100, 1) if total else 0.0,
-        "cached_mb": round(kb.get("Cached", 0.0) / 1024, 1),
+        "cached_mb": round(cached, 1),
+        "breakdown": [
+            {"key": "apps", "label": "Processes",
+             "mb": round(apps, 1), "reclaimable": False},
+            {"key": "cache", "label": "Page cache",
+             "mb": round(page_cache, 1), "reclaimable": True},
+            {"key": "slab", "label": "Kernel cache",
+             "mb": round(sreclaim, 1), "reclaimable": True},
+            {"key": "free", "label": "Free",
+             "mb": round(free, 1), "reclaimable": True},
+        ],
         "swap_total_mb": round(swap_total, 1),
         "swap_used_mb": round(swap_total - swap_free, 1),
         "swap_used_pct": (
             round((swap_total - swap_free) / swap_total * 100, 1) if swap_total else 0.0
         ),
     }
+
+
+def _top_processes(n: int = 5) -> list[dict[str, Any]]:
+    """The n largest processes by resident memory.
+
+    Straight from /proc — no `ps` subprocess. Answers the question the
+    total cannot: when memory climbs, is it the bot or something else?
+    """
+    out: list[tuple[float, str, int]] = []
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return []
+    page_mb = os.sysconf("SC_PAGE_SIZE") / 1024 / 1024
+    for pid in pids:
+        try:
+            # statm field 2 is resident set size, in pages.
+            rss = int(open(f"/proc/{pid}/statm").read().split()[1]) * page_mb
+            if rss < 1.0:
+                continue
+            name = open(f"/proc/{pid}/comm").read().strip()
+        except (OSError, ValueError, IndexError):
+            continue
+        out.append((rss, name, int(pid)))
+    out.sort(reverse=True)
+    return [
+        {"name": name, "pid": pid, "rss_mb": round(rss, 1)}
+        for rss, name, pid in out[:n]
+    ]
 
 
 def _process_rss_mb() -> Optional[float]:
@@ -204,6 +258,7 @@ def system_resources() -> dict[str, Any]:
 
     return {
         "memory": mem,
+        "top_processes": _top_processes(),
         "process_rss_mb": _process_rss_mb(),
         "disk": disk,
         "dirs": _dirs_cached(),

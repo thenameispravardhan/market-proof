@@ -2530,3 +2530,26 @@ body { transition: background-color .2s ease, color .2s ease; }
   color: #d29922;
   font-size: 11px;
 }
+
+/* ---- Resources: memory composition ---- */
+.res-bd-head { margin: 10px 0 5px; font-size: 10px; }
+.res-stack {
+  display: flex;
+  height: 10px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--bg-row);
+  margin-bottom: 8px;
+}
+.res-seg { height: 100%; }
+.res-dot {
+  display: inline-block;
+  width: 9px; height: 9px;
+  border-radius: 2px;
+  vertical-align: middle;
+}
+/* Only "apps" is unreclaimable, so it is the one that reads as spent. */
+.res-seg-apps  { background: #d29922; }
+.res-seg-cache { background: #388bfd; }
+.res-seg-slab  { background: #6e7681; }
+.res-seg-free  { background: #2ea043; }

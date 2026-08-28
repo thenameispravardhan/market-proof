@@ -189,10 +189,72 @@ export function SystemResources() {
             onClick={() => setShowBreakdown((v) => !v)}
             aria-expanded={showBreakdown}
           >
-            {showBreakdown ? "Hide" : "Show"} storage breakdown
+            {showBreakdown ? "Hide" : "Show"} breakdown
           </button>
+          {showBreakdown && mem ? (
+            <>
+              <div className="meta res-bd-head">
+                Memory - only "Processes" is unreclaimable; the kernel can
+                take the rest back under pressure.
+              </div>
+              <div className="res-stack" role="img"
+                   aria-label="Memory composition">
+                {mem.breakdown.map((b) => (
+                  <div
+                    key={b.key}
+                    className={`res-seg res-seg-${b.key}`}
+                    style={{ width: `${(b.mb / mem.total_mb) * 100}%` }}
+                    title={`${b.label}: ${mb(b.mb)}`}
+                  />
+                ))}
+              </div>
+              <table>
+                <tbody>
+                  {mem.breakdown.map((b) => (
+                    <tr key={b.key}>
+                      <td style={{ width: 18 }}>
+                        <span className={`res-dot res-seg-${b.key}`} />
+                      </td>
+                      <td className="mono">{b.label}</td>
+                      <td className="mono" style={{ textAlign: "right" }}>
+                        {mb(b.mb)}
+                      </td>
+                      <td className="mono meta" style={{ textAlign: "right" }}>
+                        {((b.mb / mem.total_mb) * 100).toFixed(0)}%
+                      </td>
+                      <td className="meta">
+                        {b.reclaimable ? "reclaimable" : "in use"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {data.top_processes.length > 0 ? (
+                <table style={{ marginTop: 8 }}>
+                  <thead>
+                    <tr>
+                      <th>Largest processes</th>
+                      <th style={{ textAlign: "right" }}>RSS</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.top_processes.map((p) => (
+                      <tr key={p.pid}>
+                        <td className="mono">
+                          {p.name} <span className="meta">#{p.pid}</span>
+                        </td>
+                        <td className="mono" style={{ textAlign: "right" }}>
+                          {mb(p.rss_mb)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ) : null}
+            </>
+          ) : null}
           {showBreakdown ? (
-            <table>
+            <table style={{ marginTop: 8 }}>
               <thead>
                 <tr>
                   <th>Directory</th>

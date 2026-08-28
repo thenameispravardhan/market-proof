@@ -1374,7 +1374,14 @@ export interface SystemResources {
     swap_total_mb: number;
     swap_used_mb: number;
     swap_used_pct: number;
+    breakdown: {
+      key: string;
+      label: string;
+      mb: number;
+      reclaimable: boolean;
+    }[];
   } | null;
+  top_processes: { name: string; pid: number; rss_mb: number }[];
   process_rss_mb: number | null;
   disk: {
     total_gb: number | null;
