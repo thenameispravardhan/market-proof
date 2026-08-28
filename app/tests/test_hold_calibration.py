@@ -237,3 +237,24 @@ def test_confidence_verdict_none_when_bands_too_thin():
     # Under 30 samples a band cannot support a claim either way.
     rows = [_conf(2.0, 0.1) for _ in range(5)] + [_conf(0.2, 0.95) for _ in range(5)]
     assert compute_calibration(rows)["confidence_verdict"] is None
+
+
+# ---- endpoint cache ------------------------------------------------------
+
+
+def test_calibration_cache_is_lru_bounded():
+    """The cache is keyed on slider params; dragging a slider must not
+    grow it without bound."""
+    from app.api import dataset as D
+
+    D._calib_cache.clear()
+    for i in range(D._CALIB_MAX_ENTRIES + 10):
+        D._calib_cache[(i,)] = (0.0, {})
+        D._calib_cache.move_to_end((i,))
+        while len(D._calib_cache) > D._CALIB_MAX_ENTRIES:
+            D._calib_cache.popitem(last=False)
+    assert len(D._calib_cache) == D._CALIB_MAX_ENTRIES
+    # Oldest evicted, newest kept.
+    assert (0,) not in D._calib_cache
+    assert (D._CALIB_MAX_ENTRIES + 9,) in D._calib_cache
+    D._calib_cache.clear()

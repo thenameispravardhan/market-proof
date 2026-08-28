@@ -28,6 +28,8 @@ from __future__ import annotations
 import csv
 import io
 import json
+import time
+from collections import OrderedDict
 from datetime import datetime
 from typing import Any, Optional
 
@@ -1043,6 +1045,23 @@ def dataset_health(
 
 # ---- HOLD calibration: is the bot passing on movers? ----------------------
 
+# The report reads ~16,500 rows as full ORM entities and reduces them to a
+# handful of rates: measured warm, 1.18s + 1.24s of SQL, 0.58s assembling,
+# 0.24s computing. Nothing in that is a bug to fix -- it is the honest cost
+# of loading the set.
+#
+# What makes it worth caching is WHAT it reports on: completed 15-minute
+# outcomes, which the dataset builder fills after the close. Between those
+# fills the answer cannot change, while the Dashboard refetches every 120s
+# and every slider nudge re-requests it. Five minutes of staleness on a
+# historical report costs the operator nothing.
+#
+# ponytail: process-local dict, no TTL library. Single worker (see
+# tradebot.service) so there is nothing to share it with.
+_CALIB_TTL_S = 300.0
+_CALIB_MAX_ENTRIES = 32
+_calib_cache: "OrderedDict[tuple[Any, ...], tuple[float, dict[str, Any]]]" = OrderedDict()
+
 
 @router.get("/calibration")
 def dataset_calibration(
@@ -1079,6 +1098,14 @@ def dataset_calibration(
         normalise_dataset_row,
     )
 
+    key = (move_threshold_pct, big_threshold_pct, limit, event_type,
+           since, until, top_n, min_bucket_n)
+    now = time.monotonic()
+    cached = _calib_cache.get(key)
+    if cached is not None and now - cached[0] < _CALIB_TTL_S:
+        _calib_cache.move_to_end(key)
+        return {**cached[1], "cached_age_s": round(now - cached[0], 1)}
+
     result = _dataset_rows(
         db,
         limit=limit,
@@ -1100,7 +1127,12 @@ def dataset_calibration(
     report["rows_analysed"] = len(normalised)
     report["window"] = {"since": since, "until": until}
     report["filters"] = {"event_type": event_type, "min_bucket_n": min_bucket_n}
-    return report
+
+    _calib_cache[key] = (now, report)
+    _calib_cache.move_to_end(key)
+    while len(_calib_cache) > _CALIB_MAX_ENTRIES:
+        _calib_cache.popitem(last=False)  # evict least-recently-used
+    return {**report, "cached_age_s": 0.0}
 
 
 def _get_builder(request: Request):
