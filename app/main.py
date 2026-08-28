@@ -351,13 +351,23 @@ async def lifespan(app: FastAPI):
             from app.risk import circuit_breakers
             from app.services.event_bus import event_bus as _bus
 
+            # Back off when the tick keeps failing. A corrupt `risk_state`
+            # page on 2026-08-25 made every tick raise, and this loop
+            # retried it every 10s for three days: 2,096 failures in six
+            # hours, each logging a ~4 KB SQLAlchemy traceback. The log
+            # flood, not the corruption, is what pushed the 2 GB box into
+            # a swap storm. Retrying a broken database faster does not
+            # fix it.
+            fails = 0
             while True:
                 try:
-                    await asyncio.sleep(10.0)
+                    delay = 10.0 if not fails else min(10.0 * 2 ** fails, 300.0)
+                    await asyncio.sleep(delay)
                     with SessionLocal() as _s:
                         summary = circuit_breakers.evaluate_breakers(
                             _s, execution_manager.market_data
                         )
+                    fails = 0
                     if summary.get("newly_tripped"):
                         await _bus.publish("breaker.tripped", summary)
                     if summary.get("flatten_required"):
@@ -365,8 +375,20 @@ async def lifespan(app: FastAPI):
                         await trade_manager.close_all(reason="CIRCUIT_BREAKER")
                 except asyncio.CancelledError:
                     raise
-                except Exception:  # noqa: BLE001
-                    log.exception("risk_monitor.tick_failed")
+                except Exception as e:  # noqa: BLE001
+                    fails += 1
+                    # Full traceback once per outage; after that a one-line
+                    # heartbeat, so a long failure stays diagnosable without
+                    # filling the journal.
+                    if fails == 1:
+                        log.exception("risk_monitor.tick_failed")
+                    else:
+                        log.warning(
+                            "risk_monitor.tick_failed",
+                            consecutive=fails,
+                            next_retry_s=min(10.0 * 2 ** fails, 300.0),
+                            error=str(e)[:200],
+                        )
 
         risk_monitor_task = asyncio.create_task(_risk_monitor(), name="risk-monitor")
 
