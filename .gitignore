@@ -79,5 +79,23 @@ AIdataset/model/*
 # machine dies — these two are the only way to regenerate it.
 !AIdataset/model/export_live.py
 !AIdataset/model/train.py
+# The SLM server. The WEIGHTS live on Hugging Face (2.9 GB — git is the wrong
+# place for them); this is the ~150-line script that serves them, and the bot
+# is useless with LLM_PROVIDER=slm unless a reader can start one.
+!AIdataset/model/serve_slm.py
+!AIdataset/model/MODEL_CARD.md
 
 c++.text
+
+# Internal research log. Carries AWS account ids, a home IP, security-group
+# ids and a second account holder's name — operational detail that has no
+# business in a public repo. Never pushed; keep it that way. The publishable
+# summary of this work is README §10 and AIdataset/model/MODEL_CARD.md.
+docs/SLM_TRAINING_PLAN.md
+
+# Flattened assistant memory + the script that writes it. PROJECT_MEMORY.md's
+# own header claims it is ignored — it was not, and it carries the production
+# static IP, the dashboard domain, the SSH key name and the Telegram bot's
+# chat id. Working notes, not project code.
+PROJECT_MEMORY.md
+dump_memory.py

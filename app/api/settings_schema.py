@@ -37,6 +37,7 @@ from app.config import Settings
 # and never returns the secret. Exposing them here would leak them via GET.
 _SECRET_KEYS = frozenset({
     "DEEPSEEK_API_KEY",
+    "LLM_SLM_API_KEY",
     "FYERS_APP_ID",
     "FYERS_SECRET_KEY",
     "FYERS_ACCESS_TOKEN",
@@ -281,6 +282,9 @@ LABELS: dict[str, str] = {
     "PORTFOLIO_VALUE": "Portfolio value (₹)",
     "MIN_LIQUIDITY_CRORE": "Min liquidity (₹ crore)",
     "INTRADAY_LEVERAGE": "Intraday leverage (×)",
+    "LLM_PROVIDER": "AI model (DeepSeek or our fine-tuned SLM)",
+    "LLM_SLM_ENDPOINT": "SLM endpoint (OpenAI-compatible /chat/completions)",
+    "LLM_SLM_MODEL": "SLM model name",
     "LLM_MAX_TOKENS": "AI max output tokens",
     "LLM_TIMEOUT_SECONDS": "AI call timeout (seconds)",
     "LLM_MAX_RETRIES": "AI retries",

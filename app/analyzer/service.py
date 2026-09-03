@@ -76,6 +76,8 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.analyzer.deepseek_client import DeepSeekClient, DeepSeekError
+from app.analyzer.slm_adapter import build_prompt as slm_build_prompt
+from app.analyzer.slm_adapter import to_analysis as slm_to_analysis
 from app.analyzer.fast_track import (
     FastTrackMatch,
     FastTrackProducer,
@@ -300,6 +302,9 @@ class Service:
         max_concurrent: int = 2,
     ) -> None:
         self._deepseek = deepseek_client or DeepSeekClient()
+        # Second client, built lazily, only when LLM_PROVIDER == "slm".
+        self._slm: Optional[DeepSeekClient] = None
+        self._slm_endpoint: str = ""
         self._session_factory = session_factory or _default_session_factory()
         self._analysis_exists = analysis_already_exists or _default_analysis_exists
         self._stop_event: asyncio.Event = asyncio.Event()
@@ -451,6 +456,39 @@ class Service:
 
     async def aclose(self) -> None:
         await self._deepseek.aclose()
+        if self._slm is not None:
+            await self._slm.aclose()
+            self._slm = None
+
+    # -- provider routing ------------------------------------------------
+
+    async def _llm_client(self, settings: Any) -> tuple[DeepSeekClient, Optional[str]]:
+        """Return (client, model_override) for this call.
+
+        LLM_PROVIDER == "slm" routes the SAME prompt to our fine-tuned model
+        behind an OpenAI-compatible endpoint; the wire format is identical, so
+        DeepSeekClient serves both. A blank endpoint falls back to DeepSeek —
+        a mis-set provider must never cost a signal (non-destructive
+        evolution: the toggle can degrade, never block).
+        """
+        if getattr(settings, "LLM_PROVIDER", "deepseek") != "slm":
+            return self._deepseek, None
+        endpoint = (getattr(settings, "LLM_SLM_ENDPOINT", "") or "").strip()
+        if not endpoint:
+            log.warning("analyzer.slm_no_endpoint")
+            return self._deepseek, None
+        if self._slm is not None and self._slm_endpoint != endpoint:
+            await self._slm.aclose()
+            self._slm = None
+        if self._slm is None:
+            self._slm = DeepSeekClient(
+                endpoint=endpoint,
+                # DeepSeekClient refuses an empty key; an unauthenticated
+                # vLLM ignores whatever bearer it is handed.
+                api_key=(getattr(settings, "LLM_SLM_API_KEY", "") or "-"),
+            )
+            self._slm_endpoint = endpoint
+        return self._slm, (getattr(settings, "LLM_SLM_MODEL", "") or None)
 
     # -- main loop -------------------------------------------------------
 
@@ -797,18 +835,38 @@ class Service:
                 int(template.max_tokens),
                 int(getattr(settings, "LLM_MAX_TOKENS", 512)),
             )
+            # Which model reads this filing (Settings → AI analysis →
+            # "AI model"). The SLM was fine-tuned on its OWN prompt format and
+            # its own target schema, so it gets both swapped — see
+            # slm_adapter. Everything downstream (rules, risk, execution) is
+            # identical for both models.
+            llm, slm_model = await self._llm_client(settings)
+            is_slm = slm_model is not None
+            slm_raw: Optional[dict[str, Any]] = None
+            if is_slm:
+                system, user = slm_build_prompt(
+                    symbol=announcement.symbol or "",
+                    filed_at=str(announcement.filed_at or ""),
+                    headline=announcement.headline or "",
+                    filing_text=extraction.text if (extraction and extraction.ok) else "",
+                )
             ds_result = await asyncio.wait_for(
-                self._deepseek.complete(
+                llm.complete(
                     system=system,
                     user=user,
-                    model=template.model,
+                    model=slm_model or template.model,
                     temperature=template.temperature,
                     max_tokens=max_tokens,
                     # v4 inference controls from the prompt page. getattr
                     # keeps this safe against pre-migration template rows.
-                    reasoning_effort=getattr(template, "reasoning_effort", None) or "medium",
-                    thinking=bool(getattr(template, "thinking_enabled", False)),
-                    stream=bool(getattr(template, "stream", False)),
+                    # They are DeepSeek-only body fields — a vLLM server
+                    # rejects unknown keys, so the SLM gets none of them.
+                    reasoning_effort=(
+                        None if is_slm
+                        else (getattr(template, "reasoning_effort", None) or "medium")
+                    ),
+                    thinking=True if is_slm else bool(getattr(template, "thinking_enabled", False)),
+                    stream=False if is_slm else bool(getattr(template, "stream", False)),
                 ),
                 timeout=llm_timeout,
             )
@@ -854,7 +912,18 @@ class Service:
 
         # Step 4: validate the JSON. On failure store raw + OTHER.
         try:
-            parsed_json = _parse_json(ds_result.content)
+            if is_slm:
+                # The SLM speaks its own schema; map it onto the contract the
+                # rest of the pipeline is written against. The untouched model
+                # JSON (price_path, volume_path, surprise) is kept so a
+                # mapping decision stays re-derivable from the raw output.
+                parsed_json, slm_raw = slm_to_analysis(
+                    ds_result.content,
+                    headline=announcement.headline or "",
+                    pdf_url=announcement.pdf_url or "",
+                )
+            else:
+                parsed_json = _parse_json(ds_result.content)
         except Exception as e:
             log.error(
                 "analyzer.invalid_json",
@@ -935,6 +1004,7 @@ class Service:
             timings,
             extraction.meta() if extraction is not None else None,
             force_block_reason,
+            slm_raw,
         )
 
         # Step 9: publish.
@@ -1112,6 +1182,7 @@ def _persist_analysis_and_signal(
     timings: Optional[dict[str, Any]] = None,
     pdf_extraction_meta: Optional[dict[str, Any]] = None,
     force_block_reason: Optional[str] = None,
+    slm_raw: Optional[dict[str, Any]] = None,
 ) -> tuple[Signal, bool]:
     """Persist the analysis, run rules, persist signal.
 
@@ -1151,6 +1222,12 @@ def _persist_analysis_and_signal(
                 # real filing text (and why not, when it didn't).
                 "timings": timings,
                 "pdf_extraction": pdf_extraction_meta,
+                # The fine-tuned model's UNMAPPED output (direction, mover,
+                # materiality, surprise, the 17-point price/volume paths).
+                # None for the hosted model. Kept so every adapter decision
+                # stays re-derivable, and so the paths — which have no slot in
+                # AnalysisResponse — are not thrown away.
+                "slm": slm_raw,
             },
         )
         session.add(a)

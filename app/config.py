@@ -382,6 +382,21 @@ class Settings(BaseSettings):
     # picked up when the analyzer (re)builds its client at startup.
     LLM_MAX_RETRIES: int = 1
     LLM_RETRY_BACKOFF_SECONDS: float = 0.5
+    # ---------- Which model reads the filing ----------
+    # "deepseek" (default) = the hosted API, behaviour unchanged. "slm" =
+    # our own fine-tuned model served behind an OpenAI-compatible
+    # /chat/completions endpoint (vLLM). Same prompt templates, same
+    # response schema, same rules/risk path — only the endpoint moves, so
+    # the two are directly comparable on the Outcomes and Dataset pages.
+    # Non-destructive: "slm" with a blank endpoint falls back to DeepSeek
+    # rather than blocking a signal.
+    LLM_PROVIDER: Literal["deepseek", "slm"] = "deepseek"
+    LLM_SLM_ENDPOINT: str = ""       # http://host:8000/v1/chat/completions
+    LLM_SLM_MODEL: str = "tradebot-slm-v1"
+    # Optional. Blank = the endpoint is unauthenticated (vLLM started
+    # without --api-key). Secret, so it is .env-only — never returned by
+    # GET /api/settings.
+    LLM_SLM_API_KEY: str = ""
     # Hard end-to-end deadline (seconds from `filed_at` to signal). If a
     # fully-analysed announcement is older than this by the time the
     # signal would be created, the analysis is still stored (data for

@@ -2,7 +2,7 @@
 # One-shot server bootstrap for the AI News Trading Bot on AWS Lightsail
 # (Ubuntu 24.04, ap-south-1). Run it from inside the cloned repo:
 #
-#   git clone https://github.com/thenameispravardhan/AI-News-Trading-Bot.git tradebot
+#   git clone https://github.com/thenameispravardhan/market-proof.git tradebot
 #   cd tradebot && bash deploy/setup.sh
 #
 # Idempotent — safe to re-run. Uses sudo (Lightsail's ubuntu user has it).
