@@ -819,9 +819,9 @@ scripts/               run · dev · smoke_slm · seeders · maintenance
 
 ## 20. Team, licence, disclaimer
 
-Built by **Manchala Nitya Pravardhan**, **Siriki Vinay Kumar** and **G Santhosh** —
+Built by **Manchala Nitya Pravardhan** —
 B.E. Artificial Intelligence & Data Science, Chaitanya Bharathi Institute of
-Technology (CBIT), Hyderabad. Guide: **Mr. Kinnera Ravi**, Assistant Professor.
+Technology (CBIT), Hyderabad.
 
 - Code: **MIT**
 - Model `tradebot-slm-v1`: **Apache 2.0** (inherited from Qwen2.5-1.5B-Instruct)
