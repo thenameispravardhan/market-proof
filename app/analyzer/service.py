@@ -1266,11 +1266,13 @@ def _persist_analysis_and_signal(
             _cache_set("rules", cached_rules)
         rules = cached_rules
         # Add the symbol/exchange for the rule context, then enrich with the
-        # cheaply-available market context (sector) so rules can gate on it.
-        # Price / change_pct / adv_crore need a live quote and are only
-        # filled when one is passed to enrich_analysis_context (not wired in
-        # this offline analysis path yet) — they stay absent here, which the
-        # engine treats as a fail-safe non-match.
+        # market context so rules can gate on it. `sector` is free (a dict).
+        # `price` / `change_pct` come from the quote the monitor started
+        # fetching when the filing was detected (quote_cache.prefetch) —
+        # read-only and time-boxed, so a quote that has not come back yet
+        # simply leaves the fields absent, which the engine treats as a
+        # fail-safe non-match. `adv_crore` stays absent: the Fyers quote
+        # does not carry ADV.
         from app.risk.engine import load_sector_map
 
         eval_ctx = dict(analysis_dict)
@@ -1280,7 +1282,18 @@ def _persist_analysis_and_signal(
         if cached_sector_map is None:
             cached_sector_map = load_sector_map()
             _cache_set("sector_map", cached_sector_map)
-        eval_ctx = enrich_analysis_context(eval_ctx, sector_map=cached_sector_map)
+        quote_obj = None
+        if bool(getattr(get_settings(), "QUOTE_PREFETCH_ENABLED", False)):
+            from types import SimpleNamespace
+
+            from app.analyzer import quote_cache
+
+            q = quote_cache.get_quote(announcement.symbol)
+            if q:
+                quote_obj = SimpleNamespace(**q)
+        eval_ctx = enrich_analysis_context(
+            eval_ctx, sector_map=cached_sector_map, quote=quote_obj
+        )
         match = rules_evaluate(eval_ctx, rules)
 
         # Attribute the signal to the strategy that actually owns the

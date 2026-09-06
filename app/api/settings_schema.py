@@ -108,13 +108,22 @@ GROUPS: list[dict[str, Any]] = [
         "prefixes": ["SECTOR_", "MAX_POSITIONS_PER_SECTOR"],
     },
     {
+        "id": "cap_tiers",
+        "title": "Market-cap tiers",
+        "note": "Which size of company this bot may trade. The two boundaries define the "
+                "three tiers — a name at or above the Large boundary is Large, at or above "
+                "the Mid boundary is Mid, anything below is Small. Caps come from AMFI's "
+                "half-yearly sheet (data/mcap.csv). With the filter off, every tier trades.",
+        "prefixes": ["CAP_"],
+    },
+    {
         "id": "filters",
         "title": "Pre-trade filters",
         "note": "Conditions a signal must clear before it can become an order. Filters whose "
                 "feed is not yet wired no-op rather than fake a pass.",
         "prefixes": [
             "MIN_SENTIMENT_CONFIDENCE", "INDIA_VIX_MAX", "MAX_SPREAD_PCT",
-            "SHORTING_ENABLED", "REQUIRE_KNOWN_LIQUIDITY",
+            "SHORTING_ENABLED", "REQUIRE_KNOWN_LIQUIDITY", "QUOTE_PREFETCH_ENABLED",
         ],
     },
     {
@@ -313,6 +322,14 @@ LABELS: dict[str, str] = {
     "ENFORCE_MARKET_HOURS": "Enforce market hours",
     "OUTCOME_LOGGER_ENABLED": "Signal outcome tracking",
     "SHORTING_ENABLED": "Allow short entries",
+    "CAP_FILTER_ENABLED": "Filter trades by market-cap tier",
+    "CAP_LARGE_MIN_CR": "Large cap starts at (₹ crore)",
+    "CAP_MID_MIN_CR": "Mid cap starts at (₹ crore)",
+    "CAP_TRADE_LARGE": "Trade large caps",
+    "CAP_TRADE_MID": "Trade mid caps",
+    "CAP_TRADE_SMALL": "Trade small caps",
+    "CAP_TRADE_UNKNOWN": "Trade symbols with no known market cap",
+    "QUOTE_PREFETCH_ENABLED": "Give rules the live quote (price, change %)",
 }
 
 _WORD_FIXUPS = {
