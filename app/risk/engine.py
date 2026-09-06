@@ -19,6 +19,8 @@ soft override anywhere.
                                                 allow with a warning when ADV is unknown)
   R9. sector concentration > 30%             -> blocked
   R10. symbol in symbol_blocklist            -> blocked
+  R15. market-cap tier switched off          -> blocked (opt-in;
+                                                CAP_FILTER_ENABLED)
 
 **The verifier tries 10+ bypass methods.** We make every rule a
 hard check, computed in a single `evaluate()` call from the
@@ -411,6 +413,37 @@ class RiskEngine:
                 "severity": "critical",
             })
             return RiskDecision(approved=False, violations=violations, context=context)
+
+        # ---- R15. Market-cap tier filter (opt-in) ----------------------
+        # Placed here on purpose: it is a dict lookup with no DB or quote
+        # dependency, so a tier the operator has switched off costs one
+        # hash and never reaches sizing. OFF by default — with
+        # CAP_FILTER_ENABLED false this block is a single bool check.
+        if bool(getattr(settings, "CAP_FILTER_ENABLED", False)):
+            from app.services import mcap as _mcap
+
+            mcap_cr = _mcap.lookup(symbol)
+            tier = _mcap.tier_of(
+                mcap_cr,
+                float(getattr(settings, "CAP_LARGE_MIN_CR", 50_000.0)),
+                float(getattr(settings, "CAP_MID_MIN_CR", 15_000.0)),
+            )
+            context["market_cap_cr"] = mcap_cr
+            context["cap_tier"] = tier
+            allowed = {
+                "large": bool(getattr(settings, "CAP_TRADE_LARGE", True)),
+                "mid": bool(getattr(settings, "CAP_TRADE_MID", True)),
+                "small": bool(getattr(settings, "CAP_TRADE_SMALL", True)),
+            }.get(tier) if tier else bool(getattr(settings, "CAP_TRADE_UNKNOWN", True))
+            if not allowed:
+                where = (f"{tier} cap (₹{mcap_cr:,.0f} cr)" if tier
+                         else "unknown market cap")
+                violations.append({
+                    "code": "RISK_CAP_TIER_BLOCKED",
+                    "message": f"symbol {symbol!r} is {where}; that tier is switched off.",
+                    "severity": "critical",
+                })
+                return RiskDecision(approved=False, violations=violations, context=context)
 
         # ---- R14. Mover model gate (offline-trained; opt-in) ------------
         # Score the filing with the exported logistic model and attach the

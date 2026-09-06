@@ -14,8 +14,14 @@ htmlcov/
 *.pdf
 *.txt
 
-# Local data
-data/
+# Local data. `data/*` rather than `data/` so a file can be re-included:
+# git will not descend into an excluded *directory*, so the negation below
+# only works against an excluded pattern.
+data/*
+# The AMFI market-cap table the cap-tier filter reads. 81 KB of reference
+# data, rebuilt twice a year by scripts/build_mcap.py — it has to ship with
+# the code or the filter has no caps on the server.
+!data/mcap.csv
 *.db
 *.sqlite
 *.sqlite3
