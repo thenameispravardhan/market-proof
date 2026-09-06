@@ -768,3 +768,107 @@ async def test_sector_cluster_window_blocks(db_session, isolated_db):
     )
     assert decision.approved is False
     assert "RISK_SECTOR_CLUSTER_WINDOW" in decision.codes
+
+
+# R15 — market-cap tier filter -------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cap_tier_filter_blocks_a_switched_off_tier(
+    db_session, isolated_db, monkeypatch
+):
+    """RELIANCE is a large cap in AMFI's sheet. Switch large caps off and
+    the signal is blocked; switch them back on and it is not."""
+    from app import config as app_config
+    from app.services import mcap
+
+    assert (mcap.lookup("RELIANCE") or 0) >= 50_000, "fixture assumes a large cap"
+
+    md = MarketDataBus()
+    md.set_quote_sync("RELIANCE", last_price=2500.0)
+    acct = _make_account(db_session)
+
+    async def decide() -> object:
+        app_config.reset_settings_cache()
+        sig = _make_signal(db_session, symbol="RELIANCE", action="BUY")
+        engine = RiskEngine(market_data=md, portfolio_value=1_000_000.0)
+        return await engine.evaluate(
+            signal=sig, strategy=None, account=acct,
+            entry=2500.0, stop_loss=2475.0, session=db_session,
+        )
+
+    try:
+        monkeypatch.setenv("CAP_FILTER_ENABLED", "1")
+        monkeypatch.setenv("CAP_TRADE_LARGE", "0")
+        d = await decide()
+        assert d.approved is False
+        assert "RISK_CAP_TIER_BLOCKED" in d.codes
+        assert d.context["cap_tier"] == "large"
+
+        monkeypatch.setenv("CAP_TRADE_LARGE", "1")
+        assert "RISK_CAP_TIER_BLOCKED" not in (await decide()).codes
+    finally:
+        monkeypatch.delenv("CAP_FILTER_ENABLED", raising=False)
+        monkeypatch.delenv("CAP_TRADE_LARGE", raising=False)
+        app_config.reset_settings_cache()
+
+
+@pytest.mark.asyncio
+async def test_cap_tier_filter_off_never_blocks(db_session, isolated_db, monkeypatch):
+    """The default. Every tier switch off, filter disabled -> still allowed,
+    so enabling the feature cannot change an existing setup's behaviour."""
+    from app import config as app_config
+
+    md = MarketDataBus()
+    md.set_quote_sync("RELIANCE", last_price=2500.0)
+    acct = _make_account(db_session)
+    try:
+        for k in ("CAP_TRADE_LARGE", "CAP_TRADE_MID", "CAP_TRADE_SMALL",
+                  "CAP_TRADE_UNKNOWN"):
+            monkeypatch.setenv(k, "0")
+        app_config.reset_settings_cache()
+        sig = _make_signal(db_session, symbol="RELIANCE", action="BUY")
+        engine = RiskEngine(market_data=md, portfolio_value=1_000_000.0)
+        d = await engine.evaluate(
+            signal=sig, strategy=None, account=acct,
+            entry=2500.0, stop_loss=2475.0, session=db_session,
+        )
+        assert "RISK_CAP_TIER_BLOCKED" not in d.codes
+    finally:
+        for k in ("CAP_TRADE_LARGE", "CAP_TRADE_MID", "CAP_TRADE_SMALL",
+                  "CAP_TRADE_UNKNOWN"):
+            monkeypatch.delenv(k, raising=False)
+        app_config.reset_settings_cache()
+
+
+@pytest.mark.asyncio
+async def test_cap_tier_unknown_symbol_can_be_failed_closed(
+    db_session, isolated_db, monkeypatch
+):
+    """A symbol AMFI has never heard of has no tier; CAP_TRADE_UNKNOWN
+    decides. False must block rather than silently pass."""
+    from app import config as app_config
+    from app.services import mcap
+
+    assert mcap.lookup("ZZZNOTALISTEDNAME") is None
+
+    md = MarketDataBus()
+    md.set_quote_sync("ZZZNOTALISTEDNAME", last_price=100.0)
+    acct = _make_account(db_session)
+    try:
+        monkeypatch.setenv("CAP_FILTER_ENABLED", "1")
+        monkeypatch.setenv("CAP_TRADE_UNKNOWN", "0")
+        app_config.reset_settings_cache()
+        sig = _make_signal(db_session, symbol="ZZZNOTALISTEDNAME", action="BUY")
+        engine = RiskEngine(market_data=md, portfolio_value=1_000_000.0)
+        d = await engine.evaluate(
+            signal=sig, strategy=None, account=acct,
+            entry=100.0, stop_loss=99.0, session=db_session,
+        )
+        assert d.approved is False
+        assert "RISK_CAP_TIER_BLOCKED" in d.codes
+        assert d.context["cap_tier"] is None
+    finally:
+        monkeypatch.delenv("CAP_FILTER_ENABLED", raising=False)
+        monkeypatch.delenv("CAP_TRADE_UNKNOWN", raising=False)
+        app_config.reset_settings_cache()
