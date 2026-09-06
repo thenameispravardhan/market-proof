@@ -766,16 +766,6 @@ export function useModelPreview(params: {
   });
 }
 
-export function useModelScore() {
-  return useMutation<
-    { features: Record<string, unknown>; score: ModelScore | null; verdict: string; reason: string },
-    Error,
-    Record<string, unknown>
-  >({
-    mutationFn: (body) => api.post("/api/model/score", body),
-  });
-}
-
 // Re-read live_model.json after a re-export, without restarting the bot.
 export function useModelReload() {
   const qc = useQueryClient();

@@ -83,12 +83,6 @@ def tier_of(mcap_cr: Optional[float], large_min: float, mid_min: float) -> Optio
     return "small"
 
 
-def reset_cache() -> None:
-    """Drop the in-memory table so a rebuilt csv is picked up. Tests, and
-    the operator's 'reload market caps' action."""
-    _table.cache_clear()
-
-
 def _selftest() -> None:
     assert tier_of(60_000, 50_000, 15_000) == "large"
     assert tier_of(50_000, 50_000, 15_000) == "large"   # boundary is inclusive

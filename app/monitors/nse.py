@@ -324,20 +324,6 @@ async def _get_nse_client(*, transport: Any = None) -> "httpx.AsyncClient":
     return _nse_client
 
 
-def _close_nse_client() -> None:
-    """Test / teardown helper — closes the shared cl ient."""
-    global _nse_client, _nse_primed
-    if _nse_client is not None:
-        import anyio
-        try:
-            anyio.from_thread.run(_nse_client.aclose)
-        except Exception:  # noqa: BLE001
-            pass
-        _nse_client = None
-    # A fresh client starts with an empty cookie jar, so it must re-prime.
-    _nse_primed = False
-
-
 # -------------------------------------------------------------------------
 # Wire-level fetchers
 #

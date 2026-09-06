@@ -71,8 +71,3 @@ export function useLiveQuote(symbol?: string | null): QuoteTick | undefined {
   const getSnapshot = useCallback(() => (key ? store.get(key) : undefined), [key]);
   return useSyncExternalStore(subscribe, getSnapshot);
 }
-
-/** Test/Storybook helper — clear all cached quotes. */
-export function __resetQuotes(): void {
-  store.clear();
-}

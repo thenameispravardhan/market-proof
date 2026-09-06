@@ -7,7 +7,6 @@
 // Only ranks 1-250 are listed: SEBI defines 251+ as Small, so every
 // symbol absent from both sets is Small by definition.
 
-export const SOURCE = "AverageMarketCapitalization30Jun2026";
 
 export const LARGE: ReadonlySet<string> = new Set([
   "ABB", "ADANIENSOL", "ADANIENT", "ADANIGREEN", "ADANIPORTS",
