@@ -12,7 +12,6 @@ import { AllSettings } from "../components/settings/AllSettings";
 import { AuditLog } from "../components/settings/AuditLog";
 import { BreakerHistory } from "../components/settings/BreakerHistory";
 import { NewsSources } from "../components/settings/NewsSources";
-import { ThemeSwitcher } from "../components/settings/ThemeSwitcher";
 
 function SectionLabel({ children }: { children: React.ReactNode }) {
   return (
@@ -45,9 +44,6 @@ export default function Settings() {
         <div>
           <SectionLabel>Detection &amp; conviction</SectionLabel>
           <NewsSources />
-
-          <SectionLabel>Appearance</SectionLabel>
-          <ThemeSwitcher />
 
           <SectionLabel>History &amp; audit (read-only)</SectionLabel>
           <BreakerHistory />
