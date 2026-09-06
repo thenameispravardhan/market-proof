@@ -2553,3 +2553,30 @@ body { transition: background-color .2s ease, color .2s ease; }
 .res-seg-cache { background: #388bfd; }
 .res-seg-slab  { background: #6e7681; }
 .res-seg-free  { background: #2ea043; }
+
+/* -------------------------------------------------------------------------
+   Dataset preview — a 91-column table you read by scrolling both ways.
+   Two things make that survivable and both are pure CSS: the header stays
+   put while you scroll down, and the identity column stays put while you
+   scroll right. Without the second one you lose track of which filing a
+   row is about three columns in.
+   ------------------------------------------------------------------------- */
+.dataset-scroll {
+  overflow: auto;
+  max-width: 100%;
+  max-height: 60vh;      /* the header can only stick inside a scroll box */
+}
+/* Sticky cells must be opaque or the rows scroll through underneath. */
+.dataset-preview thead th { background: var(--bg-surface); z-index: 2; }
+.dataset-preview tbody td:first-child,
+.dataset-preview thead th:first-child {
+  position: sticky;
+  left: 0;
+  background: var(--bg-panel);
+  border-right: 1px solid var(--border);
+}
+.dataset-preview thead th:first-child { z-index: 3; }
+.dataset-preview tbody tr:hover td { background: var(--bg-elev); }
+.dataset-preview thead th.sortable { cursor: pointer; user-select: none; }
+.dataset-preview thead th.sortable:hover { color: var(--text); }
+.dataset-preview thead th .sort-arrow { color: var(--accent); margin-left: 3px; }

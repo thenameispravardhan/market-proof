@@ -114,6 +114,29 @@ function RoleBadge({ role }: { role: DatasetColumn["role"] }) {
   );
 }
 
+export type RowSort = { key: string; dir: 1 | -1 };
+
+/** Sort a page of dataset rows by one column.
+ *
+ * Nulls always sort LAST, in both directions — a missing 15-minute label is
+ * "not measured", not "smallest", and letting it float to the top of an
+ * ascending sort would put the least informative rows where the eye lands.
+ * Numbers compare numerically, everything else as text. Returns a new array;
+ * the query cache's own array is never mutated. */
+export function sortRows<T extends Record<string, unknown>>(
+  rows: T[],
+  sort: RowSort | null
+): T[] {
+  if (!sort) return rows;
+  return [...rows].sort((a, b) => {
+    const x = a[sort.key], y = b[sort.key];
+    const xn = x === null || x === undefined, yn = y === null || y === undefined;
+    if (xn || yn) return xn && yn ? 0 : xn ? 1 : -1;
+    if (typeof x === "number" && typeof y === "number") return (x - y) * sort.dir;
+    return String(x).localeCompare(String(y)) * sort.dir;
+  });
+}
+
 function fmtCell(v: unknown): string {
   if (v === null || v === undefined) return "—";
   if (typeof v === "boolean") return v ? "✓" : "✗";
@@ -218,6 +241,11 @@ export default function Dataset() {
 
   const [filters, setFilters] = useState<DatasetFilters>({});
   const [limit, setLimit] = useState(50);
+  // Sorts the LOADED page only — the server sends newest-first and has no
+  // order param. Saying so in the UI matters: on a dataset tool, a sort
+  // that looks global but isn't would misread as "the biggest mover in the
+  // corpus" when it is only the biggest in the newest N.
+  const [sort, setSort] = useState<{ key: string; dir: 1 | -1 } | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [dedup, setDedup] = useState(true);
   const [healthOpen, setHealthOpen] = useState(false);
@@ -251,6 +279,11 @@ export default function Dataset() {
     { ...filters, source },
     orderedSelection.length > 0 ? orderedSelection : undefined,
     limit
+  );
+
+  const viewRows = useMemo(
+    () => sortRows(rowsResp?.rows ?? [], sort),
+    [rowsResp, sort]
   );
 
   const byCategory = useMemo(() => {
@@ -970,6 +1003,23 @@ export default function Dataset() {
           Preview{" "}
           <span className="meta">
             {rowsResp ? `${rowsResp.count} of ${rowsResp.total} rows` : ""}
+            {sort && rowsResp ? (
+              <>
+                {" · sorted by "}
+                <span className="mono">{sort.key}</span>
+                {sort.dir === -1 ? " desc" : " asc"}
+                <span
+                  className="pnl-neg"
+                  title={
+                    `Sorting only reorders the ${rowsResp.count} loaded rows, not all ` +
+                    `${rowsResp.total}. The newest ${rowsResp.count} are fetched first, ` +
+                    `so this is not the corpus-wide top of this column.`
+                  }
+                >
+                  {" (this page only)"}
+                </span>
+              </>
+            ) : null}
           </span>
           <span style={{ flex: 1 }} />
           <select
@@ -1023,14 +1073,31 @@ export default function Dataset() {
             minutes after the signal). Use “Enrich now” to backfill history.
           </p>
         ) : (
-          <div style={{ overflowX: "auto", maxWidth: "100%" }}>
-            <table style={{ whiteSpace: "nowrap" }}>
+          <div className="dataset-scroll">
+            <table className="table dataset-preview" style={{ whiteSpace: "nowrap" }}>
               <thead>
                 <tr>
                   {orderedSelection.map((k) => {
                     const col = catalog?.columns.find((c) => c.key === k);
+                    const active = sort?.key === k;
                     return (
-                      <th key={k} title={col ? `${col.description} — ${col.role}` : k}>
+                      <th
+                        key={k}
+                        className="sortable"
+                        title={
+                          (col ? `${col.description} — ${col.role}\n` : `${k}\n`) +
+                          "Click to sort the loaded rows"
+                        }
+                        onClick={() =>
+                          setSort((s) =>
+                            s?.key === k
+                              ? s.dir === -1
+                                ? { key: k, dir: 1 }
+                                : null // desc → asc → off
+                              : { key: k, dir: -1 }
+                          )
+                        }
+                      >
                         <span
                           className={
                             col?.role === "target"
@@ -1042,13 +1109,18 @@ export default function Dataset() {
                         >
                           {k}
                         </span>
+                        {active && (
+                          <span className="sort-arrow">
+                            {sort.dir === -1 ? "▼" : "▲"}
+                          </span>
+                        )}
                       </th>
                     );
                   })}
                 </tr>
               </thead>
               <tbody>
-                {rowsResp.rows.map((r, i) => (
+                {viewRows.map((r, i) => (
                   <tr key={(r["outcome_id"] as number) ?? i}>
                     {orderedSelection.map((k) => (
                       <td
