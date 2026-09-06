@@ -64,7 +64,9 @@ class Announcement(Base):
     pdf_url: Mapped[Optional[str]] = mapped_column(String(1024))
     source: Mapped[Optional[str]] = mapped_column(String(64))
     filed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
-    received_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime, default=_utcnow, nullable=False, index=True
+    )
 
     analyses: Mapped[list["Analysis"]] = relationship(
         back_populates="announcement", cascade="all, delete-orphan"
@@ -127,7 +129,9 @@ class Analysis(Base):
     dividend_per_share: Mapped[Optional[float]] = mapped_column(Float)
     buyback_value_inr_crore: Mapped[Optional[float]] = mapped_column(Float)
     raw_response: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=_utcnow, nullable=False, index=True
+    )
 
     announcement: Mapped["Announcement"] = relationship(back_populates="analyses")
     signals: Mapped[list["Signal"]] = relationship(
@@ -159,7 +163,9 @@ class Signal(Base):
     position_size_pct: Mapped[Optional[float]] = mapped_column(Float)
     rationale: Mapped[Optional[str]] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=_utcnow, nullable=False, index=True
+    )
 
     analysis: Mapped[Optional["Analysis"]] = relationship(back_populates="signals")
     trades: Mapped[list["Trade"]] = relationship(back_populates="signal")
@@ -235,7 +241,13 @@ class DatasetFeature(Base):
     # signal near market close) | no_candles | after_hours (filed
     # outside the IST session — no reaction window can exist; terminal)
     # | too_old | error
-    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    # Indexed because `enriched_only` filters on it and the planner would
+    # otherwise build an AUTOMATIC PARTIAL COVERING INDEX over the whole
+    # table on every call — the same failure `_ensure_indexes` was written
+    # for, on a different column. It cost 46s to fetch 200 rows.
+    status: Mapped[str] = mapped_column(
+        String(16), default="pending", nullable=False, index=True
+    )
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     features: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
     note: Mapped[Optional[str]] = mapped_column(String(128))
@@ -273,8 +285,10 @@ class Trade(Base):
     # on entry fill (slippage) and on close (r_multiple).
     slippage_pct: Mapped[Optional[float]] = mapped_column(Float)
     r_multiple: Mapped[Optional[float]] = mapped_column(Float)
-    executed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+    executed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=_utcnow, nullable=False, index=True
+    )
 
     signal: Mapped[Optional["Signal"]] = relationship(back_populates="trades")
 
@@ -321,7 +335,9 @@ class RiskEvent(Base):
     message: Mapped[str] = mapped_column(Text, nullable=False)
     context: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
     halted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=_utcnow, nullable=False, index=True
+    )
 
 
 # =========================================================================
@@ -552,7 +568,9 @@ class AuditLog(Base):
     target: Mapped[Optional[str]] = mapped_column(String(128))
     before: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
     after: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=_utcnow, nullable=False, index=True
+    )
 
     __table_args__ = (Index("ix_audit_log_action_time", "action", "created_at"),)
 
