@@ -120,12 +120,6 @@ export interface DashboardSummary {
   pnl_series: { date: string; realized: number; cumulative: number }[];
 }
 
-export interface ApiError {
-  status: number;
-  message: string;
-  detail?: unknown;
-}
-
 export interface AuditLogEntry {
   id: number;
   actor: string;
@@ -196,26 +190,9 @@ export interface NotificationChannel {
   created_at: string;
 }
 
-export interface NotificationLog {
-  id: number;
-  channel_id: number;
-  event_type: string;
-  payload: Record<string, unknown> | null;
-  status: "sent" | "failed" | "skipped";
-  error: string | null;
-  sent_at: string;
-}
-
-
-
 // ---- T7 types ----
 
 
-
-export interface EquityPoint {
-  date: string;
-  equity: number;
-}
 
 // ---- Settings ----
 
@@ -253,12 +230,6 @@ export interface SettingsSchema {
   groups: SettingsGroup[];
   overridden_count: number;
   version: string;
-}
-
-export interface SettingsExport {
-  version: string;
-  exported_at: string;
-  overrides: Record<string, unknown>;
 }
 
 export interface GlobalSettings {

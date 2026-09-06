@@ -136,25 +136,6 @@ def _get_template_or_404(event_type: str, db: Session) -> PromptTemplate:
     return t
 
 
-def _save_history(db: Session, t: PromptTemplate) -> None:
-    """Snapshot the current template state into prompt_history."""
-    db.add(
-        PromptHistory(
-            template_id=t.id,
-            version=t.version,
-            system_prompt=t.system_prompt,
-            user_template=t.user_template,
-            model=t.model,
-            temperature=t.temperature,
-            max_tokens=t.max_tokens,
-            reasoning_effort=t.reasoning_effort,
-            thinking_enabled=t.thinking_enabled,
-            stream=t.stream,
-            change_note=None,
-        )
-    )
-
-
 def _write_audit(
     db: Session,
     *,

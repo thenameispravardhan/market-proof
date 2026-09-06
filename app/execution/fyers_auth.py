@@ -124,6 +124,11 @@ def register_state(state: str) -> None:
 def consume_state(state: str) -> bool:
     """If `state` is registered and fresh, consume it (one-shot) and
     return True. Otherwise return False."""
+    # An abandoned authorise (popup opened, never completed) leaves its
+    # state behind forever otherwise — the registry is module-level and
+    # lives as long as the process. Sweeping here is the "opportunistic"
+    # call `_clear_expired_states` documents; it had none until now.
+    _clear_expired_states()
     issued_at = _expected_states.pop(state, None)
     if issued_at is None:
         return False

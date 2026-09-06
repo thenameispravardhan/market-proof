@@ -197,18 +197,6 @@ def _looks_like_blocked_response(resp: httpx.Response) -> Optional[str]:
 # ---- Low-level client ----------------------------------------------------
 
 
-@dataclass
-class _Config:
-    app_id: str
-    secret_key: str          # used only for appIdHash refresh; not sent.
-    access_token: str
-    base_url: str = "https://api-t1.fyers.in/api/v3"
-    timeout_s: float = 30.0
-    max_retries: int = 3
-    rate_limit_sleep_s: float = 5.0  # on 429
-    transport: Optional[httpx.AsyncBaseTransport] = None
-
-
 class FyersClient:
     """Low-level async client for the Fyers v3 REST API.
 
@@ -586,16 +574,6 @@ def _fyers_order_type(order_type: OrderType) -> int:
 
 def _fyers_side(side: OrderSide) -> int:
     return 1 if side == OrderSide.BUY else -1
-
-
-def _order_type_from_int(code: int) -> OrderType:
-    # Inverse of `_fyers_order_type` — Fyers v3 codes.
-    return {
-        1: OrderType.LIMIT,
-        2: OrderType.MARKET,
-        3: OrderType.STOP_LOSS_MARKET,  # SL-M
-        4: OrderType.STOP_LOSS,         # SL-L
-    }.get(code, OrderType.MARKET)
 
 
 def _state_from_str(status: str) -> OrderState:
