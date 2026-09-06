@@ -205,6 +205,39 @@ class Settings(BaseSettings):
     # real volume — flipping this on before a volume feed is wired would
     # block every live trade. Turn it on once ADV is sourced for real.
     REQUIRE_KNOWN_LIQUIDITY: bool = False
+    # §1b Market-cap tier filter. Which size of company this bot is
+    # allowed to trade. Market cap comes from `data/mcap.csv` (AMFI's
+    # half-yearly sheet — rebuild with scripts/build_mcap.py); the two
+    # boundaries below define the three tiers, so retuning what counts as
+    # "mid" is a form field, not a refetch. OFF by default: with the
+    # filter disabled every tier trades exactly as it did before.
+    CAP_FILTER_ENABLED: bool = False
+    CAP_LARGE_MIN_CR: float = 50_000.0        # >= this is Large
+    CAP_MID_MIN_CR: float = 15_000.0          # >= this (and < large) is Mid; below is Small
+    CAP_TRADE_LARGE: bool = True
+    CAP_TRADE_MID: bool = True
+    CAP_TRADE_SMALL: bool = True
+    # A symbol absent from the sheet (fresh listing, SME, a BSE-only
+    # ticker AMFI spells differently) has no tier. True keeps trading it
+    # — the current behaviour. Set False to fail closed and trade only
+    # names whose size you can confirm.
+    CAP_TRADE_UNKNOWN: bool = True
+    # §1c Live market context for rules. When on, the monitors start a
+    # Fyers quote the moment a filing is detected, so the rules engine can
+    # gate on `price` and `change_pct` — fields it has always supported but
+    # never received. The fetch overlaps the LLM call and is never waited
+    # on, so this costs no signal latency; a quote that is not back leaves
+    # the fields absent and the rule fails safe to a non-match.
+    #
+    # OFF by default because it CAN change behaviour: a rule referencing
+    # change_pct has been a permanent non-match until now, and switching
+    # this on makes it live.
+    #
+    # Why you want it, from this bot's own outcome data (n=6,861): filings
+    # on a symbol already up/down >2% in the prior 5 minutes went on to
+    # average -0.63% over the next 5, against ~flat for everything else.
+    # A `change_pct` rule is how you stop paying that.
+    QUOTE_PREFETCH_ENABLED: bool = False
     # §2 Position sizing. The risk-based qty and the notional cap are
     # both computed; the SMALLER wins. A fresh account ramps its
     # per-trade risk from RISK_RAMP_START_PCT up to MAX_CAPITAL_RISK_PCT
@@ -580,6 +613,16 @@ class Settings(BaseSettings):
     def _positive_float(cls, v: float) -> float:
         if v < 0:
             raise ValueError("min liquidity must be non-negative")
+        return v
+
+    @field_validator("CAP_LARGE_MIN_CR", "CAP_MID_MIN_CR")
+    @classmethod
+    def _cap_boundary(cls, v: float) -> float:
+        # Ordering is enforced where both are known (mcap.tier_of
+        # normalises a swapped pair); here we only reject a negative,
+        # which has no meaning as a rupee-crore boundary.
+        if v < 0:
+            raise ValueError("market-cap boundary must be non-negative")
         return v
 
     @field_validator(

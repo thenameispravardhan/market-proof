@@ -568,6 +568,16 @@ class BaseMonitor:
                     )
         except Exception:  # noqa: BLE001 — prefetch must never break publish
             log.debug("monitor.prefetch_failed", announcement_id=new_id)
+        # QUOTE PREFETCH: same idea, for the market-context rule fields
+        # (`price`, `change_pct`). Started here so the ~200ms REST round
+        # trip overlaps the LLM call instead of adding to it.
+        try:
+            if bool(getattr(get_settings(), "QUOTE_PREFETCH_ENABLED", False)):
+                from app.analyzer import quote_cache
+
+                quote_cache.prefetch(announcement.symbol)
+        except Exception:  # noqa: BLE001 — same rule: never break publish
+            log.debug("monitor.quote_prefetch_failed", announcement_id=new_id)
         try:
             await event_bus.publish(CHANNEL_NEW, payload)
         except Exception:  # noqa: BLE001
