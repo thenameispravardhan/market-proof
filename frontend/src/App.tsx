@@ -310,7 +310,7 @@ export default function App() {
         </div>
       </nav>
 
-      <main className="content">
+      <main className="content" data-page={tab}>
         {!sidebarOpen && (
           <button
             className="sidebar-toggle-floating"

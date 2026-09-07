@@ -53,7 +53,13 @@ log = get_logger(__name__)
 # row). Keep these stable — the CSV filter is operator-facing.
 CHANNELS = (
     ("signals.new", "signal"),
-    ("trades.filled", "trade"),
+    # Entries and exits. NOT "trades.filled" — that channel has no publisher
+    # anywhere in the app, so subscribing to it (as this did) could never
+    # deliver a trade notification no matter what else was fixed. The events
+    # that actually carry a trade are `trade.executed` (entry, execution
+    # manager) and `trade.closed` (exit, execution + trade manager).
+    ("trade.executed", "trade_entry"),
+    ("trade.closed", "trade_exit"),
     ("risk.halt", "risk_halt"),
     ("system.error", "error"),
     # Daily health report (app/services/health_report.py) — operators
@@ -95,7 +101,12 @@ def _channel_matches(channel: NotificationChannel, event_type: str) -> bool:
     types = _parse_event_filter(channel.events_filter)
     if "*" in types:
         return True
-    return event_type.lower() in types
+    et = event_type.lower()
+    # Operator shorthand: "trade" covers entries and exits, so a filter does
+    # not have to know the internal split.
+    if et in ("trade_entry", "trade_exit") and "trade" in types:
+        return True
+    return et in types
 
 
 # ----- renderers: event payload → (subject, body) ------------------------
@@ -176,9 +187,55 @@ def _render_report(payload: dict[str, Any]) -> tuple[str, str]:
     return subject, body
 
 
+def _render_trade_entry(payload: dict[str, Any]) -> tuple[str, str]:
+    symbol = (payload.get("symbol") or "?").upper()
+    side = (payload.get("side") or "?").upper()
+    subject = f"ENTRY {side} {symbol}"
+    lines = [
+        f"Side: {side}",
+        f"Symbol: {symbol}",
+        f"Quantity: {payload.get('quantity')}",
+    ]
+    for label, key in (("Entry", "entry"), ("Stop", "stop_loss"), ("Target", "target")):
+        v = payload.get(key)
+        if v is not None:
+            lines.append(f"{label}: {v}")
+    if payload.get("broker_order_id"):
+        lines.append(f"Broker order id: {payload['broker_order_id']}")
+    if payload.get("error"):
+        lines.append(f"Error: {payload['error']}")
+    return subject, "\n".join(lines)
+
+
+def _render_trade_exit(payload: dict[str, Any]) -> tuple[str, str]:
+    symbol = (payload.get("symbol") or "?").upper()
+    reason = (payload.get("reason") or "?").upper()
+    subject = f"EXIT {symbol} ({reason})"
+    lines = [
+        f"Symbol: {symbol}",
+        f"Reason: {reason}",
+        f"Quantity: {payload.get('quantity')}",
+    ]
+    entry, exit_ = payload.get("entry"), payload.get("exit")
+    if entry is not None:
+        lines.append(f"Entry: {entry}")
+    if exit_ is not None:
+        lines.append(f"Exit: {exit_}")
+    for label, key in (("P&L", "pnl"), ("R multiple", "r_multiple")):
+        v = payload.get(key)
+        if v is not None:
+            try:
+                lines.append(f"{label}: {float(v):.2f}")
+            except (TypeError, ValueError):
+                pass
+    return subject, "\n".join(lines)
+
+
 RENDERERS: dict[str, Callable[[dict[str, Any]], tuple[str, str]]] = {
     "signal": _render_signal,
     "trade": _render_trade,
+    "trade_entry": _render_trade_entry,
+    "trade_exit": _render_trade_exit,
     "risk_halt": _render_risk_halt,
     "error": _render_error,
     "report": _render_report,

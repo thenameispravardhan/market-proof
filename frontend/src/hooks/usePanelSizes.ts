@@ -59,6 +59,12 @@ export function resetPanelSizes(): void {
 // Give the widgets stable data-panel ids if that ever actually bites.
 export function usePanelSizes(page: string): void {
   useEffect(() => {
+    // Dataset opts out: its panels wrap one very wide table, so the grip
+    // belongs on the table's scroll box (see App.css §36), not the panel.
+    // Returning early also stops previously-stored heights being re-applied
+    // to panels that can no longer be resized back.
+    if (page === "dataset") return;
+
     let panels: HTMLElement[] = [];
     let saveTimer: number | undefined;
     // Restoring a height triggers the ResizeObserver, which would then save

@@ -2055,3 +2055,13 @@ kbd {
 .dataset-filters select { width: auto; padding: 2px 6px; }
 .dataset-filters input[type="date"] { width: auto; padding: 1px 4px; }
 .dataset-filters label { display: flex; align-items: center; gap: 4px; }
+
+/* =========================================================================
+   36. Dataset page — panel sizing
+   ========================================================================= */
+/* No panel resize here. The Dataset page's panels are wrappers around one
+   very wide table, and dragging the WRAPPER taller just adds dead space
+   under it — the thing worth resizing is the scroll box the table lives in.
+   So the grip moves onto that box instead. */
+[data-page="dataset"] .widget { resize: none; }
+.dataset-scroll { resize: vertical; }
