@@ -238,6 +238,18 @@ class Settings(BaseSettings):
     # average -0.63% over the next 5, against ~flat for everything else.
     # A `change_pct` rule is how you stop paying that.
     QUOTE_PREFETCH_ENABLED: bool = False
+
+    # §1d Automatic AI-analysis window. AI_ANALYSIS_ENABLED left off by
+    # accident costs a whole trading day silently — filings skipped while
+    # it is off are never re-analysed. This turns it on and off on a clock
+    # instead of relying on remembering.
+    #
+    # OFF by default: with the schedule disabled the toggle stays exactly
+    # where the operator put it, which is the current behaviour. Turning it
+    # ON hands control of AI_ANALYSIS_ENABLED to the clock.
+    AI_SCHEDULE_ENABLED: bool = False
+    AI_SCHEDULE_START_IST: str = "09:00"
+    AI_SCHEDULE_END_IST: str = "15:30"
     # §2 Position sizing. The risk-based qty and the notional cap are
     # both computed; the SMALLER wins. A fresh account ramps its
     # per-trade risk from RISK_RAMP_START_PCT up to MAX_CAPITAL_RISK_PCT
@@ -640,6 +652,8 @@ class Settings(BaseSettings):
         return v
 
     @field_validator(
+        "AI_SCHEDULE_START_IST",
+        "AI_SCHEDULE_END_IST",
         "MARKET_OPEN_IST",
         "MARKET_CLOSE_IST",
         "ENTRY_WINDOW_START_IST",

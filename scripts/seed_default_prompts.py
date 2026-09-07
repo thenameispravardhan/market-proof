@@ -34,8 +34,15 @@ from app.logging_config import configure_logging, get_logger  # noqa: E402
 log = get_logger("scripts.seed_default_prompts")
 
 
-def seed(session=None) -> int:
+def seed(session=None, *, overwrite: bool = False) -> int:
     """Seed the DB. Returns the number of rows touched.
+
+    `overwrite` defaults to FALSE — insert-missing-only. deploy/update.sh
+    runs this script on every deploy, and with the old default of True it
+    reset all 16 templates to factory defaults every time, silently
+    discarding the operator's edits. Prompt text is the whole point of the
+    Prompts page; a deploy must not touch it. Pass --overwrite to do the
+    deliberate factory reset.
 
     If `session` is None, opens a fresh one and commits. Otherwise
     uses the caller's session (and does NOT commit — caller controls
@@ -47,7 +54,7 @@ def seed(session=None) -> int:
         db_init.init_db()
         session = SessionLocal()
     try:
-        touched = seed_defaults(session)
+        touched = seed_defaults(session, overwrite=overwrite)
         if owns_session:
             session.commit()
         return len(touched)
@@ -56,7 +63,16 @@ def seed(session=None) -> int:
             session.close()
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(
+        "--overwrite", action="store_true",
+        help="RESET every template to its factory default, discarding operator "
+             "edits. Off by default so deploys cannot clobber the Prompts page.",
+    )
+    args = ap.parse_args(argv)
     configure_logging("INFO")
     settings = get_settings()
     log.info(
@@ -64,12 +80,13 @@ def main() -> int:
         database_url=settings.DATABASE_URL,
         testing=bool(settings.TESTING),
     )
-    n = seed()
+    n = seed(overwrite=args.overwrite)
     # Verify: there should be exactly len(EVENT_TYPES) rows (15 + DEFAULT).
     with SessionLocal() as session:
         rows = session.execute(select(PromptTemplate)).scalars().all()
         event_types = sorted(r.event_type for r in rows)
-    print(f"Touched {n} templates.")
+    print(f"Touched {n} templates"
+          f"{' (FACTORY RESET)' if args.overwrite else ' (insert-missing-only)'}.")
     print(f"Total prompt_templates rows: {len(rows)}")
     print(f"Event types: {event_types}")
     expected = sorted(EVENT_TYPES)

@@ -509,6 +509,31 @@ async def update_settings(
     return get_settings_endpoint(db=db, settings=settings)
 
 
+async def set_global_setting(key: str, value: Any) -> None:
+    """Write ONE override exactly the way PUT /api/settings does.
+
+    Same four steps, in the same order: persist, commit, re-apply to env so
+    `get_settings()` sees it immediately, then publish `settings.updated` so
+    the analyzer flushes its cached template/rules. A background task that
+    skipped any of those would leave the process disagreeing with its own
+    database until the next restart.
+
+    Used by the AI-analysis schedule in `app.main`; it is a plain function
+    rather than an endpoint so nothing has to fake an HTTP request.
+    """
+    from app.db.session import SessionLocal
+
+    with SessionLocal() as db:
+        before = _read_overrides(db)
+        after = _write_overrides(db, {key: value})
+        if before != after:
+            _audit(db, actor="schedule", action="settings.update",
+                   target="global", before=before, after=after)
+        db.commit()
+        apply_overrides_to_env(db)
+    await event_bus.publish("settings.updated", {"changed_keys": [key]})
+
+
 # -------------------------------------------------------------------------
 # Credentials (Fyers + DeepSeek) — editable from the UI, hot-applied.
 # -------------------------------------------------------------------------

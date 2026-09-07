@@ -406,9 +406,21 @@ body {
   display: flex;
   flex-direction: column;
   min-width: 0;
-  overflow: hidden;
+  /* `resize` is ignored unless overflow is non-visible, so `auto` is what
+     makes the grip appear at all — and it keeps a panel dragged smaller
+     than its content scrollable instead of clipping it. */
+  overflow: auto;
   position: relative;
+  /* Native drag-resize. No library, no pointer handlers: the browser draws
+     the grip and does the dragging. usePanelSizes only persists the result.
+     VERTICAL only: panels are grid children, so the track owns the width and
+     an inline width snaps straight back. The floor stops a panel being
+     dragged to nothing and lost. */
+  resize: vertical;
+  min-height: 80px;
 }
+/* The grip is invisible on a dark panel until you know it is there. */
+.widget::-webkit-resizer { background: var(--border-hi); }
 .widget:hover { border-color: var(--border-hi); }
 
 .widget-header {
@@ -2029,3 +2041,17 @@ kbd {
 .dataset-preview thead th.sortable { cursor: pointer; user-select: none; }
 .dataset-preview thead th.sortable:hover { color: var(--text); }
 .dataset-preview thead th .sort-arrow { color: var(--accent); margin-left: 3px; }
+
+/* =========================================================================
+   35. Dataset filter bar
+   ========================================================================= */
+.dataset-filters {
+  display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+  padding: 8px 10px; border-bottom: 1px solid var(--border);
+  background: var(--bg-surface);
+}
+.dataset-filters input[type="text"],
+.dataset-filters input:not([type]),
+.dataset-filters select { width: auto; padding: 2px 6px; }
+.dataset-filters input[type="date"] { width: auto; padding: 1px 4px; }
+.dataset-filters label { display: flex; align-items: center; gap: 4px; }

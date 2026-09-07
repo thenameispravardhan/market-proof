@@ -147,7 +147,7 @@ GROUPS: list[dict[str, Any]] = [
         "title": "AI analysis",
         "note": "What the analyzer is allowed to spend, and how much of the filing it sees.",
         "prefixes": [
-            "AI_ANALYSIS_ENABLED", "PRE_LLM_FILTER_ENABLED", "SEND_EXTRACTED_TEXT",
+            "AI_ANALYSIS_ENABLED", "AI_SCHEDULE_", "PRE_LLM_FILTER_ENABLED", "SEND_EXTRACTED_TEXT",
             "FAST_TRACK_ENABLED", "LLM_", "PDF_",
         ],
     },
@@ -173,8 +173,7 @@ GROUPS: list[dict[str, Any]] = [
     {
         "id": "exit_rules",
         "title": "Exit rules",
-        "note": "Stops, targets, trailing and momentum-death exits. The Exits page is the "
-                "richer editor for these.",
+        "note": "Stops, targets, trailing and momentum-death exits.",
         "prefixes": [
             "DEFAULT_SL_", "DEFAULT_TARGET_RR", "SMALLCAP_PRICE", "ATR_",
             "BREAKEVEN_", "SCALE_OUT_", "TRAIL_", "CONSOLIDATION_", "STALL_",
@@ -330,6 +329,9 @@ LABELS: dict[str, str] = {
     "CAP_TRADE_SMALL": "Trade small caps",
     "CAP_TRADE_UNKNOWN": "Trade symbols with no known market cap",
     "QUOTE_PREFETCH_ENABLED": "Give rules the live quote (price, change %)",
+    "AI_SCHEDULE_ENABLED": "Turn AI analysis on/off automatically",
+    "AI_SCHEDULE_START_IST": "AI analysis ON at (IST)",
+    "AI_SCHEDULE_END_IST": "AI analysis OFF at (IST)",
 }
 
 _WORD_FIXUPS = {

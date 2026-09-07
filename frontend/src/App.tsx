@@ -3,6 +3,7 @@ import { useRouter } from "./router";
 import type { TabKey } from "./router";
 import { useWebSocket } from "./hooks/useWebSocket";
 import { ingestQuote, useLiveQuote } from "./hooks/useQuotes";
+import { usePanelSizes } from "./hooks/usePanelSizes";
 import {
   useFyersAuthorizeUrl,
   useGlobalSettings,
@@ -40,7 +41,6 @@ const Strategies = lazy(() => import("./pages/Strategies"));
 const Accounts = lazy(() => import("./pages/Accounts"));
 const Notifications = lazy(() => import("./pages/Notifications"));
 const Settings = lazy(() => import("./pages/Settings"));
-const Exits = lazy(() => import("./pages/Exits"));
 const Timing = lazy(() => import("./pages/Timing"));
 
 // Nav grouped by the OPERATOR'S WORKFLOW, not by module:
@@ -63,7 +63,6 @@ const TABS: { key: TabKey; label: string; emoji: string; group: NavGroup }[] = [
   { key: "prompts",        label: "Prompts",        emoji: "✎", group: "STRATEGY" },
   { key: "rules",          label: "Rules",          emoji: "≡", group: "STRATEGY" },
   { key: "strategies",     label: "Strategies",     emoji: "◈", group: "STRATEGY" },
-  { key: "exits",          label: "Exits",          emoji: "⇥", group: "STRATEGY" },
   // How it did
   { key: "trades",         label: "Trade History",  emoji: "₹", group: "PERFORMANCE" },
   { key: "outcomes",       label: "Outcomes",       emoji: "◎", group: "PERFORMANCE" },
@@ -90,7 +89,6 @@ function PageContent({ tab }: { tab: TabKey }) {
     case "accounts": return <Accounts />;
     case "notifications": return <Notifications />;
     case "settings": return <Settings />;
-    case "exits": return <Exits />;
     case "timing": return <Timing />;
     default: return <Dashboard />;
   }
@@ -234,6 +232,10 @@ export default function App() {
     },
   });
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(readSidebarOpen);
+
+  // Restore/persist per-panel sizes for whichever page is showing. The
+  // resizing itself is CSS; this only remembers it across refreshes.
+  usePanelSizes(tab);
 
   // Persist sidebar state on change.
   useEffect(() => {
