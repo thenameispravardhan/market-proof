@@ -296,6 +296,7 @@ async def lifespan(app: FastAPI):
     # it never depends on re-evaluating settings.TESTING to match startup.
     risk_monitor_task: asyncio.Task[None] | None = None
     dataset_eod_task: asyncio.Task[None] | None = None
+    ai_schedule_task: asyncio.Task[None] | None = None
     if not settings.TESTING:
         # T3: start the analyzer before the monitors so its event-bus
         # subscription is live before the first `announcements.new`
@@ -439,12 +440,52 @@ async def lifespan(app: FastAPI):
 
         dataset_eod_task = asyncio.create_task(_dataset_eod(), name="dataset-eod")
 
+        # AI-analysis window. AI_ANALYSIS_ENABLED left off by accident costs
+        # a whole trading day silently — a skipped filing is never
+        # re-analysed — and leaving it ON overnight burns DeepSeek calls on
+        # filings no session can trade. This drives the toggle from a clock.
+        #
+        # It only ever WRITES when the desired state differs from the current
+        # one, so an operator flipping the switch by hand mid-session is
+        # corrected at the next tick rather than fought every 30 seconds.
+        async def _ai_schedule() -> None:
+            from app.api.settings_api import set_global_setting
+            from app.risk.market_clock import _is_trading_day, _parse_hhmm, to_ist
+
+            while True:
+                try:
+                    await asyncio.sleep(30.0)
+                    s_ = get_settings()
+                    if not getattr(s_, "AI_SCHEDULE_ENABLED", False):
+                        continue
+                    ist = to_ist(None)
+                    start = _parse_hhmm(s_.AI_SCHEDULE_START_IST)
+                    end = _parse_hhmm(s_.AI_SCHEDULE_END_IST)
+                    # Outside a trading day the window is simply closed; the
+                    # exchange calendar already knows about weekends/holidays.
+                    want = _is_trading_day(ist) and start <= ist.time() < end
+                    if bool(s_.AI_ANALYSIS_ENABLED) == want:
+                        continue
+                    await set_global_setting("AI_ANALYSIS_ENABLED", want)
+                    log.info(
+                        "ai_schedule.applied",
+                        enabled=want,
+                        ist=ist.strftime("%Y-%m-%d %H:%M"),
+                        window=f"{s_.AI_SCHEDULE_START_IST}-{s_.AI_SCHEDULE_END_IST}",
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 — never kill the loop
+                    log.exception("ai_schedule.failed")
+
+        ai_schedule_task = asyncio.create_task(_ai_schedule(), name="ai-schedule")
+
     try:
         yield
     finally:
         if not settings.TESTING:
             # Stop the breaker monitor first.
-            for _t in (risk_monitor_task, dataset_eod_task):
+            for _t in (risk_monitor_task, dataset_eod_task, ai_schedule_task):
                 if _t is not None:
                     _t.cancel()
                     try:

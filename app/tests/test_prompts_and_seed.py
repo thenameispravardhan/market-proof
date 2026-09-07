@@ -606,3 +606,32 @@ def test_safe_replace_is_literal_for_backslashes():
         r"C:\path\g<0> and \1 refs",
     )
     assert out == r"Text: C:\path\g<0> and \1 refs"
+
+
+def test_deploy_reseed_does_not_clobber_operator_edits(db_session, isolated_db):
+    """deploy/update.sh runs scripts/seed_default_prompts.py on EVERY
+    deploy. It used to call seed_defaults() with overwrite=True, so every
+    deploy silently reset all 16 templates to factory defaults and threw
+    the operator's prompt edits away."""
+    import scripts.seed_default_prompts as seeder
+    from app.analyzer.prompts import load_template, upsert_template
+
+    seed_defaults(db_session)
+    upsert_template(
+        db_session, event_type="ORDER_WIN",
+        system_prompt="MY EDITED PROMPT — do not clobber",
+        user_template="{{headline}}", model="deepseek-chat", temperature=0.1,
+        max_tokens=400, reasoning_effort="medium", thinking_enabled=False,
+        stream=False, updated_by="operator", change_note="operator edit",
+    )
+    db_session.commit()
+
+    seeder.seed(db_session)  # what a deploy runs now
+    assert load_template(db_session, "ORDER_WIN").system_prompt == (
+        "MY EDITED PROMPT — do not clobber"
+    )
+
+    seeder.seed(db_session, overwrite=True)  # the deliberate factory reset
+    assert load_template(db_session, "ORDER_WIN").system_prompt != (
+        "MY EDITED PROMPT — do not clobber"
+    )

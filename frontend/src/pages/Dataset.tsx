@@ -281,6 +281,11 @@ export default function Dataset() {
     limit
   );
 
+  const activeFilterCount = useMemo(
+    () => Object.values(filters).filter((v) => v !== undefined && v !== "").length,
+    [filters]
+  );
+
   const viewRows = useMemo(
     () => sortRows(rowsResp?.rows ?? [], sort),
     [rowsResp, sort]
@@ -818,19 +823,6 @@ export default function Dataset() {
           ))}
       </div>
 
-      {/* Look-ahead bias warning */}
-      <div className="widget widget-wide" style={{ marginBottom: 12, padding: "10px 14px" }}>
-        <span className="mono pnl-pos" style={{ fontSize: 10 }}>FEATURE</span>{" "}
-        <span className="meta">
-          = knowable at decision time (T0…T+5) — safe model input.
-        </span>{" "}
-        <span className="mono pnl-neg" style={{ fontSize: 10 }}>TARGET</span>{" "}
-        <span className="meta">
-          = only knowable at T+15 — train on it, never feed it in as an input
-          (that's look-ahead bias). Split train/validation by TIME, not randomly.
-        </span>
-      </div>
-
       {/* Column picker */}
       <div className="widget widget-wide" style={{ marginBottom: 12 }}>
         <h3 style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
@@ -1062,6 +1054,67 @@ export default function Dataset() {
             ))}
           </select>
         </h3>
+        <div className="dataset-filters">
+          <input
+            placeholder="Symbol…"
+            value={filters.symbol ?? ""}
+            onChange={(e) =>
+              setFilters((f) => ({ ...f, symbol: e.target.value.toUpperCase() || undefined }))
+            }
+            aria-label="Filter by symbol"
+          />
+          <select
+            value={filters.action ?? ""}
+            onChange={(e) => setFilters((f) => ({ ...f, action: e.target.value || undefined }))}
+            aria-label="Filter by action"
+          >
+            <option value="">Any action</option>
+            <option value="BUY">BUY</option>
+            <option value="SELL">SELL</option>
+          </select>
+          <select
+            value={filters.taken ?? ""}
+            onChange={(e) => setFilters((f) => ({ ...f, taken: e.target.value || undefined }))}
+            aria-label="Filter by taken or blocked"
+          >
+            <option value="">Taken + blocked</option>
+            <option value="taken">Taken only</option>
+            <option value="blocked">Blocked only</option>
+          </select>
+          <select
+            value={filters.label ?? ""}
+            onChange={(e) => setFilters((f) => ({ ...f, label: e.target.value || undefined }))}
+            aria-label="Filter by 15-minute outcome"
+          >
+            <option value="">Any outcome</option>
+            <option value="UP">Moved UP</option>
+            <option value="DOWN">Moved DOWN</option>
+            <option value="FLAT">FLAT</option>
+          </select>
+          <label className="meta">
+            from
+            <input
+              type="date"
+              value={filters.since ?? ""}
+              onChange={(e) => setFilters((f) => ({ ...f, since: e.target.value || undefined }))}
+              aria-label="From date"
+            />
+          </label>
+          <label className="meta">
+            to
+            <input
+              type="date"
+              value={filters.until ?? ""}
+              onChange={(e) => setFilters((f) => ({ ...f, until: e.target.value || undefined }))}
+              aria-label="To date"
+            />
+          </label>
+          {activeFilterCount > 0 && (
+            <button className="btn-sm" onClick={() => setFilters({})}>
+              Clear {activeFilterCount}
+            </button>
+          )}
+        </div>
         {isLoading ? (
           <p className="empty">Loading…</p>
         ) : error ? (

@@ -7,7 +7,7 @@
 //                  History & Audit         (read-only; NOT settings)
 // The Rule Book moved to the Rules page, where a rules reference belongs.
 
-import { GlobalSettings } from "../components/settings/GlobalSettings";
+import { resetPanelSizes } from "../hooks/usePanelSizes";
 import { AllSettings } from "../components/settings/AllSettings";
 import { AuditLog } from "../components/settings/AuditLog";
 import { BreakerHistory } from "../components/settings/BreakerHistory";
@@ -35,10 +35,24 @@ export default function Settings() {
       <h1 className="page-title">Settings</h1>
       <div className="layout-2">
         <div>
-          <SectionLabel>Trading parameters</SectionLabel>
-          <GlobalSettings />
+          <SectionLabel>Layout</SectionLabel>
+          <div className="widget" style={{ padding: "12px 14px" }}>
+            <div className="meta" style={{ marginBottom: 8 }}>
+              Drag the bottom-right corner of any panel to resize it. Sizes are
+              remembered per page in this browser.
+            </div>
+            <button
+              className="btn-sm"
+              onClick={() => {
+                resetPanelSizes();
+                window.location.reload();
+              }}
+            >
+              Reset panel sizes
+            </button>
+          </div>
 
-          <SectionLabel>Everything else</SectionLabel>
+          <SectionLabel>All settings</SectionLabel>
           <AllSettings />
         </div>
         <div>

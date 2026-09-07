@@ -30,7 +30,6 @@ function StatRow() {
     { label: "Open positions", value: data ? String(data.open_positions) : "—", cls: "" },
     { label: "Realised P&L (today)", value: data ? money(data.todays_realized_pnl) : "—", cls: pnlClass(data?.todays_realized_pnl) },
     { label: "Unrealised P&L", value: data ? money(data.todays_unrealized_pnl) : "—", cls: pnlClass(data?.todays_unrealized_pnl) },
-    { label: "Hard risk rules", value: data ? String(data.hard_rules_count) : "—", cls: "" },
   ];
   return (
     <div className="stat-row">

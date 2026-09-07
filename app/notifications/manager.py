@@ -270,39 +270,24 @@ class NotificationManager:
             self._subs.append((ch, q, kind))
         log.info("notification_manager.start", channels=[c for c, _ in CHANNELS])
         self._ready_event.set()
+
+        # One consumer per channel. The previous version raced every queue
+        # in a single `asyncio.wait` and then tried to recover which queue a
+        # completed task came from by testing `task in q._getters` — which is
+        # False even WHILE waiting, because asyncio stores a bare Future
+        # there, not the Task wrapping it. So the lookup returned None every
+        # time and every event was dropped on the floor; only the direct
+        # /test endpoint, which bypasses the bus, ever delivered anything.
+        # A consumer that already knows its own kind cannot have that bug.
+        consumers = [
+            asyncio.create_task(self._consume(q, kind), name=f"notify-{kind}")
+            for _ch, q, kind in self._subs
+        ]
         try:
-            while not self._stop_event.is_set():
-                # Race all subscribed queues.
-                queues = [(q, kind) for _, q, kind in self._subs]
-                # Use a single wait that fires when ANY queue has an
-                # event. The timeout keeps `stop()` responsive.
-                done, _ = await asyncio.wait(
-                    [asyncio.create_task(q.get()) for q, _ in queues],
-                    return_when=asyncio.FIRST_COMPLETED,
-                    timeout=1.0,
-                )
-                if not done:
-                    continue
-                for t in done:
-                    # Identify which queue this task came from.
-                    # Each task is a fresh `q.get()` — we re-derive
-                    # the payload from the task's exception/result.
-                    try:
-                        evt = t.result()
-                    except Exception as e:  # noqa: BLE001
-                        log.warning("notification_manager.queue_get_failed", error=str(e))
-                        continue
-                    # Find kind: queue is the one we created the task for.
-                    # Recover via t.get_name()? We didn't set one. Use
-                    # the event_id → find kind by index alignment.
-                    kind = self._kind_for_task(t, queues)
-                    if kind is None:
-                        continue
-                    try:
-                        await self._dispatch(evt.payload, kind)
-                    except Exception:  # noqa: BLE001
-                        log.exception("notification_manager.dispatch_failed", kind=kind)
+            await asyncio.gather(*consumers)
         finally:
+            for c in consumers:
+                c.cancel()
             log.info("notification_manager.stop")
             for ch, q, _ in self._subs:
                 try:
@@ -311,19 +296,19 @@ class NotificationManager:
                     pass
             self._subs = []
 
-    def _kind_for_task(self, task: asyncio.Task, queues: list[tuple[asyncio.Queue, str]]) -> Optional[str]:
-        # We can't easily map an `asyncio.Task` back to the queue
-        # that created it (the task holds no reference). The trick
-        # we use: each `q.get()` future is a new task, and we
-        # schedule them in order; the first to complete is index 0
-        # of the completed set IF it finishes first, otherwise not.
-        # Simpler approach: also stash the (queue, kind) on the task
-        # as a private attribute. We re-schedule tasks without
-        # that, so fall back to scanning all of them.
-        for q, kind in queues:
-            if q._getters and task in q._getters:  # type: ignore[attr-defined]
-                return kind
-        return None
+    async def _consume(self, q: asyncio.Queue, kind: str) -> None:
+        """Drain one channel forever. The timeout keeps `stop()` responsive."""
+        while not self._stop_event.is_set():
+            try:
+                evt = await asyncio.wait_for(q.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                raise
+            try:
+                await self._dispatch(evt.payload, kind)
+            except Exception:  # noqa: BLE001
+                log.exception("notification_manager.dispatch_failed", kind=kind)
 
     # -- dispatch --------------------------------------------------------
 
