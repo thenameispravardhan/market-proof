@@ -107,7 +107,7 @@ async def test_every_subscribed_channel_delivers(db_session, isolated_db):
     mgr.start()
     await mgr.wait_until_ready()
     try:
-        for channel in ("signals.new", "trades.filled", "system.error"):
+        for channel in ("signals.new", "trade.executed", "system.error"):
             await event_bus.publish(channel, {"symbol": "X"})
         for _ in range(100):
             if len(sent) >= 3:
@@ -117,4 +117,47 @@ async def test_every_subscribed_channel_delivers(db_session, isolated_db):
         mgr.stop()
         await mgr.wait_until_stopped()
 
-    assert {k for k, _ in sent} == {"signal", "trade", "error"}
+    assert {k for k, _ in sent} == {"signal", "trade_entry", "error"}
+
+
+@pytest.mark.asyncio
+async def test_trade_entry_and_exit_both_notify(db_session, isolated_db):
+    """`trades.filled` — which the manager used to subscribe to — has NO
+    publisher anywhere in the app, so a trade could never notify even once
+    the queue bug was fixed. Entries publish `trade.executed`, exits publish
+    `trade.closed`."""
+    from app.db.models import NotificationChannel
+    from app.notifications.manager import NotificationManager
+    from app.services.event_bus import event_bus
+
+    db_session.add(NotificationChannel(
+        name="tg", kind="telegram", enabled=True, events_filter="trade",
+        config={"bot_token": "t", "chat_id": "1"},
+    ))
+    db_session.commit()
+
+    sent: list[tuple[str, str]] = []
+    mgr = NotificationManager(
+        session_factory=lambda: _KeepOpen(db_session),
+        notifier_factory=lambda kind: _Spy(sent),
+    )
+    mgr.start()
+    await mgr.wait_until_ready()
+    try:
+        await event_bus.publish("trade.executed", {
+            "symbol": "HINDCOPPER", "side": "BUY", "quantity": 40, "entry": 412.5,
+        })
+        await event_bus.publish("trade.closed", {
+            "symbol": "HINDCOPPER", "reason": "TARGET", "quantity": 40,
+            "entry": 412.5, "exit": 421.0, "pnl": 340.0,
+        })
+        for _ in range(100):
+            if len(sent) >= 2:
+                break
+            await asyncio.sleep(0.02)
+    finally:
+        mgr.stop()
+        await mgr.wait_until_stopped()
+
+    # The operator's filter says "trade"; both halves must still match.
+    assert {k for k, _ in sent} == {"trade_entry", "trade_exit"}
