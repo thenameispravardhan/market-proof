@@ -1063,34 +1063,8 @@ export default function Dataset() {
             }
             aria-label="Filter by symbol"
           />
-          <select
-            value={filters.action ?? ""}
-            onChange={(e) => setFilters((f) => ({ ...f, action: e.target.value || undefined }))}
-            aria-label="Filter by action"
-          >
-            <option value="">Any action</option>
-            <option value="BUY">BUY</option>
-            <option value="SELL">SELL</option>
-          </select>
-          <select
-            value={filters.taken ?? ""}
-            onChange={(e) => setFilters((f) => ({ ...f, taken: e.target.value || undefined }))}
-            aria-label="Filter by taken or blocked"
-          >
-            <option value="">Taken + blocked</option>
-            <option value="taken">Taken only</option>
-            <option value="blocked">Blocked only</option>
-          </select>
-          <select
-            value={filters.label ?? ""}
-            onChange={(e) => setFilters((f) => ({ ...f, label: e.target.value || undefined }))}
-            aria-label="Filter by 15-minute outcome"
-          >
-            <option value="">Any outcome</option>
-            <option value="UP">Moved UP</option>
-            <option value="DOWN">Moved DOWN</option>
-            <option value="FLAT">FLAT</option>
-          </select>
+          {/* No action / taken / label pickers: this page is the ANNOUNCEMENT
+              grain and a filing has none of those — the API 422s them. */}
           <label className="meta">
             from
             <input
