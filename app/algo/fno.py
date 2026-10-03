@@ -191,12 +191,17 @@ def master() -> dict[str, Any]:
     lots: dict[str, int] = {}
     futures: dict[str, list[tuple[int, str]]] = {}
     strikes: dict[str, dict[int, set[float]]] = {}
+    home: dict[str, str] = {}      # name -> its exchange; NSE_FO is read first, so SBIN stays on NSE
     for f in files:
         with f.open(encoding="utf-8", errors="replace") as fh:
             for row in csv.reader(fh):
                 if len(row) < 17 or ":" not in row[9]:
                     continue
                 name, kind = row[13].strip().upper(), row[16].strip().upper()
+                exch = row[9].split(":", 1)[0].strip().upper()
+                if home.setdefault(name, exch) != exch:
+                    continue           # BSE's thin copy of an NSE contract
+
                 try:
                     exp, lot = int(float(row[8])), int(float(row[3]))
                 except ValueError:
