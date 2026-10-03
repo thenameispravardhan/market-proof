@@ -564,6 +564,12 @@ class AlgoRunner:
                 self.event("error", f"{s['name']} {sym}: candles unavailable: {e}"[:300], strategy_id=s["id"])
                 continue
             if not d["t"] or d["t"][-1] < bar:
+                # Newest candle from an earlier day, well after this bar closed:
+                # no session today (exchange holiday / suspended symbol). Mark
+                # the bar done instead of re-polling Fyers every 5s all day.
+                if (not d["t"] or (d["t"][-1] + IST) // 86400 < (now + IST) // 86400) \
+                        and now > bar + tf_s + 20:
+                    self._last_bar[key] = bar
                 continue                                   # Fyers hasn't published it yet; next tick
             self._last_bar[key] = bar
             try:
@@ -608,6 +614,16 @@ class AlgoRunner:
 
     async def _try_enter(self, s: dict, sym: str, side: str, d: dict, now: float, day_start: float) -> None:
         spec = s["spec"]
+        # A trigger can fire minutes after its signal: re-check what may have
+        # changed meanwhile — never two positions in one symbol, never past the
+        # day's trade cap, never after the entry window closed.
+        _, open_trades = await asyncio.to_thread(_snapshot)
+        if any(t["strategy_id"] == s["id"] and t["symbol"] == sym for t in open_trades):
+            return
+        if await asyncio.to_thread(_trades_today, s["id"], sym, day_start) >= spec["max_trades_per_day"]:
+            return
+        if int((now + IST) % 86400) // 60 >= engine.session_window(spec)[2]:
+            return
         book = await asyncio.to_thread(_book, s["id"], day_start)
         if book["open"] >= spec["portfolio"]["max_positions"]:
             self.event("info", f"{s['name']}: {side} {sym} skipped — {book['open']} positions open (max)",

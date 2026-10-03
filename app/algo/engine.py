@@ -266,6 +266,8 @@ def _check_group(g: dict[str, Any], base_tf: int, depth: int = 0) -> None:
                 if side == "right" and c["op"] in ("rising", "falling"):
                     continue
                 raise ValueError(f"condition {side} operand missing")
+            if "ind" not in o:
+                o["value"] = _num(o["value"], f"{side} number", -1e15)
             if "ind" in o:
                 if o["ind"] not in ind.REGISTRY:
                     raise ValueError(f"unknown indicator {o['ind']!r}")
@@ -590,13 +592,14 @@ def _solve(f: Callable[[float], float], target: float, a: float, b: float) -> fl
 # ---- simulation ------------------------------------------------------------
 
 def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = None,
-        trade_from: Optional[int] = None) -> dict[str, Any]:
+        trade_from: Optional[int] = None, oos_from: Optional[int] = None) -> dict[str, Any]:
     """Backtest a normalized spec over {symbol: bars}; one shared portfolio.
 
     Each symbol's bars may carry `htf` ({tf: bars}) for multi-timeframe
     conditions, `vix` bars, and `meta` ({symbol, name, exch, lot, step}).
     Entries are taken only on bars at/after `trade_from` (earlier bars warm
-    the indicators up).
+    the indicators up). With `oos_from`, stats are also split into in-sample
+    (entries before it) and out-of-sample (entries from it).
     """
     caches = caches if caches is not None else {}
     inst = spec["instrument"]
@@ -665,6 +668,14 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
             "reason": reason, "gross": round(gross, 2), "charges": round(chg, 2), "net": round(net, 2),
             "bars": i - pos["i"], "margin": round(pos["margin"], 2), "legs": legs_out,
             "stop": pos["sl"], "target": pos["tg"],
+            # excursions on the reference price, in % of entry: how far it went
+            # against / for you before the exit — the data to tune stops with.
+            "mae_pct": round(pos["sign"] * (pos["worst"] - pos["ref_entry"]) / pos["ref_entry"] * 100, 3)
+            if pos["ref_entry"] else None,
+            "mfe_pct": round(pos["sign"] * (pos["best"] - pos["ref_entry"]) / pos["ref_entry"] * 100, 3)
+            if pos["ref_entry"] else None,
+            "r": round(net / pos["risk"], 2) if pos["risk"] else None,
+            "minutes": round((t - pos["t"]) / 60),
         })
         realized += net
         day_realized += net
@@ -725,7 +736,10 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         margin = per_set_margin * sets
         s_["pos"] = {"side": side, "legs": legs, "ref": ref, "sign": rsign, "ref_entry": ref_entry,
                      "sl": lv["sl"], "tg": lv["tg"], "trd": lv["trd"], "tra": lv["tra"], "be": lv["be"],
-                     "be_on": False, "trail": None, "best": ref_entry, "peak": None,
+                     "be_on": False, "trail": None, "best": ref_entry, "worst": ref_entry, "peak": None,
+                     # rupees at risk to the initial stop — the "1R" of R-multiples
+                     "risk": lv["sl_dist"] * legs[0]["per_set"] * sets
+                     if lv["sl_dist"] and (ref != "u" or inst["type"] != "option") else None,
                      "t": t, "i": i, "day": (t + IST) // 86400, "u0": u, "sets": sets, "margin": margin,
                      "exit_pending": None}
         used_margin += margin
@@ -825,7 +839,9 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
             f = lambda u: ref_at(pos, u, t, iv)  # noqa: E731
             sgn = pos["sign"]
             best_now = max((d["h"][i], d["l"][i]), key=lambda u: sgn * f(u))
+            worst_now = min((d["h"][i], d["l"][i]), key=lambda u: sgn * f(u))
             pos["best"] = max(pos["best"], f(best_now)) if sgn > 0 else min(pos["best"], f(best_now))
+            pos["worst"] = min(pos["worst"], f(worst_now)) if sgn > 0 else max(pos["worst"], f(worst_now))
             gain = sgn * (pos["best"] - pos["ref_entry"])
             if pos["trd"] and gain >= pos["tra"]:
                 nt = pos["best"] - sgn * pos["trd"]
@@ -871,13 +887,29 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
 
     trades.sort(key=lambda x: x["entry_t"])
     per_symbol = {}
+    live_bars = 0
+    holds = []
     for sym in syms:
+        d = data[sym]
         mine = [x for x in trades if x["symbol"] == sym]
         s2 = stats(mine, pf["capital"])
+        first = next((j for j, t in enumerate(d["t"]) if trade_from is None or t >= trade_from), None)
+        n_live = len(d["t"]) - first if first is not None else 0
+        live_bars += n_live
+        # Buy & hold over the same window — the benchmark the strategy must beat.
+        hold = (d["c"][-1] / d["o"][first] - 1) * 100 if first is not None and d["o"][first] else None
+        if hold is not None:
+            holds.append(hold)
         per_symbol[sym] = {k: s2[k] for k in ("trades", "win_rate", "net_pnl", "profit_factor", "max_drawdown")} \
-            | {"bars": len(data[sym]["t"])}
+            | {"bars": n_live, "buy_hold_pct": round(hold, 2) if hold is not None else None}
     out = stats(trades, pf["capital"])
     out["skipped"] = skipped
+    out["exposure_pct"] = round(sum(x["bars"] + 1 for x in trades) / live_bars * 100, 2) if live_bars else 0.0
+    out["buy_hold_pct"] = round(sum(holds) / len(holds), 2) if holds else None
+    if oos_from:
+        out["in_sample"] = summary(stats([x for x in trades if x["entry_t"] < oos_from], pf["capital"]))
+        out["out_of_sample"] = summary(stats([x for x in trades if x["entry_t"] >= oos_from], pf["capital"]))
+        out["oos_from"] = oos_from
     return {"stats": out, "per_symbol": per_symbol, "by_reason": by_reason(trades), "trades": trades}
 
 
@@ -918,6 +950,18 @@ def stats(trades: list[dict[str, Any]], capital: float) -> dict[str, Any]:
         streak["win"], streak["loss"] = max(streak["win"], cur_w), max(streak["loss"], cur_l)
     gross_win, gross_loss = sum(wins), -sum(losses)
     net = sum(nets)
+    mean_t = net_mean = sum(nets) / n if n else 0.0
+    sd_t = math.sqrt(sum((v - mean_t) ** 2 for v in nets) / (n - 1)) if n > 1 else 0.0
+    # Ulcer index: RMS of the percentage drawdown along the equity curve —
+    # punishes deep AND long drawdowns, unlike max DD which sees one point.
+    pk, sq_dd = capital, 0.0
+    for _, e in curve:
+        pk = max(pk, e)
+        sq_dd += ((pk - e) / pk * 100) ** 2 if pk > 0 else 0.0
+    ulcer = math.sqrt(sq_dd / len(curve)) if curve else 0.0
+    rs = [x["r"] for x in trades if x.get("r") is not None]
+    maes = [x["mae_pct"] for x in trades if x.get("mae_pct") is not None]
+    mfes = [x["mfe_pct"] for x in trades if x.get("mfe_pct") is not None]
     days_span = ((trades[-1]["exit_t"] - trades[0]["entry_t"]) / 86400) if n else 0
     final = capital + net
     cagr = ((final / capital) ** (365 / days_span) - 1) * 100 if n and days_span >= 30 and final > 0 else None
@@ -942,6 +986,19 @@ def stats(trades: list[dict[str, Any]], capital: float) -> dict[str, Any]:
         "calmar": round((cagr or 0) / max_dd_pct, 2) if cagr is not None and max_dd_pct > 0 else None,
         "max_consecutive_wins": streak["win"], "max_consecutive_losses": streak["loss"],
         "avg_bars_held": round(sum(x["bars"] for x in trades) / n, 1) if n else 0.0,
+        "avg_minutes_held": round(sum(x.get("minutes", 0) for x in trades) / n, 1) if n else 0.0,
+        # t-stat of the mean trade: |t| > 2 is the usual bar for "not luck".
+        "t_stat": round(net_mean / (sd_t / math.sqrt(n)), 2) if n > 1 and sd_t > 0 else None,
+        "payoff_ratio": round((gross_win / len(wins)) / (gross_loss / len(losses)), 2)
+        if wins and losses and gross_loss else None,
+        # Kelly fraction W - (1-W)/R; negative = no edge, size nothing.
+        "kelly_pct": round((len(wins) / n - (1 - len(wins) / n) / ((gross_win / len(wins)) / (gross_loss / len(losses))))
+                           * 100, 2) if wins and losses and gross_loss else None,
+        "recovery_factor": round(net / max_dd, 2) if max_dd > 0 else None,
+        "ulcer_index": round(ulcer, 2),
+        "avg_r": round(sum(rs) / len(rs), 3) if rs else None,
+        "avg_mae_pct": round(sum(maes) / len(maes), 3) if maes else None,
+        "avg_mfe_pct": round(sum(mfes) / len(mfes), 3) if mfes else None,
         "trading_days": len(daily),
         "profitable_days": sum(1 for v in dv if v > 0),
         "best_day": round(max(dv), 2) if dv else 0.0,
@@ -952,6 +1009,52 @@ def stats(trades: list[dict[str, Any]], capital: float) -> dict[str, Any]:
         "weekday": {["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][k]: round(sum(v), 2)
                     for k, v in sorted(weekday.items())},
     }
+
+
+SUMMARY_KEYS = ("trades", "win_rate", "net_pnl", "profit_factor", "sharpe", "max_drawdown_pct", "expectancy",
+                "return_pct", "t_stat")
+
+
+def summary(st: dict[str, Any]) -> dict[str, Any]:
+    return {k: st.get(k) for k in SUMMARY_KEYS}
+
+
+def monte_carlo(trades: list[dict[str, Any]], capital: float, runs: int = 1000, seed: int = 7) -> Optional[dict[str, Any]]:
+    """Resample the trade sequence with replacement `runs` times.
+
+    One backtest is one path; the order of wins and losses is luck. The
+    spread of final P&L and of max drawdown across resampled paths is what
+    to size capital for — plan for the 95th-percentile drawdown, not the
+    one this history happened to produce. Seeded, so it is reproducible.
+    """
+    import random
+
+    nets = [x["net"] for x in trades]
+    n = len(nets)
+    if n < 10:
+        return None
+    rnd = random.Random(seed)
+    finals, dds, ruined = [], [], 0
+    for _ in range(runs):
+        eq = peak = capital
+        dd = 0.0
+        broke = False
+        for _ in range(n):
+            eq += nets[rnd.randrange(n)]
+            peak = max(peak, eq)
+            dd = max(dd, (peak - eq) / peak * 100 if peak > 0 else 100.0)
+            broke = broke or eq <= capital / 2
+        finals.append(eq - capital)
+        dds.append(dd)
+        ruined += broke
+    finals.sort()
+    dds.sort()
+    q = lambda xs, p: xs[min(len(xs) - 1, int(p * len(xs)))]  # noqa: E731
+    return {"runs": runs, "trades": n,
+            "net_p5": round(q(finals, 0.05), 2), "net_p50": round(q(finals, 0.5), 2), "net_p95": round(q(finals, 0.95), 2),
+            "dd_pct_p50": round(q(dds, 0.5), 2), "dd_pct_p95": round(q(dds, 0.95), 2),
+            "prob_loss_pct": round(sum(1 for f in finals if f < 0) / runs * 100, 1),
+            "prob_half_capital_pct": round(ruined / runs * 100, 1)}
 
 
 def _ym(day_index: int) -> str:
@@ -985,15 +1088,17 @@ def set_path(obj: Any, path: str, value: Any) -> None:
 
 
 MAX_COMBOS = 400
-METRICS = ("net_pnl", "profit_factor", "sharpe", "sortino", "win_rate", "return_pct", "expectancy", "calmar")
+METRICS = ("net_pnl", "profit_factor", "sharpe", "sortino", "win_rate", "return_pct", "expectancy", "calmar", "t_stat")
 
 
 def optimize(spec: dict, data: dict[str, dict], grid: list[dict[str, Any]], metric: str = "net_pnl",
-             min_trades: int = 5, trade_from: Optional[int] = None) -> dict[str, Any]:
+             min_trades: int = 5, trade_from: Optional[int] = None, oos_from: Optional[int] = None) -> dict[str, Any]:
     """Grid-search over [{path, values}] and rank by `metric`.
 
     Ranks only combos with >= min_trades: a 1-trade 100% win rate wins every
-    grid search and means nothing.
+    grid search and means nothing. With `oos_from` the ranking uses ONLY the
+    in-sample trades and each row carries its out-of-sample result — the
+    walk-forward check that a winner was found, not fitted.
     """
     if metric not in METRICS:
         raise ValueError(f"metric must be one of {METRICS}")
@@ -1010,10 +1115,13 @@ def optimize(spec: dict, data: dict[str, dict], grid: list[dict[str, Any]], metr
         for (path, _), v in zip(axes, combo):
             set_path(s, path, v)
         s = normalize(s)
-        st = run(s, data, caches, trade_from)["stats"]
+        full = run(s, data, caches, trade_from, oos_from)["stats"]
+        st = full["in_sample"] if oos_from else full
         rows.append({"params": {p: v for (p, _), v in zip(axes, combo)},
-                     **{k: st[k] for k in ("trades", "win_rate", "net_pnl", "profit_factor", "sharpe", "sortino",
-                                           "calmar", "max_drawdown", "return_pct", "expectancy")}})
+                     **{k: st.get(k) for k in ("trades", "win_rate", "net_pnl", "profit_factor", "sharpe", "sortino",
+                                               "calmar", "max_drawdown", "max_drawdown_pct", "return_pct",
+                                               "expectancy", "t_stat")},
+                     "oos": full.get("out_of_sample")})
     ok = [r for r in rows if r["trades"] >= min_trades]
     ok.sort(key=lambda r: (r[metric] is not None, r[metric] or 0), reverse=True)
     return {"combos": len(combos), "ranked": ok[:100],
