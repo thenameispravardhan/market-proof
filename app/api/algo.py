@@ -31,7 +31,7 @@ from sqlalchemy.orm import Session
 from app.algo import data, engine
 from app.algo import indicators as ind
 from app.db.init import init_db
-from app.db.models import AlgoStrategy, AlgoTrade, AuditLog, BrokerAccount
+from app.db.models import AlgoStrategy, AlgoStrategyVersion, AlgoTrade, AuditLog, BrokerAccount
 from app.db.session import get_db
 from app.logging_config import get_logger
 
@@ -64,19 +64,6 @@ def _range(body: dict[str, Any]) -> tuple[int, int]:
         raise HTTPException(422, detail=f"at most {MAX_RANGE_DAYS} days per backtest")
     ist0 = lambda d: int(datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp()) - engine.IST  # noqa: E731
     return ist0(start), min(ist0(end) + DAY, int(time.time()) + 60)
-
-
-def _pricing_note(spec: dict[str, Any]) -> Optional[str]:
-    inst = spec["instrument"]
-    if inst["type"] == "option":
-        src = {"auto": "India VIX for indices, realised volatility for stocks", "hv": "20-day realised volatility",
-               "vix": "India VIX", "fixed": f"a fixed {inst['iv']['value']}%"}[inst["iv"]["source"]]
-        return ("Option premiums are Black-Scholes ESTIMATES priced off the underlying's real candles with IV from "
-                f"{src} — Fyers keeps no history for expired contracts. Real premiums carry skew and event IV; "
-                "treat option results as a guide, then paper-trade before going live.")
-    if inst["type"] == "future":
-        return "Futures are backtested on the underlying's price (basis ignored); live trading uses the real contract."
-    return None
 
 
 async def _assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str, dict], list[dict], int]:
@@ -112,7 +99,6 @@ async def backtest(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     res["trades_total"] = len(res["trades"])
     res["trades"] = res["trades"][-3000:]
     return {**res, "spec": spec, "notes": notes, "elapsed_s": round(time.monotonic() - t0, 2),
-            "pricing_note": _pricing_note(spec),
             "chart": {"symbol": chart_sym, "candles": candles,
                       "trades": [x for x in res["trades"] if x["symbol"] == chart_sym]},
             "bars": {k: sum(1 for t in v["t"] if t >= trade_from) for k, v in bars.items()}}
@@ -184,9 +170,11 @@ def _ser(s: AlgoStrategy, db: Session) -> dict[str, Any]:
         AlgoTrade.strategy_id == s.id, AlgoTrade.status == "closed")).one()
     open_n = db.execute(select(func.count()).select_from(AlgoTrade).where(
         AlgoTrade.strategy_id == s.id, AlgoTrade.status == "open")).scalar_one()
+    versions = db.execute(select(func.max(AlgoStrategyVersion.version)).where(
+        AlgoStrategyVersion.strategy_id == s.id)).scalar_one() or 1
     return {"id": s.id, "name": s.name, "spec": s.spec, "enabled": s.enabled, "mode": s.mode,
             "account_id": s.account_id, "closed_trades": agg[0], "realized_pnl": round(agg[1], 2),
-            "open_positions": open_n,
+            "open_positions": open_n, "version": s.version or 1, "versions": versions,
             "created_at": s.created_at.isoformat() if s.created_at else None,
             "updated_at": s.updated_at.isoformat() if s.updated_at else None}
 
@@ -215,9 +203,10 @@ def create_strategy(body: dict[str, Any] = Body(...), db: Session = Depends(get_
         raise HTTPException(422, detail="name is required (max 128 chars)")
     if db.execute(select(AlgoStrategy).where(AlgoStrategy.name == name)).scalar_one_or_none():
         raise HTTPException(409, detail=f"a strategy named {name!r} already exists")
-    s = AlgoStrategy(name=name, spec=_spec(body.get("spec")), enabled=False, mode="paper")
+    s = AlgoStrategy(name=name, spec=_spec(body.get("spec")), enabled=False, mode="paper", version=1)
     db.add(s)
     db.flush()
+    db.add(AlgoStrategyVersion(strategy_id=s.id, version=1, spec=s.spec, note=body.get("note")))
     _audit(db, "algo.create", s, {"name": name})
     db.commit()
     return _ser(s, db)
@@ -234,8 +223,14 @@ def update_strategy(sid: int, body: dict[str, Any] = Body(...), db: Session = De
             raise HTTPException(409 if clash else 422, detail="name taken" if clash else "name is required")
         s.name = changes["name"] = name
     if body.get("spec") is not None:
-        s.spec = _spec(body["spec"])
-        changes["spec"] = True
+        new = _spec(body["spec"])
+        if new != s.spec:
+            _ensure_v1(db, s)
+            v = (db.execute(select(func.max(AlgoStrategyVersion.version)).where(
+                AlgoStrategyVersion.strategy_id == s.id)).scalar_one() or 0) + 1
+            db.add(AlgoStrategyVersion(strategy_id=s.id, version=v, spec=new, note=body.get("note")))
+            s.spec, s.version = new, v
+            changes["version"] = v
     if "account_id" in body:
         s.account_id = int(body["account_id"]) if body["account_id"] else None
         changes["account_id"] = s.account_id
@@ -253,10 +248,59 @@ def update_strategy(sid: int, body: dict[str, Any] = Body(...), db: Session = De
         if acc is None or acc.paper_mode or acc.broker != "fyers":
             raise HTTPException(422, detail="live mode needs a real Fyers account selected")
         spec = engine.normalize(s.spec)
-        if engine._hhmm(spec["session"]["square_off"]) > engine._hhmm(LIVE_SQUARE_OFF_LATEST):
+        if not spec["session"]["square_off"] or \
+                engine.session_window(spec)[2] > engine._hhmm(LIVE_SQUARE_OFF_LATEST):
             raise HTTPException(422, detail=f"live square-off must be at or before {LIVE_SQUARE_OFF_LATEST} "
                                             "(Fyers auto-squares intraday positions at ~15:20)")
     _audit(db, "algo.update", s, changes)
+    db.commit()
+    return _ser(s, db)
+
+
+def _ensure_v1(db: Session, s: AlgoStrategy) -> None:
+    """Strategies saved before versioning get their current spec as v1."""
+    if not db.execute(select(func.count()).select_from(AlgoStrategyVersion).where(
+            AlgoStrategyVersion.strategy_id == s.id)).scalar_one():
+        db.add(AlgoStrategyVersion(strategy_id=s.id, version=s.version or 1, spec=s.spec, note="initial"))
+        db.flush()
+
+
+@router.get("/strategies/{sid}/versions")
+def list_versions(sid: int, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Every version, newest first, with what each one actually traded."""
+    s = _get(db, sid)
+    _ensure_v1(db, s)
+    db.commit()
+    perf = {v: (n, pnl) for v, n, pnl in db.execute(
+        select(AlgoTrade.version, func.count(), func.coalesce(func.sum(AlgoTrade.net_pnl), 0.0))
+        .where(AlgoTrade.strategy_id == sid, AlgoTrade.status == "closed").group_by(AlgoTrade.version))}
+    rows = db.execute(select(AlgoStrategyVersion).where(AlgoStrategyVersion.strategy_id == sid)
+                      .order_by(AlgoStrategyVersion.version.desc())).scalars().all()
+    return {"active": s.version or 1, "versions": [
+        {"version": v.version, "spec": v.spec, "note": v.note, "active": v.version == (s.version or 1),
+         "created_at": v.created_at.isoformat() if v.created_at else None,
+         "closed_trades": perf.get(v.version, (0, 0))[0], "realized_pnl": round(perf.get(v.version, (0, 0.0))[1], 2)}
+        for v in rows]}
+
+
+@router.post("/strategies/{sid}/versions/{version}/activate")
+def activate_version(sid: int, version: int, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Make an earlier (or later) version the one that runs. Open positions keep
+    the stops/targets they were opened with."""
+    s = _get(db, sid)
+    _ensure_v1(db, s)
+    v = db.execute(select(AlgoStrategyVersion).where(
+        AlgoStrategyVersion.strategy_id == sid, AlgoStrategyVersion.version == version)).scalar_one_or_none()
+    if v is None:
+        raise HTTPException(404, detail=f"strategy {sid} has no v{version}")
+    s.spec, s.version = v.spec, v.version
+    if s.mode == "live":
+        spec = engine.normalize(s.spec)
+        if not spec["session"]["square_off"] or \
+                engine.session_window(spec)[2] > engine._hhmm(LIVE_SQUARE_OFF_LATEST):
+            raise HTTPException(422, detail=f"v{version} squares off after {LIVE_SQUARE_OFF_LATEST} — "
+                                            "switch the strategy to paper first")
+    _audit(db, "algo.activate_version", s, {"version": version})
     db.commit()
     return _ser(s, db)
 
@@ -269,6 +313,7 @@ def delete_strategy(sid: int, db: Session = Depends(get_db)) -> dict[str, Any]:
         raise HTTPException(409, detail="square off its open positions first")
     _audit(db, "algo.delete", s, {"name": s.name})
     db.query(AlgoTrade).filter(AlgoTrade.strategy_id == sid).delete()
+    db.query(AlgoStrategyVersion).filter(AlgoStrategyVersion.strategy_id == sid).delete()
     db.delete(s)
     db.commit()
     return {"ok": True}

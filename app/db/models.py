@@ -596,6 +596,23 @@ class AlgoStrategy(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow,
                                                  nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)   # the ACTIVE version
+
+
+class AlgoStrategyVersion(Base):
+    """Every saved edit of a strategy's spec: v1, v2, ... Activating an old
+    version copies its spec back onto the strategy; nothing is ever deleted."""
+
+    __tablename__ = "algo_strategy_versions"
+    __table_args__ = (UniqueConstraint("strategy_id", "version", name="uq_algo_strategy_version"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    strategy_id: Mapped[int] = mapped_column(
+        ForeignKey("algo_strategies.id", ondelete="CASCADE"), nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    spec: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    note: Mapped[Optional[str]] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
 
 
 class AlgoTrade(Base):
@@ -640,6 +657,7 @@ class AlgoTrade(Base):
     mtm_peak: Mapped[Optional[float]] = mapped_column(Float)
     margin: Mapped[Optional[float]] = mapped_column(Float)
     u_entry: Mapped[Optional[float]] = mapped_column(Float)
+    version: Mapped[Optional[int]] = mapped_column(Integer)    # strategy version that opened it
 
 
 # -------------------------------------------------------------------------
@@ -664,4 +682,5 @@ __all__ = [
     "AuditLog",
     "AlgoStrategy",
     "AlgoTrade",
+    "AlgoStrategyVersion",
 ]

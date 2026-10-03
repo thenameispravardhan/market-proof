@@ -68,7 +68,8 @@ type Spec = {
   breakeven: Level;
   mtm: { stop: number | null; target: number | null; trail_start: number | null; trail_gap: number | null };
   daily: { max_loss: number | null; max_profit: number | null };
-  session: { start: string; end: string; square_off: string };
+  session: { start: string | null; end: string | null; square_off: string | null };
+  entry_order: { type: string; offset_pct: number; valid_bars: number };
   max_trades_per_day: number;
   cooldown_bars: number;
   max_bars: number | null;
@@ -105,14 +106,14 @@ type BtResult = {
   trades: BtTrade[];
   trades_total: number;
   notes: { symbol: string; note: string }[];
-  pricing_note: string | null;
   elapsed_s: number;
   chart: { symbol: string; candles: number[][]; trades: BtTrade[] };
   spec: Spec;
 };
 type OptRow = { params: Record<string, number>; trades: number; win_rate: number; net_pnl: number; profit_factor: number | null; sharpe: number | null; max_drawdown: number; return_pct: number; expectancy: number };
 type OptResult = { combos: number; ranked: OptRow[]; too_few_trades: number; metric: string; notes: { symbol: string; note: string }[]; elapsed_s: number };
-type Saved = { id: number; name: string; spec: Spec; enabled: boolean; mode: "paper" | "live"; account_id: number | null; closed_trades: number; realized_pnl: number; open_positions: number };
+type Saved = { id: number; name: string; spec: Spec; enabled: boolean; mode: "paper" | "live"; account_id: number | null; closed_trades: number; realized_pnl: number; open_positions: number; version: number; versions: number };
+type Version = { version: number; spec: Spec; note: string | null; active: boolean; created_at: string | null; closed_trades: number; realized_pnl: number };
 type LiveLeg = { symbol: string; label?: string; act: number; qty: number; entry: number; exit?: number; ltp?: number | null };
 type LiveTrade = {
   id: number; strategy_id: number; symbol: string; instrument: string | null; side: string; quantity: number; mode: string; status: string;
@@ -148,7 +149,10 @@ const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const daysAgo = (n: number) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
 const shortSym = (s: string) => s.replace(/^NSE:/, "").replace(/-EQ$/, "").replace(/-INDEX$/, "");
 const tfLabel = (t: number) => (t === 1440 ? "daily" : t >= 60 ? `${t / 60}h` : `${t}m`);
-const SECTIONS = ["instrument", "session", "sizing", "portfolio", "mtm", "daily", "costs"] as const;
+const SECTIONS = ["instrument", "session", "sizing", "portfolio", "mtm", "daily", "costs", "entry_order"] as const;
+const STRIKES = ["ATM", ...Array.from({ length: 20 }, (_, k) => `ITM${k + 1}`), ...Array.from({ length: 20 }, (_, k) => `OTM${k + 1}`), "PREMIUM"];
+const strikeKey = (lg: Leg) => (lg.strike === "ITM" || lg.strike === "OTM" ? `${lg.strike}${Math.max(1, lg.steps)}` : lg.strike);
+const SESSION_DEFAULT = { start: "09:20", end: "15:00", square_off: "15:15" } as const;
 
 // Merge a partial spec (template, import, saved) onto the defaults section by section.
 function withDefaults(defaults: Spec, part: Partial<Spec>): Spec {
@@ -584,10 +588,12 @@ function LegsEditor({ legs, onChange, title }: { legs: Leg[]; onChange: (l: Leg[
           <select value={lg.right} onChange={(e) => set(i, { right: e.target.value as Leg["right"] })}>
             <option value="CE">CE (call)</option><option value="PE">PE (put)</option>
           </select>
-          <select value={lg.strike} onChange={(e) => set(i, { strike: e.target.value })}>
-            <option value="ATM">ATM</option><option value="ITM">ITM</option><option value="OTM">OTM</option><option value="PREMIUM">closest to premium ₹</option>
+          <select value={strikeKey(lg)} title="strikes are counted in the underlying's strike steps" onChange={(e) => {
+            const m = e.target.value.match(/^(ITM|OTM)(\d+)$/);
+            set(i, m ? { strike: m[1], steps: Number(m[2]) } : { strike: e.target.value, steps: 0 });
+          }}>
+            {STRIKES.map((k) => <option key={k} value={k}>{k === "PREMIUM" ? "closest to premium ₹" : k.replace(/(\d+)$/, " $1")}</option>)}
           </select>
-          {(lg.strike === "ITM" || lg.strike === "OTM") && <label className="meta">by <NumInput width={36} value={lg.steps} onChange={(n) => set(i, { steps: Math.max(0, Math.floor(n ?? 0)) })} /> strike(s)</label>}
           {lg.strike === "PREMIUM" && <label className="meta">₹<NumInput width={56} value={lg.premium} onChange={(n) => set(i, { premium: n ?? 100 })} /></label>}
           <label className="meta">lots <NumInput width={40} value={lg.lots} onChange={(n) => set(i, { lots: Math.max(1, Math.floor(n ?? 1)) })} /></label>
           <button type="button" className="btn-sm danger" onClick={() => onChange(legs.filter((_, j) => j !== i))}>✕</button>
@@ -671,9 +677,8 @@ function Results({ r }: { r: BtResult }) {
   const skipped = Object.entries(s.skipped ?? {}).filter(([, v]) => v > 0);
   return (
     <>
-      {(r.notes.length > 0 || r.pricing_note) && (
+      {r.notes.length > 0 && (
         <div className="widget widget-wide" style={{ marginBottom: 12, borderColor: "var(--amber)" }}>
-          {r.pricing_note && <div className="meta">ⓘ {r.pricing_note}</div>}
           {r.notes.map((n) => <div key={n.symbol} className="meta">⚠ {n.symbol}: {n.note}</div>)}
         </div>
       )}
@@ -703,7 +708,7 @@ function Results({ r }: { r: BtResult }) {
         </div>
         {skipped.length > 0 && (
           <div className="meta" style={{ marginTop: 6 }}>
-            Signals not taken: {skipped.map(([k, v]) => `${v} × ${k.replace("_", " ")}`).join(" · ")}
+            Signals not taken: {skipped.map(([k, v]) => `${v} × ${k.replace(/_/g, " ")}`).join(" · ")}
             {skipped.some(([k]) => k === "no_capital") && " — raise capital or leverage, or size smaller"}
           </div>
         )}
@@ -726,35 +731,35 @@ function Results({ r }: { r: BtResult }) {
         <h3>{r.chart.symbol} <span className="meta">last {r.chart.candles.length} candles of the underlying · ▲▼ entries, ● exits</span></h3>
         <TradeChart chart={r.chart} />
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 12, marginBottom: 12 }}>
+      <div className="algo-quad">
         <div className="widget">
           <h3>By symbol</h3>
-          <table><thead><tr><th>Symbol</th><th>Bars</th><th>Trades</th><th>Win %</th><th>PF</th><th>Net</th></tr></thead>
+          <div className="algo-scroll"><table><thead><tr><th>Symbol</th><th>Bars</th><th>Trades</th><th>Win %</th><th>PF</th><th>Net</th></tr></thead>
             <tbody>{Object.entries(r.per_symbol).map(([k, v]) => (
               <tr key={k}><td>{shortSym(k)}</td><td className="mono">{v.bars}</td><td className="mono">{v.trades}</td><td className="mono">{num(v.win_rate, 1)}</td>
                 <td className="mono">{num(v.profit_factor)}</td><td className={`mono ${pnlCls(v.net_pnl)}`}>{inr(v.net_pnl)}</td></tr>))}
-            </tbody></table>
+            </tbody></table></div>
         </div>
         <div className="widget">
           <h3>By exit reason</h3>
-          <table><thead><tr><th>Reason</th><th>Count</th><th>Net</th></tr></thead>
+          <div className="algo-scroll"><table><thead><tr><th>Reason</th><th>Count</th><th>Net</th></tr></thead>
             <tbody>{Object.entries(r.by_reason).map(([k, v]) => (
               <tr key={k}><td>{k}</td><td className="mono">{v.count}</td><td className={`mono ${pnlCls(v.net)}`}>{inr(v.net)}</td></tr>))}
-            </tbody></table>
+            </tbody></table></div>
         </div>
         <div className="widget">
           <h3>By month</h3>
-          <table><thead><tr><th>Month</th><th>Net</th></tr></thead>
+          <div className="algo-scroll"><table><thead><tr><th>Month</th><th>Net</th></tr></thead>
             <tbody>{Object.entries(s.monthly ?? {}).map(([k, v]) => (
               <tr key={k}><td>{k}</td><td className={`mono ${pnlCls(v)}`}>{inr(v)}</td></tr>))}
-            </tbody></table>
+            </tbody></table></div>
         </div>
         <div className="widget">
           <h3>By weekday</h3>
-          <table><thead><tr><th>Day</th><th>Net</th></tr></thead>
+          <div className="algo-scroll"><table><thead><tr><th>Day</th><th>Net</th></tr></thead>
             <tbody>{Object.entries(s.weekday ?? {}).map(([k, v]) => (
               <tr key={k}><td>{k}</td><td className={`mono ${pnlCls(v)}`}>{inr(v)}</td></tr>))}
-            </tbody></table>
+            </tbody></table></div>
         </div>
       </div>
       <div className="widget widget-wide">
@@ -897,11 +902,20 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
         ) : (
           <div style={{ overflowX: "auto" }}>
             <table>
-              <thead><tr><th>On</th><th>Strategy</th><th>Symbols</th><th>Trades</th><th>TF</th><th>Mode</th><th>Open</th><th>Closed</th><th>Realised</th><th></th></tr></thead>
+              <thead><tr><th>On</th><th>Strategy</th><th>Version</th><th>Symbols</th><th>Trades</th><th>TF</th><th>Mode</th><th>Open</th><th>Closed</th><th>Realised</th><th></th></tr></thead>
               <tbody>{strategies.data!.strategies.map((s) => (
                 <tr key={s.id} style={sel === s.id ? { background: "var(--bg-row)" } : undefined}>
                   <td><Toggle on={s.enabled} size="sm" onChange={(on: boolean) => put(s.id, { enabled: on })} /></td>
                   <td><a href="#/algo" onClick={(e) => { e.preventDefault(); setSel(sel === s.id ? null : s.id); }}>{s.name}</a></td>
+                  <td>
+                    <select value={s.version} title="the version that runs — switch back and forth any time" onChange={async (e) => {
+                      setErr(null);
+                      try { await api.post(`/api/algo/strategies/${s.id}/versions/${e.target.value}/activate`, {}); } catch (er) { setErr(errMsg(er)); }
+                      refresh();
+                    }}>
+                      {Array.from({ length: s.versions || 1 }, (_, k) => (s.versions || 1) - k).map((v) => <option key={v} value={v}>v{v}{v === s.version ? " ✓" : ""}</option>)}
+                    </select>
+                  </td>
                   <td className="mono" style={{ maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis" }} title={s.spec.symbols.join(", ")}>{s.spec.symbols.map(shortSym).join(", ")}</td>
                   <td className="meta" style={{ maxWidth: 240, whiteSpace: "normal" }}>{instLabel(s)}</td>
                   <td className="mono">{tfLabel(s.spec.timeframe)}</td>
@@ -1044,6 +1058,7 @@ export default function Algo() {
   const [spec, setSpec] = useState<Spec | null>(null);
   const [name, setName] = useState("My strategy");
   const [editing, setEditing] = useState<number | null>(null);
+  const [viewing, setViewing] = useState<number | null>(null);   // version loaded into the builder
   const [range, setRange] = useState({ start: daysAgo(180), end: daysAgo(0) });
   const [msg, setMsg] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -1051,12 +1066,13 @@ export default function Algo() {
   // Restore the draft (or start from the server defaults + the first template).
   useEffect(() => {
     if (!cat.data || spec) return;
-    let draft: { spec: Partial<Spec>; name: string; editing: number | null } | null = null;
+    let draft: { spec: Partial<Spec>; name: string; editing: number | null; viewing?: number | null } | null = null;
     try { draft = JSON.parse(localStorage.getItem(DRAFT_KEY) ?? "null"); } catch { /* private mode */ }
     if (draft?.spec) {
       setSpec(withDefaults(cat.data.defaults, draft.spec));
       setName(draft.name);
       setEditing(draft.editing);
+      setViewing(draft.viewing ?? null);
     } else {
       setSpec(withDefaults(cat.data.defaults, { symbols: ["NSE:SBIN-EQ"], ...TEMPLATES[0].spec }));
       setName(TEMPLATES[0].name);
@@ -1064,8 +1080,8 @@ export default function Algo() {
   }, [cat.data, spec]);
   useEffect(() => {
     if (!spec) return;
-    try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ spec, name, editing })); } catch { /* ignore */ }
-  }, [spec, name, editing]);
+    try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ spec, name, editing, viewing })); } catch { /* ignore */ }
+  }, [spec, name, editing, viewing]);
 
   const first = spec?.symbols[0];
   const info = useQuery({
@@ -1076,6 +1092,10 @@ export default function Algo() {
   const bt = useMutation({
     mutationFn: () => longPost<BtResult>("/api/algo/backtest", { spec: tidy(spec!), ...range }),
   });
+  const versions = useQuery({
+    queryKey: ["algo", "versions", editing], enabled: !!editing,
+    queryFn: () => api.get<{ active: number; versions: Version[] }>(`/api/algo/strategies/${editing}/versions`),
+  });
   const save = useMutation({
     mutationFn: async (asNew: boolean) => {
       const body = { name, spec: tidy(spec!) };
@@ -1084,9 +1104,15 @@ export default function Algo() {
     },
     onSuccess: (s) => {
       setEditing(s.id);
-      setMsg(`Saved “${s.name}” — switch it on in the Automations tab.`);
-      qc.invalidateQueries({ queryKey: ["algo", "strategies"] });
+      setViewing(s.version);
+      setMsg(`Saved “${s.name}” as v${s.version} — it is the active version. Switch it on in the Automations tab.`);
+      qc.invalidateQueries({ queryKey: ["algo"] });
     },
+    onError: (e) => setMsg(errMsg(e)),
+  });
+  const activate = useMutation({
+    mutationFn: (v: number) => api.post<Saved>(`/api/algo/strategies/${editing}/versions/${v}/activate`, {}),
+    onSuccess: (s) => { setMsg(`v${s.version} is now the active version.`); qc.invalidateQueries({ queryKey: ["algo"] }); },
     onError: (e) => setMsg(errMsg(e)),
   });
 
@@ -1138,7 +1164,7 @@ export default function Algo() {
       </div>
 
       {tab === "automations" && <Automations onEdit={(s) => {
-        setName(s.name); setEditing(s.id);
+        setName(s.name); setEditing(s.id); setViewing(s.version);
         setSpec(withDefaults(c.defaults, s.spec)); setTab("builder");
       }} />}
       {tab === "data" && <DataTab />}
@@ -1155,7 +1181,7 @@ export default function Algo() {
       {tab === "builder" && (
         <>
           <div className="widget widget-wide" style={{ marginBottom: 12 }}>
-            <h3>Strategy {editing ? <span className="meta">editing saved #{editing}</span> : <span className="meta">unsaved draft</span>}
+            <h3>Strategy {editing ? <span className="meta">saved #{editing}{viewing ? ` · v${viewing}` : ""}</span> : <span className="meta">unsaved draft</span>}
               <span style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
                 <button type="button" className="btn-sm" onClick={() => download(`${name.replace(/[^\w-]+/g, "_")}.json`, JSON.stringify({ name, spec: tidy(spec) }, null, 2))}>⬇ export</button>
                 <button type="button" className="btn-sm" onClick={() => fileRef.current?.click()}>⬆ import</button>
@@ -1165,36 +1191,53 @@ export default function Algo() {
                   if (!f) return;
                   try {
                     const j = JSON.parse(await f.text()) as { name?: string; spec?: Partial<Spec> } & Partial<Spec>;
-                    setSpec(withDefaults(c.defaults, j.spec ?? j)); setName(j.name ?? f.name.replace(/\.json$/, "")); setEditing(null);
+                    setSpec(withDefaults(c.defaults, j.spec ?? j)); setName(j.name ?? f.name.replace(/\.json$/, "")); setEditing(null); setViewing(null);
                     setMsg("Imported — save it to keep it.");
                   } catch (err) { setMsg(`Import failed: ${errMsg(err)}`); }
                 }} />
               </span>
             </h3>
-            <div className="algo-operand" style={{ gap: 12, marginBottom: 10 }}>
-              <label className="meta">name <input value={name} onChange={(e) => setName(e.target.value)} style={{ width: 240 }} /></label>
-              <label className="meta">template
+            <div className="algo-fields">
+              <label className="algo-field"><span className="meta">name</span><input value={name} onChange={(e) => setName(e.target.value)} /></label>
+              <label className="algo-field"><span className="meta">template</span>
                 <select value="" onChange={(e) => {
                   const t = TEMPLATES[Number(e.target.value)];
-                  if (t) { setSpec(withDefaults(c.defaults, { symbols: t.symbols ?? spec.symbols, ...t.spec })); setName(t.name); setEditing(null); }
+                  if (t) { setSpec(withDefaults(c.defaults, { symbols: t.symbols ?? spec.symbols, ...t.spec })); setName(t.name); setEditing(null); setViewing(null); }
                 }}>
                   <option value="">— load a template —</option>
                   {TEMPLATES.map((t, i) => <option key={t.name} value={i}>{t.name}</option>)}
                 </select>
               </label>
-              <label className="meta">timeframe
+              <label className="algo-field"><span className="meta">timeframe</span>
                 <select value={spec.timeframe} onChange={(e) => upd({ timeframe: Number(e.target.value) })}>
                   {c.timeframes.map((t) => <option key={t} value={t}>{tfLabel(t)}</option>)}
                 </select>
               </label>
-              <label className="meta">direction
+              <label className="algo-field"><span className="meta">direction</span>
                 <select value={spec.direction} onChange={(e) => upd({ direction: e.target.value as Spec["direction"] })}>
                   <option value="long">long / bullish only</option><option value="short">short / bearish only</option><option value="both">both</option>
                 </select>
               </label>
             </div>
-            <div className="meta" style={{ marginBottom: 4 }}>Symbols — signals are computed on these (stocks or indices)</div>
-            <SymbolPicker value={spec.symbols} onChange={(symbols) => upd({ symbols })} />
+            <div className="algo-field"><span className="meta">symbols — signals are computed on these (stocks or indices)</span>
+              <SymbolPicker value={spec.symbols} onChange={(symbols) => upd({ symbols })} />
+            </div>
+            {editing && versions.data && (
+              <div className="algo-operand" style={{ gap: 6 }}>
+                <span className="meta">versions</span>
+                {versions.data.versions.map((v) => (
+                  <button key={v.version} type="button" className={`btn-sm ${v.version === viewing ? "primary" : "ghost"}`}
+                    title={`${v.note ?? ""} saved ${isoIst(v.created_at)} · ${v.closed_trades} live/paper trades · ${inr(v.realized_pnl)}${v.active ? " · ACTIVE" : ""}`}
+                    onClick={() => { setSpec(withDefaults(c.defaults, v.spec)); setViewing(v.version); setMsg(`Loaded v${v.version} into the builder${v.active ? " (active)" : " — not active yet"}.`); }}>
+                    v{v.version}{v.active ? " ✓" : ""}
+                  </button>
+                ))}
+                {viewing && viewing !== versions.data.active && (
+                  <button type="button" className="btn-sm" disabled={activate.isPending} onClick={() => activate.mutate(viewing)}>make v{viewing} active</button>
+                )}
+                <span className="meta">✓ = runs in Automations · saving creates the next version</span>
+              </div>
+            )}
           </div>
 
           <div className="widget widget-wide" style={{ marginBottom: 12 }}>
@@ -1310,11 +1353,32 @@ export default function Algo() {
               <label className="meta" title="exit a position that has been open this many candles">time stop <NumInput width={44} allowEmpty placeholder="off" value={spec.max_bars} onChange={(n) => upd({ max_bars: n === null ? null : Math.max(1, Math.floor(n)) })} /> bars</label>
             </div>
             <div className="algo-operand" style={{ gap: 14, marginTop: 8 }}>
-              {(["start", "end", "square_off"] as const).map((k) => (
-                <label key={k} className="meta">{k === "start" ? "entries from" : k === "end" ? "entries until" : "square off"}
-                  <input type="time" value={spec.session[k]} min="09:15" max="15:29" onChange={(e) => upd({ session: { ...spec.session, [k]: e.target.value } })} />
-                </label>
-              ))}
+              {(["start", "end", "square_off"] as const).map((k) => {
+                const on = spec.session[k] !== null && spec.session[k] !== undefined;
+                const off = { start: "from the 09:15 open", end: "until square-off", square_off: "at 15:29" }[k];
+                return (
+                  <label key={k} className="meta" title={on ? "" : `off — ${off}`}>
+                    <input type="checkbox" checked={on} onChange={(e) => upd({ session: { ...spec.session, [k]: e.target.checked ? SESSION_DEFAULT[k] : null } })} />
+                    {k === "start" ? "entries from" : k === "end" ? "entries until" : "square off"}
+                    {on
+                      ? <input type="time" value={spec.session[k] ?? ""} min="09:15" max="15:29" onChange={(e) => upd({ session: { ...spec.session, [k]: e.target.value || null } })} />
+                      : <span style={{ color: "var(--text-faint)" }}>off ({off})</span>}
+                  </label>
+                );
+              })}
+            </div>
+            <div className="algo-operand" style={{ gap: 10, marginTop: 8 }}>
+              <label className="meta" title="market: fill at the next candle's open. pullback: wait for a better price (limit-style). breakout: wait for price to run further in the trade's direction (stop-style).">entry order
+                <select value={spec.entry_order.type} onChange={(e) => upd({ entry_order: { ...spec.entry_order, type: e.target.value } })}>
+                  <option value="market">at market</option><option value="pullback">on a pullback</option><option value="breakout">on a breakout</option>
+                </select>
+              </label>
+              {spec.entry_order.type !== "market" && (
+                <>
+                  <label className="meta"><NumInput width={48} value={spec.entry_order.offset_pct} onChange={(n) => upd({ entry_order: { ...spec.entry_order, offset_pct: n ?? 0 } })} />% {spec.entry_order.type === "pullback" ? "better than" : "beyond"} the signal close</label>
+                  <label className="meta">cancel after <NumInput width={40} value={spec.entry_order.valid_bars} onChange={(n) => upd({ entry_order: { ...spec.entry_order, valid_bars: Math.max(1, Math.floor(n ?? 1)) } })} /> bars</label>
+                </>
+              )}
             </div>
           </div>
 
@@ -1349,8 +1413,9 @@ export default function Algo() {
               <button type="button" className="primary" disabled={bt.isPending} onClick={() => { setMsg(null); bt.mutate(); }}>
                 {bt.isPending ? "Backtesting… (downloads missing candles first)" : "▶ Run backtest"}
               </button>
-              <button type="button" disabled={save.isPending} onClick={() => save.mutate(true)}>Save as new</button>
-              {editing && <button type="button" disabled={save.isPending} onClick={() => save.mutate(false)}>Update saved #{editing}</button>}
+              {editing && <button type="button" disabled={save.isPending} onClick={() => save.mutate(false)}
+                title="keeps every earlier version — switch back any time">Save as v{(versions.data?.versions[0]?.version ?? 0) + 1}</button>}
+              <button type="button" disabled={save.isPending} onClick={() => save.mutate(true)}>Save as new strategy</button>
             </div>
             {msg && <div className="meta" style={{ marginTop: 6 }}>{msg}</div>}
             {bt.error && <div className="pnl-neg" style={{ marginTop: 6 }}>{errMsg(bt.error)}</div>}

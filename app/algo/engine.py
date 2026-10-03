@@ -69,7 +69,8 @@ DEFAULT_SPEC: dict[str, Any] = {
     "breakeven": None,                    # {"type", "value"}: once this far in profit, stop -> entry
     "mtm": {"stop": None, "target": None, "trail_start": None, "trail_gap": None},   # rupees
     "daily": {"max_loss": None, "max_profit": None},                                # rupees
-    "session": {"start": "09:20", "end": "15:00", "square_off": "15:15"},
+    "session": {"start": "09:20", "end": "15:00", "square_off": "15:15"},   # any of them null = off
+    "entry_order": {"type": "market", "offset_pct": 0.1, "valid_bars": 3},  # market | pullback | breakout
     "max_trades_per_day": 3,
     "cooldown_bars": 0,
     "max_bars": None,
@@ -77,6 +78,30 @@ DEFAULT_SPEC: dict[str, Any] = {
     "portfolio": {"capital": 100000, "leverage": 1.0, "max_positions": 10, "compounding": True},
     "costs": {"slippage_pct": 0.02, "charges": True},
 }
+
+
+def session_window(spec: dict[str, Any]) -> tuple[int, int, int]:
+    """(entries from, entries until, square off) in IST minutes. A switched-off
+    time falls back to the session edge: entries from the open, until the
+    square-off, and square-off at the last minute (15:29) — still intraday."""
+    sess = spec["session"]
+    sq = _hhmm(sess["square_off"]) if sess.get("square_off") else 15 * 60 + 29
+    start = _hhmm(sess["start"]) if sess.get("start") else 9 * 60 + 15
+    end = _hhmm(sess["end"]) if sess.get("end") else sq
+    return start, end, sq
+
+
+def entry_trigger(spec: dict[str, Any], side: str, close: float) -> Optional[float]:
+    """Price the underlying must trade at for a non-market entry. pullback =
+    X% better than the signal close (limit-style), breakout = X% beyond it in
+    the trade's direction (stop-style)."""
+    eo = spec["entry_order"]
+    if eo["type"] == "market":
+        return None
+    k = eo["offset_pct"] / 100
+    better = -1 if side == "BUY" else 1
+    sign = better if eo["type"] == "pullback" else -better
+    return close * (1 + sign * k)
 
 
 def _hhmm(s: str) -> int:
@@ -108,7 +133,8 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
     if "capital" in spec and "portfolio" not in spec:       # specs saved before portfolios
         spec["portfolio"] = {"capital": spec.pop("capital")}
     for k, v in spec.items():
-        if k in ("session", "costs", "sizing", "portfolio", "mtm", "daily", "instrument") and isinstance(v, dict):
+        if k in ("session", "costs", "sizing", "portfolio", "mtm", "daily", "instrument", "entry_order") \
+                and isinstance(v, dict):
             s[k] = {**s[k], **v}
         elif k in s or k == "name":
             s[k] = v
@@ -122,9 +148,17 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"timeframe must be one of {TIMEFRAMES} minutes")
     if s["direction"] not in ("long", "short", "both"):
         raise ValueError("direction must be long, short or both")
-    sess = s["session"]
-    if not _hhmm("09:15") <= _hhmm(sess["start"]) <= _hhmm(sess["end"]) <= _hhmm(sess["square_off"]) <= _hhmm("15:29"):
+    for k in ("start", "end", "square_off"):
+        if s["session"].get(k) in ("", None):
+            s["session"][k] = None
+    start, end, sq = session_window(s)
+    if not 9 * 60 + 15 <= start <= end <= sq <= 15 * 60 + 29:
         raise ValueError("session must satisfy 09:15 <= start <= end <= square_off <= 15:29")
+    eo = s["entry_order"]
+    if eo.get("type") not in ("market", "pullback", "breakout"):
+        raise ValueError("entry order is market, pullback or breakout")
+    eo["offset_pct"] = _num(eo.get("offset_pct", 0.1), "entry offset %", 0)
+    eo["valid_bars"] = _num(eo.get("valid_bars", 3), "entry valid bars", 1, integer=True)
     for key in ("entry_long", "exit_long", "entry_short", "exit_short"):
         if s[key]:
             _check_group(s[key], s["timeframe"])
@@ -494,7 +528,11 @@ def prepare(d: dict, spec: dict) -> None:
     meta.setdefault("exch", fno.exchange_of(meta.get("symbol", "")))
     inst = spec["instrument"]
     kind = inst["expiry_kind"] if inst["type"] == "option" else "monthly"
-    d["expiry_ts"] = [fno.expiry_after(meta["name"], meta["exch"], kind, inst["expiry"], t) for t in d["t"]]
+    # Days the underlying actually traded: an expiry that falls on a day with
+    # no candles was an exchange holiday and really settled the day before.
+    d["trading_days"] = frozenset((t + IST) // 86400 for t in d["t"])
+    d["expiry_ts"] = [fno.expiry_after(meta["name"], meta["exch"], kind, inst["expiry"], t, d["trading_days"])
+                      for t in d["t"]]
     if inst["type"] != "option":
         return
     n = len(d["t"])
@@ -565,8 +603,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
     pf = spec["portfolio"]
     slip = spec["costs"]["slippage_pct"] / 100
     with_ch = spec["costs"]["charges"]
-    start, end = _hhmm(spec["session"]["start"]), _hhmm(spec["session"]["end"])
-    sq = _hhmm(spec["session"]["square_off"])
+    start, end, sq = session_window(spec)
     mtm_rules, daily = spec["mtm"], spec["daily"]
     syms = list(data)
 
@@ -585,7 +622,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
 
     events = sorted(((t, k, i) for k, sym in enumerate(syms) for i, t in enumerate(data[sym]["t"])))
     trades: list[dict[str, Any]] = []
-    skipped = {"no_capital": 0, "max_positions": 0, "daily_halt": 0}
+    skipped = {"no_capital": 0, "max_positions": 0, "daily_halt": 0, "entry_expired": 0}
     realized = 0.0
     used_margin = 0.0
     open_n = 0
@@ -637,13 +674,14 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         s_["pos"] = None
         s_["cool"] = i + spec["cooldown_bars"]
 
-    def open_(sym: str, side: str, i: int, sig_i: int) -> Optional[str]:
-        """Fill at bar i's open. Returns a skip reason or None."""
+    def open_(sym: str, side: str, i: int, sig_i: int, u_fill: Optional[float] = None) -> Optional[str]:
+        """Fill at bar i's open (or at `u_fill` for a triggered entry). Returns a skip reason or None."""
         nonlocal used_margin, open_n
         s_ = st[sym]
         d = s_["d"]
         meta = d["meta"]
-        u, t = d["o"][i], d["t"][i]
+        u, t = (d["o"][i] if u_fill is None else u_fill), d["t"][i]
+        tdays = d.get("trading_days")
         iv = d["iv"][i] if inst["type"] == "option" else 0.0
         sign = 1 if side == "BUY" else -1
         lot = int(meta.get("lot") or 1) if inst["type"] != "equity" else 1
@@ -651,13 +689,13 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         if inst["type"] == "equity":
             legs.append({"kind": "EQ", "act": sign, "label": sym, "per_set": 1})
         elif inst["type"] == "future":
-            exp = fno.expiry_after(meta["name"], meta["exch"], "monthly", inst["expiry"], t)
+            exp = fno.expiry_after(meta["name"], meta["exch"], "monthly", inst["expiry"], t, tdays)
             legs.append({"kind": "FUT", "act": sign, "exp": exp, "per_set": lot,
                          "label": f"{meta['name']} FUT {fno.label_date(exp)}"})
         else:
             step = float(meta.get("step") or fno.default_step(meta["name"], u))
             for cfg in inst["legs_long" if side == "BUY" else "legs_short"]:
-                exp = fno.expiry_after(meta["name"], meta["exch"], inst["expiry_kind"], inst["expiry"], t)
+                exp = fno.expiry_after(meta["name"], meta["exch"], inst["expiry_kind"], inst["expiry"], t, tdays)
                 tyrs = fno.years_to(exp, t)
                 if cfg["strike"] == "PREMIUM":
                     k_ = fno.strike_for_premium(u, step, cfg["right"], cfg["premium"],
@@ -753,14 +791,30 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         if s_["pos"] and (s_["pos"]["exit_pending"] or mod >= sq):
             close(sym, d["o"][i], t, s_["pos"]["exit_pending"] or "SQUARE_OFF", i)
         if s_["pending"]:
-            p, s_["pending"] = s_["pending"], None
-            if s_["pos"] is None and p["day"] == day and mod < sq:
+            p = s_["pending"]
+            fill: Optional[float] = None
+            lo_, hi_, op_ = d["l"][i], d["h"][i], d["o"][i]
+            if p["level"] is None:
+                fill = op_
+            elif (p["side"] == "BUY") == (p["kind"] == "pullback"):     # buy dip / sell breakdown
+                if lo_ <= p["level"]:
+                    fill = min(op_, p["level"])
+            elif hi_ >= p["level"]:                                     # buy breakout / sell rally
+                fill = max(op_, p["level"])
+            alive = p["day"] == day and mod < sq and halted != day and s_["pos"] is None
+            if fill is None and alive and i < p["expires"]:
+                pass                                      # still waiting for the trigger
+            else:
+                s_["pending"] = None
                 if halted == day:
                     skipped["daily_halt"] += 1
+                elif fill is None or not alive:
+                    if p["level"] is not None:
+                        skipped["entry_expired"] += 1
                 elif open_n >= pf["max_positions"]:
                     skipped["max_positions"] += 1
                 else:
-                    why = open_(sym, p["side"], i, p["i"])
+                    why = open_(sym, p["side"], i, p["i"], fill)
                     if why:
                         skipped[why] += 1
         if s_["pos"]:
@@ -806,7 +860,10 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
             if start <= close_mod <= end and s_["per_day"].get(day, 0) < spec["max_trades_per_day"]:
                 side = "BUY" if s_["sig"]["entry_long"][i] else "SELL" if s_["sig"]["entry_short"][i] else None
                 if side:
-                    s_["pending"] = {"side": side, "day": day, "i": i}
+                    s_["pending"] = {"side": side, "day": day, "i": i,
+                                     "level": entry_trigger(spec, side, d["c"][i]),
+                                     "kind": spec["entry_order"]["type"],
+                                     "expires": i + 1 + spec["entry_order"]["valid_bars"]}
     for sym in syms:
         if st[sym]["pos"]:
             d = st[sym]["d"]

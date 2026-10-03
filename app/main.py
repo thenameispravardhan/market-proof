@@ -386,6 +386,15 @@ async def lifespan(app: FastAPI):
                     if fails == 1:
                         log.exception("risk_monitor.tick_failed")
                     else:
+                        if fails == 3:
+                            # Once per outage: the breakers are OFF until this
+                            # clears. 631 silent failures went unnoticed on a
+                            # damaged risk_state page (Sep 2026).
+                            await _bus.publish("system.error", {
+                                "subject": "Circuit breakers NOT running",
+                                "body": f"The risk monitor has failed 3 times in a row: {e}"[:500],
+                                "error": "risk_monitor_failed",
+                            })
                         log.warning(
                             "risk_monitor.tick_failed",
                             consecutive=fails,

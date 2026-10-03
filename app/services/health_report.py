@@ -335,6 +335,7 @@ class HealthReportService:
         self._task: Optional[asyncio.Task[None]] = None
         self._last_sent_date: Optional[str] = None
         self._last_preflight_date: Optional[str] = None
+        self._report_alerted: Optional[str] = None
 
     def start(self) -> Optional[asyncio.Task[None]]:
         if getattr(get_settings(), "TESTING", 0):
@@ -440,13 +441,31 @@ class HealthReportService:
         log.info("health_report.start")
         try:
             while not self._stop_event.is_set():
+                # Preflight first and on its own: it is the alarm for a corrupt
+                # DB, and the daily report reads risk_state — the table that
+                # corrupts. Sharing one try with the report let a failing
+                # report (retried every 30s, never marked sent) block the
+                # integrity check for four weeks (2026-09-08 -> 10-03).
                 try:
-                    if self._due():
-                        await self.send_now()
                     if self._preflight_due():
                         await self.run_preflight()
                 except Exception:  # noqa: BLE001
+                    log.exception("health_report.preflight_failed")
+                try:
+                    if self._due():
+                        await self.send_now()
+                except Exception as e:  # noqa: BLE001
                     log.exception("health_report.tick_failed")
+                    day = to_ist(None).date().isoformat()
+                    if self._report_alerted != day:
+                        self._report_alerted = day
+                        await event_bus.publish(CHANNEL_SYSTEM_ERROR, {
+                            "subject": "Daily health report FAILED",
+                            "body": f"The 15:45 report could not be compiled: {e}"[:500]
+                                    + " — a database error here usually means trading.db is damaged "
+                                      "(see deploy/repair.sh).",
+                            "error": "health_report_failed",
+                        })
                 try:
                     await asyncio.wait_for(self._stop_event.wait(), timeout=30.0)
                     break

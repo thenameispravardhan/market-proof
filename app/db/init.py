@@ -69,7 +69,9 @@ _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
     # Algo Lab v2: F&O legs + extra exit state.
     "algo_trades": [("instrument", "VARCHAR(160)"), ("legs", "JSON"), ("ref", "VARCHAR(4)"),
                     ("ref_sign", "INTEGER"), ("trail_activate", "FLOAT"), ("breakeven", "FLOAT"),
-                    ("be_on", "BOOLEAN"), ("mtm_peak", "FLOAT"), ("margin", "FLOAT"), ("u_entry", "FLOAT")],
+                    ("be_on", "BOOLEAN"), ("mtm_peak", "FLOAT"), ("margin", "FLOAT"), ("u_entry", "FLOAT"),
+                    ("version", "INTEGER")],
+    "algo_strategies": [("version", "INTEGER NOT NULL DEFAULT 1")],
 }
 
 

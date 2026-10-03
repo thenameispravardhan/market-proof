@@ -100,14 +100,25 @@ def _expiries_from(name: str, exch: str, kind: str, d: date) -> tuple[date, ...]
     return tuple(out)
 
 
-def expiry_after(name: str, exch: str, kind: str, which: str, t: float) -> int:
+def expiry_after(name: str, exch: str, kind: str, which: str, t: float,
+                 trading_days: Optional[frozenset] = None) -> int:
     """Epoch of the contract's 15:30 close. `which` = current | next.
 
-    ponytail: exchange holidays are not modelled — an expiry that fell on a
-    holiday really moved a day earlier. Off by one day on a handful of dates.
+    `trading_days` (IST day numbers the market actually traded, read off the
+    candles) moves an expiry that fell on an exchange holiday back to the
+    previous trading day — no holiday list to maintain. Outside the span the
+    candles cover, the plain weekday rule applies.
     """
-    days = [x for x in _expiries_from(name, exch, kind, datetime.fromtimestamp(t, IST).date())
-            if _close_ts(x) >= t]
+    days: list[date] = []
+    for x in _expiries_from(name, exch, kind, datetime.fromtimestamp(t, IST).date()):
+        if trading_days:
+            k = (x - date(1970, 1, 1)).days
+            lo, hi = min(trading_days), max(trading_days)
+            while lo <= k <= hi and k not in trading_days:
+                k -= 1
+            x = date(1970, 1, 1) + timedelta(days=k)
+        if _close_ts(x) >= t and x not in days:
+            days.append(x)
     return _close_ts(days[0 if which == "current" else 1])
 
 

@@ -2081,3 +2081,12 @@ kbd {
 .algo-dropdown { position: absolute; top: 100%; left: 0; z-index: 50; min-width: 320px; max-height: 300px; overflow: auto; background: var(--bg-elev); border: 1px solid var(--border-hi); box-shadow: var(--shadow); }
 .algo-dropdown > div { padding: 5px 8px; cursor: pointer; white-space: nowrap; font-size: 12px; }
 .algo-dropdown > div.active { background: var(--bg-row); color: var(--accent); }
+.algo-quad { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 12px; margin-bottom: 12px; }
+.algo-quad .widget { min-width: 0; }
+.algo-scroll { max-height: 320px; overflow: auto; }
+.algo-scroll table { width: 100%; }
+.algo-fields { display: grid; grid-template-columns: minmax(180px, 2fr) minmax(200px, 2.4fr) minmax(90px, 0.8fr) minmax(150px, 1.2fr); gap: 8px 12px; }
+.algo .algo-fields input, .algo .algo-fields select { width: 100%; }
+.algo-field { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+@media (max-width: 720px) { .algo-fields { grid-template-columns: 1fr 1fr; } }
+.algo .algo-scroll th, .algo .algo-scroll td { padding: 3px 6px; }

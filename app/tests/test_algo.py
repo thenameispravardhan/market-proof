@@ -293,3 +293,122 @@ def test_runner_paper_straddle_mtm(monkeypatch, isolated_db):
         t = db.query(AlgoTrade).one()
         assert t.status == "closed" and t.exit_reason == "MTM_SL" and t.gross_pnl == -2145.0
         assert t.charges > 80 and all(lg["exit"] for lg in t.legs)
+
+
+def test_session_times_can_be_switched_off():
+    closes = [100] * 5 + [106] + [107] * 80
+    spec = _cross_spec(exit_long=None, session={"start": None, "end": None, "square_off": None})
+    t = engine.run(spec, {"X": bars(closes, spread=0)})["trades"][0]
+    assert t["reason"] == "SQUARE_OFF" and (t["exit_t"] + 19800) % 86400 >= 15 * 3600 + 29 * 60   # not 15:15
+
+
+def test_pullback_and_breakout_entries():
+    closes = [100, 101, 102, 106, 106.5, 105.2, 104.0, 104.5, 104.4, 104.3]
+    pull = _cross_spec(exit_long=None, entry_order={"type": "pullback", "offset_pct": 1.5, "valid_bars": 5})
+    t = engine.run(pull, {"X": bars(closes, spread=0)})["trades"][0]
+    assert t["entry"] == round(106 * 0.985, 2)                 # filled at the trigger, not the next open
+    never = _cross_spec(exit_long=None, entry_order={"type": "pullback", "offset_pct": 5, "valid_bars": 2})
+    r = engine.run(never, {"X": bars(closes, spread=0)})
+    assert not r["trades"] and r["stats"]["skipped"]["entry_expired"] == 1
+    brk = _cross_spec(exit_long=None, entry_order={"type": "breakout", "offset_pct": 0.4, "valid_bars": 3})
+    assert engine.run(brk, {"X": bars(closes, spread=0)})["trades"][0]["entry"] == round(106 * 1.004, 2)  # stop at trigger
+
+
+def test_expiry_moves_back_off_a_holiday():
+    from datetime import date, datetime
+
+    from app.algo import fno
+
+    ts = datetime(2026, 10, 5, 10, 0, tzinfo=fno.IST).timestamp()
+    day = lambda d: (d - date(1970, 1, 1)).days  # noqa: E731
+    traded = frozenset(day(date(2026, 10, k)) for k in (1, 2, 5, 7, 8, 9))     # Tue 6 Oct closed
+    e = fno.expiry_after("NIFTY", "NSE", "weekly", "current", ts, traded)
+    assert datetime.fromtimestamp(e, fno.IST).date() == date(2026, 10, 5)
+
+
+def test_strategy_versions(client):
+    base = {"symbols": ["NSE:SBIN-EQ"], "timeframe": 5, "direction": "long",
+            "entry_long": {"logic": "AND", "conditions": [
+                {"left": {"ind": "EMA", "params": {"period": 9}}, "op": "crosses_above",
+                 "right": {"ind": "EMA", "params": {"period": 21}}}]}}
+    sid = client.post("/api/algo/strategies", json={"name": "ver-test", "spec": base}).json()["id"]
+    v2 = {**base, "timeframe": 15}
+    v3 = {**base, "timeframe": 30}
+    assert client.put(f"/api/algo/strategies/{sid}", json={"spec": v2}).json()["version"] == 2
+    assert client.put(f"/api/algo/strategies/{sid}", json={"spec": v2}).json()["version"] == 2   # unchanged: no new version
+    assert client.put(f"/api/algo/strategies/{sid}", json={"spec": v3}).json()["version"] == 3
+    r = client.post(f"/api/algo/strategies/{sid}/versions/1/activate").json()
+    assert r["version"] == 1 and r["spec"]["timeframe"] == 5 and r["versions"] == 3
+    vs = client.get(f"/api/algo/strategies/{sid}/versions").json()
+    assert [v["version"] for v in vs["versions"]] == [3, 2, 1] and vs["active"] == 1
+    assert client.post(f"/api/algo/strategies/{sid}/versions/3/activate").json()["spec"]["timeframe"] == 30
+    assert client.put(f"/api/algo/strategies/{sid}", json={"spec": {**base, "timeframe": 10}}).json()["version"] == 4
+    client.delete(f"/api/algo/strategies/{sid}")
+
+
+def test_preflight_runs_even_when_daily_report_breaks(monkeypatch):
+    import asyncio
+
+    from app.services import health_report as hr
+
+    svc = hr.HealthReportService()
+    calls = []
+
+    async def boom():
+        raise RuntimeError("database disk image is malformed")
+
+    async def preflight(now=None):
+        calls.append("preflight")
+        svc._stop_event.set()
+        return []
+
+    published = []
+
+    async def pub(ch, payload):
+        published.append(payload.get("error"))
+        return 1
+
+    monkeypatch.setattr(svc, "_due", lambda now=None: True)
+    monkeypatch.setattr(svc, "_preflight_due", lambda now=None: True)
+    monkeypatch.setattr(svc, "send_now", boom)
+    monkeypatch.setattr(svc, "run_preflight", preflight)
+    monkeypatch.setattr(hr.event_bus, "publish", pub)
+    asyncio.run(svc._run())
+    assert calls == ["preflight"] and published == ["health_report_failed"]
+
+
+def test_runner_pullback_entry_waits_for_trigger(monkeypatch, isolated_db):
+    import asyncio
+
+    from app.algo import runner as rn
+    from app.db import session as dbs
+    from app.db.models import AlgoStrategy, AlgoTrade
+
+    spec = _cross_spec(exit_long=None, entry_order={"type": "pullback", "offset_pct": 1, "valid_bars": 3})
+    with dbs.SessionLocal() as db:
+        db.add(AlgoStrategy(name="pb", spec=spec, enabled=True, mode="paper", version=2))
+        db.commit()
+    ltp = {"px": 106.0}
+
+    async def fake_bars(sym, tf, bars=400, now=None):
+        d = globals()["bars"]([100, 101, 102, 106], spread=0)
+        keep = [i for i, t in enumerate(d["t"]) if t + 300 <= now]
+        return {k: ([v[i] for i in keep] if isinstance(v, list) else v) for k, v in d.items()}
+
+    async def fake_ltp(symbols):
+        return {s.upper(): ltp["px"] for s in symbols}
+
+    monkeypatch.setattr(rn.data, "recent_bars", fake_bars)
+    monkeypatch.setattr(rn, "_ltp", fake_ltp)
+    r = rn.AlgoRunner()
+    t0 = DAY0 + 4 * 300 + 4
+    asyncio.run(r.tick(t0))                          # signal -> armed at 104.94, no trade yet
+    ltp["px"] = 105.5
+    asyncio.run(r.tick(t0 + 5))                      # not touched
+    with dbs.SessionLocal() as db:
+        assert db.query(AlgoTrade).count() == 0 and r._armed
+    ltp["px"] = 104.9
+    asyncio.run(r.tick(t0 + 10))                     # touched -> enters
+    with dbs.SessionLocal() as db:
+        t = db.query(AlgoTrade).one()
+        assert t.entry_price == 104.9 and t.version == 2 and not r._armed
