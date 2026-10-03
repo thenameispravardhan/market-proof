@@ -2065,3 +2065,11 @@ kbd {
    So the grip moves onto that box instead. */
 [data-page="dataset"] .widget { resize: none; }
 .dataset-scroll { resize: vertical; }
+
+/* Algo Lab — condition rows are sentences of inline controls; the global
+   full-width rule above would stack every select on its own line. */
+.algo select, .algo input:not([type="checkbox"]) { width: auto; padding: 3px 6px; }
+.algo label.meta { display: inline-flex; gap: 4px; align-items: center; white-space: nowrap; }
+.algo .widget { padding: 10px 12px; gap: 8px; }
+.algo .widget h3 { flex: none; justify-content: flex-start; }
+.algo th, .algo td { padding: 3px 8px; white-space: nowrap; text-align: left; }
