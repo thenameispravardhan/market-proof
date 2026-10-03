@@ -38,6 +38,7 @@ const Model = lazy(() => import("./pages/Model"));
 const Prompts = lazy(() => import("./pages/Prompts"));
 const Rules = lazy(() => import("./pages/Rules"));
 const Strategies = lazy(() => import("./pages/Strategies"));
+const Algo = lazy(() => import("./pages/Algo"));
 const Accounts = lazy(() => import("./pages/Accounts"));
 const Notifications = lazy(() => import("./pages/Notifications"));
 const Settings = lazy(() => import("./pages/Settings"));
@@ -63,6 +64,7 @@ const TABS: { key: TabKey; label: string; emoji: string; group: NavGroup }[] = [
   { key: "prompts",        label: "Prompts",        emoji: "✎", group: "STRATEGY" },
   { key: "rules",          label: "Rules",          emoji: "≡", group: "STRATEGY" },
   { key: "strategies",     label: "Strategies",     emoji: "◈", group: "STRATEGY" },
+  { key: "algo",           label: "Algo Lab",       emoji: "∿", group: "STRATEGY" },
   // How it did
   { key: "trades",         label: "Trade History",  emoji: "₹", group: "PERFORMANCE" },
   { key: "outcomes",       label: "Outcomes",       emoji: "◎", group: "PERFORMANCE" },
@@ -86,6 +88,7 @@ function PageContent({ tab }: { tab: TabKey }) {
     case "prompts": return <Prompts />;
     case "rules": return <Rules />;
     case "strategies": return <Strategies />;
+    case "algo": return <Algo />;
     case "accounts": return <Accounts />;
     case "notifications": return <Notifications />;
     case "settings": return <Settings />;
