@@ -575,6 +575,60 @@ class AuditLog(Base):
     __table_args__ = (Index("ix_audit_log_action_time", "action", "created_at"),)
 
 
+# =========================================================================
+# Algo: indicator strategies (app/algo) — separate from the news pipeline
+# =========================================================================
+
+
+class AlgoStrategy(Base):
+    """An indicator strategy built on the Algo page. `spec` is the JSON the
+    engine runs (app/algo/engine.py). New rows start disabled and in paper."""
+
+    __tablename__ = "algo_strategies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    spec: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    mode: Mapped[str] = mapped_column(String(8), default="paper", nullable=False)  # paper | live
+    account_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("broker_accounts.id", ondelete="SET NULL"))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow,
+                                                 nullable=False)
+
+
+class AlgoTrade(Base):
+    """One automated position, open (exit_at NULL) or closed."""
+
+    __tablename__ = "algo_trades"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    strategy_id: Mapped[int] = mapped_column(
+        ForeignKey("algo_strategies.id", ondelete="CASCADE"), nullable=False, index=True)
+    symbol: Mapped[str] = mapped_column(String(64), nullable=False)
+    side: Mapped[str] = mapped_column(String(4), nullable=False)
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    mode: Mapped[str] = mapped_column(String(8), nullable=False)
+    status: Mapped[str] = mapped_column(String(12), nullable=False, index=True)  # open|closed|rejected
+    entry_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+    entry_price: Mapped[Optional[float]] = mapped_column(Float)
+    stop_loss: Mapped[Optional[float]] = mapped_column(Float)
+    target: Mapped[Optional[float]] = mapped_column(Float)
+    trail_dist: Mapped[Optional[float]] = mapped_column(Float)
+    trail_stop: Mapped[Optional[float]] = mapped_column(Float)
+    best_price: Mapped[Optional[float]] = mapped_column(Float)
+    exit_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    exit_price: Mapped[Optional[float]] = mapped_column(Float)
+    exit_reason: Mapped[Optional[str]] = mapped_column(String(32))
+    gross_pnl: Mapped[Optional[float]] = mapped_column(Float)
+    charges: Mapped[Optional[float]] = mapped_column(Float)
+    net_pnl: Mapped[Optional[float]] = mapped_column(Float)
+    entry_order_id: Mapped[Optional[str]] = mapped_column(String(64))
+    exit_order_id: Mapped[Optional[str]] = mapped_column(String(64))
+    note: Mapped[Optional[str]] = mapped_column(Text)
+
+
 # -------------------------------------------------------------------------
 # Re-export all model classes so siblings can do `from app.db.models import *`
 # -------------------------------------------------------------------------
@@ -595,4 +649,6 @@ __all__ = [
     "NotificationChannel",
     "NotificationLog",
     "AuditLog",
+    "AlgoStrategy",
+    "AlgoTrade",
 ]

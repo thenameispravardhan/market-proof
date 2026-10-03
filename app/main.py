@@ -21,6 +21,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from app import __version__
 from app.analyzer.service import Service as AnalyzerService
 from app.api import (
+    algo as algo_api,
     audit_log as audit_log_api,
     broker_accounts as broker_accounts_api,
     core as core_api,
@@ -297,6 +298,7 @@ async def lifespan(app: FastAPI):
     risk_monitor_task: asyncio.Task[None] | None = None
     dataset_eod_task: asyncio.Task[None] | None = None
     ai_schedule_task: asyncio.Task[None] | None = None
+    algo_task: asyncio.Task[None] | None = None
     if not settings.TESTING:
         # T3: start the analyzer before the monitors so its event-bus
         # subscription is live before the first `announcements.new`
@@ -480,12 +482,20 @@ async def lifespan(app: FastAPI):
 
         ai_schedule_task = asyncio.create_task(_ai_schedule(), name="ai-schedule")
 
+        # Indicator automation (Algo page). Idle unless a strategy is switched
+        # on there; new strategies start OFF and in paper mode.
+        from app.algo.runner import AlgoRunner
+
+        app.state.algo_runner = AlgoRunner()
+        algo_task = asyncio.create_task(app.state.algo_runner.run(), name="algo-runner")
+        app.state.algo_task = algo_task
+
     try:
         yield
     finally:
         if not settings.TESTING:
             # Stop the breaker monitor first.
-            for _t in (risk_monitor_task, dataset_eod_task, ai_schedule_task):
+            for _t in (risk_monitor_task, dataset_eod_task, ai_schedule_task, algo_task):
                 if _t is not None:
                     _t.cancel()
                     try:
@@ -599,6 +609,7 @@ app.include_router(dataset_api.router)
 app.include_router(warehouse_api.router)
 app.include_router(model_api.router)
 app.include_router(system_api.router)
+app.include_router(algo_api.router)
 
 
 # -------------------------------------------------------------------------
