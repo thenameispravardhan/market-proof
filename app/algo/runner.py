@@ -77,7 +77,7 @@ def _snapshot() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
                 log.warning("algo.bad_spec", strategy=s.id, error=str(e))
                 continue
             strategies.append({"id": s.id, "name": s.name, "enabled": s.enabled, "mode": s.mode,
-                               "account_id": s.account_id, "spec": spec})
+                               "account_id": s.account_id, "spec": spec, "version": s.version or 1})
         trades = [_row(t) for t in db.execute(
             select(AlgoTrade).where(AlgoTrade.status == "open")).scalars()]
     return strategies, trades
@@ -204,6 +204,28 @@ async def _order(account: BrokerAccount, symbol: str, side: str, qty: int, *, ex
     return False, r.get("broker_order_id"), str(r.get("error") or r.get("risk_message") or r.get("status"))
 
 
+async def _fill_price(account: Optional[BrokerAccount], order_id: Optional[str], tries: int = 4) -> Optional[float]:
+    """Average traded price of a live order, polled briefly; None if the broker
+    hasn't reported a fill yet (the quote then stands in)."""
+    if account is None or not order_id:
+        return None
+    from app.api.orders import _manager
+    from app.execution.base import OrderState
+
+    backend = _manager()._manual_backend_for(account)  # noqa: SLF001
+    for k in range(tries):
+        try:
+            st = await backend.get_order_status(str(order_id))
+            if st.state == OrderState.FILLED and st.average_price:
+                return float(st.average_price)
+        except Exception as e:  # noqa: BLE001
+            log.warning("algo.fill_price_failed", order_id=order_id, error=str(e)[:200])
+            return None
+        if k + 1 < tries:
+            await asyncio.sleep(0.6)
+    return None
+
+
 def _mtm(legs: list[dict], prices: dict[str, float]) -> Optional[float]:
     total = 0.0
     for lg in legs:
@@ -301,6 +323,10 @@ class AlgoRunner:
         self._sync_day: Optional[int] = None
         self._master_day: Optional[int] = None
         self._halted: set[tuple[int, int]] = set()
+        # Pullback / breakout entries waiting for their trigger price.
+        # ponytail: in memory — a restart drops pending triggers (they expire
+        # within a few bars anyway); persist them if that ever costs a trade.
+        self._armed: dict[tuple[int, str], dict[str, Any]] = {}
 
     def event(self, level: str, msg: str, **kw: Any) -> None:
         self.events.appendleft({"t": time.time(), "level": level, "msg": msg, **kw})
@@ -340,6 +366,8 @@ class AlgoRunner:
             open_trades = [t for t in open_trades if t not in stale]
         if OPEN_MIN <= mins < CLOSE_MIN:
             await self._manage(open_trades, by_id, now, mins, day_start)
+            if self._armed:
+                await self._check_armed(by_id, now, day, day_start)
             for s in strategies:
                 if s["enabled"] and (s["id"], day) not in self._halted:
                     await self._on_bar(s, now, day_start)
@@ -360,7 +388,7 @@ class AlgoRunner:
         for t in trades:
             s = by_id.get(t["strategy_id"])
             spec = s["spec"] if s else None
-            sq = engine._hhmm(spec["session"]["square_off"]) if spec else 15 * 60 + 15
+            sq = engine.session_window(spec)[2] if spec else 15 * 60 + 15
             if mins >= sq:
                 await self._exit(t, prices, "SQUARE_OFF", now)
                 continue
@@ -488,6 +516,7 @@ class AlgoRunner:
                     self.event("error", f"EXIT FAILED {lg['symbol']} ({reason}): {msg}", trade_id=t["id"])
                     return False
                 lg["exit_order_id"] = oid
+                px = await _fill_price(acc, oid) or px     # the broker's average, when it reports one
             lg["exit"] = px
         await self._book(t, reason, now)
         return True
@@ -555,8 +584,8 @@ class AlgoRunner:
                 await self._exit(mine, prices, "SIGNAL", now)
             return
         close_min = int((d["t"][-1] + d["tf_s"] + IST) % 86400) // 60
-        sess = spec["session"]
-        if not engine._hhmm(sess["start"]) <= close_min <= engine._hhmm(sess["end"]):
+        start, end, _ = engine.session_window(spec)
+        if not start <= close_min <= end:
             return
         side = "BUY" if sig["entry_long"][-1] else "SELL" if sig["entry_short"][-1] else None
         if side is None:
@@ -567,12 +596,44 @@ class AlgoRunner:
             last = await asyncio.to_thread(_last_exit, s["id"], sym)
             if last and now < last + spec["cooldown_bars"] * spec["timeframe"] * 60:
                 return
+        level = engine.entry_trigger(spec, side, d["c"][-1])
+        if level is not None:
+            eo = spec["entry_order"]
+            self._armed[(s["id"], sym)] = {"side": side, "level": level, "kind": eo["type"], "d": d,
+                                           "expires": now + eo["valid_bars"] * spec["timeframe"] * 60}
+            self.event("info", f"{s['name']}: {side} {sym} armed — {eo['type']} entry at {level:.2f}",
+                       strategy_id=s["id"])
+            return
+        await self._try_enter(s, sym, side, d, now, day_start)
+
+    async def _try_enter(self, s: dict, sym: str, side: str, d: dict, now: float, day_start: float) -> None:
+        spec = s["spec"]
         book = await asyncio.to_thread(_book, s["id"], day_start)
         if book["open"] >= spec["portfolio"]["max_positions"]:
             self.event("info", f"{s['name']}: {side} {sym} skipped — {book['open']} positions open (max)",
                        strategy_id=s["id"])
             return
         await self._enter(s, sym, side, d, now, book)
+
+    async def _check_armed(self, by_id: dict, now: float, day: int, day_start: float) -> None:
+        """Fire pullback / breakout entries whose trigger the underlying touched."""
+        prices = await _ltp([sym for _, sym in self._armed])
+        for key, a in list(self._armed.items()):
+            sid, sym = key
+            s = by_id.get(sid)
+            if s is None or not s["enabled"] or (sid, day) in self._halted or now > a["expires"]:
+                self._armed.pop(key, None)
+                if s is not None and now > a["expires"]:
+                    self.event("info", f"{s['name']}: {a['side']} {sym} {a['kind']} entry expired untouched",
+                               strategy_id=sid)
+                continue
+            px = prices.get(sym.upper())
+            if px is None:
+                continue
+            dip = (a["side"] == "BUY") == (a["kind"] == "pullback")
+            if (px <= a["level"]) if dip else (px >= a["level"]):
+                self._armed.pop(key, None)
+                await self._try_enter(s, sym, a["side"], a["d"], now, day_start)
 
     async def _enter(self, s: dict, sym: str, side: str, d: dict, now: float, book: dict) -> None:
         spec, inst, pf = s["spec"], s["spec"]["instrument"], s["spec"]["portfolio"]
@@ -593,14 +654,14 @@ class AlgoRunner:
         ref = "u" if inst["type"] == "equity" or inst["levels_on"] == "underlying" else "0"
         sign = 1 if side == "BUY" else -1
         rsign = sign if ref == "u" else legs[0]["act"]
-        ref_entry = u if ref == "u" else legs[0]["price"]
         atr_vals = {p: engine.series(d, {"ind": "ATR", "params": {"period": p}}, {})[-1]
                     for p in engine.atr_periods(spec)}
-        lv = engine.entry_levels(spec, rsign, ref_entry, atr_vals)
+        # Sizing on the quoted prices (the stop distance only needs the shape).
+        pre = engine.entry_levels(spec, rsign, u if ref == "u" else legs[0]["price"], atr_vals)
         per_set_margin = engine.position_margin(legs, u, pf["leverage"], price_key="price")
         equity = pf["capital"] + (book["realized"] if pf["compounding"] else 0.0)
         sets = engine.units(spec, equity, per_set_margin,
-                            lv["sl_dist"] * legs[0]["per_set"] if lv["sl_dist"] else None)
+                            pre["sl_dist"] * legs[0]["per_set"] if pre["sl_dist"] else None)
         if per_set_margin > 0:
             sets = min(sets, int(max(0.0, equity - book["margin"]) // per_set_margin))
         if sets < 1:
@@ -631,13 +692,17 @@ class AlgoRunner:
                                  exit_=True, strategy_id=s["id"])
                 await asyncio.to_thread(
                     _insert, strategy_id=s["id"], symbol=sym, side=side, quantity=legs[0]["qty"], mode="live",
-                    status="rejected", entry_at=_utc(now), entry_price=round(ref_entry, 2), legs=_clean(legs),
-                    instrument=" + ".join(lg["label"] for lg in legs)[:160],
+                    status="rejected", entry_at=_utc(now), entry_price=round(u, 2), legs=_clean(legs),
+                    instrument=" + ".join(lg["label"] for lg in legs)[:160], version=s.get("version"),
                     note=f"{failure}{' (placed legs rolled back)' if placed else ''}"[:500])
                 self.event("error", f"{s['name']}: LIVE {side} {sym} rejected: {failure}", strategy_id=s["id"])
                 return
-        # ponytail: booked at the LTP seen at order time; a live MARKET fill can
-        # differ by the spread. Reconcile from the tradebook if that ever matters.
+            for lg in legs:                                        # book the broker's fill, not the quote
+                fill = await _fill_price(acc, lg.get("order_id"))
+                if fill:
+                    lg["entry"] = fill
+        ref_entry = u if ref == "u" else legs[0]["entry"]
+        lv = engine.entry_levels(spec, rsign, ref_entry, atr_vals)
         label = " + ".join(lg["label"] for lg in legs)[:160]
         tid = await asyncio.to_thread(
             _insert, strategy_id=s["id"], symbol=sym, side=side, quantity=legs[0]["qty"], mode=s["mode"],
@@ -645,10 +710,11 @@ class AlgoRunner:
             stop_loss=lv["sl"] and round(lv["sl"], 2), target=lv["tg"] and round(lv["tg"], 2),
             trail_dist=lv["trd"], trail_activate=lv["tra"], breakeven=lv["be"], best_price=ref_entry,
             legs=_clean(legs), ref=ref, ref_sign=rsign, margin=round(per_set_margin * sets, 2),
-            instrument=label, u_entry=u, entry_order_id=",".join(order_ids)[:64] or None)
-        self.event("entry", f"{s['name']}: {side} → {label} x{sets} set(s) ({s['mode']})",
+            instrument=label, u_entry=u, entry_order_id=",".join(order_ids)[:64] or None,
+            version=s.get("version"))
+        self.event("entry", f"{s['name']} v{s.get('version', 1)}: {side} → {label} x{sets} set(s) ({s['mode']})",
                    trade_id=tid, strategy_id=s["id"])
-        _notify_entry({"side": side, "symbol": label, "quantity": legs[0]["qty"], "entry": round(legs[0]["price"], 2),
+        _notify_entry({"side": side, "symbol": label, "quantity": legs[0]["qty"], "entry": round(legs[0]["entry"], 2),
                        "stop_loss": lv["sl"] and round(lv["sl"], 2), "target": lv["tg"] and round(lv["tg"], 2)})
 
     # -- data ----------------------------------------------------------------
