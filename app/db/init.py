@@ -66,6 +66,10 @@ _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
     ],
     # Shadow-row support (analyzed announcements that never signaled).
     "dataset_features": [("announcement_id", "INTEGER")],
+    # Algo Lab v2: F&O legs + extra exit state.
+    "algo_trades": [("instrument", "VARCHAR(160)"), ("legs", "JSON"), ("ref", "VARCHAR(4)"),
+                    ("ref_sign", "INTEGER"), ("trail_activate", "FLOAT"), ("breakeven", "FLOAT"),
+                    ("be_on", "BOOLEAN"), ("mtm_peak", "FLOAT"), ("margin", "FLOAT"), ("u_entry", "FLOAT")],
 }
 
 

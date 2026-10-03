@@ -1,23 +1,33 @@
 """Live automation: run enabled Algo strategies on bar close, manage exits on LTP.
 
 Every 5 seconds during the session:
-  * open positions are checked against the live Fyers LTP for stop / target /
-    trailing stop and the strategy's square-off time — exits do not wait for
-    a bar to close;
+  * open positions are re-priced from live Fyers LTPs and checked against
+    stop / target / trailing (with activation) / breakeven on their reference
+    price, the MTM (rupee) stop / target / trail on the whole position, the
+    time stop, and the strategy's square-off time — exits never wait for a bar;
+  * per strategy, the day's realised + open P&L is checked against the daily
+    max loss / max profit, which flatten the strategy and stop it for the day;
   * each enabled strategy whose timeframe just closed a bar fetches its last
-    completed candles from Fyers, evaluates the SAME engine the backtest uses
-    on that bar, and enters / exits.
+    COMPLETED candles (and any higher timeframes its conditions use) from
+    Fyers, evaluates the same engine the backtest runs, and enters / exits.
+
+What gets traded follows the strategy's instrument: the stock or index
+itself, its current/next-month future (from the F&O scrip master), or
+option legs picked from the LIVE Fyers option chain (ATM / N strikes ITM or
+OTM / closest to a target premium; weekly or monthly; current or next).
 
 Modes, chosen per strategy on the Algo page:
   paper — fills at the live LTP, nothing is sent to a broker;
-  live  — orders go through Manager.place_manual_order (MARKET, INTRADAY) on the
+  live  — MARKET INTRADAY orders through Manager.place_manual_order on the
           chosen real Fyers account, so the global risk caps apply to entries.
-          Exits pass bypass_risk: closing a position must never be blocked.
+          Multi-leg entries place bought legs before written ones (margin) and
+          roll back the placed legs if any leg is refused. Exits bypass risk —
+          closing must never be blocked — written legs first, and each leg is
+          checked against the broker's net position before an order is sent.
 
-Invariants kept: Fyers-only prices; no live price -> no entry (never a
-synthetic fill); intraday only — everything is flat by the square-off time and
-anything left at 15:30 is closed. After the close, every symbol any strategy
-uses gets the day's 1-minute candles downloaded into the store.
+Invariants kept: Fyers-only prices; no live price -> no entry and no booked
+exit (never a synthetic fill); intraday only — everything is flat by the
+square-off time and anything left at 15:30 is closed.
 """
 from __future__ import annotations
 
@@ -29,9 +39,9 @@ from typing import Any, Optional
 
 from sqlalchemy import func, select
 
-from app.algo import data, engine
-from app.db.models import AlgoStrategy, AlgoTrade, BrokerAccount
+from app.algo import data, engine, fno
 from app.db import session as db_session
+from app.db.models import AlgoStrategy, AlgoTrade, BrokerAccount
 from app.logging_config import get_logger
 
 log = get_logger(__name__)
@@ -45,6 +55,14 @@ SYNC_AFTER_MIN = 15 * 60 + 45
 
 def _utc(ts: float) -> datetime:
     return datetime.fromtimestamp(ts, tz=timezone.utc)
+
+
+def _naive(ts: float) -> datetime:
+    return _utc(ts).replace(tzinfo=None)
+
+
+def _epoch(dt: datetime) -> float:
+    return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp()
 
 
 # ---- DB helpers (run in a worker thread) ------------------------------------
@@ -66,15 +84,39 @@ def _snapshot() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
 
 
 def _row(t: AlgoTrade) -> dict[str, Any]:
-    return {c.name: getattr(t, c.name) for c in AlgoTrade.__table__.columns}
+    r = {c.name: getattr(t, c.name) for c in AlgoTrade.__table__.columns}
+    if not r.get("legs"):        # rows from before F&O support: one equity leg
+        r["legs"] = [{"symbol": r["symbol"], "kind": "EQ", "act": 1 if r["side"] == "BUY" else -1,
+                      "qty": r["quantity"], "entry": r["entry_price"], "label": r["symbol"]}]
+        r["ref"] = r.get("ref") or "u"
+    return r
 
 
 def _trades_today(strategy_id: int, symbol: str, day_start: float) -> int:
     with db_session.SessionLocal() as db:
         return db.execute(select(func.count()).select_from(AlgoTrade).where(
             AlgoTrade.strategy_id == strategy_id, AlgoTrade.symbol == symbol,
-            AlgoTrade.status != "rejected",
-            AlgoTrade.entry_at >= _utc(day_start).replace(tzinfo=None))).scalar_one()
+            AlgoTrade.status != "rejected", AlgoTrade.entry_at >= _naive(day_start))).scalar_one()
+
+
+def _last_exit(strategy_id: int, symbol: str) -> Optional[float]:
+    with db_session.SessionLocal() as db:
+        v = db.execute(select(func.max(AlgoTrade.exit_at)).where(
+            AlgoTrade.strategy_id == strategy_id, AlgoTrade.symbol == symbol)).scalar_one()
+        return _epoch(v) if v else None
+
+
+def _book(strategy_id: int, day_start: float) -> dict[str, float]:
+    """Realised P&L (all time / today), margin blocked and positions open."""
+    with db_session.SessionLocal() as db:
+        total = db.execute(select(func.coalesce(func.sum(AlgoTrade.net_pnl), 0.0)).where(
+            AlgoTrade.strategy_id == strategy_id, AlgoTrade.status == "closed")).scalar_one()
+        today = db.execute(select(func.coalesce(func.sum(AlgoTrade.net_pnl), 0.0)).where(
+            AlgoTrade.strategy_id == strategy_id, AlgoTrade.status == "closed",
+            AlgoTrade.exit_at >= _naive(day_start))).scalar_one()
+        margin, n = db.execute(select(func.coalesce(func.sum(AlgoTrade.margin), 0.0), func.count()).where(
+            AlgoTrade.strategy_id == strategy_id, AlgoTrade.status == "open")).one()
+    return {"realized": float(total), "today": float(today), "margin": float(margin), "open": int(n)}
 
 
 def _insert(**fields: Any) -> int:
@@ -111,6 +153,14 @@ def _account(account_id: Optional[int]) -> tuple[Optional[BrokerAccount], Option
         db.expunge(acc)
         return acc, None
 
+
+def _strategy_account(strategy_id: int) -> Optional[int]:
+    with db_session.SessionLocal() as db:
+        s = db.get(AlgoStrategy, strategy_id)
+        return s.account_id if s else None
+
+
+# ---- broker helpers ------------------------------------------------------------
 
 async def _ltp(symbols: list[str]) -> dict[str, float]:
     from app.api.market import fyers_quotes
@@ -154,16 +204,103 @@ async def _order(account: BrokerAccount, symbol: str, side: str, qty: int, *, ex
     return False, r.get("broker_order_id"), str(r.get("error") or r.get("risk_message") or r.get("status"))
 
 
+def _mtm(legs: list[dict], prices: dict[str, float]) -> Optional[float]:
+    total = 0.0
+    for lg in legs:
+        px = lg.get("exit") if lg.get("exit") is not None else prices.get(lg["symbol"].upper())
+        if px is None:
+            return None
+        total += lg["act"] * (px - lg["entry"]) * lg["qty"]
+    return total
+
+
+def _pick_expiry(expiries: list[int], kind: str, name: str, which: str) -> Optional[int]:
+    """From the chain's listed expiries (epochs, ascending): monthly = the last
+    listed expiry of each month."""
+    exps = sorted(expiries)
+    if kind == "monthly" or name not in fno.WEEKLY:
+        month = lambda e: datetime.fromtimestamp(e, fno.IST).strftime("%Y%m")  # noqa: E731
+        exps = [e for k, e in enumerate(exps) if k + 1 == len(exps) or month(exps[k + 1]) != month(e)]
+    idx = 0 if which == "current" else 1
+    return exps[idx] if len(exps) > idx else None
+
+
+async def build_legs(spec: dict, sym: str, side: str, u: float, now: float) -> list[dict[str, Any]]:
+    """The concrete contracts to trade for a signal, each with a live price.
+    Raises ValueError with an operator-readable reason."""
+    inst = spec["instrument"]
+    sign = 1 if side == "BUY" else -1
+    name = fno.fno_name(sym)
+    if inst["type"] == "equity":
+        return [{"symbol": sym, "kind": "EQ", "act": sign, "per_set": 1, "label": sym, "price": u}]
+    lot = fno.lot_size(name)
+    if inst["type"] == "future":
+        fs = fno.future_symbol(name, inst["expiry"], now)
+        if not fs:
+            raise ValueError(f"no {inst['expiry']} {name} future in the F&O master")
+        px = (await _ltp([fs])).get(fs)
+        return [{"symbol": fs, "kind": "FUT", "act": sign, "per_set": lot, "label": fs.split(":")[-1], "price": px}]
+    backend = data._backend()
+    cfgs = inst["legs_long" if side == "BUY" else "legs_short"]
+    count = min(50, max([c["steps"] for c in cfgs] + [0]) + 3 if all(c["strike"] != "PREMIUM" for c in cfgs) else 30)
+    chain = await backend.get_option_chain(sym, strikecount=count)
+    exp = _pick_expiry([int(e["ts"]) for e in chain.get("expiries") or [] if str(e.get("ts")).isdigit()],
+                       inst["expiry_kind"], name, inst["expiry"])
+    if exp is None:
+        raise ValueError(f"no {inst['expiry']} {inst['expiry_kind']} expiry listed for {name}")
+    listed = sorted(int(e["ts"]) for e in chain.get("expiries") or [] if str(e.get("ts")).isdigit())
+    if listed and exp != listed[0]:
+        chain = await backend.get_option_chain(sym, strikecount=count, timestamp=str(exp))
+    rows = [r for r in chain.get("strikes") or [] if r.get("strike")]
+    if not rows:
+        raise ValueError(f"empty option chain for {name}")
+    strikes = sorted(r["strike"] for r in rows)
+    step = min((b - a for a, b in zip(strikes, strikes[1:]) if b > a), default=fno.default_step(name, u))
+    spot = chain.get("spot") or u
+    legs = []
+    for c in cfgs:
+        key = c["right"].lower()
+        if c["strike"] == "PREMIUM":
+            cands = [r for r in rows if (r.get(key) or {}).get("ltp")]
+            if not cands:
+                raise ValueError(f"no {c['right']} premiums in the chain")
+            row = min(cands, key=lambda r: abs(r[key]["ltp"] - c["premium"]))
+        else:
+            k_ = fno.pick_strike(spot, step, c["right"], c["strike"], c["steps"])
+            row = min(rows, key=lambda r: abs(r["strike"] - k_))
+        leg = row.get(key) or {}
+        if not leg.get("symbol"):
+            raise ValueError(f"{name} {row['strike']:g} {c['right']} not in the chain")
+        legs.append({"symbol": leg["symbol"].upper(), "kind": c["right"], "act": 1 if c["action"] == "BUY" else -1,
+                     "per_set": lot * c["lots"], "label": leg["symbol"].split(":")[-1],
+                     "price": leg.get("ltp"), "K": row["strike"], "exp": exp})
+    return legs
+
+
+def _notify_entry(payload: dict[str, Any]) -> None:
+    from app.services.event_bus import event_bus
+
+    asyncio.ensure_future(event_bus.publish("algo.entry", payload))
+
+
+def _notify_exit(payload: dict[str, Any]) -> None:
+    from app.services.event_bus import event_bus
+
+    asyncio.ensure_future(event_bus.publish("trade.closed", payload))
+
+
 class AlgoRunner:
     TICK_S = 5.0
 
     def __init__(self) -> None:
-        self.events: deque[dict[str, Any]] = deque(maxlen=200)
+        self.events: deque[dict[str, Any]] = deque(maxlen=300)
         self.last_tick: Optional[float] = None
         self.last_sync: Optional[dict[str, Any]] = None
         self._last_bar: dict[tuple[int, str], int] = {}
         self._retry_at: dict[int, float] = {}
         self._sync_day: Optional[int] = None
+        self._master_day: Optional[int] = None
+        self._halted: set[tuple[int, int]] = set()
 
     def event(self, level: str, msg: str, **kw: Any) -> None:
         self.events.appendleft({"t": time.time(), "level": level, "msg": msg, **kw})
@@ -191,55 +328,113 @@ class AlgoRunner:
         strategies, open_trades = await asyncio.to_thread(_snapshot)
         by_id = {s["id"]: s for s in strategies}
         day_start = day * 86400 - IST
-        stale = [t for t in open_trades if _utc(day_start).replace(tzinfo=None) > t["entry_at"].replace(tzinfo=None)]
+        if self._master_day != day and any(s["spec"]["instrument"]["type"] != "equity" for s in strategies):
+            self._master_day = day
+            try:
+                await fno.ensure_master()
+            except Exception as e:  # noqa: BLE001
+                self.event("error", f"F&O master refresh failed: {e}"[:200])
+        stale = [t for t in open_trades if _naive(day_start) > t["entry_at"].replace(tzinfo=None)]
         if stale:
-            await self._close_stale(stale, by_id)
+            await self._close_stale(stale)
             open_trades = [t for t in open_trades if t not in stale]
         if OPEN_MIN <= mins < CLOSE_MIN:
-            await self._manage(open_trades, by_id, now, mins)
+            await self._manage(open_trades, by_id, now, mins, day_start)
             for s in strategies:
-                if s["enabled"]:
+                if s["enabled"] and (s["id"], day) not in self._halted:
                     await self._on_bar(s, now, day_start)
         elif mins >= CLOSE_MIN:
             if open_trades:
-                await self._manage(open_trades, by_id, now, 24 * 60)   # past every square-off
+                await self._manage(open_trades, by_id, now, 24 * 60, day_start)   # past every square-off
             if mins >= SYNC_AFTER_MIN and self._sync_day != day and strategies:
                 self._sync_day = day
                 await self.sync(strategies, days=5)
 
     # -- exits ---------------------------------------------------------------
 
-    async def _manage(self, trades: list[dict], by_id: dict, now: float, mins: int) -> None:
+    async def _manage(self, trades: list[dict], by_id: dict, now: float, mins: int, day_start: float) -> None:
         if not trades:
             return
-        prices = await _ltp([t["symbol"] for t in trades])
+        syms = {lg["symbol"] for t in trades for lg in t["legs"]} | {t["symbol"] for t in trades}
+        prices = await _ltp(list(syms))
         for t in trades:
             s = by_id.get(t["strategy_id"])
-            sq = engine._hhmm(s["spec"]["session"]["square_off"]) if s else 15 * 60 + 15
-            ltp = prices.get(t["symbol"].upper())
+            spec = s["spec"] if s else None
+            sq = engine._hhmm(spec["session"]["square_off"]) if spec else 15 * 60 + 15
             if mins >= sq:
-                if ltp is None:
-                    ltp = await self._last_close(t["symbol"])
-                if ltp is not None:
-                    await self._exit(t, ltp, "SQUARE_OFF", now)
+                await self._exit(t, prices, "SQUARE_OFF", now)
                 continue
-            if ltp is None:
+            reason = await self._check(t, spec, prices, now)
+            if reason:
+                await self._exit(t, prices, reason, now)
+        day = int((now + IST) // 86400)
+        for sid in {t["strategy_id"] for t in trades}:
+            s = by_id.get(sid)
+            if not s or not (s["spec"]["daily"]["max_loss"] or s["spec"]["daily"]["max_profit"]):
                 continue
-            buy = t["side"] == "BUY"
-            if t["trail_dist"]:
-                best = max(t["best_price"] or ltp, ltp) if buy else min(t["best_price"] or ltp, ltp)
-                nt = best - t["trail_dist"] if buy else best + t["trail_dist"]
+            mine = [t for t in trades if t["strategy_id"] == sid and t["status"] == "open"]
+            opens = [_mtm(t["legs"], prices) for t in mine]
+            if any(m is None for m in opens):
+                continue
+            pnl = (await asyncio.to_thread(_book, sid, day_start))["today"] + sum(opens)
+            dl = s["spec"]["daily"]
+            hit = ("DAILY_MAX_LOSS" if dl["max_loss"] and pnl <= -dl["max_loss"] else
+                   "DAILY_TARGET" if dl["max_profit"] and pnl >= dl["max_profit"] else None)
+            if hit:
+                self._halted.add((sid, day))
+                self.event("exit", f"{s['name']}: {hit} (day P&L ₹{pnl:.0f}) — flattening, no more entries today",
+                           strategy_id=sid)
+                for t in mine:
+                    await self._exit(t, prices, hit, now)
+
+    async def _check(self, t: dict, spec: Optional[dict], prices: dict[str, float], now: float) -> Optional[str]:
+        """Update trailing / breakeven / MTM peak and return an exit reason, if any."""
+        legs = t["legs"]
+        sign = t["ref_sign"] or (1 if t["side"] == "BUY" else -1)
+        ref_px = prices.get((t["symbol"] if t["ref"] == "u" else legs[0]["symbol"]).upper())
+        changed: dict[str, Any] = {}
+        reason = None
+        if ref_px is not None and t["entry_price"]:
+            best = t["best_price"] or t["entry_price"]
+            best = max(best, ref_px) if sign > 0 else min(best, ref_px)
+            if best != t["best_price"]:
+                changed["best_price"] = best
+            gain = sign * (best - t["entry_price"])
+            if t["trail_dist"] and gain >= (t["trail_activate"] or 0):
+                nt = best - sign * t["trail_dist"]
                 old = t["trail_stop"]
-                trail = nt if old is None else (max(old, nt) if buy else min(old, nt))
-                if best != t["best_price"] or trail != old:
-                    t["best_price"], t["trail_stop"] = best, trail
-                    await asyncio.to_thread(_update, t["id"], best_price=best, trail_stop=trail)
-            stops = [x for x in (t["stop_loss"], t["trail_stop"]) if x is not None]
-            stop = (max(stops) if buy else min(stops)) if stops else None
-            if stop is not None and (ltp <= stop if buy else ltp >= stop):
-                await self._exit(t, ltp, "TRAIL" if stop == t["trail_stop"] and stop != t["stop_loss"] else "SL", now)
-            elif t["target"] is not None and (ltp >= t["target"] if buy else ltp <= t["target"]):
-                await self._exit(t, ltp, "TARGET", now)
+                trail = nt if old is None else (max(old, nt) if sign > 0 else min(old, nt))
+                if trail != old:
+                    changed["trail_stop"] = trail
+            if t["breakeven"] and not t["be_on"] and gain >= t["breakeven"]:
+                changed["be_on"] = True
+            t.update(changed)
+            stops = [x for x in (t["stop_loss"], t["trail_stop"], t["entry_price"] if t["be_on"] else None)
+                     if x is not None]
+            stop = (max(stops) if sign > 0 else min(stops)) if stops else None
+            if stop is not None and sign * (ref_px - stop) <= 0:
+                reason = ("TRAIL" if stop == t["trail_stop"] else
+                          "BREAKEVEN" if t["be_on"] and stop == t["entry_price"] and stop != t["stop_loss"] else "SL")
+            elif t["target"] is not None and sign * (ref_px - t["target"]) >= 0:
+                reason = "TARGET"
+        m = _mtm(legs, prices)
+        if spec and m is not None and not reason:
+            r = spec["mtm"]
+            peak = m if t["mtm_peak"] is None else max(t["mtm_peak"], m)
+            if peak != t["mtm_peak"]:
+                changed["mtm_peak"] = t["mtm_peak"] = peak
+            if r["stop"] and m <= -r["stop"]:
+                reason = "MTM_SL"
+            elif r["trail_start"] and peak >= r["trail_start"] and m <= peak - r["trail_gap"]:
+                reason = "MTM_TRAIL"
+            elif r["target"] and m >= r["target"]:
+                reason = "MTM_TARGET"
+        if spec and not reason and spec["max_bars"]:
+            if now >= _epoch(t["entry_at"]) + spec["max_bars"] * spec["timeframe"] * 60:
+                reason = "TIME_STOP"
+        if changed:
+            await asyncio.to_thread(_update, t["id"], **{k: v for k, v in changed.items()})
+        return reason
 
     async def _last_close(self, symbol: str) -> Optional[float]:
         try:
@@ -248,51 +443,73 @@ class AlgoRunner:
         except Exception:  # noqa: BLE001
             return None
 
-    async def _close_stale(self, trades: list[dict], by_id: dict) -> None:
+    async def _close_stale(self, trades: list[dict]) -> None:
         """A position from an earlier session (the server was down at square-off).
         The broker auto-squares MIS; book it at the previous close so P&L is real."""
         from app.api.market import fyers_quotes
 
-        qs = await fyers_quotes(sorted({t["symbol"] for t in trades}))
+        qs = await fyers_quotes(sorted({lg["symbol"] for t in trades for lg in t["legs"]}))
         for t in trades:
-            q = qs.get(t["symbol"].upper())
-            px = (q.prev_close if q is not None and q.prev_close else None) or t["entry_price"]
-            await self._book(t, px, "STALE_SESSION", time.time(), None)
+            for lg in t["legs"]:
+                if lg.get("exit") is None:
+                    q = qs.get(lg["symbol"].upper())
+                    lg["exit"] = (q.prev_close if q is not None and q.prev_close else None) or lg["entry"]
+            await self._book(t, "STALE_SESSION", time.time())
 
-    async def _exit(self, t: dict, price: float, reason: str, now: float) -> bool:
+    async def _exit(self, t: dict, prices: dict[str, float], reason: str, now: float) -> bool:
+        """Close every remaining leg. Partial progress (a leg that filled) is
+        saved, so a retry only touches what is still open."""
         if self._retry_at.get(t["id"], 0) > now:
             return False
-        order_id = None
-        if t["mode"] == "live":
-            s_acc = await asyncio.to_thread(_strategy_account, t["strategy_id"])
-            acc, why = await asyncio.to_thread(_account, s_acc)
-            # Never exit blind: if the broker already flattened it (MIS auto
-            # square-off, a manual close in the Fyers app), a MARKET exit would
-            # OPEN the opposite position.
-            net = await _broker_net(acc, t["symbol"]) if acc is not None else None
-            mine = net if net is not None and (net > 0) == (t["side"] == "BUY") else 0
-            if acc is not None and net is not None and mine == 0:
-                await self._book(t, price, "CLOSED_EXTERNAL", now, None)
-                return True
-            ok, order_id, msg = (False, None, why or "positions unavailable") if acc is None or net is None \
-                else await _order(acc, t["symbol"], "SELL" if t["side"] == "BUY" else "BUY",
-                                  min(t["quantity"], abs(mine)), exit_=True, strategy_id=t["strategy_id"])
-            if not ok:
-                self._retry_at[t["id"]] = now + 30
-                await asyncio.to_thread(_update, t["id"], note=f"exit failed: {msg}"[:500])
-                self.event("error", f"EXIT FAILED {t['symbol']} ({reason}): {msg}", trade_id=t["id"])
+        legs = t["legs"]
+        todo = sorted([lg for lg in legs if lg.get("exit") is None], key=lambda lg: lg["act"])  # written legs first
+        for lg in todo:
+            px = prices.get(lg["symbol"].upper())
+            if px is None:
+                px = await self._last_close(lg["symbol"])
+            if px is None:
+                self._retry_at[t["id"]] = now + 15
+                self.event("error", f"{t['symbol']}: no price for {lg['symbol']} — exit ({reason}) retried",
+                           trade_id=t["id"])
                 return False
-        await self._book(t, price, reason, now, order_id)
+            if t["mode"] == "live":
+                acc, why = await asyncio.to_thread(_account, await asyncio.to_thread(_strategy_account, t["strategy_id"]))
+                net = await _broker_net(acc, lg["symbol"]) if acc is not None else None
+                held = net if net is not None and (net > 0) == (lg["act"] > 0) else 0
+                if acc is not None and net is not None and held == 0:
+                    lg["exit"], lg["external"] = px, True       # already flat at the broker: no order
+                    continue
+                ok, oid, msg = (False, None, why or "positions unavailable") if acc is None or net is None \
+                    else await _order(acc, lg["symbol"], "SELL" if lg["act"] > 0 else "BUY",
+                                      min(lg["qty"], abs(held)), exit_=True, strategy_id=t["strategy_id"])
+                if not ok:
+                    self._retry_at[t["id"]] = now + 30
+                    await asyncio.to_thread(_update, t["id"], legs=legs, note=f"exit failed: {msg}"[:500])
+                    self.event("error", f"EXIT FAILED {lg['symbol']} ({reason}): {msg}", trade_id=t["id"])
+                    return False
+                lg["exit_order_id"] = oid
+            lg["exit"] = px
+        await self._book(t, reason, now)
         return True
 
-    async def _book(self, t: dict, price: float, reason: str, now: float, order_id: Optional[str]) -> None:
-        gross, ch = engine.trade_pnl(t["side"], t["quantity"], t["entry_price"], price, True)
-        await asyncio.to_thread(_update, t["id"], status="closed", exit_at=_utc(now), exit_price=round(price, 2),
-                                exit_reason=reason, gross_pnl=gross, charges=ch, net_pnl=round(gross - ch, 2),
-                                exit_order_id=order_id)
+    async def _book(self, t: dict, reason: str, now: float) -> None:
+        gross = ch = 0.0
+        for lg in t["legs"]:
+            g, c = engine.leg_pnl(lg["act"], lg["qty"], lg["entry"], lg["exit"], lg["kind"], True)
+            gross, ch = gross + g, ch + c
+        if all(lg.get("external") for lg in t["legs"]) and reason not in ("STALE_SESSION",):
+            reason = "CLOSED_EXTERNAL"
+        first = t["legs"][0]
+        await asyncio.to_thread(
+            _update, t["id"], status="closed", exit_at=_utc(now), exit_price=round(first["exit"], 2),
+            exit_reason=reason, gross_pnl=round(gross, 2), charges=round(ch, 2), net_pnl=round(gross - ch, 2),
+            legs=t["legs"], exit_order_id=",".join(str(lg.get("exit_order_id")) for lg in t["legs"]
+                                                   if lg.get("exit_order_id"))[:64] or None)
         self._retry_at.pop(t["id"], None)
-        self.event("exit", f"{reason} {t['side']} {t['symbol']} x{t['quantity']} @ {price:.2f} "
-                           f"net ₹{gross - ch:.2f}", trade_id=t["id"], strategy_id=t["strategy_id"])
+        self.event("exit", f"{reason} {t.get('instrument') or t['symbol']} net ₹{gross - ch:.2f}",
+                   trade_id=t["id"], strategy_id=t["strategy_id"])
+        _notify_exit({"symbol": t.get("instrument") or t["symbol"], "reason": reason, "quantity": first["qty"],
+                      "entry": first["entry"], "exit": first["exit"], "pnl": round(gross - ch, 2)})
 
     # -- entries -------------------------------------------------------------
 
@@ -312,28 +529,32 @@ class AlgoRunner:
                 self._last_bar[key] = bar                  # startup mid-bar: wait for the next one
                 continue
             try:
-                bars = await data.recent_bars(sym, spec["timeframe"], now=now)
+                d = await data.live_bundle(spec, sym, now)
             except Exception as e:  # noqa: BLE001
                 self._last_bar[key] = bar
                 self.event("error", f"{s['name']} {sym}: candles unavailable: {e}"[:300], strategy_id=s["id"])
                 continue
-            if not bars["t"] or bars["t"][-1] < bar:
+            if not d["t"] or d["t"][-1] < bar:
                 continue                                   # Fyers hasn't published it yet; next tick
             self._last_bar[key] = bar
-            await self._decide(s, sym, bars, now, day_start)
+            try:
+                await self._decide(s, sym, d, now, day_start)
+            except Exception as e:  # noqa: BLE001 — one symbol must not stop the others
+                log.exception("algo.decide_failed", symbol=sym)
+                self.event("error", f"{s['name']} {sym}: {e}"[:300], strategy_id=s["id"])
 
-    async def _decide(self, s: dict, sym: str, bars: dict, now: float, day_start: float) -> None:
+    async def _decide(self, s: dict, sym: str, d: dict, now: float, day_start: float) -> None:
         spec = s["spec"]
-        sig = engine.signals(bars, spec, {})
+        engine.prepare(d, spec)
+        sig = engine.signals(d, spec, {})
         _, open_trades = await asyncio.to_thread(_snapshot)
         mine = next((t for t in open_trades if t["strategy_id"] == s["id"] and t["symbol"] == sym), None)
         if mine:
             if sig["exit_long" if mine["side"] == "BUY" else "exit_short"][-1]:
-                px = (await _ltp([sym])).get(sym.upper())
-                if px is not None:
-                    await self._exit(mine, px, "SIGNAL", now)
+                prices = await _ltp([lg["symbol"] for lg in mine["legs"]])
+                await self._exit(mine, prices, "SIGNAL", now)
             return
-        close_min = int((bars["t"][-1] + bars["tf_s"] + IST) % 86400) // 60
+        close_min = int((d["t"][-1] + d["tf_s"] + IST) % 86400) // 60
         sess = spec["session"]
         if not engine._hhmm(sess["start"]) <= close_min <= engine._hhmm(sess["end"]):
             return
@@ -342,47 +563,101 @@ class AlgoRunner:
             return
         if await asyncio.to_thread(_trades_today, s["id"], sym, day_start) >= spec["max_trades_per_day"]:
             return
-        await self._enter(s, sym, side, bars, now)
+        if spec["cooldown_bars"]:
+            last = await asyncio.to_thread(_last_exit, s["id"], sym)
+            if last and now < last + spec["cooldown_bars"] * spec["timeframe"] * 60:
+                return
+        book = await asyncio.to_thread(_book, s["id"], day_start)
+        if book["open"] >= spec["portfolio"]["max_positions"]:
+            self.event("info", f"{s['name']}: {side} {sym} skipped — {book['open']} positions open (max)",
+                       strategy_id=s["id"])
+            return
+        await self._enter(s, sym, side, d, now, book)
 
-    async def _enter(self, s: dict, sym: str, side: str, bars: dict, now: float) -> None:
-        spec = s["spec"]
-        ltp = (await _ltp([sym])).get(sym.upper())
-        if ltp is None:
+    async def _enter(self, s: dict, sym: str, side: str, d: dict, now: float, book: dict) -> None:
+        spec, inst, pf = s["spec"], s["spec"]["instrument"], s["spec"]["portfolio"]
+        u = (await _ltp([sym])).get(sym.upper())
+        if u is None:
             self.event("error", f"{s['name']}: {side} {sym} skipped — no live price (no synthetic fills)",
                        strategy_id=s["id"])
             return
-        atr_vals = {p: engine.series(bars, {"ind": "ATR", "params": {"period": p}}, {})[-1]
-                    for p in engine.atr_periods(spec)}
-        sl, tg, trd = engine.entry_levels(spec, side, ltp, atr_vals)
-        qty = engine.size(spec, ltp, sl)
-        if qty < 1:
-            self.event("error", f"{s['name']}: {side} {sym} skipped — sizing gave 0 shares", strategy_id=s["id"])
+        try:
+            legs = await build_legs(spec, sym, side, u, now)
+        except Exception as e:  # noqa: BLE001
+            self.event("error", f"{s['name']}: {side} {sym} skipped — {e}"[:300], strategy_id=s["id"])
             return
-        base = dict(strategy_id=s["id"], symbol=sym, side=side, quantity=qty, mode=s["mode"],
-                    entry_at=_utc(now), entry_price=round(ltp, 2), stop_loss=sl and round(sl, 2),
-                    target=tg and round(tg, 2), trail_dist=trd, best_price=ltp)
-        order_id = None
+        if any(not lg.get("price") for lg in legs):
+            self.event("error", f"{s['name']}: {side} {sym} skipped — no live price for "
+                                f"{', '.join(lg['symbol'] for lg in legs if not lg.get('price'))}", strategy_id=s["id"])
+            return
+        ref = "u" if inst["type"] == "equity" or inst["levels_on"] == "underlying" else "0"
+        sign = 1 if side == "BUY" else -1
+        rsign = sign if ref == "u" else legs[0]["act"]
+        ref_entry = u if ref == "u" else legs[0]["price"]
+        atr_vals = {p: engine.series(d, {"ind": "ATR", "params": {"period": p}}, {})[-1]
+                    for p in engine.atr_periods(spec)}
+        lv = engine.entry_levels(spec, rsign, ref_entry, atr_vals)
+        per_set_margin = engine.position_margin(legs, u, pf["leverage"], price_key="price")
+        equity = pf["capital"] + (book["realized"] if pf["compounding"] else 0.0)
+        sets = engine.units(spec, equity, per_set_margin,
+                            lv["sl_dist"] * legs[0]["per_set"] if lv["sl_dist"] else None)
+        if per_set_margin > 0:
+            sets = min(sets, int(max(0.0, equity - book["margin"]) // per_set_margin))
+        if sets < 1:
+            self.event("error", f"{s['name']}: {side} {sym} skipped — sizing / free capital gives 0 "
+                                f"(needs ₹{per_set_margin:,.0f} per set)", strategy_id=s["id"])
+            return
+        for lg in legs:
+            lg["qty"] = lg["per_set"] * sets
+            lg["entry"] = lg["price"]
+        order_ids: list[str] = []
         if s["mode"] == "live":
             acc, why = await asyncio.to_thread(_account, s["account_id"])
-            ok, order_id, msg = (False, None, why or "") if acc is None else await _order(
-                acc, sym, side, qty, exit_=False, strategy_id=s["id"])
-            if not ok:
-                await asyncio.to_thread(_insert, **base, status="rejected", entry_order_id=order_id,
-                                        note=msg[:500])
-                self.event("error", f"{s['name']}: LIVE {side} {sym} rejected: {msg}", strategy_id=s["id"])
+            placed: list[dict] = []
+            failure = why
+            if acc is not None:
+                for lg in sorted(legs, key=lambda x: -x["act"]):       # bought legs first
+                    ok, oid, msg = await _order(acc, lg["symbol"], "BUY" if lg["act"] > 0 else "SELL",
+                                                lg["qty"], exit_=False, strategy_id=s["id"])
+                    if not ok:
+                        failure = f"{lg['symbol']}: {msg}"
+                        break
+                    lg["order_id"] = oid
+                    placed.append(lg)
+                    order_ids.append(str(oid))
+            if failure:
+                for lg in placed:                                   # roll back what did fill
+                    await _order(acc, lg["symbol"], "SELL" if lg["act"] > 0 else "BUY", lg["qty"],
+                                 exit_=True, strategy_id=s["id"])
+                await asyncio.to_thread(
+                    _insert, strategy_id=s["id"], symbol=sym, side=side, quantity=legs[0]["qty"], mode="live",
+                    status="rejected", entry_at=_utc(now), entry_price=round(ref_entry, 2), legs=_clean(legs),
+                    instrument=" + ".join(lg["label"] for lg in legs)[:160],
+                    note=f"{failure}{' (placed legs rolled back)' if placed else ''}"[:500])
+                self.event("error", f"{s['name']}: LIVE {side} {sym} rejected: {failure}", strategy_id=s["id"])
                 return
-        # ponytail: the entry is booked at the LTP seen at order time; a live
-        # MARKET fill can differ by the spread. Reconcile from the order book
-        # if the gap ever matters for reporting.
-        tid = await asyncio.to_thread(_insert, **base, status="open", entry_order_id=order_id)
-        self.event("entry", f"{s['name']}: {side} {sym} x{qty} @ {ltp:.2f} ({s['mode']})",
+        # ponytail: booked at the LTP seen at order time; a live MARKET fill can
+        # differ by the spread. Reconcile from the tradebook if that ever matters.
+        label = " + ".join(lg["label"] for lg in legs)[:160]
+        tid = await asyncio.to_thread(
+            _insert, strategy_id=s["id"], symbol=sym, side=side, quantity=legs[0]["qty"], mode=s["mode"],
+            status="open", entry_at=_utc(now), entry_price=round(ref_entry, 2),
+            stop_loss=lv["sl"] and round(lv["sl"], 2), target=lv["tg"] and round(lv["tg"], 2),
+            trail_dist=lv["trd"], trail_activate=lv["tra"], breakeven=lv["be"], best_price=ref_entry,
+            legs=_clean(legs), ref=ref, ref_sign=rsign, margin=round(per_set_margin * sets, 2),
+            instrument=label, u_entry=u, entry_order_id=",".join(order_ids)[:64] or None)
+        self.event("entry", f"{s['name']}: {side} → {label} x{sets} set(s) ({s['mode']})",
                    trade_id=tid, strategy_id=s["id"])
+        _notify_entry({"side": side, "symbol": label, "quantity": legs[0]["qty"], "entry": round(legs[0]["price"], 2),
+                       "stop_loss": lv["sl"] and round(lv["sl"], 2), "target": lv["tg"] and round(lv["tg"], 2)})
 
     # -- data ----------------------------------------------------------------
 
     async def sync(self, strategies: list[dict], days: int = 5) -> dict[str, Any]:
         """Top up the 1-minute store for every symbol any strategy trades."""
         syms = sorted({x for s in strategies for x in s["spec"]["symbols"]})
+        if any(s["spec"]["instrument"]["type"] == "option" for s in strategies):
+            syms.append(data.VIX)
         now = int(time.time())
         ok, failed = 0, []
         for sym in syms:
@@ -396,7 +671,6 @@ class AlgoRunner:
         return self.last_sync
 
 
-def _strategy_account(strategy_id: int) -> Optional[int]:
-    with db_session.SessionLocal() as db:
-        s = db.get(AlgoStrategy, strategy_id)
-        return s.account_id if s else None
+def _clean(legs: list[dict]) -> list[dict]:
+    keep = ("symbol", "kind", "act", "qty", "entry", "label", "K", "exp", "order_id")
+    return [{k: lg[k] for k in keep if k in lg} for lg in legs]

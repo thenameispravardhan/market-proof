@@ -82,6 +82,10 @@ def _parse_expiry(s: str) -> Optional[datetime]:
     if not s or not s.strip():
         return None
     s = s.strip().upper()
+    if s.isdigit() and int(s) > 10**9:   # Fyers' F&O master stores expiry as epoch seconds
+        from datetime import timedelta, timezone
+
+        return datetime.fromtimestamp(int(s), timezone(timedelta(hours=5, minutes=30))).replace(tzinfo=None)
     for fmt in ("%d-%b-%Y", "%d-%B-%Y", "%Y-%m-%d"):
         try:
             return datetime.strptime(s, fmt)

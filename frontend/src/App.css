@@ -2070,6 +2070,14 @@ kbd {
    full-width rule above would stack every select on its own line. */
 .algo select, .algo input:not([type="checkbox"]) { width: auto; padding: 3px 6px; }
 .algo label.meta { display: inline-flex; gap: 4px; align-items: center; white-space: nowrap; }
-.algo .widget { padding: 10px 12px; gap: 8px; }
+.algo .widget { padding: 10px 12px; gap: 8px; overflow: visible; resize: none; }
 .algo .widget h3 { flex: none; justify-content: flex-start; }
 .algo th, .algo td { padding: 3px 8px; white-space: nowrap; text-align: left; }
+.algo-operand { display: inline-flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.algo-symbols { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.algo-chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 4px 2px 8px; border: 1px solid var(--border-hi); background: var(--bg-surface); font-size: 12px; }
+.algo-chip button { padding: 0 5px; border: none; background: transparent; color: var(--text-dim); font-size: 13px; line-height: 1; }
+.algo-chip button:hover { color: var(--red); background: transparent; }
+.algo-dropdown { position: absolute; top: 100%; left: 0; z-index: 50; min-width: 320px; max-height: 300px; overflow: auto; background: var(--bg-elev); border: 1px solid var(--border-hi); box-shadow: var(--shadow); }
+.algo-dropdown > div { padding: 5px 8px; cursor: pointer; white-space: nowrap; font-size: 12px; }
+.algo-dropdown > div.active { background: var(--bg-row); color: var(--accent); }
