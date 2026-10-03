@@ -524,6 +524,11 @@ REGISTRY: dict[str, tuple[Callable[..., Any], dict[str, Any], list[str], str]] =
                                               "bullish_engulfing", "bearish_engulfing", "inside_bar",
                                               "outside_bar"], "Candles"),
     "TIME":       (lambda d: clock(d), {}, ["hhmm", "weekday"], "Time"),
+    # Calendar days to the instrument's expiry (options: the chosen weekly /
+    # monthly; otherwise the monthly F&O expiry) — "trade only on expiry day"
+    # is DTE < 1. The engine attaches `expiry_ts` before signals run.
+    "DTE":        (lambda d: [(e - t) / 86400 for e, t in zip(d["expiry_ts"], d["t"])]
+                   if d.get("expiry_ts") else [None] * len(d["t"]), {}, ["value"], "Time"),
 }
 
 SOURCES = ("close", "open", "high", "low", "hl2", "hlc3", "ohlc4", "volume")

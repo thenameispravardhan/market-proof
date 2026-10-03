@@ -60,6 +60,9 @@ CHANNELS = (
     # manager) and `trade.closed` (exit, execution + trade manager).
     ("trade.executed", "trade_entry"),
     ("trade.closed", "trade_exit"),
+    # Algo Lab entries. Its own channel: `trade.executed` is also consumed by
+    # the TradeManager, which must never adopt an algo position.
+    ("algo.entry", "trade_entry"),
     ("risk.halt", "risk_halt"),
     ("system.error", "error"),
     # Daily health report (app/services/health_report.py) — operators

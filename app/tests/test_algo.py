@@ -146,3 +146,100 @@ def test_runner_paper_session(monkeypatch, isolated_db):
     with dbs.SessionLocal() as db:
         last = db.query(AlgoTrade).order_by(AlgoTrade.id.desc()).first()
         assert last.status == "closed" and last.exit_reason == "SQUARE_OFF"
+
+
+def _nifty(closes, tf=300):
+    d = bars(closes, tf=tf, spread=5)
+    d["meta"] = {"symbol": "NSE:NIFTY50-INDEX", "name": "NIFTY", "exch": "NSE", "lot": 65, "step": 50}
+    return d
+
+
+def _opt_spec(**kw):
+    s = {"symbols": ["NSE:NIFTY50-INDEX"], "timeframe": 5, "direction": "long",
+         "entry_long": {"logic": "AND", "conditions": [
+             {"left": {"ind": "PRICE"}, "op": "crosses_above", "right": {"value": 24550}}]},
+         "instrument": {"type": "option", "expiry_kind": "weekly", "iv": {"source": "fixed", "value": 14}},
+         "stop_loss": None, "target": None, "sizing": {"mode": "lots", "value": 2},
+         "session": {"start": "09:15", "end": "15:00", "square_off": "15:15"},
+         "portfolio": {"capital": 1_000_000, "leverage": 8},
+         "costs": {"slippage_pct": 0, "charges": True}}
+    s.update(kw)
+    return engine.normalize(s)
+
+
+def test_option_legs_priced_and_sized_in_lots():
+    closes = [24500, 24520, 24540, 24560, 24600, 24650, 24700] + [24700] * 10
+    r = engine.run(_opt_spec(), {"N": _nifty(closes)})
+    t = r["trades"][0]
+    leg = t["legs"][0]
+    assert leg["label"] == "NIFTY 02JAN25 24550 CE" and leg["qty"] == 130 and leg["side"] == "BUY"  # ATM of the 24560 fill, weekly, 2 lots
+    assert 0 < leg["entry"] < 400 and leg["exit"] > leg["entry"]                              # the call gained
+    assert t["charges"] > 40                                                                  # ₹20 x 2 orders + STT etc.
+
+
+def test_short_straddle_mtm_stop():
+    closes = [24500, 24520, 24540, 24560] + [24560 + 60 * k for k in range(1, 12)]
+    spec = _opt_spec(instrument={"type": "option", "expiry_kind": "weekly", "iv": {"source": "fixed", "value": 14},
+                                 "legs_long": [{"right": "CE", "action": "SELL", "strike": "ATM", "lots": 1},
+                                               {"right": "PE", "action": "SELL", "strike": "ATM", "lots": 1}]},
+                     mtm={"stop": 5000})
+    t = engine.run(spec, {"N": _nifty(closes)})["trades"][0]
+    assert t["reason"] == "MTM_SL" and -6500 < t["gross"] <= -4900 and len(t["legs"]) == 2
+
+
+def test_multi_timeframe_sees_only_closed_bars():
+    base = bars([float(i) for i in range(1, 13)], tf=300)                 # 12 x 5m from 09:15
+    htf = bars([10.0, 20.0, 30.0, 40.0], tf=900)                          # 4 x 15m
+    base["tf_min"], base["htf"] = 5, {15: htf}
+    s = engine.series(base, {"ind": "PRICE", "params": {}, "tf": 15}, {})
+    # base bar i closes at 09:20 + 5i; the first 15m bar closes at 09:30 (base index 2)
+    assert s[:2] == [None, None] and s[2] == 10.0 and s[4] == 10.0 and s[5] == 20.0
+
+
+def test_portfolio_max_positions_and_daily_halt():
+    closes = [100, 101, 102, 106, 108, 110, 104, 102, 101]
+    spec = _cross_spec(exit_long=None, portfolio={"capital": 100000, "max_positions": 1})
+    r = engine.run(spec, {"A": bars(closes, spread=0), "B": bars(closes, spread=0)})
+    assert len(r["trades"]) == 1 and r["stats"]["skipped"]["max_positions"] == 1
+    down = [100, 101, 102, 106, 103, 100, 97, 94, 92, 90]
+    spec = _cross_spec(exit_long=None, daily={"max_loss": 5}, sizing={"mode": "qty", "value": 1})
+    t = engine.run(spec, {"A": bars(down, spread=0)})["trades"][0]
+    assert t["reason"] == "DAILY_MAX_LOSS"
+
+
+def test_expiry_calendar_and_strikes():
+    from datetime import datetime
+
+    from app.algo import fno
+
+    ts = lambda s: datetime.strptime(s, "%Y-%m-%d %H:%M").replace(tzinfo=fno.IST).timestamp()  # noqa: E731
+    lab = lambda e: datetime.fromtimestamp(e, fno.IST).strftime("%Y-%m-%d")  # noqa: E731
+    assert lab(fno.expiry_after("NIFTY", "NSE", "weekly", "current", ts("2025-08-26 10:00"))) == "2025-08-28"  # Thu era
+    assert lab(fno.expiry_after("NIFTY", "NSE", "weekly", "current", ts("2025-09-01 10:00"))) == "2025-09-02"  # Tue era
+    assert lab(fno.expiry_after("BANKNIFTY", "NSE", "weekly", "current", ts("2026-10-05 10:00"))) == "2026-10-27"
+    assert lab(fno.expiry_after("NIFTY", "NSE", "weekly", "current", ts("2026-10-06 15:45"))) == "2026-10-13"
+    assert fno.pick_strike(24537, 50, "CE", "ITM", 2) == 24450 and fno.pick_strike(24537, 50, "PE", "OTM", 1) == 24500
+
+
+def test_live_legs_from_chain(monkeypatch):
+    import asyncio
+
+    from app.algo import runner as rn
+
+    chain = {"spot": 24537, "expiries": [{"ts": "1791000000"}, {"ts": "1791600000"}, {"ts": "1793095800"}],
+             "strikes": [{"strike": k, "ce": {"symbol": f"NSE:NIFTYX{k}CE", "ltp": 100 + (24550 - k) / 2},
+                          "pe": {"symbol": f"NSE:NIFTYX{k}PE", "ltp": 100 - (24550 - k) / 2}}
+                         for k in range(24300, 24850, 50)]}
+
+    class B:
+        async def get_option_chain(self, sym, strikecount=10, timestamp=""):
+            return chain
+
+    monkeypatch.setattr(rn.data, "_backend", lambda: B())
+    spec = _opt_spec(instrument={"type": "option", "legs_long": [
+        {"right": "CE", "action": "BUY", "strike": "OTM", "steps": 2, "lots": 1},
+        {"right": "PE", "action": "SELL", "strike": "PREMIUM", "premium": 80, "lots": 1}]})
+    legs = asyncio.run(rn.build_legs(spec, "NSE:NIFTY50-INDEX", "BUY", 24537, 1790000000))
+    assert legs[0]["symbol"] == "NSE:NIFTYX24650CE" and legs[0]["act"] == 1
+    assert legs[1]["symbol"] == "NSE:NIFTYX24500PE" and legs[1]["act"] == -1
+    assert rn._pick_expiry([1791000000, 1791600000, 1793095800], "monthly", "BANKNIFTY", "current") == 1793095800

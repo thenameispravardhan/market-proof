@@ -66,31 +66,31 @@ def _range(body: dict[str, Any]) -> tuple[int, int]:
     return ist0(start), min(ist0(end) + DAY, int(time.time()) + 60)
 
 
-async def _bars(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str, dict], list[dict]]:
-    """Ensure + load every symbol; one failing symbol is a note, not a 500."""
-    out, notes = {}, []
-    for fy in spec["symbols"]:
-        try:
-            info = await data.ensure(fy, start, end)
-            if info["note"]:
-                notes.append({"symbol": fy, "note": info["note"]})
-            bars = await asyncio.to_thread(data.load, info["key"], spec["timeframe"], start, end)
-            if bars and bars["t"]:
-                out[fy] = bars
-            else:
-                notes.append({"symbol": fy, "note": "no candles in this range"})
-        except Exception as e:  # noqa: BLE001
-            notes.append({"symbol": fy, "note": str(e)[:200]})
-    if not out:
+def _pricing_note(spec: dict[str, Any]) -> Optional[str]:
+    inst = spec["instrument"]
+    if inst["type"] == "option":
+        src = {"auto": "India VIX for indices, realised volatility for stocks", "hv": "20-day realised volatility",
+               "vix": "India VIX", "fixed": f"a fixed {inst['iv']['value']}%"}[inst["iv"]["source"]]
+        return ("Option premiums are Black-Scholes ESTIMATES priced off the underlying's real candles with IV from "
+                f"{src} — Fyers keeps no history for expired contracts. Real premiums carry skew and event IV; "
+                "treat option results as a guide, then paper-trade before going live.")
+    if inst["type"] == "future":
+        return "Futures are backtested on the underlying's price (basis ignored); live trading uses the real contract."
+    return None
+
+
+async def _assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str, dict], list[dict], int]:
+    bars, notes, trade_from = await data.assemble(spec, start, end)
+    if not bars:
         raise HTTPException(422, detail="; ".join(f"{n['symbol']}: {n['note']}" for n in notes) or "no data")
-    return out, notes
+    return bars, notes, trade_from
 
 
 @router.get("/indicators")
 def indicators() -> dict[str, Any]:
     return {"indicators": ind.catalog(), "operators": engine.OPS, "timeframes": engine.TIMEFRAMES,
-            "sources": ind.SOURCES, "metrics": engine.METRICS, "defaults": engine.DEFAULT_SPEC,
-            "max_range_days": MAX_RANGE_DAYS}
+            "cond_timeframes": engine.COND_TIMEFRAMES, "sources": ind.SOURCES, "metrics": engine.METRICS,
+            "sizing": engine.SIZING, "defaults": engine.DEFAULT_SPEC, "max_range_days": MAX_RANGE_DAYS}
 
 
 @router.post("/backtest")
@@ -98,18 +98,24 @@ async def backtest(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     spec = _spec(body.get("spec"))
     start, end = _range(body)
     t0 = time.monotonic()
-    bars, notes = await _bars(spec, start, end)
-    res = await asyncio.to_thread(engine.run, spec, bars)
+    bars, notes, trade_from = await _assemble(spec, start, end)
+    try:
+        res = await asyncio.to_thread(engine.run, spec, bars, None, trade_from)
+    except (ValueError, KeyError) as e:
+        raise HTTPException(422, detail=f"backtest: {e}")
     chart_sym = body.get("chart_symbol") if body.get("chart_symbol") in bars else next(iter(bars))
     d = bars[chart_sym]
     keep = 8000                         # enough to inspect, small enough to ship
-    candles = [[d["t"][i], d["o"][i], d["h"][i], d["l"][i], d["c"][i]] for i in range(max(0, len(d["t"]) - keep), len(d["t"]))]
+    first = next((i for i, t in enumerate(d["t"]) if t >= trade_from), 0)
+    lo = max(first, len(d["t"]) - keep)
+    candles = [[d["t"][i], d["o"][i], d["h"][i], d["l"][i], d["c"][i]] for i in range(lo, len(d["t"]))]
     res["trades_total"] = len(res["trades"])
     res["trades"] = res["trades"][-3000:]
     return {**res, "spec": spec, "notes": notes, "elapsed_s": round(time.monotonic() - t0, 2),
+            "pricing_note": _pricing_note(spec),
             "chart": {"symbol": chart_sym, "candles": candles,
                       "trades": [x for x in res["trades"] if x["symbol"] == chart_sym]},
-            "bars": {k: len(v["t"]) for k, v in bars.items()}}
+            "bars": {k: sum(1 for t in v["t"] if t >= trade_from) for k, v in bars.items()}}
 
 
 @router.post("/optimize")
@@ -117,13 +123,34 @@ async def optimize(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     spec = _spec(body.get("spec"))
     start, end = _range(body)
     t0 = time.monotonic()
-    bars, notes = await _bars(spec, start, end)
+    bars, notes, trade_from = await _assemble(spec, start, end)
     try:
         res = await asyncio.to_thread(engine.optimize, spec, bars, body.get("grid") or [],
-                                      str(body.get("metric") or "net_pnl"), int(body.get("min_trades") or 5))
+                                      str(body.get("metric") or "net_pnl"), int(body.get("min_trades") or 5),
+                                      trade_from)
     except (ValueError, KeyError, IndexError, TypeError) as e:
         raise HTTPException(422, detail=f"optimize: {e}")
     return {**res, "notes": notes, "elapsed_s": round(time.monotonic() - t0, 2)}
+
+
+@router.get("/instrument")
+async def instrument_info(symbol: str) -> dict[str, Any]:
+    """What the builder needs to know about an underlying: F&O or not, lot
+    size, strike step, weekly expiries, and its listed futures."""
+    from app.algo import fno
+
+    fy = data.fyers_symbol(symbol)
+    try:
+        await fno.ensure_master()
+    except Exception as e:  # noqa: BLE001
+        log.warning("algo.fno_master_unavailable", error=str(e)[:200])
+    name = fno.fno_name(fy)
+    is_fno = fno.is_fno(name)
+    return {"symbol": fy, "name": name, "fno": is_fno, "lot": fno.lot_size(name) if is_fno else None,
+            "weekly": name in fno.WEEKLY,
+            "futures": [{"symbol": s_, "expiry": e} for e, s_ in fno.master()["futures"].get(name, [])
+                        if e >= time.time()][:3],
+            "coverage": data.coverage(data.store_key(fy))}
 
 
 @router.get("/data")
@@ -263,14 +290,14 @@ async def square_off(sid: int, request: Request, db: Session = Depends(get_db)) 
     _get(db, sid)
     trades = [_row(t) for t in db.execute(select(AlgoTrade).where(
         AlgoTrade.strategy_id == sid, AlgoTrade.status == "open")).scalars()]
-    prices = await _ltp([t["symbol"] for t in trades]) if trades else {}
+    prices = await _ltp([lg["symbol"] for t in trades for lg in t["legs"]]) if trades else {}
     runner, closed, failed = _runner(request), 0, []
     for t in trades:
-        px = prices.get(t["symbol"].upper()) or await runner._last_close(t["symbol"])  # noqa: SLF001
-        if px is None or not await runner._exit(t, px, "MANUAL", time.time()):  # noqa: SLF001
-            failed.append(t["symbol"])
-        else:
+        runner._retry_at.pop(t["id"], None)  # noqa: SLF001 — an operator click retries now
+        if await runner._exit(t, prices, "MANUAL", time.time()):  # noqa: SLF001
             closed += 1
+        else:
+            failed.append(t.get("instrument") or t["symbol"])
     return {"closed": closed, "failed": failed}
 
 
@@ -293,19 +320,20 @@ def list_trades(strategy_id: Optional[int] = None, limit: int = Query(300, ge=1,
 
 @router.get("/status")
 async def status(request: Request, db: Session = Depends(get_db)) -> dict[str, Any]:
-    from app.algo.runner import _ltp, _row
+    from app.algo.runner import _ltp, _mtm, _row
 
     r = _runner(request)
     open_rows = [_row(t) for t in db.execute(select(AlgoTrade).where(AlgoTrade.status == "open")).scalars()]
-    prices = await _ltp([t["symbol"] for t in open_rows]) if open_rows else {}
+    prices = await _ltp([lg["symbol"] for t in open_rows for lg in t["legs"]] + [t["symbol"] for t in open_rows])         if open_rows else {}
     for t in open_rows:
-        ltp = prices.get(t["symbol"].upper())
-        t["ltp"] = ltp
-        t["unrealized"] = round((ltp - t["entry_price"]) * t["quantity"] * (1 if t["side"] == "BUY" else -1), 2) \
-            if ltp is not None and t["entry_price"] else None
+        t["ltp"] = prices.get((t["symbol"] if t["ref"] == "u" else t["legs"][0]["symbol"]).upper())
+        m = _mtm(t["legs"], prices)
+        t["unrealized"] = round(m, 2) if m is not None else None
+        for lg in t["legs"]:
+            lg["ltp"] = prices.get(lg["symbol"].upper())
         t["entry_at"] = t["entry_at"].isoformat()
     return {"running": getattr(request.app.state, "algo_task", None) is not None,
-            "last_tick": r.last_tick, "last_sync": r.last_sync, "events": list(r.events)[:100],
+            "last_tick": r.last_tick, "last_sync": r.last_sync, "events": list(r.events)[:150],
             "open": open_rows}
 
 

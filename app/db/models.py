@@ -627,6 +627,19 @@ class AlgoTrade(Base):
     entry_order_id: Mapped[Optional[str]] = mapped_column(String(64))
     exit_order_id: Mapped[Optional[str]] = mapped_column(String(64))
     note: Mapped[Optional[str]] = mapped_column(Text)
+    # F&O / multi-leg: what is actually held. Levels above (entry_price,
+    # stop_loss, target, trail_*, best_price) are on the REFERENCE price —
+    # the underlying when ref == "u", else the first leg.
+    instrument: Mapped[Optional[str]] = mapped_column(String(160))
+    legs: Mapped[Optional[list[dict[str, Any]]]] = mapped_column(JSON)
+    ref: Mapped[Optional[str]] = mapped_column(String(4))
+    ref_sign: Mapped[Optional[int]] = mapped_column(Integer)
+    trail_activate: Mapped[Optional[float]] = mapped_column(Float)
+    breakeven: Mapped[Optional[float]] = mapped_column(Float)
+    be_on: Mapped[Optional[bool]] = mapped_column(Boolean)
+    mtm_peak: Mapped[Optional[float]] = mapped_column(Float)
+    margin: Mapped[Optional[float]] = mapped_column(Float)
+    u_entry: Mapped[Optional[float]] = mapped_column(Float)
 
 
 # -------------------------------------------------------------------------

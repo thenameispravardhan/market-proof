@@ -4,6 +4,8 @@
 // One engine runs everywhere (app/algo/engine.py): the backtest, the
 // optimiser and the live runner evaluate the same JSON spec, on completed
 // bars, filling at the next bar's open. What you backtest is what runs.
+// Signals come from the underlying; the instrument decides what is traded —
+// the stock/index, its future, or option legs (ATM/ITM/OTM/premium strikes).
 //
 // Control lives here (frontend-only-control invariant): saved strategies
 // start OFF and in paper; LIVE needs a real Fyers account and the typed
@@ -33,11 +35,24 @@ type Operand = {
   params?: Record<string, number | string>;
   field?: string;
   offset?: number;
+  tf?: number;
+  mult?: number;
+  add?: number;
   value?: number;
 };
 type Cond = { left: Operand; op: string; right?: Operand };
 type Group = { logic: "AND" | "OR"; conditions: (Cond | Group)[] };
-type Level = { type: string; value: number; atr_period?: number } | null;
+type Level = { type: string; value: number; atr_period?: number; activate?: number } | null;
+type Leg = { right: "CE" | "PE"; action: "BUY" | "SELL"; strike: string; steps: number; premium: number; lots: number };
+type Instrument = {
+  type: "equity" | "future" | "option";
+  expiry: "current" | "next";
+  expiry_kind: "weekly" | "monthly";
+  legs_long: Leg[];
+  legs_short: Leg[];
+  levels_on: "instrument" | "underlying";
+  iv: { source: string; value: number };
+};
 type Spec = {
   symbols: string[];
   timeframe: number;
@@ -46,13 +61,19 @@ type Spec = {
   exit_long: Group | null;
   entry_short: Group;
   exit_short: Group | null;
+  instrument: Instrument;
   stop_loss: Level;
   target: Level;
   trailing: Level;
+  breakeven: Level;
+  mtm: { stop: number | null; target: number | null; trail_start: number | null; trail_gap: number | null };
+  daily: { max_loss: number | null; max_profit: number | null };
   session: { start: string; end: string; square_off: string };
   max_trades_per_day: number;
+  cooldown_bars: number;
+  max_bars: number | null;
   sizing: { mode: string; value: number };
-  capital: number;
+  portfolio: { capital: number; leverage: number; max_positions: number; compounding: boolean };
   costs: { slippage_pct: number; charges: boolean };
 };
 type IndicatorDef = { name: string; params: Record<string, number | string>; outputs: string[]; group: string };
@@ -60,16 +81,23 @@ type Catalog = {
   indicators: IndicatorDef[];
   operators: string[];
   timeframes: number[];
+  cond_timeframes: number[];
   sources: string[];
   metrics: string[];
+  sizing: string[];
   defaults: Spec;
   max_range_days: number;
 };
+type BtLeg = { label: string; side: string; qty: number; entry: number; exit: number };
 type BtTrade = {
-  symbol: string; side: string; qty: number; entry_t: number; entry: number; exit_t: number;
-  exit: number; reason: string; gross: number; charges: number; net: number; bars: number;
+  symbol: string; instrument: string; side: string; qty: number; lots: number; entry_t: number; entry: number;
+  exit_t: number; exit: number; u_entry: number; u_exit: number; reason: string; gross: number; charges: number;
+  net: number; bars: number; margin: number; legs: BtLeg[];
 };
-type Stats = Record<string, number | null> & { equity: [number, number][]; daily: [number, number][] };
+type Stats = Record<string, number | null> & {
+  equity: [number, number][]; daily: [number, number][]; monthly: Record<string, number>;
+  weekday: Record<string, number>; skipped: Record<string, number>;
+};
 type BtResult = {
   stats: Stats;
   per_symbol: Record<string, { trades: number; win_rate: number; net_pnl: number; profit_factor: number | null; max_drawdown: number; bars: number }>;
@@ -77,6 +105,7 @@ type BtResult = {
   trades: BtTrade[];
   trades_total: number;
   notes: { symbol: string; note: string }[];
+  pricing_note: string | null;
   elapsed_s: number;
   chart: { symbol: string; candles: number[][]; trades: BtTrade[] };
   spec: Spec;
@@ -84,14 +113,17 @@ type BtResult = {
 type OptRow = { params: Record<string, number>; trades: number; win_rate: number; net_pnl: number; profit_factor: number | null; sharpe: number | null; max_drawdown: number; return_pct: number; expectancy: number };
 type OptResult = { combos: number; ranked: OptRow[]; too_few_trades: number; metric: string; notes: { symbol: string; note: string }[]; elapsed_s: number };
 type Saved = { id: number; name: string; spec: Spec; enabled: boolean; mode: "paper" | "live"; account_id: number | null; closed_trades: number; realized_pnl: number; open_positions: number };
+type LiveLeg = { symbol: string; label?: string; act: number; qty: number; entry: number; exit?: number; ltp?: number | null };
 type LiveTrade = {
-  id: number; strategy_id: number; symbol: string; side: string; quantity: number; mode: string; status: string;
+  id: number; strategy_id: number; symbol: string; instrument: string | null; side: string; quantity: number; mode: string; status: string;
   entry_at: string; entry_price: number | null; stop_loss: number | null; target: number | null; trail_stop: number | null;
   exit_at: string | null; exit_price: number | null; exit_reason: string | null; net_pnl: number | null; charges: number | null;
-  note: string | null; ltp?: number | null; unrealized?: number | null;
+  note: string | null; ltp?: number | null; unrealized?: number | null; legs: LiveLeg[] | null; be_on?: boolean | null;
 };
 type RunnerStatus = { running: boolean; last_tick: number | null; last_sync: { t: number; symbols: number; ok: number; failed: string[] } | null; events: { t: number; level: string; msg: string }[]; open: LiveTrade[] };
 type Account = { id: number; name: string; broker: string; paper_mode: boolean; enabled: boolean };
+type InstInfo = { symbol: string; name: string; fno: boolean; lot: number | null; weekly: boolean; futures: { symbol: string; expiry: number }[]; coverage: { first: number; last: number; rows: number } | null };
+type Hit = { symbol: string; short_name: string; segment: string; exchange: string; display: string; lot_size: number };
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -99,10 +131,11 @@ type Account = { id: number; name: string; broker: string; paper_mode: boolean; 
 
 const IST_S = 19800;
 const isGroup = (c: Cond | Group): c is Group => (c as Group).conditions !== undefined;
-const I = (ind: string, params: Record<string, number | string> = {}, field?: string): Operand => ({ ind, params, field, offset: 0 });
+const I = (ind: string, params: Record<string, number | string> = {}, field?: string, tf?: number): Operand => ({ ind, params, field, offset: 0, ...(tf ? { tf } : {}) });
 const N = (value: number): Operand => ({ value });
 const C = (left: Operand, op: string, right?: Operand): Cond => ({ left, op, right });
 const G = (conditions: (Cond | Group)[], logic: "AND" | "OR" = "AND"): Group => ({ logic, conditions });
+const L = (right: "CE" | "PE", action: "BUY" | "SELL", strike = "ATM", steps = 0, lots = 1, premium = 100): Leg => ({ right, action, strike, steps, premium, lots });
 const clone = <T,>(x: T): T => JSON.parse(JSON.stringify(x)) as T;
 const inr = (v: number | null | undefined, dp = 0) =>
   v === null || v === undefined || Number.isNaN(v) ? "—" : `₹${v.toLocaleString("en-IN", { maximumFractionDigits: dp, minimumFractionDigits: dp })}`;
@@ -113,9 +146,22 @@ const ist = (epoch: number) =>
 const isoIst = (iso: string | null) => (iso ? ist(Date.parse(iso.endsWith("Z") || iso.includes("+") ? iso : iso + "Z") / 1000) : "—");
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const daysAgo = (n: number) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
+const shortSym = (s: string) => s.replace(/^NSE:/, "").replace(/-EQ$/, "").replace(/-INDEX$/, "");
+const tfLabel = (t: number) => (t === 1440 ? "daily" : t >= 60 ? `${t / 60}h` : `${t}m`);
+const SECTIONS = ["instrument", "session", "sizing", "portfolio", "mtm", "daily", "costs"] as const;
 
-// Backtests can run for minutes when a year of candles has to be downloaded
-// first — the shared client's 30s ceiling would abort them.
+// Merge a partial spec (template, import, saved) onto the defaults section by section.
+function withDefaults(defaults: Spec, part: Partial<Spec>): Spec {
+  const s = clone(defaults) as unknown as Record<string, unknown>;
+  Object.entries(clone(part)).forEach(([k, v]) => {
+    if ((SECTIONS as readonly string[]).includes(k) && v && typeof v === "object") s[k] = { ...(s[k] as object), ...(v as object) };
+    else s[k] = v;
+  });
+  return s as unknown as Spec;
+}
+
+// Backtests can run for minutes when history has to be downloaded first —
+// the shared client's 30s ceiling would abort them.
 async function longPost<T>(url: string, body: unknown): Promise<T> {
   const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   const text = await res.text();
@@ -138,6 +184,14 @@ function setPath(obj: unknown, path: string, value: unknown) {
   o[keys[keys.length - 1]] = value;
 }
 
+function download(name: string, text: string, type = "application/json") {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type }));
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
 // Every number in a spec the optimiser can sweep.
 function numericPaths(spec: Spec, cat: Catalog): { path: string; label: string; value: number }[] {
   const out: { path: string; label: string; value: number }[] = [];
@@ -154,6 +208,7 @@ function numericPaths(spec: Spec, cat: Catalog): { path: string; label: string; 
             if (k === "source") return;
             out.push({ path: `${p}.${side}.params.${k}`, label: `${label} #${i + 1} ${side}: ${o.ind}.${k}`, value: Number(o.params?.[k] ?? dv) });
           });
+          if (o.mult !== undefined && o.mult !== 1) out.push({ path: `${p}.${side}.mult`, label: `${label} #${i + 1} ${side}: × multiplier`, value: o.mult });
         } else if (o.value !== undefined) {
           out.push({ path: `${p}.${side}.value`, label: `${label} #${i + 1} ${side}: number`, value: o.value });
         }
@@ -164,16 +219,29 @@ function numericPaths(spec: Spec, cat: Catalog): { path: string; label: string; 
   walk(spec.exit_long, "exit_long", "Long exit");
   walk(spec.entry_short, "entry_short", "Short entry");
   walk(spec.exit_short, "exit_short", "Short exit");
-  (["stop_loss", "target", "trailing"] as const).forEach((k) => {
+  (["stop_loss", "target", "trailing", "breakeven"] as const).forEach((k) => {
     const lv = spec[k];
     if (lv) out.push({ path: `${k}.value`, label: `${k.replace("_", " ")} (${lv.type})`, value: lv.value });
   });
+  if (spec.trailing?.activate) out.push({ path: "trailing.activate", label: "trailing activation", value: spec.trailing.activate });
+  (["stop", "target", "trail_start", "trail_gap"] as const).forEach((k) => {
+    const v = spec.mtm[k];
+    if (v) out.push({ path: `mtm.${k}`, label: `MTM ${k.replace("_", " ")} ₹`, value: v });
+  });
+  if (spec.instrument.type === "option") {
+    (["legs_long", "legs_short"] as const).forEach((side) => spec.instrument[side].forEach((lg, i) => {
+      if (lg.strike === "ITM" || lg.strike === "OTM") out.push({ path: `instrument.${side}.${i}.steps`, label: `${side} leg ${i + 1} ${lg.right} strikes ${lg.strike}`, value: lg.steps });
+      if (lg.strike === "PREMIUM") out.push({ path: `instrument.${side}.${i}.premium`, label: `${side} leg ${i + 1} ${lg.right} target premium`, value: lg.premium });
+    }));
+  }
   out.push({ path: "max_trades_per_day", label: "max trades / day", value: spec.max_trades_per_day });
+  out.push({ path: "cooldown_bars", label: "cooldown bars", value: spec.cooldown_bars });
+  out.push({ path: "sizing.value", label: `size (${spec.sizing.mode})`, value: spec.sizing.value });
   return out;
 }
 
 // Make sure every indicator operand carries a params object (the optimiser
-// writes into it) and drop the side of a direction that isn't traded.
+// writes into it).
 function tidy(spec: Spec): Spec {
   const s = clone(spec);
   const fix = (g: Group | null) =>
@@ -189,72 +257,196 @@ function tidy(spec: Spec): Spec {
 // templates — starting points, all editable
 // ---------------------------------------------------------------------------
 
-type Template = { name: string; spec: Partial<Spec> };
+type Template = { name: string; symbols?: string[]; spec: Partial<Spec> };
+const ST = (f: "crosses_above" | "crosses_below") => C(I("SUPERTREND", { period: 10, multiplier: 3 }, "direction"), f, N(0));
 const TEMPLATES: Template[] = [
-  { name: "EMA 9/21 crossover (both sides)", spec: {
-    direction: "both",
+  { name: "Equity · EMA 9/21 crossover", spec: {
+    direction: "both", instrument: { type: "equity" } as Instrument,
     entry_long: G([C(I("EMA", { period: 9 }), "crosses_above", I("EMA", { period: 21 }))]),
     entry_short: G([C(I("EMA", { period: 9 }), "crosses_below", I("EMA", { period: 21 }))]),
-    stop_loss: { type: "atr", value: 1.5, atr_period: 14 }, target: { type: "rr", value: 2 }, trailing: null } },
-  { name: "Supertrend flip", spec: {
-    direction: "both",
-    entry_long: G([C(I("SUPERTREND", { period: 10, multiplier: 3 }, "direction"), "crosses_above", N(0))]),
-    exit_long: G([C(I("SUPERTREND", { period: 10, multiplier: 3 }, "direction"), "crosses_below", N(0))]),
-    entry_short: G([C(I("SUPERTREND", { period: 10, multiplier: 3 }, "direction"), "crosses_below", N(0))]),
-    exit_short: G([C(I("SUPERTREND", { period: 10, multiplier: 3 }, "direction"), "crosses_above", N(0))]),
-    stop_loss: { type: "pct", value: 1 }, target: null, trailing: null } },
-  { name: "Opening range breakout (15m)", spec: {
-    direction: "both", timeframe: 5,
+    stop_loss: { type: "atr", value: 1.5, atr_period: 14 }, target: { type: "rr", value: 2 }, trailing: null,
+    sizing: { mode: "pct_equity", value: 25 } } },
+  { name: "Equity · VWAP + RSI momentum (60m trend filter)", spec: {
+    direction: "both", instrument: { type: "equity" } as Instrument,
+    entry_long: G([C(I("PRICE"), "crosses_above", I("VWAP")), C(I("RSI", { period: 14 }), ">", N(55)), C(I("PRICE"), ">", I("EMA", { period: 20 }, undefined, 60))]),
+    entry_short: G([C(I("PRICE"), "crosses_below", I("VWAP")), C(I("RSI", { period: 14 }), "<", N(45)), C(I("PRICE"), "<", I("EMA", { period: 20 }, undefined, 60))]),
+    stop_loss: { type: "atr", value: 1.2, atr_period: 14 }, target: { type: "rr", value: 1.5 }, breakeven: { type: "pct", value: 0.4 },
+    sizing: { mode: "risk_pct", value: 0.5 } } },
+  { name: "Equity · Opening range breakout (15m)", spec: {
+    direction: "both", timeframe: 5, instrument: { type: "equity" } as Instrument,
     session: { start: "09:30", end: "13:00", square_off: "15:10" },
     entry_long: G([C(I("PRICE"), "crosses_above", I("ORB", { minutes: 15 }, "high"))]),
     entry_short: G([C(I("PRICE"), "crosses_below", I("ORB", { minutes: 15 }, "low"))]),
-    max_trades_per_day: 1, stop_loss: { type: "pct", value: 0.6 }, target: { type: "rr", value: 2 }, trailing: null } },
-  { name: "VWAP + RSI momentum", spec: {
-    direction: "both",
-    entry_long: G([C(I("PRICE"), "crosses_above", I("VWAP")), C(I("RSI", { period: 14 }), ">", N(55))]),
-    entry_short: G([C(I("PRICE"), "crosses_below", I("VWAP")), C(I("RSI", { period: 14 }), "<", N(45))]),
-    stop_loss: { type: "atr", value: 1.2, atr_period: 14 }, target: { type: "rr", value: 1.5 }, trailing: null } },
-  { name: "RSI reversal 30/70", spec: {
-    direction: "both",
-    entry_long: G([C(I("RSI", { period: 14 }), "crosses_above", N(30))]),
-    exit_long: G([C(I("RSI", { period: 14 }), "crosses_above", N(70))]),
-    entry_short: G([C(I("RSI", { period: 14 }), "crosses_below", N(70))]),
-    exit_short: G([C(I("RSI", { period: 14 }), "crosses_below", N(30))]),
-    stop_loss: { type: "pct", value: 0.8 }, target: null, trailing: null } },
-  { name: "Bollinger mean reversion", spec: {
-    direction: "long",
-    entry_long: G([C(I("PRICE"), "crosses_above", I("BBANDS", { period: 20, multiplier: 2 }, "lower"))]),
+    max_trades_per_day: 1, stop_loss: { type: "pct", value: 0.6 }, target: { type: "rr", value: 2 } } },
+  { name: "Equity · Bollinger mean reversion", spec: {
+    direction: "long", instrument: { type: "equity" } as Instrument,
+    entry_long: G([C(I("PRICE"), "crosses_above", I("BBANDS", { period: 20, multiplier: 2 }, "lower")), C(I("RSI", { period: 14 }, undefined, 1440), ">", N(40))]),
     exit_long: G([C(I("PRICE"), "crosses_above", I("BBANDS", { period: 20, multiplier: 2 }, "middle"))]),
-    stop_loss: { type: "pct", value: 1 }, target: null, trailing: null } },
-  { name: "MACD cross + ADX trend filter", spec: {
-    direction: "both",
-    entry_long: G([C(I("MACD", {}, "macd"), "crosses_above", I("MACD", {}, "signal")), C(I("ADX", { period: 14 }, "adx"), ">", N(25))]),
-    entry_short: G([C(I("MACD", {}, "macd"), "crosses_below", I("MACD", {}, "signal")), C(I("ADX", { period: 14 }, "adx"), ">", N(25))]),
-    stop_loss: { type: "atr", value: 2, atr_period: 14 }, target: null, trailing: { type: "atr", value: 2, atr_period: 14 } } },
-  { name: "CPR breakout", spec: {
+    stop_loss: { type: "pct", value: 1 }, target: null } },
+  { name: "Equity · Gap-up continuation (open > prev high × 1.005)", spec: {
+    direction: "long", instrument: { type: "equity" } as Instrument, session: { start: "09:20", end: "10:30", square_off: "15:15" },
+    entry_long: G([C(I("DAILY", {}, "day_open"), ">", { ...I("DAILY", {}, "prev_high"), mult: 1.005 }), C(I("PRICE"), "crosses_above", I("DAILY", {}, "day_high"), ), C(I("VOLUME_SMA", { period: 20 }), "rising", N(2))], "AND"),
+    max_trades_per_day: 1, stop_loss: { type: "pct", value: 1 }, trailing: { type: "pct", value: 0.8, activate: 0.8 } } },
+  { name: "NIFTY options · Supertrend → buy ATM CE / PE", symbols: ["NSE:NIFTY50-INDEX"], spec: {
+    direction: "both", timeframe: 5,
+    instrument: { type: "option", expiry: "current", expiry_kind: "weekly", legs_long: [L("CE", "BUY")], legs_short: [L("PE", "BUY")], levels_on: "instrument", iv: { source: "auto", value: 15 } },
+    entry_long: G([ST("crosses_above")]), entry_short: G([ST("crosses_below")]),
+    stop_loss: { type: "pct", value: 30 }, target: { type: "pct", value: 60 }, trailing: { type: "pct", value: 20, activate: 30 },
+    sizing: { mode: "lots", value: 1 }, daily: { max_loss: 5000, max_profit: null } } },
+  { name: "NIFTY options · 9:20 short straddle (MTM ₹ stop/target)", symbols: ["NSE:NIFTY50-INDEX"], spec: {
+    direction: "long", timeframe: 5, session: { start: "09:20", end: "09:25", square_off: "15:15" },
+    instrument: { type: "option", expiry: "current", expiry_kind: "weekly", legs_long: [L("CE", "SELL"), L("PE", "SELL")], legs_short: [L("PE", "BUY")], levels_on: "underlying", iv: { source: "auto", value: 15 } },
+    entry_long: G([C(I("TIME", {}, "hhmm"), ">=", N(920))]), max_trades_per_day: 1,
+    stop_loss: null, target: null, trailing: null, mtm: { stop: 3000, target: 4000, trail_start: 2000, trail_gap: 1000 },
+    sizing: { mode: "lots", value: 1 }, portfolio: { capital: 300000, leverage: 8, max_positions: 1, compounding: false } } },
+  { name: "NIFTY options · expiry-day OTM strangle sell (DTE < 1)", symbols: ["NSE:NIFTY50-INDEX"], spec: {
+    direction: "long", timeframe: 5, session: { start: "09:30", end: "09:35", square_off: "15:15" },
+    instrument: { type: "option", expiry: "current", expiry_kind: "weekly", legs_long: [L("CE", "SELL", "OTM", 3), L("PE", "SELL", "OTM", 3)], legs_short: [L("PE", "BUY")], levels_on: "underlying", iv: { source: "auto", value: 15 } },
+    entry_long: G([C(I("TIME", {}, "hhmm"), ">=", N(930)), C(I("DTE"), "<", N(1))]), max_trades_per_day: 1,
+    stop_loss: null, target: null, mtm: { stop: 2500, target: null, trail_start: 1500, trail_gap: 800 },
+    sizing: { mode: "lots", value: 1 }, portfolio: { capital: 300000, leverage: 8, max_positions: 1, compounding: false } } },
+  { name: "BANKNIFTY futures · EMA cross + daily trend", symbols: ["NSE:NIFTYBANK-INDEX"], spec: {
     direction: "both", timeframe: 15,
+    instrument: { type: "future", expiry: "current", expiry_kind: "monthly", legs_long: [], legs_short: [], levels_on: "instrument", iv: { source: "auto", value: 15 } },
+    entry_long: G([C(I("EMA", { period: 9 }), "crosses_above", I("EMA", { period: 21 })), C(I("PRICE"), ">", I("EMA", { period: 20 }, undefined, 1440))]),
+    entry_short: G([C(I("EMA", { period: 9 }), "crosses_below", I("EMA", { period: 21 })), C(I("PRICE"), "<", I("EMA", { period: 20 }, undefined, 1440))]),
+    stop_loss: { type: "atr", value: 2, atr_period: 14 }, target: { type: "rr", value: 2 }, breakeven: { type: "atr", value: 1, atr_period: 14 },
+    sizing: { mode: "lots", value: 1 }, portfolio: { capital: 300000, leverage: 6, max_positions: 1, compounding: true } } },
+  { name: "Stock options · CPR breakout → buy 1-ITM", symbols: ["NSE:RELIANCE-EQ", "NSE:HDFCBANK-EQ"], spec: {
+    direction: "both", timeframe: 15,
+    instrument: { type: "option", expiry: "current", expiry_kind: "monthly", legs_long: [L("CE", "BUY", "ITM", 1)], legs_short: [L("PE", "BUY", "ITM", 1)], levels_on: "underlying", iv: { source: "hv", value: 25 } },
     entry_long: G([C(I("PRICE"), "crosses_above", I("DAILY", {}, "tc")), C(I("PRICE"), ">", I("DAILY", {}, "pivot"))]),
     entry_short: G([C(I("PRICE"), "crosses_below", I("DAILY", {}, "bc")), C(I("PRICE"), "<", I("DAILY", {}, "pivot"))]),
-    max_trades_per_day: 1, stop_loss: { type: "pct", value: 0.7 }, target: { type: "rr", value: 2 }, trailing: null } },
+    max_trades_per_day: 1, stop_loss: { type: "pct", value: 0.7 }, target: { type: "rr", value: 2 },
+    sizing: { mode: "lots", value: 1 }, portfolio: { capital: 300000, leverage: 1, max_positions: 2, compounding: true } } },
 ];
 
-const DRAFT_KEY = "algo.draft.v1";
+const LEG_PRESETS: { name: string; long: Leg[]; short: Leg[] }[] = [
+  { name: "Buy ATM CE / PE", long: [L("CE", "BUY")], short: [L("PE", "BUY")] },
+  { name: "Buy 1-OTM CE / PE", long: [L("CE", "BUY", "OTM", 1)], short: [L("PE", "BUY", "OTM", 1)] },
+  { name: "Sell ATM PE / CE (writer)", long: [L("PE", "SELL")], short: [L("CE", "SELL")] },
+  { name: "Bull call / bear put spread", long: [L("CE", "BUY"), L("CE", "SELL", "OTM", 2)], short: [L("PE", "BUY"), L("PE", "SELL", "OTM", 2)] },
+  { name: "Short straddle", long: [L("CE", "SELL"), L("PE", "SELL")], short: [L("CE", "SELL"), L("PE", "SELL")] },
+  { name: "Short strangle (3 OTM)", long: [L("CE", "SELL", "OTM", 3), L("PE", "SELL", "OTM", 3)], short: [L("CE", "SELL", "OTM", 3), L("PE", "SELL", "OTM", 3)] },
+  { name: "Iron fly (hedged straddle)", long: [L("CE", "SELL"), L("PE", "SELL"), L("CE", "BUY", "OTM", 4), L("PE", "BUY", "OTM", 4)], short: [L("CE", "SELL"), L("PE", "SELL"), L("CE", "BUY", "OTM", 4), L("PE", "BUY", "OTM", 4)] },
+];
+
+const DRAFT_KEY = "algo.draft.v2";
+
+// ---------------------------------------------------------------------------
+// inputs
+// ---------------------------------------------------------------------------
+
+// A number box that lets you TYPE decimals ("0.", "1.05") — a controlled
+// <input type=number> fights partial input in some browsers. Keeps the raw
+// text locally and reports only complete numbers.
+function NumInput({ value, onChange, width = 64, allowEmpty = false, signed = false, title, placeholder }: {
+  value: number | null | undefined; onChange: (v: number | null) => void; width?: number;
+  allowEmpty?: boolean; signed?: boolean; title?: string; placeholder?: string;
+}) {
+  const shown = value === null || value === undefined ? "" : String(value);
+  const [text, setText] = useState(shown);
+  const committed = useRef(value);
+  useEffect(() => {
+    if (value !== committed.current) { committed.current = value; setText(shown); }
+  }, [value, shown]);
+  const re = signed ? /^-?\d*\.?\d*$/ : /^\d*\.?\d*$/;
+  return (
+    <input type="text" inputMode="decimal" style={{ width }} value={text} title={title} placeholder={placeholder}
+      onChange={(e) => {
+        const t = e.target.value.trim();
+        if (!re.test(t)) return;
+        setText(t);
+        if (t === "") { if (allowEmpty) { committed.current = null; onChange(null); } return; }
+        if (t === "-" || t === "." || t.endsWith(".")) return;
+        const n = Number(t);
+        if (!Number.isNaN(n)) { committed.current = n; onChange(n); }
+      }}
+      onBlur={() => { if (text === "" && !allowEmpty) setText(shown); else if (text.endsWith(".")) setText(text.slice(0, -1)); }} />
+  );
+}
+
+const QUICK = [
+  { s: "NSE:NIFTY50-INDEX", l: "NIFTY" }, { s: "NSE:NIFTYBANK-INDEX", l: "BANKNIFTY" }, { s: "NSE:FINNIFTY-INDEX", l: "FINNIFTY" },
+  { s: "NSE:MIDCPNIFTY-INDEX", l: "MIDCPNIFTY" }, { s: "BSE:SENSEX-INDEX", l: "SENSEX" },
+];
+
+function SymbolPicker({ value, onChange }: { value: string[]; onChange: (v: string[]) => void }) {
+  const [q, setQ] = useState("");
+  const [hits, setHits] = useState<Hit[]>([]);
+  const [open, setOpen] = useState(false);
+  const [hi, setHi] = useState(0);
+  useEffect(() => {
+    if (!open) return;
+    const h = setTimeout(async () => {
+      try {
+        const r = await api.get<{ hits: Hit[] }>(`/api/search/symbols?q=${encodeURIComponent(q)}&segment=EQ,INDEX&limit=15`);
+        setHits(r.hits.filter((x) => !value.includes(x.symbol)));
+        setHi(0);
+      } catch { setHits([]); }
+    }, 120);
+    return () => clearTimeout(h);
+  }, [q, open, value]);
+  const add = (...syms: string[]) => {
+    const next = [...value];
+    syms.map((s) => s.trim().toUpperCase()).filter(Boolean).forEach((s) => { if (!next.includes(s)) next.push(s); });
+    onChange(next);
+    setQ("");
+  };
+  return (
+    <div className="algo-symbols">
+      {value.map((s) => (
+        <span className="algo-chip" key={s} title={s}>
+          {shortSym(s)}
+          <button type="button" aria-label={`remove ${s}`} onClick={() => onChange(value.filter((x) => x !== s))}>×</button>
+        </span>
+      ))}
+      <span style={{ position: "relative" }}>
+        <input value={q} placeholder={value.length ? "add symbol…" : "search a stock or index…"} style={{ width: 190 }}
+          onFocus={() => setOpen(true)} onBlur={() => setTimeout(() => setOpen(false), 150)}
+          onChange={(e) => { setQ(e.target.value); setOpen(true); }}
+          onPaste={(e) => {
+            const t = e.clipboardData.getData("text");
+            if (/[,\s]/.test(t.trim())) { e.preventDefault(); add(...t.split(/[\s,]+/)); }
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowDown") { e.preventDefault(); setHi(Math.min(hi + 1, hits.length - 1)); }
+            else if (e.key === "ArrowUp") { e.preventDefault(); setHi(Math.max(hi - 1, 0)); }
+            else if (e.key === "Enter") { e.preventDefault(); if (hits[hi]) add(hits[hi].symbol); else if (q.includes(":")) add(q); }
+            else if (e.key === "Backspace" && !q && value.length) onChange(value.slice(0, -1));
+            else if (e.key === "Escape") setOpen(false);
+          }} />
+        {open && hits.length > 0 && (
+          <div className="algo-dropdown" role="listbox">
+            {hits.map((h, i) => (
+              <div key={h.symbol} role="option" aria-selected={i === hi} className={i === hi ? "active" : ""}
+                onMouseEnter={() => setHi(i)} onMouseDown={(e) => { e.preventDefault(); add(h.symbol); }}>
+                <b>{h.short_name}</b> <span className="meta">{h.symbol}{h.segment === "INDEX" ? " · index" : ""}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </span>
+      {QUICK.filter((x) => !value.includes(x.s)).map((x) => (
+        <button key={x.s} type="button" className="btn-sm ghost" onClick={() => add(x.s)}>+ {x.l}</button>
+      ))}
+      {value.length > 1 && <button type="button" className="btn-sm ghost" onClick={() => onChange([])}>clear</button>}
+    </div>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // builder widgets
 // ---------------------------------------------------------------------------
 
-const inp: React.CSSProperties = { width: 64 };
-
-function OperandEditor({ v, onChange, cat, allowNumber = true }: { v: Operand; onChange: (o: Operand) => void; cat: Catalog; allowNumber?: boolean }) {
+function OperandEditor({ v, onChange, cat, baseTf, allowNumber = true }: { v: Operand; onChange: (o: Operand) => void; cat: Catalog; baseTf: number; allowNumber?: boolean }) {
   const def = v.ind ? cat.indicators.find((d) => d.name === v.ind) : undefined;
   const groups = useMemo(() => Array.from(new Set(cat.indicators.map((d) => d.group))), [cat]);
+  const [math, setMath] = useState((v.mult !== undefined && v.mult !== 1) || !!v.add);
+  const tfs = cat.cond_timeframes.filter((t) => t === 1440 || (t > baseTf && t % baseTf === 0));
   return (
-    <span style={{ display: "inline-flex", gap: 4, alignItems: "center", flexWrap: "wrap" }}>
-      <select
-        value={v.ind ?? "#"}
-        onChange={(e) => onChange(e.target.value === "#" ? { value: 0 } : I(e.target.value))}
-      >
+    <span className="algo-operand">
+      <select value={v.ind ?? "#"} onChange={(e) => onChange(e.target.value === "#" ? { value: 0 } : I(e.target.value))}>
         {allowNumber && <option value="#">Number</option>}
         {groups.map((g) => (
           <optgroup key={g} label={g}>
@@ -262,35 +454,44 @@ function OperandEditor({ v, onChange, cat, allowNumber = true }: { v: Operand; o
           </optgroup>
         ))}
       </select>
-      {!def && (
-        <input type="number" step="any" style={inp} value={v.value ?? 0}
-          onChange={(e) => onChange({ value: Number(e.target.value) })} />
-      )}
+      {!def && <NumInput value={v.value ?? 0} signed width={80} onChange={(n) => onChange({ value: n ?? 0 })} />}
       {def && def.outputs.length > 1 && (
         <select value={v.field ?? def.outputs[0]} onChange={(e) => onChange({ ...v, field: e.target.value })}>
           {def.outputs.map((o) => <option key={o} value={o}>{o}</option>)}
         </select>
       )}
       {def && Object.entries(def.params).map(([k, dv]) => (
-        <label key={k} className="meta" style={{ display: "inline-flex", gap: 2, alignItems: "center" }} title={k}>
+        <label key={k} className="meta" title={k}>
           {k.replace("_period", "").replace("multiplier", "mult")}
           {k === "source" ? (
             <select value={String(v.params?.[k] ?? dv)} onChange={(e) => onChange({ ...v, params: { ...v.params, [k]: e.target.value } })}>
               {cat.sources.map((s) => <option key={s} value={s}>{s}</option>)}
             </select>
           ) : (
-            <input type="number" step="any" style={{ width: 52 }} value={Number(v.params?.[k] ?? dv)}
-              onChange={(e) => onChange({ ...v, params: { ...v.params, [k]: Number(e.target.value) } })} />
+            <NumInput width={52} value={Number(v.params?.[k] ?? dv)} onChange={(n) => onChange({ ...v, params: { ...v.params, [k]: n ?? Number(dv) } })} />
           )}
         </label>
       ))}
-      {def && (
-        <label className="meta" title="bars ago — 1 = the previous candle's value" style={{ display: "inline-flex", gap: 2, alignItems: "center" }}>
-          ago
-          <input type="number" min={0} style={{ width: 40 }} value={v.offset ?? 0}
-            onChange={(e) => onChange({ ...v, offset: Math.max(0, Number(e.target.value)) })} />
+      {def && tfs.length > 0 && (
+        <label className="meta" title="evaluate this indicator on a higher timeframe (only its completed candles are used)">
+          on
+          <select value={v.tf ?? 0} onChange={(e) => { const tf = Number(e.target.value); const n = { ...v }; if (tf) n.tf = tf; else delete n.tf; onChange(n); }}>
+            <option value={0}>{tfLabel(baseTf)} (base)</option>
+            {tfs.map((t) => <option key={t} value={t}>{tfLabel(t)}</option>)}
+          </select>
         </label>
       )}
+      {def && (
+        <label className="meta" title="bars ago — 1 = the previous candle's value">
+          ago <NumInput width={36} value={v.offset ?? 0} onChange={(n) => onChange({ ...v, offset: Math.max(0, Math.floor(n ?? 0)) })} />
+        </label>
+      )}
+      {def && (math ? (
+        <>
+          <label className="meta" title="multiply, e.g. 1.02 = 2% above">× <NumInput width={52} value={v.mult ?? 1} onChange={(n) => onChange({ ...v, mult: n ?? 1 })} /></label>
+          <label className="meta" title="add (can be negative)">+ <NumInput width={52} signed value={v.add ?? 0} onChange={(n) => onChange({ ...v, add: n ?? 0 })} /></label>
+        </>
+      ) : <button type="button" className="btn-sm ghost" title="scale or offset this value (× 1.02, + 20 …)" onClick={() => setMath(true)}>ƒ</button>)}
     </span>
   );
 }
@@ -300,11 +501,11 @@ const OP_LABEL: Record<string, string> = {
   rising: "is rising for (bars)", falling: "is falling for (bars)",
 };
 
-function CondEditor({ c, onChange, cat }: { c: Cond; onChange: (c: Cond) => void; cat: Catalog }) {
+function CondEditor({ c, onChange, cat, baseTf }: { c: Cond; onChange: (c: Cond) => void; cat: Catalog; baseTf: number }) {
   const trend = c.op === "rising" || c.op === "falling";
   return (
-    <span style={{ display: "inline-flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
-      <OperandEditor v={c.left} cat={cat} allowNumber={false} onChange={(left) => onChange({ ...c, left })} />
+    <span className="algo-operand" style={{ gap: 8 }}>
+      <OperandEditor v={c.left} cat={cat} baseTf={baseTf} allowNumber={false} onChange={(left) => onChange({ ...c, left })} />
       <select value={c.op} onChange={(e) => {
         const op = e.target.value;
         const t = op === "rising" || op === "falling";
@@ -313,58 +514,87 @@ function CondEditor({ c, onChange, cat }: { c: Cond; onChange: (c: Cond) => void
         {cat.operators.map((o) => <option key={o} value={o}>{OP_LABEL[o] ?? o}</option>)}
       </select>
       {trend ? (
-        <input type="number" min={1} style={{ width: 48 }} value={c.right?.value ?? 1}
-          onChange={(e) => onChange({ ...c, right: N(Math.max(1, Number(e.target.value))) })} />
+        <NumInput width={44} value={c.right?.value ?? 1} onChange={(n) => onChange({ ...c, right: N(Math.max(1, Math.floor(n ?? 1))) })} />
       ) : (
-        <OperandEditor v={c.right ?? N(0)} cat={cat} onChange={(right) => onChange({ ...c, right })} />
+        <OperandEditor v={c.right ?? N(0)} cat={cat} baseTf={baseTf} onChange={(right) => onChange({ ...c, right })} />
       )}
     </span>
   );
 }
 
-function GroupEditor({ g, onChange, cat, depth = 0 }: { g: Group; onChange: (g: Group) => void; cat: Catalog; depth?: number }) {
+function GroupEditor({ g, onChange, cat, baseTf, depth = 0 }: { g: Group; onChange: (g: Group) => void; cat: Catalog; baseTf: number; depth?: number }) {
   const set = (i: number, c: Cond | Group) => onChange({ ...g, conditions: g.conditions.map((x, j) => (j === i ? c : x)) });
   return (
     <div style={{ borderLeft: `2px solid ${depth ? "var(--cyan)" : "var(--accent)"}`, paddingLeft: 8, display: "grid", gap: 6 }}>
-      <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+      <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
         <select value={g.logic} onChange={(e) => onChange({ ...g, logic: e.target.value as "AND" | "OR" })}>
           <option value="AND">ALL of (AND)</option>
           <option value="OR">ANY of (OR)</option>
         </select>
-        <button className="btn-sm" onClick={() => onChange({ ...g, conditions: [...g.conditions, C(I("PRICE"), ">", I("EMA", { period: 20 }))] })}>+ condition</button>
-        {depth < 2 && <button className="btn-sm" onClick={() => onChange({ ...g, conditions: [...g.conditions, G([C(I("RSI", { period: 14 }), ">", N(50))], "OR")] })}>+ group</button>}
+        <button type="button" className="btn-sm" onClick={() => onChange({ ...g, conditions: [...g.conditions, C(I("PRICE"), ">", I("EMA", { period: 20 }))] })}>+ condition</button>
+        {depth < 2 && <button type="button" className="btn-sm" onClick={() => onChange({ ...g, conditions: [...g.conditions, G([C(I("RSI", { period: 14 }), ">", N(50))], "OR")] })}>+ group</button>}
         {g.conditions.length === 0 && <span className="meta">no conditions — never fires</span>}
       </div>
       {g.conditions.map((c, i) => (
         <div key={i} style={{ display: "flex", gap: 6, alignItems: "flex-start" }}>
           <div style={{ flex: 1 }}>
             {isGroup(c)
-              ? <GroupEditor g={c} cat={cat} depth={depth + 1} onChange={(x) => set(i, x)} />
-              : <CondEditor c={c} cat={cat} onChange={(x) => set(i, x)} />}
+              ? <GroupEditor g={c} cat={cat} baseTf={baseTf} depth={depth + 1} onChange={(x) => set(i, x)} />
+              : <CondEditor c={c} cat={cat} baseTf={baseTf} onChange={(x) => set(i, x)} />}
           </div>
-          <button className="btn-sm danger" title="remove" onClick={() => onChange({ ...g, conditions: g.conditions.filter((_, j) => j !== i) })}>✕</button>
+          <button type="button" className="btn-sm danger" title="remove" onClick={() => onChange({ ...g, conditions: g.conditions.filter((_, j) => j !== i) })}>✕</button>
         </div>
       ))}
     </div>
   );
 }
 
-function LevelEditor({ label, v, onChange, allowRR = false }: { label: string; v: Level; onChange: (l: Level) => void; allowRR?: boolean }) {
+function LevelEditor({ label, v, onChange, kinds, activate = false, hint }: { label: string; v: Level; onChange: (l: Level) => void; kinds: string[]; activate?: boolean; hint?: string }) {
+  const KIND_LABEL: Record<string, string> = { pct: "% of price", points: "points", atr: "× ATR", rr: "× risk (R:R)" };
   return (
-    <label className="meta" style={{ display: "inline-flex", gap: 4, alignItems: "center" }}>
+    <label className="meta" title={hint}>
       {label}
-      <select value={v?.type ?? "none"} onChange={(e) => onChange(e.target.value === "none" ? null : { type: e.target.value, value: v?.value ?? 1, atr_period: v?.atr_period ?? 14 })}>
-        <option value="none">none</option>
-        <option value="pct">% of price</option>
-        <option value="points">points (₹)</option>
-        <option value="atr">× ATR</option>
-        {allowRR && <option value="rr">× risk (R:R)</option>}
+      <select value={v?.type ?? "none"} onChange={(e) => onChange(e.target.value === "none" ? null : { type: e.target.value, value: v?.value ?? 1, atr_period: v?.atr_period ?? 14, ...(activate ? { activate: v?.activate ?? 0 } : {}) })}>
+        <option value="none">off</option>
+        {kinds.map((k) => <option key={k} value={k}>{KIND_LABEL[k]}</option>)}
       </select>
-      {v && <input type="number" step="any" min={0} style={inp} value={v.value} onChange={(e) => onChange({ ...v, value: Number(e.target.value) })} />}
-      {v?.type === "atr" && (
-        <>ATR<input type="number" min={1} style={{ width: 44 }} value={v.atr_period ?? 14} onChange={(e) => onChange({ ...v, atr_period: Number(e.target.value) })} /></>
-      )}
+      {v && <NumInput value={v.value} onChange={(n) => onChange({ ...v, value: n ?? 0 })} />}
+      {v?.type === "atr" && <>ATR <NumInput width={40} value={v.atr_period ?? 14} onChange={(n) => onChange({ ...v, atr_period: Math.max(1, Math.floor(n ?? 14)) })} /></>}
+      {v && activate && <>after <NumInput width={52} value={v.activate ?? 0} title="start trailing only once this far in profit (same unit); 0 = at once" onChange={(n) => onChange({ ...v, activate: n ?? 0 })} /> profit</>}
     </label>
+  );
+}
+
+function Rupee({ label, value, onChange, hint }: { label: string; value: number | null; onChange: (v: number | null) => void; hint?: string }) {
+  return (
+    <label className="meta" title={hint}>{label} ₹<NumInput width={76} allowEmpty placeholder="off" value={value} onChange={onChange} /></label>
+  );
+}
+
+function LegsEditor({ legs, onChange, title }: { legs: Leg[]; onChange: (l: Leg[]) => void; title: string }) {
+  const set = (i: number, p: Partial<Leg>) => onChange(legs.map((x, j) => (j === i ? { ...x, ...p } : x)));
+  return (
+    <div style={{ display: "grid", gap: 4 }}>
+      <div className="meta">{title}</div>
+      {legs.map((lg, i) => (
+        <div key={i} className="algo-operand">
+          <select value={lg.action} onChange={(e) => set(i, { action: e.target.value as Leg["action"] })}>
+            <option value="BUY">BUY</option><option value="SELL">SELL</option>
+          </select>
+          <select value={lg.right} onChange={(e) => set(i, { right: e.target.value as Leg["right"] })}>
+            <option value="CE">CE (call)</option><option value="PE">PE (put)</option>
+          </select>
+          <select value={lg.strike} onChange={(e) => set(i, { strike: e.target.value })}>
+            <option value="ATM">ATM</option><option value="ITM">ITM</option><option value="OTM">OTM</option><option value="PREMIUM">closest to premium ₹</option>
+          </select>
+          {(lg.strike === "ITM" || lg.strike === "OTM") && <label className="meta">by <NumInput width={36} value={lg.steps} onChange={(n) => set(i, { steps: Math.max(0, Math.floor(n ?? 0)) })} /> strike(s)</label>}
+          {lg.strike === "PREMIUM" && <label className="meta">₹<NumInput width={56} value={lg.premium} onChange={(n) => set(i, { premium: n ?? 100 })} /></label>}
+          <label className="meta">lots <NumInput width={40} value={lg.lots} onChange={(n) => set(i, { lots: Math.max(1, Math.floor(n ?? 1)) })} /></label>
+          <button type="button" className="btn-sm danger" onClick={() => onChange(legs.filter((_, j) => j !== i))}>✕</button>
+        </div>
+      ))}
+      <div><button type="button" className="btn-sm" onClick={() => onChange([...legs, L("CE", "BUY")])}>+ leg</button></div>
+    </div>
   );
 }
 
@@ -410,7 +640,7 @@ function TradeChart({ chart }: { chart: BtResult["chart"] }) {
     const markers: SeriesMarker<Time>[] = [];
     chart.trades.filter((t) => t.entry_t >= first).forEach((t) => {
       const buy = t.side === "BUY";
-      markers.push({ time: (snap(t.entry_t) + IST_S) as UTCTimestamp, position: buy ? "belowBar" : "aboveBar", color: buy ? up : dn, shape: buy ? "arrowUp" : "arrowDown", text: `${t.side} ${t.entry}` });
+      markers.push({ time: (snap(t.entry_t) + IST_S) as UTCTimestamp, position: buy ? "belowBar" : "aboveBar", color: buy ? up : dn, shape: buy ? "arrowUp" : "arrowDown", text: t.legs.length > 1 ? t.side : `${t.side} ${t.entry}` });
       markers.push({ time: (snap(t.exit_t) + IST_S) as UTCTimestamp, position: buy ? "aboveBar" : "belowBar", color: t.net >= 0 ? up : dn, shape: "circle", text: `${t.reason} ${t.net >= 0 ? "+" : ""}${t.net.toFixed(0)}` });
     });
     markers.sort((a, b) => (a.time as number) - (b.time as number));
@@ -419,6 +649,13 @@ function TradeChart({ chart }: { chart: BtResult["chart"] }) {
     return () => c.remove();
   }, [chart]);
   return <div ref={ref} style={{ height: 380, width: "100%" }} />;
+}
+
+function tradesCsv(trades: BtTrade[]): string {
+  const head = ["symbol", "instrument", "side", "qty", "lots", "entry_time", "entry", "exit_time", "exit", "underlying_entry", "underlying_exit", "reason", "bars", "gross", "charges", "net"];
+  const iso = (t: number) => new Date((t + IST_S) * 1000).toISOString().replace("T", " ").slice(0, 16);
+  const rows = trades.map((t) => [t.symbol, t.instrument, t.side, t.qty, t.lots, iso(t.entry_t), t.entry, iso(t.exit_t), t.exit, t.u_entry, t.u_exit, t.reason, t.bars, t.gross, t.charges, t.net]);
+  return [head, ...rows].map((r) => r.map((x) => `"${String(x).replace(/"/g, '""')}"`).join(",")).join("\n");
 }
 
 function Results({ r }: { r: BtResult }) {
@@ -430,31 +667,46 @@ function Results({ r }: { r: BtResult }) {
   }, [s.equity]);
   const [showAll, setShowAll] = useState(false);
   const trades = useMemo(() => [...r.trades].reverse().slice(0, showAll ? 3000 : 200), [r.trades, showAll]);
+  const multiLeg = r.trades.some((t) => t.legs.length > 1);
+  const skipped = Object.entries(s.skipped ?? {}).filter(([, v]) => v > 0);
   return (
     <>
-      {r.notes.length > 0 && (
+      {(r.notes.length > 0 || r.pricing_note) && (
         <div className="widget widget-wide" style={{ marginBottom: 12, borderColor: "var(--amber)" }}>
+          {r.pricing_note && <div className="meta">ⓘ {r.pricing_note}</div>}
           {r.notes.map((n) => <div key={n.symbol} className="meta">⚠ {n.symbol}: {n.note}</div>)}
         </div>
       )}
       <div className="widget widget-wide" style={{ marginBottom: 12 }}>
-        <h3>Performance <span className="meta">{r.trades_total} trades · {s.trading_days} days · {r.elapsed_s}s</span></h3>
+        <h3>Performance <span className="meta">{r.trades_total} trades · {s.trading_days} days · {r.elapsed_s}s</span>
+          <button type="button" className="btn-sm" style={{ marginLeft: "auto" }} onClick={() => download("backtest_trades.csv", tradesCsv(r.trades), "text/csv")}>⬇ trades CSV</button>
+        </h3>
         <div style={{ display: "flex", flexWrap: "wrap", gap: 18 }}>
-          <Metric label="Net P&L" value={inr(s.net_pnl as number)} cls={pnlCls(s.net_pnl as number)} hint="after charges and slippage" />
-          <Metric label="Return" value={`${num(s.return_pct as number)}%`} cls={pnlCls(s.return_pct as number)} hint="net P&L / capital" />
-          <Metric label="Win rate" value={`${num(s.win_rate as number, 1)}%`} />
+          <Metric label="Net P&L" value={inr(s.net_pnl)} cls={pnlCls(s.net_pnl)} hint="after charges and slippage" />
+          <Metric label="Return" value={`${num(s.return_pct)}%`} cls={pnlCls(s.return_pct)} hint="net P&L / starting capital" />
+          <Metric label="CAGR" value={s.cagr_pct === null ? "—" : `${num(s.cagr_pct)}%`} hint="annualised (needs 30+ days)" />
+          <Metric label="Win rate" value={`${num(s.win_rate, 1)}%`} />
           <Metric label="Profit factor" value={num(s.profit_factor)} hint="gross wins / gross losses" />
-          <Metric label="Expectancy" value={inr(s.expectancy as number)} hint="average net per trade" />
-          <Metric label="Max drawdown" value={`${inr(s.max_drawdown as number)} (${num(s.max_drawdown_pct as number, 1)}%)`} cls="pnl-neg" />
+          <Metric label="Expectancy" value={inr(s.expectancy)} hint="average net per trade" />
+          <Metric label="Max drawdown" value={`${inr(s.max_drawdown)} (${num(s.max_drawdown_pct, 1)}%)`} cls="pnl-neg" />
           <Metric label="Sharpe" value={num(s.sharpe)} hint="daily P&L, annualised √252" />
-          <Metric label="Charges" value={inr(s.charges as number)} hint="brokerage, STT, exchange, SEBI, GST, stamp" />
-          <Metric label="Gross P&L" value={inr(s.gross_pnl as number)} cls={pnlCls(s.gross_pnl as number)} />
-          <Metric label="Avg win / loss" value={`${inr(s.avg_win as number)} / ${inr(s.avg_loss as number)}`} />
-          <Metric label="Largest win / loss" value={`${inr(s.largest_win as number)} / ${inr(s.largest_loss as number)}`} />
+          <Metric label="Sortino" value={num(s.sortino)} hint="like Sharpe, but only downside days count as risk" />
+          <Metric label="Calmar" value={num(s.calmar)} hint="CAGR / max drawdown %" />
+          <Metric label="Charges" value={inr(s.charges)} hint="brokerage, STT, exchange, SEBI, GST, stamp — by segment" />
+          <Metric label="Gross P&L" value={inr(s.gross_pnl)} cls={pnlCls(s.gross_pnl)} />
+          <Metric label="Avg win / loss" value={`${inr(s.avg_win)} / ${inr(s.avg_loss)}`} />
+          <Metric label="Largest win / loss" value={`${inr(s.largest_win)} / ${inr(s.largest_loss)}`} />
+          <Metric label="Best / worst day" value={`${inr(s.best_day)} / ${inr(s.worst_day)}`} />
           <Metric label="Streaks W / L" value={`${s.max_consecutive_wins} / ${s.max_consecutive_losses}`} />
           <Metric label="Profitable days" value={`${s.profitable_days} / ${s.trading_days}`} />
-          <Metric label="Avg bars held" value={num(s.avg_bars_held as number, 1)} />
+          <Metric label="Avg bars held" value={num(s.avg_bars_held, 1)} />
         </div>
+        {skipped.length > 0 && (
+          <div className="meta" style={{ marginTop: 6 }}>
+            Signals not taken: {skipped.map(([k, v]) => `${v} × ${k.replace("_", " ")}`).join(" · ")}
+            {skipped.some(([k]) => k === "no_capital") && " — raise capital or leverage, or size smaller"}
+          </div>
+        )}
       </div>
       <div className="widget widget-wide" style={{ marginBottom: 12 }}>
         <h3>Equity curve</h3>
@@ -471,15 +723,15 @@ function Results({ r }: { r: BtResult }) {
         )}
       </div>
       <div className="widget widget-wide" style={{ marginBottom: 12 }}>
-        <h3>{r.chart.symbol} <span className="meta">last {r.chart.candles.length} candles · ▲▼ entries, ● exits</span></h3>
+        <h3>{r.chart.symbol} <span className="meta">last {r.chart.candles.length} candles of the underlying · ▲▼ entries, ● exits</span></h3>
         <TradeChart chart={r.chart} />
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 12, marginBottom: 12 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 12, marginBottom: 12 }}>
         <div className="widget">
           <h3>By symbol</h3>
           <table><thead><tr><th>Symbol</th><th>Bars</th><th>Trades</th><th>Win %</th><th>PF</th><th>Net</th></tr></thead>
             <tbody>{Object.entries(r.per_symbol).map(([k, v]) => (
-              <tr key={k}><td>{k}</td><td className="mono">{v.bars}</td><td className="mono">{v.trades}</td><td className="mono">{num(v.win_rate, 1)}</td>
+              <tr key={k}><td>{shortSym(k)}</td><td className="mono">{v.bars}</td><td className="mono">{v.trades}</td><td className="mono">{num(v.win_rate, 1)}</td>
                 <td className="mono">{num(v.profit_factor)}</td><td className={`mono ${pnlCls(v.net_pnl)}`}>{inr(v.net_pnl)}</td></tr>))}
             </tbody></table>
         </div>
@@ -490,16 +742,32 @@ function Results({ r }: { r: BtResult }) {
               <tr key={k}><td>{k}</td><td className="mono">{v.count}</td><td className={`mono ${pnlCls(v.net)}`}>{inr(v.net)}</td></tr>))}
             </tbody></table>
         </div>
+        <div className="widget">
+          <h3>By month</h3>
+          <table><thead><tr><th>Month</th><th>Net</th></tr></thead>
+            <tbody>{Object.entries(s.monthly ?? {}).map(([k, v]) => (
+              <tr key={k}><td>{k}</td><td className={`mono ${pnlCls(v)}`}>{inr(v)}</td></tr>))}
+            </tbody></table>
+        </div>
+        <div className="widget">
+          <h3>By weekday</h3>
+          <table><thead><tr><th>Day</th><th>Net</th></tr></thead>
+            <tbody>{Object.entries(s.weekday ?? {}).map(([k, v]) => (
+              <tr key={k}><td>{k}</td><td className={`mono ${pnlCls(v)}`}>{inr(v)}</td></tr>))}
+            </tbody></table>
+        </div>
       </div>
       <div className="widget widget-wide">
-        <h3>Trades <span className="meta">newest first · showing {trades.length} of {r.trades_total}</span>
-          {r.trades.length > 200 && <button className="btn-sm" style={{ marginLeft: 8 }} onClick={() => setShowAll(!showAll)}>{showAll ? "fewer" : "show all"}</button>}
+        <h3>Trades <span className="meta">newest first · showing {trades.length} of {r.trades_total}{multiLeg ? " · entry/exit = underlying for multi-leg; hover a row for its legs" : ""}</span>
+          {r.trades.length > 200 && <button type="button" className="btn-sm" style={{ marginLeft: 8 }} onClick={() => setShowAll(!showAll)}>{showAll ? "fewer" : "show all"}</button>}
         </h3>
         <div style={{ maxHeight: 420, overflow: "auto" }}>
           <table>
-            <thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Entry (IST)</th><th>Entry</th><th>Exit (IST)</th><th>Exit</th><th>Reason</th><th>Bars</th><th>Charges</th><th>Net</th></tr></thead>
+            <thead><tr><th>Instrument</th><th>Signal</th><th>Qty</th><th>Entry (IST)</th><th>Entry</th><th>Exit (IST)</th><th>Exit</th><th>Reason</th><th>Bars</th><th>Charges</th><th>Net</th></tr></thead>
             <tbody>{trades.map((t, i) => (
-              <tr key={i}><td>{t.symbol}</td><td><span className={`badge ${t.side === "BUY" ? "buy" : "sell"}`}>{t.side}</span></td>
+              <tr key={i} title={t.legs.map((l) => `${l.side} ${l.qty} ${l.label}: ${l.entry} → ${l.exit}`).join("\n")}>
+                <td>{t.instrument.length > 46 ? `${t.legs.length} legs · ${shortSym(t.symbol)}` : t.instrument.replace(/^NSE:/, "")}</td>
+                <td><span className={`badge ${t.side === "BUY" ? "buy" : "sell"}`}>{t.side === "BUY" ? "LONG" : "SHORT"}</span></td>
                 <td className="mono">{t.qty}</td><td className="mono">{ist(t.entry_t)}</td><td className="mono">{t.entry.toFixed(2)}</td>
                 <td className="mono">{ist(t.exit_t)}</td><td className="mono">{t.exit.toFixed(2)}</td><td>{t.reason}</td>
                 <td className="mono">{t.bars}</td><td className="mono">{t.charges.toFixed(0)}</td><td className={`mono ${pnlCls(t.net)}`}>{t.net.toFixed(0)}</td></tr>))}
@@ -534,35 +802,35 @@ function Optimizer({ spec, cat, range, onApply }: { spec: Spec; cat: Catalog; ra
     }),
   });
   const label = (p: string) => paths.find((x) => x.path === p)?.label ?? p;
+  const axisFor = (p: { path: string; value: number }) => ({ path: p.path, from: p.value, to: p.value ? p.value * 2 : 10, step: p.value >= 4 ? Math.round(p.value / 4) : p.value ? p.value / 4 : 1 });
   return (
     <div className="widget widget-wide">
       <h3>Optimise <span className="meta">grid search over the builder's strategy, {range.start} → {range.end}</span></h3>
       <div style={{ display: "grid", gap: 6, marginBottom: 8 }}>
         {axes.map((a, i) => (
-          <div key={i} style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+          <div key={i} className="algo-operand">
             <select value={a.path} onChange={(e) => {
               const p = paths.find((x) => x.path === e.target.value);
-              setAxes(axes.map((x, j) => (j === i ? { path: e.target.value, from: p?.value ?? 1, to: (p?.value ?? 1) * 2, step: Math.max(1, Math.round((p?.value ?? 1) / 4)) } : x)));
+              if (p) setAxes(axes.map((x, j) => (j === i ? axisFor(p) : x)));
             }}>
-              {paths.map((p) => <option key={p.path} value={p.path}>{p.label}</option>)}
+              {paths.filter((p) => p.path === a.path || !axes.some((x) => x.path === p.path)).map((p) => <option key={p.path} value={p.path}>{p.label}</option>)}
             </select>
             {(["from", "to", "step"] as const).map((k) => (
-              <label key={k} className="meta">{k} <input type="number" step="any" style={inp} value={a[k]} onChange={(e) => setAxes(axes.map((x, j) => (j === i ? { ...x, [k]: Number(e.target.value) } : x)))} /></label>
+              <label key={k} className="meta">{k} <NumInput value={a[k]} onChange={(n) => setAxes(axes.map((x, j) => (j === i ? { ...x, [k]: n ?? 0 } : x)))} /></label>
             ))}
             <span className="meta">{values(a).length} values</span>
-            <button className="btn-sm danger" onClick={() => setAxes(axes.filter((_, j) => j !== i))}>✕</button>
+            <button type="button" className="btn-sm danger" onClick={() => setAxes(axes.filter((_, j) => j !== i))}>✕</button>
           </div>
         ))}
-        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-          <button className="btn-sm" disabled={axes.length >= paths.length} onClick={() => {
+        <div className="algo-operand" style={{ gap: 10 }}>
+          <button type="button" className="btn-sm" disabled={axes.length >= paths.length} onClick={() => {
             const p = paths.find((x) => !axes.some((a) => a.path === x.path));
-            if (!p) return;
-            setAxes([...axes, { path: p.path, from: p.value, to: p.value * 2, step: Math.max(1, Math.round(p.value / 4)) }]);
+            if (p) setAxes([...axes, axisFor(p)]);
           }}>+ parameter</button>
           <label className="meta">rank by <select value={metric} onChange={(e) => setMetric(e.target.value)}>{cat.metrics.map((m) => <option key={m}>{m}</option>)}</select></label>
-          <label className="meta" title="combos with fewer trades are not ranked — a 1-trade 100% win rate means nothing">min trades <input type="number" min={1} style={{ width: 52 }} value={minTrades} onChange={(e) => setMinTrades(Number(e.target.value))} /></label>
+          <label className="meta" title="combos with fewer trades are not ranked — a 1-trade 100% win rate means nothing">min trades <NumInput width={52} value={minTrades} onChange={(n) => setMinTrades(Math.max(1, Math.floor(n ?? 1)))} /></label>
           <span className="meta">{combos} combinations (max 400)</span>
-          <button className="primary" disabled={!combos || combos > 400 || run.isPending} onClick={() => run.mutate()}>{run.isPending ? "Optimising…" : "Run optimisation"}</button>
+          <button type="button" className="primary" disabled={!combos || combos > 400 || run.isPending} onClick={() => run.mutate()}>{run.isPending ? "Optimising…" : "Run optimisation"}</button>
         </div>
       </div>
       {run.error && <div className="pnl-neg">{errMsg(run.error)}</div>}
@@ -574,7 +842,7 @@ function Optimizer({ spec, cat, range, onApply }: { spec: Spec; cat: Catalog; ra
               <thead><tr><th></th>{axes.map((a) => <th key={a.path} title={a.path}>{label(a.path)}</th>)}<th>Trades</th><th>Win %</th><th>PF</th><th>Sharpe</th><th>Max DD</th><th>Net</th></tr></thead>
               <tbody>{run.data.ranked.map((r, i) => (
                 <tr key={i}>
-                  <td><button className="btn-sm" onClick={() => onApply(r.params)}>apply</button></td>
+                  <td><button type="button" className="btn-sm" onClick={() => onApply(r.params)}>apply</button></td>
                   {axes.map((a) => <td key={a.path} className="mono">{r.params[a.path]}</td>)}
                   <td className="mono">{r.trades}</td><td className="mono">{num(r.win_rate, 1)}</td><td className="mono">{num(r.profit_factor)}</td>
                   <td className="mono">{num(r.sharpe)}</td><td className="mono">{inr(r.max_drawdown)}</td><td className={`mono ${pnlCls(r.net_pnl)}`}>{inr(r.net_pnl)}</td>
@@ -608,6 +876,14 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
   const live = (accounts.data?.accounts ?? []).filter((a) => a.broker === "fyers" && !a.paper_mode);
   const st = status.data;
   const ago = st?.last_tick ? Math.round(Date.now() / 1000 - st.last_tick) : null;
+  const nameOf = (id: number) => strategies.data?.strategies.find((s) => s.id === id)?.name ?? String(id);
+  const instLabel = (s: Saved) => {
+    const i = s.spec.instrument;
+    if (!i || i.type === "equity") return "equity";
+    if (i.type === "future") return `futures · ${i.expiry}`;
+    const legs = (s.spec.direction === "short" ? i.legs_short : i.legs_long) ?? [];
+    return `options · ${i.expiry_kind} ${i.expiry} · ${legs.map((l) => `${l.action[0]} ${l.strike === "PREMIUM" ? `₹${l.premium}` : l.strike + (l.steps ? l.steps : "")} ${l.right}`).join(", ")}`;
+  };
   return (
     <>
       {err && <div className="widget widget-wide pnl-neg" style={{ marginBottom: 12 }}>{err}</div>}
@@ -619,74 +895,81 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
         {(strategies.data?.strategies ?? []).length === 0 ? (
           <div className="empty">No saved strategies yet — build one in the Builder tab and press “Save as new”.</div>
         ) : (
-          <table>
-            <thead><tr><th>On</th><th>Strategy</th><th>Symbols</th><th>TF</th><th>Mode</th><th>Open</th><th>Closed</th><th>Realised</th><th></th></tr></thead>
-            <tbody>{strategies.data!.strategies.map((s) => (
-              <tr key={s.id} style={sel === s.id ? { background: "var(--bg-row)" } : undefined}>
-                <td><Toggle on={s.enabled} size="sm" onChange={(on: boolean) => put(s.id, { enabled: on })} /></td>
-                <td><a href="#/algo" onClick={(e) => { e.preventDefault(); setSel(sel === s.id ? null : s.id); }}>{s.name}</a></td>
-                <td className="mono" style={{ maxWidth: 220, overflow: "hidden", textOverflow: "ellipsis" }} title={s.spec.symbols.join(", ")}>{s.spec.symbols.join(", ")}</td>
-                <td className="mono">{s.spec.timeframe}m</td>
-                <td>
-                  <select value={s.mode} onChange={(e) => {
-                    if (e.target.value === "live") {
-                      if (!live.length) { setErr("No real Fyers account — connect one on the Accounts page first."); return; }
-                      const acc = s.account_id && live.some((a) => a.id === s.account_id) ? s.account_id : live[0].id;
-                      const typed = window.prompt(`REAL MONEY: "${s.name}" will place MARKET intraday orders on ${live.find((a) => a.id === acc)?.name}. Type LIVE to confirm.`);
-                      if (typed !== "LIVE") return;
-                      put(s.id, { mode: "live", account_id: acc, confirm: "LIVE" });
-                    } else put(s.id, { mode: "paper" });
-                  }}>
-                    <option value="paper">paper</option>
-                    <option value="live">LIVE</option>
-                  </select>
-                  {s.mode === "live" && <span className="badge danger" style={{ marginLeft: 4 }}>REAL ₹</span>}
-                </td>
-                <td className="mono">{s.open_positions}</td>
-                <td className="mono">{s.closed_trades}</td>
-                <td className={`mono ${pnlCls(s.realized_pnl)}`}>{inr(s.realized_pnl)}</td>
-                <td style={{ whiteSpace: "nowrap" }}>
-                  <button className="btn-sm" onClick={() => onEdit(s)}>edit</button>{" "}
-                  <button className="btn-sm" disabled={!s.open_positions} onClick={async () => {
-                    if (!window.confirm(`Square off every open position of "${s.name}" now?`)) return;
-                    try { const r = await api.post<{ closed: number; failed: string[] }>(`/api/algo/strategies/${s.id}/squareoff`, {}); setErr(r.failed.length ? `could not close: ${r.failed.join(", ")}` : null); } catch (e) { setErr(errMsg(e)); }
-                    refresh();
-                  }}>square off</button>{" "}
-                  <button className="btn-sm danger" onClick={async () => {
-                    if (!window.confirm(`Delete "${s.name}" and its trade history?`)) return;
-                    try { await api.delete(`/api/algo/strategies/${s.id}`); } catch (e) { setErr(errMsg(e)); }
-                    refresh();
-                  }}>delete</button>
-                </td>
-              </tr>))}
-            </tbody>
-          </table>
+          <div style={{ overflowX: "auto" }}>
+            <table>
+              <thead><tr><th>On</th><th>Strategy</th><th>Symbols</th><th>Trades</th><th>TF</th><th>Mode</th><th>Open</th><th>Closed</th><th>Realised</th><th></th></tr></thead>
+              <tbody>{strategies.data!.strategies.map((s) => (
+                <tr key={s.id} style={sel === s.id ? { background: "var(--bg-row)" } : undefined}>
+                  <td><Toggle on={s.enabled} size="sm" onChange={(on: boolean) => put(s.id, { enabled: on })} /></td>
+                  <td><a href="#/algo" onClick={(e) => { e.preventDefault(); setSel(sel === s.id ? null : s.id); }}>{s.name}</a></td>
+                  <td className="mono" style={{ maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis" }} title={s.spec.symbols.join(", ")}>{s.spec.symbols.map(shortSym).join(", ")}</td>
+                  <td className="meta" style={{ maxWidth: 240, whiteSpace: "normal" }}>{instLabel(s)}</td>
+                  <td className="mono">{tfLabel(s.spec.timeframe)}</td>
+                  <td>
+                    <select value={s.mode} onChange={(e) => {
+                      if (e.target.value === "live") {
+                        if (!live.length) { setErr("No real Fyers account — connect one on the Accounts page first."); return; }
+                        const acc = s.account_id && live.some((a) => a.id === s.account_id) ? s.account_id : live[0].id;
+                        const typed = window.prompt(`REAL MONEY: "${s.name}" will place MARKET intraday orders on ${live.find((a) => a.id === acc)?.name}. Type LIVE to confirm.`);
+                        if (typed !== "LIVE") return;
+                        put(s.id, { mode: "live", account_id: acc, confirm: "LIVE" });
+                      } else put(s.id, { mode: "paper" });
+                    }}>
+                      <option value="paper">paper</option>
+                      <option value="live">LIVE</option>
+                    </select>
+                    {s.mode === "live" && <span className="badge danger" style={{ marginLeft: 4 }}>REAL ₹</span>}
+                  </td>
+                  <td className="mono">{s.open_positions}</td>
+                  <td className="mono">{s.closed_trades}</td>
+                  <td className={`mono ${pnlCls(s.realized_pnl)}`}>{inr(s.realized_pnl)}</td>
+                  <td style={{ whiteSpace: "nowrap" }}>
+                    <button type="button" className="btn-sm" onClick={() => onEdit(s)}>edit</button>{" "}
+                    <button type="button" className="btn-sm" disabled={!s.open_positions} onClick={async () => {
+                      if (!window.confirm(`Square off every open position of "${s.name}" now?`)) return;
+                      try { const r = await api.post<{ closed: number; failed: string[] }>(`/api/algo/strategies/${s.id}/squareoff`, {}); setErr(r.failed.length ? `could not close: ${r.failed.join(", ")}` : null); } catch (e) { setErr(errMsg(e)); }
+                      refresh();
+                    }}>square off</button>{" "}
+                    <button type="button" className="btn-sm danger" onClick={async () => {
+                      if (!window.confirm(`Delete "${s.name}" and its trade history?`)) return;
+                      try { await api.delete(`/api/algo/strategies/${s.id}`); } catch (e) { setErr(errMsg(e)); }
+                      refresh();
+                    }}>delete</button>
+                  </td>
+                </tr>))}
+              </tbody>
+            </table>
+          </div>
         )}
       </div>
       <div className="widget widget-wide" style={{ marginBottom: 12 }}>
         <h3>Open positions</h3>
         {!st?.open.length ? <div className="empty">flat</div> : (
-          <table>
-            <thead><tr><th>Strategy</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Mode</th><th>Entry</th><th>LTP</th><th>Stop</th><th>Trail</th><th>Target</th><th>Unrealised</th><th>Since</th></tr></thead>
-            <tbody>{st.open.map((t) => (
-              <tr key={t.id}><td>{strategies.data?.strategies.find((s) => s.id === t.strategy_id)?.name ?? t.strategy_id}</td><td>{t.symbol}</td>
-                <td><span className={`badge ${t.side === "BUY" ? "buy" : "sell"}`}>{t.side}</span></td><td className="mono">{t.quantity}</td><td>{t.mode}</td>
-                <td className="mono">{num(t.entry_price)}</td><td className="mono">{num(t.ltp)}</td><td className="mono">{num(t.stop_loss)}</td>
-                <td className="mono">{num(t.trail_stop)}</td><td className="mono">{num(t.target)}</td>
-                <td className={`mono ${pnlCls(t.unrealized)}`}>{inr(t.unrealized)}</td><td className="mono">{isoIst(t.entry_at)}</td></tr>))}
-            </tbody>
-          </table>
+          <div style={{ overflowX: "auto" }}>
+            <table>
+              <thead><tr><th>Strategy</th><th>Instrument</th><th>Signal</th><th>Qty</th><th>Mode</th><th>Ref entry</th><th>Ref LTP</th><th>Stop</th><th>Trail</th><th>Target</th><th>MTM</th><th>Since</th></tr></thead>
+              <tbody>{st.open.map((t) => (
+                <tr key={t.id} title={(t.legs ?? []).map((l) => `${l.act > 0 ? "BUY" : "SELL"} ${l.qty} ${l.label ?? l.symbol}: ${num(l.entry)} → ${num(l.ltp)}`).join("\n")}>
+                  <td>{nameOf(t.strategy_id)}</td><td>{(t.instrument ?? t.symbol).replace(/NSE:/g, "")}</td>
+                  <td><span className={`badge ${t.side === "BUY" ? "buy" : "sell"}`}>{t.side === "BUY" ? "LONG" : "SHORT"}</span></td><td className="mono">{t.quantity}</td><td>{t.mode}</td>
+                  <td className="mono">{num(t.entry_price)}</td><td className="mono">{num(t.ltp)}</td><td className="mono">{t.be_on ? `BE ${num(t.entry_price)}` : num(t.stop_loss)}</td>
+                  <td className="mono">{num(t.trail_stop)}</td><td className="mono">{num(t.target)}</td>
+                  <td className={`mono ${pnlCls(t.unrealized)}`}>{inr(t.unrealized)}</td><td className="mono">{isoIst(t.entry_at)}</td></tr>))}
+              </tbody>
+            </table>
+          </div>
         )}
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(380px, 1fr))", gap: 12 }}>
         <div className="widget">
-          <h3>Trades {sel ? <span className="meta">— {strategies.data?.strategies.find((s) => s.id === sel)?.name} (click the name again for all)</span> : <span className="meta">— all strategies</span>}</h3>
+          <h3>Trades {sel ? <span className="meta">— {nameOf(sel)} (click the name again for all)</span> : <span className="meta">— all strategies</span>}</h3>
           <div style={{ maxHeight: 420, overflow: "auto" }}>
             {!trades.data?.trades.length ? <div className="empty">none yet</div> : (
               <table>
-                <thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Status</th><th>Entry</th><th>Exit</th><th>Reason</th><th>Net</th></tr></thead>
+                <thead><tr><th>Instrument</th><th>Signal</th><th>Qty</th><th>Status</th><th>Entry</th><th>Exit</th><th>Reason</th><th>Net</th></tr></thead>
                 <tbody>{trades.data.trades.map((t) => (
-                  <tr key={t.id} title={t.note ?? ""}><td>{t.symbol}</td><td>{t.side}</td><td className="mono">{t.quantity}</td>
+                  <tr key={t.id} title={[t.note ?? "", ...(t.legs ?? []).map((l) => `${l.act > 0 ? "BUY" : "SELL"} ${l.qty} ${l.label ?? l.symbol}: ${num(l.entry)} → ${num(l.exit)}`)].filter(Boolean).join("\n")}>
+                    <td>{(t.instrument ?? t.symbol).replace(/NSE:/g, "")}</td><td>{t.side === "BUY" ? "LONG" : "SHORT"}</td><td className="mono">{t.quantity}</td>
                     <td>{t.status}{t.mode === "live" ? " ₹" : ""}</td>
                     <td className="mono">{num(t.entry_price)} <span className="meta">{isoIst(t.entry_at)}</span></td>
                     <td className="mono">{num(t.exit_price)} <span className="meta">{t.exit_at ? isoIst(t.exit_at) : ""}</span></td>
@@ -712,11 +995,11 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
 }
 
 function DataTab() {
-  const [symbols, setSymbols] = useState("NSE:SBIN-EQ, NSE:RELIANCE-EQ, NSE:NIFTY50-INDEX");
+  const [symbols, setSymbols] = useState<string[]>(["NSE:NIFTY50-INDEX", "NSE:SBIN-EQ"]);
   const [days, setDays] = useState(365);
   const dl = useMutation({
     mutationFn: () => longPost<{ results: { symbol: string; note: string | null; coverage: { first: number; last: number; rows: number } | null }[] }>(
-      "/api/algo/data/download", { symbols: symbols.split(/[\s,]+/).filter(Boolean), days }),
+      "/api/algo/data/download", { symbols, days }),
   });
   const sync = useMutation({ mutationFn: () => longPost<{ symbols: number; ok: number; failed: string[] }>("/api/algo/sync", {}) });
   return (
@@ -724,13 +1007,13 @@ function DataTab() {
       <h3>Market data <span className="meta">1-minute candles from Fyers, stored locally; every timeframe is built from these</span></h3>
       <p className="meta" style={{ marginTop: 0 }}>
         Backtests download whatever they're missing on their own. Every trading day after 15:45 IST the runner also downloads that day's candles for every
-        symbol any saved strategy uses. Use this to pre-load history in bulk (≈4 Fyers calls per symbol-year).
+        symbol any saved strategy uses (plus India VIX for option strategies). Use this to pre-load history in bulk (≈4 Fyers calls per symbol-year).
       </p>
-      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 8 }}>
-        <input style={{ width: 460, maxWidth: "100%" }} value={symbols} onChange={(e) => setSymbols(e.target.value)} placeholder="NSE:SBIN-EQ, RELIANCE, NSE:NIFTYBANK-INDEX" />
-        <label className="meta">days <input type="number" min={1} max={1098} style={inp} value={days} onChange={(e) => setDays(Number(e.target.value))} /></label>
-        <button className="primary" disabled={dl.isPending} onClick={() => dl.mutate()}>{dl.isPending ? "Downloading…" : "Download"}</button>
-        <button disabled={sync.isPending} onClick={() => sync.mutate()} title="the last 5 days for every strategy symbol">{sync.isPending ? "Syncing…" : "Sync strategy symbols now"}</button>
+      <SymbolPicker value={symbols} onChange={setSymbols} />
+      <div className="algo-operand" style={{ gap: 10, margin: "8px 0" }}>
+        <label className="meta">days <NumInput value={days} onChange={(n) => setDays(Math.max(1, Math.min(1098, Math.floor(n ?? 1))))} /></label>
+        <button type="button" className="primary" disabled={dl.isPending || !symbols.length} onClick={() => dl.mutate()}>{dl.isPending ? "Downloading…" : "Download"}</button>
+        <button type="button" disabled={sync.isPending} onClick={() => sync.mutate()} title="the last 5 days for every strategy symbol">{sync.isPending ? "Syncing…" : "Sync strategy symbols now"}</button>
       </div>
       {(dl.error || sync.error) && <div className="pnl-neg">{errMsg(dl.error ?? sync.error)}</div>}
       {sync.data && <div className="meta">synced {sync.data.ok}/{sync.data.symbols} symbols {sync.data.failed.join("; ")}</div>}
@@ -758,31 +1041,37 @@ export default function Algo() {
   const cat = useQuery({ queryKey: ["algo", "catalog"], queryFn: () => api.get<Catalog>("/api/algo/indicators"), staleTime: Infinity });
   const qc = useQueryClient();
   const [tab, setTab] = useState<Tab>("builder");
-  const [spec, setSpecRaw] = useState<Spec | null>(null);
+  const [spec, setSpec] = useState<Spec | null>(null);
   const [name, setName] = useState("My strategy");
   const [editing, setEditing] = useState<number | null>(null);
   const [range, setRange] = useState({ start: daysAgo(180), end: daysAgo(0) });
   const [msg, setMsg] = useState<string | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   // Restore the draft (or start from the server defaults + the first template).
   useEffect(() => {
     if (!cat.data || spec) return;
-    let draft: { spec: Spec; name: string; editing: number | null } | null = null;
+    let draft: { spec: Partial<Spec>; name: string; editing: number | null } | null = null;
     try { draft = JSON.parse(localStorage.getItem(DRAFT_KEY) ?? "null"); } catch { /* private mode */ }
     if (draft?.spec) {
-      setSpecRaw({ ...clone(cat.data.defaults), ...draft.spec });
+      setSpec(withDefaults(cat.data.defaults, draft.spec));
       setName(draft.name);
       setEditing(draft.editing);
     } else {
-      setSpecRaw({ ...clone(cat.data.defaults), symbols: ["NSE:SBIN-EQ"], ...clone(TEMPLATES[0].spec) } as Spec);
+      setSpec(withDefaults(cat.data.defaults, { symbols: ["NSE:SBIN-EQ"], ...TEMPLATES[0].spec }));
+      setName(TEMPLATES[0].name);
     }
   }, [cat.data, spec]);
-  const setSpec = setSpecRaw;
   useEffect(() => {
     if (!spec) return;
     try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ spec, name, editing })); } catch { /* ignore */ }
   }, [spec, name, editing]);
-  const [symText, setSymText] = useState<string | null>(null);
+
+  const first = spec?.symbols[0];
+  const info = useQuery({
+    queryKey: ["algo", "instrument", first], enabled: !!first, staleTime: 300000,
+    queryFn: () => api.get<InstInfo>(`/api/algo/instrument?symbol=${encodeURIComponent(first!)}`),
+  });
 
   const bt = useMutation({
     mutationFn: () => longPost<BtResult>("/api/algo/backtest", { spec: tidy(spec!), ...range }),
@@ -801,26 +1090,39 @@ export default function Algo() {
     onError: (e) => setMsg(errMsg(e)),
   });
 
-  if (cat.isLoading || !spec) return <div className="empty">loading…</div>;
-  if (cat.error || !cat.data) return <div className="empty">Algo API unavailable: {errMsg(cat.error)}</div>;
+  if (cat.isLoading || (!spec && !cat.error)) return <div className="empty">loading…</div>;
+  if (cat.error || !cat.data || !spec) return <div className="empty">Algo API unavailable: {errMsg(cat.error)}</div>;
   const c = cat.data;
   const upd = (patch: Partial<Spec>) => setSpec({ ...spec, ...patch });
+  const inst = spec.instrument;
+  const updInst = (patch: Partial<Instrument>) => upd({ instrument: { ...inst, ...patch } });
   const showLong = spec.direction !== "short";
   const showShort = spec.direction !== "long";
+  const fno = inst.type !== "equity";
+  const multi = inst.type === "option" && ((showLong && inst.legs_long.length > 1) || (showShort && inst.legs_short.length > 1));
+  const sizingModes = c.sizing.filter((m) => (fno ? m !== "qty" : m !== "lots"));
+  const SIZE_LABEL: Record<string, string> = {
+    qty: "fixed shares", lots: "fixed lots", amount: "₹ capital per trade", pct_equity: "% of equity per trade",
+    risk: "₹ risk per trade (needs stop)", risk_pct: "% of equity at risk (needs stop)",
+  };
   const exitBlock = (key: "exit_long" | "exit_short", label: string) => {
     const g = spec[key];
     return (
       <div>
         <div className="meta" style={{ marginBottom: 4 }}>
           {label}{" "}
-          {g ? <button className="btn-sm" onClick={() => upd({ [key]: null } as Partial<Spec>)}>remove</button>
-            : <button className="btn-sm" onClick={() => upd({ [key]: G([]) } as Partial<Spec>)}>+ add exit conditions</button>}
-          {!g && <span> — exits by stop / target / trailing / square-off only</span>}
+          {g ? <button type="button" className="btn-sm" onClick={() => upd({ [key]: null } as Partial<Spec>)}>remove</button>
+            : <button type="button" className="btn-sm" onClick={() => upd({ [key]: G([]) } as Partial<Spec>)}>+ add exit conditions</button>}
+          {!g && <span> — exits by stop / target / trailing / MTM / square-off only</span>}
         </div>
-        {g && <GroupEditor g={g} cat={c} onChange={(x) => upd({ [key]: x } as Partial<Spec>)} />}
+        {g && <GroupEditor g={g} cat={c} baseTf={spec.timeframe} onChange={(x) => upd({ [key]: x } as Partial<Spec>)} />}
       </div>
     );
   };
+  const levelKinds = inst.type === "option" && inst.levels_on === "instrument" ? ["pct", "points"] : ["pct", "points", "atr"];
+  const levelsHint = inst.type === "option"
+    ? inst.levels_on === "instrument" ? "measured on the option premium" : "measured on the underlying's price"
+    : inst.type === "future" && inst.levels_on === "instrument" ? "measured on the futures price" : "measured on the traded price";
 
   return (
     <div className="algo">
@@ -829,15 +1131,15 @@ export default function Algo() {
       </div>
       <div className="tabs">
         {(["builder", "optimize", "automations", "data"] as Tab[]).map((t) => (
-          <button key={t} className={`tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
+          <button type="button" key={t} className={`tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
             {{ builder: "Builder & backtest", optimize: "Optimise", automations: "Automations", data: "Data" }[t]}
           </button>
         ))}
       </div>
 
       {tab === "automations" && <Automations onEdit={(s) => {
-        setName(s.name); setEditing(s.id); setSymText(null);
-        setSpec({ ...clone(c.defaults), ...clone(s.spec) }); setTab("builder");
+        setName(s.name); setEditing(s.id);
+        setSpec(withDefaults(c.defaults, s.spec)); setTab("builder");
       }} />}
       {tab === "data" && <DataTab />}
       {tab === "optimize" && (
@@ -853,93 +1155,202 @@ export default function Algo() {
       {tab === "builder" && (
         <>
           <div className="widget widget-wide" style={{ marginBottom: 12 }}>
-            <h3>Strategy {editing ? <span className="meta">editing saved #{editing}</span> : <span className="meta">unsaved draft</span>}</h3>
-            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center", marginBottom: 10 }}>
-              <label className="meta">name <input value={name} onChange={(e) => setName(e.target.value)} style={{ width: 200 }} /></label>
-              <label className="meta">template{" "}
+            <h3>Strategy {editing ? <span className="meta">editing saved #{editing}</span> : <span className="meta">unsaved draft</span>}
+              <span style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
+                <button type="button" className="btn-sm" onClick={() => download(`${name.replace(/[^\w-]+/g, "_")}.json`, JSON.stringify({ name, spec: tidy(spec) }, null, 2))}>⬇ export</button>
+                <button type="button" className="btn-sm" onClick={() => fileRef.current?.click()}>⬆ import</button>
+                <input ref={fileRef} type="file" accept="application/json,.json" style={{ display: "none" }} onChange={async (e) => {
+                  const f = e.target.files?.[0];
+                  e.target.value = "";
+                  if (!f) return;
+                  try {
+                    const j = JSON.parse(await f.text()) as { name?: string; spec?: Partial<Spec> } & Partial<Spec>;
+                    setSpec(withDefaults(c.defaults, j.spec ?? j)); setName(j.name ?? f.name.replace(/\.json$/, "")); setEditing(null);
+                    setMsg("Imported — save it to keep it.");
+                  } catch (err) { setMsg(`Import failed: ${errMsg(err)}`); }
+                }} />
+              </span>
+            </h3>
+            <div className="algo-operand" style={{ gap: 12, marginBottom: 10 }}>
+              <label className="meta">name <input value={name} onChange={(e) => setName(e.target.value)} style={{ width: 240 }} /></label>
+              <label className="meta">template
                 <select value="" onChange={(e) => {
                   const t = TEMPLATES[Number(e.target.value)];
-                  if (t) { setSpec({ ...clone(c.defaults), symbols: spec.symbols, ...clone(t.spec) } as Spec); setName(t.name); setEditing(null); }
+                  if (t) { setSpec(withDefaults(c.defaults, { symbols: t.symbols ?? spec.symbols, ...t.spec })); setName(t.name); setEditing(null); }
                 }}>
                   <option value="">— load a template —</option>
                   {TEMPLATES.map((t, i) => <option key={t.name} value={i}>{t.name}</option>)}
                 </select>
               </label>
-              <label className="meta">symbols{" "}
-                <input style={{ width: 300 }} value={symText ?? spec.symbols.join(", ")}
-                  onChange={(e) => setSymText(e.target.value)}
-                  onBlur={() => { if (symText !== null) { upd({ symbols: symText.split(/[\s,]+/).filter(Boolean).map((x) => x.toUpperCase()) }); setSymText(null); } }}
-                  placeholder="NSE:SBIN-EQ, RELIANCE, NSE:NIFTYBANK-INDEX" />
-              </label>
-              <label className="meta">timeframe{" "}
+              <label className="meta">timeframe
                 <select value={spec.timeframe} onChange={(e) => upd({ timeframe: Number(e.target.value) })}>
-                  {c.timeframes.map((t) => <option key={t} value={t}>{t >= 60 ? `${t / 60}h` : `${t}m`}</option>)}
+                  {c.timeframes.map((t) => <option key={t} value={t}>{tfLabel(t)}</option>)}
                 </select>
               </label>
-              <label className="meta">direction{" "}
+              <label className="meta">direction
                 <select value={spec.direction} onChange={(e) => upd({ direction: e.target.value as Spec["direction"] })}>
-                  <option value="long">long only</option><option value="short">short only</option><option value="both">long + short</option>
+                  <option value="long">long / bullish only</option><option value="short">short / bearish only</option><option value="both">both</option>
                 </select>
               </label>
             </div>
+            <div className="meta" style={{ marginBottom: 4 }}>Symbols — signals are computed on these (stocks or indices)</div>
+            <SymbolPicker value={spec.symbols} onChange={(symbols) => upd({ symbols })} />
+          </div>
+
+          <div className="widget widget-wide" style={{ marginBottom: 12 }}>
+            <h3>What to trade
+              {first && info.data && <span className="meta">
+                {shortSym(first)}: {info.data.fno ? `F&O · lot ${info.data.lot}${info.data.weekly ? " · weekly expiries" : " · monthly expiries"}` : "no F&O contracts (equity only)"}
+              </span>}
+            </h3>
+            <div className="algo-operand" style={{ gap: 12 }}>
+              {(["equity", "future", "option"] as const).map((t) => (
+                <label key={t} className="meta" style={{ cursor: "pointer" }}>
+                  <input type="radio" name="inst" checked={inst.type === t} onChange={() => upd({
+                    instrument: { ...inst, type: t },
+                    sizing: { ...spec.sizing, mode: t === "equity" ? (spec.sizing.mode === "lots" ? "qty" : spec.sizing.mode) : (spec.sizing.mode === "qty" ? "lots" : spec.sizing.mode) },
+                  })} />
+                  {{ equity: "Equity / index (cash)", future: "Futures", option: "Options" }[t]}
+                </label>
+              ))}
+              {fno && (
+                <label className="meta">expiry
+                  <select value={inst.expiry} onChange={(e) => updInst({ expiry: e.target.value as Instrument["expiry"] })}>
+                    <option value="current">current</option><option value="next">next</option>
+                  </select>
+                  {inst.type === "option" && (
+                    <select value={inst.expiry_kind} onChange={(e) => updInst({ expiry_kind: e.target.value as Instrument["expiry_kind"] })}>
+                      <option value="weekly">weekly (NIFTY, SENSEX)</option><option value="monthly">monthly</option>
+                    </select>
+                  )}
+                </label>
+              )}
+              {fno && (
+                <label className="meta" title="where stop / target / trailing / breakeven are measured">levels on
+                  <select value={inst.levels_on} onChange={(e) => updInst({ levels_on: e.target.value as Instrument["levels_on"] })}>
+                    <option value="instrument" disabled={multi}>{inst.type === "option" ? "the option premium" : "the futures price"}</option>
+                    <option value="underlying">the underlying (spot)</option>
+                  </select>
+                </label>
+              )}
+            </div>
+            {inst.type === "option" && (
+              <>
+                <div className="algo-operand" style={{ gap: 8, marginTop: 8 }}>
+                  <span className="meta">preset</span>
+                  {LEG_PRESETS.map((p) => (
+                    <button key={p.name} type="button" className="btn-sm ghost" onClick={() => updInst({
+                      legs_long: clone(p.long), legs_short: clone(p.short),
+                      levels_on: p.long.length > 1 ? "underlying" : inst.levels_on,
+                    })}>{p.name}</button>
+                  ))}
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(380px, 1fr))", gap: 12, marginTop: 8 }}>
+                  {showLong && <LegsEditor title="On a LONG / bullish signal" legs={inst.legs_long} onChange={(legs_long) => updInst({ legs_long })} />}
+                  {showShort && <LegsEditor title="On a SHORT / bearish signal" legs={inst.legs_short} onChange={(legs_short) => updInst({ legs_short })} />}
+                </div>
+                <div className="algo-operand" style={{ gap: 8, marginTop: 8 }}>
+                  <label className="meta" title="backtests only — live trades use real premiums">backtest IV
+                    <select value={inst.iv.source} onChange={(e) => updInst({ iv: { ...inst.iv, source: e.target.value } })}>
+                      <option value="auto">auto (India VIX for indices, realised vol for stocks)</option>
+                      <option value="vix">India VIX</option><option value="hv">20-day realised volatility</option><option value="fixed">fixed %</option>
+                    </select>
+                    {inst.iv.source === "fixed" && <NumInput width={48} value={inst.iv.value} onChange={(n) => updInst({ iv: { ...inst.iv, value: n ?? 15 } })} />}
+                  </label>
+                  <span className="meta">Strikes ATM/ITM/OTM are counted in the underlying's strike steps. Multi-leg positions exit together — use MTM ₹ stops.</span>
+                </div>
+              </>
+            )}
+          </div>
+
+          <div className="widget widget-wide" style={{ marginBottom: 12 }}>
+            <h3>Entry & exit conditions <span className="meta">evaluated on each completed {tfLabel(spec.timeframe)} candle of the underlying</span></h3>
             <div style={{ display: "grid", gap: 12 }}>
               {showLong && (
                 <div>
-                  <div className="meta" style={{ marginBottom: 4, color: "var(--green)" }}>BUY when</div>
-                  <GroupEditor g={spec.entry_long} cat={c} onChange={(g) => upd({ entry_long: g })} />
+                  <div className="meta" style={{ marginBottom: 4, color: "var(--green)" }}>LONG / bullish signal when</div>
+                  <GroupEditor g={spec.entry_long} cat={c} baseTf={spec.timeframe} onChange={(g) => upd({ entry_long: g })} />
                 </div>
               )}
               {showLong && exitBlock("exit_long", "Exit long when")}
               {showShort && (
                 <div>
-                  <div className="meta" style={{ marginBottom: 4, color: "var(--red)" }}>SELL SHORT when</div>
-                  <GroupEditor g={spec.entry_short} cat={c} onChange={(g) => upd({ entry_short: g })} />
+                  <div className="meta" style={{ marginBottom: 4, color: "var(--red)" }}>SHORT / bearish signal when</div>
+                  <GroupEditor g={spec.entry_short} cat={c} baseTf={spec.timeframe} onChange={(g) => upd({ entry_short: g })} />
                 </div>
               )}
-              {showShort && exitBlock("exit_short", "Cover short when")}
+              {showShort && exitBlock("exit_short", "Exit short when")}
             </div>
           </div>
 
           <div className="widget widget-wide" style={{ marginBottom: 12 }}>
-            <h3>Risk, sizing & session</h3>
-            <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "center" }}>
-              <LevelEditor label="stop loss" v={spec.stop_loss} onChange={(l) => upd({ stop_loss: l })} />
-              <LevelEditor label="target" v={spec.target} allowRR onChange={(l) => upd({ target: l })} />
-              <LevelEditor label="trailing stop" v={spec.trailing} onChange={(l) => upd({ trailing: l })} />
+            <h3>Stop loss, target & risk <span className="meta">price levels {levelsHint}</span></h3>
+            {multi && inst.levels_on === "instrument" && <div className="meta pnl-neg">Multi-leg: put levels on the underlying or use MTM ₹ stops.</div>}
+            <div className="algo-operand" style={{ gap: 14 }}>
+              <LevelEditor label="stop loss" v={spec.stop_loss} kinds={levelKinds} onChange={(l) => upd({ stop_loss: l })} />
+              <LevelEditor label="target" v={spec.target} kinds={[...levelKinds, "rr"]} onChange={(l) => upd({ target: l })} />
+              <LevelEditor label="trailing stop" v={spec.trailing} kinds={levelKinds} activate onChange={(l) => upd({ trailing: l })}
+                hint="follows the best price by this gap; 'after' delays it until that much profit" />
+              <LevelEditor label="move stop to cost after" v={spec.breakeven} kinds={levelKinds} onChange={(l) => upd({ breakeven: l })}
+                hint="once the trade is this far in profit, the stop moves to the entry price" />
             </div>
-            <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "center", marginTop: 8 }}>
-              <label className="meta">size{" "}
-                <select value={spec.sizing.mode} onChange={(e) => upd({ sizing: { ...spec.sizing, mode: e.target.value } })}>
-                  <option value="qty">fixed shares</option><option value="amount">₹ per trade</option><option value="risk">₹ risk per trade (needs stop)</option>
-                </select>
-                <input type="number" min={1} style={{ width: 90 }} value={spec.sizing.value} onChange={(e) => upd({ sizing: { ...spec.sizing, value: Number(e.target.value) } })} />
-              </label>
-              <label className="meta">max trades / day / symbol <input type="number" min={1} style={{ width: 48 }} value={spec.max_trades_per_day} onChange={(e) => upd({ max_trades_per_day: Number(e.target.value) })} /></label>
+            <div className="algo-operand" style={{ gap: 14, marginTop: 8 }}>
+              <span className="meta" style={{ color: "var(--text)" }}>Position MTM:</span>
+              <Rupee label="stop" value={spec.mtm.stop} onChange={(v) => upd({ mtm: { ...spec.mtm, stop: v } })} hint="exit when the position's P&L falls to −₹X" />
+              <Rupee label="target" value={spec.mtm.target} onChange={(v) => upd({ mtm: { ...spec.mtm, target: v } })} hint="exit when the position's P&L reaches +₹X" />
+              <Rupee label="trail after" value={spec.mtm.trail_start} onChange={(v) => upd({ mtm: { ...spec.mtm, trail_start: v } })} hint="once P&L has reached ₹X…" />
+              <Rupee label="by" value={spec.mtm.trail_gap} onChange={(v) => upd({ mtm: { ...spec.mtm, trail_gap: v } })} hint="…exit if it gives back ₹Y from its peak" />
+            </div>
+            <div className="algo-operand" style={{ gap: 14, marginTop: 8 }}>
+              <span className="meta" style={{ color: "var(--text)" }}>Per day:</span>
+              <Rupee label="max loss" value={spec.daily.max_loss} onChange={(v) => upd({ daily: { ...spec.daily, max_loss: v } })} hint="realised + open P&L for the day; hit it and everything is flattened, no more entries today" />
+              <Rupee label="max profit" value={spec.daily.max_profit} onChange={(v) => upd({ daily: { ...spec.daily, max_profit: v } })} hint="lock the day in once this much is made" />
+              <label className="meta">max trades / symbol <NumInput width={44} value={spec.max_trades_per_day} onChange={(n) => upd({ max_trades_per_day: Math.max(1, Math.floor(n ?? 1)) })} /></label>
+              <label className="meta" title="after an exit, wait this many candles before re-entering the same symbol">re-entry cooldown <NumInput width={44} value={spec.cooldown_bars} onChange={(n) => upd({ cooldown_bars: Math.max(0, Math.floor(n ?? 0)) })} /> bars</label>
+              <label className="meta" title="exit a position that has been open this many candles">time stop <NumInput width={44} allowEmpty placeholder="off" value={spec.max_bars} onChange={(n) => upd({ max_bars: n === null ? null : Math.max(1, Math.floor(n)) })} /> bars</label>
+            </div>
+            <div className="algo-operand" style={{ gap: 14, marginTop: 8 }}>
               {(["start", "end", "square_off"] as const).map((k) => (
-                <label key={k} className="meta">{k === "start" ? "entries from" : k === "end" ? "entries until" : "square off"}{" "}
+                <label key={k} className="meta">{k === "start" ? "entries from" : k === "end" ? "entries until" : "square off"}
                   <input type="time" value={spec.session[k]} min="09:15" max="15:29" onChange={(e) => upd({ session: { ...spec.session, [k]: e.target.value } })} />
                 </label>
               ))}
             </div>
-            <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "center", marginTop: 8 }}>
-              <label className="meta">capital ₹ <input type="number" min={1} style={{ width: 100 }} value={spec.capital} onChange={(e) => upd({ capital: Number(e.target.value) })} /></label>
-              <label className="meta">slippage % <input type="number" step="0.01" min={0} style={inp} value={spec.costs.slippage_pct} onChange={(e) => upd({ costs: { ...spec.costs, slippage_pct: Number(e.target.value) } })} /></label>
-              <label className="meta"><input type="checkbox" checked={spec.costs.charges} onChange={(e) => upd({ costs: { ...spec.costs, charges: e.target.checked } })} /> Indian intraday charges (brokerage, STT, GST, stamp…)</label>
+          </div>
+
+          <div className="widget widget-wide" style={{ marginBottom: 12 }}>
+            <h3>Sizing & portfolio <span className="meta">one capital pool shared by every symbol in the strategy</span></h3>
+            <div className="algo-operand" style={{ gap: 14 }}>
+              <label className="meta">size
+                <select value={spec.sizing.mode} onChange={(e) => upd({ sizing: { ...spec.sizing, mode: e.target.value } })}>
+                  {sizingModes.map((m) => <option key={m} value={m}>{SIZE_LABEL[m]}</option>)}
+                </select>
+                <NumInput width={80} value={spec.sizing.value} onChange={(n) => upd({ sizing: { ...spec.sizing, value: n ?? 1 } })} />
+                {fno && info.data?.lot ? <span>× {info.data.lot} per lot</span> : null}
+              </label>
+              <label className="meta">capital ₹ <NumInput width={100} value={spec.portfolio.capital} onChange={(n) => upd({ portfolio: { ...spec.portfolio, capital: n ?? 100000 } })} /></label>
+              <label className="meta" title="intraday margin multiplier: equity MIS ≈ 5, futures / written options ≈ 6–9. Bought options always need the full premium.">leverage × <NumInput width={44} value={spec.portfolio.leverage} onChange={(n) => upd({ portfolio: { ...spec.portfolio, leverage: n ?? 1 } })} /></label>
+              <label className="meta">max open positions <NumInput width={44} value={spec.portfolio.max_positions} onChange={(n) => upd({ portfolio: { ...spec.portfolio, max_positions: Math.max(1, Math.floor(n ?? 1)) } })} /></label>
+              <label className="meta"><input type="checkbox" checked={spec.portfolio.compounding} onChange={(e) => upd({ portfolio: { ...spec.portfolio, compounding: e.target.checked } })} /> compound (size from current equity)</label>
+            </div>
+            <div className="algo-operand" style={{ gap: 14, marginTop: 8 }}>
+              <label className="meta">slippage % <NumInput width={52} value={spec.costs.slippage_pct} onChange={(n) => upd({ costs: { ...spec.costs, slippage_pct: n ?? 0 } })} /></label>
+              <label className="meta"><input type="checkbox" checked={spec.costs.charges} onChange={(e) => upd({ costs: { ...spec.costs, charges: e.target.checked } })} /> Indian charges by segment (brokerage, STT, exchange, GST, stamp)</label>
             </div>
           </div>
 
           <div className="widget widget-wide" style={{ marginBottom: 12 }}>
-            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+            <div className="algo-operand" style={{ gap: 10 }}>
               <label className="meta">from <input type="date" value={range.start} onChange={(e) => setRange({ ...range, start: e.target.value })} /></label>
               <label className="meta">to <input type="date" value={range.end} onChange={(e) => setRange({ ...range, end: e.target.value })} /></label>
               {[30, 90, 180, 365, 730].map((d) => (
-                <button key={d} className="btn-sm" onClick={() => setRange({ start: daysAgo(d), end: daysAgo(0) })}>{d < 365 ? `${d}d` : `${d / 365}y`}</button>
+                <button type="button" key={d} className="btn-sm" onClick={() => setRange({ start: daysAgo(d), end: daysAgo(0) })}>{d < 365 ? `${d}d` : `${d / 365}y`}</button>
               ))}
-              <button className="primary" disabled={bt.isPending} onClick={() => { setMsg(null); bt.mutate(); }}>
+              <button type="button" className="primary" disabled={bt.isPending} onClick={() => { setMsg(null); bt.mutate(); }}>
                 {bt.isPending ? "Backtesting… (downloads missing candles first)" : "▶ Run backtest"}
               </button>
-              <button disabled={save.isPending} onClick={() => save.mutate(true)}>Save as new</button>
-              {editing && <button disabled={save.isPending} onClick={() => save.mutate(false)}>Update saved #{editing}</button>}
+              <button type="button" disabled={save.isPending} onClick={() => save.mutate(true)}>Save as new</button>
+              {editing && <button type="button" disabled={save.isPending} onClick={() => save.mutate(false)}>Update saved #{editing}</button>}
             </div>
             {msg && <div className="meta" style={{ marginTop: 6 }}>{msg}</div>}
             {bt.error && <div className="pnl-neg" style={{ marginTop: 6 }}>{errMsg(bt.error)}</div>}

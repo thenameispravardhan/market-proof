@@ -57,13 +57,16 @@ def coverage(key: str) -> Optional[dict[str, Any]]:
 
 
 def load(key: str, tf_min: int, start_ts: int, end_ts: int) -> Optional[dict[str, Any]]:
-    """`tf_min`-minute OHLCV bars in [start_ts, end_ts), session minutes only."""
+    """`tf_min`-minute OHLCV bars in [start_ts, end_ts), session minutes only.
+    tf_min=1440 gives daily bars stamped at IST midnight."""
     src = candle_source(key)
     if not src:
         return None
     n = int(tf_min) * 60
+    bucket = ("ts - ((ts + 19800) % 86400)" if tf_min == 1440
+              else f"o_s + ((ts - o_s) // {n}) * {n}")
     rows = duckdb.connect().execute(f"""
-        SELECT o_s + ((ts - o_s) // {n}) * {n} AS b,
+        SELECT {bucket} AS b,
                arg_min(open, ts), max(high), min(low), arg_max(close, ts), sum(volume)
         FROM (SELECT DISTINCT ON (ts) ts, open, high, low, close, volume,
                      ts - ((ts + 19800) % 86400) + 33300 AS o_s
@@ -71,6 +74,69 @@ def load(key: str, tf_min: int, start_ts: int, end_ts: int) -> Optional[dict[str
               WHERE ts >= ? AND ts < ? AND (ts + 19800) % 86400 BETWEEN 33300 AND 55799)
         GROUP BY b ORDER BY b""", [int(start_ts), int(end_ts)]).fetchall()
     return bars_from(rows, n)
+
+
+def warmup_days(tf_min: int, bars: int) -> int:
+    """Calendar days of history that hold `bars` bars of `tf_min` (375 session minutes a day)."""
+    per_day = 1 if tf_min == 1440 else max(1, 375 // tf_min)
+    return int(bars / per_day * 1.5) + 4
+
+
+VIX = "NSE:INDIAVIX-INDEX"
+
+
+async def assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str, dict], list[dict], int]:
+    """Everything one backtest needs, per symbol: base bars from `start - warmup`,
+    every higher timeframe the conditions use, India VIX when options are priced
+    off it, and the F&O meta (name, lot, strike step). Returns (data, notes,
+    trade_from). One failing symbol is a note, not an error."""
+    from app.algo import engine, fno
+
+    base_tf = spec["timeframe"]
+    htfs = sorted(engine.cond_timeframes(spec))
+    wb = engine.warmup_bars(spec)
+    lead = max([warmup_days(base_tf, wb)] + [warmup_days(tf, wb) for tf in htfs])
+    lead = min(lead, 800)
+    first = start - lead * DAY
+    inst = spec["instrument"]
+    if inst["type"] != "equity":
+        await fno.ensure_master()
+    vix = None
+    notes: list[dict] = []
+    wants_vix = inst["iv"]["source"] == "vix" or (
+        inst["iv"]["source"] == "auto" and any(fno.fno_name(x) in fno.INDEX_LOTS for x in spec["symbols"]))
+    if inst["type"] == "option" and wants_vix:
+        try:
+            await ensure(VIX, first, end)
+            vix = await asyncio.to_thread(load, store_key(VIX), base_tf, first, end)
+        except Exception as e:  # noqa: BLE001
+            notes.append({"symbol": VIX, "note": f"VIX unavailable, using realised vol: {e}"[:200]})
+    out: dict[str, dict] = {}
+    for fy in spec["symbols"]:
+        try:
+            info = await ensure(fy, first, end)
+            if info["note"]:
+                notes.append({"symbol": fy, "note": info["note"]})
+            bars = await asyncio.to_thread(load, info["key"], base_tf, first, end)
+            if not bars or not bars["t"] or bars["t"][-1] < start:
+                notes.append({"symbol": fy, "note": "no candles in this range"})
+                continue
+            bars["tf_min"] = base_tf
+            bars["htf"] = {tf: await asyncio.to_thread(load, info["key"], tf, first, end) for tf in htfs}
+            if vix and vix["t"]:
+                bars["vix"] = vix
+            name = fno.fno_name(fy)
+            bars["meta"] = {"symbol": fy, "name": name, "exch": fno.exchange_of(fy)}
+            if inst["type"] != "equity":
+                if not fno.is_fno(name):
+                    notes.append({"symbol": fy, "note": f"{name} has no F&O contracts — skipped"})
+                    continue
+                bars["meta"]["lot"] = fno.lot_size(name)
+                bars["meta"]["step"] = fno.default_step(name, bars["c"][-1])
+            out[fy] = bars
+        except Exception as e:  # noqa: BLE001
+            notes.append({"symbol": fy, "note": str(e)[:200]})
+    return out, notes, start
 
 
 def bars_from(rows: list, tf_s: int) -> dict[str, Any]:
@@ -140,12 +206,33 @@ async def ensure(fy: str, start_ts: int, end_ts: int) -> dict[str, Any]:
 async def recent_bars(fy: str, tf_min: int, bars: int = 400, now: Optional[float] = None) -> dict[str, Any]:
     """The last `bars` COMPLETED bars straight from Fyers at the strategy's
     resolution (live runner). The still-forming bar is dropped — a strategy
-    must never act on a candle that can still change."""
+    must never act on a candle that can still change. tf_min=1440 is daily."""
     now = int(now or time.time())
-    tf_s = int(tf_min) * 60
-    days = min(MAX_DAYS, max(5, math.ceil(bars * tf_min / 375 * 1.6) + 4))
-    raw = await _backend().get_history_range(fy, resolution=str(tf_min), from_ts=now - days * DAY, to_ts=now)
+    daily = tf_min == 1440
+    tf_s = 86400 if daily else int(tf_min) * 60
+    days = min(365, int(bars * 1.5) + 5) if daily else min(MAX_DAYS, max(5, math.ceil(bars * tf_min / 375 * 1.6) + 4))
+    raw = await _backend().get_history_range(fy, resolution="D" if daily else str(tf_min),
+                                             from_ts=now - days * DAY, to_ts=now)
     if raw is None:
         raise RuntimeError(f"Fyers history call failed for {fy}")
-    rows = [r for r in raw if isinstance(r, (list, tuple)) and len(r) >= 6 and int(r[0]) + tf_s <= now]
+    if daily:      # Fyers stamps daily candles at the day's start; finished once the session closed
+        done = lambda t: t - (t + 19800) % 86400 + 55800 <= now  # noqa: E731
+    else:
+        done = lambda t: t + tf_s <= now  # noqa: E731
+    rows = [r for r in raw if isinstance(r, (list, tuple)) and len(r) >= 6 and done(int(r[0]))]
     return bars_from(rows[-bars:], tf_s)
+
+
+async def live_bundle(spec: dict[str, Any], fy: str, now: float) -> dict[str, Any]:
+    """Base + higher-timeframe bars and F&O meta for one symbol, for the runner."""
+    from app.algo import engine, fno
+
+    wb = engine.warmup_bars(spec)
+    d = await recent_bars(fy, spec["timeframe"], bars=wb + 60, now=now)
+    d["tf_min"] = spec["timeframe"]
+    d["htf"] = {tf: await recent_bars(fy, tf, bars=wb + 5, now=now) for tf in engine.cond_timeframes(spec)}
+    name = fno.fno_name(fy)
+    d["meta"] = {"symbol": fy, "name": name, "exch": fno.exchange_of(fy)}
+    if spec["instrument"]["type"] != "equity":
+        d["meta"]["lot"] = fno.lot_size(name)
+    return d
