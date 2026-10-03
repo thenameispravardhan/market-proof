@@ -554,8 +554,9 @@ function Optimizer({ spec, cat, range, onApply }: { spec: Spec; cat: Catalog; ra
           </div>
         ))}
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-          <button className="btn-sm" disabled={!paths.length} onClick={() => {
-            const p = paths[0];
+          <button className="btn-sm" disabled={axes.length >= paths.length} onClick={() => {
+            const p = paths.find((x) => !axes.some((a) => a.path === x.path));
+            if (!p) return;
             setAxes([...axes, { path: p.path, from: p.value, to: p.value * 2, step: Math.max(1, Math.round(p.value / 4)) }]);
           }}>+ parameter</button>
           <label className="meta">rank by <select value={metric} onChange={(e) => setMetric(e.target.value)}>{cat.metrics.map((m) => <option key={m}>{m}</option>)}</select></label>
@@ -726,7 +727,7 @@ function DataTab() {
         symbol any saved strategy uses. Use this to pre-load history in bulk (≈4 Fyers calls per symbol-year).
       </p>
       <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 8 }}>
-        <input style={{ flex: 1, minWidth: 280 }} value={symbols} onChange={(e) => setSymbols(e.target.value)} placeholder="NSE:SBIN-EQ, RELIANCE, NSE:NIFTYBANK-INDEX" />
+        <input style={{ width: 460, maxWidth: "100%" }} value={symbols} onChange={(e) => setSymbols(e.target.value)} placeholder="NSE:SBIN-EQ, RELIANCE, NSE:NIFTYBANK-INDEX" />
         <label className="meta">days <input type="number" min={1} max={1098} style={inp} value={days} onChange={(e) => setDays(Number(e.target.value))} /></label>
         <button className="primary" disabled={dl.isPending} onClick={() => dl.mutate()}>{dl.isPending ? "Downloading…" : "Download"}</button>
         <button disabled={sync.isPending} onClick={() => sync.mutate()} title="the last 5 days for every strategy symbol">{sync.isPending ? "Syncing…" : "Sync strategy symbols now"}</button>
@@ -822,7 +823,7 @@ export default function Algo() {
   };
 
   return (
-    <div>
+    <div className="algo">
       <div className="dashboard-head">
         <h1 className="page-title">Algo Lab</h1>
       </div>
