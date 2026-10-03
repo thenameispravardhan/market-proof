@@ -243,3 +243,53 @@ def test_live_legs_from_chain(monkeypatch):
     assert legs[0]["symbol"] == "NSE:NIFTYX24650CE" and legs[0]["act"] == 1
     assert legs[1]["symbol"] == "NSE:NIFTYX24500PE" and legs[1]["act"] == -1
     assert rn._pick_expiry([1791000000, 1791600000, 1793095800], "monthly", "BANKNIFTY", "current") == 1793095800
+
+
+def test_runner_paper_straddle_mtm(monkeypatch, isolated_db):
+    """Runner, option legs: entry on bar close builds both legs at live
+    premiums; a premium spike trips the MTM stop and both legs are booked."""
+    import asyncio
+
+    from app.algo import runner as rn
+    from app.db import session as dbs
+    from app.db.models import AlgoStrategy, AlgoTrade
+
+    spec = _opt_spec(direction="long", instrument={"type": "option", "levels_on": "underlying",
+                     "legs_long": [{"right": "CE", "action": "SELL", "strike": "ATM", "lots": 1},
+                                   {"right": "PE", "action": "SELL", "strike": "ATM", "lots": 1}]},
+                     mtm={"stop": 2000}, sizing={"mode": "lots", "value": 1})
+    with dbs.SessionLocal() as db:
+        db.add(AlgoStrategy(name="straddle", spec=spec, enabled=True, mode="paper"))
+        db.commit()
+    px = {"NSE:NIFTY50-INDEX": 24570.0, "NSE:NIFTYCE": 100.0, "NSE:NIFTYPE": 90.0}
+
+    async def fake_bundle(spec_, sym, now):
+        d = bars([24500, 24520, 24540, 24560], spread=0)
+        keep = [i for i, t in enumerate(d["t"]) if t + 300 <= now]
+        d = {k: ([v[i] for i in keep] if isinstance(v, list) else v) for k, v in d.items()}
+        d.update(tf_min=5, htf={}, meta={"symbol": sym, "name": "NIFTY", "exch": "NSE", "lot": 65})
+        return d
+
+    async def fake_legs(spec_, sym, side, u, now):
+        return [{"symbol": "NSE:NIFTYCE", "kind": "CE", "act": -1, "per_set": 65, "label": "CE", "price": px["NSE:NIFTYCE"]},
+                {"symbol": "NSE:NIFTYPE", "kind": "PE", "act": -1, "per_set": 65, "label": "PE", "price": px["NSE:NIFTYPE"]}]
+
+    async def fake_ltp(symbols):
+        return {s.upper(): px[s.upper()] for s in symbols if s.upper() in px}
+
+    monkeypatch.setattr(rn.data, "live_bundle", fake_bundle)
+    monkeypatch.setattr(rn, "build_legs", fake_legs)
+    monkeypatch.setattr(rn, "_ltp", fake_ltp)
+    r = rn.AlgoRunner()
+    t_close = DAY0 + 4 * 300 + 4
+    asyncio.run(r.tick(t_close))
+    with dbs.SessionLocal() as db:
+        t = db.query(AlgoTrade).one()
+        assert t.status == "open" and len(t.legs) == 2 and t.legs[0]["qty"] == 65 and t.ref == "u"
+    px["NSE:NIFTYCE"] = 135.0                       # CE +35, PE -2: MTM = -(35 - 2) x 65 = -2145
+    px["NSE:NIFTYPE"] = 88.0
+    asyncio.run(r.tick(t_close + 5))
+    with dbs.SessionLocal() as db:
+        t = db.query(AlgoTrade).one()
+        assert t.status == "closed" and t.exit_reason == "MTM_SL" and t.gross_pnl == -2145.0
+        assert t.charges > 80 and all(lg["exit"] for lg in t.legs)
