@@ -412,3 +412,49 @@ def test_runner_pullback_entry_waits_for_trigger(monkeypatch, isolated_db):
     with dbs.SessionLocal() as db:
         t = db.query(AlgoTrade).one()
         assert t.entry_price == 104.9 and t.version == 2 and not r._armed
+
+
+def test_quant_stats_monte_carlo_and_oos():
+    closes = [100 + (i % 20) - (i % 7) * 0.5 for i in range(1500)]
+    spec = _cross_spec(exit_long=None, stop_loss={"type": "pct", "value": 1}, target={"type": "pct", "value": 1.5})
+    d = bars(closes, spread=0.4)
+    split = d["t"][900]
+    r = engine.run(spec, {"X": d}, oos_from=split)
+    s = r["stats"]
+    assert s["trades"] >= 10 and s["in_sample"]["trades"] + s["out_of_sample"]["trades"] == s["trades"]
+    assert s["t_stat"] is not None and 0 < s["exposure_pct"] <= 100 and s["ulcer_index"] >= 0
+    t = r["trades"][0]
+    assert t["mae_pct"] <= 0 <= t["mfe_pct"] and t["r"] is not None       # excursions signed; 1R from the stop
+    mc = engine.monte_carlo(r["trades"], 100000, runs=200)
+    assert mc["net_p5"] <= mc["net_p50"] <= mc["net_p95"] and 0 <= mc["prob_loss_pct"] <= 100
+    assert engine.monte_carlo(r["trades"][:5], 100000) is None              # too few trades to say anything
+    assert r["per_symbol"]["X"]["buy_hold_pct"] is not None
+
+
+def test_edge_cases_are_clean_errors_not_crashes():
+    with pytest.raises(ValueError):            # constant that isn't a number
+        _cross_spec(entry_long={"logic": "AND", "conditions": [
+            {"left": {"ind": "PRICE"}, "op": ">", "right": {"value": "abc"}}]})
+    with pytest.raises(ValueError):            # session inverted
+        _cross_spec(session={"start": "14:00", "end": "10:00", "square_off": "15:15"})
+    with pytest.raises(ValueError):            # multi-leg with levels on the premium
+        _opt_spec(instrument={"type": "option", "legs_long": [
+            {"right": "CE", "action": "SELL"}, {"right": "PE", "action": "SELL"}]}, stop_loss={"type": "pct", "value": 20})
+    from app.algo import fno
+    assert fno.pick_strike(30, 5, "PE", "OTM", 20) == 5                    # never a zero/negative strike
+    flat = bars([100.0] * 60, spread=0)                                     # no movement at all
+    for name in ind.REGISTRY:
+        ind.compute(flat, name, {})                                         # no ZeroDivision anywhere
+    tiny = engine.run(_cross_spec(portfolio={"capital": 50}), {"X": bars([100, 101, 102, 106, 108], spread=0)})
+    assert tiny["trades"] == [] and tiny["stats"]["skipped"]["no_capital"] == 1
+    assert engine.run(_cross_spec(), {"X": bars([100], spread=0)})["trades"] == []   # a single bar
+
+
+def test_api_guards_heavy_jobs(client):
+    spec = {"symbols": [f"NSE:S{i}-EQ" for i in range(40)], "timeframe": 1, "direction": "long",
+            "entry_long": {"logic": "AND", "conditions": [{"left": {"ind": "PRICE"}, "op": ">", "right": {"value": 1}}]}}
+    r = client.post("/api/algo/backtest", json={"spec": spec, "start": "2024-01-01", "end": "2026-01-01"})
+    assert r.status_code == 422 and "too much data" in r.json()["detail"]
+    r = client.post("/api/algo/backtest", json={"spec": {**spec, "symbols": ["NSE:SBIN-EQ"], "timeframe": 15},
+                                                 "start": "2025-01-01", "end": "2025-06-01", "oos_pct": 95})
+    assert r.status_code == 422 and "out-of-sample" in r.json()["detail"]

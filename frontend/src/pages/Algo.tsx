@@ -13,7 +13,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { Area, AreaChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import {
   CandlestickSeries,
   ColorType,
@@ -94,14 +94,20 @@ type BtTrade = {
   symbol: string; instrument: string; side: string; qty: number; lots: number; entry_t: number; entry: number;
   exit_t: number; exit: number; u_entry: number; u_exit: number; reason: string; gross: number; charges: number;
   net: number; bars: number; margin: number; legs: BtLeg[];
+  mae_pct: number | null; mfe_pct: number | null; r: number | null; minutes: number;
 };
-type Stats = Record<string, number | null> & {
+type Summary = Record<string, number | null>;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type Stats = Record<string, any> & {
   equity: [number, number][]; daily: [number, number][]; monthly: Record<string, number>;
   weekday: Record<string, number>; skipped: Record<string, number>;
+  in_sample?: Summary; out_of_sample?: Summary; oos_from?: number;
 };
+type MonteCarlo = { runs: number; trades: number; net_p5: number; net_p50: number; net_p95: number; dd_pct_p50: number; dd_pct_p95: number; prob_loss_pct: number; prob_half_capital_pct: number };
 type BtResult = {
   stats: Stats;
-  per_symbol: Record<string, { trades: number; win_rate: number; net_pnl: number; profit_factor: number | null; max_drawdown: number; bars: number }>;
+  per_symbol: Record<string, { trades: number; win_rate: number; net_pnl: number; profit_factor: number | null; max_drawdown: number; bars: number; buy_hold_pct: number | null }>;
+  monte_carlo: MonteCarlo | null;
   by_reason: Record<string, { count: number; net: number }>;
   trades: BtTrade[];
   trades_total: number;
@@ -110,8 +116,8 @@ type BtResult = {
   chart: { symbol: string; candles: number[][]; trades: BtTrade[] };
   spec: Spec;
 };
-type OptRow = { params: Record<string, number>; trades: number; win_rate: number; net_pnl: number; profit_factor: number | null; sharpe: number | null; max_drawdown: number; return_pct: number; expectancy: number };
-type OptResult = { combos: number; ranked: OptRow[]; too_few_trades: number; metric: string; notes: { symbol: string; note: string }[]; elapsed_s: number };
+type OptRow = { params: Record<string, number>; trades: number; win_rate: number; net_pnl: number; profit_factor: number | null; sharpe: number | null; max_drawdown: number; return_pct: number; expectancy: number; t_stat: number | null; oos: Summary | null };
+type OptResult = { combos: number; ranked: OptRow[]; too_few_trades: number; metric: string; notes: { symbol: string; note: string }[]; elapsed_s: number; oos_from: number | null };
 type Saved = { id: number; name: string; spec: Spec; enabled: boolean; mode: "paper" | "live"; account_id: number | null; closed_trades: number; realized_pnl: number; open_positions: number; version: number; versions: number };
 type Version = { version: number; spec: Spec; note: string | null; active: boolean; created_at: string | null; closed_trades: number; realized_pnl: number };
 type LiveLeg = { symbol: string; label?: string; act: number; qty: number; entry: number; exit?: number; ltp?: number | null };
@@ -134,6 +140,7 @@ const IST_S = 19800;
 const isGroup = (c: Cond | Group): c is Group => (c as Group).conditions !== undefined;
 const I = (ind: string, params: Record<string, number | string> = {}, field?: string, tf?: number): Operand => ({ ind, params, field, offset: 0, ...(tf ? { tf } : {}) });
 const N = (value: number): Operand => ({ value });
+const A = (o: Operand, ago: number): Operand => ({ ...o, offset: ago });
 const C = (left: Operand, op: string, right?: Operand): Cond => ({ left, op, right });
 const G = (conditions: (Cond | Group)[], logic: "AND" | "OR" = "AND"): Group => ({ logic, conditions });
 const L = (right: "CE" | "PE", action: "BUY" | "SELL", strike = "ATM", steps = 0, lots = 1, premium = 100): Leg => ({ right, action, strike, steps, premium, lots });
@@ -263,7 +270,7 @@ function tidy(spec: Spec): Spec {
 
 type Template = { name: string; symbols?: string[]; spec: Partial<Spec> };
 const ST = (f: "crosses_above" | "crosses_below") => C(I("SUPERTREND", { period: 10, multiplier: 3 }, "direction"), f, N(0));
-const TEMPLATES: Template[] = [
+export const TEMPLATES: Template[] = [
   { name: "Equity · EMA 9/21 crossover", spec: {
     direction: "both", instrument: { type: "equity" } as Instrument,
     entry_long: G([C(I("EMA", { period: 9 }), "crosses_above", I("EMA", { period: 21 }))]),
@@ -289,7 +296,7 @@ const TEMPLATES: Template[] = [
     stop_loss: { type: "pct", value: 1 }, target: null } },
   { name: "Equity · Gap-up continuation (open > prev high × 1.005)", spec: {
     direction: "long", instrument: { type: "equity" } as Instrument, session: { start: "09:20", end: "10:30", square_off: "15:15" },
-    entry_long: G([C(I("DAILY", {}, "day_open"), ">", { ...I("DAILY", {}, "prev_high"), mult: 1.005 }), C(I("PRICE"), "crosses_above", I("DAILY", {}, "day_high"), ), C(I("VOLUME_SMA", { period: 20 }), "rising", N(2))], "AND"),
+    entry_long: G([C(I("DAILY", {}, "day_open"), ">", { ...I("DAILY", {}, "prev_high"), mult: 1.005 }), C(I("PRICE"), ">", A(I("DAILY", {}, "day_high"), 1)), C(I("VOLUME_SMA", { period: 20 }), "rising", N(2))], "AND"),
     max_trades_per_day: 1, stop_loss: { type: "pct", value: 1 }, trailing: { type: "pct", value: 0.8, activate: 0.8 } } },
   { name: "NIFTY options · Supertrend → buy ATM CE / PE", symbols: ["NSE:NIFTY50-INDEX"], spec: {
     direction: "both", timeframe: 5,
@@ -323,6 +330,101 @@ const TEMPLATES: Template[] = [
     entry_short: G([C(I("PRICE"), "crosses_below", I("DAILY", {}, "bc")), C(I("PRICE"), "<", I("DAILY", {}, "pivot"))]),
     max_trades_per_day: 1, stop_loss: { type: "pct", value: 0.7 }, target: { type: "rr", value: 2 },
     sizing: { mode: "lots", value: 1 }, portfolio: { capital: 300000, leverage: 1, max_positions: 2, compounding: true } } },
+  // ---- trend / breakout ----
+  { name: "Equity · Turtle 20/10 Donchian breakout (15m)", spec: {
+    direction: "both", timeframe: 15, instrument: { type: "equity" } as Instrument,
+    entry_long: G([C(I("PRICE"), "crosses_above", A(I("DONCHIAN", { period: 20 }, "upper"), 1))]),
+    exit_long: G([C(I("PRICE"), "crosses_below", A(I("DONCHIAN", { period: 10 }, "lower"), 1))]),
+    entry_short: G([C(I("PRICE"), "crosses_below", A(I("DONCHIAN", { period: 20 }, "lower"), 1))]),
+    exit_short: G([C(I("PRICE"), "crosses_above", A(I("DONCHIAN", { period: 10 }, "upper"), 1))]),
+    stop_loss: { type: "atr", value: 2, atr_period: 14 }, target: null, sizing: { mode: "risk_pct", value: 0.5 } } },
+  { name: "Equity · Bollinger squeeze breakout", spec: {
+    direction: "both", instrument: { type: "equity" } as Instrument,
+    entry_long: G([C(A(I("BBANDS", { period: 20, multiplier: 2 }, "upper"), 1), "<", A(I("KELTNER", { period: 20, multiplier: 1.5 }, "upper"), 1)),
+                   C(I("PRICE"), "crosses_above", I("BBANDS", { period: 20, multiplier: 2 }, "upper"))]),
+    entry_short: G([C(A(I("BBANDS", { period: 20, multiplier: 2 }, "lower"), 1), ">", A(I("KELTNER", { period: 20, multiplier: 1.5 }, "lower"), 1)),
+                    C(I("PRICE"), "crosses_below", I("BBANDS", { period: 20, multiplier: 2 }, "lower"))]),
+    stop_loss: { type: "atr", value: 1.5, atr_period: 14 }, target: { type: "rr", value: 2 } } },
+  { name: "Equity · Ichimoku TK cross above the cloud (15m)", spec: {
+    direction: "both", timeframe: 15, instrument: { type: "equity" } as Instrument,
+    entry_long: G([C(I("ICHIMOKU", {}, "tenkan"), "crosses_above", I("ICHIMOKU", {}, "kijun")),
+                   C(I("PRICE"), ">", I("ICHIMOKU", {}, "span_a")), C(I("PRICE"), ">", I("ICHIMOKU", {}, "span_b"))]),
+    entry_short: G([C(I("ICHIMOKU", {}, "tenkan"), "crosses_below", I("ICHIMOKU", {}, "kijun")),
+                    C(I("PRICE"), "<", I("ICHIMOKU", {}, "span_a")), C(I("PRICE"), "<", I("ICHIMOKU", {}, "span_b"))]),
+    stop_loss: { type: "atr", value: 2, atr_period: 14 }, trailing: { type: "atr", value: 2.5, atr_period: 14, activate: 0 }, target: null } },
+  { name: "Equity · Heikin-Ashi trend + ADX", spec: {
+    direction: "both", instrument: { type: "equity" } as Instrument,
+    entry_long: G([C(I("HEIKIN_ASHI", {}, "close"), "crosses_above", I("HEIKIN_ASHI", {}, "open")), C(I("ADX", { period: 14 }, "adx"), ">", N(20))]),
+    exit_long: G([C(I("HEIKIN_ASHI", {}, "close"), "crosses_below", I("HEIKIN_ASHI", {}, "open"))]),
+    entry_short: G([C(I("HEIKIN_ASHI", {}, "close"), "crosses_below", I("HEIKIN_ASHI", {}, "open")), C(I("ADX", { period: 14 }, "adx"), ">", N(20))]),
+    exit_short: G([C(I("HEIKIN_ASHI", {}, "close"), "crosses_above", I("HEIKIN_ASHI", {}, "open"))]),
+    stop_loss: { type: "atr", value: 1.5, atr_period: 14 }, target: null } },
+  { name: "Equity · Linear-regression slope trend + RSI", spec: {
+    direction: "both", instrument: { type: "equity" } as Instrument,
+    entry_long: G([C(I("LINREG", { period: 20 }, "slope_pct"), "crosses_above", N(0.02)), C(I("RSI", { period: 14 }), ">", N(50))]),
+    entry_short: G([C(I("LINREG", { period: 20 }, "slope_pct"), "crosses_below", N(-0.02)), C(I("RSI", { period: 14 }), "<", N(50))]),
+    stop_loss: { type: "pct", value: 0.6 }, trailing: { type: "pct", value: 0.6, activate: 0.4 }, target: null } },
+  { name: "Equity · PSAR flip with ADX filter", spec: {
+    direction: "both", instrument: { type: "equity" } as Instrument,
+    entry_long: G([C(I("PRICE"), "crosses_above", I("PSAR")), C(I("ADX", { period: 14 }, "adx"), ">", N(20))]),
+    exit_long: G([C(I("PRICE"), "crosses_below", I("PSAR"))]),
+    entry_short: G([C(I("PRICE"), "crosses_below", I("PSAR")), C(I("ADX", { period: 14 }, "adx"), ">", N(20))]),
+    exit_short: G([C(I("PRICE"), "crosses_above", I("PSAR"))]),
+    stop_loss: { type: "atr", value: 2, atr_period: 14 }, target: null } },
+  { name: "Equity · NR7 breakout (15m)", spec: {
+    direction: "both", timeframe: 15, instrument: { type: "equity" } as Instrument, max_trades_per_day: 1,
+    entry_long: G([C(A(I("CANDLE", {}, "nr7"), 1), "==", N(1)), C(I("PRICE"), ">", A(I("PRICE", { source: "high" }), 1))]),
+    entry_short: G([C(A(I("CANDLE", {}, "nr7"), 1), "==", N(1)), C(I("PRICE"), "<", A(I("PRICE", { source: "low" }), 1))]),
+    stop_loss: { type: "atr", value: 1, atr_period: 14 }, target: { type: "rr", value: 2 } } },
+  // ---- mean reversion / gaps ----
+  { name: "Equity · Z-score mean reversion (±2σ)", spec: {
+    direction: "both", instrument: { type: "equity" } as Instrument, max_bars: 24,
+    entry_long: G([C(I("ZSCORE", { period: 20 }), "crosses_above", N(-2))]), exit_long: G([C(I("ZSCORE", { period: 20 }), "crosses_above", N(0))]),
+    entry_short: G([C(I("ZSCORE", { period: 20 }), "crosses_below", N(2))]), exit_short: G([C(I("ZSCORE", { period: 20 }), "crosses_below", N(0))]),
+    stop_loss: { type: "pct", value: 1 }, target: null } },
+  { name: "Equity · Gap fade back to previous close", spec: {
+    direction: "both", instrument: { type: "equity" } as Instrument, max_trades_per_day: 1,
+    session: { start: "09:20", end: "10:00", square_off: "15:15" },
+    entry_short: G([C(I("DAILY", {}, "gap_pct"), ">", N(0.8)), C(I("TIME", {}, "hhmm"), ">=", N(920))]),
+    exit_short: G([C(I("PRICE"), "<=", I("DAILY", {}, "prev_close"))]),
+    entry_long: G([C(I("DAILY", {}, "gap_pct"), "<", N(-0.8)), C(I("TIME", {}, "hhmm"), ">=", N(920))]),
+    exit_long: G([C(I("PRICE"), ">=", I("DAILY", {}, "prev_close"))]),
+    stop_loss: { type: "pct", value: 0.8 }, target: null } },
+  { name: "Equity · Stoch-RSI pullback in a 1h uptrend (15m)", spec: {
+    direction: "long", timeframe: 15, instrument: { type: "equity" } as Instrument,
+    entry_long: G([C(I("STOCHRSI", {}, "k"), "crosses_above", N(20)), C(I("PRICE"), ">", I("EMA", { period: 50 }, undefined, 60))]),
+    exit_long: G([C(I("STOCHRSI", {}, "k"), "crosses_above", N(80))]),
+    stop_loss: { type: "atr", value: 1.5, atr_period: 14 }, target: null, entry_order: { type: "pullback", offset_pct: 0.1, valid_bars: 2 } } },
+  // ---- options / futures ----
+  { name: "NIFTY options · 9:30 iron condor (MTM)", symbols: ["NSE:NIFTY50-INDEX"], spec: {
+    direction: "long", timeframe: 5, session: { start: "09:30", end: "09:35", square_off: "15:15" }, max_trades_per_day: 1,
+    instrument: { type: "option", expiry: "current", expiry_kind: "weekly", levels_on: "underlying", iv: { source: "auto", value: 15 },
+      legs_long: [L("CE", "SELL", "OTM", 3), L("PE", "SELL", "OTM", 3), L("CE", "BUY", "OTM", 6), L("PE", "BUY", "OTM", 6)], legs_short: [L("PE", "BUY")] },
+    entry_long: G([C(I("TIME", {}, "hhmm"), ">=", N(930))]), stop_loss: null, target: null,
+    mtm: { stop: 2500, target: 2000, trail_start: null, trail_gap: null },
+    sizing: { mode: "lots", value: 1 }, portfolio: { capital: 300000, leverage: 8, max_positions: 1, compounding: false } } },
+  { name: "NIFTY options · long straddle on a squeeze release", symbols: ["NSE:NIFTY50-INDEX"], spec: {
+    direction: "long", timeframe: 5,
+    instrument: { type: "option", expiry: "current", expiry_kind: "weekly", levels_on: "underlying", iv: { source: "auto", value: 15 },
+      legs_long: [L("CE", "BUY"), L("PE", "BUY")], legs_short: [L("PE", "BUY")] },
+    entry_long: G([C(A(I("BBANDS", { period: 20, multiplier: 2 }, "upper"), 1), "<", A(I("KELTNER", { period: 20, multiplier: 1.5 }, "upper"), 1)),
+                   C(I("BBANDS", { period: 20, multiplier: 2 }, "upper"), ">", I("KELTNER", { period: 20, multiplier: 1.5 }, "upper"))]),
+    stop_loss: null, target: null, mtm: { stop: 2500, target: 5000, trail_start: 3000, trail_gap: 1500 }, max_trades_per_day: 2,
+    sizing: { mode: "lots", value: 1 } } },
+  { name: "NIFTY options · credit spreads on Supertrend", symbols: ["NSE:NIFTY50-INDEX"], spec: {
+    direction: "both", timeframe: 5,
+    instrument: { type: "option", expiry: "current", expiry_kind: "weekly", levels_on: "underlying", iv: { source: "auto", value: 15 },
+      legs_long: [L("PE", "SELL"), L("PE", "BUY", "OTM", 2)], legs_short: [L("CE", "SELL"), L("CE", "BUY", "OTM", 2)] },
+    entry_long: G([ST("crosses_above")]), entry_short: G([ST("crosses_below")]),
+    stop_loss: null, target: null, mtm: { stop: 2000, target: 2500, trail_start: null, trail_gap: null },
+    sizing: { mode: "lots", value: 1 }, portfolio: { capital: 300000, leverage: 8, max_positions: 1, compounding: false } } },
+  { name: "BANKNIFTY futures · opening range breakout", symbols: ["NSE:NIFTYBANK-INDEX"], spec: {
+    direction: "both", timeframe: 5, session: { start: "09:30", end: "12:00", square_off: "15:10" }, max_trades_per_day: 1,
+    instrument: { type: "future", expiry: "current", expiry_kind: "monthly", legs_long: [], legs_short: [], levels_on: "instrument", iv: { source: "auto", value: 15 } },
+    entry_long: G([C(I("PRICE"), "crosses_above", I("ORB", { minutes: 15 }, "high"))]),
+    entry_short: G([C(I("PRICE"), "crosses_below", I("ORB", { minutes: 15 }, "low"))]),
+    stop_loss: { type: "pct", value: 0.4 }, target: { type: "rr", value: 2 },
+    sizing: { mode: "lots", value: 1 }, portfolio: { capital: 300000, leverage: 6, max_positions: 1, compounding: true } } },
 ];
 
 const LEG_PRESETS: { name: string; long: Leg[]; short: Leg[] }[] = [
@@ -658,9 +760,9 @@ function TradeChart({ chart }: { chart: BtResult["chart"] }) {
 }
 
 function tradesCsv(trades: BtTrade[]): string {
-  const head = ["symbol", "instrument", "side", "qty", "lots", "entry_time", "entry", "exit_time", "exit", "underlying_entry", "underlying_exit", "reason", "bars", "gross", "charges", "net"];
+  const head = ["symbol", "instrument", "side", "qty", "lots", "entry_time", "entry", "exit_time", "exit", "underlying_entry", "underlying_exit", "reason", "bars", "minutes", "mae_pct", "mfe_pct", "r_multiple", "gross", "charges", "net"];
   const iso = (t: number) => new Date((t + IST_S) * 1000).toISOString().replace("T", " ").slice(0, 16);
-  const rows = trades.map((t) => [t.symbol, t.instrument, t.side, t.qty, t.lots, iso(t.entry_t), t.entry, iso(t.exit_t), t.exit, t.u_entry, t.u_exit, t.reason, t.bars, t.gross, t.charges, t.net]);
+  const rows = trades.map((t) => [t.symbol, t.instrument, t.side, t.qty, t.lots, iso(t.entry_t), t.entry, iso(t.exit_t), t.exit, t.u_entry, t.u_exit, t.reason, t.bars, t.minutes, t.mae_pct ?? "", t.mfe_pct ?? "", t.r ?? "", t.gross, t.charges, t.net]);
   return [head, ...rows].map((r) => r.map((x) => `"${String(x).replace(/"/g, '""')}"`).join(",")).join("\n");
 }
 
@@ -671,6 +773,10 @@ function Results({ r }: { r: BtResult }) {
     const step = Math.max(1, Math.ceil(pts.length / 800));
     return pts.filter((_, i) => i % step === 0 || i === pts.length - 1).map(([t, v]) => ({ t: ist(t), v }));
   }, [s.equity]);
+  const dd = useMemo(() => {   // underwater curve: % below the running peak
+    let peak = Number(r.spec?.portfolio?.capital ?? 0);
+    return eq.map((p) => { peak = Math.max(peak, p.v); return { t: p.t, dd: peak > 0 ? -((peak - p.v) / peak) * 100 : 0 }; });
+  }, [eq, r.spec]);
   const [showAll, setShowAll] = useState(false);
   const trades = useMemo(() => [...r.trades].reverse().slice(0, showAll ? 3000 : 200), [r.trades, showAll]);
   const multiLeg = r.trades.some((t) => t.legs.length > 1);
@@ -706,6 +812,20 @@ function Results({ r }: { r: BtResult }) {
           <Metric label="Profitable days" value={`${s.profitable_days} / ${s.trading_days}`} />
           <Metric label="Avg bars held" value={num(s.avg_bars_held, 1)} />
         </div>
+        <div className="meta" style={{ marginTop: 8, color: "var(--text)" }}>Quant</div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 18 }}>
+          <Metric label="t-stat (mean trade)" value={num(s.t_stat)} cls={s.t_stat !== null && Math.abs(s.t_stat) >= 2 ? (s.t_stat > 0 ? "pnl-pos" : "pnl-neg") : ""}
+            hint="mean trade / standard error. |t| ≥ 2 ≈ unlikely to be luck; below that the edge is not proven" />
+          <Metric label="Payoff ratio" value={num(s.payoff_ratio)} hint="average win / average loss" />
+          <Metric label="Kelly %" value={s.kelly_pct === null ? "—" : `${num(s.kelly_pct, 1)}%`} cls={pnlCls(s.kelly_pct)} hint="W − (1−W)/payoff. ≤ 0 = no edge. Trade a fraction (¼–½) of it at most" />
+          <Metric label="Avg R" value={num(s.avg_r, 2)} cls={pnlCls(s.avg_r)} hint="net P&L per trade in units of the initial stop risk" />
+          <Metric label="Recovery factor" value={num(s.recovery_factor)} hint="net P&L / max drawdown" />
+          <Metric label="Ulcer index" value={num(s.ulcer_index)} hint="RMS of % drawdown along the equity curve — depth AND duration of pain" />
+          <Metric label="Avg MAE / MFE" value={`${num(s.avg_mae_pct, 2)}% / ${num(s.avg_mfe_pct, 2)}%`} hint="how far trades went against / for you before exit — tune stops and targets with it" />
+          <Metric label="Exposure" value={`${num(s.exposure_pct, 1)}%`} hint="share of candles with a position open" />
+          <Metric label="Avg hold" value={`${num(s.avg_minutes_held, 0)} min`} />
+          <Metric label="Buy & hold" value={s.buy_hold_pct === null || s.buy_hold_pct === undefined ? "—" : `${num(s.buy_hold_pct)}%`} cls={pnlCls(s.buy_hold_pct)} hint="the underlying's own move over the same window (average across symbols) — the benchmark" />
+        </div>
         {skipped.length > 0 && (
           <div className="meta" style={{ marginTop: 6 }}>
             Signals not taken: {skipped.map(([k, v]) => `${v} × ${k.replace(/_/g, " ")}`).join(" · ")}
@@ -713,6 +833,39 @@ function Results({ r }: { r: BtResult }) {
           </div>
         )}
       </div>
+      {(s.in_sample || r.monte_carlo) && (
+        <div className="algo-quad">
+          {s.in_sample && s.out_of_sample && (
+            <div className="widget">
+              <h3>In-sample vs out-of-sample <span className="meta">split at {ist(s.oos_from ?? 0)}</span></h3>
+              <div className="algo-scroll"><table>
+                <thead><tr><th></th><th>In-sample</th><th>Out-of-sample</th></tr></thead>
+                <tbody>{([["trades", "Trades", 0], ["win_rate", "Win %", 1], ["net_pnl", "Net ₹", 0], ["profit_factor", "Profit factor", 2],
+                  ["sharpe", "Sharpe", 2], ["expectancy", "Expectancy ₹", 0], ["max_drawdown_pct", "Max DD %", 1], ["t_stat", "t-stat", 2]] as [string, string, number][]).map(([k, lab, dp]) => (
+                  <tr key={k}><td>{lab}</td><td className="mono">{num(s.in_sample![k], dp)}</td>
+                    <td className={`mono ${k === "net_pnl" ? pnlCls(s.out_of_sample![k]) : ""}`}>{num(s.out_of_sample![k], dp)}</td></tr>))}
+                </tbody></table></div>
+              <div className="meta">Judge the strategy on the right-hand column — it never influenced the rules.</div>
+            </div>
+          )}
+          {r.monte_carlo && (
+            <div className="widget">
+              <h3>Monte Carlo <span className="meta">{r.monte_carlo.runs} resampled paths of {r.monte_carlo.trades} trades</span></h3>
+              <div className="algo-scroll"><table>
+                <tbody>
+                  <tr><td>Net P&L — bad case (5%)</td><td className={`mono ${pnlCls(r.monte_carlo.net_p5)}`}>{inr(r.monte_carlo.net_p5)}</td></tr>
+                  <tr><td>Net P&L — median</td><td className={`mono ${pnlCls(r.monte_carlo.net_p50)}`}>{inr(r.monte_carlo.net_p50)}</td></tr>
+                  <tr><td>Net P&L — good case (95%)</td><td className={`mono ${pnlCls(r.monte_carlo.net_p95)}`}>{inr(r.monte_carlo.net_p95)}</td></tr>
+                  <tr><td>Max drawdown — median</td><td className="mono">{num(r.monte_carlo.dd_pct_p50, 1)}%</td></tr>
+                  <tr><td>Max drawdown — bad case (95%)</td><td className="mono pnl-neg">{num(r.monte_carlo.dd_pct_p95, 1)}%</td></tr>
+                  <tr><td>Chance of ending at a loss</td><td className="mono">{num(r.monte_carlo.prob_loss_pct, 1)}%</td></tr>
+                  <tr><td>Chance equity halves at some point</td><td className="mono">{num(r.monte_carlo.prob_half_capital_pct, 1)}%</td></tr>
+                </tbody></table></div>
+              <div className="meta">The backtest is one ordering of these trades. Size capital for the 95% drawdown, not the one history happened to give.</div>
+            </div>
+          )}
+        </div>
+      )}
       <div className="widget widget-wide" style={{ marginBottom: 12 }}>
         <h3>Equity curve</h3>
         {eq.length < 2 ? <div className="empty">no trades</div> : (
@@ -726,6 +879,16 @@ function Results({ r }: { r: BtResult }) {
             </LineChart>
           </ResponsiveContainer>
         )}
+        {dd.length > 1 && (
+          <ResponsiveContainer width="100%" height={110}>
+            <AreaChart data={dd}>
+              <XAxis dataKey="t" hide />
+              <YAxis tick={{ fontSize: 10, fill: "var(--text-dim)" }} width={70} tickFormatter={(v: number) => `${v.toFixed(0)}%`} />
+              <Tooltip contentStyle={{ background: "var(--bg-panel)", border: "1px solid var(--border)" }} formatter={(v: number) => `${v.toFixed(2)}%`} />
+              <Area type="stepAfter" dataKey="dd" stroke="var(--red)" fill="var(--red-bg)" isAnimationActive={false} name="drawdown" />
+            </AreaChart>
+          </ResponsiveContainer>
+        )}
       </div>
       <div className="widget widget-wide" style={{ marginBottom: 12 }}>
         <h3>{r.chart.symbol} <span className="meta">last {r.chart.candles.length} candles of the underlying · ▲▼ entries, ● exits</span></h3>
@@ -734,10 +897,11 @@ function Results({ r }: { r: BtResult }) {
       <div className="algo-quad">
         <div className="widget">
           <h3>By symbol</h3>
-          <div className="algo-scroll"><table><thead><tr><th>Symbol</th><th>Bars</th><th>Trades</th><th>Win %</th><th>PF</th><th>Net</th></tr></thead>
+          <div className="algo-scroll"><table><thead><tr><th>Symbol</th><th>Bars</th><th>Trades</th><th>Win %</th><th>PF</th><th>Net</th><th title="the underlying's own move">B&amp;H</th></tr></thead>
             <tbody>{Object.entries(r.per_symbol).map(([k, v]) => (
               <tr key={k}><td>{shortSym(k)}</td><td className="mono">{v.bars}</td><td className="mono">{v.trades}</td><td className="mono">{num(v.win_rate, 1)}</td>
-                <td className="mono">{num(v.profit_factor)}</td><td className={`mono ${pnlCls(v.net_pnl)}`}>{inr(v.net_pnl)}</td></tr>))}
+                <td className="mono">{num(v.profit_factor)}</td><td className={`mono ${pnlCls(v.net_pnl)}`}>{inr(v.net_pnl)}</td>
+                <td className={`mono ${pnlCls(v.buy_hold_pct)}`}>{v.buy_hold_pct === null ? "—" : `${num(v.buy_hold_pct, 1)}%`}</td></tr>))}
             </tbody></table></div>
         </div>
         <div className="widget">
@@ -768,14 +932,15 @@ function Results({ r }: { r: BtResult }) {
         </h3>
         <div style={{ maxHeight: 420, overflow: "auto" }}>
           <table>
-            <thead><tr><th>Instrument</th><th>Signal</th><th>Qty</th><th>Entry (IST)</th><th>Entry</th><th>Exit (IST)</th><th>Exit</th><th>Reason</th><th>Bars</th><th>Charges</th><th>Net</th></tr></thead>
+            <thead><tr><th>Instrument</th><th>Signal</th><th>Qty</th><th>Entry (IST)</th><th>Entry</th><th>Exit (IST)</th><th>Exit</th><th>Reason</th><th>Bars</th><th title="max adverse / favourable excursion, % of entry">MAE / MFE %</th><th title="net / initial stop risk">R</th><th>Charges</th><th>Net</th></tr></thead>
             <tbody>{trades.map((t, i) => (
               <tr key={i} title={t.legs.map((l) => `${l.side} ${l.qty} ${l.label}: ${l.entry} → ${l.exit}`).join("\n")}>
                 <td>{t.instrument.length > 46 ? `${t.legs.length} legs · ${shortSym(t.symbol)}` : t.instrument.replace(/^NSE:/, "")}</td>
                 <td><span className={`badge ${t.side === "BUY" ? "buy" : "sell"}`}>{t.side === "BUY" ? "LONG" : "SHORT"}</span></td>
                 <td className="mono">{t.qty}</td><td className="mono">{ist(t.entry_t)}</td><td className="mono">{t.entry.toFixed(2)}</td>
                 <td className="mono">{ist(t.exit_t)}</td><td className="mono">{t.exit.toFixed(2)}</td><td>{t.reason}</td>
-                <td className="mono">{t.bars}</td><td className="mono">{t.charges.toFixed(0)}</td><td className={`mono ${pnlCls(t.net)}`}>{t.net.toFixed(0)}</td></tr>))}
+                <td className="mono">{t.bars}</td><td className="mono">{num(t.mae_pct, 2)} / {num(t.mfe_pct, 2)}</td>
+                <td className={`mono ${pnlCls(t.r)}`}>{num(t.r, 2)}</td><td className="mono">{t.charges.toFixed(0)}</td><td className={`mono ${pnlCls(t.net)}`}>{t.net.toFixed(0)}</td></tr>))}
             </tbody>
           </table>
         </div>
@@ -793,6 +958,7 @@ function Optimizer({ spec, cat, range, onApply }: { spec: Spec; cat: Catalog; ra
   const [axes, setAxes] = useState<{ path: string; from: number; to: number; step: number }[]>([]);
   const [metric, setMetric] = useState("net_pnl");
   const [minTrades, setMinTrades] = useState(10);
+  const [oos, setOos] = useState(30);
   const values = (a: { from: number; to: number; step: number }) => {
     const out: number[] = [];
     if (a.step <= 0) return [a.from];
@@ -802,7 +968,7 @@ function Optimizer({ spec, cat, range, onApply }: { spec: Spec; cat: Catalog; ra
   const combos = axes.reduce((n, a) => n * values(a).length, axes.length ? 1 : 0);
   const run = useMutation({
     mutationFn: () => longPost<OptResult>("/api/algo/optimize", {
-      spec: tidy(spec), ...range, metric, min_trades: minTrades,
+      spec: tidy(spec), ...range, metric, min_trades: minTrades, oos_pct: oos || undefined,
       grid: axes.map((a) => ({ path: a.path, values: values(a) })),
     }),
   });
@@ -833,6 +999,7 @@ function Optimizer({ spec, cat, range, onApply }: { spec: Spec; cat: Catalog; ra
             if (p) setAxes([...axes, axisFor(p)]);
           }}>+ parameter</button>
           <label className="meta">rank by <select value={metric} onChange={(e) => setMetric(e.target.value)}>{cat.metrics.map((m) => <option key={m}>{m}</option>)}</select></label>
+          <label className="meta" title="the last X% of the range is held out: ranking uses only the earlier part, and each row shows how it did afterwards (walk-forward). 0 = off">hold out last <NumInput width={36} value={oos} onChange={(n) => setOos(Math.max(0, Math.min(80, Math.floor(n ?? 0))))} />% as out-of-sample</label>
           <label className="meta" title="combos with fewer trades are not ranked — a 1-trade 100% win rate means nothing">min trades <NumInput width={52} value={minTrades} onChange={(n) => setMinTrades(Math.max(1, Math.floor(n ?? 1)))} /></label>
           <span className="meta">{combos} combinations (max 400)</span>
           <button type="button" className="primary" disabled={!combos || combos > 400 || run.isPending} onClick={() => run.mutate()}>{run.isPending ? "Optimising…" : "Run optimisation"}</button>
@@ -841,16 +1008,18 @@ function Optimizer({ spec, cat, range, onApply }: { spec: Spec; cat: Catalog; ra
       {run.error && <div className="pnl-neg">{errMsg(run.error)}</div>}
       {run.data && (
         <>
-          <div className="meta" style={{ marginBottom: 6 }}>{run.data.combos} combos in {run.data.elapsed_s}s · {run.data.too_few_trades} skipped for too few trades. Beware overfitting — confirm the winner on a later date range.</div>
+          <div className="meta" style={{ marginBottom: 6 }}>{run.data.combos} combos in {run.data.elapsed_s}s · {run.data.too_few_trades} skipped for too few trades.{run.data.oos_from ? ` Ranked on the in-sample period only (before ${ist(run.data.oos_from)}); trust rows whose OOS columns hold up.` : " Beware overfitting — hold out an out-of-sample % to check."}</div>
           <div style={{ maxHeight: 480, overflow: "auto" }}>
             <table>
-              <thead><tr><th></th>{axes.map((a) => <th key={a.path} title={a.path}>{label(a.path)}</th>)}<th>Trades</th><th>Win %</th><th>PF</th><th>Sharpe</th><th>Max DD</th><th>Net</th></tr></thead>
+              <thead><tr><th></th>{axes.map((a) => <th key={a.path} title={a.path}>{label(a.path)}</th>)}<th>Trades</th><th>Win %</th><th>PF</th><th>Sharpe</th><th>t</th><th>Max DD</th><th>Net</th>{run.data.oos_from ? <><th title="out-of-sample">OOS trades</th><th title="out-of-sample">OOS PF</th><th title="out-of-sample">OOS net</th></> : null}</tr></thead>
               <tbody>{run.data.ranked.map((r, i) => (
                 <tr key={i}>
                   <td><button type="button" className="btn-sm" onClick={() => onApply(r.params)}>apply</button></td>
                   {axes.map((a) => <td key={a.path} className="mono">{r.params[a.path]}</td>)}
                   <td className="mono">{r.trades}</td><td className="mono">{num(r.win_rate, 1)}</td><td className="mono">{num(r.profit_factor)}</td>
-                  <td className="mono">{num(r.sharpe)}</td><td className="mono">{inr(r.max_drawdown)}</td><td className={`mono ${pnlCls(r.net_pnl)}`}>{inr(r.net_pnl)}</td>
+                  <td className="mono">{num(r.sharpe)}</td><td className="mono">{num(r.t_stat)}</td><td className="mono">{inr(r.max_drawdown)}</td><td className={`mono ${pnlCls(r.net_pnl)}`}>{inr(r.net_pnl)}</td>
+                  {run.data!.oos_from ? <><td className="mono">{r.oos?.trades ?? "—"}</td><td className="mono">{num(r.oos?.profit_factor)}</td>
+                    <td className={`mono ${pnlCls(r.oos?.net_pnl)}`}>{inr(r.oos?.net_pnl)}</td></> : null}
                 </tr>))}
               </tbody>
             </table>
@@ -1061,6 +1230,7 @@ export default function Algo() {
   const [viewing, setViewing] = useState<number | null>(null);   // version loaded into the builder
   const [range, setRange] = useState({ start: daysAgo(180), end: daysAgo(0) });
   const [msg, setMsg] = useState<string | null>(null);
+  const [oosPct, setOosPct] = useState(0);
   const fileRef = useRef<HTMLInputElement>(null);
 
   // Restore the draft (or start from the server defaults + the first template).
@@ -1090,7 +1260,7 @@ export default function Algo() {
   });
 
   const bt = useMutation({
-    mutationFn: () => longPost<BtResult>("/api/algo/backtest", { spec: tidy(spec!), ...range }),
+    mutationFn: () => longPost<BtResult>("/api/algo/backtest", { spec: tidy(spec!), ...range, oos_pct: oosPct || undefined }),
   });
   const versions = useQuery({
     queryKey: ["algo", "versions", editing], enabled: !!editing,
@@ -1154,6 +1324,12 @@ export default function Algo() {
     <div className="algo">
       <div className="dashboard-head">
         <h1 className="page-title">Algo Lab</h1>
+        <button type="button" className="primary" style={{ marginLeft: 12 }} onClick={() => {
+          if (!editing && !window.confirm("Start a new algo? The unsaved draft in the builder will be replaced.")) return;
+          setSpec(withDefaults(cat.data!.defaults, { symbols: [], entry_long: G([]), entry_short: G([]) }));
+          setName("New strategy"); setEditing(null); setViewing(null); bt.reset(); setTab("builder");
+          setMsg("New algo — pick symbols, add entry conditions, then backtest and save.");
+        }}>＋ New algo</button>
       </div>
       <div className="tabs">
         {(["builder", "optimize", "automations", "data"] as Tab[]).map((t) => (
@@ -1410,6 +1586,7 @@ export default function Algo() {
               {[30, 90, 180, 365, 730].map((d) => (
                 <button type="button" key={d} className="btn-sm" onClick={() => setRange({ start: daysAgo(d), end: daysAgo(0) })}>{d < 365 ? `${d}d` : `${d / 365}y`}</button>
               ))}
+              <label className="meta" title="split the result: the last X% of the range as out-of-sample (0 = off)">out-of-sample <NumInput width={36} value={oosPct} onChange={(n) => setOosPct(Math.max(0, Math.min(80, Math.floor(n ?? 0))))} />%</label>
               <button type="button" className="primary" disabled={bt.isPending} onClick={() => { setMsg(null); bt.mutate(); }}>
                 {bt.isPending ? "Backtesting… (downloads missing candles first)" : "▶ Run backtest"}
               </button>

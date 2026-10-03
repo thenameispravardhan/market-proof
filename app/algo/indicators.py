@@ -337,6 +337,38 @@ def ichimoku(d: dict, conv: int, base: int, span_b: int) -> dict[str, S]:
             "span_b": shift(mid(span_b), disp)}
 
 
+def zscore(x: S, n: int) -> S:
+    """(x - SMA) / stdev over n — how stretched price is, in sigmas."""
+    return _zip(lambda v, m, sd: (v - m) / sd if sd else 0.0, x, sma(x, n), stdev(x, n))
+
+
+def linreg(x: S, n: int) -> dict[str, S]:
+    """Least-squares line through the last n points: its end value, and its
+    slope as % of price per bar (trend strength that ignores noise)."""
+    val: S = [None] * len(x)
+    slope: S = [None] * len(x)
+    sx = n * (n - 1) / 2
+    sxx = (n - 1) * n * (2 * n - 1) / 6
+    den = n * sxx - sx * sx
+    for i in range(_first(x) + n - 1, len(x)):
+        w = x[i - n + 1:i + 1]
+        sy = sum(w)
+        sxy = sum(k * y for k, y in enumerate(w))
+        b = (n * sxy - sx * sy) / den if den else 0.0
+        a = (sy - b * sx) / n
+        val[i] = a + b * (n - 1)
+        slope[i] = b / val[i] * 100 if val[i] else 0.0
+    return {"value": val, "slope_pct": slope}
+
+
+def hist_vol(d: dict, n: int) -> S:
+    """Annualised close-to-close volatility (%) over n bars of this timeframe."""
+    c = d["c"]
+    rets: S = [None] + [math.log(c[i] / c[i - 1]) if c[i] > 0 and c[i - 1] > 0 else 0.0 for i in range(1, len(c))]
+    per_year = 252 * (1 if d["tf_s"] >= 86400 else max(1, 22500 // d["tf_s"]))
+    return _zip(lambda sd: sd * math.sqrt(per_year) * 100, stdev(rets, n))
+
+
 def _day_keys(d: dict) -> list[int]:
     return [(t + IST_OFFSET) // 86400 for t in d["t"]]
 
@@ -345,7 +377,7 @@ def daily_levels(d: dict) -> dict[str, S]:
     """Previous-day OHLC, classic pivots + CPR, and today's running OHLC."""
     keys, o, h, l, c = _day_keys(d), d["o"], d["h"], d["l"], d["c"]
     names = ("prev_open", "prev_high", "prev_low", "prev_close", "pivot", "r1", "r2", "r3",
-             "s1", "s2", "s3", "tc", "bc", "day_open", "day_high", "day_low")
+             "s1", "s2", "s3", "tc", "bc", "day_open", "day_high", "day_low", "gap_pct")
     out: dict[str, S] = {k: [None] * len(c) for k in names}
     prev = None          # (o, h, l, c) of the previous session
     cur = None
@@ -366,6 +398,7 @@ def daily_levels(d: dict) -> dict[str, S]:
                 2 * p - ph, p - (ph - pl), pl - 2 * (ph - p), 2 * p - bc, bc)
         for k, val in zip(names, vals):
             out[k][i] = val
+        out["gap_pct"][i] = (cur[0] - pc) / pc * 100 if pc else None
     return out
 
 
@@ -417,7 +450,7 @@ def candles(d: dict) -> dict[str, S]:
     o, h, l, c = d["o"], d["h"], d["l"], d["c"]
     out: dict[str, S] = {k: [0.0] * len(c) for k in (
         "green", "red", "doji", "hammer", "shooting_star", "bullish_engulfing",
-        "bearish_engulfing", "inside_bar", "outside_bar")}
+        "bearish_engulfing", "inside_bar", "outside_bar", "nr7")}
     for i in range(len(c)):
         body, rng = abs(c[i] - o[i]), h[i] - l[i]
         lower, upper = min(o[i], c[i]) - l[i], h[i] - max(o[i], c[i])
@@ -432,6 +465,8 @@ def candles(d: dict) -> dict[str, S]:
             out["bearish_engulfing"][i] = float(pg and c[i] < o[i] and o[i] >= c[i - 1] and c[i] <= o[i - 1])
             out["inside_bar"][i] = float(h[i] < h[i - 1] and l[i] > l[i - 1])
             out["outside_bar"][i] = float(h[i] > h[i - 1] and l[i] < l[i - 1])
+        if i >= 6:   # narrowest range of the last 7 bars — volatility coiled before a move
+            out["nr7"][i] = float(h[i] - l[i] <= min(h[k] - l[k] for k in range(i - 6, i)))
     return out
 
 
@@ -510,6 +545,10 @@ REGISTRY: dict[str, tuple[Callable[..., Any], dict[str, Any], list[str], str]] =
                    {"period": 20}, ["upper", "lower", "middle"], "Volatility"),
     "ATR":        (lambda d, period=14: atr(d, period), {"period": 14}, ["value"], "Volatility"),
     "STDDEV":     (_src(lambda x, period: stdev(x, period)), {"period": 20, "source": "close"}, ["value"], "Volatility"),
+    "ZSCORE":     (_src(lambda x, period: zscore(x, period)), {"period": 20, "source": "close"}, ["value"], "Volatility"),
+    "HV":         (lambda d, period=20: hist_vol(d, period), {"period": 20}, ["value"], "Volatility"),
+    "LINREG":     (_src(lambda x, period: linreg(x, period)), {"period": 20, "source": "close"},
+                   ["value", "slope_pct"], "Trend"),
     "HIGHEST":    (_src(lambda x, period: highest(x, period)), {"period": 20, "source": "high"}, ["value"], "Volatility"),
     "LOWEST":     (_src(lambda x, period: lowest(x, period)), {"period": 20, "source": "low"}, ["value"], "Volatility"),
     "OBV":        (lambda d: obv(d), {}, ["value"], "Volume"),
@@ -517,12 +556,12 @@ REGISTRY: dict[str, tuple[Callable[..., Any], dict[str, Any], list[str], str]] =
     "VOLUME_SMA": (lambda d, period=20: sma([float(v) for v in d["v"]], period), {"period": 20}, ["value"], "Volume"),
     "DAILY":      (lambda d: daily_levels(d), {}, ["prev_high", "prev_low", "prev_close", "prev_open",
                                                    "pivot", "r1", "r2", "r3", "s1", "s2", "s3", "tc", "bc",
-                                                   "day_open", "day_high", "day_low"], "Levels"),
+                                                   "day_open", "day_high", "day_low", "gap_pct"], "Levels"),
     "ORB":        (lambda d, minutes=15: opening_range(d, minutes), {"minutes": 15}, ["high", "low"], "Levels"),
     "HEIKIN_ASHI": (lambda d: heikin_ashi(d), {}, ["close", "open", "high", "low"], "Candles"),
     "CANDLE":     (lambda d: candles(d), {}, ["green", "red", "doji", "hammer", "shooting_star",
                                               "bullish_engulfing", "bearish_engulfing", "inside_bar",
-                                              "outside_bar"], "Candles"),
+                                              "outside_bar", "nr7"], "Candles"),
     "TIME":       (lambda d: clock(d), {}, ["hhmm", "weekday"], "Time"),
     # Calendar days to the instrument's expiry (options: the chosen weekly /
     # monthly; otherwise the monthly F&O expiry) — "trade only on expiry day"

@@ -26,6 +26,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.algo import data, engine
@@ -66,6 +67,57 @@ def _range(body: dict[str, Any]) -> tuple[int, int]:
     return ist0(start), min(ist0(end) + DAY, int(time.time()) + 60)
 
 
+# The backtester shares a 2 GB box (MemoryMax 1.4G) with the live trading
+# process. ~140k bars (4 symbols x 2y x 5m) measured ~350 MB peak, so a cap of
+# 600k bars keeps one job well inside the budget, and the semaphore makes it
+# ONE job at a time — two big backtests in parallel would double the peak and
+# could get the trading process OOM-killed mid-session.
+MAX_BARS = 600_000
+MAX_BAR_RUNS = 30_000_000          # optimiser: combos x bars (~4 minutes of CPU)
+_heavy = asyncio.Semaphore(1)
+
+
+def _estimate_bars(spec: dict[str, Any], start: int, end: int) -> int:
+    days = (end - start) / 86400 * 5 / 7 + 30
+    per_day = 375 / spec["timeframe"]
+    htf = sum(1 if tf == 1440 else 375 / tf for tf in engine.cond_timeframes(spec)) / per_day
+    return int(len(spec["symbols"]) * days * per_day * (1 + htf))
+
+
+def _guard(spec: dict[str, Any], start: int, end: int, combos: int = 1) -> int:
+    est = _estimate_bars(spec, start, end)
+    if est > MAX_BARS:
+        raise HTTPException(422, detail=(
+            f"too much data for one run: ~{est:,} candles ({len(spec['symbols'])} symbols x "
+            f"{(end - start) // 86400} days at {spec['timeframe']}m). Keep it under {MAX_BARS:,} — "
+            "shorten the range, use a larger timeframe or fewer symbols."))
+    if est * combos > MAX_BAR_RUNS:
+        raise HTTPException(422, detail=(
+            f"optimisation too heavy: {combos} combinations x ~{est:,} candles. Narrow the grid "
+            f"or the date range (limit {MAX_BAR_RUNS:,} candle-runs)."))
+    return est
+
+
+def _oos_pct(body: dict[str, Any]) -> float:
+    try:
+        pct = float(body.get("oos_pct") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(422, detail="out-of-sample % must be a number") from None
+    if pct and not 5 <= pct <= 80:
+        raise HTTPException(422, detail="out-of-sample % must be between 5 and 80")
+    return pct
+
+
+def _oos_from(bars: dict[str, dict], trade_from: int, pct: float) -> Optional[int]:
+    """Hold out the LAST pct % of the data actually loaded — not of the
+    requested range, which may run past the newest candle (a split in the
+    empty tail would leave the out-of-sample side with nothing)."""
+    if not pct:
+        return None
+    last = max(v["t"][-1] for v in bars.values())
+    return int(last - (last - trade_from) * pct / 100)
+
+
 async def _assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str, dict], list[dict], int]:
     bars, notes, trade_from = await data.assemble(spec, start, end)
     if not bars:
@@ -80,16 +132,27 @@ def indicators() -> dict[str, Any]:
             "sizing": engine.SIZING, "defaults": engine.DEFAULT_SPEC, "max_range_days": MAX_RANGE_DAYS}
 
 
+@router.post("/validate")
+def validate(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Check a spec without running it: the normalized spec, or a 422 saying what is wrong."""
+    return {"ok": True, "spec": _spec(body.get("spec"))}
+
+
 @router.post("/backtest")
 async def backtest(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     spec = _spec(body.get("spec"))
     start, end = _range(body)
-    t0 = time.monotonic()
-    bars, notes, trade_from = await _assemble(spec, start, end)
-    try:
-        res = await asyncio.to_thread(engine.run, spec, bars, None, trade_from)
-    except (ValueError, KeyError) as e:
-        raise HTTPException(422, detail=f"backtest: {e}")
+    _guard(spec, start, end)
+    pct = _oos_pct(body)
+    async with _heavy:
+        t0 = time.monotonic()
+        bars, notes, trade_from = await _assemble(spec, start, end)
+        oos_from = _oos_from(bars, trade_from, pct)
+        try:
+            res = await asyncio.to_thread(engine.run, spec, bars, None, trade_from, oos_from)
+            res["monte_carlo"] = await asyncio.to_thread(engine.monte_carlo, res["trades"], spec["portfolio"]["capital"])
+        except (ValueError, KeyError, ZeroDivisionError) as e:
+            raise HTTPException(422, detail=f"backtest: {e}")
     chart_sym = body.get("chart_symbol") if body.get("chart_symbol") in bars else next(iter(bars))
     d = bars[chart_sym]
     keep = 8000                         # enough to inspect, small enough to ship
@@ -108,15 +171,23 @@ async def backtest(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
 async def optimize(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     spec = _spec(body.get("spec"))
     start, end = _range(body)
-    t0 = time.monotonic()
-    bars, notes, trade_from = await _assemble(spec, start, end)
-    try:
-        res = await asyncio.to_thread(engine.optimize, spec, bars, body.get("grid") or [],
-                                      str(body.get("metric") or "net_pnl"), int(body.get("min_trades") or 5),
-                                      trade_from)
-    except (ValueError, KeyError, IndexError, TypeError) as e:
-        raise HTTPException(422, detail=f"optimize: {e}")
-    return {**res, "notes": notes, "elapsed_s": round(time.monotonic() - t0, 2)}
+    grid = body.get("grid") or []
+    combos = 1
+    for g in grid:
+        combos *= max(1, len(g.get("values") or []))
+    _guard(spec, start, end, combos)
+    pct = _oos_pct(body)
+    async with _heavy:
+        t0 = time.monotonic()
+        bars, notes, trade_from = await _assemble(spec, start, end)
+        oos_from = _oos_from(bars, trade_from, pct)
+        try:
+            res = await asyncio.to_thread(engine.optimize, spec, bars, grid,
+                                          str(body.get("metric") or "net_pnl"), int(body.get("min_trades") or 5),
+                                          trade_from, oos_from)
+        except (ValueError, KeyError, IndexError, TypeError, ZeroDivisionError) as e:
+            raise HTTPException(422, detail=f"optimize: {e}")
+    return {**res, "notes": notes, "elapsed_s": round(time.monotonic() - t0, 2), "oos_from": oos_from}
 
 
 @router.get("/instrument")
@@ -253,7 +324,11 @@ def update_strategy(sid: int, body: dict[str, Any] = Body(...), db: Session = De
             raise HTTPException(422, detail=f"live square-off must be at or before {LIVE_SQUARE_OFF_LATEST} "
                                             "(Fyers auto-squares intraday positions at ~15:20)")
     _audit(db, "algo.update", s, changes)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, detail="another save of this strategy landed at the same moment — reload and retry")
     return _ser(s, db)
 
 

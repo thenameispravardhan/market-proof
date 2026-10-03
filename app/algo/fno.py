@@ -174,11 +174,12 @@ def default_step(name: str, spot: float) -> float:
 
 def pick_strike(spot: float, step: float, right: str, mode: str, steps: int) -> float:
     """ATM, or N strikes in-the-money / out-of-the-money for this right."""
-    atm = round(spot / step) * step
+    atm = max(step, round(spot / step) * step)
     n = int(steps or 0) if mode in ("ITM", "OTM") else 0
     itm_dir = -1 if right == "CE" else 1          # CE ITM = lower strikes
     sign = itm_dir if mode == "ITM" else -itm_dir
-    return round(atm + sign * n * step, 2)
+    # A deep strike can't go to zero or below (a 20-OTM put on a cheap stock).
+    return round(max(step, atm + sign * n * step), 2)
 
 
 def strike_for_premium(spot: float, step: float, right: str, target: float, price_at) -> float:
