@@ -1396,12 +1396,25 @@ kbd {
 .chart-toolbar {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 10px;
-  row-gap: 6px;
+  flex-wrap: nowrap;   /* one row, TradingView-style */
+  gap: 6px;
 }
-.chart-symbol { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
-.chart-symbol .sym { font-size: 15px; font-weight: 700; color: var(--text); }
+.chart-select {
+  width: auto;
+  flex-shrink: 0;
+  background: var(--bg-surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 4px 4px;
+  cursor: pointer;
+}
+.chart-select:hover { border-color: var(--border-hi); }
+.chart-symbol { display: flex; align-items: baseline; gap: 8px; min-width: 0; flex-shrink: 1; overflow: hidden; white-space: nowrap; }
+.chart-symbol .sym { font-size: 15px; font-weight: 700; color: var(--text); overflow: hidden; text-overflow: ellipsis; }
 .chart-symbol .exch {
   font-size: 10px;
   color: var(--text-dim);
