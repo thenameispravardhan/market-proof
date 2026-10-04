@@ -331,7 +331,7 @@ export default function App() {
             <PageContent tab={tab} />
           </Suspense>
         </div>
-        <StatusBar wsStatus={status} />
+        {tab !== "trade" && <StatusBar wsStatus={status} />}
       </main>
     </div>
   );
