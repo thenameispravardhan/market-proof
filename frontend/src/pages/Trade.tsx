@@ -300,6 +300,10 @@ export default function Trade() {
   const [cells, setCells] = useState<(InstrumentHit | null)[]>(() => stored("trade:cells", []));
   const [activeCell, setActiveCell] = useState(0);
   const [layoutOpen, setLayoutOpen] = useState(false);
+  // One top toolbar + one drawing strip for the whole layout: the active
+  // chart renders its own controls into these (TradingView-style).
+  const [topSlot, setTopSlot] = useState<HTMLDivElement | null>(null);
+  const [leftSlot, setLeftSlot] = useState<HTMLDivElement | null>(null);
   const [scalper, setScalper] = useState(() => stored("trade:scalper", false));
   useEffect(() => { try { localStorage.setItem("trade:scalper", JSON.stringify(scalper)); } catch { /* best-effort */ } }, [scalper]);
   const dockWidth = dock.includes("chain") ? Math.max(dockW, 400) : dockW;   // the chain's 5 columns need room
@@ -523,6 +527,7 @@ export default function Trade() {
 
   // Chart "⤷ Ticket" tool → prefill the ticket as a LIMIT order.
   const onPickPrice = (price: number) => {
+    if (!dock.includes("trade")) toggleDock("trade");
     setOrderType("LIMIT");
     setLimitPrice(price.toFixed(2));
   };
@@ -761,6 +766,10 @@ export default function Trade() {
               helpers={{ positionFor, levelsFor, closeFor, orderFor }}
             />
           ) : (
+            <div className="tv-layout">
+            <div className="tv-topbar" ref={setTopSlot} />
+            <div className="tv-chartrow">
+            <div className="tv-leftbar" ref={setLeftSlot} />
             <div className={`tv-grid l${layout}`}>
               {Array.from({ length: nCells }, (_, i) => {
                 const h = i === activeCell ? selected : cells[i] ?? null;
@@ -781,6 +790,9 @@ export default function Trade() {
                         onClosePosition={closeFor(h.symbol)}
                         onChartOrder={active ? orderFor(h.symbol, h.short_name, Number(quantity)) : undefined}
                         orderQty={active ? Number(quantity) : undefined}
+                        toolbarSlot={active ? topSlot : undefined}
+                        toolsSlot={active ? leftSlot : undefined}
+                        chrome={active}
                       />
                     )}
                     {h && !active && <KeepLive symbol={h.symbol} />}
@@ -797,6 +809,8 @@ export default function Trade() {
                   </div>
                 );
               })}
+            </div>
+            </div>
             </div>
           )}
         </div>

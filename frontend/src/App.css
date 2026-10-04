@@ -2273,3 +2273,20 @@ kbd {
 .scalp-btn.sell { background: var(--red); color: #fff; }
 .scalp-btn.exit { background: var(--bg-elev); color: var(--text); border: 1px solid var(--border-hi); }
 .scalp-btn:disabled { opacity: 0.4; cursor: default; }
+
+/* Shared chrome for the layout grid: the active chart's toolbar on top and
+   its drawing strip on the left. */
+.tv-layout { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 6px; }
+.tv-topbar { flex-shrink: 0; container-type: inline-size; padding: 4px 8px; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; }
+.tv-topbar:empty, .tv-leftbar:empty { display: none; }
+.tv-chartrow { flex: 1; min-height: 0; display: flex; gap: 6px; }
+.tv-leftbar { flex-shrink: 0; display: flex; }
+.tv-leftbar .chart-tools { height: 100%; }
+.tv-chartrow .tv-grid { flex: 1; min-width: 0; }
+
+/* "+" on the price scale + menu shortcuts */
+.chart-plus { position: absolute; z-index: 7; width: 18px; height: 18px; padding: 0; place-items: center; border: 1px solid var(--border-hi); border-radius: 50%; background: var(--bg-panel); color: var(--text); font-size: 13px; line-height: 1; cursor: pointer; }
+.chart-plus:hover { background: var(--accent); border-color: var(--accent); color: var(--text-inv); }
+.chart-ctx { min-width: 280px; }
+.chart-ctx .chart-menu-item { display: flex; align-items: center; gap: 6px; }
+.chart-ctx .kbd { margin-left: auto; padding-left: 16px; color: var(--text-faint); font-size: 10px; }
