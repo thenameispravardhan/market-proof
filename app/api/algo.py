@@ -118,6 +118,39 @@ def _oos_from(bars: dict[str, dict], trade_from: int, pct: float) -> Optional[in
     return int(last - (last - trade_from) * pct / 100)
 
 
+def _real_share(d: dict) -> float:
+    """% of the order-flow volume that came from recorded ticks (rest is BVC)."""
+    tot = sum(d["v"]) or 0
+    return round(sum(v * p / 100 for v, p in zip(d["v"], d.get("real_pct") or [])) / tot * 100, 1) if tot else 0.0
+
+
+def _overlays(spec: dict[str, Any], d: dict, cache: dict, lo: int) -> list[dict[str, Any]]:
+    """The strategy's own indicator lines for the chart symbol — what it
+    actually sees — so the results chart can draw them. Each is marked to sit
+    on the price scale or in its own pane by whether its values live in the
+    price range."""
+    seen, out = set(), []
+    pmin, pmax = min(d["l"][lo:] or [0]), max(d["h"][lo:] or [0])
+    for op in engine._walk_operands(spec):
+        if op["ind"] in ("PRICE", "TIME", "CANDLE", "DTE") or len(out) >= 8:
+            continue
+        key = (op["ind"], op.get("field"), tuple(sorted((op.get("params") or {}).items())), op.get("tf"), op.get("mult"), op.get("add"))
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            vals = engine.series(d, op, cache)[lo:]
+        except (ValueError, KeyError):
+            continue
+        nums = [v for v in vals if v is not None]
+        if not nums:
+            continue
+        on_price = pmin * 0.8 <= min(nums) and max(nums) <= pmax * 1.2
+        label = op["ind"] + (f".{op['field']}" if op.get("field") else "") +             (f"({','.join(str(v) for v in (op.get('params') or {}).values())})" if op.get("params") else "") +             (f" {op['tf']}m" if op.get("tf") else "")
+        out.append({"label": label, "price": on_price, "values": [None if v is None else round(v, 4) for v in vals]})
+    return out
+
+
 async def _assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str, dict], list[dict], int]:
     bars, notes, trade_from = await data.assemble(spec, start, end)
     if not bars:
@@ -149,7 +182,8 @@ async def backtest(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         bars, notes, trade_from = await _assemble(spec, start, end)
         oos_from = _oos_from(bars, trade_from, pct)
         try:
-            res = await asyncio.to_thread(engine.run, spec, bars, None, trade_from, oos_from)
+            caches: dict[str, dict] = {}
+            res = await asyncio.to_thread(engine.run, spec, bars, caches, trade_from, oos_from)
             res["monte_carlo"] = await asyncio.to_thread(engine.monte_carlo, res["trades"], spec["portfolio"]["capital"])
         except (ValueError, KeyError, ZeroDivisionError) as e:
             raise HTTPException(422, detail=f"backtest: {e}")
@@ -165,7 +199,9 @@ async def backtest(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     res["trades"] = res["trades"][-3000:]
     return {**res, "spec": spec, "notes": notes, "elapsed_s": round(time.monotonic() - t0, 2),
             "chart": {"symbol": chart_sym, "candles": candles,
-                      "trades": [x for x in res["trades"] if x["symbol"] == chart_sym]},
+                      "trades": [x for x in res["trades"] if x["symbol"] == chart_sym],
+                      "overlays": _overlays(spec, d, caches.get(chart_sym, {}), lo)},
+            "flow_source": {k: _real_share(v) for k, v in bars.items() if v.get("flow")},
             "bars": {k: sum(1 for t in v["t"] if t >= trade_from) for k, v in bars.items()}}
 
 
@@ -210,6 +246,67 @@ async def instrument_info(symbol: str) -> dict[str, Any]:
             "futures": [{"symbol": s_, "expiry": e} for e, s_ in fno.master()["futures"].get(name, [])
                         if e >= time.time()][:3],
             "coverage": data.coverage(data.store_key(fy))}
+
+
+# ---- real tick recording (app/algo/ticks.py) --------------------------------
+
+@router.get("/ticks/status")
+def ticks_status() -> dict[str, Any]:
+    from app.algo import ticks
+
+    return ticks.recorder().status()
+
+
+@router.put("/ticks/config")
+def ticks_config(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Which symbols to record. "NIFTY:FUT" = the current NIFTY future (rolls
+    by itself); an index entry records its current future too."""
+    from app.algo import ticks
+
+    syms = body.get("symbols") or []
+    if not isinstance(syms, list) or len(syms) > ticks.MAX_SYMBOLS:
+        raise HTTPException(422, detail=f"symbols must be a list of at most {ticks.MAX_SYMBOLS}")
+    ticks.recorder().save_config(bool(body.get("enabled", True)), [str(x) for x in syms])
+    return ticks.recorder().status()
+
+
+@router.get("/ticks/flow")
+def ticks_flow(symbol: str, resolution: str = "5", from_ts: int = Query(..., alias="from"),
+               to_ts: int = Query(..., alias="to"), footprint: bool = False) -> dict[str, Any]:
+    """REAL order flow per chart candle: buy / sell volume classified from
+    recorded ticks, delta, trades, and the resting book at the candle's end.
+    Candles align with /api/market/history (09:15 buckets, D = session).
+    With footprint=true also buy/sell per price per candle."""
+    from app.algo import ticks
+
+    if resolution != "D" and not resolution.isdigit():
+        raise HTTPException(422, detail="resolution is minutes or D")
+    span = 86400 if resolution == "D" else int(resolution) * 60
+    rec = ticks.recorder()
+    key = ticks.flow_key(data.fyers_symbol(symbol))
+
+    def bucket(t: int) -> int:
+        day0 = t - (t + 19800) % 86400
+        if span == 86400:
+            return day0
+        o_s = day0 + 33300
+        return o_s + ((t - o_s) // span) * span
+
+    rows: dict[int, list[float]] = {}
+    for t, (b, s_) in sorted(rec.minute_flow(key, from_ts, to_ts).items()):
+        r = rows.setdefault(bucket(t), [0.0, 0.0])
+        r[0] += b
+        r[1] += s_
+    out = {"symbol": symbol, "key": key, "recorded": bool(rows),
+           "bars": [[t, round(b, 2), round(s_, 2), round(b - s_, 2)] for t, (b, s_) in sorted(rows.items())]}
+    if footprint:
+        fp: dict[tuple[int, float], list[float]] = {}
+        for t, price, b, s_ in rec.footprint(key, from_ts, to_ts):
+            f = fp.setdefault((bucket(int(t)), price), [0.0, 0.0])
+            f[0] += b
+            f[1] += s_
+        out["footprint"] = [[t, p, round(b, 2), round(s_, 2)] for (t, p), (b, s_) in sorted(fp.items())]
+    return out
 
 
 @router.get("/data")

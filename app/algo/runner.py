@@ -356,6 +356,10 @@ class AlgoRunner:
         strategies, open_trades = await asyncio.to_thread(_snapshot)
         by_id = {s["id"]: s for s in strategies}
         day_start = day * 86400 - IST
+        # Record real ticks for everything an enabled strategy trades.
+        from app.algo import ticks
+
+        ticks.recorder().extra = sorted({x for s in strategies if s["enabled"] for x in s["spec"]["symbols"]})
         if self._master_day != day and any(s["spec"]["instrument"]["type"] != "equity" for s in strategies):
             self._master_day = day
             try:

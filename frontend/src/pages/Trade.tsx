@@ -133,7 +133,81 @@ function loadRecent(): InstrumentHit[] {
   }
 }
 
+// Real order flow for the selected symbol, from the tick recorder: every
+// Fyers tick classified buy/sell (Lee-Ready). Today's 5-minute candles of
+// buy vs sell volume, delta and cumulative delta. Symbols not on the
+// recorder's list can be added from here.
+type FlowResp = { symbol: string; key: string; recorded: boolean; bars: [number, number, number, number][] };
+function FlowPanel({ symbol }: { symbol: string | null }) {
+  const [data, setData] = useState<FlowResp | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
+  const load = async () => {
+    if (!symbol) return;
+    const now = Math.floor(Date.now() / 1000);
+    const day0 = now - ((now + 19800) % 86400);
+    try {
+      const r = await fetch(`/api/algo/ticks/flow?symbol=${encodeURIComponent(symbol)}&resolution=5&from=${day0 - 86400 * 4}&to=${now + 60}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      setData(await r.json()); setErr(null);
+    } catch (e) { setErr(e instanceof Error ? e.message : String(e)); }
+  };
+  useEffect(() => { setData(null); load(); const id = setInterval(load, 15000); return () => clearInterval(id); }, [symbol]);  // eslint-disable-line react-hooks/exhaustive-deps
+  if (!symbol) return <section className="trade-card"><div className="empty">Pick a symbol first.</div></section>;
+  const bars = data?.bars ?? [];
+  const lastDay = bars.length ? Math.floor((bars[bars.length - 1][0] + 19800) / 86400) : 0;
+  const today = bars.filter((b) => Math.floor((b[0] + 19800) / 86400) === lastDay);
+  const buy = today.reduce((a, b) => a + b[1], 0), sell = today.reduce((a, b) => a + b[2], 0);
+  let cvd = 0;
+  const maxAbs = Math.max(1, ...today.map((b) => Math.abs(b[3])));
+  const fmt = (v: number) => Math.round(v).toLocaleString("en-IN");
+  return (
+    <section className="trade-card" data-testid="trade-flow">
+      <h2>Real order flow — {symbol} {data?.key && <span className="hint">recorded as {data.key}</span>}</h2>
+      {err && <div className="hint warn-text">{err}</div>}
+      {data && !data.recorded && (
+        <div className="empty">
+          No ticks recorded for this symbol yet.{" "}
+          <button type="button" className="btn-sm" disabled={adding} onClick={async () => {
+            setAdding(true);
+            try {
+              const st = await (await fetch("/api/algo/ticks/status")).json();
+              await fetch("/api/algo/ticks/config", { method: "PUT", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ enabled: true, symbols: [...st.config_symbols, symbol] }) });
+              setErr("Added — recording starts with the next tick (market hours).");
+            } finally { setAdding(false); }
+          }}>record it</button>
+        </div>
+      )}
+      {today.length > 0 && (
+        <>
+          <div className="quote-row">
+            <div className="quote-cell"><div className="k">BUY VOL</div><div className="v up">{fmt(buy)}</div></div>
+            <div className="quote-cell"><div className="k">SELL VOL</div><div className="v down">{fmt(sell)}</div></div>
+            <div className="quote-cell"><div className="k">DELTA</div><div className={`v ${buy >= sell ? "up" : "down"}`}>{fmt(buy - sell)}</div></div>
+            <div className="quote-cell"><div className="k">BUY %</div><div className="v">{buy + sell ? ((buy / (buy + sell)) * 100).toFixed(1) : "—"}</div></div>
+          </div>
+          <div style={{ maxHeight: 280, overflow: "auto" }}>
+            <table className="pending-table">
+              <thead><tr><th>Time</th><th>Buy</th><th>Sell</th><th>Delta</th><th style={{ width: "40%" }}></th><th>CVD</th></tr></thead>
+              <tbody>{today.map((b) => { cvd += b[3]; return (
+                <tr key={b[0]}>
+                  <td>{new Date((b[0] + 19800) * 1000).toISOString().slice(11, 16)}</td>
+                  <td className="up">{fmt(b[1])}</td><td className="down">{fmt(b[2])}</td>
+                  <td className={b[3] >= 0 ? "up" : "down"}>{fmt(b[3])}</td>
+                  <td><div style={{ height: 8, width: `${(Math.abs(b[3]) / maxAbs) * 100}%`, background: b[3] >= 0 ? "var(--green)" : "var(--red)", marginLeft: b[3] >= 0 ? "50%" : `${50 - (Math.abs(b[3]) / maxAbs) * 50}%`, maxWidth: "50%" }} /></td>
+                  <td className={cvd >= 0 ? "up" : "down"}>{fmt(cvd)}</td>
+                </tr>); })}</tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
 export default function Trade() {
+  const [bottomTab, setBottomTab] = useState<"positions" | "orders" | "chain" | "flow">("orders");
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<InstrumentHit | null>(null);
   const [showResults, setShowResults] = useState(false);
@@ -522,520 +596,546 @@ export default function Trade() {
         )}
       </div>
 
-      {/* ---- TradingView-style chart for the selected instrument ----
-           key={symbol} remounts the panel per symbol so its internal
-           candle store, drawings, and pagination reset cleanly. */}
-      {selected && (
-        <ChartPanel
-          key={selected.symbol}
-          symbol={selected.symbol}
-          shortName={selected.short_name}
-          brokerLines={brokerLines}
-          onPickPrice={onPickPrice}
-        />
-      )}
-
-      {/* ---- main grid: quote | ticket | pending ---- */}
-      <div className="trade-grid">
-        {/* QUOTE */}
-        <section className="trade-card" data-testid="trade-quote">
-          <h2>Quote</h2>
-          {!selected ? (
-            <div className="empty">Pick a symbol above to start.</div>
-          ) : (
-            <div>
-              <div className="quote-sym">
-                <span className="big">{selected.short_name}</span>
-                <span className="exch">{selected.exchange}:{selected.segment}</span>
-                {isOption && <span className="badge opt">OPTION</span>}
-                {isFuture && <span className="badge fut">FUTURE</span>}
-                {!isOption && !isFuture && <span className="badge cash">CASH</span>}
-              </div>
-              <div className="quote-fullsym">{selected.symbol}</div>
-              <div className="quote-row">
-                <div className="quote-cell">
-                  <div className="k">LTP</div>
-                  <div className="v big" data-testid="quote-ltp">
-                    {ltp != null ? fmtMoney(ltp) : "—"}
-                  </div>
-                </div>
-                <div className="quote-cell">
-                  <div className="k">BID</div>
-                  <div className="v">{bid != null ? fmtMoney(bid) : "—"}</div>
-                </div>
-                <div className="quote-cell">
-                  <div className="k">ASK</div>
-                  <div className="v">{ask != null ? fmtMoney(ask) : "—"}</div>
-                </div>
-                <div className="quote-cell">
-                  <div className="k">LOT</div>
-                  <div className="v">{selected.lot_size}</div>
-                </div>
-              </div>
-              {!quote?.ok && (
-                <div className="hint warn-text">
-                  {quote?.reason ?? "no quote cached for this symbol"}
-                </div>
-              )}
-            </div>
+      <div className="trade-layout">
+        <div className="trade-left">
+        {/* ---- TradingView-style chart for the selected instrument ----
+             key={symbol} remounts the panel per symbol so its internal
+             candle store, drawings, and pagination reset cleanly. */}
+        {selected && (
+          <ChartPanel
+            key={selected.symbol}
+            symbol={selected.symbol}
+            shortName={selected.short_name}
+            brokerLines={brokerLines}
+            onPickPrice={onPickPrice}
+          />
+        )}
+  
+          {!selected && (
+            <section className="trade-card"><div className="empty">Search a symbol above to open its chart.</div></section>
           )}
-        </section>
-
-        {/* TICKET */}
-        <section className="trade-card" data-testid="trade-ticket">
-          <h2>Ticket</h2>
-          <div className="ticket-side" role="group" aria-label="side">
-            <button
-              className={`ticket-side-btn buy ${side === "BUY" ? "on" : ""}`}
-              onClick={() => setSide("BUY")}
-              data-testid="ticket-side-buy"
-            >
-              BUY
-            </button>
-            <button
-              className={`ticket-side-btn sell ${side === "SELL" ? "on" : ""}`}
-              onClick={() => setSide("SELL")}
-              data-testid="ticket-side-sell"
-            >
-              SELL
-            </button>
+          <div className="tabs trade-tabs" role="tablist">
+            {([["positions", `Positions${positions?.length ? ` (${positions.length})` : ""}`], ["orders", `Orders${pending?.count ? ` (${pending.count})` : ""}`], ["chain", "Option chain"], ["flow", "Order flow"]] as const).map(([k, label]) => (
+              <button key={k} type="button" role="tab" aria-selected={bottomTab === k} className={`tab ${bottomTab === k ? "active" : ""}`} onClick={() => setBottomTab(k)}>{label}</button>
+            ))}
           </div>
-
-          <label className="ticket-row">
-            <span>Quantity</span>
-            <input
-              type="number"
-              min={1}
-              step={selected?.lot_size ?? 1}
-              value={quantity}
-              onChange={(e) => setQuantity(Math.max(1, Number(e.target.value || 1)))}
-              data-testid="ticket-qty"
-            />
-            {selected && selected.lot_size > 1 && (
-              <span className="hint">
-                {Math.floor(quantity / selected.lot_size)} lot(s)
-              </span>
-            )}
-          </label>
-
-          <label className="ticket-row">
-            <span>Order type</span>
-            <select
-              value={orderType}
-              onChange={(e) => setOrderType(e.target.value as OrderType)}
-              data-testid="ticket-type"
-            >
-              <option value="MARKET">MARKET</option>
-              <option value="LIMIT">LIMIT</option>
-              <option value="STOP_LOSS">STOP_LOSS (SL-L)</option>
-              <option value="SL-M">SL-M</option>
-            </select>
-          </label>
-
-          {requiresLimit && (
-            <label className="ticket-row">
-              <span>Limit price</span>
-              <input
-                type="number"
-                step="0.05"
-                value={limitPrice}
-                onChange={(e) => setLimitPrice(e.target.value)}
-                data-testid="ticket-limit"
-              />
-              <span className="px-quick">
-                {bid != null && (
-                  <button
-                    type="button"
-                    className="px-quick-btn"
-                    onClick={() => setLimitPrice(bid.toFixed(2))}
-                    title={`bid ${fmtMoney(bid)}`}
-                    data-testid="limit-fill-bid"
-                  >
-                    bid
-                  </button>
-                )}
-                {ltp != null && (
-                  <button
-                    type="button"
-                    className="px-quick-btn"
-                    onClick={() => setLimitPrice(ltp.toFixed(2))}
-                    title={`LTP ${fmtMoney(ltp)}`}
-                    data-testid="limit-fill-ltp"
-                  >
-                    ltp
-                  </button>
-                )}
-                {ask != null && (
-                  <button
-                    type="button"
-                    className="px-quick-btn"
-                    onClick={() => setLimitPrice(ask.toFixed(2))}
-                    title={`ask ${fmtMoney(ask)}`}
-                    data-testid="limit-fill-ask"
-                  >
-                    ask
-                  </button>
-                )}
-              </span>
-            </label>
-          )}
-
-          {requiresStop && (
-            <label className="ticket-row">
-              <span>Stop price</span>
-              <input
-                type="number"
-                step="0.05"
-                value={stopPrice}
-                onChange={(e) => setStopPrice(e.target.value)}
-                data-testid="ticket-stop"
-              />
-              {ltp != null && (
-                <span className="px-quick">
-                  <button
-                    type="button"
-                    className="px-quick-btn"
-                    onClick={() => setStopPrice(ltp.toFixed(2))}
-                    title={`LTP ${fmtMoney(ltp)}`}
-                    data-testid="stop-fill-ltp"
-                  >
-                    ltp
-                  </button>
-                </span>
-              )}
-            </label>
-          )}
-
-          {/* Intraday-only bot: no delivery / carry-forward, ever. One value,
-              so it reads as a fact rather than a choice you cannot make. */}
-          <div className="ticket-row">
-            <span>Product</span>
-            <span
-              data-testid="ticket-product"
-              title="Intraday-only bot — every position is squared off the same day"
-            >
-              INTRADAY (MIS)
-            </span>
-          </div>
-
-          {/* Submit */}
-          <div className="ticket-submit">
-            <button
-              className={`btn ${side === "BUY" ? "buy" : "sell"}`}
-              disabled={!canSubmit || placeOrder.isPending}
-              onClick={() => onSubmit()}
-              data-testid="ticket-submit"
-            >
-              {placeOrder.isPending ? "placing…" : `PLACE ${side}`}
-            </button>
-          </div>
-
-          {lastResult && lastResult.type === "success" && (
-            <div className="result success" data-testid="ticket-result-success">
-              {lastResult.message}
-              {lastResult.warning && (
-                <div className="result-warning" data-testid="ticket-risk-advisory">
-                  ⚠ risk advisory: {lastResult.warning}
-                </div>
-              )}
-            </div>
-          )}
-          {lastResult && lastResult.type === "error" && (
-            <div className="result error" data-testid="ticket-result-error">
-              {lastResult.message}
-              {lastResult.reason === "risk_block" && (
-                <div
-                  className="risk-override-hint"
-                  data-testid="ticket-risk-override"
-                  style={{
-                    marginTop: 10,
-                    padding: "8px 10px",
-                    border: "1px solid var(--amber)",
-                    borderRadius: 4,
-                    background: "rgba(255, 200, 80, 0.08)",
-                    fontSize: 12,
-                  }}
-                >
-                  <div style={{ marginBottom: 8 }}>
-                    This order breaches a limit set in <b>Settings</b>. Reduce
-                    the size or relax the limit — or override the check and
-                    place it anyway.
-                  </div>
-                  <button
-                    className="btn-sm sell"
-                    onClick={() => onSubmit({ bypassRisk: true })}
-                    disabled={placeOrder.isPending}
-                    data-testid="ticket-risk-override-btn"
-                  >
-                    {placeOrder.isPending
-                      ? "placing…"
-                      : "⚠ Override risk & place anyway"}
-                  </button>
-                </div>
-              )}
-              {lastResult.reason === "ip_whitelist" && serverInfo?.public_ip && (
-                <div
-                  className="ip-whitelist-hint"
-                  data-testid="ticket-ip-whitelist"
-                  style={{
-                    marginTop: 10,
-                    padding: "8px 10px",
-                    border: "1px solid var(--amber)",
-                    borderRadius: 4,
-                    background: "rgba(255, 200, 80, 0.08)",
-                    fontSize: 12,
-                    fontFamily: "var(--mono)",
-                  }}
-                >
-                  <div style={{ marginBottom: 6 }}>
-                    Add this server's public IP to the Fyers app's
-                    IP-whitelist on{" "}
-                    <a
-                      href="https://myapi.fyers.in/dashboard/"
-                      target="_blank"
-                      rel="noreferrer"
-                      style={{ color: "var(--amber)" }}
-                    >
-                      myapi.fyers.in/dashboard
-                    </a>
-                    , then click PLACE BUY again.
-                  </div>
-                  <div
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 8,
-                    }}
-                  >
-                    <div
-                      style={{
-                        fontSize: 14,
-                        fontWeight: 700,
-                        letterSpacing: "0.05em",
-                        userSelect: "all",
-                        flex: 1,
-                      }}
-                      data-testid="ticket-server-ip"
-                    >
-                      {serverInfo.public_ip}
-                    </div>
-                    <button
-                      className="btn-sm"
-                      onClick={() => {
-                        if (serverInfo.public_ip && navigator.clipboard) {
-                          navigator.clipboard
-                            .writeText(serverInfo.public_ip)
-                            .catch(() => {
-                              /* ignore — the IP is selectable */
-                            });
-                        }
-                      }}
-                      data-testid="ticket-server-ip-copy"
-                      title="Copy IP"
-                    >
-                      Copy
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-        </section>
-
-        {/* PENDING ORDERS */}
-        <section className="trade-card" data-testid="trade-pending">
-          <h2>Pending orders</h2>
-          {cancelMessage && (
-            <div
-              className={`result ${cancelMessage.type}`}
-              data-testid="cancel-result"
-            >
-              {cancelMessage.text}
-            </div>
-          )}
-          {(pending?.count ?? 0) === 0 ? (
-            <div className="empty">No pending orders.</div>
-          ) : (
-            <table className="pending-table">
+          {bottomTab === "positions" && !positions?.length && <section className="trade-card"><div className="empty">No open positions.</div></section>}
+          {bottomTab === "positions" && (
+            <>
+        {/* ---- open positions (mini panel) ---- */}
+        {positions && positions.length > 0 && (
+          <section className="trade-card" data-testid="trade-positions">
+            <h2>Open positions</h2>
+            <table className="positions-table">
               <thead>
                 <tr>
                   <th>Symbol</th>
-                  <th>Side</th>
                   <th>Qty</th>
-                  <th>Type</th>
-                  <th>ID</th>
-                  <th />
+                  <th>Avg</th>
+                  <th>LTP</th>
+                  <th>P&amp;L</th>
                 </tr>
               </thead>
               <tbody>
-                {pending!.orders.map((o) => {
-                  // The mutation's `variables` carries the request body
-                  // while it's in flight; use it to disable just the
-                  // button that was clicked so the rest of the rows
-                  // stay clickable.
-                  const pendingId =
-                    cancelOrder.isPending &&
-                    cancelOrder.variables?.broker_order_id === o.broker_order_id
-                      ? o.broker_order_id
-                      : null;
-                  return (
-                    <tr key={o.id}>
-                      <td className="sym">{o.symbol}</td>
-                      <td className={o.side === "BUY" ? "up" : "down"}>{o.side}</td>
-                      <td>{o.quantity}</td>
-                      <td>{o.order_type}</td>
-                      <td className="broker-id">{o.broker_order_id ?? "—"}</td>
-                      <td>
-                        {o.broker_order_id && (
-                          <button
-                            className="btn small"
-                            onClick={() => onCancel(o.broker_order_id!)}
-                            disabled={pendingId !== null}
-                            data-testid={`cancel-${o.broker_order_id}`}
-                          >
-                            {pendingId !== null ? "cancelling…" : "Cancel"}
-                          </button>
-                        )}
-                      </td>
-                    </tr>
-                  );
-                })}
+                {positions.map((p) => (
+                  <PositionRow key={p.symbol} p={p} />
+                ))}
               </tbody>
             </table>
+          </section>
+        )}
+            </>
           )}
-        </section>
-      </div>
-
-      {/* ---- option chain (index underlyings + F&O stocks) ----
-           Indices always show the panel; a cash stock shows it only when
-           it actually has options (F&O stock), so non-F&O names stay clean. */}
-      {selected &&
-        (selected.instrument_type === "IND" ||
-          (selected.instrument_type === "EQ" &&
-            (chain?.strikes?.length ?? 0) > 0)) && (
-        <section className="trade-card chain" data-testid="trade-chain">
-          <div className="chain-head">
-            <h2>Option chain — {selected.short_name}</h2>
-            <div className="chain-meta">
-              <span
-                className={`badge ${chain?.source === "fyers" ? "cash" : "neutral"}`}
-                title={chain?.source === "fyers" ? "live Fyers prices" : "static ladder"}
+          {bottomTab === "orders" && (
+            <>
+          {/* PENDING ORDERS */}
+          <section className="trade-card" data-testid="trade-pending">
+            <h2>Pending orders</h2>
+            {cancelMessage && (
+              <div
+                className={`result ${cancelMessage.type}`}
+                data-testid="cancel-result"
               >
-                {chain?.source === "fyers" ? "LIVE" : "STATIC"}
-              </span>
-              {chain?.spot != null && (
-                <span data-testid="chain-spot">spot {fmtMoney(chain.spot)}</span>
-              )}
-              {(chain?.expiries?.length ?? 0) > 0 && (
-                <label className="chain-expiry">
-                  <span>expiry</span>
-                  <select
-                    value={selectedExpiry ?? chain?.selected_expiry ?? ""}
-                    onChange={(e) => setSelectedExpiry(e.target.value || null)}
-                    data-testid="chain-expiry"
-                  >
-                    {chain!.expiries.map((ex) => (
-                      <option key={ex.ts} value={ex.ts}>
-                        {ex.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              )}
-            </div>
-          </div>
-          {!chain ? (
-            <div className="empty">Loading chain…</div>
-          ) : chain.strikes.length === 0 ? (
-            <div className="empty" data-testid="chain-empty">
-              {chain.reason ?? "No option chain available for this underlying."}
-            </div>
-          ) : (
-            <table className="chain-table">
-              <thead>
-                <tr>
-                  <th colSpan={2} className="ce-head">CALLS (CE)</th>
-                  <th className="strike-head">Strike</th>
-                  <th colSpan={2} className="pe-head">PUTS (PE)</th>
-                </tr>
-                <tr className="chain-subhead">
-                  <th>OI</th>
-                  <th>LTP</th>
-                  <th> </th>
-                  <th>LTP</th>
-                  <th>OI</th>
-                </tr>
-              </thead>
-              <tbody>
-                {chain.strikes.map((s) => {
-                  const atm = s.strike === atmStrike;
-                  return (
-                    <tr key={s.strike} className={atm ? "atm" : ""}>
-                      <td className="oi">{fmtOi(s.ce?.oi)}</td>
-                      <td className="ce-cell">
-                        {s.ce ? (
-                          <button
-                            className="chain-ltp ce"
-                            onClick={() => onSelectOption(s, "CE")}
-                            data-testid={`chain-ce-${s.strike}`}
-                            title={s.ce.symbol}
-                          >
-                            {s.ce.ltp != null ? fmtMoney(s.ce.ltp) : "—"}
-                          </button>
-                        ) : (
-                          "—"
-                        )}
-                      </td>
-                      <th className="strike">
-                        {s.strike}
-                        {atm && <span className="atm-tag">ATM</span>}
-                      </th>
-                      <td className="pe-cell">
-                        {s.pe ? (
-                          <button
-                            className="chain-ltp pe"
-                            onClick={() => onSelectOption(s, "PE")}
-                            data-testid={`chain-pe-${s.strike}`}
-                            title={s.pe.symbol}
-                          >
-                            {s.pe.ltp != null ? fmtMoney(s.pe.ltp) : "—"}
-                          </button>
-                        ) : (
-                          "—"
-                        )}
-                      </td>
-                      <td className="oi">{fmtOi(s.pe?.oi)}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                {cancelMessage.text}
+              </div>
+            )}
+            {(pending?.count ?? 0) === 0 ? (
+              <div className="empty">No pending orders.</div>
+            ) : (
+              <table className="pending-table">
+                <thead>
+                  <tr>
+                    <th>Symbol</th>
+                    <th>Side</th>
+                    <th>Qty</th>
+                    <th>Type</th>
+                    <th>ID</th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody>
+                  {pending!.orders.map((o) => {
+                    // The mutation's `variables` carries the request body
+                    // while it's in flight; use it to disable just the
+                    // button that was clicked so the rest of the rows
+                    // stay clickable.
+                    const pendingId =
+                      cancelOrder.isPending &&
+                      cancelOrder.variables?.broker_order_id === o.broker_order_id
+                        ? o.broker_order_id
+                        : null;
+                    return (
+                      <tr key={o.id}>
+                        <td className="sym">{o.symbol}</td>
+                        <td className={o.side === "BUY" ? "up" : "down"}>{o.side}</td>
+                        <td>{o.quantity}</td>
+                        <td>{o.order_type}</td>
+                        <td className="broker-id">{o.broker_order_id ?? "—"}</td>
+                        <td>
+                          {o.broker_order_id && (
+                            <button
+                              className="btn small"
+                              onClick={() => onCancel(o.broker_order_id!)}
+                              disabled={pendingId !== null}
+                              data-testid={`cancel-${o.broker_order_id}`}
+                            >
+                              {pendingId !== null ? "cancelling…" : "Cancel"}
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </section>
+            </>
           )}
-        </section>
-      )}
+          {bottomTab === "chain" && (
+            <>
+        {/* ---- option chain (index underlyings + F&O stocks) ----
+             Indices always show the panel; a cash stock shows it only when
+             it actually has options (F&O stock), so non-F&O names stay clean. */}
+        {selected &&
+          (selected.instrument_type === "IND" ||
+            (selected.instrument_type === "EQ" &&
+              (chain?.strikes?.length ?? 0) > 0)) && (
+          <section className="trade-card chain" data-testid="trade-chain">
+            <div className="chain-head">
+              <h2>Option chain — {selected.short_name}</h2>
+              <div className="chain-meta">
+                <span
+                  className={`badge ${chain?.source === "fyers" ? "cash" : "neutral"}`}
+                  title={chain?.source === "fyers" ? "live Fyers prices" : "static ladder"}
+                >
+                  {chain?.source === "fyers" ? "LIVE" : "STATIC"}
+                </span>
+                {chain?.spot != null && (
+                  <span data-testid="chain-spot">spot {fmtMoney(chain.spot)}</span>
+                )}
+                {(chain?.expiries?.length ?? 0) > 0 && (
+                  <label className="chain-expiry">
+                    <span>expiry</span>
+                    <select
+                      value={selectedExpiry ?? chain?.selected_expiry ?? ""}
+                      onChange={(e) => setSelectedExpiry(e.target.value || null)}
+                      data-testid="chain-expiry"
+                    >
+                      {chain!.expiries.map((ex) => (
+                        <option key={ex.ts} value={ex.ts}>
+                          {ex.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
+              </div>
+            </div>
+            {!chain ? (
+              <div className="empty">Loading chain…</div>
+            ) : chain.strikes.length === 0 ? (
+              <div className="empty" data-testid="chain-empty">
+                {chain.reason ?? "No option chain available for this underlying."}
+              </div>
+            ) : (
+              <table className="chain-table">
+                <thead>
+                  <tr>
+                    <th colSpan={2} className="ce-head">CALLS (CE)</th>
+                    <th className="strike-head">Strike</th>
+                    <th colSpan={2} className="pe-head">PUTS (PE)</th>
+                  </tr>
+                  <tr className="chain-subhead">
+                    <th>OI</th>
+                    <th>LTP</th>
+                    <th> </th>
+                    <th>LTP</th>
+                    <th>OI</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {chain.strikes.map((s) => {
+                    const atm = s.strike === atmStrike;
+                    return (
+                      <tr key={s.strike} className={atm ? "atm" : ""}>
+                        <td className="oi">{fmtOi(s.ce?.oi)}</td>
+                        <td className="ce-cell">
+                          {s.ce ? (
+                            <button
+                              className="chain-ltp ce"
+                              onClick={() => onSelectOption(s, "CE")}
+                              data-testid={`chain-ce-${s.strike}`}
+                              title={s.ce.symbol}
+                            >
+                              {s.ce.ltp != null ? fmtMoney(s.ce.ltp) : "—"}
+                            </button>
+                          ) : (
+                            "—"
+                          )}
+                        </td>
+                        <th className="strike">
+                          {s.strike}
+                          {atm && <span className="atm-tag">ATM</span>}
+                        </th>
+                        <td className="pe-cell">
+                          {s.pe ? (
+                            <button
+                              className="chain-ltp pe"
+                              onClick={() => onSelectOption(s, "PE")}
+                              data-testid={`chain-pe-${s.strike}`}
+                              title={s.pe.symbol}
+                            >
+                              {s.pe.ltp != null ? fmtMoney(s.pe.ltp) : "—"}
+                            </button>
+                          ) : (
+                            "—"
+                          )}
+                        </td>
+                        <td className="oi">{fmtOi(s.pe?.oi)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </section>
+        )}
+              {!(selected && (selected.instrument_type === "IND" || (selected.instrument_type === "EQ" && (chain?.strikes?.length ?? 0) > 0))) && (
+                <section className="trade-card"><div className="empty">{selected ? "No options listed for this symbol." : "Pick a symbol first."}</div></section>
+              )}
+            </>
+          )}
+          {bottomTab === "flow" && <FlowPanel symbol={selected?.symbol ?? null} />}
+        </div>
 
-      {/* ---- open positions (mini panel) ---- */}
-      {positions && positions.length > 0 && (
-        <section className="trade-card" data-testid="trade-positions">
-          <h2>Open positions</h2>
-          <table className="positions-table">
-            <thead>
-              <tr>
-                <th>Symbol</th>
-                <th>Qty</th>
-                <th>Avg</th>
-                <th>LTP</th>
-                <th>P&amp;L</th>
-              </tr>
-            </thead>
-            <tbody>
-              {positions.map((p) => (
-                <PositionRow key={p.symbol} p={p} />
-              ))}
-            </tbody>
-          </table>
-        </section>
-      )}
+        {/* ---- right rail: quote + order ticket (TradingView-style) ---- */}
+        <aside className="trade-right">
+          {/* QUOTE */}
+          <section className="trade-card" data-testid="trade-quote">
+            <h2>Quote</h2>
+            {!selected ? (
+              <div className="empty">Pick a symbol above to start.</div>
+            ) : (
+              <div>
+                <div className="quote-sym">
+                  <span className="big">{selected.short_name}</span>
+                  <span className="exch">{selected.exchange}:{selected.segment}</span>
+                  {isOption && <span className="badge opt">OPTION</span>}
+                  {isFuture && <span className="badge fut">FUTURE</span>}
+                  {!isOption && !isFuture && <span className="badge cash">CASH</span>}
+                </div>
+                <div className="quote-fullsym">{selected.symbol}</div>
+                <div className="quote-row">
+                  <div className="quote-cell">
+                    <div className="k">LTP</div>
+                    <div className="v big" data-testid="quote-ltp">
+                      {ltp != null ? fmtMoney(ltp) : "—"}
+                    </div>
+                  </div>
+                  <div className="quote-cell">
+                    <div className="k">BID</div>
+                    <div className="v">{bid != null ? fmtMoney(bid) : "—"}</div>
+                  </div>
+                  <div className="quote-cell">
+                    <div className="k">ASK</div>
+                    <div className="v">{ask != null ? fmtMoney(ask) : "—"}</div>
+                  </div>
+                  <div className="quote-cell">
+                    <div className="k">LOT</div>
+                    <div className="v">{selected.lot_size}</div>
+                  </div>
+                </div>
+                {!quote?.ok && (
+                  <div className="hint warn-text">
+                    {quote?.reason ?? "no quote cached for this symbol"}
+                  </div>
+                )}
+              </div>
+            )}
+          </section>
+          {/* TICKET */}
+          <section className="trade-card" data-testid="trade-ticket">
+            <h2>Ticket</h2>
+            <div className="ticket-side" role="group" aria-label="side">
+              <button
+                className={`ticket-side-btn buy ${side === "BUY" ? "on" : ""}`}
+                onClick={() => setSide("BUY")}
+                data-testid="ticket-side-buy"
+              >
+                BUY
+              </button>
+              <button
+                className={`ticket-side-btn sell ${side === "SELL" ? "on" : ""}`}
+                onClick={() => setSide("SELL")}
+                data-testid="ticket-side-sell"
+              >
+                SELL
+              </button>
+            </div>
+  
+            <label className="ticket-row">
+              <span>Quantity</span>
+              <input
+                type="number"
+                min={1}
+                step={selected?.lot_size ?? 1}
+                value={quantity}
+                onChange={(e) => setQuantity(Math.max(1, Number(e.target.value || 1)))}
+                data-testid="ticket-qty"
+              />
+              {selected && selected.lot_size > 1 && (
+                <span className="hint">
+                  {Math.floor(quantity / selected.lot_size)} lot(s)
+                </span>
+              )}
+            </label>
+  
+            <label className="ticket-row">
+              <span>Order type</span>
+              <select
+                value={orderType}
+                onChange={(e) => setOrderType(e.target.value as OrderType)}
+                data-testid="ticket-type"
+              >
+                <option value="MARKET">MARKET</option>
+                <option value="LIMIT">LIMIT</option>
+                <option value="STOP_LOSS">STOP_LOSS (SL-L)</option>
+                <option value="SL-M">SL-M</option>
+              </select>
+            </label>
+  
+            {requiresLimit && (
+              <label className="ticket-row">
+                <span>Limit price</span>
+                <input
+                  type="number"
+                  step="0.05"
+                  value={limitPrice}
+                  onChange={(e) => setLimitPrice(e.target.value)}
+                  data-testid="ticket-limit"
+                />
+                <span className="px-quick">
+                  {bid != null && (
+                    <button
+                      type="button"
+                      className="px-quick-btn"
+                      onClick={() => setLimitPrice(bid.toFixed(2))}
+                      title={`bid ${fmtMoney(bid)}`}
+                      data-testid="limit-fill-bid"
+                    >
+                      bid
+                    </button>
+                  )}
+                  {ltp != null && (
+                    <button
+                      type="button"
+                      className="px-quick-btn"
+                      onClick={() => setLimitPrice(ltp.toFixed(2))}
+                      title={`LTP ${fmtMoney(ltp)}`}
+                      data-testid="limit-fill-ltp"
+                    >
+                      ltp
+                    </button>
+                  )}
+                  {ask != null && (
+                    <button
+                      type="button"
+                      className="px-quick-btn"
+                      onClick={() => setLimitPrice(ask.toFixed(2))}
+                      title={`ask ${fmtMoney(ask)}`}
+                      data-testid="limit-fill-ask"
+                    >
+                      ask
+                    </button>
+                  )}
+                </span>
+              </label>
+            )}
+  
+            {requiresStop && (
+              <label className="ticket-row">
+                <span>Stop price</span>
+                <input
+                  type="number"
+                  step="0.05"
+                  value={stopPrice}
+                  onChange={(e) => setStopPrice(e.target.value)}
+                  data-testid="ticket-stop"
+                />
+                {ltp != null && (
+                  <span className="px-quick">
+                    <button
+                      type="button"
+                      className="px-quick-btn"
+                      onClick={() => setStopPrice(ltp.toFixed(2))}
+                      title={`LTP ${fmtMoney(ltp)}`}
+                      data-testid="stop-fill-ltp"
+                    >
+                      ltp
+                    </button>
+                  </span>
+                )}
+              </label>
+            )}
+  
+            {/* Intraday-only bot: no delivery / carry-forward, ever. One value,
+                so it reads as a fact rather than a choice you cannot make. */}
+            <div className="ticket-row">
+              <span>Product</span>
+              <span
+                data-testid="ticket-product"
+                title="Intraday-only bot — every position is squared off the same day"
+              >
+                INTRADAY (MIS)
+              </span>
+            </div>
+  
+            {/* Submit */}
+            <div className="ticket-submit">
+              <button
+                className={`btn ${side === "BUY" ? "buy" : "sell"}`}
+                disabled={!canSubmit || placeOrder.isPending}
+                onClick={() => onSubmit()}
+                data-testid="ticket-submit"
+              >
+                {placeOrder.isPending ? "placing…" : `PLACE ${side}`}
+              </button>
+            </div>
+  
+            {lastResult && lastResult.type === "success" && (
+              <div className="result success" data-testid="ticket-result-success">
+                {lastResult.message}
+                {lastResult.warning && (
+                  <div className="result-warning" data-testid="ticket-risk-advisory">
+                    ⚠ risk advisory: {lastResult.warning}
+                  </div>
+                )}
+              </div>
+            )}
+            {lastResult && lastResult.type === "error" && (
+              <div className="result error" data-testid="ticket-result-error">
+                {lastResult.message}
+                {lastResult.reason === "risk_block" && (
+                  <div
+                    className="risk-override-hint"
+                    data-testid="ticket-risk-override"
+                    style={{
+                      marginTop: 10,
+                      padding: "8px 10px",
+                      border: "1px solid var(--amber)",
+                      borderRadius: 4,
+                      background: "rgba(255, 200, 80, 0.08)",
+                      fontSize: 12,
+                    }}
+                  >
+                    <div style={{ marginBottom: 8 }}>
+                      This order breaches a limit set in <b>Settings</b>. Reduce
+                      the size or relax the limit — or override the check and
+                      place it anyway.
+                    </div>
+                    <button
+                      className="btn-sm sell"
+                      onClick={() => onSubmit({ bypassRisk: true })}
+                      disabled={placeOrder.isPending}
+                      data-testid="ticket-risk-override-btn"
+                    >
+                      {placeOrder.isPending
+                        ? "placing…"
+                        : "⚠ Override risk & place anyway"}
+                    </button>
+                  </div>
+                )}
+                {lastResult.reason === "ip_whitelist" && serverInfo?.public_ip && (
+                  <div
+                    className="ip-whitelist-hint"
+                    data-testid="ticket-ip-whitelist"
+                    style={{
+                      marginTop: 10,
+                      padding: "8px 10px",
+                      border: "1px solid var(--amber)",
+                      borderRadius: 4,
+                      background: "rgba(255, 200, 80, 0.08)",
+                      fontSize: 12,
+                      fontFamily: "var(--mono)",
+                    }}
+                  >
+                    <div style={{ marginBottom: 6 }}>
+                      Add this server's public IP to the Fyers app's
+                      IP-whitelist on{" "}
+                      <a
+                        href="https://myapi.fyers.in/dashboard/"
+                        target="_blank"
+                        rel="noreferrer"
+                        style={{ color: "var(--amber)" }}
+                      >
+                        myapi.fyers.in/dashboard
+                      </a>
+                      , then click PLACE BUY again.
+                    </div>
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 8,
+                      }}
+                    >
+                      <div
+                        style={{
+                          fontSize: 14,
+                          fontWeight: 700,
+                          letterSpacing: "0.05em",
+                          userSelect: "all",
+                          flex: 1,
+                        }}
+                        data-testid="ticket-server-ip"
+                      >
+                        {serverInfo.public_ip}
+                      </div>
+                      <button
+                        className="btn-sm"
+                        onClick={() => {
+                          if (serverInfo.public_ip && navigator.clipboard) {
+                            navigator.clipboard
+                              .writeText(serverInfo.public_ip)
+                              .catch(() => {
+                                /* ignore — the IP is selectable */
+                              });
+                          }
+                        }}
+                        data-testid="ticket-server-ip-copy"
+                        title="Copy IP"
+                      >
+                        Copy
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </section>
+        </aside>
+      </div>
     </div>
   );
 }

@@ -578,3 +578,49 @@ export function macd(
   }
   return { macd: macdLine, signal, histogram };
 }
+
+
+/** Developing session volume profile: POC (price with the most volume so far
+ *  today) and the value area (where `valueArea` of the volume traded), per
+ *  candle. Each candle's volume is spread over its high-low range in bins of
+ *  ~5 bps of price. `time` is chart time (already IST-shifted), so a session
+ *  is one UTC day of it. */
+export function volumeProfile(candles: OhlcvCandle[], valueArea = 0.7): {
+  poc: (number | null)[]; vah: (number | null)[]; val: (number | null)[];
+} {
+  const n = candles.length;
+  const poc: (number | null)[] = new Array(n).fill(null);
+  const vah: (number | null)[] = new Array(n).fill(null);
+  const val: (number | null)[] = new Array(n).fill(null);
+  if (!n) return { poc, vah, val };
+  const sorted = candles.map((c) => c.close).sort((a, b) => a - b);
+  const step = Math.max(0.05, Math.round(sorted[Math.floor(n / 2)] * 0.0005 * 100) / 100);
+  let day = -1;
+  let bins = new Map<number, number>();
+  let pocB = 0, lo = 0, hi = 0, total = 0;
+  for (let i = 0; i < n; i++) {
+    const c = candles[i];
+    const d = Math.floor(c.time / 86400);
+    if (d !== day) {
+      day = d; bins = new Map(); total = 0;
+      pocB = lo = hi = Math.floor(c.close / step);
+    }
+    const a = Math.floor(c.low / step), b = Math.floor(c.high / step);
+    const stride = Math.max(1, Math.floor((b - a) / 200));
+    const span = Math.floor((b - a) / stride) + 1;
+    for (let k = a; k <= b; k += stride) {
+      const v = (bins.get(k) ?? 0) + c.volume / span;
+      bins.set(k, v);
+      if (v > (bins.get(pocB) ?? -1)) pocB = k;
+    }
+    lo = Math.min(lo, a); hi = Math.max(hi, b); total += c.volume;
+    let l = pocB, h = pocB, acc = bins.get(pocB) ?? 0;
+    while (acc < total * valueArea && (l > lo || h < hi)) {
+      const up = h < hi ? bins.get(h + 1) ?? 0 : -1;
+      const dn = l > lo ? bins.get(l - 1) ?? 0 : -1;
+      if (up >= dn) { h += 1; acc += Math.max(up, 0); } else { l -= 1; acc += Math.max(dn, 0); }
+    }
+    poc[i] = (pocB + 0.5) * step; val[i] = l * step; vah[i] = (h + 1) * step;
+  }
+  return { poc, vah, val };
+}

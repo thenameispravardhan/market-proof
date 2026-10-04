@@ -37,6 +37,7 @@ import {
   CandlestickSeries,
   ColorType,
   createChart,
+  createSeriesMarkers,
   CrosshairMode,
   HistogramSeries,
   LineSeries,
@@ -71,6 +72,7 @@ import {
   sma,
   stochastic,
   supertrend,
+  volumeProfile,
   vwap,
   williamsR,
   wma,
@@ -145,7 +147,9 @@ type IndicatorId =
   | "obv"
   | "cci"
   | "mfi"
-  | "wpr";
+  | "wpr"
+  | "vprofile"
+  | "flow";
 
 const INDICATOR_DEFS: { id: IndicatorId; label: string; group: "Overlays" | "Oscillators" }[] = [
   { id: "sma", label: "SMA 20", group: "Overlays" },
@@ -157,6 +161,7 @@ const INDICATOR_DEFS: { id: IndicatorId; label: string; group: "Overlays" | "Osc
   { id: "psar", label: "Parabolic SAR", group: "Overlays" },
   { id: "ichimoku", label: "Ichimoku 9, 26, 52", group: "Overlays" },
   { id: "donchian", label: "Donchian 20", group: "Overlays" },
+  { id: "vprofile", label: "Volume profile POC / value area", group: "Overlays" },
   { id: "rsi", label: "RSI 14", group: "Oscillators" },
   { id: "macd", label: "MACD 12, 26, 9", group: "Oscillators" },
   { id: "stoch", label: "Stochastic 14, 3, 3", group: "Oscillators" },
@@ -166,6 +171,7 @@ const INDICATOR_DEFS: { id: IndicatorId; label: string; group: "Overlays" | "Osc
   { id: "cci", label: "CCI 20", group: "Oscillators" },
   { id: "mfi", label: "MFI 14", group: "Oscillators" },
   { id: "wpr", label: "Williams %R 14", group: "Oscillators" },
+  { id: "flow", label: "Real order flow (recorded ticks)", group: "Oscillators" },
 ];
 
 const DEFAULT_ACTIVE: Record<IndicatorId, boolean> = Object.fromEntries(
@@ -183,7 +189,9 @@ const DRAW_TOOLS: { id: DrawingType; label: string; hint: string }[] = [
 ];
 
 type DrawMode = DrawingType | "alert" | "ticket" | null;
-type MenuId = "ind" | "draw" | "alerts" | "compare" | null;
+type MenuId = "ind" | "draw" | "alerts" | "compare" | "strategy" | null;
+type StratTrade = { side: string; entry_t: number; exit_t: number; entry: number; exit: number; net: number; reason: string; instrument: string };
+type StratRun = { name: string; trades: StratTrade[]; stats: Record<string, number | null>; error?: string; running?: boolean };
 type ScaleMode = "normal" | "log" | "percent";
 
 /** A broker-state line drawn on the chart (position avg / pending order). */
@@ -414,6 +422,12 @@ export default function ChartPanel({
   const [menuOpen, setMenuOpen] = useState<MenuId>(null);
   const [status, setStatus] = useState<ChartStatus>({ kind: "loading" });
   const [reloadNonce, setReloadNonce] = useState(0);
+  // real order flow (tick recorder) + strategy-on-chart
+  const flowRef = useRef<Map<number, [number, number, number]>>(new Map());
+  const [flowNote, setFlowNote] = useState("");
+  const [strategies, setStrategies] = useState<{ id: number; name: string; spec: Record<string, unknown> }[]>([]);
+  const [strat, setStrat] = useState<StratRun | null>(null);
+  const markersRef = useRef<{ detach: () => void; setMarkers: (m: never[]) => void } | null>(null);
 
   // ---- refs (chart internals live outside React) ----
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -947,8 +961,51 @@ export default function ChartPanel({
       addLine((c) => toLine(c, donchian(c, 20).lower), "rgba(38,198,218,0.7)");
     }
 
+    if (active.vprofile && resolution !== "D") {
+      // developing POC / value area per session; whitespace between sessions
+      const vpLine = (pick: "poc" | "vah" | "val") => (c: Candle[]) => {
+        const vp = volumeProfile(c)[pick];
+        const out: LinePoint[] = [];
+        for (let i = 0; i < c.length; i++) {
+          if (i && Math.floor(c[i].time / 86400) !== Math.floor(c[i - 1].time / 86400)) out.push({ time: c[i].time });
+          else if (vp[i] !== null) out.push({ time: c[i].time, value: vp[i] as number });
+        }
+        return out;
+      };
+      addLine(vpLine("poc"), "#FF8C00", 0, 2, LineStyle.Solid, { title: "POC" });
+      addLine(vpLine("vah"), "rgba(153,153,153,0.7)", 0, 1, LineStyle.Dashed, { title: "VAH" });
+      addLine(vpLine("val"), "rgba(153,153,153,0.7)", 0, 1, LineStyle.Dashed, { title: "VAL" });
+    }
+
     // ---- oscillator panes (assigned in a stable order) ----
     let pane = 1;
+    if (active.flow) {
+      const p = pane++;
+      const hist = chart.addSeries(HistogramSeries, { lastValueVisible: false, priceLineVisible: false, title: "Δ ticks" }, p);
+      indicatorSeriesRef.current.push({
+        series: hist,
+        compute: (c) => c.filter((k) => flowRef.current.has(k.time)).map((k) => {
+          const f = flowRef.current.get(k.time)!;
+          return { time: k.time, value: f[2], color: f[2] >= 0 ? colors.volUp : colors.volDown };
+        }),
+      });
+      sizePane(p);
+      const q = pane++;
+      addLine((c) => {
+        const out: LinePoint[] = [];
+        let run = 0, day = -1;
+        for (const k of c) {
+          const f = flowRef.current.get(k.time);
+          if (!f) continue;
+          const d = Math.floor(k.time / 86400);
+          if (d !== day) { run = 0; day = d; }
+          run += f[2];
+          out.push({ time: k.time, value: run });
+        }
+        return out;
+      }, "#26C6DA", q, 2, LineStyle.Solid, { title: "CVD ticks", lastValueVisible: true });
+      sizePane(q);
+    }
     if (active.rsi) {
       const p = pane++;
       const s = addLine((c) => toLine(c, rsi(closesOf(c), 14)), "#B39DDB", p);
@@ -1633,6 +1690,78 @@ export default function ChartPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active]);
 
+  // 4b) Real order flow from the tick recorder, polled while the pane is on.
+  useEffect(() => {
+    if (!active.flow) { flowRef.current = new Map(); setFlowNote(""); return; }
+    let stop = false;
+    const load = async () => {
+      const c = candlesRef.current;
+      const now = Math.floor(Date.now() / 1000);
+      const from = c.length ? c[0].time - IST_OFFSET : now - 5 * 86400;
+      try {
+        const r = await fetch(`/api/algo/ticks/flow?symbol=${encodeURIComponent(symbol)}&resolution=${resolution}&from=${from}&to=${now + 60}`);
+        const j = await r.json();
+        if (stop) return;
+        flowRef.current = new Map((j.bars ?? []).map((b: number[]) => [b[0] + IST_OFFSET, [b[1], b[2], b[3]] as [number, number, number]]));
+        setFlowNote(j.recorded ? `real flow: ${j.key}` : `no ticks recorded for ${j.key} yet — add it on Algo Lab › Data`);
+        refreshIndicatorData();
+      } catch { if (!stop) setFlowNote("order-flow fetch failed"); }
+    };
+    void load();
+    const id = setInterval(load, 15000);
+    return () => { stop = true; clearInterval(id); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active.flow, symbol, resolution, reloadNonce]);
+
+  // 4c) Strategy-on-chart markers (re-attached if the main series is rebuilt).
+  useEffect(() => {
+    markersRef.current?.detach();
+    markersRef.current = null;
+    const main = mainRef.current;
+    const c = candlesRef.current;
+    if (!main || !strat?.trades.length || !c.length) return;
+    const times = c.map((k) => k.time);
+    const snap = (t: number) => {
+      const x = t + IST_OFFSET;
+      let lo = 0, hi = times.length - 1;
+      while (lo < hi) { const m = (lo + hi + 1) >> 1; if (times[m] <= x) lo = m; else hi = m - 1; }
+      return times[lo];
+    };
+    const col = colorsRef.current;
+    const ms: { time: UTCTimestamp; position: "aboveBar" | "belowBar"; color: string; shape: "arrowUp" | "arrowDown" | "circle"; text: string }[] = [];
+    for (const t of strat.trades) {
+      if (t.entry_t + IST_OFFSET < times[0]) continue;
+      const buy = t.side === "BUY";
+      ms.push({ time: snap(t.entry_t) as UTCTimestamp, position: buy ? "belowBar" : "aboveBar", color: buy ? col.up : col.down, shape: buy ? "arrowUp" : "arrowDown", text: buy ? "L" : "S" });
+      ms.push({ time: snap(t.exit_t) as UTCTimestamp, position: buy ? "aboveBar" : "belowBar", color: t.net >= 0 ? col.up : col.down, shape: "circle", text: `${t.net >= 0 ? "+" : ""}${Math.round(t.net)}` });
+    }
+    ms.sort((a, b) => a.time - b.time);
+    try {
+      markersRef.current = createSeriesMarkers(main, ms as never[]) as unknown as typeof markersRef.current;
+    } catch { /* main series mid-rebuild */ }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [strat, chartKind, status.kind]);
+
+  async function runStrategy(s: { id: number; name: string; spec: Record<string, unknown> }): Promise<void> {
+    setMenuOpen(null);
+    const c = candlesRef.current;
+    const now = Math.floor(Date.now() / 1000);
+    const from = c.length ? c[0].time - IST_OFFSET : now - 30 * 86400;
+    const ymd = (t: number) => new Date((t + IST_OFFSET) * 1000).toISOString().slice(0, 10);
+    setStrat({ name: s.name, trades: [], stats: {}, running: true });
+    try {
+      const r = await fetch("/api/algo/backtest", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ spec: { ...s.spec, symbols: [symbol] }, start: ymd(Math.min(from, now - 7 * 86400)), end: ymd(now) }),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail));
+      setStrat({ name: s.name, trades: j.trades ?? [], stats: j.stats ?? {} });
+    } catch (e) {
+      setStrat({ name: s.name, trades: [], stats: {}, error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
   // 5) Keep alert price lines in sync (recreated when the main series
   //    changes, since price lines belong to a series).
   useEffect(() => {
@@ -2026,6 +2155,39 @@ export default function ChartPanel({
             </button>
           ))}
         </div>
+
+        {/* strategy on chart */}
+        <div className="chart-group chart-menu-wrap">
+          <button
+            type="button"
+            className={`chart-btn${strat ? " on" : ""}`}
+            title="Run a saved Algo Lab strategy on this symbol and mark its trades"
+            onClick={async () => {
+              if (menuOpen === "strategy") { setMenuOpen(null); return; }
+              setMenuOpen("strategy");
+              try { setStrategies(((await (await fetch("/api/algo/strategies")).json()).strategies ?? [])); } catch { setStrategies([]); }
+            }}
+          >
+            ⚙ Strategy{strat ? `: ${strat.running ? "…" : `${strat.stats.trades ?? 0} trades ₹${Math.round(Number(strat.stats.net_pnl ?? 0)).toLocaleString("en-IN")}`}` : ""} ▾
+          </button>
+          {menuOpen === "strategy" && (
+            <div className="chart-menu">
+              {strategies.length === 0 && <div className="chart-menu-hint">No saved strategies — build one in Algo Lab.</div>}
+              {strategies.map((s) => (
+                <button key={s.id} type="button" className="chart-menu-item" onClick={() => void runStrategy(s)}>{s.name}</button>
+              ))}
+              {strat && <button type="button" className="chart-menu-item" onClick={() => { setStrat(null); setMenuOpen(null); }}>✕ clear markers</button>}
+              {strat?.error && <div className="chart-menu-hint warn-text">{strat.error}</div>}
+              {strat && !strat.error && !strat.running && (
+                <div className="chart-menu-hint">
+                  {strat.name}: {strat.stats.trades} trades · win {strat.stats.win_rate}% · PF {strat.stats.profit_factor ?? "—"} · net ₹{Math.round(Number(strat.stats.net_pnl ?? 0)).toLocaleString("en-IN")}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {active.flow && flowNote && <span className="chart-menu-hint" style={{ alignSelf: "center" }}>{flowNote}</span>}
 
         {/* indicators */}
         <div className="chart-group chart-menu-wrap">

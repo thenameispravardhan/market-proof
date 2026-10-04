@@ -96,12 +96,24 @@ def bar_size(m1: dict[str, Any], mode: str, per_day: int, until: Optional[int] =
 
 
 def build_bars(m1: dict[str, Any], mode: str = "time", tf_min: int = 5,
-               size: Optional[float] = None) -> dict[str, Any]:
+               size: Optional[float] = None, real: Optional[dict[int, tuple[float, float]]] = None) -> dict[str, Any]:
     """Aggregate 1-minute candles into time / volume / turnover candles with
     order-flow fields. `last_complete` says whether the final candle closed
-    (threshold, bucket end or session end seen) or is still forming."""
+    (threshold, bucket end or session end seen) or is still forming.
+
+    `real` ({minute: (buy, sell)} from the tick recorder) replaces the BVC
+    estimate for every minute that was recorded: the minute's candle volume
+    is split by the REAL buy/sell ratio. `real_pct` per candle says how much
+    of its volume that covered."""
     share = buy_share(m1)
-    keys = ("t", "tc", "o", "h", "l", "c", "v", "buy_v", "sell_v", "delta", "poc", "bvwap")
+    real_hit = [False] * len(share)
+    if real:
+        for i, t in enumerate(m1["t"]):
+            r = real.get(t)
+            if r and r[0] + r[1] > 0:
+                share[i] = r[0] / (r[0] + r[1])
+                real_hit[i] = True
+    keys = ("t", "tc", "o", "h", "l", "c", "v", "buy_v", "sell_v", "delta", "poc", "bvwap", "real_pct")
     out: dict[str, Any] = {k: [] for k in keys}
     cur: Optional[dict[str, Any]] = None
     tf_s = 86400 if tf_min == 1440 else int(tf_min) * 60
@@ -120,6 +132,7 @@ def build_bars(m1: dict[str, Any], mode: str = "time", tf_min: int = 5,
         out["delta"].append(round(2 * cur["buy"] - v, 2))
         out["poc"].append(cur["poc"])
         out["bvwap"].append(cur["pv"] / v if v else cur["c"])
+        out["real_pct"].append(round(cur["realv"] / v * 100, 1) if v else 0.0)
 
     complete = True
     for i, t in enumerate(m1["t"]):
@@ -143,11 +156,12 @@ def build_bars(m1: dict[str, Any], mode: str = "time", tf_min: int = 5,
         tp = (h + l + c) / 3
         if cur is None:
             cur = {"t": key, "day": day_start, "o": o, "h": h, "l": l, "c": c, "v": 0, "buy": 0.0,
-                   "pv": 0.0, "turn": 0.0, "maxv": -1, "poc": tp,
+                   "pv": 0.0, "turn": 0.0, "maxv": -1, "poc": tp, "realv": 0,
                    "tc": tc if mode == "time" else t + 60}
         cur["h"], cur["l"], cur["c"] = max(cur["h"], h), min(cur["l"], l), c
         cur["v"] += v
         cur["buy"] += v * share[i]
+        cur["realv"] += v if real_hit[i] else 0
         cur["pv"] += tp * v
         cur["turn"] += tp * v
         if v > cur["maxv"]:
