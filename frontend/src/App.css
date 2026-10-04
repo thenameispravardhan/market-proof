@@ -2218,3 +2218,58 @@ kbd {
 .chart-ctx .ctx-sell { color: var(--red); }
 .chart-ctx-confirm { padding: 6px 10px; font-family: var(--mono); font-size: 11px; color: var(--text); white-space: normal; }
 .chart-ctx-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; padding: 4px 8px 8px; }
+
+/* Multi-chart layouts */
+.tv-grid { flex: 1; min-height: 0; display: grid; gap: 6px; }
+.tv-grid.l1 { grid-template: 1fr / 1fr; }
+.tv-grid.l2 { grid-template: 1fr / 1fr 1fr; }
+.tv-grid.l2v { grid-template: 1fr 1fr / 1fr; }
+.tv-grid.l3 { grid-template: 1fr 1fr / 3fr 2fr; }
+.tv-grid.l3 > .tv-cell:first-child { grid-row: span 2; }
+.tv-grid.l4 { grid-template: 1fr 1fr / 1fr 1fr; }
+.tv-cell { min-width: 0; min-height: 0; display: flex; flex-direction: column; border-radius: 6px; }
+.tv-cell > .trade-card { flex: 1; min-height: 0; }
+.tv-cell.active { box-shadow: 0 0 0 1px var(--accent); }
+.chart-card { container-type: inline-size; }
+@container (max-width: 640px) {
+  .chart-toolbar .chart-opt { display: none; }
+}
+@container (max-width: 420px) {
+  .chart-toolbar .chart-symbol { display: none; }   /* the scalper leg / cell already names it */
+}
+.tv-rail-sep { height: 1px; margin: 4px 2px; background: var(--border); }
+.tv-rail-pop-wrap { position: relative; }
+.tv-rail-pop { position: absolute; right: calc(100% + 8px); top: 0; z-index: 30; display: flex; flex-direction: column; gap: 2px; padding: 4px; min-width: 170px; background: var(--bg-panel); border: 1px solid var(--border-hi); border-radius: 6px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4); }
+.tv-layout-btn { display: flex; align-items: center; gap: 8px; padding: 6px 8px; background: transparent; border: 0; border-radius: 4px; color: var(--text-dim); font-size: 11px; text-align: left; cursor: pointer; }
+.tv-layout-btn .ico { font-size: 16px; width: 18px; text-align: center; }
+.tv-layout-btn:hover { background: var(--bg-elev); color: var(--text); }
+.tv-layout-btn.on { color: var(--accent); }
+
+/* Option scalper */
+.scalp { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 6px; }
+.scalp-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 6px 10px; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; font-size: 11px; color: var(--text-dim); }
+.scalp-bar select, .scalp-leg select { width: auto; padding: 3px 6px; font-size: 11px; }
+.scalp-title { color: var(--accent); letter-spacing: 0.06em; text-transform: uppercase; }
+.scalp-spot b { color: var(--text); font-family: var(--mono); }
+.scalp-lots { display: flex; align-items: center; gap: 4px; }
+.scalp-lots input { width: 52px; padding: 3px 4px; font-size: 11px; text-align: center; }
+.scalp-lots button { width: 22px; height: 22px; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 3px; color: var(--text); cursor: pointer; }
+.scalp-lots b { color: var(--text); }
+.scalp-oneclick { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+.scalp-oneclick input { width: auto; }
+.scalp-oneclick.on { color: var(--amber, #ffb300); font-weight: 700; }
+.scalp-msg { margin-left: auto; max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); color: var(--text); }
+.scalp-grid { flex: 1; min-height: 0; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
+.scalp-col { min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 4px; }
+.scalp-col > .trade-card { flex: 1; min-height: 0; }
+.scalp-leg { display: flex; align-items: center; gap: 6px; padding: 4px 6px; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; font-size: 11px; min-width: 0; }
+.scalp-leg.ce { border-top: 2px solid var(--green); }
+.scalp-leg.pe { border-top: 2px solid var(--red); }
+.scalp-leg.base { border-top: 2px solid var(--accent); }
+.scalp-leg .name { font-family: var(--mono); font-weight: 700; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
+.scalp-ltp { font-family: var(--mono); font-weight: 700; color: var(--accent); }
+.scalp-btn { padding: 4px 10px; border: 0; border-radius: 3px; font-size: 11px; font-weight: 700; letter-spacing: 0.04em; cursor: pointer; }
+.scalp-btn.buy { background: var(--green); color: #000; }
+.scalp-btn.sell { background: var(--red); color: #fff; }
+.scalp-btn.exit { background: var(--bg-elev); color: var(--text); border: 1px solid var(--border-hi); }
+.scalp-btn:disabled { opacity: 0.4; cursor: default; }

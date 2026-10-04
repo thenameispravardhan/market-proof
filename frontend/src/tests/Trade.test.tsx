@@ -337,6 +337,40 @@ describe("Trade page", () => {
     });
   });
 
+  it("scalper: BUY CE places a market order for lots x lot size on the ATM call", async () => {
+    localStorage.setItem("trade:scalper", "true");
+    const leg = (strike: number, t: "CE" | "PE") => ({
+      symbol: `NSE:RELIANCE26OCT${strike}${t}`, ltp: 20, bid: null, ask: null, oi: 1, volume: 1, ltpch: 0, lot_size: 250, tick_size: 0.05,
+    });
+    const posts: Record<string, unknown>[] = [];
+    const stubs = defaultStubs();
+    globalThis.fetch = makeFetchStub((url, init) => {
+      if (url.includes("/api/options/chain")) {
+        return makeJsonResponse({
+          ok: true, underlying: "RELIANCE", symbol: "NSE:RELIANCE-EQ", spot: 2452, source: "fyers", reason: null,
+          expiries: [{ label: "28-10-2026", ts: "1793000000" }], selected_expiry: "1793000000",
+          strikes: [2400, 2450, 2500].map((k) => ({ strike: k, ce: leg(k, "CE"), pe: leg(k, "PE") })),
+        });
+      }
+      if (/\/api\/orders$/.test(url) && init?.method === "POST") posts.push(JSON.parse(String(init.body)));
+      return stubs(url, init);
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const user = userEvent.setup();
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await user.type(await screen.findByTestId("trade-search"), "RELI");
+    await user.click(await screen.findByTestId("search-row-NSE:RELIANCE-EQ"));
+    await waitFor(() => expect(screen.getByTestId("ticket-submit")).not.toBeDisabled());   // account loaded
+
+    await user.click(await screen.findByTestId("scalp-buy-CE"));
+    expect(confirm).toHaveBeenCalled();                       // 1-click is off: a confirm first
+    await waitFor(() => expect(posts).toHaveLength(1));
+    expect(posts[0]).toMatchObject({
+      account_id: 7, symbol: "NSE:RELIANCE26OCT2450CE", side: "BUY", quantity: 250,
+      order_type: "MARKET", product_type: "INTRADAY",
+    });
+  });
+
   it("surfaces a risk warning on a placed order (override / engine-fault)", async () => {
     // When the backend places an order that still carries a risk note
     // (an operator override, or a risk-engine fault that didn't block),
