@@ -3,9 +3,9 @@
 # __BASIC_HASH__ and installs it to /etc/caddy/Caddyfile.
 #
 # Everything is protected by basic auth EXCEPT the Fyers order postback,
-# which Fyers' servers call without credentials. That endpoint checks its
-# own ?token=<FYERS_POSTBACK_SECRET> and is closed when no secret is set.
-# The matcher is the exact path, so /api/fyers/postback/url stays behind auth.
+# which Fyers' servers call without credentials. It trusts nothing in the
+# request: it re-reads the order's real state from the Fyers API, and only
+# for orders the bot placed. The matcher is the exact path.
 #
 # TLS certificates are provisioned automatically via Let's Encrypt as
 # soon as the domain's A record points at this server.

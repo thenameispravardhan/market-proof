@@ -1,64 +1,55 @@
 """Fyers order postback (webhook) — a second channel for order updates.
 
 Fyers POSTs order updates (pending / traded / rejected / cancelled) to the
-webhook URL set in the API dashboard. They go through the same reconciler
-as the order WebSocket (match by broker_order_id, never create a signal,
-deduped), so the two channels converge on the same row.
+webhook URL set in the API dashboard:
 
-Auth: Fyers does not send the dashboard's "Secret" (their support: it
-"is currently not having a use"), so the shared secret rides in the URL as
-?token=<FYERS_POSTBACK_SECRET>. No secret configured = endpoint closed.
-Caddy exempts only the exact path /api/fyers/postback from basic auth;
-/api/fyers/postback/url stays behind it.
+    https://<domain>/api/fyers/postback
 
-  POST /api/fyers/postback?token=..   the receiver Fyers calls
-  GET  /api/fyers/postback/url        the URL to paste into the dashboard
+The payload is treated as a NUDGE, never as truth: we take the order id,
+and only if it is one of OUR orders (a trades row with that
+broker_order_id) do we fetch the order's real state from the Fyers REST
+API and reconcile from that — the same deduped path as the order
+WebSocket, which never creates a signal. So the URL needs no secret
+(Fyers doesn't send the dashboard "Secret" anyway): a forged POST can at
+most make us re-read one of our own orders from Fyers.
+
+Caddy exempts only the exact path /api/fyers/postback from basic auth.
 """
 from __future__ import annotations
 
-import secrets
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
-from app.config import get_settings
+from app.api import market
+from app.db.models import Trade
 from app.db.session import get_db
-from app.execution.order_reconcile import reconcile_order_update
+from app.execution.order_reconcile import _unwrap_fyers, reconcile_order_update
 
 router = APIRouter(prefix="/api/fyers", tags=["fyers"])
 
-PATH = "/api/fyers/postback"
-
-
-def _secret() -> str:
-    return (get_settings().FYERS_POSTBACK_SECRET or "").strip()
-
 
 @router.post("/postback")
-async def fyers_postback(request: Request, token: str = Query(default=""), db: Session = Depends(get_db)) -> dict[str, Any]:
-    secret = _secret()
-    if not secret:
-        raise HTTPException(status_code=503, detail="postback not configured (set FYERS_POSTBACK_SECRET)")
-    if not secrets.compare_digest(token.encode(), secret.encode()):
-        raise HTTPException(status_code=401, detail="bad token")
+async def fyers_postback(request: Request, db: Session = Depends(get_db)) -> dict[str, Any]:
     try:
         payload = await request.json()
     except Exception:  # noqa: BLE001
         raise HTTPException(status_code=400, detail="invalid json")
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="expected a JSON object")
-    return await reconcile_order_update(db, payload, source="fyers_postback")
-
-
-@router.get("/postback/url")
-def postback_url(request: Request) -> dict[str, Any]:
-    secret = _secret()
-    host = request.headers.get("host", "localhost:8000")
-    scheme = "http" if host.startswith(("localhost", "127.0.0.1")) else "https"
-    return {
-        "configured": bool(secret),
-        "url": f"{scheme}://{host}{PATH}?token={secret}" if secret else None,
-        "dashboard_secret": "Any value without spaces — Fyers does not use it yet.",
-        "order_updates": ["Pending", "Rejected", "Cancelled", "Traded"],
-    }
+    order_id = str(_unwrap_fyers(payload).get("id") or "").strip()
+    if not order_id:
+        return {"ok": False, "reason": "no order id"}
+    # Only our own orders cost a Fyers call; manual / unknown ids stop here.
+    if db.query(Trade.id).filter(Trade.broker_order_id == order_id).first() is None:
+        return {"ok": True, "matched": False, "order_id": order_id}
+    backend = market._fyers_backend()  # noqa: SLF001
+    if backend is None or not hasattr(backend, "get_order_status"):
+        return {"ok": False, "reason": "Fyers not connected", "order_id": order_id}
+    # ponytail: one REST read per update of our own orders; add a per-id cooldown if Fyers ever floods
+    st = await backend.get_order_status(order_id)
+    truth = st.raw if isinstance(st.raw, dict) and str(st.raw.get("id") or "") == order_id else None
+    if truth is None:
+        return {"ok": False, "reason": st.error or "order not found at Fyers", "order_id": order_id}
+    return await reconcile_order_update(db, truth, source="fyers_postback")
