@@ -2638,3 +2638,18 @@ div.ind-row { cursor: default; }
 .am-acts { display: flex; gap: 4px; justify-content: flex-end; }
 .am-msg { cursor: pointer; margin: 6px 0; }
 .basket-name { width: 160px; padding: 3px 6px; font-size: 11.5px; }
+
+/* chart UI keeps its own letter case (5m ≠ 5M) */
+.chart-card button, .chart-toolbar button, .chart-tools button, .cmodal button, .dtb-fly button, .chart-menu button,
+.chart-rangebar button, .fav-bar button, .dfloat button, .wl button, .det button, .otree button, .alerts-panel button, .chart-ctx button {
+  text-transform: none;
+  letter-spacing: normal;
+}
+.chart-toolbar .chart-btn { font-size: 11px; }
+.tv-topbar .layout-menu .chart-btn { max-width: 190px; overflow: hidden; text-overflow: ellipsis; }
+.chart-replay { top: auto; bottom: 70px; }
+.chart-toasts { right: 72px; top: 40px; }
+/* legend rows are content-sized and interactive (hover shows their actions);
+   the gaps between them still pass through to the chart */
+.chart-legend .lg-row { pointer-events: auto; }
+.cmodal[data-testid="ind-settings"] .cform-check { width: 150px; }

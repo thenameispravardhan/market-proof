@@ -387,6 +387,15 @@ export function rgba(hex: string, a: number): string {
   return `rgba(${parseInt(h.slice(0, 2), 16)},${parseInt(h.slice(2, 4), 16)},${parseInt(h.slice(4, 6), 16)},${a})`;
 }
 
+/** Readable text color on a solid background color. */
+export function contrastText(bg: string): string {
+  const m = /^#([0-9a-f]{6})$/i.exec((bg || "").trim());
+  if (!m) return "#FFFFFF";
+  const h = m[1];
+  const [r, g, b] = [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16) / 255);
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.55 ? "#131722" : "#FFFFFF";
+}
+
 function textLines(t: string): string[] {
   return t.split("\n");
 }
@@ -408,7 +417,13 @@ function textBox(s: Extract<Shape, { k: "text" }>, measure?: (t: string) => numb
 
 const imageCache = new Map<string, HTMLImageElement | null>();
 
-function paintShape(ctx: CanvasRenderingContext2D, s: Shape, def: { color: string; width: number; dash: number[] }, repaint: () => void): void {
+function paintShape(
+  ctx: CanvasRenderingContext2D,
+  s: Shape,
+  def: { color: string; width: number; dash: number[] },
+  repaint: () => void,
+  pane?: { w: number; h: number },
+): void {
   ctx.save();
   const color = s.color ?? def.color;
   ctx.strokeStyle = color;
@@ -492,6 +507,12 @@ function paintShape(ctx: CanvasRenderingContext2D, s: Shape, def: { color: strin
       ctx.setLineDash([]);
       ctx.font = `${s.italic ? "italic " : ""}${s.bold ? "bold " : ""}${size}px ${FONT}`;
       const box = textBox(s, (t) => ctx.measureText(t).width);
+      // Labels with a background stay inside the pane (position tool,
+      // info line … near the price scale).
+      if (pane && (s.bg || s.border)) {
+        box.x = Math.max(2, Math.min(box.x, pane.w - box.w - 2));
+        box.y = Math.max(2, Math.min(box.y, pane.h - box.h - 2));
+      }
       if (s.bg) {
         ctx.fillStyle = s.bg;
         ctx.fillRect(box.x, box.y, box.w, box.h);
@@ -699,7 +720,7 @@ interface G {
 }
 
 function label(g: G, x: number, y: number, text: string, o: Partial<Extract<Shape, { k: "text" }>> = {}): Shape {
-  return { k: "text", x, y, text, size: 11, color: "#FFFFFF", bg: rgba(g.col, 0.85), pad: 4, align: "center", base: "middle", ...o };
+  return { k: "text", x, y, text, size: 11, color: contrastText(g.col), bg: rgba(g.col, 0.85), pad: 4, align: "center", base: "middle", ...o };
 }
 
 /** Bar range [i0, i1] (inclusive, clamped) covered by two chart times. */
@@ -1382,7 +1403,7 @@ const GEO: Record<string, (g: G) => Shape[]> = {
   anote: (g) => noteGeo(g),
   callout: (g) => {
     const [a, b] = g.P;
-    const t = textShape(g, b.x, b.y, { align: "center", base: "middle", bg: rgba(g.col, 0.85), color: "#FFFFFF", pad: 6 });
+    const t = textShape(g, b.x, b.y, { align: "center", base: "middle", bg: rgba(g.col, 0.85), color: contrastText(g.col), pad: 6 });
     const box = textBox(t as Extract<Shape, { k: "text" }>);
     const cx = Math.max(box.x + 8, Math.min(box.x + box.w - 8, a.x));
     const edgeY = a.y > box.y + box.h ? box.y + box.h : box.y;
@@ -1390,7 +1411,7 @@ const GEO: Record<string, (g: G) => Shape[]> = {
   },
   comment: (g) => {
     const a = g.P[0];
-    const t = textShape(g, a.x + 4, a.y - 14, { base: "bottom", bg: rgba(g.col, 0.85), color: "#FFFFFF", pad: 6 });
+    const t = textShape(g, a.x + 4, a.y - 14, { base: "bottom", bg: rgba(g.col, 0.85), color: contrastText(g.col), pad: 6 });
     return [{ k: "poly", pts: [{ x: a.x + 4, y: a.y - 16 }, a, { x: a.x + 16, y: a.y - 16 }], closed: true, fill: rgba(g.col, 0.85), noStroke: true }, t];
   },
   signpost: (g) => {
@@ -1399,7 +1420,7 @@ const GEO: Record<string, (g: G) => Shape[]> = {
     return [
       { k: "line", a, b: { x: a.x, y: top } },
       { k: "ellipse", cx: a.x, cy: a.y, rx: 3, ry: 3, fill: g.col },
-      textShape(g, a.x, top, { align: "center", base: "bottom", bg: rgba(g.col, 0.9), color: "#FFFFFF", pad: 5 }),
+      textShape(g, a.x, top, { align: "center", base: "bottom", bg: rgba(g.col, 0.9), color: contrastText(g.col), pad: 5 }),
     ];
   },
   pricelabel: (g) => {
@@ -1759,7 +1780,7 @@ export class DrawingsPrimitive implements ISeriesPrimitive<Time> {
                 const sel = d.id === selected;
                 const s = styleOf(d, deps);
                 const base = { color: s.color || deps.lineColor(), width: s.width, dash: DASH[s.dash] ?? [] };
-                for (const shape of geometry(d, deps, w, h, sel)) paintShape(ctx, shape, base, repaint);
+                for (const shape of geometry(d, deps, w, h, sel)) paintShape(ctx, shape, base, repaint, { w, h });
                 if (sel) {
                   const P = project(d, deps, w, h) ?? [];
                   for (const p of P) {

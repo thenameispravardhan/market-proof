@@ -153,7 +153,7 @@ export function IndicatorSettings({
     <Modal
       title={def.name}
       onClose={() => { onChange(orig); onClose(); }}
-      width={480}
+      width={580}
       tabs={tabs}
       tab={tab}
       onTab={setTab}

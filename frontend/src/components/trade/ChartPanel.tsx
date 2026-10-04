@@ -770,6 +770,7 @@ export default function ChartPanel(props: ChartPanelProps) {
   const indValuesRef = useRef<Map<string, (number | null)[][]>>(new Map());
   const indPaneRef = useRef<Map<string, number>>(new Map());
   const indLegendRefs = useRef<Map<string, HTMLSpanElement>>(new Map());
+  const indHasDataRef = useRef<Map<string, boolean[]>>(new Map());
   const compareSeriesRef = useRef<Map<string, ISeriesApi<"Line">>>(new Map());
   const alertLinesRef = useRef<Map<string, IPriceLine>>(new Map());
   const brokerLinesRef = useRef<IPriceLine[]>([]);
@@ -1351,7 +1352,7 @@ export default function ChartPanel(props: ChartPanelProps) {
       const prec = inst.precision ?? (def.overlay && !def.ownScale ? s.precision ?? 2 : 2);
       span.innerHTML = def.plots
         .map((p, k) => {
-          if (!inst.plots[k]?.visible) return "";
+          if (!inst.plots[k]?.visible || indHasDataRef.current.get(uid)?.[k] === false) return "";
           const v = vals[k]?.[i];
           const txt = v == null ? "∅" : inst.type === "volume" || inst.type === "obv" || inst.type === "flow" ? fmtVol(v) : fmtNum(v, prec);
           return `<b style="color:${inst.plots[k].color}">${txt}</b>`;
@@ -1615,6 +1616,7 @@ export default function ChartPanel(props: ChartPanelProps) {
         return out;
       });
       indValuesRef.current.set(uid, aligned);
+      indHasDataRef.current.set(uid, res.plots.map((vals) => vals.some((v) => v !== null)));
       for (const e of indEntriesRef.current) {
         if (e.uid !== uid) continue;
         const vals = res.plots[e.plot] ?? [];
@@ -1909,6 +1911,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     d = finalizeDrawing(d, drawingDeps(), dims.width, dims.height);
     pendingRef.current = null;
     setPendingCount(0);
+    polyDoneRef.current = performance.now();
     addDrawing(d, `add ${tool.label}`);
     if (!tool.temp) {
       setLastTool((lt) => ({ ...lt, [tool.group]: type }));
@@ -1917,7 +1920,7 @@ export default function ChartPanel(props: ChartPanelProps) {
       drawModeRef.current = null;
       setDrawModeState(null);
     }
-    if (tool.text) setTimeout(() => openTextEditor(d.id), 0);
+    if (tool.text) openTextEditor(d.id);
   }
 
   function finishPoly(): void {
@@ -1939,6 +1942,8 @@ export default function ChartPanel(props: ChartPanelProps) {
       repaintDrawings();
     }
   }
+
+  const polyDoneRef = useRef(0);
 
   function placePoint(mode: string, x: number, y: number, time: number, price: number): void {
     const tool = TOOL_BY_ID.get(mode);
@@ -2002,10 +2007,12 @@ export default function ChartPanel(props: ChartPanelProps) {
     setAutoScale(false);
   }
 
-  function onChartClick(param: MouseEventParams): void {
-    if (!param.point || !chartRef.current || !mainRef.current) return;
-    if ((param.paneIndex ?? 0) !== 0) return; // draw / select only on the price pane
-    const { x, y } = param.point;
+  /** A click on the price pane (pane coordinates). Detected from DOM
+   *  mousedown / mouseup rather than the engine's click event: the engine
+   *  drops a second click that lands within 500ms and ≥5px of the first,
+   *  which loses points when placing multi-point drawings quickly. */
+  function onPaneClick(x: number, y: number): void {
+    if (!chartRef.current || !mainRef.current) return;
     const price = yToPrice(y);
     const time = xToTime(x);
     const mode = drawModeRef.current;
@@ -2100,6 +2107,7 @@ export default function ChartPanel(props: ChartPanelProps) {
    *  chart doesn't pan underneath. */
   function onHostMouseDown(e: MouseEvent): void {
     if (e.button !== 0) return;
+    pressRef.current = { x: e.clientX, y: e.clientY };
     const target = e.target as HTMLElement | null;
     if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.closest?.(".chart-overlay-ui"))) return;
     const pt = paneCoords(e);
@@ -2146,6 +2154,19 @@ export default function ChartPanel(props: ChartPanelProps) {
       e.stopPropagation();
       return;
     }
+  }
+
+  const pressRef = useRef<{ x: number; y: number } | null>(null);
+
+  /** A press + release without travel on the price pane is a click. */
+  function onHostMouseUp(e: MouseEvent): void {
+    const p = pressRef.current;
+    pressRef.current = null;
+    if (!p || e.button !== 0 || freehandRef.current) return;
+    if (dragRef.current?.moved) return;
+    if (Math.hypot(e.clientX - p.x, e.clientY - p.y) > 4) return; // a pan / drag
+    const pt = paneCoords(e);
+    if (pt) onPaneClick(pt.x, pt.y);
   }
 
   function onWindowMouseMove(e: MouseEvent): void {
@@ -2289,6 +2310,7 @@ export default function ChartPanel(props: ChartPanelProps) {
       return;
     }
     if (drawModeRef.current) return;
+    if (performance.now() - polyDoneRef.current < 500) return; // the clicks that just placed a drawing
     const pt = paneCoords(e);
     if (!pt) return;
     const hit = hitDrawingAt(pt.x, pt.y);
@@ -2315,8 +2337,13 @@ export default function ChartPanel(props: ChartPanelProps) {
       y = priceToY(p.price);
     }
     if (x === null || y === null) return;
-    setTextDraft({ id, x: x + paneLeft(), y, value: d.text ?? "" });
+    const draft = { id, x: x + paneLeft(), y, value: d.text ?? "" };
+    textDraftRef.current = draft;
+    setTextDraft(draft);
   }
+
+  const textDraftRef = useRef(textDraft);
+  textDraftRef.current = textDraft;
 
   function commitTextDraft(): void {
     if (!textDraft) return;
@@ -2443,7 +2470,10 @@ export default function ChartPanel(props: ChartPanelProps) {
       if (!e.shiftKey && e.key === "ArrowUp") { e.preventDefault(); zoomBy(1.25); return; }
       if (!e.shiftKey && e.key === "ArrowDown") { e.preventDefault(); zoomBy(0.8); return; }
     }
-    if (!ctrl && !e.altKey && !e.shiftKey && e.key.length === 1) {
+    // Typing starts a symbol search — not while a note is being edited or
+    // straight after placing a drawing (its text editor is opening).
+    const editing = textDraftRef.current !== null || performance.now() - polyDoneRef.current < 400;
+    if (!ctrl && !e.altKey && !e.shiftKey && e.key.length === 1 && !editing) {
       if (/^[a-z]$/i.test(e.key) && onSymbolChange) {
         e.preventDefault();
         setDialog({ k: "symbol", q: e.key });
@@ -2458,8 +2488,8 @@ export default function ChartPanel(props: ChartPanelProps) {
 
   // Chart subscriptions are attached once at mount; they call through
   // this ref so they always run the latest render's closures.
-  const implRef = useRef({ onCrosshair, onChartClick, onVisibleRange, onKeyDown, onHostMouseDown, onWindowMouseMove, onWindowMouseUp, onHostDblClick });
-  implRef.current = { onCrosshair, onChartClick, onVisibleRange, onKeyDown, onHostMouseDown, onWindowMouseMove, onWindowMouseUp, onHostDblClick };
+  const implRef = useRef({ onCrosshair, onVisibleRange, onKeyDown, onHostMouseDown, onHostMouseUp, onWindowMouseMove, onWindowMouseUp, onHostDblClick });
+  implRef.current = { onCrosshair, onVisibleRange, onKeyDown, onHostMouseDown, onHostMouseUp, onWindowMouseMove, onWindowMouseUp, onHostDblClick };
 
   // ------------------------------------------------------------------
   // Effects
@@ -2510,19 +2540,19 @@ export default function ChartPanel(props: ChartPanelProps) {
     }
     chartRef.current = chart;
     const moveH = (p: MouseEventParams) => implRef.current.onCrosshair(p);
-    const clickH = (p: MouseEventParams) => implRef.current.onChartClick(p);
     const rangeH = (r: LogicalRange | null) => implRef.current.onVisibleRange(r);
     const keyH = (e: KeyboardEvent) => implRef.current.onKeyDown(e);
     const downH = (e: MouseEvent) => implRef.current.onHostMouseDown(e);
+    const upH = (e: MouseEvent) => implRef.current.onHostMouseUp(e);
     const dblH = (e: MouseEvent) => implRef.current.onHostDblClick(e);
     const winMoveH = (e: MouseEvent) => implRef.current.onWindowMouseMove(e);
     const winUpH = () => implRef.current.onWindowMouseUp();
     safe(() => chart.subscribeCrosshairMove(moveH));
-    safe(() => chart.subscribeClick(clickH));
     safe(() => chart.timeScale().subscribeVisibleLogicalRangeChange(rangeH));
     window.addEventListener("keydown", keyH);
     // Capture phase so a grab on a drawing wins over the chart's pan.
     el.addEventListener("mousedown", downH, true);
+    el.addEventListener("mouseup", upH, true);
     el.addEventListener("dblclick", dblH, true);
     window.addEventListener("mousemove", winMoveH);
     window.addEventListener("mouseup", winUpH);
@@ -2530,6 +2560,7 @@ export default function ChartPanel(props: ChartPanelProps) {
       fetchSeqRef.current++; // invalidate in-flight fetches
       window.removeEventListener("keydown", keyH);
       el.removeEventListener("mousedown", downH, true);
+      el.removeEventListener("mouseup", upH, true);
       el.removeEventListener("dblclick", dblH, true);
       window.removeEventListener("mousemove", winMoveH);
       window.removeEventListener("mouseup", winUpH);
@@ -2537,7 +2568,6 @@ export default function ChartPanel(props: ChartPanelProps) {
       window.clearTimeout(brickTimer.current);
       dragRef.current = null;
       safe(() => chart.unsubscribeCrosshairMove(moveH));
-      safe(() => chart.unsubscribeClick(clickH));
       safe(() => chart.timeScale().unsubscribeVisibleLogicalRangeChange(rangeH));
       safe(() => chart.remove());
       chartRef.current = null;
@@ -3022,12 +3052,27 @@ export default function ChartPanel(props: ChartPanelProps) {
       const drag = levelDragRef.current;
       const levels = { entry: showPos.avg, sl: drag?.which === "sl" ? drag.price : showPos.sl, tp: drag?.which === "tp" ? drag.price : showPos.tp };
       const pctMode = settingsRef.current.plMode === "percent";
+      // Desired tops, clamped into the pane, then pushed apart so tags
+      // pinned to an edge (or close together) don't sit on each other.
+      const want: { k: "entry" | "sl" | "tp"; y: number; top: number }[] = [];
+      for (const k of ["entry", "sl", "tp"] as const) {
+        const price = levels[k];
+        const y = price == null ? null : priceToY(price);
+        if (price != null && y != null) want.push({ k, y, top: Math.max(0, Math.min(h - 22, y - 11)) });
+      }
+      want.sort((a, b) => a.top - b.top);
+      for (let i = 1; i < want.length; i++) if (want[i].top < want[i - 1].top + 24) want[i].top = want[i - 1].top + 24;
+      for (let i = want.length - 1; i >= 0; i--) {
+        if (want[i].top > h - 22) want[i].top = h - 22;
+        if (i > 0 && want[i - 1].top > want[i].top - 24) want[i - 1].top = want[i].top - 24;
+      }
       for (const k of ["entry", "sl", "tp"] as const) {
         const el = posTagRefs.current[k];
         const price = levels[k];
         if (!el || price == null) continue;
-        const y = priceToY(price);
-        if (y == null) {
+        const slot = want.find((w) => w.k === k);
+        const y = slot ? slot.y : null;
+        if (y == null || !slot) {
           el.style.visibility = "hidden";
           continue;
         }
@@ -3039,7 +3084,7 @@ export default function ChartPanel(props: ChartPanelProps) {
           el.style.right = offset;
           el.style.left = "auto";
         }
-        el.style.transform = `translateY(${Math.max(0, Math.min(h - 22, y - 11))}px)`;
+        el.style.transform = `translateY(${slot.top}px)`;
         el.classList.toggle("off", y < 0 || y > h); // pinned to the edge while off-screen
         const pnlEl = el.querySelector<HTMLElement>(".pnl");
         const at = k === "entry" ? ltp : price;
@@ -3843,7 +3888,8 @@ export default function ChartPanel(props: ChartPanelProps) {
         if (!def || !vals) continue;
         groups.push({
           title: `${def.short} ${argsLabel(inst)}`,
-          rows: def.plots.map((p, k) => {
+          rows: def.plots.filter((_, k) => indHasDataRef.current.get(inst.uid)?.[k] !== false).map((p) => {
+            const k = def.plots.indexOf(p);
             const x = vals[k]?.[i];
             return { label: p.label, value: x == null ? "∅" : inst.type === "volume" || inst.type === "obv" ? fmtVol(x) : fmtNum(x, inst.precision ?? 2), color: inst.plots[k]?.color };
           }),
@@ -4289,6 +4335,12 @@ export default function ChartPanel(props: ChartPanelProps) {
         top: Math.max(0, Math.min(ctx.y, Math.max(0, (containerRef.current?.clientHeight ?? 400) - 320))),
       }}
       onMouseDown={(e) => e.stopPropagation()}
+      ref={(el) => {
+        const host = containerRef.current;
+        if (!el || !host) return;
+        const maxTop = host.clientHeight - el.offsetHeight - 4;
+        if (el.offsetTop > maxTop) el.style.top = `${Math.max(0, maxTop)}px`;
+      }}
       data-testid="chart-ctx"
     >
       {ctx.confirm ? (
@@ -4693,6 +4745,7 @@ export default function ChartPanel(props: ChartPanelProps) {
                 } else if (e.key === "Escape") setTextDraft(null);
               }}
               onBlur={commitTextDraft}
+              onFocus={(e) => e.currentTarget.select()}
               data-testid="chart-text-input"
             />
           )}

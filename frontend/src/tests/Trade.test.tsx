@@ -912,4 +912,71 @@ describe("Trade page", () => {
     // The text of the response should appear, not "body stream".
     expect(banner.textContent).not.toMatch(/body stream/i);
   });
+
+  // ---- TradingView-style chart page ----
+
+  async function openReliance(user: ReturnType<typeof userEvent.setup>) {
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await user.type(await screen.findByTestId("trade-search"), "RELI");
+    await user.click(await screen.findByTestId("search-row-NSE:RELIANCE-EQ"));
+    await screen.findByTestId("trade-chart");
+  }
+
+  it("chart: the indicator picker adds an instance to the legend and its settings open", async () => {
+    globalThis.fetch = makeFetchStub(defaultStubs());
+    const user = userEvent.setup();
+    await openReliance(user);
+    await user.click(screen.getByTestId("chart-indicators-btn"));
+    await user.click(await screen.findByTestId("chart-ind-macd"));
+    await user.keyboard("{Escape}");
+    expect(await screen.findByTestId("legend-macd")).toBeInTheDocument();
+    await user.click(screen.getByTestId("ind-settings-macd"));
+    expect(await screen.findByTestId("ind-settings")).toBeInTheDocument();
+    await user.click(screen.getByTestId("ind-settings-ok"));
+    // persisted for the next visit
+    const prefs = JSON.parse(localStorage.getItem("chart:prefs") ?? "{}");
+    expect(prefs.indicators.map((i: { type: string }) => i.type)).toContain("macd");
+  });
+
+  it("chart: an alert created in the dialog is saved for the symbol", async () => {
+    globalThis.fetch = makeFetchStub(defaultStubs());
+    const user = userEvent.setup();
+    await openReliance(user);
+    await user.click(screen.getByTestId("chart-alerts-btn"));
+    await user.click(await screen.findByTestId("chart-alert-create"));
+    await user.selectOptions(await screen.findByLabelText("Condition"), "crossUp");
+    await user.selectOptions(screen.getByLabelText("Trigger"), "oncePerBar");
+    await user.click(screen.getByTestId("alert-save"));
+    await waitFor(() => {
+      const saved = JSON.parse(localStorage.getItem("chart:alerts:NSE:RELIANCE-EQ") ?? "[]");
+      expect(saved).toHaveLength(1);
+      expect(saved[0]).toMatchObject({ cond: "crossUp", trigger: "oncePerBar", active: true });
+    });
+  });
+
+  it("chart: settings changes persist and the interval menu switches intervals", async () => {
+    globalThis.fetch = makeFetchStub(defaultStubs());
+    const user = userEvent.setup();
+    await openReliance(user);
+    await user.click(screen.getByTestId("chart-settings-btn"));
+    await user.click(await screen.findByRole("tab", { name: "Canvas" }));
+    await user.selectOptions(screen.getByLabelText("Grid lines"), "horz");
+    await user.click(screen.getByTestId("chart-settings-ok"));
+    expect(JSON.parse(localStorage.getItem("chart:settings") ?? "{}").grid).toBe("horz");
+    await user.click(screen.getByTestId("chart-tf"));
+    await user.click(await screen.findByTestId("chart-ivm-75"));
+    await waitFor(() => expect(JSON.parse(localStorage.getItem("chart:prefs") ?? "{}").interval).toBe("75"));
+  });
+
+  it("account manager: lists open positions with exit / reverse actions", async () => {
+    localStorage.setItem("trade:bottomTab", JSON.stringify("positions"));
+    globalThis.fetch = makeFetchStub(defaultStubs({
+      positions: [{ id: 1, symbol: "NSE:RELIANCE-EQ", quantity: 10, average_price: 2440, last_price: 2450, unrealized_pnl: 100, strategy_id: null, opened_at: "", updated_at: "" }],
+    }));
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    const panel = await screen.findByTestId("trade-positions");
+    await waitFor(() => expect(panel.textContent).toMatch(/NSE:RELIANCE-EQ/));
+    expect(screen.getByText("Exit all")).toBeInTheDocument();
+    expect(screen.getByTitle("Reverse at market")).toBeInTheDocument();
+  });
 });
