@@ -2094,12 +2094,13 @@ kbd {
 .algo .algo-fields .algo-operand select { width: auto; }
 
 /* Trade page — TradingView layout: chart + bottom tabs left, quote + ticket right */
-/* Trade page — TradingView layout: chart (with a vertical drawing strip) over
-   a resizable tabbed bottom panel, watchlist + quote + ticket rail on the right.
-   The workspace fills the viewport; each section scrolls inside itself. */
+/* Trade page — TradingView layout: chart (vertical drawing strip on its left)
+   over a bottom bar (positions / orders) that opens on click; a right dock of
+   panels opened from the icon bar at the far right. The workspace fills the
+   viewport; each panel scrolls inside itself. */
 [data-page="trade"] .content-scroll { padding: 8px 10px; }
-.trade-page.tv { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 8px; height: 100%; min-height: 620px; padding: 0; }
-.tv-center { display: flex; flex-direction: column; gap: 8px; min-width: 0; min-height: 0; }
+.trade-page.tv { display: flex; flex-direction: row; gap: 8px; height: 100%; min-height: 620px; padding: 0; }
+.tv-center { flex: 1; display: flex; flex-direction: column; gap: 8px; min-width: 0; min-height: 0; }
 .tv-chart { flex: 1; min-height: 280px; display: flex; flex-direction: column; }
 .tv-chart > .trade-card { flex: 1; min-height: 0; }
 .tv-chart .chart-body { flex: 1; }
@@ -2112,11 +2113,35 @@ kbd {
 .tv-collapse { margin-left: auto; }
 .tv-bottom-body { flex: 1; min-height: 0; overflow: auto; padding: 0 8px 8px; }
 .tv-bottom-body .trade-card { border: 0; background: transparent; padding: 8px 2px; }
-.tv-right { display: flex; flex-direction: column; gap: 8px; min-height: 0; overflow: auto; }
-.tv-right > .trade-card { flex-shrink: 0; }
-.tv-right .trade-search-row { grid-template-columns: minmax(0, 1fr) auto auto; }
-.tv-right .trade-search-row .disp { display: none; }
-.tv-watch-list { display: flex; flex-direction: column; max-height: 240px; overflow: auto; margin: 0 -6px; }
+.tv-bottom.closed .trade-tabs .tab.active { border-bottom-color: transparent; }
+
+.tv-dock { position: relative; flex-shrink: 0; display: flex; flex-direction: column; gap: 8px; min-height: 0; overflow: auto; }
+.tv-dock-resize { position: absolute; left: 0; top: 0; bottom: 0; width: 6px; cursor: ew-resize; z-index: 5; }
+.tv-dock-resize:hover { background: var(--accent-dim); }
+.dock-panel { flex: 0 1 auto; min-height: 140px; display: flex; flex-direction: column; overflow: hidden; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; }
+.dock-panel.dock-trade { flex-shrink: 0.3; }   /* the ticket keeps its room; lists and the chain give way first */
+.dock-head { flex-shrink: 0; display: flex; align-items: center; gap: 8px; padding: 6px 6px 6px 12px; border-bottom: 1px solid var(--border); font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-dim); }
+.dock-head .sub { color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dock-x { margin-left: auto; background: none; border: 0; border-radius: 3px; padding: 0 6px; font-size: 16px; line-height: 1.2; color: var(--text-faint); cursor: pointer; }
+.dock-x:hover { background: var(--bg-elev); color: var(--text); }
+.dock-body { flex: 1; min-height: 0; overflow: auto; padding: 8px 10px; display: flex; flex-direction: column; gap: 12px; }
+.dock-body .trade-card { border: 0; background: transparent; padding: 0; min-height: 0; flex-shrink: 0; }
+.dock-body .trade-search-results { position: static; margin-top: 4px; }
+.dock-body .trade-search-row { grid-template-columns: minmax(0, 1fr) auto auto; }
+.dock-body .trade-search-row .disp { display: none; }
+.dock-body .chain-table thead { position: sticky; top: -8px;   /* -padding: pinned flush to the panel edge */ z-index: 1; background: var(--bg-panel); }
+.dock-body .chain-table thead th { background: var(--bg-panel); }
+.dock-body .chain-table th, .dock-body .chain-table td { padding: 3px 4px; font-size: 11px; }
+.dock-body .chain-table .chain-ltp { min-width: 0; padding: 2px 4px; font-size: 11px; }
+.chain-table .chain-ltp.on { background: var(--accent); color: var(--text-inv); }
+
+.tv-rail { width: 52px; flex-shrink: 0; display: flex; flex-direction: column; gap: 4px; padding: 4px; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; }
+.tv-rail-btn { display: flex; flex-direction: column; align-items: center; gap: 3px; padding: 8px 0 6px; background: transparent; border: 0; border-radius: 4px; color: var(--text-dim); cursor: pointer; }
+.tv-rail-btn .ico { font-size: 16px; line-height: 1; }
+.tv-rail-btn .lbl { font-size: 9px; letter-spacing: 0.04em; text-transform: uppercase; }
+.tv-rail-btn:hover { background: var(--bg-elev); color: var(--text); }
+.tv-rail-btn.on { background: var(--bg-elev); color: var(--accent); box-shadow: inset -2px 0 var(--accent); }
+.tv-watch-list { display: flex; flex-direction: column; margin: 0 -6px; }
 .tv-watch-head, .tv-watch-row { display: grid; grid-template-columns: minmax(0, 1fr) 74px 62px 14px; gap: 6px; align-items: center; padding: 4px 6px; font-family: var(--mono); font-size: 11px; }
 .tv-watch-head { color: var(--text-faint); font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.06em; }
 .tv-watch-head > span:not(:first-child), .tv-watch-row > span:not(.sym) { text-align: right; }
@@ -2130,9 +2155,11 @@ kbd {
 .tv-watch-row:hover .x { visibility: visible; }
 .tv-watch-row .x:hover { color: var(--red); }
 @media (max-width: 1100px) {
-  .trade-page.tv { grid-template-columns: 1fr; height: auto; }
-  .tv-chart { min-height: 520px; }
-  .tv-right { overflow: visible; }
+  .trade-page.tv { flex-wrap: wrap; height: auto; }
+  .tv-center { flex: 1 1 100%; }
+  .tv-chart { min-height: 480px; }
+  .tv-dock { flex: 1; width: auto; overflow: visible; }
+  .tv-dock-resize { display: none; }
 }
 
 /* chart: vertical drawing strip left of the plot */

@@ -205,6 +205,7 @@ describe("Trade page", () => {
 
   beforeEach(() => {
     localStorage.clear();
+    localStorage.setItem("trade:bottomOpen", "true");   // the orders panel open, as an operator would have it
     originalFetch = globalThis.fetch;
   });
   afterEach(() => {
