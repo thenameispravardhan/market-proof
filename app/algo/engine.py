@@ -49,6 +49,9 @@ STRIKE_MODES = ("ATM", "ITM", "OTM", "PREMIUM")
 DEFAULT_SPEC: dict[str, Any] = {
     "symbols": [],
     "timeframe": 5,
+    # time = every `timeframe` minutes; volume / turnover = a candle closes once
+    # that much has traded, sized so a typical session has ~per_day candles.
+    "bars": {"type": "time", "per_day": 50},
     "direction": "long",
     "entry_long": {"logic": "AND", "conditions": []},
     "exit_long": None,
@@ -133,7 +136,7 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
     if "capital" in spec and "portfolio" not in spec:       # specs saved before portfolios
         spec["portfolio"] = {"capital": spec.pop("capital")}
     for k, v in spec.items():
-        if k in ("session", "costs", "sizing", "portfolio", "mtm", "daily", "instrument", "entry_order") \
+        if k in ("session", "costs", "sizing", "portfolio", "mtm", "daily", "instrument", "entry_order", "bars") \
                 and isinstance(v, dict):
             s[k] = {**s[k], **v}
         elif k in s or k == "name":
@@ -146,6 +149,13 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
     s["timeframe"] = int(s["timeframe"])
     if s["timeframe"] not in TIMEFRAMES:
         raise ValueError(f"timeframe must be one of {TIMEFRAMES} minutes")
+    if s["bars"].get("type") not in ("time", "volume", "turnover"):
+        raise ValueError("candles are time, volume or turnover")
+    s["bars"]["per_day"] = _num(s["bars"].get("per_day", 50), "candles per day", 5, integer=True)
+    if s["bars"]["per_day"] > 1000:
+        raise ValueError("at most 1000 candles per day")
+    if s["bars"]["type"] != "time":
+        s["timeframe"] = 1        # volume/turnover candles are built from 1-minute data
     if s["direction"] not in ("long", "short", "both"):
         raise ValueError("direction must be long, short or both")
     for k in ("start", "end", "square_off"):
@@ -296,6 +306,20 @@ def _walk_operands(spec: dict[str, Any]):
         yield from walk(spec.get(k))
 
 
+ORDER_FLOW = {"DELTA", "CVD", "CVD_DIVERGENCE", "VPROFILE", "RVOL", "BAR_FLOW"}
+
+
+def bar_minutes(spec: dict[str, Any]) -> float:
+    """Typical candle length in minutes — for turning 'N bars' into time live."""
+    return spec["timeframe"] if spec["bars"]["type"] == "time" else 375 / spec["bars"]["per_day"]
+
+
+def needs_minutes(spec: dict[str, Any]) -> bool:
+    """Build candles from 1-minute data (volume/turnover candles, or order-flow
+    indicators that should see each minute's flow, not the candle as a lump)."""
+    return spec["bars"]["type"] != "time" or any(o["ind"] in ORDER_FLOW for o in _walk_operands(spec))
+
+
 def cond_timeframes(spec: dict[str, Any]) -> set[int]:
     """Higher timeframes the conditions reference (the base excluded)."""
     return {int(o["tf"]) for o in _walk_operands(spec) if int(o.get("tf") or 0) not in (0, spec["timeframe"])}
@@ -315,6 +339,8 @@ def warmup_bars(spec: dict[str, Any]) -> int:
 # ---- signals ---------------------------------------------------------------
 
 def _close_times(b: dict) -> list[int]:
+    if "tc" in b:            # volume/turnover candles carry their real close times
+        return [min(tc, t - (t + IST) % 86400 + SESSION_CLOSE_S) for t, tc in zip(b["t"], b["tc"])]
     tf = b["tf_s"]
     return [min(t + tf, t - (t + IST) % 86400 + SESSION_CLOSE_S) for t in b["t"]]
 
@@ -801,7 +827,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         if day != day_key:
             day_key, day_realized = day, 0.0
         if s_["pos"] and day != s_["pos"]["day"]:
-            close(sym, d["c"][i - 1], d["t"][i - 1] + d["tf_s"], "EOD", i - 1)
+            close(sym, d["c"][i - 1], ind.close_time(d, i - 1), "EOD", i - 1)
         if s_["pos"] and (s_["pos"]["exit_pending"] or mod >= sq):
             close(sym, d["o"][i], t, s_["pos"]["exit_pending"] or "SQUARE_OFF", i)
         if s_["pending"]:
@@ -872,7 +898,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                     s2["pending"] = None
         if (s_["pos"] is None and s_["pending"] is None and i + 1 < len(d["t"]) and i >= s_["cool"]
                 and halted != day and (trade_from is None or t >= trade_from)):
-            close_mod = mod + d["tf_s"] // 60
+            close_mod = ((ind.close_time(d, i) + IST) % 86400) // 60
             if start <= close_mod <= end and s_["per_day"].get(day, 0) < spec["max_trades_per_day"]:
                 side = "BUY" if s_["sig"]["entry_long"][i] else "SELL" if s_["sig"]["entry_short"][i] else None
                 if side:
@@ -883,7 +909,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
     for sym in syms:
         if st[sym]["pos"]:
             d = st[sym]["d"]
-            close(sym, d["c"][-1], d["t"][-1] + d["tf_s"], "END", len(d["t"]) - 1)
+            close(sym, d["c"][-1], ind.close_time(d, len(d["t"]) - 1), "END", len(d["t"]) - 1)
 
     trades.sort(key=lambda x: x["entry_t"])
     per_symbol = {}

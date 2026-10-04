@@ -40,6 +40,7 @@ from typing import Any, Optional
 from sqlalchemy import func, select
 
 from app.algo import data, engine, fno
+from app.algo import indicators
 from app.db import session as db_session
 from app.db.models import AlgoStrategy, AlgoTrade, BrokerAccount
 from app.logging_config import get_logger
@@ -327,6 +328,7 @@ class AlgoRunner:
         # ponytail: in memory — a restart drops pending triggers (they expire
         # within a few bars anyway); persist them if that ever costs a trade.
         self._armed: dict[tuple[int, str], dict[str, Any]] = {}
+        self._last_tc: dict[tuple[int, str], int] = {}   # volume/turnover: last candle close acted on
 
     def event(self, level: str, msg: str, **kw: Any) -> None:
         self.events.appendleft({"t": time.time(), "level": level, "msg": msg, **kw})
@@ -458,7 +460,7 @@ class AlgoRunner:
             elif r["target"] and m >= r["target"]:
                 reason = "MTM_TARGET"
         if spec and not reason and spec["max_bars"]:
-            if now >= _epoch(t["entry_at"]) + spec["max_bars"] * spec["timeframe"] * 60:
+            if now >= _epoch(t["entry_at"]) + spec["max_bars"] * engine.bar_minutes(spec) * 60:
                 reason = "TIME_STOP"
         if changed:
             await asyncio.to_thread(_update, t["id"], **{k: v for k, v in changed.items()})
@@ -563,6 +565,22 @@ class AlgoRunner:
                 self._last_bar[key] = bar
                 self.event("error", f"{s['name']} {sym}: candles unavailable: {e}"[:300], strategy_id=s["id"])
                 continue
+            if spec["bars"]["type"] != "time":
+                # Volume/turnover candles close whenever enough has traded: this
+                # minute is done; act only if a NEW candle completed since.
+                self._last_bar[key] = bar
+                if not d["t"] or d["tc"][-1] <= self._last_tc.get(key, 0):
+                    continue
+                first_seen = key not in self._last_tc
+                self._last_tc[key] = d["tc"][-1]
+                if first_seen or now - d["tc"][-1] > STALE_BAR_S:
+                    continue                               # closed before we were watching
+                try:
+                    await self._decide(s, sym, d, now, day_start)
+                except Exception as e:  # noqa: BLE001
+                    log.exception("algo.decide_failed", symbol=sym)
+                    self.event("error", f"{s['name']} {sym}: {e}"[:300], strategy_id=s["id"])
+                continue
             if not d["t"] or d["t"][-1] < bar:
                 # Newest candle from an earlier day, well after this bar closed:
                 # no session today (exchange holiday / suspended symbol). Mark
@@ -589,7 +607,7 @@ class AlgoRunner:
                 prices = await _ltp([lg["symbol"] for lg in mine["legs"]])
                 await self._exit(mine, prices, "SIGNAL", now)
             return
-        close_min = int((d["t"][-1] + d["tf_s"] + IST) % 86400) // 60
+        close_min = int((indicators.close_time(d, len(d["t"]) - 1) + IST) % 86400) // 60
         start, end, _ = engine.session_window(spec)
         if not start <= close_min <= end:
             return
@@ -600,13 +618,13 @@ class AlgoRunner:
             return
         if spec["cooldown_bars"]:
             last = await asyncio.to_thread(_last_exit, s["id"], sym)
-            if last and now < last + spec["cooldown_bars"] * spec["timeframe"] * 60:
+            if last and now < last + spec["cooldown_bars"] * engine.bar_minutes(spec) * 60:
                 return
         level = engine.entry_trigger(spec, side, d["c"][-1])
         if level is not None:
             eo = spec["entry_order"]
             self._armed[(s["id"], sym)] = {"side": side, "level": level, "kind": eo["type"], "d": d,
-                                           "expires": now + eo["valid_bars"] * spec["timeframe"] * 60}
+                                           "expires": now + eo["valid_bars"] * engine.bar_minutes(spec) * 60}
             self.event("info", f"{s['name']}: {side} {sym} armed — {eo['type']} entry at {level:.2f}",
                        strategy_id=s["id"])
             return

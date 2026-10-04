@@ -170,6 +170,8 @@ def source(d: dict, name: str) -> S:
         return [(a + b + k + m) / 4 for a, b, k, m in zip(o, h, l, c)]
     if name == "close":
         return c
+    if name == "range":
+        return [a - b for a, b in zip(h, l)]
     raise ValueError(f"unknown source {name!r}")
 
 
@@ -369,6 +371,163 @@ def hist_vol(d: dict, n: int) -> S:
     return _zip(lambda sd: sd * math.sqrt(per_year) * 100, stdev(rets, n))
 
 
+def close_time(d: dict, i: int) -> int:
+    """When bar i closed: volume/turnover candles carry it; time bars are t + tf."""
+    return d["tc"][i] if "tc" in d else d["t"][i] + d["tf_s"]
+
+
+# ---- order flow (see app/algo/orderflow.py for how candles get their flow) ----
+
+def _flow(d: dict) -> tuple[S, S]:
+    """(buy volume, sell volume) per bar. Candles built from minutes carry it;
+    otherwise (e.g. a daily higher-timeframe candle) estimate it at bar level
+    with the same Bulk Volume Classification."""
+    if d.get("flow"):
+        return d["buy_v"], d["sell_v"]
+    o, h, l, c, v = d["o"], d["h"], d["l"], d["c"], d["v"]
+    dps = [c[0] - o[0] if c else 0.0] + [c[i] - c[i - 1] for i in range(1, len(c))]
+    sd = stdev(dps, 20)
+    buy: S = []
+    for i in range(len(c)):
+        if sd[i]:
+            sh = 0.5 * (1 + math.erf(dps[i] / sd[i] / math.sqrt(2)))
+        else:
+            sh = (c[i] - l[i]) / (h[i] - l[i]) if h[i] > l[i] else 0.5
+        buy.append(v[i] * sh)
+    return buy, [x - b for x, b in zip(v, buy)]
+
+
+def order_delta(d: dict) -> dict[str, S]:
+    buy, sell = _flow(d)
+    delta = [b - s_ for b, s_ in zip(buy, sell)]
+    return {"delta": delta, "delta_pct": [x / (b + s_) * 100 if b + s_ else 0.0 for x, b, s_ in zip(delta, buy, sell)],
+            "buy_volume": list(buy), "sell_volume": list(sell)}
+
+
+def cvd(d: dict) -> dict[str, S]:
+    """Cumulative delta: per session (resets at the open) and running total."""
+    delta = order_delta(d)["delta"]
+    keys = _day_keys(d)
+    ses: S = []
+    tot: S = []
+    a = b = 0.0
+    for i, x in enumerate(delta):
+        if i and keys[i] != keys[i - 1]:
+            a = 0.0
+        a += x
+        b += x
+        ses.append(a)
+        tot.append(b)
+    return {"session": ses, "total": tot}
+
+
+def cvd_divergence(d: dict, n: int) -> dict[str, S]:
+    """1.0 when price makes a new n-bar low but cumulative delta does not
+    (bull: sellers exhausted), or a new high that delta doesn't confirm (bear)."""
+    tot, h, l = cvd(d)["total"], d["h"], d["l"]
+    bull: S = [0.0] * len(h)
+    bear: S = [0.0] * len(h)
+    for i in range(n, len(h)):
+        if l[i] < min(l[i - n:i]) and tot[i] > min(tot[i - n:i]):
+            bull[i] = 1.0
+        if h[i] > max(h[i - n:i]) and tot[i] < max(tot[i - n:i]):
+            bear[i] = 1.0
+    return {"bull": bull, "bear": bear}
+
+
+def _value_area(bins: dict[int, float], poc: int, lo_b: int, hi_b: int, target: float) -> tuple[int, int]:
+    lo = hi = poc
+    acc = bins.get(poc, 0.0)
+    while acc < target and (lo > lo_b or hi < hi_b):
+        up = bins.get(hi + 1, 0.0) if hi < hi_b else -1.0
+        dn = bins.get(lo - 1, 0.0) if lo > lo_b else -1.0
+        if up >= dn:
+            hi += 1
+            acc += max(up, 0.0)
+        else:
+            lo -= 1
+            acc += max(dn, 0.0)
+    return lo, hi
+
+
+def volume_profile(d: dict, value_area: int = 70) -> dict[str, S]:
+    """Session volume profile, developing bar by bar: POC (price with the most
+    volume), value-area high/low (where `value_area`% of the volume traded),
+    plus the previous session's final POC / VAH / VAL. Each bar's volume is
+    spread evenly over its high-low range in bins of ~5 bps of price.
+
+    ponytail: the value area is recomputed about every 5 minutes of bars, not
+    every 1-minute bar — O(bins) each; tighten if a strategy needs it per bar.
+    """
+    h, l, c, v = d["h"], d["l"], d["c"], d["v"]
+    n = len(c)
+    names = ("poc", "vah", "val", "prev_poc", "prev_vah", "prev_val")
+    out: dict[str, S] = {k: [None] * n for k in names}
+    if not n:
+        return out
+    mid = sorted(c)[n // 2]
+    step = max(0.05, round(mid * 0.0005, 2))
+    keys = _day_keys(d)
+    every = max(1, 300 // max(60, int(d.get("tf_s") or 300)))
+    bins: dict[int, float] = {}
+    poc_b = lo_b = hi_b = 0
+    total = 0.0
+    va = (None, None)
+    prev = last = (None, None, None)
+    for i in range(n):
+        if i == 0 or keys[i] != keys[i - 1]:
+            prev = last
+            bins, total, va = {}, 0.0, (None, None)
+            poc_b = lo_b = hi_b = int(c[i] // step)
+        lo, hi = int(l[i] // step), int(h[i] // step)
+        stride = max(1, (hi - lo) // 200)              # a huge-range bar: sample its bins
+        span = range(lo, hi + 1, stride)
+        share = v[i] / len(span)
+        for b in span:
+            bins[b] = bins.get(b, 0.0) + share
+            if bins[b] > bins.get(poc_b, -1.0):
+                poc_b = b
+        lo_b, hi_b = min(lo_b, lo), max(hi_b, hi)
+        total += v[i]
+        if va[0] is None or i % every == 0 or i + 1 == n or keys[i + 1] != keys[i]:
+            a, b = _value_area(bins, poc_b, lo_b, hi_b, total * value_area / 100)
+            va = (a * step, (b + 1) * step)
+        poc = (poc_b + 0.5) * step
+        out["poc"][i], out["val"][i], out["vah"][i] = poc, va[0], va[1]
+        out["prev_poc"][i], out["prev_vah"][i], out["prev_val"][i] = prev[0], prev[1], prev[2]
+        last = (poc, va[1], va[0])
+    return out
+
+
+def rvol(d: dict, days: int) -> S:
+    """Relative volume so far today: cumulative session volume up to this bar's
+    close / the average cumulative volume at the same time of day over the
+    previous `days` sessions. 2.0 = twice the usual activity by now."""
+    import bisect
+
+    keys = _day_keys(d)
+    out: S = [None] * len(d["t"])
+    hist: deque[tuple[list[int], list[float]]] = deque(maxlen=days)
+    sods: list[int] = []
+    cums: list[float] = []
+    cum = 0.0
+    for i, v in enumerate(d["v"]):
+        if i and keys[i] != keys[i - 1]:
+            hist.append((sods, cums))
+            sods, cums, cum = [], [], 0.0
+        cum += v
+        sod = (close_time(d, i) + IST_OFFSET) % 86400
+        sods.append(sod)
+        cums.append(cum)
+        refs = []
+        for hs, hc in hist:
+            j = bisect.bisect_right(hs, sod) - 1
+            refs.append(hc[j] if j >= 0 else 0.0)
+        avg = sum(refs) / len(refs) if refs else 0.0
+        out[i] = cum / avg if avg > 0 else None
+    return out
+
+
 def _day_keys(d: dict) -> list[int]:
     return [(t + IST_OFFSET) // 86400 for t in d["t"]]
 
@@ -417,7 +576,7 @@ def vwap(d: dict) -> S:
 
 def opening_range(d: dict, minutes: int) -> dict[str, S]:
     """High/low of the first `minutes` of the session; None until it closes."""
-    t, h, l, tf = d["t"], d["h"], d["l"], d["tf_s"]
+    t, h, l = d["t"], d["h"], d["l"]
     keys = _day_keys(d)
     hi: S = [None] * len(t)
     lo: S = [None] * len(t)
@@ -429,7 +588,7 @@ def opening_range(d: dict, minutes: int) -> dict[str, S]:
         if sod < SESSION_OPEN_S + minutes * 60:
             rh = h[i] if rh is None else max(rh, h[i])
             rl = l[i] if rl is None else min(rl, l[i])
-        if sod + tf >= SESSION_OPEN_S + minutes * 60 and rh is not None:
+        if (close_time(d, i) + IST_OFFSET) % 86400 >= SESSION_OPEN_S + minutes * 60 and rh is not None:
             hi[i], lo[i] = rh, rl
     return {"high": hi, "low": lo}
 
@@ -562,6 +721,15 @@ REGISTRY: dict[str, tuple[Callable[..., Any], dict[str, Any], list[str], str]] =
     "CANDLE":     (lambda d: candles(d), {}, ["green", "red", "doji", "hammer", "shooting_star",
                                               "bullish_engulfing", "bearish_engulfing", "inside_bar",
                                               "outside_bar", "nr7"], "Candles"),
+    "DELTA":      (lambda d: order_delta(d), {}, ["delta", "delta_pct", "buy_volume", "sell_volume"], "Order flow"),
+    "CVD":        (lambda d: cvd(d), {}, ["session", "total"], "Order flow"),
+    "CVD_DIVERGENCE": (lambda d, period=20: cvd_divergence(d, period), {"period": 20}, ["bull", "bear"], "Order flow"),
+    "VPROFILE":   (lambda d, value_area=70: volume_profile(d, value_area), {"value_area": 70},
+                   ["poc", "vah", "val", "prev_poc", "prev_vah", "prev_val"], "Order flow"),
+    "RVOL":       (lambda d, days=10: rvol(d, days), {"days": 10}, ["value"], "Order flow"),
+    "BAR_FLOW":   (lambda d: {"poc": d["poc"] if d.get("flow") else source(d, "hlc3"),
+                              "vwap": d["bvwap"] if d.get("flow") else source(d, "hlc3")},
+                   {}, ["poc", "vwap"], "Order flow"),
     "TIME":       (lambda d: clock(d), {}, ["hhmm", "weekday"], "Time"),
     # Calendar days to the instrument's expiry (options: the chosen weekly /
     # monthly; otherwise the monthly F&O expiry) — "trade only on expiry day"
@@ -570,7 +738,7 @@ REGISTRY: dict[str, tuple[Callable[..., Any], dict[str, Any], list[str], str]] =
                    if d.get("expiry_ts") else [None] * len(d["t"]), {}, ["value"], "Time"),
 }
 
-SOURCES = ("close", "open", "high", "low", "hl2", "hlc3", "ohlc4", "volume")
+SOURCES = ("close", "open", "high", "low", "hl2", "hlc3", "ohlc4", "volume", "range")
 
 
 def compute(d: dict, name: str, params: dict[str, Any]) -> dict[str, S]:

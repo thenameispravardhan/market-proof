@@ -458,3 +458,74 @@ def test_api_guards_heavy_jobs(client):
     r = client.post("/api/algo/backtest", json={"spec": {**spec, "symbols": ["NSE:SBIN-EQ"], "timeframe": 15},
                                                  "start": "2025-01-01", "end": "2025-06-01", "oos_pct": 95})
     assert r.status_code == 422 and "out-of-sample" in r.json()["detail"]
+
+
+def _minutes(closes, vols=None, start=DAY0, days=1):
+    """1-minute candles: `closes` per session, repeated over `days` sessions."""
+    t, o, h, l, c, v = [], [], [], [], [], []
+    for dd in range(days):
+        prev = closes[0]
+        for i, x in enumerate(closes):
+            t.append(start + dd * 86400 + 60 * i)
+            o.append(prev)
+            h.append(max(prev, x) + 0.05)
+            l.append(min(prev, x) - 0.05)
+            c.append(x)
+            v.append((vols[i] if vols else 100) * (dd + 1))
+            prev = x
+    return {"t": t, "o": o, "h": h, "l": l, "c": c, "v": v, "tf_s": 60}
+
+
+def test_orderflow_candles_from_minutes():
+    from app.algo import orderflow as of
+
+    m1 = _minutes([100 + i * 0.1 for i in range(30)])
+    b = of.build_bars(m1, "time", 5)
+    assert len(b["t"]) == 6 and b["o"][0] == 100 and b["c"][0] == round(100.4, 10) and b["v"][0] == 500
+    assert all(abs(bu + se - v) < 1e-6 for bu, se, v in zip(b["buy_v"], b["sell_v"], b["v"]))
+    assert all(x > 0 for x in b["delta"][2:])                     # a steady climb is net buying
+    assert b["tc"][0] == DAY0 + 300 and b["last_complete"]
+    vb = of.build_bars(_minutes([100] * 20, days=2), "volume", size=450)
+    days = {(t + 19800) // 86400 for t in vb["t"]}
+    assert len(days) == 2 and all(v >= 450 for v in vb["v"][:4])  # thresholds; nothing spans sessions
+    assert of.build_bars(_minutes([100] * 7), "volume", size=450)["last_complete"] is False
+    with pytest.raises(ValueError):
+        of.bar_size(_minutes([100] * 30, vols=[0] * 30), "volume", 50)      # an index: no volume
+
+
+def test_orderflow_indicators():
+    from app.algo import orderflow as of
+
+    # day 1 trades mostly at 100, day 2 doubles volume
+    closes = [100.0] * 20 + [101.0] * 5 + [100.0] * 5
+    vols = [500] * 20 + [50] * 5 + [500] * 5
+    b = of.build_bars(_minutes(closes, vols, days=2), "time", 5)
+    b["tf_min"] = 5
+    vp = ind.compute(b, "VPROFILE", {})
+    day2 = [i for i, t in enumerate(b["t"]) if t >= DAY0 + 86400]
+    assert abs(vp["poc"][day2[-1]] - 100) < 0.2 and vp["val"][-1] <= vp["poc"][-1] <= vp["vah"][-1]
+    assert vp["prev_poc"][day2[0]] is not None and vp["prev_poc"][0] is None
+    rv = ind.compute(b, "RVOL", {"days": 5})["value"]
+    assert rv[0] is None and abs(rv[day2[-1]] - 2.0) < 1e-6        # twice yesterday's volume by the same time
+    cvd = ind.compute(b, "CVD", {})
+    assert cvd["session"][day2[0]] == b["delta"][day2[0]]          # session CVD resets at the open
+    plain = bars([100 + (i % 9) for i in range(80)])               # candles not built from minutes
+    assert len(ind.compute(plain, "DELTA", {})["delta"]) == 80      # bar-level fallback still works
+
+
+def test_volume_candle_strategy_backtests():
+    from app.algo import orderflow as of
+
+    closes = ([100 + i * 0.05 for i in range(200)] + [110 - i * 0.05 for i in range(175)])
+    m1 = _minutes(closes, days=3)
+    spec = _cross_spec(bars={"type": "volume", "per_day": 40}, exit_long=None,
+                       entry_long={"logic": "AND", "conditions": [
+                           {"left": {"ind": "DELTA", "field": "delta_pct"}, "op": ">", "right": {"value": 10}},
+                           {"left": {"ind": "PRICE"}, "op": "crosses_above", "right": {"ind": "EMA", "params": {"period": 5}}}]},
+                       stop_loss={"type": "pct", "value": 0.5}, target={"type": "pct", "value": 1})
+    assert spec["timeframe"] == 1 and engine.needs_minutes(spec)
+    d = of.build_bars(m1, "volume", size=of.bar_size(m1, "volume", 40))
+    d["tf_min"] = 1
+    r = engine.run(spec, {"X": d})
+    assert r["trades"] and all(t["exit_t"] in d["tc"] or t["reason"] in ("SL", "TARGET") or t["exit_t"] in d["t"]
+                               for t in r["trades"])

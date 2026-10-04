@@ -17,6 +17,8 @@ import { Area, AreaChart, CartesianGrid, Line, LineChart, ResponsiveContainer, T
 import {
   CandlestickSeries,
   ColorType,
+  HistogramSeries,
+  LineSeries,
   createChart,
   createSeriesMarkers,
   type SeriesMarker,
@@ -56,6 +58,7 @@ type Instrument = {
 type Spec = {
   symbols: string[];
   timeframe: number;
+  bars: { type: string; per_day: number };
   direction: "long" | "short" | "both";
   entry_long: Group;
   exit_long: Group | null;
@@ -156,7 +159,8 @@ const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const daysAgo = (n: number) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
 const shortSym = (s: string) => s.replace(/^NSE:/, "").replace(/-EQ$/, "").replace(/-INDEX$/, "");
 const tfLabel = (t: number) => (t === 1440 ? "daily" : t >= 60 ? `${t / 60}h` : `${t}m`);
-const SECTIONS = ["instrument", "session", "sizing", "portfolio", "mtm", "daily", "costs", "entry_order"] as const;
+const SECTIONS = ["instrument", "session", "sizing", "portfolio", "mtm", "daily", "costs", "entry_order", "bars"] as const;
+const barLabel = (sp: Spec) => (!sp.bars || sp.bars.type === "time" ? tfLabel(sp.timeframe) : `${sp.bars.type} ~${sp.bars.per_day}/day`);
 const STRIKES = ["ATM", ...Array.from({ length: 20 }, (_, k) => `ITM${k + 1}`), ...Array.from({ length: 20 }, (_, k) => `OTM${k + 1}`), "PREMIUM"];
 const strikeKey = (lg: Leg) => (lg.strike === "ITM" || lg.strike === "OTM" ? `${lg.strike}${Math.max(1, lg.steps)}` : lg.strike);
 const SESSION_DEFAULT = { start: "09:20", end: "15:00", square_off: "15:15" } as const;
@@ -425,6 +429,50 @@ export const TEMPLATES: Template[] = [
     entry_short: G([C(I("PRICE"), "crosses_below", I("ORB", { minutes: 15 }, "low"))]),
     stop_loss: { type: "pct", value: 0.4 }, target: { type: "rr", value: 2 },
     sizing: { mode: "lots", value: 1 }, portfolio: { capital: 300000, leverage: 6, max_positions: 1, compounding: true } } },
+  // ---- order flow (delta estimated per minute from 1-minute candles) ----
+  { name: "Order flow · delta-confirmed EMA cross on volume candles", spec: {
+    direction: "both", bars: { type: "volume", per_day: 60 }, timeframe: 1, instrument: { type: "equity" } as Instrument,
+    entry_long: G([C(I("EMA", { period: 9 }), "crosses_above", I("EMA", { period: 21 })), C(I("DELTA", {}, "delta_pct"), ">", N(15))]),
+    entry_short: G([C(I("EMA", { period: 9 }), "crosses_below", I("EMA", { period: 21 })), C(I("DELTA", {}, "delta_pct"), "<", N(-15))]),
+    stop_loss: { type: "atr", value: 1.5, atr_period: 14 }, target: { type: "rr", value: 2 }, sizing: { mode: "risk_pct", value: 0.5 } } },
+  { name: "Order flow · cumulative-delta divergence reversal (5m)", spec: {
+    direction: "both", timeframe: 5, instrument: { type: "equity" } as Instrument, max_bars: 12,
+    entry_long: G([C(I("CVD_DIVERGENCE", { period: 20 }, "bull"), "==", N(1)), C(I("RSI", { period: 14 }), "<", N(40))]),
+    entry_short: G([C(I("CVD_DIVERGENCE", { period: 20 }, "bear"), "==", N(1)), C(I("RSI", { period: 14 }), ">", N(60))]),
+    stop_loss: { type: "atr", value: 1, atr_period: 14 }, target: { type: "rr", value: 1.5 } } },
+  { name: "Order flow · value-area rejection back to POC (5m)", spec: {
+    direction: "both", timeframe: 5, instrument: { type: "equity" } as Instrument, max_trades_per_day: 1,
+    entry_short: G([C(I("DAILY", {}, "day_open"), ">", I("VPROFILE", {}, "prev_vah")), C(I("PRICE"), "crosses_below", I("VPROFILE", {}, "prev_vah"))]),
+    exit_short: G([C(I("PRICE"), "<=", I("VPROFILE", {}, "prev_poc"))]),
+    entry_long: G([C(I("DAILY", {}, "day_open"), "<", I("VPROFILE", {}, "prev_val")), C(I("PRICE"), "crosses_above", I("VPROFILE", {}, "prev_val"))]),
+    exit_long: G([C(I("PRICE"), ">=", I("VPROFILE", {}, "prev_poc"))]),
+    stop_loss: { type: "pct", value: 0.7 }, target: null } },
+  { name: "Order flow · 80% rule (re-enter yesterday's value area)", spec: {
+    direction: "both", timeframe: 15, instrument: { type: "equity" } as Instrument, max_trades_per_day: 1,
+    entry_long: G([C(I("DAILY", {}, "day_open"), "<", I("VPROFILE", {}, "prev_val")), C(I("PRICE"), ">", I("VPROFILE", {}, "prev_val")), C(A(I("PRICE"), 1), ">", I("VPROFILE", {}, "prev_val"))]),
+    exit_long: G([C(I("PRICE"), ">=", I("VPROFILE", {}, "prev_vah"))]),
+    entry_short: G([C(I("DAILY", {}, "day_open"), ">", I("VPROFILE", {}, "prev_vah")), C(I("PRICE"), "<", I("VPROFILE", {}, "prev_vah")), C(A(I("PRICE"), 1), "<", I("VPROFILE", {}, "prev_vah"))]),
+    exit_short: G([C(I("PRICE"), "<=", I("VPROFILE", {}, "prev_val"))]),
+    stop_loss: { type: "pct", value: 0.8 }, target: null } },
+  { name: "Order flow · RVOL breakout on turnover candles", spec: {
+    direction: "both", bars: { type: "turnover", per_day: 40 }, timeframe: 1, instrument: { type: "equity" } as Instrument,
+    entry_long: G([C(I("RVOL", { days: 10 }), ">", N(1.5)), C(I("PRICE"), "crosses_above", A(I("DONCHIAN", { period: 20 }, "upper"), 1)), C(I("DELTA", {}, "delta"), ">", N(0))]),
+    entry_short: G([C(I("RVOL", { days: 10 }), ">", N(1.5)), C(I("PRICE"), "crosses_below", A(I("DONCHIAN", { period: 20 }, "lower"), 1)), C(I("DELTA", {}, "delta"), "<", N(0))]),
+    stop_loss: { type: "atr", value: 1.5, atr_period: 14 }, trailing: { type: "atr", value: 2, atr_period: 14, activate: 1 }, target: null } },
+  { name: "Order flow · absorption at the day's extreme", spec: {
+    direction: "both", timeframe: 5, instrument: { type: "equity" } as Instrument, max_trades_per_day: 2,
+    entry_long: G([C(I("ZSCORE", { period: 20, source: "volume" }), ">", N(2)), C(I("ZSCORE", { period: 20, source: "range" }), "<", N(0)),
+                   C(I("PRICE"), "<=", { ...I("DAILY", {}, "day_low"), mult: 1.002 }), C(I("DELTA", {}, "delta"), ">", N(0))]),
+    entry_short: G([C(I("ZSCORE", { period: 20, source: "volume" }), ">", N(2)), C(I("ZSCORE", { period: 20, source: "range" }), "<", N(0)),
+                    C(I("PRICE"), ">=", { ...I("DAILY", {}, "day_high"), mult: 0.998 }), C(I("DELTA", {}, "delta"), "<", N(0))]),
+    stop_loss: { type: "atr", value: 1, atr_period: 14 }, target: { type: "rr", value: 2 } } },
+  { name: "NIFTY options · buy ATM on a delta surge with high RVOL", symbols: ["NSE:NIFTY50-INDEX"], spec: {
+    direction: "both", timeframe: 5,
+    instrument: { type: "option", expiry: "current", expiry_kind: "weekly", levels_on: "instrument", iv: { source: "auto", value: 15 },
+      legs_long: [L("CE", "BUY")], legs_short: [L("PE", "BUY")] },
+    entry_long: G([C(I("DELTA", {}, "delta_pct"), ">", N(25)), C(I("RVOL", { days: 10 }), ">", N(1.3)), C(I("PRICE"), ">", I("VWAP"))]),
+    entry_short: G([C(I("DELTA", {}, "delta_pct"), "<", N(-25)), C(I("RVOL", { days: 10 }), ">", N(1.3)), C(I("PRICE"), "<", I("VWAP"))]),
+    stop_loss: { type: "pct", value: 25 }, target: { type: "pct", value: 50 }, max_trades_per_day: 3, sizing: { mode: "lots", value: 1 } } },
 ];
 
 const LEG_PRESETS: { name: string; long: Leg[]; short: Leg[] }[] = [
@@ -582,7 +630,7 @@ function OperandEditor({ v, onChange, cat, baseTf, allowNumber = true }: { v: Op
         <label className="meta" title="evaluate this indicator on a higher timeframe (only its completed candles are used)">
           on
           <select value={v.tf ?? 0} onChange={(e) => { const tf = Number(e.target.value); const n = { ...v }; if (tf) n.tf = tf; else delete n.tf; onChange(n); }}>
-            <option value={0}>{tfLabel(baseTf)} (base)</option>
+            <option value={0}>base candle</option>
             {tfs.map((t) => <option key={t} value={t}>{tfLabel(t)}</option>)}
           </select>
         </label>
@@ -753,10 +801,34 @@ function TradeChart({ chart }: { chart: BtResult["chart"] }) {
     });
     markers.sort((a, b) => (a.time as number) - (b.time as number));
     createSeriesMarkers(s, markers);
+    // Volume (pane 1) coloured by the candle's delta when it carries order flow,
+    // else by its direction; cumulative delta for the session (pane 2).
+    if (chart.candles.some((k) => k[5])) {
+      const flow = chart.candles.some((k) => k[6] !== null && k[6] !== undefined);
+      const vol = c.addSeries(HistogramSeries, { priceFormat: { type: "volume" }, lastValueVisible: false, priceLineVisible: false }, 1);
+      vol.setData(chart.candles.map((k) => ({
+        time: (k[0] + IST_S) as UTCTimestamp, value: k[5],
+        color: (flow ? (k[6] ?? 0) >= 0 : k[4] >= k[1]) ? "rgba(0,215,135,0.55)" : "rgba(255,56,56,0.55)",
+      })));
+      if (flow) {
+        const cvd = c.addSeries(LineSeries, { color: color("--cyan", "#00B4D8"), lineWidth: 1, priceLineVisible: false, title: "CVD" }, 2);
+        let run = 0, day = -1;
+        cvd.setData(chart.candles.map((k) => {
+          const dd = Math.floor((k[0] + IST_S) / 86400);
+          if (dd !== day) { run = 0; day = dd; }
+          run += k[6] ?? 0;
+          return { time: (k[0] + IST_S) as UTCTimestamp, value: run };
+        }));
+      }
+      const panes = c.panes();
+      panes[0]?.setHeight(260);
+      panes[1]?.setHeight(70);
+      panes[2]?.setHeight(70);
+    }
     c.timeScale().setVisibleLogicalRange({ from: Math.max(0, times.length - 300), to: times.length + 5 });
     return () => c.remove();
   }, [chart]);
-  return <div ref={ref} style={{ height: 380, width: "100%" }} />;
+  return <div ref={ref} style={{ height: chart.candles.some((k) => k[5]) ? 440 : 380, width: "100%" }} />;
 }
 
 function tradesCsv(trades: BtTrade[]): string {
@@ -891,7 +963,7 @@ function Results({ r }: { r: BtResult }) {
         )}
       </div>
       <div className="widget widget-wide" style={{ marginBottom: 12 }}>
-        <h3>{r.chart.symbol} <span className="meta">last {r.chart.candles.length} candles of the underlying · ▲▼ entries, ● exits</span></h3>
+        <h3>{r.chart.symbol} <span className="meta">last {r.chart.candles.length} {barLabel(r.spec)} candles of the underlying · ▲▼ entries, ● exits{r.chart.candles.some((k) => k[6] !== null && k[6] !== undefined) ? " · volume coloured by delta, cumulative delta below" : ""}</span></h3>
         <TradeChart chart={r.chart} />
       </div>
       <div className="algo-quad">
@@ -1087,7 +1159,7 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
                   </td>
                   <td className="mono" style={{ maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis" }} title={s.spec.symbols.join(", ")}>{s.spec.symbols.map(shortSym).join(", ")}</td>
                   <td className="meta" style={{ maxWidth: 240, whiteSpace: "normal" }}>{instLabel(s)}</td>
-                  <td className="mono">{tfLabel(s.spec.timeframe)}</td>
+                  <td className="mono">{barLabel(s.spec)}</td>
                   <td>
                     <select value={s.mode} onChange={(e) => {
                       if (e.target.value === "live") {
@@ -1378,16 +1450,25 @@ export default function Algo() {
               <label className="algo-field"><span className="meta">template</span>
                 <select value="" onChange={(e) => {
                   const t = TEMPLATES[Number(e.target.value)];
-                  if (t) { setSpec(withDefaults(c.defaults, { symbols: t.symbols ?? spec.symbols, ...t.spec })); setName(t.name); setEditing(null); setViewing(null); }
+                  if (t) { setSpec(withDefaults(c.defaults, { symbols: t.symbols ?? (spec.symbols.length ? spec.symbols : ["NSE:SBIN-EQ"]), ...t.spec })); setName(t.name); setEditing(null); setViewing(null); }
                 }}>
                   <option value="">— load a template —</option>
                   {TEMPLATES.map((t, i) => <option key={t.name} value={i}>{t.name}</option>)}
                 </select>
               </label>
-              <label className="algo-field"><span className="meta">timeframe</span>
-                <select value={spec.timeframe} onChange={(e) => upd({ timeframe: Number(e.target.value) })}>
-                  {c.timeframes.map((t) => <option key={t} value={t}>{tfLabel(t)}</option>)}
-                </select>
+              <label className="algo-field" title="time candles close every N minutes; volume / turnover candles close once that much has traded (busy markets get more candles, quiet ones fewer)"><span className="meta">candles</span>
+                <span className="algo-operand" style={{ flexWrap: "nowrap" }}>
+                  <select value={spec.bars?.type ?? "time"} onChange={(e) => upd({ bars: { ...(spec.bars ?? { per_day: 50 }), type: e.target.value }, timeframe: e.target.value === "time" ? (spec.timeframe === 1 ? 5 : spec.timeframe) : 1 })}>
+                    <option value="time">time</option><option value="volume">volume</option><option value="turnover">turnover ₹</option>
+                  </select>
+                  {(spec.bars?.type ?? "time") === "time" ? (
+                    <select value={spec.timeframe} onChange={(e) => upd({ timeframe: Number(e.target.value) })}>
+                      {c.timeframes.map((t) => <option key={t} value={t}>{tfLabel(t)}</option>)}
+                    </select>
+                  ) : (
+                    <label className="meta" title="the size is set so a typical session (median of the 20 before the start) has about this many candles">~<NumInput width={44} value={spec.bars.per_day} onChange={(n) => upd({ bars: { ...spec.bars, per_day: Math.max(5, Math.min(1000, Math.floor(n ?? 50))) } })} />/day</label>
+                  )}
+                </span>
               </label>
               <label className="algo-field"><span className="meta">direction</span>
                 <select value={spec.direction} onChange={(e) => upd({ direction: e.target.value as Spec["direction"] })}>
@@ -1483,7 +1564,7 @@ export default function Algo() {
           </div>
 
           <div className="widget widget-wide" style={{ marginBottom: 12 }}>
-            <h3>Entry & exit conditions <span className="meta">evaluated on each completed {tfLabel(spec.timeframe)} candle of the underlying</span></h3>
+            <h3>Entry & exit conditions <span className="meta">evaluated on each completed {barLabel(spec)} candle of the underlying</span></h3>
             <div style={{ display: "grid", gap: 12 }}>
               {showLong && (
                 <div>
