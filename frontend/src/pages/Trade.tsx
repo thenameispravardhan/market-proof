@@ -23,7 +23,7 @@
 // blocking codes and a "BYPASS" field that the operator must type
 // "I ACCEPT THE RISK" into before re-submitting.
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   useBrokerAccounts,
@@ -120,6 +120,51 @@ function cleanError(raw: unknown, fallback: string): string {
   return s;
 }
 
+// Right-dock panels, opened / closed from the icon bar. Several can be open;
+// they stack in this order.
+type DockId = "watch" | "trade" | "chain" | "flow";
+const DOCK: { id: DockId; label: string; short: string; icon: string; hint: string }[] = [
+  { id: "watch", label: "Watchlist", short: "Watch", icon: "☰", hint: "Watchlist — search and switch symbols" },
+  { id: "trade", label: "Trade", short: "Trade", icon: "⇅", hint: "Quote and order ticket (buy / sell)" },
+  { id: "chain", label: "Option chain", short: "Chain", icon: "⊞", hint: "Option chain — click a price to trade that option" },
+  { id: "flow", label: "Order flow", short: "Flow", icon: "Δ", hint: "Real order flow from recorded ticks" },
+];
+const DEFAULT_DOCK: DockId[] = ["watch", "trade"];
+type BottomTab = "positions" | "orders";
+
+// An instrument that HAS an option chain (index or cash stock).
+const isUnderlying = (h: InstrumentHit | null): h is InstrumentHit =>
+  h != null && (h.instrument_type === "IND" || h.instrument_type === "EQ");
+
+function stored<T>(key: string, fallback: T): T {
+  try {
+    const v = localStorage.getItem(key);
+    return v == null ? fallback : (JSON.parse(v) as T);
+  } catch {
+    return fallback;
+  }
+}
+
+// Drag-to-resize for the bottom bar (y) and the right dock (x): dragging
+// toward the chart grows the panel. The size persists under `key`.
+function drag(e: React.PointerEvent, axis: "x" | "y", start: number, set: (v: number) => void,
+              min: number, max: number, key: string) {
+  e.preventDefault();
+  const p0 = axis === "x" ? e.clientX : e.clientY;
+  let v = start;
+  const move = (ev: PointerEvent) => {
+    v = Math.max(min, Math.min(max, start + p0 - (axis === "x" ? ev.clientX : ev.clientY)));
+    set(v);
+  };
+  const up = () => {
+    window.removeEventListener("pointermove", move);
+    window.removeEventListener("pointerup", up);
+    try { localStorage.setItem(key, String(Math.round(v))); } catch { /* best-effort */ }
+  };
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", up);
+}
+
 // Watchlist (TradingView-style): every instrument picked on this page joins
 // it; × removes. Kept local, like the last-open symbol.
 const RECENT_KEY = "trade:recent";
@@ -209,30 +254,46 @@ function FlowPanel({ symbol }: { symbol: string | null }) {
 }
 
 export default function Trade() {
-  const [bottomTab, setBottomTab] = useState<"positions" | "orders" | "chain" | "flow">("orders");
+  const [bottomTab, setBottomTab] = useState<BottomTab>(() => stored<BottomTab>("trade:bottomTab", "orders"));
+  const [bottomOpen, setBottomOpen] = useState(() => stored("trade:bottomOpen", false));
+  const openBottom = (tab: BottomTab | null) => {
+    if (tab) setBottomTab(tab);
+    setBottomOpen(tab != null);
+    try {
+      localStorage.setItem("trade:bottomOpen", JSON.stringify(tab != null));
+      if (tab) localStorage.setItem("trade:bottomTab", JSON.stringify(tab));
+    } catch { /* best-effort */ }
+  };
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<InstrumentHit | null>(() => {
     try { return JSON.parse(localStorage.getItem(LAST_KEY) ?? "null"); } catch { return null; }
   });
+  // The chain stays on the last UNDERLYING picked, so clicking one of its
+  // options (which opens that option's chart + ticket) keeps the chain up.
+  const [chainBase, setChainBase] = useState<InstrumentHit | null>(() => (isUnderlying(selected) ? selected : null));
+  const [dock, setDock] = useState<DockId[]>(() => {
+    const v = stored<DockId[]>("trade:dock", DEFAULT_DOCK);
+    return Array.isArray(v) ? v.filter((x) => DOCK.some((d) => d.id === x)) : DEFAULT_DOCK;
+  });
+  const [dockW, setDockW] = useState(() => Number(stored("trade:dockW", 340)) || 340);
+  const toggleDock = (id: DockId) => {
+    const next = dock.includes(id) ? dock.filter((x) => x !== id) : [...dock, id];
+    if (id === "chain" && !dock.includes(id)) setDockW((w) => Math.max(w, 400));   // 5 columns need room
+    setDock(next);
+    try { localStorage.setItem("trade:dock", JSON.stringify(next)); } catch { /* best-effort */ }
+  };
+  const dockHead = (id: DockId, sub?: string) => (
+    <header className="dock-head">
+      <span>{DOCK.find((d) => d.id === id)!.label}</span>
+      {sub && <span className="sub">{sub}</span>}
+      <button type="button" className="dock-x" onClick={() => toggleDock(id)} title="Close panel" aria-label={`Close ${DOCK.find((d) => d.id === id)!.label}`}>×</button>
+    </header>
+  );
   const [showResults, setShowResults] = useState(false);
   // Keyboard cursor into the search results (-1 = nothing highlighted).
   const [highlightIdx, setHighlightIdx] = useState(-1);
   const [recent, setRecent] = useState<InstrumentHit[]>(loadRecent);
-  const [bottomOpen, setBottomOpen] = useState(true);
-  const [bottomH, setBottomH] = useState(() => Number(localStorage.getItem("trade:bottomH")) || 260);
-  const startResize = (e: React.PointerEvent) => {
-    e.preventDefault();
-    const y0 = e.clientY, h0 = bottomH;
-    let h = h0;
-    const move = (ev: PointerEvent) => { h = Math.max(120, Math.min(window.innerHeight * 0.7, h0 + y0 - ev.clientY)); setBottomH(h); };
-    const up = () => {
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", up);
-      try { localStorage.setItem("trade:bottomH", String(Math.round(h))); } catch { /* best-effort */ }
-    };
-    window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", up);
-  };
+  const [bottomH, setBottomH] = useState(() => Number(stored("trade:bottomH", 260)) || 260);
   const saveWatch = (next: InstrumentHit[]) => {
     try { localStorage.setItem(RECENT_KEY, JSON.stringify(next)); } catch { /* best-effort */ }
     return next;
@@ -279,12 +340,10 @@ export default function Trade() {
   // The chain is available for index underlyings AND F&O stocks. We fetch
   // for both indices and cash equities; a non-F&O stock just returns no
   // strikes and the panel stays hidden.
-  const chainEligible =
-    selected != null &&
-    (selected.instrument_type === "IND" || selected.instrument_type === "EQ");
+  const chainOn = chainBase != null && dock.includes("chain");
   const { data: chain } = useOptionChain(
-    chainEligible ? selected!.symbol : "",
-    chainEligible ? selected!.short_name : "",
+    chainOn ? chainBase!.symbol : "",
+    chainOn ? chainBase!.short_name : "",
     selectedExpiry,
     12,
   );
@@ -383,13 +442,18 @@ export default function Trade() {
     return true;
   }, [selected, accountId, quantity, requiresLimit, limitPrice, requiresStop, stopPrice]);
 
-  const onSelect = (h: InstrumentHit) => {
+  const onSelect = (h: InstrumentHit, fromChain = false) => {
     setSelected(h);
     setShowResults(false);
     setQuery(""); // the watchlist row + chart header show the pick; the box is for the next search
     setLastResult(null);
-    setSelectedExpiry(null); // load the nearest expiry for the new symbol
-    setRecent((prev) => (prev.some((r) => r.symbol === h.symbol) ? prev : saveWatch([h, ...prev].slice(0, 40))));
+    if (isUnderlying(h)) {
+      setChainBase(h);
+      setSelectedExpiry(null); // load the nearest expiry for the new underlying
+    }
+    // An option picked off the chain opens its chart + ticket without
+    // flooding the watchlist; a searched symbol joins it.
+    if (!fromChain) setRecent((prev) => (prev.some((r) => r.symbol === h.symbol) ? prev : saveWatch([h, ...prev].slice(0, 40))));
     try { localStorage.setItem(LAST_KEY, JSON.stringify(h)); } catch { /* best-effort */ }
     // Intraday-only bot — F&O included. Every ticket is MIS/INTRADAY; the
     // backend rejects anything else, so there is nothing per-instrument to set.
@@ -411,17 +475,22 @@ export default function Trade() {
     return best;
   }, [chain]);
 
+  const atmRef = useRef<HTMLTableRowElement | null>(null);
+  useEffect(() => {
+    atmRef.current?.scrollIntoView?.({ block: "center" });
+  }, [chainOn, chainBase?.symbol, chain?.selected_expiry, chain != null]);  // eslint-disable-line react-hooks/exhaustive-deps
+
   // Click a CE/PE cell in the chain → load that option into the ticket.
   const onSelectOption = (
     row: { strike: number; ce: OptionLeg | null; pe: OptionLeg | null },
     type: "CE" | "PE",
   ) => {
     const leg = type === "CE" ? row.ce : row.pe;
-    if (!leg || !selected) return;
-    const exch = leg.symbol.includes(":") ? leg.symbol.split(":")[0] : selected.exchange;
+    if (!leg || !chainBase) return;
+    const exch = leg.symbol.includes(":") ? leg.symbol.split(":")[0] : chainBase.exchange;
     onSelect({
       symbol: leg.symbol,
-      short_name: `${selected.short_name} ${row.strike} ${type}`,
+      short_name: `${chainBase.short_name} ${row.strike} ${type}`,
       exchange: exch,
       segment: "FO",
       instrument_type: type,
@@ -429,9 +498,10 @@ export default function Trade() {
       tick_size: leg.tick_size,
       expiry: null,
       strike: row.strike,
-      underlying: selected.short_name,
-      display: `${selected.short_name} ${row.strike} ${type}`,
-    });
+      underlying: chainBase.short_name,
+      display: `${chainBase.short_name} ${row.strike} ${type}`,
+    }, true);
+    if (!dock.includes("trade")) toggleDock("trade");   // the ticket is where the click is going
   };
 
   const onSubmit = async (opts?: { bypassRisk?: boolean }) => {
@@ -535,18 +605,25 @@ export default function Trade() {
           />
         )}
           {!selected && (
-            <section className="trade-card tv-empty"><div className="empty">Pick a symbol from the watchlist on the right to open its chart.</div></section>
+            <section className="trade-card tv-empty">
+              <div className="empty">
+                No symbol open.{" "}
+                <button type="button" className="btn-sm" onClick={() => { if (!dock.includes("watch")) toggleDock("watch"); setTimeout(() => document.querySelector<HTMLInputElement>('[data-testid="trade-search"]')?.focus(), 0); }}>
+                  Search a symbol
+                </button>
+              </div>
+            </section>
           )}
         </div>
 
-        {/* ---- bottom panel: drag the top edge to resize, ▾ collapses ---- */}
+        {/* ---- bottom bar: click a tab to open it, click it again (or ▾) to close; drag the top edge to resize ---- */}
         <div className={`tv-bottom${bottomOpen ? "" : " closed"}`} style={bottomOpen ? { height: bottomH } : undefined}>
-          {bottomOpen && <div className="tv-resize" onPointerDown={startResize} title="Drag to resize" />}
+          {bottomOpen && <div className="tv-resize" onPointerDown={(e) => drag(e, "y", bottomH, setBottomH, 120, window.innerHeight * 0.7, "trade:bottomH")} title="Drag to resize" />}
           <div className="tabs trade-tabs" role="tablist">
-            {([["positions", `Positions${positions?.length ? ` (${positions.length})` : ""}`], ["orders", `Orders${pending?.count ? ` (${pending.count})` : ""}`], ["chain", "Option chain"], ["flow", "Order flow"]] as const).map(([k, label]) => (
-              <button key={k} type="button" role="tab" aria-selected={bottomTab === k} className={`tab ${bottomTab === k ? "active" : ""}`} onClick={() => { setBottomTab(k); setBottomOpen(true); }}>{label}</button>
+            {([["positions", `Positions${positions?.length ? ` (${positions.length})` : ""}`], ["orders", `Orders${pending?.count ? ` (${pending.count})` : ""}`]] as const).map(([k, label]) => (
+              <button key={k} type="button" role="tab" aria-selected={bottomOpen && bottomTab === k} className={`tab ${bottomOpen && bottomTab === k ? "active" : ""}`} onClick={() => openBottom(bottomOpen && bottomTab === k ? null : k)}>{label}</button>
             ))}
-            <button type="button" className="tab tv-collapse" onClick={() => setBottomOpen((o) => !o)} title={bottomOpen ? "Collapse panel" : "Expand panel"}>{bottomOpen ? "▾" : "▴"}</button>
+            <button type="button" className="tab tv-collapse" onClick={() => openBottom(bottomOpen ? null : bottomTab)} title={bottomOpen ? "Close panel" : "Open panel"}>{bottomOpen ? "▾" : "▴"}</button>
           </div>
           {bottomOpen && (
             <div className="tv-bottom-body">
@@ -643,544 +720,583 @@ export default function Trade() {
           </section>
             </>
           )}
-          {bottomTab === "chain" && (
-            <>
-        {/* ---- option chain (index underlyings + F&O stocks) ----
-             Indices always show the panel; a cash stock shows it only when
-             it actually has options (F&O stock), so non-F&O names stay clean. */}
-        {selected &&
-          (selected.instrument_type === "IND" ||
-            (selected.instrument_type === "EQ" &&
-              (chain?.strikes?.length ?? 0) > 0)) && (
-          <section className="trade-card chain" data-testid="trade-chain">
-            <div className="chain-head">
-              <h2>Option chain — {selected.short_name}</h2>
-              <div className="chain-meta">
-                <span
-                  className={`badge ${chain?.source === "fyers" ? "cash" : "neutral"}`}
-                  title={chain?.source === "fyers" ? "live Fyers prices" : "static ladder"}
-                >
-                  {chain?.source === "fyers" ? "LIVE" : "STATIC"}
-                </span>
-                {chain?.spot != null && (
-                  <span data-testid="chain-spot">spot {fmtMoney(chain.spot)}</span>
-                )}
-                {(chain?.expiries?.length ?? 0) > 0 && (
-                  <label className="chain-expiry">
-                    <span>expiry</span>
-                    <select
-                      value={selectedExpiry ?? chain?.selected_expiry ?? ""}
-                      onChange={(e) => setSelectedExpiry(e.target.value || null)}
-                      data-testid="chain-expiry"
-                    >
-                      {chain!.expiries.map((ex) => (
-                        <option key={ex.ts} value={ex.ts}>
-                          {ex.label}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                )}
-              </div>
-            </div>
-            {!chain ? (
-              <div className="empty">Loading chain…</div>
-            ) : chain.strikes.length === 0 ? (
-              <div className="empty" data-testid="chain-empty">
-                {chain.reason ?? "No option chain available for this underlying."}
-              </div>
-            ) : (
-              <table className="chain-table">
-                <thead>
-                  <tr>
-                    <th colSpan={2} className="ce-head">CALLS (CE)</th>
-                    <th className="strike-head">Strike</th>
-                    <th colSpan={2} className="pe-head">PUTS (PE)</th>
-                  </tr>
-                  <tr className="chain-subhead">
-                    <th>OI</th>
-                    <th>LTP</th>
-                    <th> </th>
-                    <th>LTP</th>
-                    <th>OI</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {chain.strikes.map((s) => {
-                    const atm = s.strike === atmStrike;
-                    return (
-                      <tr key={s.strike} className={atm ? "atm" : ""}>
-                        <td className="oi">{fmtOi(s.ce?.oi)}</td>
-                        <td className="ce-cell">
-                          {s.ce ? (
-                            <button
-                              className="chain-ltp ce"
-                              onClick={() => onSelectOption(s, "CE")}
-                              data-testid={`chain-ce-${s.strike}`}
-                              title={s.ce.symbol}
-                            >
-                              {s.ce.ltp != null ? fmtMoney(s.ce.ltp) : "—"}
-                            </button>
-                          ) : (
-                            "—"
-                          )}
-                        </td>
-                        <th className="strike">
-                          {s.strike}
-                          {atm && <span className="atm-tag">ATM</span>}
-                        </th>
-                        <td className="pe-cell">
-                          {s.pe ? (
-                            <button
-                              className="chain-ltp pe"
-                              onClick={() => onSelectOption(s, "PE")}
-                              data-testid={`chain-pe-${s.strike}`}
-                              title={s.pe.symbol}
-                            >
-                              {s.pe.ltp != null ? fmtMoney(s.pe.ltp) : "—"}
-                            </button>
-                          ) : (
-                            "—"
-                          )}
-                        </td>
-                        <td className="oi">{fmtOi(s.pe?.oi)}</td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            )}
-          </section>
-        )}
-              {!(selected && (selected.instrument_type === "IND" || (selected.instrument_type === "EQ" && (chain?.strikes?.length ?? 0) > 0))) && (
-                <section className="trade-card"><div className="empty">{selected ? "No options listed for this symbol." : "Pick a symbol first."}</div></section>
-              )}
-            </>
-          )}
-          {bottomTab === "flow" && <FlowPanel symbol={selected?.symbol ?? null} />}
             </div>
           )}
         </div>
       </div>
 
-      {/* ---- right rail: watchlist + quote + order ticket (TradingView-style) ---- */}
-      <aside className="tv-right">
-        <section className="trade-card tv-watch">
-          <h2>Watchlist</h2>
-          <div className="trade-search">
-          <div className="trade-search-bar">
-            <input
-              type="text"
-              value={query}
-              onChange={(e) => {
-                setQuery(e.target.value);
-                setShowResults(true);
-                setHighlightIdx(-1);
-                setLastResult(null);
-              }}
-              onFocus={() => {
-                // Reopen only for a genuine query — not for the display
-                // string a selection left behind (which has no hits and
-                // would show a stale "no results" box).
-                if (query && query !== selected?.display) setShowResults(true);
-              }}
-              onKeyDown={(e) => {
-                const hits = searchData?.hits ?? [];
-                if (e.key === "Escape") {
-                  setShowResults(false);
-                  setHighlightIdx(-1);
-                  return;
-                }
-                if (!showResults || hits.length === 0) return;
-                if (e.key === "ArrowDown") {
-                  e.preventDefault();
-                  setHighlightIdx((i) => (i + 1) % hits.length);
-                } else if (e.key === "ArrowUp") {
-                  e.preventDefault();
-                  setHighlightIdx((i) => (i <= 0 ? hits.length - 1 : i - 1));
-                } else if (e.key === "Enter") {
-                  e.preventDefault();
-                  const pick = hits[highlightIdx >= 0 ? highlightIdx : 0];
-                  if (pick) {
-                    onSelect(pick);
-                    setHighlightIdx(-1);
-                  }
-                }
-              }}
-              placeholder="+ Add symbol — RELIANCE, NIFTY…"
-              data-testid="trade-search"
-              autoComplete="off"
-            />
-            <button
-              type="button"
-              className="btn-sm"
-              onClick={() => refreshInstruments.mutate()}
-              disabled={refreshInstruments.isPending}
-              data-testid="refresh-instruments"
-              title="Download the full NSE + BSE stock list from Fyers"
-            >
-              {refreshInstruments.isPending
-                ? "loading…"
-                : refreshInstruments.isSuccess
-                ? `✓ ${refreshInstruments.data?.instrument_count?.toLocaleString() ?? ""} symbols`
-                : "↻ NSE/BSE"}
-            </button>
-          </div>
-          {showResults && query && (
-            <div className="trade-search-results" data-testid="trade-search-results">
-              {searching && <div className="hint">searching…</div>}
-              {!searching && (searchData?.count ?? 0) === 0 && (
-                <div className="hint">no results for "{query}"</div>
-              )}
-              {(searchData?.hits ?? []).map((h, i) => (
-                <button
-                  key={h.symbol}
-                  type="button"
-                  className={`trade-search-row${i === highlightIdx ? " hl" : ""}`}
-                  onClick={() => onSelect(h)}
-                  onMouseEnter={() => setHighlightIdx(i)}
-                  data-testid={`search-row-${h.symbol}`}
-                >
-                  <span className="sym">{h.short_name}</span>
-                  <span className="exch">{h.exchange}:{h.segment}</span>
-                  <span className="disp">{h.display}</span>
-                  {h.lot_size > 1 && <span className="lot">lot {h.lot_size}</span>}
-                </button>
-              ))}
-            </div>
-          )}
-          </div>
-          {recent.length > 0 && (
-            <div className="tv-watch-list" data-testid="trade-recent">
-              <div className="tv-watch-head"><span>Symbol</span><span>Last</span><span>Chg%</span><span /></div>
-              {recent.map((h) => {
-                const q = watchQuotes?.quotes?.[h.symbol.toUpperCase()];
-                const pct = q?.change_pct ?? null;
-                return (
-                  <div
-                    key={h.symbol}
-                    role="button"
-                    tabIndex={0}
-                    className={`tv-watch-row${selected?.symbol === h.symbol ? " on" : ""}`}
-                    onClick={() => onSelect(h)}
-                    onKeyDown={(e) => { if (e.key === "Enter") onSelect(h); }}
-                    title={h.symbol}
-                    data-testid={`recent-chip-${h.symbol}`}
-                  >
-                    <span className="sym">{h.short_name}</span>
-                    <span>{q ? q.ltp.toFixed(2) : "—"}</span>
-                    <span className={pct == null ? "" : pct >= 0 ? "up" : "down"}>{pct == null ? "—" : `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`}</span>
-                    <button type="button" className="x" title="Remove from watchlist" onClick={(e) => { e.stopPropagation(); removeWatch(h.symbol); }}>×</button>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </section>
-          {/* QUOTE */}
-          <section className="trade-card" data-testid="trade-quote">
-            <h2>Quote</h2>
-            {!selected ? (
-              <div className="empty">Pick a symbol above to start.</div>
-            ) : (
-              <div>
-                <div className="quote-sym">
-                  <span className="big">{selected.short_name}</span>
-                  <span className="exch">{selected.exchange}:{selected.segment}</span>
-                  {isOption && <span className="badge opt">OPTION</span>}
-                  {isFuture && <span className="badge fut">FUTURE</span>}
-                  {!isOption && !isFuture && <span className="badge cash">CASH</span>}
-                </div>
-                <div className="quote-fullsym">{selected.symbol}</div>
-                <div className="quote-row">
-                  <div className="quote-cell">
-                    <div className="k">LTP</div>
-                    <div className="v big" data-testid="quote-ltp">
-                      {ltp != null ? fmtMoney(ltp) : "—"}
-                    </div>
-                  </div>
-                  <div className="quote-cell">
-                    <div className="k">BID</div>
-                    <div className="v">{bid != null ? fmtMoney(bid) : "—"}</div>
-                  </div>
-                  <div className="quote-cell">
-                    <div className="k">ASK</div>
-                    <div className="v">{ask != null ? fmtMoney(ask) : "—"}</div>
-                  </div>
-                  <div className="quote-cell">
-                    <div className="k">LOT</div>
-                    <div className="v">{selected.lot_size}</div>
-                  </div>
-                </div>
-                {!quote?.ok && (
-                  <div className="hint warn-text">
-                    {quote?.reason ?? "no quote cached for this symbol"}
-                  </div>
-                )}
-              </div>
-            )}
-          </section>
-          {/* TICKET */}
-          <section className="trade-card" data-testid="trade-ticket">
-            <h2>Ticket</h2>
-            <div className="ticket-side" role="group" aria-label="side">
-              <button
-                className={`ticket-side-btn buy ${side === "BUY" ? "on" : ""}`}
-                onClick={() => setSide("BUY")}
-                data-testid="ticket-side-buy"
-              >
-                BUY
-              </button>
-              <button
-                className={`ticket-side-btn sell ${side === "SELL" ? "on" : ""}`}
-                onClick={() => setSide("SELL")}
-                data-testid="ticket-side-sell"
-              >
-                SELL
-              </button>
-            </div>
-  
-            <label className="ticket-row">
-              <span>Quantity</span>
-              <input
-                type="number"
-                min={1}
-                step={selected?.lot_size ?? 1}
-                value={quantity}
-                onChange={(e) => setQuantity(Math.max(1, Number(e.target.value || 1)))}
-                data-testid="ticket-qty"
-              />
-              {selected && selected.lot_size > 1 && (
-                <span className="hint">
-                  {Math.floor(quantity / selected.lot_size)} lot(s)
-                </span>
-              )}
-            </label>
-  
-            <label className="ticket-row">
-              <span>Order type</span>
-              <select
-                value={orderType}
-                onChange={(e) => setOrderType(e.target.value as OrderType)}
-                data-testid="ticket-type"
-              >
-                <option value="MARKET">MARKET</option>
-                <option value="LIMIT">LIMIT</option>
-                <option value="STOP_LOSS">STOP_LOSS (SL-L)</option>
-                <option value="SL-M">SL-M</option>
-              </select>
-            </label>
-  
-            {requiresLimit && (
-              <label className="ticket-row">
-                <span>Limit price</span>
-                <input
-                  type="number"
-                  step="0.05"
-                  value={limitPrice}
-                  onChange={(e) => setLimitPrice(e.target.value)}
-                  data-testid="ticket-limit"
-                />
-                <span className="px-quick">
-                  {bid != null && (
-                    <button
-                      type="button"
-                      className="px-quick-btn"
-                      onClick={() => setLimitPrice(bid.toFixed(2))}
-                      title={`bid ${fmtMoney(bid)}`}
-                      data-testid="limit-fill-bid"
-                    >
-                      bid
-                    </button>
-                  )}
-                  {ltp != null && (
-                    <button
-                      type="button"
-                      className="px-quick-btn"
-                      onClick={() => setLimitPrice(ltp.toFixed(2))}
-                      title={`LTP ${fmtMoney(ltp)}`}
-                      data-testid="limit-fill-ltp"
-                    >
-                      ltp
-                    </button>
-                  )}
-                  {ask != null && (
-                    <button
-                      type="button"
-                      className="px-quick-btn"
-                      onClick={() => setLimitPrice(ask.toFixed(2))}
-                      title={`ask ${fmtMoney(ask)}`}
-                      data-testid="limit-fill-ask"
-                    >
-                      ask
-                    </button>
-                  )}
-                </span>
-              </label>
-            )}
-  
-            {requiresStop && (
-              <label className="ticket-row">
-                <span>Stop price</span>
-                <input
-                  type="number"
-                  step="0.05"
-                  value={stopPrice}
-                  onChange={(e) => setStopPrice(e.target.value)}
-                  data-testid="ticket-stop"
-                />
-                {ltp != null && (
-                  <span className="px-quick">
-                    <button
-                      type="button"
-                      className="px-quick-btn"
-                      onClick={() => setStopPrice(ltp.toFixed(2))}
-                      title={`LTP ${fmtMoney(ltp)}`}
-                      data-testid="stop-fill-ltp"
-                    >
-                      ltp
-                    </button>
-                  </span>
-                )}
-              </label>
-            )}
-  
-            {/* Intraday-only bot: no delivery / carry-forward, ever. One value,
-                so it reads as a fact rather than a choice you cannot make. */}
-            <div className="ticket-row">
-              <span>Product</span>
-              <span
-                data-testid="ticket-product"
-                title="Intraday-only bot — every position is squared off the same day"
-              >
-                INTRADAY (MIS)
-              </span>
-            </div>
-  
-            {/* Submit */}
-            <div className="ticket-submit">
-              <button
-                className={`btn ${side === "BUY" ? "buy" : "sell"}`}
-                disabled={!canSubmit || placeOrder.isPending}
-                onClick={() => onSubmit()}
-                data-testid="ticket-submit"
-              >
-                {placeOrder.isPending ? "placing…" : `PLACE ${side}`}
-              </button>
-            </div>
-  
-            {lastResult && lastResult.type === "success" && (
-              <div className="result success" data-testid="ticket-result-success">
-                {lastResult.message}
-                {lastResult.warning && (
-                  <div className="result-warning" data-testid="ticket-risk-advisory">
-                    ⚠ risk advisory: {lastResult.warning}
-                  </div>
-                )}
-              </div>
-            )}
-            {lastResult && lastResult.type === "error" && (
-              <div className="result error" data-testid="ticket-result-error">
-                {lastResult.message}
-                {lastResult.reason === "risk_block" && (
-                  <div
-                    className="risk-override-hint"
-                    data-testid="ticket-risk-override"
-                    style={{
-                      marginTop: 10,
-                      padding: "8px 10px",
-                      border: "1px solid var(--amber)",
-                      borderRadius: 4,
-                      background: "rgba(255, 200, 80, 0.08)",
-                      fontSize: 12,
+      {/* ---- right dock: the panels opened from the icon bar, stacked; each scrolls inside itself ---- */}
+      {dock.length > 0 && (
+        <div className="tv-dock" style={{ width: dockW }}>
+          <div className="tv-dock-resize" onPointerDown={(e) => drag(e, "x", dockW, setDockW, 280, 760, "trade:dockW")} title="Drag to resize" />
+          {dock.includes("watch") && (
+            <section className="dock-panel" data-testid="dock-watch">
+              {dockHead("watch")}
+              <div className="dock-body">
+                <div className="trade-search">
+                <div className="trade-search-bar">
+                  <input
+                    type="text"
+                    value={query}
+                    onChange={(e) => {
+                      setQuery(e.target.value);
+                      setShowResults(true);
+                      setHighlightIdx(-1);
+                      setLastResult(null);
                     }}
-                  >
-                    <div style={{ marginBottom: 8 }}>
-                      This order breaches a limit set in <b>Settings</b>. Reduce
-                      the size or relax the limit — or override the check and
-                      place it anyway.
-                    </div>
-                    <button
-                      className="btn-sm sell"
-                      onClick={() => onSubmit({ bypassRisk: true })}
-                      disabled={placeOrder.isPending}
-                      data-testid="ticket-risk-override-btn"
-                    >
-                      {placeOrder.isPending
-                        ? "placing…"
-                        : "⚠ Override risk & place anyway"}
-                    </button>
-                  </div>
-                )}
-                {lastResult.reason === "ip_whitelist" && serverInfo?.public_ip && (
-                  <div
-                    className="ip-whitelist-hint"
-                    data-testid="ticket-ip-whitelist"
-                    style={{
-                      marginTop: 10,
-                      padding: "8px 10px",
-                      border: "1px solid var(--amber)",
-                      borderRadius: 4,
-                      background: "rgba(255, 200, 80, 0.08)",
-                      fontSize: 12,
-                      fontFamily: "var(--mono)",
+                    onFocus={() => {
+                      // Reopen only for a genuine query — not for the display
+                      // string a selection left behind (which has no hits and
+                      // would show a stale "no results" box).
+                      if (query && query !== selected?.display) setShowResults(true);
                     }}
+                    onKeyDown={(e) => {
+                      const hits = searchData?.hits ?? [];
+                      if (e.key === "Escape") {
+                        setShowResults(false);
+                        setHighlightIdx(-1);
+                        return;
+                      }
+                      if (!showResults || hits.length === 0) return;
+                      if (e.key === "ArrowDown") {
+                        e.preventDefault();
+                        setHighlightIdx((i) => (i + 1) % hits.length);
+                      } else if (e.key === "ArrowUp") {
+                        e.preventDefault();
+                        setHighlightIdx((i) => (i <= 0 ? hits.length - 1 : i - 1));
+                      } else if (e.key === "Enter") {
+                        e.preventDefault();
+                        const pick = hits[highlightIdx >= 0 ? highlightIdx : 0];
+                        if (pick) {
+                          onSelect(pick);
+                          setHighlightIdx(-1);
+                        }
+                      }
+                    }}
+                    placeholder="+ Add symbol — RELIANCE, NIFTY…"
+                    data-testid="trade-search"
+                    autoComplete="off"
+                  />
+                  <button
+                    type="button"
+                    className="btn-sm"
+                    onClick={() => refreshInstruments.mutate()}
+                    disabled={refreshInstruments.isPending}
+                    data-testid="refresh-instruments"
+                    title="Download the full NSE + BSE stock list from Fyers"
                   >
-                    <div style={{ marginBottom: 6 }}>
-                      Add this server's public IP to the Fyers app's
-                      IP-whitelist on{" "}
-                      <a
-                        href="https://myapi.fyers.in/dashboard/"
-                        target="_blank"
-                        rel="noreferrer"
-                        style={{ color: "var(--amber)" }}
-                      >
-                        myapi.fyers.in/dashboard
-                      </a>
-                      , then click PLACE BUY again.
-                    </div>
-                    <div
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 8,
-                      }}
-                    >
-                      <div
-                        style={{
-                          fontSize: 14,
-                          fontWeight: 700,
-                          letterSpacing: "0.05em",
-                          userSelect: "all",
-                          flex: 1,
-                        }}
-                        data-testid="ticket-server-ip"
-                      >
-                        {serverInfo.public_ip}
-                      </div>
+                    {refreshInstruments.isPending
+                      ? "loading…"
+                      : refreshInstruments.isSuccess
+                      ? `✓ ${refreshInstruments.data?.instrument_count?.toLocaleString() ?? ""} symbols`
+                      : "↻ NSE/BSE"}
+                  </button>
+                </div>
+                {showResults && query && (
+                  <div className="trade-search-results" data-testid="trade-search-results">
+                    {searching && <div className="hint">searching…</div>}
+                    {!searching && (searchData?.count ?? 0) === 0 && (
+                      <div className="hint">no results for "{query}"</div>
+                    )}
+                    {(searchData?.hits ?? []).map((h, i) => (
                       <button
-                        className="btn-sm"
-                        onClick={() => {
-                          if (serverInfo.public_ip && navigator.clipboard) {
-                            navigator.clipboard
-                              .writeText(serverInfo.public_ip)
-                              .catch(() => {
-                                /* ignore — the IP is selectable */
-                              });
-                          }
-                        }}
-                        data-testid="ticket-server-ip-copy"
-                        title="Copy IP"
+                        key={h.symbol}
+                        type="button"
+                        className={`trade-search-row${i === highlightIdx ? " hl" : ""}`}
+                        onClick={() => onSelect(h)}
+                        onMouseEnter={() => setHighlightIdx(i)}
+                        data-testid={`search-row-${h.symbol}`}
                       >
-                        Copy
+                        <span className="sym">{h.short_name}</span>
+                        <span className="exch">{h.exchange}:{h.segment}</span>
+                        <span className="disp">{h.display}</span>
+                        {h.lot_size > 1 && <span className="lot">lot {h.lot_size}</span>}
                       </button>
-                    </div>
+                    ))}
+                  </div>
+                )}
+                </div>
+                {recent.length > 0 && (
+                  <div className="tv-watch-list" data-testid="trade-recent">
+                    <div className="tv-watch-head"><span>Symbol</span><span>Last</span><span>Chg%</span><span /></div>
+                    {recent.map((h) => {
+                      const q = watchQuotes?.quotes?.[h.symbol.toUpperCase()];
+                      const pct = q?.change_pct ?? null;
+                      return (
+                        <div
+                          key={h.symbol}
+                          role="button"
+                          tabIndex={0}
+                          className={`tv-watch-row${selected?.symbol === h.symbol ? " on" : ""}`}
+                          onClick={() => onSelect(h)}
+                          onKeyDown={(e) => { if (e.key === "Enter") onSelect(h); }}
+                          title={h.symbol}
+                          data-testid={`recent-chip-${h.symbol}`}
+                        >
+                          <span className="sym">{h.short_name}</span>
+                          <span>{q ? q.ltp.toFixed(2) : "—"}</span>
+                          <span className={pct == null ? "" : pct >= 0 ? "up" : "down"}>{pct == null ? "—" : `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`}</span>
+                          <button type="button" className="x" title="Remove from watchlist" onClick={(e) => { e.stopPropagation(); removeWatch(h.symbol); }}>×</button>
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
               </div>
-            )}
-          </section>
-      </aside>
+            </section>
+          )}
+          {dock.includes("trade") && (
+            <section className="dock-panel dock-trade" data-testid="dock-trade">
+              {dockHead("trade", selected?.short_name)}
+              <div className="dock-body">
+                {/* QUOTE */}
+                <section className="trade-card" data-testid="trade-quote">
+                  <h2>Quote</h2>
+                  {!selected ? (
+                    <div className="empty">Pick a symbol above to start.</div>
+                  ) : (
+                    <div>
+                      <div className="quote-sym">
+                        <span className="big">{selected.short_name}</span>
+                        <span className="exch">{selected.exchange}:{selected.segment}</span>
+                        {isOption && <span className="badge opt">OPTION</span>}
+                        {isFuture && <span className="badge fut">FUTURE</span>}
+                        {!isOption && !isFuture && <span className="badge cash">CASH</span>}
+                      </div>
+                      <div className="quote-fullsym">{selected.symbol}</div>
+                      <div className="quote-row">
+                        <div className="quote-cell">
+                          <div className="k">LTP</div>
+                          <div className="v big" data-testid="quote-ltp">
+                            {ltp != null ? fmtMoney(ltp) : "—"}
+                          </div>
+                        </div>
+                        <div className="quote-cell">
+                          <div className="k">BID</div>
+                          <div className="v">{bid != null ? fmtMoney(bid) : "—"}</div>
+                        </div>
+                        <div className="quote-cell">
+                          <div className="k">ASK</div>
+                          <div className="v">{ask != null ? fmtMoney(ask) : "—"}</div>
+                        </div>
+                        <div className="quote-cell">
+                          <div className="k">LOT</div>
+                          <div className="v">{selected.lot_size}</div>
+                        </div>
+                      </div>
+                      {!quote?.ok && (
+                        <div className="hint warn-text">
+                          {quote?.reason ?? "no quote cached for this symbol"}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </section>
+                {/* TICKET */}
+                <section className="trade-card" data-testid="trade-ticket">
+                  <h2>Ticket</h2>
+                  <div className="ticket-side" role="group" aria-label="side">
+                    <button
+                      className={`ticket-side-btn buy ${side === "BUY" ? "on" : ""}`}
+                      onClick={() => setSide("BUY")}
+                      data-testid="ticket-side-buy"
+                    >
+                      BUY
+                    </button>
+                    <button
+                      className={`ticket-side-btn sell ${side === "SELL" ? "on" : ""}`}
+                      onClick={() => setSide("SELL")}
+                      data-testid="ticket-side-sell"
+                    >
+                      SELL
+                    </button>
+                  </div>
+  
+                  <label className="ticket-row">
+                    <span>Quantity</span>
+                    <input
+                      type="number"
+                      min={1}
+                      step={selected?.lot_size ?? 1}
+                      value={quantity}
+                      onChange={(e) => setQuantity(Math.max(1, Number(e.target.value || 1)))}
+                      data-testid="ticket-qty"
+                    />
+                    {selected && selected.lot_size > 1 && (
+                      <span className="hint">
+                        {Math.floor(quantity / selected.lot_size)} lot(s)
+                      </span>
+                    )}
+                  </label>
+  
+                  <label className="ticket-row">
+                    <span>Order type</span>
+                    <select
+                      value={orderType}
+                      onChange={(e) => setOrderType(e.target.value as OrderType)}
+                      data-testid="ticket-type"
+                    >
+                      <option value="MARKET">MARKET</option>
+                      <option value="LIMIT">LIMIT</option>
+                      <option value="STOP_LOSS">STOP_LOSS (SL-L)</option>
+                      <option value="SL-M">SL-M</option>
+                    </select>
+                  </label>
+  
+                  {requiresLimit && (
+                    <label className="ticket-row">
+                      <span>Limit price</span>
+                      <input
+                        type="number"
+                        step="0.05"
+                        value={limitPrice}
+                        onChange={(e) => setLimitPrice(e.target.value)}
+                        data-testid="ticket-limit"
+                      />
+                      <span className="px-quick">
+                        {bid != null && (
+                          <button
+                            type="button"
+                            className="px-quick-btn"
+                            onClick={() => setLimitPrice(bid.toFixed(2))}
+                            title={`bid ${fmtMoney(bid)}`}
+                            data-testid="limit-fill-bid"
+                          >
+                            bid
+                          </button>
+                        )}
+                        {ltp != null && (
+                          <button
+                            type="button"
+                            className="px-quick-btn"
+                            onClick={() => setLimitPrice(ltp.toFixed(2))}
+                            title={`LTP ${fmtMoney(ltp)}`}
+                            data-testid="limit-fill-ltp"
+                          >
+                            ltp
+                          </button>
+                        )}
+                        {ask != null && (
+                          <button
+                            type="button"
+                            className="px-quick-btn"
+                            onClick={() => setLimitPrice(ask.toFixed(2))}
+                            title={`ask ${fmtMoney(ask)}`}
+                            data-testid="limit-fill-ask"
+                          >
+                            ask
+                          </button>
+                        )}
+                      </span>
+                    </label>
+                  )}
+  
+                  {requiresStop && (
+                    <label className="ticket-row">
+                      <span>Stop price</span>
+                      <input
+                        type="number"
+                        step="0.05"
+                        value={stopPrice}
+                        onChange={(e) => setStopPrice(e.target.value)}
+                        data-testid="ticket-stop"
+                      />
+                      {ltp != null && (
+                        <span className="px-quick">
+                          <button
+                            type="button"
+                            className="px-quick-btn"
+                            onClick={() => setStopPrice(ltp.toFixed(2))}
+                            title={`LTP ${fmtMoney(ltp)}`}
+                            data-testid="stop-fill-ltp"
+                          >
+                            ltp
+                          </button>
+                        </span>
+                      )}
+                    </label>
+                  )}
+  
+                  {/* Intraday-only bot: no delivery / carry-forward, ever. One value,
+                      so it reads as a fact rather than a choice you cannot make. */}
+                  <div className="ticket-row">
+                    <span>Product</span>
+                    <span
+                      data-testid="ticket-product"
+                      title="Intraday-only bot — every position is squared off the same day"
+                    >
+                      INTRADAY (MIS)
+                    </span>
+                  </div>
+  
+                  {/* Submit */}
+                  <div className="ticket-submit">
+                    <button
+                      className={`btn ${side === "BUY" ? "buy" : "sell"}`}
+                      disabled={!canSubmit || placeOrder.isPending}
+                      onClick={() => onSubmit()}
+                      data-testid="ticket-submit"
+                    >
+                      {placeOrder.isPending ? "placing…" : `PLACE ${side}`}
+                    </button>
+                  </div>
+  
+                  {lastResult && lastResult.type === "success" && (
+                    <div className="result success" data-testid="ticket-result-success">
+                      {lastResult.message}
+                      {lastResult.warning && (
+                        <div className="result-warning" data-testid="ticket-risk-advisory">
+                          ⚠ risk advisory: {lastResult.warning}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {lastResult && lastResult.type === "error" && (
+                    <div className="result error" data-testid="ticket-result-error">
+                      {lastResult.message}
+                      {lastResult.reason === "risk_block" && (
+                        <div
+                          className="risk-override-hint"
+                          data-testid="ticket-risk-override"
+                          style={{
+                            marginTop: 10,
+                            padding: "8px 10px",
+                            border: "1px solid var(--amber)",
+                            borderRadius: 4,
+                            background: "rgba(255, 200, 80, 0.08)",
+                            fontSize: 12,
+                          }}
+                        >
+                          <div style={{ marginBottom: 8 }}>
+                            This order breaches a limit set in <b>Settings</b>. Reduce
+                            the size or relax the limit — or override the check and
+                            place it anyway.
+                          </div>
+                          <button
+                            className="btn-sm sell"
+                            onClick={() => onSubmit({ bypassRisk: true })}
+                            disabled={placeOrder.isPending}
+                            data-testid="ticket-risk-override-btn"
+                          >
+                            {placeOrder.isPending
+                              ? "placing…"
+                              : "⚠ Override risk & place anyway"}
+                          </button>
+                        </div>
+                      )}
+                      {lastResult.reason === "ip_whitelist" && serverInfo?.public_ip && (
+                        <div
+                          className="ip-whitelist-hint"
+                          data-testid="ticket-ip-whitelist"
+                          style={{
+                            marginTop: 10,
+                            padding: "8px 10px",
+                            border: "1px solid var(--amber)",
+                            borderRadius: 4,
+                            background: "rgba(255, 200, 80, 0.08)",
+                            fontSize: 12,
+                            fontFamily: "var(--mono)",
+                          }}
+                        >
+                          <div style={{ marginBottom: 6 }}>
+                            Add this server's public IP to the Fyers app's
+                            IP-whitelist on{" "}
+                            <a
+                              href="https://myapi.fyers.in/dashboard/"
+                              target="_blank"
+                              rel="noreferrer"
+                              style={{ color: "var(--amber)" }}
+                            >
+                              myapi.fyers.in/dashboard
+                            </a>
+                            , then click PLACE BUY again.
+                          </div>
+                          <div
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: 8,
+                            }}
+                          >
+                            <div
+                              style={{
+                                fontSize: 14,
+                                fontWeight: 700,
+                                letterSpacing: "0.05em",
+                                userSelect: "all",
+                                flex: 1,
+                              }}
+                              data-testid="ticket-server-ip"
+                            >
+                              {serverInfo.public_ip}
+                            </div>
+                            <button
+                              className="btn-sm"
+                              onClick={() => {
+                                if (serverInfo.public_ip && navigator.clipboard) {
+                                  navigator.clipboard
+                                    .writeText(serverInfo.public_ip)
+                                    .catch(() => {
+                                      /* ignore — the IP is selectable */
+                                    });
+                                }
+                              }}
+                              data-testid="ticket-server-ip-copy"
+                              title="Copy IP"
+                            >
+                              Copy
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </section>
+              </div>
+            </section>
+          )}
+          {dock.includes("chain") && (
+            <section className="dock-panel" data-testid="dock-chain">
+              {dockHead("chain", chainBase?.short_name)}
+              <div className="dock-body">
+                {/* ---- option chain (index underlyings + F&O stocks) ----
+                     Indices always show the panel; a cash stock shows it only when
+                     it actually has options (F&O stock), so non-F&O names stay clean. */}
+                {chainBase &&
+                  (chainBase.instrument_type === "IND" ||
+                    (chainBase.instrument_type === "EQ" &&
+                      (chain?.strikes?.length ?? 0) > 0)) && (
+                  <section className="trade-card chain" data-testid="trade-chain">
+                    <div className="chain-head">
+                      <div className="chain-meta">
+                        <span
+                          className={`badge ${chain?.source === "fyers" ? "cash" : "neutral"}`}
+                          title={chain?.source === "fyers" ? "live Fyers prices" : "static ladder"}
+                        >
+                          {chain?.source === "fyers" ? "LIVE" : "STATIC"}
+                        </span>
+                        {chain?.spot != null && (
+                          <span data-testid="chain-spot">spot {fmtMoney(chain.spot)}</span>
+                        )}
+                        {(chain?.expiries?.length ?? 0) > 0 && (
+                          <label className="chain-expiry">
+                            <span>expiry</span>
+                            <select
+                              value={selectedExpiry ?? chain?.selected_expiry ?? ""}
+                              onChange={(e) => setSelectedExpiry(e.target.value || null)}
+                              data-testid="chain-expiry"
+                            >
+                              {chain!.expiries.map((ex) => (
+                                <option key={ex.ts} value={ex.ts}>
+                                  {ex.label}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                        )}
+                      </div>
+                    </div>
+                    {!chain ? (
+                      <div className="empty">Loading chain…</div>
+                    ) : chain.strikes.length === 0 ? (
+                      <div className="empty" data-testid="chain-empty">
+                        {chain.reason ?? "No option chain available for this underlying."}
+                      </div>
+                    ) : (
+                      <table className="chain-table">
+                        <thead>
+                          <tr>
+                            <th colSpan={2} className="ce-head">CALLS (CE)</th>
+                            <th className="strike-head">Strike</th>
+                            <th colSpan={2} className="pe-head">PUTS (PE)</th>
+                          </tr>
+                          <tr className="chain-subhead">
+                            <th>OI</th>
+                            <th>LTP</th>
+                            <th> </th>
+                            <th>LTP</th>
+                            <th>OI</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {chain.strikes.map((s) => {
+                            const atm = s.strike === atmStrike;
+                            return (
+                              <tr key={s.strike} className={atm ? "atm" : ""} ref={atm ? atmRef : undefined}>
+                                <td className="oi">{fmtOi(s.ce?.oi)}</td>
+                                <td className="ce-cell">
+                                  {s.ce ? (
+                                    <button
+                                      className={`chain-ltp ce${selected?.symbol === s.ce.symbol ? " on" : ""}`}
+                                      onClick={() => onSelectOption(s, "CE")}
+                                      data-testid={`chain-ce-${s.strike}`}
+                                      title={s.ce.symbol}
+                                    >
+                                      {s.ce.ltp != null ? fmtMoney(s.ce.ltp) : "—"}
+                                    </button>
+                                  ) : (
+                                    "—"
+                                  )}
+                                </td>
+                                <th className="strike">
+                                  {s.strike}
+                                  {atm && <span className="atm-tag">ATM</span>}
+                                </th>
+                                <td className="pe-cell">
+                                  {s.pe ? (
+                                    <button
+                                      className={`chain-ltp pe${selected?.symbol === s.pe.symbol ? " on" : ""}`}
+                                      onClick={() => onSelectOption(s, "PE")}
+                                      data-testid={`chain-pe-${s.strike}`}
+                                      title={s.pe.symbol}
+                                    >
+                                      {s.pe.ltp != null ? fmtMoney(s.pe.ltp) : "—"}
+                                    </button>
+                                  ) : (
+                                    "—"
+                                  )}
+                                </td>
+                                <td className="oi">{fmtOi(s.pe?.oi)}</td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    )}
+                  </section>
+                )}
+                      {!(chainBase && (chainBase.instrument_type === "IND" || (chainBase.instrument_type === "EQ" && (chain?.strikes?.length ?? 0) > 0))) && (
+                        <section className="trade-card"><div className="empty">{chainBase ? "No options listed for this symbol." : "Open an index or F&O stock to see its option chain."}</div></section>
+                      )}
+              </div>
+            </section>
+          )}
+          {dock.includes("flow") && (
+            <section className="dock-panel" data-testid="dock-flow">
+              {dockHead("flow", selected?.short_name)}
+              <div className="dock-body"><FlowPanel symbol={selected?.symbol ?? null} /></div>
+            </section>
+          )}
+        </div>
+      )}
+
+      {/* ---- icon bar: each button opens / closes its panel ---- */}
+      <nav className="tv-rail" aria-label="Panels">
+        {DOCK.map((d) => (
+          <button
+            key={d.id}
+            type="button"
+            className={`tv-rail-btn${dock.includes(d.id) ? " on" : ""}`}
+            aria-pressed={dock.includes(d.id)}
+            title={`${d.hint} — click to ${dock.includes(d.id) ? "close" : "open"}`}
+            onClick={() => toggleDock(d.id)}
+            data-testid={`rail-${d.id}`}
+          >
+            <span className="ico">{d.icon}</span>
+            <span className="lbl">{d.short}</span>
+          </button>
+        ))}
+      </nav>
     </div>
   );
 }
