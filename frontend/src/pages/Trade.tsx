@@ -24,7 +24,7 @@
 // "I ACCEPT THE RISK" into before re-submitting.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   useBrokerAccounts,
   useCancelOrder,
@@ -38,7 +38,7 @@ import {
   useServerInfo,
 } from "../hooks/useApi";
 import { useLiveQuote } from "../hooks/useQuotes";
-import ChartPanel, { type BrokerLine } from "../components/trade/ChartPanel";
+import ChartPanel, { type BrokerLine, type ChartOrder, type ChartPosition } from "../components/trade/ChartPanel";
 import type {
   BrokerAccount,
   InstrumentHit,
@@ -436,16 +436,6 @@ export default function Trade() {
   const brokerLines = useMemo<BrokerLine[]>(() => {
     if (!selected) return [];
     const lines: BrokerLine[] = [];
-    const pos = positions?.find(
-      (p) => p.symbol === selected.symbol && p.quantity !== 0,
-    );
-    if (pos) {
-      lines.push({
-        price: pos.average_price,
-        title: `pos ${pos.quantity > 0 ? "+" : ""}${pos.quantity}`,
-        kind: pos.quantity > 0 ? "position-long" : "position-short",
-      });
-    }
     for (const o of pending?.orders ?? []) {
       if (o.symbol === selected.symbol && o.price > 0) {
         lines.push({
@@ -456,7 +446,45 @@ export default function Trade() {
       }
     }
     return lines;
-  }, [selected, positions, pending]);
+  }, [selected, pending]);
+
+  // The open position on the charted symbol + the exits the trade manager
+  // is watching for it: drawn as a live-P&L line with draggable SL / TP.
+  const qc = useQueryClient();
+  type Managed = { symbol: string; stop_loss: number | null; target: number | null };
+  const { data: managed } = useQuery<Managed[]>({
+    queryKey: ["managed-positions"],
+    queryFn: async () => {
+      const r = await fetch("/api/positions/managed");
+      return r.ok ? r.json() : [];      // 503 when the trade manager isn't running
+    },
+    refetchInterval: 3000,
+  });
+  const chartPosition = useMemo<ChartPosition | null>(() => {
+    const pos = selected && positions?.find((p) => p.symbol === selected.symbol && p.quantity !== 0);
+    if (!pos) return null;
+    const m = managed?.find((x) => x.symbol === pos.symbol);
+    return { qty: pos.quantity, avg: pos.average_price, sl: m?.stop_loss ?? null, tp: m?.target ?? null };
+  }, [selected, positions, managed]);
+  const onLevels = async (sl: number | null, tp: number | null) => {
+    if (!selected) return;
+    const r = await fetch(`/api/positions/${encodeURIComponent(selected.symbol)}/levels`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ stop_loss: sl, target: tp }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail ?? `HTTP ${r.status}`);
+    qc.setQueryData<Managed[]>(["managed-positions"], (old) => [...(old ?? []).filter((x) => x.symbol !== j.managed.symbol), j.managed]);
+  };
+  const onClosePosition = async () => {
+    if (!selected) return;
+    const r = await fetch(`/api/positions/${encodeURIComponent(selected.symbol)}/close`, { method: "POST" });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail ?? `HTTP ${r.status}`);
+    void qc.invalidateQueries({ queryKey: ["positions"] });
+    void qc.invalidateQueries({ queryKey: ["managed-positions"] });
+  };
 
   // Chart "⤷ Ticket" tool → prefill the ticket as a LIMIT order.
   const onPickPrice = (price: number) => {
@@ -542,6 +570,30 @@ export default function Trade() {
       display: `${chainBase.short_name} ${row.strike} ${type}`,
     }, true);
     if (!dock.includes("trade")) toggleDock("trade");   // the ticket is where the click is going
+  };
+
+  // Right-click order from the chart: the ticket's account + quantity, the
+  // clicked price. Risk-blocked or rejected orders come back as errors (the
+  // ticket is where a risk override is typed).
+  const onChartOrder = async (o: ChartOrder): Promise<string> => {
+    if (!selected) throw new Error("no symbol");
+    if (!accountId) throw new Error("no live Fyers account connected");
+    const r = await placeOrder.mutateAsync({
+      account_id: accountId,
+      symbol: selected.symbol,
+      side: o.side,
+      quantity: Number(quantity),
+      order_type: o.type,
+      limit_price: o.type === "LIMIT" ? o.price : null,
+      stop_price: o.type === "SL-M" ? o.price : null,
+      product_type: "INTRADAY",
+      bypass_risk: false,
+      operator: "ui_chart",
+    });
+    if (r.status === "REJECTED" || r.status === "REJECTED_RISK" || r.ok === false) {
+      throw new Error(cleanError(r.error || r.risk_message, "broker rejected the order"));
+    }
+    return `${o.side} ${quantity} ${selected.short_name} ${o.type}${o.price != null ? ` @ ${o.price}` : ""} → ${r.status}`;
   };
 
   const onSubmit = async (opts?: { bypassRisk?: boolean }) => {
@@ -642,6 +694,11 @@ export default function Trade() {
             shortName={selected.short_name}
             brokerLines={brokerLines}
             onPickPrice={onPickPrice}
+            position={chartPosition}
+            onLevels={onLevels}
+            onClosePosition={onClosePosition}
+            onChartOrder={onChartOrder}
+            orderQty={Number(quantity)}
           />
         )}
           {!selected && (
