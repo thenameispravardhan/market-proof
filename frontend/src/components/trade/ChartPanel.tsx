@@ -27,7 +27,7 @@
 // other display time zones are applied by the formatters. The same shift
 // is undone when paging older history from the API.
 
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import {
   AreaSeries,
@@ -53,6 +53,7 @@ import {
   type UTCTimestamp,
 } from "lightweight-charts";
 import { api } from "../../api/client";
+import { getTheme, THEME_EVENT, toggleTheme } from "../../lib/theme";
 import { useLiveQuote } from "../../hooks/useQuotes";
 import { heikinAshi, heikinAshiBar, type OhlcvCandle } from "../../lib/indicators";
 import type { HistoryResponse, InstrumentHit, SearchResponse } from "../../types";
@@ -141,7 +142,8 @@ import {
 } from "./ChartDialogs";
 import { DrawingFloatBar, FavoritesBar, LeftToolbar, type CursorMode, type Magnet } from "./DrawingToolbar";
 import { AlertsPanel, DataWindow, ObjectTree, type DataRow, type TreeItem } from "./ChartWidgets";
-import { AboutIndicatorDialog, InsightsDialog, ManagePanesDialog } from "./ChartInfoDialogs";
+import { AboutIndicatorDialog, InsightsDialog, ManagePanesDialog, WhatsNewDialog } from "./ChartInfoDialogs";
+import { CHART_SETTINGS_EVENT } from "./UserSettings";
 
 const IST = IST_OFFSET;
 
@@ -223,8 +225,8 @@ const RANGES: RangeDef[] = [
 export type HostAction =
   | "panel:chain" | "panel:details" | "panel:tree" | "panel:data" | "panel:alerts" | "panel:watch" | "panel:flow"
   | "panel:depth" | "panel:tape" | "panel:futures" | "panel:strategy"
-  | "bottom:positions" | "bottom:orders" | "bottom:basket"
-  | "scalper" | "layouts" | "save" | "maximize" | "watch:add" | "privacy";
+  | "bottom:positions" | "bottom:orders" | "bottom:basket" | "bottom:smart"
+  | "scalper" | "layouts" | "save" | "maximize" | "watch:add" | "privacy" | "logout" | "usersettings";
 
 interface ToolMenuItem {
   id: string;
@@ -232,14 +234,18 @@ interface ToolMenuItem {
   icon: string;
   host?: HostAction;
   badge?: string;
+  /** Label when pinned to the top bar. */
+  short?: string;
+  /** A Fyers account page (funds, MTF, eDIS …) opened in a new tab. */
+  href?: string;
 }
 
 const TOOLS_MENU: ToolMenuItem[] = [
-  { id: "replay", label: "Bar Replay", icon: "⏪" },
-  { id: "flow", label: "Order Flow", icon: "Δ", host: "panel:flow", badge: "NEW" },
-  { id: "chain", label: "Option Chain", icon: "⊞", host: "panel:chain" },
-  { id: "scalper", label: "Option Scalper", icon: "⚡", host: "scalper" },
-  { id: "positions", label: "Manage Positions & Orders", icon: "⇅", host: "bottom:positions" },
+  { id: "replay", label: "Bar Replay", icon: "⏪", short: "Replay" },
+  { id: "flow", label: "Order Flow", icon: "Δ", host: "panel:flow", badge: "NEW", short: "Order Flow" },
+  { id: "chain", label: "Option Chain", icon: "⊞", host: "panel:chain", short: "Option Chain" },
+  { id: "scalper", label: "Option Scalper", icon: "⚡", host: "scalper", short: "Scalper" },
+  { id: "positions", label: "Manage Positions & Orders", icon: "⇅", host: "bottom:positions", short: "Positions" },
   { id: "basket", label: "Basket Orders", icon: "🧺", host: "bottom:basket" },
   { id: "strategy", label: "Strategy Builder", icon: "⚖", host: "panel:strategy" },
   { id: "depth", label: "Market Depth (DOM)", icon: "≣", host: "panel:depth" },
@@ -251,12 +257,20 @@ const TOOLS_MENU: ToolMenuItem[] = [
   { id: "theme", label: "Change Theme (dark / light)", icon: "◐" },
   { id: "privacy", label: "Privacy (mask P&L)", icon: "🙈", host: "privacy" },
   { id: "settings", label: "User Settings", icon: "⚙" },
+  { id: "smartbook", label: "Smart Orderbook", icon: "📑", host: "bottom:smart" },
   { id: "shortcuts", label: "Keyboard Shortcuts", icon: "⌨" },
+  // Broker account services live on Fyers' own site: these open it.
+  { id: "funds", label: "Add Funds", icon: "₹", href: "https://trade.fyers.in/" },
+  { id: "mtf", label: "Pay later (MTF)", icon: "⏳", href: "https://fyers.in/" },
+  { id: "edis", label: "Holding Authorization (eDIS)", icon: "🔐", href: "https://trade.fyers.in/" },
+  { id: "fia", label: "FIA", icon: "✦", href: "https://fyers.in/" },
+  { id: "refer", label: "Refer & Earn", icon: "🎁", href: "https://fyers.in/" },
+  { id: "prime", label: "FYERS Prime", icon: "★", href: "https://fyers.in/" },
 ];
 
 type ScaleMode = "normal" | "log" | "percent" | "indexed";
 type DrawMode = string | null; // a tool id, "alert", "ticket", "zoom", "image", or null
-type MenuId = "interval" | "kind" | "templates" | "alerts" | "compare" | "tools" | "snapshot" | "scale" | "tz" | null;
+type MenuId = "interval" | "kind" | "templates" | "alerts" | "compare" | "tools" | "snapshot" | "scale" | "tz" | "products" | null;
 type StratTrade = { side: string; entry_t: number; exit_t: number; entry: number; exit: number; net: number; reason: string; instrument: string };
 type StratRun = { name: string; trades: StratTrade[]; stats: Record<string, number | null>; error?: string; running?: boolean };
 
@@ -625,6 +639,7 @@ type Dialog =
   | { k: "about"; uid: string }
   | { k: "panes" }
   | { k: "insights" }
+  | { k: "whatsnew" }
   | null;
 
 interface Ctx {
@@ -643,6 +658,33 @@ interface Snap {
   indicators: IndicatorInstance[];
   kind: ChartKind;
   iv: string;
+  /** Set on "change symbol" steps: undo switches the chart back. */
+  symbol?: string;
+  hit?: InstrumentHit | null;
+  /** Set on "change settings" steps. */
+  settings?: ChartSettings;
+  /** Set on "reset scales" steps: the view to return to. */
+  view?: { auto: boolean; mode: ScaleMode; invert: boolean; range: { from: number; to: number } | null; price: { from: number; to: number } | null };
+}
+
+/** Undo history per chart cell, kept across the remount a symbol change
+ *  causes — so "Undo change symbol" can bring the previous symbol back. */
+interface UndoStore {
+  past: Snap[];
+  future: Snap[];
+  symbol: string | null;
+  hit: InstrumentHit | null;
+  /** An undo / redo is switching the symbol: don't record it as a new change. */
+  restoring: boolean;
+}
+const UNDO_STORES = new Map<string, UndoStore>();
+function undoStore(key: string): UndoStore {
+  let st = UNDO_STORES.get(key);
+  if (!st) {
+    st = { past: [], future: [], symbol: null, hit: null, restoring: false };
+    UNDO_STORES.set(key, st);
+  }
+  return st;
 }
 
 function computeTheme(s: ChartSettings): ThemeColors {
@@ -717,6 +759,8 @@ export default function ChartPanel(props: ChartPanelProps) {
   const autoScaleRef = useRef(autoScale);
   autoScaleRef.current = autoScale;
   const [invert, setInvert] = useState(prefs.invert ?? false);
+  const invertRef = useRef(invert);
+  invertRef.current = invert;
   const [scalePriceOnly, setScalePriceOnly] = useState(prefs.scalePriceOnly ?? false);
   const [favIntervals, setFavIntervals] = useState<string[]>(prefs.favIntervals ?? DEFAULT_FAV_INTERVALS);
   const [customIntervals, setCustomIntervals] = useState<string[]>(prefs.customIntervals ?? []);
@@ -734,7 +778,8 @@ export default function ChartPanel(props: ChartPanelProps) {
   const [legendMenu, setLegendMenu] = useState<{ kind: "main" | "ind"; uid?: string; x: number; y: number } | null>(null);
   const [showFavBar, setShowFavBar] = useState(prefs.showFavBar ?? false);
   const [toolsCollapsed, setToolsCollapsed] = useState(prefs.toolsCollapsed ?? false);
-  const [pinnedTools, setPinnedTools] = useState<string[]>(prefs.pinnedTools ?? ["replay"]);
+  // TradingView / Fyers pin these to the top bar out of the box
+  const [pinnedTools, setPinnedTools] = useState<string[]>(prefs.pinnedTools ?? ["flow", "scalper", "positions", "chain", "replay"]);
 
   // ---- state: transient ----
   const [drawMode, setDrawModeState] = useState<DrawMode>(null);
@@ -788,7 +833,14 @@ export default function ChartPanel(props: ChartPanelProps) {
     return () => document.removeEventListener("fullscreenchange", on);
   }, []);
 
-  const theme = useMemo(() => computeTheme(settings), [settings.theme, settings.upColor, settings.downColor]); // eslint-disable-line react-hooks/exhaustive-deps
+  // the app skin changes the CSS variables the chart colours come from
+  const [skin, setSkin] = useState(getTheme);
+  useEffect(() => {
+    const on = () => setSkin(getTheme());
+    window.addEventListener(THEME_EVENT, on);
+    return () => window.removeEventListener(THEME_EVENT, on);
+  }, []);
+  const theme = useMemo(() => computeTheme(settings), [settings.theme, settings.upColor, settings.downColor, skin]); // eslint-disable-line react-hooks/exhaustive-deps
   const precision = settings.precision ?? (instrument?.tick_size && instrument.tick_size < 0.01 ? 4 : 2);
   const tickRef = useRef(0.05);
   const liveQuoteRef = useRef<ReturnType<typeof useLiveQuote>>(undefined);
@@ -809,6 +861,9 @@ export default function ChartPanel(props: ChartPanelProps) {
   const [hostEl, setHostEl] = useState<HTMLDivElement | null>(null);
   const legendRef = useRef<HTMLSpanElement | null>(null);
   const countdownRef = useRef<HTMLDivElement | null>(null);
+  /** The top toolbar scrolls sideways when narrow; arrows show what's hidden. */
+  const toolbarRef = useRef<HTMLDivElement | null>(null);
+  const [tbScroll, setTbScroll] = useState({ left: false, right: false });
   const rawLabelRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const mainRef = useRef<ISeriesApi<SeriesType> | null>(null);
@@ -879,7 +934,23 @@ export default function ChartPanel(props: ChartPanelProps) {
   const indRefreshTimer = useRef<number | undefined>(undefined);
   const brickTimer = useRef<number | undefined>(undefined);
   const toolDefaultsRef = useRef<Record<string, Partial<DrawingStyle>>>(loadJson("chart:drawStyles", {}));
-  const undoRef = useRef<{ past: Snap[]; future: Snap[] }>({ past: [], future: [] });
+  const undoRef = useRef<UndoStore>(undoStore(myId));
+  // A new symbol in this cell (search, watchlist, undo …) is a history step.
+  useEffect(() => {
+    const st = undoRef.current;
+    if (st.symbol && st.symbol !== symbol) {
+      if (st.restoring) st.restoring = false;
+      else {
+        st.past.push({ label: "change symbol", drawings: [], indicators: [], kind: kindRef.current, iv: ivRef.current, symbol: st.symbol, hit: st.hit });
+        if (st.past.length > 100) st.past.shift();
+        st.future = [];
+      }
+      setUndoVer((v) => v + 1);
+    }
+    st.symbol = symbol;
+    st.hit = instrument ?? st.hit;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [symbol]);
   const clipboardRef = drawingClipboard as { current: Drawing | null }; // shared across charts
   const pendingIconRef = useRef<DrawingData | null>(null);
 
@@ -1184,12 +1255,40 @@ export default function ChartPanel(props: ChartPanelProps) {
     bumpDrawings();
   }
 
+  /** The state to put on the other stack when `s` is undone / redone. */
+  function counterSnap(s: Snap): Snap {
+    if (s.symbol !== undefined) return { ...snapshot(s.label), symbol, hit: instrument ?? null };
+    if (s.settings) return { ...snapshot(s.label), settings: settingsRef.current };
+    if (s.view) return { ...snapshot(s.label), view: viewState() };
+    return snapshot(s.label);
+  }
+
+  function applySnap(s: Snap): void {
+    if (s.symbol !== undefined) {
+      // back to the other symbol: the chart remounts and loads its own drawings
+      if (s.hit && onSymbolChange && s.symbol !== symbol) {
+        undoRef.current.restoring = true;
+        onSymbolChange(s.hit);
+      }
+      return;
+    }
+    if (s.settings) {
+      changeSettings(s.settings);
+      return;
+    }
+    if (s.view) {
+      restoreView(s.view);
+      return;
+    }
+    restoreSnap(s);
+  }
+
   function undo(): void {
     const u = undoRef.current;
     const s = u.past.pop();
     if (!s) return;
-    u.future.push(snapshot(s.label));
-    restoreSnap(s);
+    u.future.push(counterSnap(s));
+    applySnap(s);
     setUndoVer((v) => v + 1);
   }
 
@@ -1197,9 +1296,32 @@ export default function ChartPanel(props: ChartPanelProps) {
     const u = undoRef.current;
     const s = u.future.pop();
     if (!s) return;
-    u.past.push(snapshot(s.label));
-    restoreSnap(s);
+    u.past.push(counterSnap(s));
+    applySnap(s);
     setUndoVer((v) => v + 1);
+  }
+
+  /** Scale / view state ("reset scales" is undoable). */
+  function viewState(): NonNullable<Snap["view"]> {
+    const lr = safe(() => chartRef.current!.timeScale().getVisibleLogicalRange());
+    const h = paneDims().height;
+    const top = safe(() => mainRef.current?.coordinateToPrice(0) as number | null, null);
+    const bot = safe(() => mainRef.current?.coordinateToPrice(h) as number | null, null);
+    return {
+      auto: autoScaleRef.current,
+      mode: scaleModeRef.current,
+      invert: invertRef.current,
+      range: lr ? { from: lr.from as number, to: lr.to as number } : null,
+      price: top != null && bot != null ? { from: Math.min(top, bot), to: Math.max(top, bot) } : null,
+    };
+  }
+
+  function restoreView(v: NonNullable<Snap["view"]>): void {
+    setScaleMode(v.mode);
+    setInvert(v.invert);
+    setAutoScale(v.auto);
+    if (v.range) safe(() => chartRef.current!.timeScale().setVisibleLogicalRange({ from: v.range!.from as Logical, to: v.range!.to as Logical }));
+    if (!v.auto && v.price) setTimeout(() => safe(() => mainRef.current?.priceScale().setVisibleRange(v.price!)), 0);
   }
 
   function selectDrawing(id: string | null): void {
@@ -2710,6 +2832,7 @@ export default function ChartPanel(props: ChartPanelProps) {
   }
 
   function resetView(): void {
+    pushUndo("reset scales", { ...snapshot("reset scales"), view: viewState() });
     setAutoScale(true);
     safe(() => mainRef.current?.priceScale().applyOptions({ autoScale: true }));
     showLatest(90);
@@ -2766,6 +2889,7 @@ export default function ChartPanel(props: ChartPanelProps) {
         r: () => resetView(),
         a: () => openAlertDialog(),
         w: () => onAction?.("watch:add"),
+        s: () => void takeSnapshot("link"),
       };
       if (e.key === "Enter") { e.preventDefault(); onAction?.("maximize"); return; }
       if (map[letter]) { e.preventDefault(); map[letter](); return; }
@@ -3642,6 +3766,17 @@ export default function ChartPanel(props: ChartPanelProps) {
     } satisfies ChartPrefs);
   }, [iv, chartKind, indicators, magnet, cursor, scaleMode, autoScale, invert, scalePriceOnly, favIntervals, customIntervals, favKinds, favTools, favIndicators, lastTool, stay, lockAll, hide, syncDrawings, legendCollapsed, showFavBar, toolsCollapsed, pinnedTools, mainHidden]);
 
+  // User Settings (outside the chart) edited chart:settings — pick them up.
+  useEffect(() => {
+    const on = () => {
+      const s = loadSettings();
+      settingsRef.current = s;
+      setSettingsState(s);
+    };
+    window.addEventListener(CHART_SETTINGS_EVENT, on);
+    return () => window.removeEventListener(CHART_SETTINGS_EVENT, on);
+  }, []);
+
   // The legend's eye on the main series (and the object tree's) hides it.
   useEffect(() => {
     safe(() => mainRef.current?.applyOptions({ visible: !mainHidden } as never));
@@ -3802,6 +3937,45 @@ export default function ChartPanel(props: ChartPanelProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings.lastPriceScaleValue, settings.lastPriceLabel, settings.lastPriceColor, scaleMode, compares.length]);
 
+  function measureToolbar(): void {
+    const el = toolbarRef.current;
+    if (!el) return;
+    const left = el.scrollLeft > 2;
+    const right = el.scrollLeft + el.clientWidth < el.scrollWidth - 2;
+    setTbScroll((p) => (p.left === left && p.right === right ? p : { left, right }));
+  }
+  useEffect(() => {
+    const el = toolbarRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => measureToolbar());
+    ro.observe(el);
+    measureToolbar();
+    return () => ro.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [toolbarSlot, chrome]);
+  // The scroller clips its children, so an open toolbar menu is positioned
+  // against the (unclipped) wrapper, under its button.
+  function positionToolbarMenu(): void {
+    const bar = toolbarRef.current;
+    const wrap = bar?.parentElement;
+    if (!bar || !wrap) return;
+    const menu = bar.querySelector<HTMLElement>(".chart-menu-wrap > .chart-menu");
+    const anchor = menu?.parentElement;
+    if (!menu || !anchor) return;
+    const a = anchor.getBoundingClientRect();
+    const cb = wrap.getBoundingClientRect();
+    const w = menu.offsetWidth;
+    const alignRight = menu.classList.contains("right");
+    const left = alignRight ? a.right - cb.left - w : a.left - cb.left;
+    menu.style.left = `${Math.max(0, Math.min(left, cb.width - w))}px`;
+    menu.style.right = "auto";
+    menu.style.top = `${a.bottom - cb.top + 6}px`;
+  }
+  // (scrolling the bar — e.g. a half-hidden button taking focus — moves the open menu along)
+  useLayoutEffect(() => {
+    if (menuOpen) positionToolbarMenu();
+  }, [menuOpen]);
+
   // 11) Close menus on outside click; the context menu on any click / Esc.
   useEffect(() => {
     if (!menuOpen) return;
@@ -3856,6 +4030,11 @@ export default function ChartPanel(props: ChartPanelProps) {
             repaintDrawings();
             bumpDrawings();
           }
+        } else if (e.type === "daterange") {
+          if (!s.dateRange) return;
+          const preset = e.preset ? RANGES.find((r) => r.id === e.preset) : undefined;
+          if (preset) applyRange(preset, true);
+          else goTo({ at: e.at, from: e.from, to: e.to }, true);
         } else if (e.type === "interval") {
           if (s.interval) changeInterval(e.interval, true);
         } else if (e.type === "range") {
@@ -4076,37 +4255,131 @@ export default function ChartPanel(props: ChartPanelProps) {
   }
 
   function toggleFullscreen(): void {
-    // The whole trade workspace (chart + panels + bottom bar) goes
-    // fullscreen, not the chart alone. Esc exits (browser).
+    // The chart area (toolbars, drawing strip, charts, date-range bar) goes
+    // fullscreen — not the side panels or the account manager. Esc exits.
     if (document.fullscreenElement) void document.exitFullscreen();
-    else void (wrapRef.current?.closest(".trade-page") ?? wrapRef.current?.closest(".chart-card"))?.requestFullscreen?.();
+    else void (wrapRef.current?.closest(".tv-layout") ?? wrapRef.current?.closest(".chart-card"))?.requestFullscreen?.();
   }
 
-  /** PNG of the chart with a title strip (symbol, interval, last OHLC). */
-  async function takeSnapshot(kind: "download" | "copy" | "open"): Promise<void> {
-    setMenuOpen(null);
+  /** PNG of the chart: a title strip (symbol, interval, last OHLC, change),
+   *  the legend's indicator values, compare symbols and the watermarks. */
+  async function snapshotBlob(): Promise<Blob> {
     const chart = chartRef.current;
-    if (!chart) return;
-    try {
-      const canvas = chart.takeScreenshot();
-      const out = document.createElement("canvas");
-      const head = 28;
-      out.width = canvas.width;
-      out.height = canvas.height + head;
-      const g = out.getContext("2d");
-      if (g) {
-        g.fillStyle = settingsRef.current.theme === "light" ? "#FFFFFF" : colorsRef.current.bg;
-        g.fillRect(0, 0, out.width, out.height);
-        g.drawImage(canvas, 0, head);
-        const v = viewRef.current;
-        const c = v[v.length - 1];
-        g.fillStyle = settingsRef.current.theme === "light" ? "#131722" : "#E8E8E8";
-        g.font = '13px "JetBrains Mono", monospace';
-        const when = new Date().toLocaleString("en-IN");
-        g.fillText(`${shortName} · ${ivLabel} · ${exchange}${c ? `   O ${fmtPrice(c.open)} H ${fmtPrice(c.high)} L ${fmtPrice(c.low)} C ${fmtPrice(c.close)}` : ""}   ${when}`, 10, 19);
+    if (!chart) throw new Error("no chart");
+    const canvas = chart.takeScreenshot();
+    const out = document.createElement("canvas");
+    const head = 30;
+    out.width = canvas.width;
+    out.height = canvas.height + head;
+    const g = out.getContext("2d");
+    if (!g) throw new Error("no canvas");
+    const light = getTheme() === "light" || settingsRef.current.theme === "light";
+    const fg = light ? "#131722" : "#E8E8E8";
+    const faint = light ? "rgba(19,23,34,0.10)" : "rgba(232,232,232,0.08)";
+    g.fillStyle = light ? "#FFFFFF" : colorsRef.current.bg;
+    g.fillRect(0, 0, out.width, out.height);
+    g.drawImage(canvas, 0, head);
+    const v = viewRef.current;
+    const c = v[v.length - 1];
+    const p = v[v.length - 2];
+    const s = settingsRef.current;
+    // watermarks (the chart canvas doesn't contain the HTML ones)
+    if (s.watermark) {
+      g.save();
+      g.fillStyle = faint;
+      g.textAlign = "center";
+      g.textBaseline = "middle";
+      g.font = `700 ${Math.round(out.width / 14)}px "JetBrains Mono", monospace`;
+      g.fillText(shortName, out.width / 2, head + canvas.height * 0.42);
+      g.font = `600 ${Math.round(out.width / 40)}px "JetBrains Mono", monospace`;
+      g.fillText(ivLabel, out.width / 2, head + canvas.height * 0.42 + out.width / 18);
+      g.restore();
+    }
+    if (s.logoWatermark) {
+      g.save();
+      g.globalAlpha = 0.55;
+      g.font = '800 12px "JetBrains Mono", monospace';
+      g.fillStyle = colorsRef.current.accent;
+      g.fillText("◆", 12, head + canvas.height - 36);
+      g.fillStyle = light ? "#787B86" : "#666666";
+      g.fillText("TRADEBOT", 26, head + canvas.height - 36);
+      g.restore();
+    }
+    // title strip
+    g.font = '13px "JetBrains Mono", monospace';
+    g.fillStyle = fg;
+    let x = 10;
+    const put = (t: string, color = fg) => {
+      g.fillStyle = color;
+      g.fillText(t, x, 20);
+      x += g.measureText(t).width + 10;
+    };
+    put(`${shortName} · ${ivLabel} · ${exchange}`);
+    if (c) {
+      put(`O ${fmtPrice(c.open)} H ${fmtPrice(c.high)} L ${fmtPrice(c.low)} C ${fmtPrice(c.close)}`);
+      if (p) {
+        const ch = c.close - p.close;
+        put(`${ch >= 0 ? "+" : ""}${fmtPrice(ch)} (${ch >= 0 ? "+" : ""}${((ch / p.close) * 100).toFixed(2)}%)`, ch >= 0 ? colorsRef.current.up : colorsRef.current.down);
       }
-      const blob: Blob | null = await new Promise((res) => out.toBlob((b) => res(b)));
-      if (!blob) throw new Error("no image");
+    }
+    put(new Date().toLocaleString("en-IN"), light ? "#787B86" : "#999999");
+    // legend: compares + indicator values at the last bar
+    g.font = '11px "JetBrains Mono", monospace';
+    let y = head + 18;
+    const line = (parts: [string, string][]) => {
+      let lx = 10;
+      for (const [t, col] of parts) {
+        g.fillStyle = col;
+        g.fillText(t, lx, y);
+        lx += g.measureText(t).width + 6;
+      }
+      y += 15;
+    };
+    for (const cmp of compares.filter((q) => !q.hidden)) line([["●", cmp.color], [cmp.name, fg]]);
+    const i = v.length - 1;
+    for (const inst of indicatorsRef.current) {
+      const def = INDICATOR_BY_TYPE.get(inst.type);
+      const vals = indValuesRef.current.get(inst.uid);
+      if (!def || !inst.visible || !indPaneRef.current.has(inst.uid)) continue;
+      const prec = inst.precision ?? 2;
+      const parts: [string, string][] = [[`${def.short} ${argsLabel(inst)}`.trim(), fg]];
+      def.plots.forEach((pd, k) => {
+        const val = vals?.[k]?.[i];
+        if (pd.kind === "marks" || !inst.plots[k]?.visible || val == null) return;
+        parts.push([inst.type === "volume" ? fmtVol(val) : fmtNum(val, prec), inst.plots[k].color]);
+      });
+      line(parts);
+      if (y > head + canvas.height * 0.45) break;
+    }
+    const blob: Blob | null = await new Promise((res) => out.toBlob((b) => res(b)));
+    if (!blob) throw new Error("no image");
+    return blob;
+  }
+
+  /** Upload the image to this terminal's snapshot store; returns its absolute URL. */
+  async function snapshotLink(): Promise<string> {
+    const blob = await snapshotBlob();
+    const r = await fetch("/api/snapshots", { method: "POST", headers: { "Content-Type": "image/png" }, body: blob });
+    if (!r.ok) throw new Error(`upload failed (${r.status})`);
+    const j = (await r.json()) as { url: string };
+    return new URL(j.url, window.location.origin).toString();
+  }
+
+  async function takeSnapshot(kind: "download" | "copy" | "open" | "link" | "tweet"): Promise<void> {
+    setMenuOpen(null);
+    try {
+      if (kind === "link" || kind === "tweet") {
+        const url = await snapshotLink();
+        if (kind === "link") {
+          await navigator.clipboard?.writeText(url).catch(() => undefined);
+          addToast("snapshot link copied — it opens for anyone signed in to this terminal");
+        } else {
+          const text = `${shortName} ${ivLabel} chart`;
+          window.open(`https://twitter.com/intent/tweet?text=${encodeURIComponent(text)}&url=${encodeURIComponent(url)}`, "_blank", "noopener");
+        }
+        return;
+      }
+      const blob = await snapshotBlob();
       if (kind === "copy") {
         const CI = (window as unknown as { ClipboardItem?: new (d: Record<string, Blob>) => unknown }).ClipboardItem;
         if (!CI || !navigator.clipboard?.write) throw new Error("clipboard images aren't supported here");
@@ -4234,15 +4507,17 @@ export default function ChartPanel(props: ChartPanelProps) {
     }
   }
 
-  function applyRange(r: RangeDef): void {
+  function applyRange(r: RangeDef, fromSync = false): void {
     pendingRangeRef.current = r;
-    if (normalizeInterval(r.interval) !== iv) changeInterval(r.interval);
+    if (normalizeInterval(r.interval) !== iv) changeInterval(r.interval, fromSync);
     else void applyPendingRange();
+    if (!fromSync && syncRef.current.dateRange) publishSync({ type: "daterange", src: myId, preset: r.id });
   }
 
-  function goTo(r: { at?: number; from?: number; to?: number }): void {
+  function goTo(r: { at?: number; from?: number; to?: number }, fromSync = false): void {
     pendingRangeRef.current = r;
     void applyPendingRange();
+    if (!fromSync && syncRef.current.dateRange) publishSync({ type: "daterange", src: myId, ...r });
   }
 
   // ---- indicators ----
@@ -4421,12 +4696,20 @@ export default function ChartPanel(props: ChartPanelProps) {
     switch (id) {
       case "replay": return replayRef.current.on ? stopReplay() : startReplaySelect();
       case "popout": {
-        window.open(`${window.location.pathname}#/trade`, "_blank", "popup,width=1200,height=760");
+        // a window with just this chart, on this symbol and interval
+        const q = new URLSearchParams({ popout: "1", symbol, name: shortName, iv: ivRef.current });
+        window.open(`${window.location.pathname}#/trade?${q.toString()}`, "_blank", "popup,width=1200,height=760");
         return;
       }
       case "refresh": return setReloadNonce((n) => n + 1);
-      case "theme": return changeSettings({ ...settingsRef.current, theme: settingsRef.current.theme === "light" ? "app" : "light" });
-      case "settings": return setDialog({ k: "settings" });
+      case "theme": {
+        // the whole app flips skin; the chart follows it ("App theme")
+        const next = toggleTheme();
+        if (settingsRef.current.theme !== "app") changeSettings({ ...settingsRef.current, theme: "app" });
+        addToast(`${next === "light" ? "Light" : "Dark"} theme`);
+        return;
+      }
+      case "settings": return onAction ? onAction("usersettings") : setDialog({ k: "settings" });
       case "shortcuts": return setDialog({ k: "shortcuts" });
     }
   }
@@ -4453,17 +4736,45 @@ export default function ChartPanel(props: ChartPanelProps) {
       { id: "a:copyimg", label: "Copy chart image", group: "Actions", run: () => void takeSnapshot("copy") },
       { id: "a:full", label: "Fullscreen", group: "Actions", hint: "Shift+F", run: toggleFullscreen },
       { id: "a:settings", label: "Chart settings…", group: "Settings", run: () => setDialog({ k: "settings" }) },
-      { id: "a:log", label: "Toggle log scale", group: "Settings", hint: "Alt+L", run: () => setScaleMode((m) => (m === "log" ? "normal" : "log")) },
-      { id: "a:pct", label: "Toggle percent scale", group: "Settings", hint: "Alt+P", run: () => setScaleMode((m) => (m === "percent" ? "normal" : "percent")) },
-      { id: "a:idx", label: "Indexed to 100 scale", group: "Settings", run: () => setScaleMode((m) => (m === "indexed" ? "normal" : "indexed")) },
-      { id: "a:auto", label: "Toggle auto scale", group: "Settings", run: () => setAutoScale((v) => !v) },
-      { id: "a:inv", label: "Invert scale", group: "Settings", hint: "Alt+I", run: () => setInvert((v) => !v) },
-      { id: "a:magnet", label: "Toggle magnet mode", group: "Drawing", run: () => setMagnet((m) => (m === "off" ? "weak" : "off")) },
-      { id: "a:lock", label: lockAll ? "Unlock all drawings" : "Lock all drawings", group: "Drawing", run: () => setLockAll((v) => !v) },
-      { id: "a:hide", label: "Hide / show drawings", group: "Drawing", run: () => setHideKind("drawings") },
+      { id: "a:log", label: "Log scale", group: "Settings", hint: "Alt+L", toggle: scaleMode === "log", run: () => setScaleMode((m) => (m === "log" ? "normal" : "log")) },
+      { id: "a:pct", label: "Percent scale", group: "Settings", hint: "Alt+P", toggle: scaleMode === "percent", run: () => setScaleMode((m) => (m === "percent" ? "normal" : "percent")) },
+      { id: "a:idx", label: "Indexed to 100 scale", group: "Settings", toggle: scaleMode === "indexed", run: () => setScaleMode((m) => (m === "indexed" ? "normal" : "indexed")) },
+      { id: "a:auto", label: "Auto scale", group: "Settings", toggle: autoScale, run: () => setAutoScale((v) => !v) },
+      { id: "a:inv", label: "Invert scale", group: "Settings", hint: "Alt+I", toggle: invert, run: () => setInvert((v) => !v) },
+      ...([
+        ["sessionBreaks", "Session breaks"],
+        ["countdown", "Countdown to bar close"],
+        ["noOverlapLabels", "No overlapping labels"],
+        ["lockRatio", "Lock price to bar ratio"],
+        ["symbolNameLabel", "Symbol name label"],
+        ["prevCloseLine", "Previous day close line"],
+        ["highLowLabels", "High and low price labels"],
+        ["bidAskLines", "Bid and ask lines"],
+        ["showEvents", "Corporate events on bars"],
+        ["showMarks", "Marks on bars"],
+        ["watermark", "Symbol watermark"],
+        ["logoWatermark", "Logo watermark"],
+        ["showVolume", "Volume in the status line"],
+        ["showLastDayChange", "Last day change in the status line"],
+        ["indValues", "Indicator values in the status line"],
+        ["executions", "Executions on the chart"],
+        ["extendLines", "Extended position / order lines"],
+        ["buySellButtons", "Buy / sell buttons"],
+        ["sound", "Sound for executions and alerts"],
+      ] as [keyof ChartSettings, string][]).map(([k, label]): Command => ({
+        id: `set:${k}`,
+        label,
+        group: "Settings",
+        toggle: settings[k] === true,
+        run: () => changeSettings({ ...settingsRef.current, [k]: !settingsRef.current[k] }),
+      })),
+      { id: "a:magnet", label: "Magnet mode", group: "Drawing", toggle: magnet !== "off", run: () => setMagnet((m) => (m === "off" ? "weak" : "off")) },
+      { id: "a:lock", label: "Lock all drawings", group: "Drawing", toggle: lockAll, run: () => setLockAll((v) => !v) },
+      { id: "a:hide", label: "Hide drawings", group: "Drawing", toggle: hide.drawings, run: () => setHideKind("drawings") },
+      { id: "a:stay", label: "Stay in drawing mode", group: "Drawing", toggle: stay, run: () => setStay((v) => !v) },
       { id: "a:rmd", label: "Remove all drawings", group: "Drawing", run: () => clearDrawings() },
       { id: "a:rmi", label: "Remove all indicators", group: "Drawing", run: () => removeKind("indicators") },
-      { id: "a:quick", label: settings.buySellButtons ? "Hide buy / sell buttons" : "Show buy / sell buttons (quick trade)", group: "Trading", run: () => changeSettings({ ...settingsRef.current, buySellButtons: !settingsRef.current.buySellButtons }) },
+
       { id: "a:keys", label: "Keyboard shortcuts", group: "Help", hint: "?", run: () => setDialog({ k: "shortcuts" }) },
     );
     if (onAction) {
@@ -4595,7 +4906,11 @@ export default function ChartPanel(props: ChartPanelProps) {
   // snapshot of the drawing when its settings dialog opens (one undo step)
   const dialogSnapRef = useRef<Snap | null>(null);
   useEffect(() => {
-    dialogSnapRef.current = dialog?.k === "drawSettings" ? snapshot("edit drawing") : null;
+    dialogSnapRef.current =
+      dialog?.k === "drawSettings" ? snapshot("edit drawing")
+      : dialog?.k === "settings" ? { ...snapshot("change settings"), settings: settingsRef.current }
+      : dialog?.k === "indSettings" ? snapshot("change indicator settings")
+      : null;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dialog?.k, dialog?.k === "drawSettings" ? dialog.id : null]);
 
@@ -4740,7 +5055,22 @@ export default function ChartPanel(props: ChartPanelProps) {
   );
 
   const toolbar = (
-    <div className="chart-toolbar" data-testid="chart-toolbar">
+    <div className={`chart-toolbar-wrap${tbScroll.left || tbScroll.right ? " scrolls" : ""}`}>
+    <div className="chart-toolbar" data-testid="chart-toolbar" ref={toolbarRef} onScroll={() => { measureToolbar(); positionToolbarMenu(); }}>
+      {onAction && (
+        <div className="chart-group chart-menu-wrap">
+          <button type="button" className={`chart-btn tb-logo${menuOpen === "products" ? " on" : ""}`} onClick={menuBtn("products")} title="Products" data-testid="chart-products">◆▾</button>
+          {menuOpen === "products" && (
+            <div className="chart-menu cdrop" data-testid="products-menu">
+              <div className="chart-menu-head">Fyers products</div>
+              <a className="chart-menu-item" href="https://trade.fyers.in/" target="_blank" rel="noopener noreferrer" onClick={() => setMenuOpen(null)}>FYERS Web ↗</a>
+              <button type="button" className="chart-menu-item" onClick={() => { setMenuOpen(null); onAction("panel:flow"); }}>Smart Charts (order flow)</button>
+              <button type="button" className="chart-menu-item" onClick={() => { setMenuOpen(null); onAction("scalper"); }}>Option Scalper</button>
+              <button type="button" className="chart-menu-item" onClick={() => { setMenuOpen(null); setDialog({ k: "whatsnew" }); }} data-testid="whats-new">What's New</button>
+            </div>
+          )}
+        </div>
+      )}
       <button type="button" className="chart-btn chart-sym-btn" onClick={() => setDialog({ k: "symbol", q: "" })} title={onSymbolChange ? "Symbol search (type on the chart)" : symbol} disabled={!onSymbolChange} data-testid="chart-symbol">
         <span className="ico">⌕</span><span className="sym">{shortName}</span>
       </button>
@@ -4910,9 +5240,17 @@ export default function ChartPanel(props: ChartPanelProps) {
       {pinnedTools.map((id) => {
         const t = TOOLS_MENU.find((x) => x.id === id);
         if (!t || (t.host && !onAction)) return null;
+        if (t.href)
+          return (
+            <a key={id} className="chart-btn pinned-tool" href={t.href} target="_blank" rel="noopener noreferrer" title={`${t.label} (opens Fyers)`} data-testid={`chart-tool-${id}`}>
+              {t.icon}<span className="pt-label">{t.label}</span>
+            </a>
+          );
         return (
-          <button key={id} type="button" className={`chart-btn${id === "replay" && replay.on ? " on" : ""}`} onClick={() => runTool(id)} title={t.label} data-testid={`chart-tool-${id}`}>
+          <button key={id} type="button" className={`chart-btn pinned-tool${id === "replay" && replay.on ? " on" : ""}`} onClick={() => runTool(id)} title={t.label} data-testid={`chart-tool-${id}`}>
             {t.icon}
+            {t.short && <span className="pt-label">{t.short}</span>}
+            {t.badge && <span className="ind-new">{t.badge}</span>}
           </button>
         );
       })}
@@ -4922,11 +5260,17 @@ export default function ChartPanel(props: ChartPanelProps) {
           <div className="chart-menu">
             {TOOLS_MENU.filter((t) => !t.host || onAction).map((t) => (
               <div key={t.id} className="chart-menu-row">
+                {t.href ? (
+                  <a className="chart-menu-item" href={t.href} target="_blank" rel="noopener noreferrer" onClick={() => setMenuOpen(null)} title="Opens Fyers in a new tab">
+                    <span className="ico">{t.icon}</span> {t.label} <span className="hint">↗</span>
+                  </a>
+                ) : (
                 <button type="button" className="chart-menu-item" onClick={() => runTool(t.id)}>
                   <span className="ico">{t.icon}</span> {t.label}{t.badge && <span className="badge-new">{t.badge}</span>}
                   {t.id === "theme" && <span className="hint"> ({settings.theme === "light" ? "light" : "dark"})</span>}
                   {t.id === "privacy" && privacy && <span className="hint"> (on)</span>}
                 </button>
+                )}
                 {star(pinnedTools.includes(t.id), () => setPinnedTools((l) => toggleIn(l, t.id)), `Pin ${t.label}`)}
               </div>
             ))}
@@ -4950,12 +5294,24 @@ export default function ChartPanel(props: ChartPanelProps) {
           {menuOpen === "snapshot" && (
             <div className="chart-menu cdrop right">
               <button type="button" className="chart-menu-item" onClick={() => void takeSnapshot("download")} data-testid="chart-snapshot-download">Download image<span className="kbd">Ctrl+Alt+S</span></button>
-              <button type="button" className="chart-menu-item" onClick={() => void takeSnapshot("copy")}>Copy image</button>
+              <button type="button" className="chart-menu-item" onClick={() => void takeSnapshot("copy")}>Copy image<span className="kbd">Ctrl+Shift+S</span></button>
+              <button type="button" className="chart-menu-item" onClick={() => void takeSnapshot("link")} data-testid="chart-snapshot-link">Copy link<span className="kbd">Alt+S</span></button>
               <button type="button" className="chart-menu-item" onClick={() => void takeSnapshot("open")}>Open in new tab</button>
+              <button type="button" className="chart-menu-item" onClick={() => void takeSnapshot("tweet")}>Tweet image</button>
             </div>
           )}
         </div>
+        {onAction && (
+          <button type="button" className="chart-btn" onClick={() => onAction("logout")} title="Logout from the trading terminal (disconnects Fyers)" data-testid="chart-logout">⏻</button>
+        )}
       </div>
+    </div>
+      {tbScroll.left && (
+        <button type="button" className="tb-arrow left" onClick={() => toolbarRef.current?.scrollBy({ left: -240, behavior: "smooth" })} title="Scroll left" aria-label="Scroll toolbar left">‹</button>
+      )}
+      {tbScroll.right && (
+        <button type="button" className="tb-arrow right" onClick={() => toolbarRef.current?.scrollBy({ left: 240, behavior: "smooth" })} title="More tools" aria-label="Scroll toolbar right" data-testid="toolbar-more">›</button>
+      )}
     </div>
   );
 
@@ -5650,7 +6006,11 @@ export default function ChartPanel(props: ChartPanelProps) {
         <IndicatorSettings
           inst={dlgInd}
           onChange={updateIndicator}
-          onClose={() => setDialog(null)}
+          onClose={() => {
+            const snap = dialogSnapRef.current;
+            if (snap && JSON.stringify(snap.indicators) !== JSON.stringify(indicatorsRef.current)) pushUndo(snap.label, snap);
+            setDialog(null);
+          }}
           onSaveDefault={(i) => {
             const all = loadJson<Record<string, Partial<IndicatorInstance>>>("chart:indDefaults", {});
             all[i.type] = instanceDefaults(i);
@@ -5663,7 +6023,11 @@ export default function ChartPanel(props: ChartPanelProps) {
         <ChartSettingsDialog
           value={settings}
           onChange={changeSettings}
-          onClose={() => setDialog(null)}
+          onClose={() => {
+            const snap = dialogSnapRef.current;
+            if (snap?.settings && JSON.stringify(snap.settings) !== JSON.stringify(settingsRef.current)) pushUndo(snap.label, snap);
+            setDialog(null);
+          }}
           theme={{ up: theme.up, down: theme.down, text: theme.text, grid: theme.grid, bg: theme.bg, accent: theme.accent, crosshair: theme.crosshair, border: theme.border }}
           trading={trading}
           onTrading={onTrading}
@@ -5707,6 +6071,7 @@ export default function ChartPanel(props: ChartPanelProps) {
         />
       )}
       {dlg?.k === "insights" && <InsightsDialog symbol={symbol} name={shortName} onClose={() => setDialog(null)} />}
+      {dlg?.k === "whatsnew" && <WhatsNewDialog onClose={() => setDialog(null)} />}
       {dlg?.k === "interval" && (
         <IntervalPrompt
           initial={dlg.txt}

@@ -233,3 +233,33 @@ export function InsightsDialog({ symbol, name, onClose }: { symbol: string; name
     </Modal>
   );
 }
+
+const WHATS_NEW: [string, string[]][] = [
+  ["Chart", [
+    "≈140 indicators incl. the Fyers desk set (CPR D / W / M, ORB, ATR trailing stop, Chandelier, KAMA, Jurik, candlestick patterns, RSI divergence, OI)",
+    "Shaded clouds and band backgrounds; plot type per output; pattern / fractal markers",
+    "Legend More menu: move to pane, pin to scale, visual order, copy, About; Manage panes",
+    "Lock price to bar ratio, raw-price label in % mode, executions on bars, ticks P&L",
+  ]],
+  ["Drawing", [
+    "Pin, arrow marks in all four directions, stickers and icon glyphs, drag-to-zoom",
+    "Named drawing templates, visibility ranges per timeframe, copy / paste between charts",
+  ]],
+  ["Desk", [
+    "Market depth ladder, time & sales, futures chain, options strategy builder",
+    "Fyers live view of the whole account; light theme; 4 / 5 / 6 / 7 / 8-chart layouts",
+  ]],
+];
+
+export function WhatsNewDialog({ onClose }: { onClose: () => void }) {
+  return (
+    <Modal title="What's new" onClose={onClose} width={520} testid="whats-new-dialog">
+      {WHATS_NEW.map(([sec, items]) => (
+        <div key={sec}>
+          <div className="cform-sec-title">{sec}</div>
+          <ul className="whats-new">{items.map((t) => <li key={t}>{t}</li>)}</ul>
+        </div>
+      ))}
+    </Modal>
+  );
+}

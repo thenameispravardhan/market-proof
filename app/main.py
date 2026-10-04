@@ -42,6 +42,7 @@ from app.api import (
     rules as rules_api,
     search as search_api,
     settings_api,
+    snapshots as snapshots_api,
     strategies as strategies_api,
     system as system_api,
     trading_mode,
@@ -641,6 +642,7 @@ app.include_router(warehouse_api.router)
 app.include_router(model_api.router)
 app.include_router(system_api.router)
 app.include_router(algo_api.router)
+app.include_router(snapshots_api.router)
 
 
 # -------------------------------------------------------------------------
