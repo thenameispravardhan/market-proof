@@ -892,6 +892,8 @@ export default function Trade() {
     }
     switch (a) {
       case "usersettings": setUserSettingsOpen(true); return;
+      case "ticket:buy": onBookMarket("BUY"); return;
+      case "ticket:sell": onBookMarket("SELL"); return;
       case "logout": {
         if (window.confirm("Log out of the Fyers trading session? Orders already at the broker stay working; reconnect from Accounts.")) {
           fyersDisconnect.mutate(undefined, { onSuccess: () => setLastResult({ type: "success", message: "Logged out of Fyers — reconnect from Accounts" }) });

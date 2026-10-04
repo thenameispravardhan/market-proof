@@ -1,7 +1,7 @@
 // ChartDialogs — symbol search, go to date, the command palette (Quick
 // Search), keyboard shortcuts, the alert editor, and drawing settings.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api } from "../../api/client";
 import type { InstrumentHit, SearchResponse } from "../../types";
 import { Check, ColorInput, Modal, Num, Row, Sel } from "./chartUi";
@@ -13,58 +13,158 @@ import { VIS_GROUPS } from "./indicatorCatalog";
 // Symbol search
 // ---------------------------------------------------------------------------
 
-const SEGMENTS: { id: string; label: string; seg: string | null }[] = [
-  { id: "all", label: "All", seg: null },
-  { id: "stocks", label: "Stocks", seg: "EQ" },
-  { id: "fno", label: "Futures & options", seg: "FO" },
-  { id: "indices", label: "Indices", seg: "INDEX" },
+/** Type chips → the search API's `segment` / `types` filters. */
+const TYPE_CHIPS: { id: string; label: string; seg?: string; types?: string }[] = [
+  { id: "all", label: "All" },
+  { id: "stocks", label: "Stocks", types: "EQ" },
+  { id: "futures", label: "Futures", types: "FUT" },
+  { id: "options", label: "Options", types: "OPT" },
+  { id: "indices", label: "Indices", types: "IND" },
+  { id: "etf", label: "ETFs", types: "ETF" },
   { id: "commodity", label: "Commodities", seg: "COM" },
   { id: "currency", label: "Currency", seg: "CD" },
 ];
 
+/** Sources: exchange + segment (NFO = NSE F&O, BFO = BSE F&O, CDS = NSE currency). */
+const SOURCES: { v: string; l: string }[] = [
+  { v: "all", l: "All sources" },
+  { v: "NSE", l: "NSE" },
+  { v: "BSE", l: "BSE" },
+  { v: "MCX", l: "MCX" },
+  { v: "NFO", l: "NFO · NSE F&O" },
+  { v: "BFO", l: "BFO · BSE F&O" },
+  { v: "CDS", l: "CDS · currency" },
+];
+
 const TYPE_BADGE: Record<string, string> = { EQ: "stock", FUT: "futures", CE: "call", PE: "put", IND: "index" };
+const PAGE = 50;
+
+const isEtf = (h: InstrumentHit) => h.instrument_type === "EQ" && /ETF|BEES/i.test(`${h.short_name} ${h.symbol}`);
+
+/** Same rules as the search API, for the (client-side) recent list. */
+export function hitMatches(h: InstrumentHit, chip: string, src: string): boolean {
+  const c = TYPE_CHIPS.find((x) => x.id === chip);
+  if (c?.seg && h.segment !== c.seg) return false;
+  if (c?.types) {
+    const t = h.instrument_type;
+    const ok = c.types === "EQ" ? t === "EQ" && !isEtf(h)
+      : c.types === "ETF" ? isEtf(h)
+        : c.types === "OPT" ? t === "CE" || t === "PE"
+          : c.types === "IND" ? t === "IND" || h.segment === "INDEX"
+            : t === c.types;
+    if (!ok) return false;
+  }
+  if (src === "all") return true;
+  const fo = h.segment === "FO", cd = h.segment === "CD";
+  if (src === "NSE" || src === "BSE") return h.exchange === src && !fo && !cd;
+  if (src === "MCX") return h.exchange === "MCX";
+  if (src === "NFO") return h.exchange === "NSE" && fo;
+  if (src === "BFO") return h.exchange === "BSE" && fo;
+  if (src === "CDS") return h.exchange === "NSE" && cd;
+  return true;
+}
+
+/** "NSE:SBIN-EQ" → "NSE:SBIN" (TradingView's EXCHANGE:TICKER). */
+export function exchTicker(h: Pick<InstrumentHit, "symbol" | "exchange">): string {
+  const raw = h.symbol.includes(":") ? h.symbol.slice(h.symbol.indexOf(":") + 1) : h.symbol;
+  return `${h.exchange}:${raw.replace(/-(EQ|BE|INDEX)$/i, "")}`;
+}
+
+/** Wrap every case-insensitive match of the query's words in <mark>. */
+export function highlight(text: string, q: string): ReactNode {
+  const words = q.trim().split(/\s+/).filter(Boolean).map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  if (!words.length) return text;
+  const parts = text.split(new RegExp(`(${words.join("|")})`, "ig"));
+  return parts.map((p, i) => (i % 2 === 1 ? <mark key={i} className="sym-hl">{p}</mark> : p));
+}
 
 export function SymbolSearchDialog({
   initial = "",
+  select = false,
   title = "Symbol Search",
   recent,
   onPick,
   onClose,
 }: {
   initial?: string;
+  /** Pre-select the initial text (opened from the toolbar with the current symbol). */
+  select?: boolean;
   title?: string;
   recent: InstrumentHit[];
   onPick: (h: InstrumentHit) => void;
   onClose: () => void;
 }) {
   const [q, setQ] = useState(initial);
-  const [seg, setSeg] = useState("all");
-  const [exch, setExch] = useState("all");
+  const [chip, setChip] = useState("all");
+  const [src, setSrc] = useState("all");
   const [hits, setHits] = useState<InstrumentHit[]>([]);
+  const [more, setMore] = useState(false);
   const [busy, setBusy] = useState(false);
   const [hl, setHl] = useState(0);
-  useEffect(() => {
-    const query = q.trim();
-    if (!query) {
-      setHits([]);
-      return;
-    }
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const seqRef = useRef(0);
+  const query = q.trim();
+  const url = (offset: number) => {
+    const c = TYPE_CHIPS.find((x) => x.id === chip);
+    return `/api/search/symbols?q=${encodeURIComponent(query)}&limit=${PAGE}&offset=${offset}` +
+      `${c?.seg ? `&segment=${c.seg}` : ""}${c?.types ? `&types=${c.types}` : ""}${src !== "all" ? `&exchange=${src}` : ""}`;
+  };
+  const load = (offset: number) => {
+    const seq = ++seqRef.current;
     setBusy(true);
-    const s = SEGMENTS.find((x) => x.id === seg)?.seg;
-    const h = setTimeout(() => {
-      void api
-        .get<SearchResponse>(`/api/search/symbols?q=${encodeURIComponent(query)}&limit=50${s ? `&segment=${s}` : ""}`)
-        .then((r) => setHits(r.hits ?? []))
-        .catch(() => setHits([]))
-        .finally(() => setBusy(false));
-    }, 200);
+    return api
+      .get<SearchResponse>(url(offset))
+      .then((r) => {
+        if (seq !== seqRef.current) return;
+        const page = r.hits ?? [];
+        setHits((h) => {
+          if (!offset) return page;
+          const seen = new Set(h.map((x) => x.symbol));
+          return [...h, ...page.filter((x) => !seen.has(x.symbol))];
+        });
+        setMore(r.has_more ?? page.length >= PAGE);
+      })
+      .catch(() => {
+        if (seq !== seqRef.current) return;
+        if (!offset) setHits([]);
+        setMore(false);
+      })
+      .finally(() => seq === seqRef.current && setBusy(false));
+  };
+  useEffect(() => {
+    const h = setTimeout(() => void load(0), 200);
     return () => clearTimeout(h);
-  }, [q, seg]);
-  const shown = (q.trim() ? hits : recent).filter((h) => exch === "all" || h.exchange === exch);
-  useEffect(() => setHl(0), [q, seg, exch]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query, chip, src]);
+  useEffect(() => {
+    if (select) inputRef.current?.select();
+  }, [select]);
+  const recentShown = query ? [] : recent.filter((h) => hitMatches(h, chip, src));
+  const shown = [...recentShown, ...hits.filter((h) => !recentShown.some((r) => r.symbol === h.symbol))];
+  useEffect(() => setHl(0), [query, chip, src]);
+  useEffect(() => {
+    listRef.current?.querySelector(".sym-row.hl")?.scrollIntoView?.({ block: "nearest" });
+  }, [hl]);
+  const onScroll = () => {
+    const el = listRef.current;
+    if (el && more && !busy && el.scrollTop + el.clientHeight >= el.scrollHeight - 80) void load(hits.length);
+  };
+  const pick = (h: InstrumentHit) => {
+    onPick(h);
+    onClose();
+  };
   return (
-    <Modal title={title} onClose={onClose} width={620} testid="symbol-search" className="sym-search">
+    <Modal
+      title={title}
+      onClose={onClose}
+      width={660}
+      testid="symbol-search"
+      className="sym-search"
+      footer={<span className="sym-foot">Simply start typing while on the chart to pull up this search box</span>}
+    >
       <input
+        ref={inputRef}
         className="chart-menu-input sym-input"
         value={q}
         autoFocus
@@ -72,38 +172,44 @@ export function SymbolSearchDialog({
         aria-label="Search symbol"
         onChange={(e) => setQ(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === "ArrowDown") { e.preventDefault(); setHl((i) => Math.min(shown.length - 1, i + 1)); }
-          else if (e.key === "ArrowUp") { e.preventDefault(); setHl((i) => Math.max(0, i - 1)); }
-          else if (e.key === "Enter" && shown[hl]) { onPick(shown[hl]); onClose(); }
+          if (e.key === "ArrowDown") {
+            e.preventDefault();
+            setHl((i) => Math.min(shown.length - 1, i + 1));
+            if (hl >= shown.length - 3 && more && !busy) void load(hits.length);
+          } else if (e.key === "ArrowUp") { e.preventDefault(); setHl((i) => Math.max(0, i - 1)); }
+          else if (e.key === "Enter" && shown[hl]) pick(shown[hl]);
         }}
         data-testid="symbol-search-input"
       />
       <div className="sym-filters">
-        {SEGMENTS.map((s) => (
-          <button key={s.id} type="button" className={`chip${seg === s.id ? " on" : ""}`} onClick={() => setSeg(s.id)}>{s.label}</button>
+        {TYPE_CHIPS.map((c) => (
+          <button key={c.id} type="button" className={`chip${chip === c.id ? " on" : ""}`} onClick={() => setChip(c.id)} data-testid={`symbol-chip-${c.id}`}>{c.label}</button>
         ))}
         <span className="grow" />
-        <Sel value={exch} options={[{ v: "all", l: "All exchanges" }, { v: "NSE", l: "NSE" }, { v: "BSE", l: "BSE" }, { v: "MCX", l: "MCX" }]} onChange={setExch} ariaLabel="Exchange" />
+        <Sel value={src} options={SOURCES.map((x) => ({ v: x.v, l: x.l }))} onChange={setSrc} ariaLabel="Source" />
       </div>
-      <div className="sym-list">
-        {!q.trim() && recent.length > 0 && <div className="sym-head">Recently searched</div>}
-        {busy && <div className="hint">searching…</div>}
-        {!busy && q.trim() && shown.length === 0 && <div className="hint">No symbols match "{q}".</div>}
+      <div className="sym-cols"><span>Symbol</span><span>Description</span><span /><span>Source</span></div>
+      <div className="sym-list" ref={listRef} onScroll={onScroll} data-testid="symbol-search-list">
+        {recentShown.length > 0 && <div className="sym-head">Recently searched</div>}
         {shown.map((h, i) => (
-          <button
-            key={h.symbol}
-            type="button"
-            className={`sym-row${i === hl ? " hl" : ""}`}
-            onMouseEnter={() => setHl(i)}
-            onClick={() => { onPick(h); onClose(); }}
-            data-testid={`symbol-search-row-${h.symbol}`}
-          >
-            <span className="sym">{h.short_name}</span>
-            <span className="desc">{h.display}</span>
-            <span className="badge neutral">{TYPE_BADGE[h.instrument_type] ?? h.instrument_type}</span>
-            <span className="exch">{h.exchange}</span>
-          </button>
+          <Fragment key={h.symbol}>
+            {!query && i === recentShown.length && recentShown.length > 0 && <div className="sym-head">Popular</div>}
+            <button
+              type="button"
+              className={`sym-row${i === hl ? " hl" : ""}`}
+              onMouseEnter={() => setHl(i)}
+              onClick={() => pick(h)}
+              data-testid={`symbol-search-row-${h.symbol}`}
+            >
+              <span className="sym">{highlight(exchTicker(h), query)}</span>
+              <span className="desc">{highlight(h.display, query)}</span>
+              <span className="badge neutral">{isEtf(h) ? "etf" : TYPE_BADGE[h.instrument_type] ?? h.instrument_type}</span>
+              <span className="exch">{h.exchange}{h.segment === "FO" ? " F&O" : ""}</span>
+            </button>
+          </Fragment>
         ))}
+        {busy && <div className="hint sym-busy">{hits.length ? "loading more…" : "searching…"}</div>}
+        {!busy && shown.length === 0 && <div className="hint">{query ? `No symbols match "${q}".` : "No symbols for this filter."}</div>}
       </div>
     </Modal>
   );
