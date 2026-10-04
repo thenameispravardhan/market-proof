@@ -41,7 +41,7 @@ import {
 import { useLiveQuote } from "../hooks/useQuotes";
 import ChartPanel, { type BrokerLine, type ChartOrder, type ChartPosition, type HostAction } from "../components/trade/ChartPanel";
 import Scalper, { splitDrag } from "../components/trade/Scalper";
-import { AccountManager, LayoutMenu, SymbolDetails, WatchlistTable, useLayouts, type BottomTab, type WatchState } from "../components/trade/TradePanels";
+import { AccountManager, BOTTOM_TABS, LayoutMenu, SymbolDetails, WatchlistTable, useLayouts, type BottomTab, type WatchState } from "../components/trade/TradePanels";
 import { BookPanel, FnoPanel, type DeskTab } from "../components/trade/ProPanels";
 import { loadUserPrefs, UserSettingsDialog, type UserPrefs } from "../components/trade/UserSettings";
 import type { SyncFlags } from "../components/trade/chartSync";
@@ -1020,9 +1020,11 @@ export default function Trade() {
           {bottomOpen && <div className="tv-resize" onPointerDown={(e) => { setBottomMax(false); drag(e, "y", bottomH, setBottomH, 120, window.innerHeight * 0.75, "trade:bottomH"); }} title="Drag to resize" />}
           {!bottomOpen && (
             <div className="tabs trade-tabs" role="tablist">
-              {([["positions", `Positions${positions?.filter((p) => p.quantity !== 0).length ? ` (${positions.filter((p) => p.quantity !== 0).length})` : ""}`], ["orders", `Orders${pending?.count ? ` (${pending.count})` : ""}`], ["trades", "Trades"], ["account", "Account"], ["basket", "Basket"], ["broker", "Fyers live"], ["log", "Notifications"]] as const).map(([k, label]) => (
-                <button key={k} type="button" role="tab" aria-selected={false} className="tab" onClick={() => openBottom(k)}>{label}</button>
-              ))}
+              <button type="button" role="tab" aria-selected={false} className="tab am-trade-tab" onClick={() => openBottom("trade")} title="DOM — trade from the price ladder">Trade</button>
+              {BOTTOM_TABS.map(([k, l]) => {
+                const n = k === "positions" ? positions?.filter((p) => p.quantity !== 0).length ?? 0 : k === "orders" ? pending?.count ?? 0 : 0;
+                return <button key={k} type="button" role="tab" aria-selected={false} className="tab" onClick={() => openBottom(k)}>{l}{n ? ` (${n})` : ""}</button>;
+              })}
               <button type="button" className="tab tv-collapse" onClick={() => openBottom(bottomTab)} title="Open panel">▴</button>
             </div>
           )}
@@ -1032,7 +1034,15 @@ export default function Trade() {
               onTab={(t) => openBottom(t)}
               positions={positions}
               managed={managed}
-              pendingCount={pending?.count ?? 0}
+              pendingOrders={pending?.orders ?? []}
+              onCancel={(id) => void onCancel(id)}
+              cancelBusyId={cancelOrder.isPending ? cancelOrder.variables?.broker_order_id ?? null : null}
+              cancelBanner={cancelMessage && (
+                <div className={`result ${cancelMessage.type}`} data-testid="cancel-result">
+                  {cancelMessage.text}
+                </div>
+              )}
+              accountId={accountId}
               privacy={privacy}
               connected={accountId != null}
               accountLabel={realAccounts[0] ? `${realAccounts[0].name} · INR` : ""}
@@ -1040,72 +1050,13 @@ export default function Trade() {
               closeFor={closeFor}
               levelsFor={levelsFor}
               orderFor={orderFor}
+              instant={tset.instant}
+              qty={Number(quantity)}
+              onQty={(n) => setQuantity(n)}
+              onLogout={() => hostAction("logout")}
               maximized={bottomMax}
               onMaximize={() => setBottomMax((v) => !v)}
               onCollapse={() => openBottom(null)}
-              pendingSection={
-          <section className="trade-card" data-testid="trade-pending">
-            <h2>Pending orders</h2>
-            {cancelMessage && (
-              <div
-                className={`result ${cancelMessage.type}`}
-                data-testid="cancel-result"
-              >
-                {cancelMessage.text}
-              </div>
-            )}
-            {(pending?.count ?? 0) === 0 ? (
-              <div className="empty">No pending orders.</div>
-            ) : (
-              <table className="pending-table">
-                <thead>
-                  <tr>
-                    <th>Symbol</th>
-                    <th>Side</th>
-                    <th>Qty</th>
-                    <th>Type</th>
-                    <th>ID</th>
-                    <th />
-                  </tr>
-                </thead>
-                <tbody>
-                  {pending!.orders.map((o) => {
-                    // The mutation's `variables` carries the request body
-                    // while it's in flight; use it to disable just the
-                    // button that was clicked so the rest of the rows
-                    // stay clickable.
-                    const pendingId =
-                      cancelOrder.isPending &&
-                      cancelOrder.variables?.broker_order_id === o.broker_order_id
-                        ? o.broker_order_id
-                        : null;
-                    return (
-                      <tr key={o.id}>
-                        <td className="sym">{o.symbol}</td>
-                        <td className={o.side === "BUY" ? "up" : "down"}>{o.side}</td>
-                        <td>{o.quantity}</td>
-                        <td>{o.order_type}</td>
-                        <td className="broker-id">{o.broker_order_id ?? "—"}</td>
-                        <td>
-                          {o.broker_order_id && (
-                            <button
-                              className="btn small"
-                              onClick={() => onCancel(o.broker_order_id!)}
-                              disabled={pendingId !== null}
-                              data-testid={`cancel-${o.broker_order_id}`}
-                            >
-                              {pendingId !== null ? "cancelling…" : "Cancel"}
-                            </button>
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            )}
-          </section>
-              }
             />
           )}
         </div>
