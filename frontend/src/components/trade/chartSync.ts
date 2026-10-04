@@ -76,3 +76,7 @@ export function subscribeLog(l: () => void): () => void {
 
 /** Which chart the pointer is over (keyboard shortcuts go to it). */
 export const chartFocus: { hover: string | null } = { hover: null };
+
+/** The copied drawing, shared by every chart on the page (Ctrl+C in one
+ *  chart, Ctrl+V in another or after switching symbol). */
+export const drawingClipboard: { current: unknown } = { current: null };

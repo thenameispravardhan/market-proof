@@ -364,7 +364,7 @@ export function DrawingSettingsDialog({
   fmt,
 }: {
   drawing: Drawing;
-  deps: Pick<DrawingDeps, "toolDefaults" | "lineColor">;
+  deps: Pick<DrawingDeps, "toolDefaults" | "lineColor"> & Partial<Pick<DrawingDeps, "candles" | "timeToLogical">>;
   onChange: (d: Drawing) => void;
   onClose: (commit: boolean) => void;
   fmt: (n: number) => string;
@@ -400,7 +400,14 @@ export function DrawingSettingsDialog({
       {tab === "inputs" && isPos && (
         <>
           <Row label="Account size"><Num value={d.data?.account ?? 100000} min={0} step={1000} width={110} onChange={(v) => onChange({ ...d, data: { ...d.data, account: v } })} ariaLabel="Account size" /></Row>
-          <Row label="Risk %"><Num value={d.data?.risk ?? 1} min={0} max={100} step={0.25} onChange={(v) => onChange({ ...d, data: { ...d.data, risk: v } })} ariaLabel="Risk" /></Row>
+          <Row label="Risk">
+            <Sel value={d.data?.riskMode ?? "pct"} options={[{ v: "pct", l: "% of account" }, { v: "amount", l: "Amount (₹)" }]} onChange={(v) => onChange({ ...d, data: { ...d.data, riskMode: v as "pct" | "amount" } })} ariaLabel="Risk mode" />
+            {(d.data?.riskMode ?? "pct") === "pct" ? (
+              <Num value={d.data?.risk ?? 1} min={0} max={100} step={0.25} onChange={(v) => onChange({ ...d, data: { ...d.data, risk: v } })} ariaLabel="Risk" />
+            ) : (
+              <Num value={d.data?.riskAmount ?? 1000} min={0} step={100} width={100} onChange={(v) => onChange({ ...d, data: { ...d.data, riskAmount: v } })} ariaLabel="Risk amount" />
+            )}
+          </Row>
           <Row label="Lot size"><Num value={d.data?.lot ?? 1} min={1} onChange={(v) => onChange({ ...d, data: { ...d.data, lot: Math.round(v) } })} ariaLabel="Lot size" /></Row>
           <Row label="Quantity" hint="0 = sized from account × risk"><Num value={d.data?.qty ?? 0} min={0} onChange={(v) => onChange({ ...d, data: { ...d.data, qty: Math.round(v) } })} ariaLabel="Quantity" /></Row>
           {(["Entry price", "Target price", "Stop price"] as const).map((lbl, i) => (
@@ -457,9 +464,29 @@ export function DrawingSettingsDialog({
       {tab === "coords" &&
         d.points.map((p, i) => {
           const w = chartToWall(p.time);
+          const bars = deps.candles?.() ?? [];
+          const bar = deps.timeToLogical?.(p.time);
+          const timeOfBar = (k: number): number | null => {
+            if (!bars.length) return null;
+            if (k >= 0 && k < bars.length) return bars[k].time;
+            const step = bars.length > 1 ? bars[bars.length - 1].time - bars[bars.length - 2].time : 60;
+            return k < 0 ? bars[0].time + k * step : bars[bars.length - 1].time + (k - bars.length + 1) * step;
+          };
           return (
             <Row key={i} label={`#${i + 1}`}>
               <Num value={Math.round(p.price * 100) / 100} step={0.05} width={100} onChange={(v) => onChange({ ...d, points: d.points.map((q, j) => (j === i ? { ...q, price: v } : q)) })} ariaLabel={`Point ${i + 1} price`} />
+              {bar != null && (
+                <Num
+                  value={Math.round(bar)}
+                  step={1}
+                  width={70}
+                  onChange={(v) => {
+                    const t = timeOfBar(Math.round(v));
+                    if (t !== null) onChange({ ...d, points: d.points.map((q, j) => (j === i ? { ...q, time: t } : q)) });
+                  }}
+                  ariaLabel={`Point ${i + 1} bar`}
+                />
+              )}
               <input
                 type="datetime-local"
                 value={`${w.date}T${w.time}`}
@@ -474,9 +501,28 @@ export function DrawingSettingsDialog({
           );
         })}
       {tab === "visibility" &&
-        VIS_GROUPS.map((g) => (
-          <Check key={g.id} label={g.label} checked={d.vis?.[g.id] !== false} onChange={(v) => onChange({ ...d, vis: { ...(d.vis ?? {}), [g.id]: v } })} />
-        ))}
+        VIS_GROUPS.map((g) => {
+          const raw = d.vis?.[g.id];
+          const v = raw && typeof raw === "object" ? raw : { on: raw !== false, min: 1, max: g.max };
+          const put = (patch: Partial<typeof v>) => {
+            const next = { ...v, ...patch };
+            const whole = next.min <= 1 && next.max >= g.max;
+            onChange({ ...d, vis: { ...(d.vis ?? {}), [g.id]: whole ? next.on : next } });
+          };
+          return (
+            <div key={g.id} className="cform-row">
+              <label className="cform-check">
+                <input type="checkbox" checked={v.on} onChange={(e) => put({ on: e.target.checked })} />
+                {g.label}
+              </label>
+              <span className="cform-ctl">
+                <Num value={v.min} min={1} max={g.max} width={56} onChange={(n) => put({ min: Math.round(n) })} ariaLabel={`${g.label} from`} />
+                <span className="hint">–</span>
+                <Num value={v.max} min={1} max={g.max} width={56} onChange={(n) => put({ max: Math.round(n) })} ariaLabel={`${g.label} to`} />
+              </span>
+            </div>
+          );
+        })}
     </Modal>
   );
 }

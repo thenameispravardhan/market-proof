@@ -64,11 +64,21 @@ export interface DrawingData {
   risk?: number;
   qty?: number;
   lot?: number;
+  /** Size the position by a cash risk instead of a % of the account. */
+  riskMode?: "pct" | "amount";
+  riskAmount?: number;
   emoji?: string;
+  /** Icons tab: a monochrome glyph painted in the drawing's colour. */
+  glyph?: boolean;
+  /** Stickers tab: an emoji + caption badge. */
+  sticker?: { text: string; color: string };
   src?: string; // image data URL
   w?: number;
   h?: number;
 }
+
+/** Per-timeframe visibility: on/off, or on within a range of interval counts. */
+export type DrawingVis = boolean | { on: boolean; min: number; max: number };
 
 export interface Drawing {
   id: string;
@@ -82,7 +92,7 @@ export interface Drawing {
   /** Pane-relative position (0..1) for screen-anchored tools. */
   screen?: { x: number; y: number };
   /** Per-timeframe visibility; absent / true = shown. */
-  vis?: Partial<Record<IntervalGroup, boolean>>;
+  vis?: Partial<Record<IntervalGroup, DrawingVis>>;
   data?: DrawingData;
 }
 
@@ -107,6 +117,10 @@ export interface DrawingDeps {
   barSpacing: () => number;
   candles: () => Bar[];
   intervalGroup: () => IntervalGroup;
+  /** The interval's count within its group (5 for 5m) — visibility ranges. */
+  intervalCount?: () => number;
+  /** Instrument tick size (position tools show distances in ticks). */
+  tickSize?: () => number;
   lineColor: () => string;
   accent: () => string;
   upColor: () => string;
@@ -144,6 +158,8 @@ export interface ToolDef {
   /** Not persisted (measure). */
   temp?: boolean;
   hint?: string;
+  /** Keyboard shortcut shown in the flyout. */
+  kbd?: string;
 }
 
 const lv = (v: number, color: string, on = true): Level => ({ v, color, on });
@@ -173,15 +189,15 @@ const CIRCLE_LEVELS: Level[] = [
 
 export const TOOLS: ToolDef[] = [
   // ---- trend line tools ----
-  { id: "trend", label: "Trend Line", group: "lines", section: "Lines", icon: "╱", points: 2 },
+  { id: "trend", label: "Trend Line", group: "lines", section: "Lines", icon: "╱", points: 2, kbd: "Alt+T" },
   { id: "ray", label: "Ray", group: "lines", section: "Lines", icon: "↗", points: 2 },
   { id: "info", label: "Info Line", group: "lines", section: "Lines", icon: "ⓘ", points: 2 },
   { id: "extended", label: "Extended Line", group: "lines", section: "Lines", icon: "⟷", points: 2 },
   { id: "angle", label: "Trend Angle", group: "lines", section: "Lines", icon: "∠", points: 2 },
-  { id: "hline", label: "Horizontal Line", group: "lines", section: "Lines", icon: "─", points: 1, axis: "price" },
-  { id: "hray", label: "Horizontal Ray", group: "lines", section: "Lines", icon: "⇥", points: 1 },
-  { id: "vline", label: "Vertical Line", group: "lines", section: "Lines", icon: "│", points: 1, axis: "time" },
-  { id: "cross", label: "Cross Line", group: "lines", section: "Lines", icon: "┼", points: 1 },
+  { id: "hline", label: "Horizontal Line", group: "lines", section: "Lines", icon: "─", points: 1, axis: "price", kbd: "Alt+H" },
+  { id: "hray", label: "Horizontal Ray", group: "lines", section: "Lines", icon: "⇥", points: 1, kbd: "Alt+J" },
+  { id: "vline", label: "Vertical Line", group: "lines", section: "Lines", icon: "│", points: 1, axis: "time", kbd: "Alt+V" },
+  { id: "cross", label: "Cross Line", group: "lines", section: "Lines", icon: "┼", points: 1, kbd: "Alt+C" },
   { id: "channel", label: "Parallel Channel", group: "lines", section: "Channels", icon: "▱", points: 3 },
   { id: "regression", label: "Regression Trend", group: "lines", section: "Channels", icon: "≈", points: 2 },
   { id: "flattop", label: "Flat Top/Bottom", group: "lines", section: "Channels", icon: "⫠", points: 3 },
@@ -191,7 +207,7 @@ export const TOOLS: ToolDef[] = [
   { id: "mschiff", label: "Modified Schiff Pitchfork", group: "lines", section: "Pitchforks", icon: "⋔", points: 3 },
   { id: "ipitchfork", label: "Inside Pitchfork", group: "lines", section: "Pitchforks", icon: "⋔", points: 3 },
   // ---- gann & fibonacci ----
-  { id: "fib", label: "Fib Retracement", group: "fib", section: "Fibonacci", icon: "≣", points: 2, defaults: { levels: FIB_LEVELS } },
+  { id: "fib", label: "Fib Retracement", group: "fib", section: "Fibonacci", icon: "≣", points: 2, defaults: { levels: FIB_LEVELS }, kbd: "Alt+F" },
   { id: "fibext", label: "Trend-Based Fib Extension", group: "fib", section: "Fibonacci", icon: "⩸", points: 3, defaults: { levels: FIB_EXT_LEVELS } },
   { id: "fibchannel", label: "Fib Channel", group: "fib", section: "Fibonacci", icon: "⫽", points: 3, defaults: { levels: FIB_LEVELS.slice(0, 8) } },
   { id: "fibtime", label: "Fib Time Zone", group: "fib", section: "Fibonacci", icon: "⦙", points: 2, defaults: { levels: FIB_TIME_LEVELS } },
@@ -233,38 +249,39 @@ export const TOOLS: ToolDef[] = [
   { id: "daterange", label: "Date Range", group: "forecast", section: "Measurer", icon: "↔", points: 2 },
   { id: "pricerange", label: "Price Range", group: "forecast", section: "Measurer", icon: "↕", points: 2 },
   { id: "dprange", label: "Date and Price Range", group: "forecast", section: "Measurer", icon: "⤡", points: 2 },
-  // ---- geometric shapes ----
+  // ---- geometric shapes: brushes, arrows, shapes ----
   { id: "brush", label: "Brush", group: "shapes", section: "Brushes", icon: "✎", points: "free", hint: "press and drag" },
   { id: "highlighter", label: "Highlighter", group: "shapes", section: "Brushes", icon: "▌", points: "free", hint: "press and drag", defaults: { color: "#FFEB3B", width: 10 } },
+  { id: "arrowmarker", label: "Arrow Marker", group: "shapes", section: "Arrows", icon: "➚", points: 2 },
   { id: "arrowline", label: "Arrow", group: "shapes", section: "Arrows", icon: "➝", points: 2 },
-  { id: "path", label: "Path", group: "shapes", section: "Arrows", icon: "↝", points: "poly", hint: "click points, double-click to finish" },
-  { id: "rect", label: "Rectangle", group: "shapes", section: "Shapes", icon: "▭", points: 2 },
+  { id: "arrowup", label: "Arrow Mark Up", group: "shapes", section: "Arrows", icon: "⬆", points: 1 },
+  { id: "arrowdown", label: "Arrow Mark Down", group: "shapes", section: "Arrows", icon: "⬇", points: 1 },
+  { id: "arrowleft", label: "Arrow Mark Left", group: "shapes", section: "Arrows", icon: "⬅", points: 1 },
+  { id: "arrowright", label: "Arrow Mark Right", group: "shapes", section: "Arrows", icon: "➡", points: 1 },
+  { id: "rect", label: "Rectangle", group: "shapes", section: "Shapes", icon: "▭", points: 2, kbd: "Alt+Shift+R" },
   { id: "rotrect", label: "Rotated Rectangle", group: "shapes", section: "Shapes", icon: "◇", points: 3 },
+  { id: "path", label: "Path", group: "shapes", section: "Shapes", icon: "↝", points: "poly", hint: "click points, double-click to finish" },
   { id: "circle", label: "Circle", group: "shapes", section: "Shapes", icon: "◯", points: 2 },
   { id: "ellipse", label: "Ellipse", group: "shapes", section: "Shapes", icon: "⬭", points: 2 },
-  { id: "triangle", label: "Triangle", group: "shapes", section: "Shapes", icon: "△", points: 3 },
   { id: "polyline", label: "Polyline", group: "shapes", section: "Shapes", icon: "⌇", points: "poly", hint: "click points, double-click (or click the first point) to finish" },
+  { id: "triangle", label: "Triangle", group: "shapes", section: "Shapes", icon: "△", points: 3 },
   { id: "arc", label: "Arc", group: "shapes", section: "Shapes", icon: "⌒", points: 3 },
   { id: "curve", label: "Curve", group: "shapes", section: "Shapes", icon: "∽", points: 3 },
   { id: "dcurve", label: "Double Curve", group: "shapes", section: "Shapes", icon: "∾", points: 3 },
-  // ---- annotation ----
+  // ---- text & notes ----
   { id: "text", label: "Text", group: "annotate", section: "Text & notes", icon: "T", points: 1, text: "Text" },
   { id: "atext", label: "Anchored Text", group: "annotate", section: "Text & notes", icon: "Ŧ", points: 1, text: "Text", screen: true },
   { id: "note", label: "Note", group: "annotate", section: "Text & notes", icon: "✍", points: 1, text: "Note" },
   { id: "anote", label: "Anchored Note", group: "annotate", section: "Text & notes", icon: "✍", points: 1, text: "Note", screen: true },
+  { id: "pricenote", label: "Price Note", group: "annotate", section: "Text & notes", icon: "₹", points: 2 },
+  { id: "pin", label: "Pin", group: "annotate", section: "Text & notes", icon: "📌", points: 1, text: "Pin" },
+  { id: "table", label: "Table", group: "annotate", section: "Text & notes", icon: "▦", points: 1, text: "Col 1, Col 2\nA, B" },
   { id: "callout", label: "Callout", group: "annotate", section: "Text & notes", icon: "❝", points: 2, text: "Callout" },
   { id: "comment", label: "Comment", group: "annotate", section: "Text & notes", icon: "❞", points: 1, text: "Comment" },
-  { id: "signpost", label: "Signpost", group: "annotate", section: "Text & notes", icon: "⇞", points: 1, text: "Signpost" },
   { id: "pricelabel", label: "Price Label", group: "annotate", section: "Text & notes", icon: "⌖", points: 1 },
-  { id: "pricenote", label: "Price Note", group: "annotate", section: "Text & notes", icon: "₹", points: 2 },
-  { id: "table", label: "Table", group: "annotate", section: "Text & notes", icon: "▦", points: 1, text: "Col 1, Col 2\nA, B" },
+  { id: "signpost", label: "Signpost", group: "annotate", section: "Text & notes", icon: "⇞", points: 1, text: "Signpost" },
+  { id: "flag", label: "Flag Mark", group: "annotate", section: "Text & notes", icon: "⚑", points: 1 },
   { id: "image", label: "Image", group: "annotate", section: "Content", icon: "▣", points: 1 },
-  { id: "arrowmarker", label: "Arrow Marker", group: "annotate", section: "Arrows", icon: "➚", points: 2 },
-  { id: "arrowup", label: "Arrow Mark Up", group: "annotate", section: "Arrows", icon: "⬆", points: 1 },
-  { id: "arrowdown", label: "Arrow Mark Down", group: "annotate", section: "Arrows", icon: "⬇", points: 1 },
-  { id: "arrowleft", label: "Arrow Mark Left", group: "annotate", section: "Arrows", icon: "⬅", points: 1 },
-  { id: "arrowright", label: "Arrow Mark Right", group: "annotate", section: "Arrows", icon: "➡", points: 1 },
-  { id: "flag", label: "Flag Mark", group: "annotate", section: "Arrows", icon: "⚑", points: 1 },
   // ---- icons / measure ----
   { id: "icon", label: "Icon", group: "icons", icon: "☺", points: 1, defaults: { fontSize: 28 } },
   { id: "measure", label: "Measure", group: "forecast", icon: "📏", points: 2, temp: true },
@@ -282,22 +299,44 @@ export const TOOL_GROUPS: { id: ToolGroupId; label: string }[] = [
   { id: "icons", label: "Icons" },
 ];
 
-export const EMOJIS: { e: string; k: string; cat: string }[] = [
-  ["😀", "smile happy", "Smileys"], ["😂", "laugh joy", "Smileys"], ["😎", "cool sunglasses", "Smileys"], ["🤔", "think", "Smileys"],
-  ["😱", "scream fear", "Smileys"], ["😡", "angry", "Smileys"], ["🤑", "money face", "Smileys"], ["😴", "sleep", "Smileys"],
-  ["🥳", "party", "Smileys"], ["🤯", "mind blown", "Smileys"], ["😭", "cry", "Smileys"], ["🙄", "eye roll", "Smileys"],
-  ["🚀", "rocket moon", "Symbols"], ["🔥", "fire hot", "Symbols"], ["💎", "diamond", "Symbols"], ["💰", "money bag", "Symbols"],
-  ["📈", "chart up", "Symbols"], ["📉", "chart down", "Symbols"], ["⚠️", "warning", "Symbols"], ["❗", "exclamation", "Symbols"],
-  ["❓", "question", "Symbols"], ["✅", "check ok", "Symbols"], ["❌", "cross no", "Symbols"], ["⭐", "star", "Symbols"],
-  ["🎯", "target", "Symbols"], ["⏰", "alarm clock time", "Symbols"], ["🔔", "bell alert", "Symbols"], ["💡", "idea bulb", "Symbols"],
-  ["🐂", "bull", "Animals"], ["🐻", "bear", "Animals"], ["🐳", "whale", "Animals"], ["🦄", "unicorn", "Animals"],
-  ["🐢", "turtle slow", "Animals"], ["🦅", "eagle", "Animals"], ["🐍", "snake", "Animals"], ["🐺", "wolf", "Animals"],
-  ["⬆️", "up arrow", "Arrows"], ["⬇️", "down arrow", "Arrows"], ["➡️", "right arrow", "Arrows"], ["⬅️", "left arrow", "Arrows"],
-  ["↗️", "up right", "Arrows"], ["↘️", "down right", "Arrows"], ["🔄", "cycle repeat", "Arrows"], ["🔃", "reverse", "Arrows"],
-  ["🟢", "green circle", "Shapes"], ["🔴", "red circle", "Shapes"], ["🟡", "yellow circle", "Shapes"], ["🔵", "blue circle", "Shapes"],
-  ["🟩", "green square", "Shapes"], ["🟥", "red square", "Shapes"], ["🔺", "red triangle up", "Shapes"], ["🔻", "red triangle down", "Shapes"],
-  ["🇮🇳", "india flag", "Flags"], ["🏁", "finish flag", "Flags"], ["🚩", "red flag", "Flags"], ["🏳️", "white flag", "Flags"],
-].map(([e, k, cat]) => ({ e, k, cat }));
+const EMOJI_ROWS: [string, string][] = [
+  ["Smileys & people", "😀 smile happy|😃 grin|😄 laugh|😁 beam|😆 squint laugh|😂 joy tears|🤣 rofl|😊 blush|😇 angel|🙂 slight smile|😉 wink|😍 love eyes|🤩 star struck|😎 cool sunglasses|🤔 think|🤨 raised brow|😐 neutral|😑 expressionless|🙄 eye roll|😏 smirk|😬 grimace|😮 surprised|😱 scream fear|😨 fearful|😰 anxious sweat|😥 sad relieved|😢 cry|😭 sob|😤 triumph|😡 angry|🤬 swear|🤯 mind blown|😳 flushed|🥵 hot|🥶 cold|😴 sleep|🤑 money face|🤗 hug|🤫 shush|🤥 lie|🥳 party|🤠 cowboy|🤡 clown|💀 skull rekt|👻 ghost|🤖 robot|👍 thumbs up|👎 thumbs down|👏 clap|🙌 raise hands|🙏 pray thanks|💪 strong|👀 eyes watch|🤝 deal handshake|✌️ peace|👌 ok|🤞 fingers crossed|👋 wave|☝️ point up|👇 point down|👉 point right|👈 point left|🧠 brain|🫡 salute"],
+  ["Animals & nature", "🐂 bull|🐻 bear|🐳 whale|🐋 humpback whale|🦄 unicorn|🐢 turtle slow|🦅 eagle|🐍 snake|🐺 wolf|🦈 shark|🐝 bee|🦋 butterfly|🐌 snail slow|🐎 horse|🦁 lion|🐯 tiger|🐶 dog|🐱 cat|🦊 fox|🐼 panda|🐸 frog|🦍 gorilla ape|🐉 dragon|🌱 seedling grow|🌳 tree|🍀 clover luck|🌵 cactus|🌸 blossom|🌹 rose|🌞 sun|🌙 moon|⭐ star|🌟 glowing star|✨ sparkles|⚡ lightning|🔥 fire hot|🌊 wave|❄️ snow|🌈 rainbow|☔ rain|🌪️ tornado"],
+  ["Objects", "🚀 rocket moon|💰 money bag|💵 dollar|💸 money wings|🪙 coin|💎 diamond|🏦 bank|📈 chart up|📉 chart down|📊 bar chart|🧾 receipt|💼 briefcase|📌 pin|📍 location pin|📎 paperclip|🔑 key|🔒 lock|🔓 unlock|🔔 bell alert|🔕 mute|⏰ alarm clock time|⏳ hourglass|⌛ time up|💡 idea bulb|🔍 search|🧲 magnet|⚙️ gear|🛠️ tools|🧯 extinguisher|💣 bomb|🎯 target|🏆 trophy|🥇 gold medal|🎉 celebration|🎁 gift|📰 news|📣 megaphone|📢 loudspeaker|📅 calendar|🗓️ schedule|☕ coffee|🍕 pizza|🍺 beer|🎲 dice gamble|🃏 joker|🎰 slot machine"],
+  ["Travel & places", "✈️ plane|🛫 takeoff|🛬 landing|🚂 train|🚗 car|🏎️ race car fast|🛥️ boat|⛵ sailboat|🛰️ satellite|🌍 earth|🗽 statue liberty|🏛️ exchange building|🏭 factory|🏠 home|⛰️ mountain peak|🌋 volcano|🏝️ island|🚧 construction|🚦 traffic light|⛽ fuel oil"],
+  ["Symbols", "✅ check ok|❌ cross no|❎ cross mark|⚠️ warning|❗ exclamation|❓ question|‼️ double exclamation|⛔ no entry stop|🚫 prohibited|💯 hundred|🔝 top|🆕 new|🆗 ok button|🔄 cycle repeat|🔃 reverse|♻️ recycle|➕ plus|➖ minus|✖️ multiply|➗ divide|💲 dollar sign|💹 yen chart|⬆️ up arrow|⬇️ down arrow|➡️ right arrow|⬅️ left arrow|↗️ up right|↘️ down right|↙️ down left|↖️ up left|🔼 up button|🔽 down button|⏫ fast up|⏬ fast down|🟢 green circle|🔴 red circle|🟡 yellow circle|🔵 blue circle|🟠 orange circle|🟣 purple circle|⚫ black circle|⚪ white circle|🟩 green square|🟥 red square|🟨 yellow square|🟦 blue square|🔺 red triangle up|🔻 red triangle down|🔶 orange diamond|🔷 blue diamond|♾️ infinity|☯️ yin yang"],
+  ["Flags", "🇮🇳 india flag|🇺🇸 usa flag|🇬🇧 uk flag|🇯🇵 japan flag|🇨🇳 china flag|🇪🇺 eu flag|🏁 finish flag|🚩 red flag|🏳️ white flag|🏴 black flag|🎌 crossed flags"],
+];
+
+export const EMOJIS: { e: string; k: string; cat: string }[] = EMOJI_ROWS.flatMap(([cat, row]) =>
+  row.split("|").map((item) => {
+    const i = item.indexOf(" ");
+    return { e: item.slice(0, i), k: item.slice(i + 1), cat };
+  }),
+);
+
+/** Stickers tab: caption badges. */
+export const STICKERS: { emoji: string; text: string; color: string }[] = [
+  { emoji: "🚀", text: "TO THE MOON", color: "#7E57C2" },
+  { emoji: "🐂", text: "BULLISH", color: "#089981" },
+  { emoji: "🐻", text: "BEARISH", color: "#F23645" },
+  { emoji: "💎", text: "HODL", color: "#2962FF" },
+  { emoji: "🔥", text: "BREAKOUT", color: "#FF6D00" },
+  { emoji: "📉", text: "BUY THE DIP", color: "#00897B" },
+  { emoji: "😱", text: "FOMO", color: "#E91E63" },
+  { emoji: "💀", text: "REKT", color: "#424242" },
+  { emoji: "💰", text: "PROFIT", color: "#43A047" },
+  { emoji: "⛔", text: "STOP LOSS", color: "#D32F2F" },
+  { emoji: "🎯", text: "TARGET HIT", color: "#00ACC1" },
+  { emoji: "⚠️", text: "CAUTION", color: "#F9A825" },
+  { emoji: "🐳", text: "WHALE ALERT", color: "#1565C0" },
+  { emoji: "📰", text: "NEWS", color: "#5D4037" },
+  { emoji: "🧘", text: "PATIENCE", color: "#6A1B9A" },
+  { emoji: "✅", text: "CONFIRMED", color: "#2E7D32" },
+];
+
+/** Icons tab: monochrome glyphs painted in the drawing's colour. */
+export const GLYPHS = "★ ☆ ✓ ✗ ✔ ✘ ⚑ ⚐ ♥ ♦ ♣ ♠ ☀ ☁ ☂ ⚡ ❄ ☃ ♻ ⚠ ☢ ☣ ⚙ ⚖ ⚔ ⚓ ✈ ⌛ ⏰ ☎ ✉ ✂ ✏ ✒ ☕ ♛ ♚ ☯ ☮ ✿ ❀ ☘ ♫ ♪ ⌂ ☺ ☹ ➤ ➜ ⇧ ⇩ ⇦ ⇨ ◆ ◇ ● ○ ■ □ ▲ △ ▼ ▽ ✚ ✖ ∞ § © ® ™ $ € £ ¥ ₹ % # @ ? !".split(" ");
 
 export function pointsNeeded(type: DrawingType): number | "free" | "poly" {
   return TOOL_BY_ID.get(type)?.points ?? 2;
@@ -784,6 +823,12 @@ function textShape(g: G, x: number, y: number, o: Partial<Extract<Shape, { k: "t
   };
 }
 
+/** Cash at risk for a position tool: a fixed amount, or a % of the account. */
+export function positionRisk(data: DrawingData): number {
+  if (data.riskMode === "amount" && (data.riskAmount ?? 0) > 0) return data.riskAmount as number;
+  return ((data.account ?? 100000) * (data.risk ?? 1)) / 100;
+}
+
 function posGeometry(g: G, long: boolean): Shape[] {
   const [E, T, S] = g.P;
   if (!E || !T || !S) return [];
@@ -794,14 +839,17 @@ function posGeometry(g: G, long: boolean): Shape[] {
   const data = g.d.data ?? {};
   const lot = Math.max(1, data.lot ?? 1);
   const riskPer = Math.abs(pE - pS);
+  const cash = positionRisk(data);
   const qty = data.qty && data.qty > 0
     ? data.qty
-    : riskPer > 0 ? Math.max(lot, Math.floor(((data.account ?? 100000) * (data.risk ?? 1)) / 100 / riskPer / lot) * lot) : lot;
+    : riskPer > 0 ? Math.max(lot, Math.floor(cash / riskPer / lot) * lot) : lot;
   const f = g.deps.priceFormatter;
   const pct = (p: number) => ((p - pE) / pE) * 100;
   const rr = riskPer > 0 ? Math.abs(pT - pE) / riskPer : 0;
-  const tgtTxt = `Target: ${f(pT)} (${pct(pT).toFixed(2)}%) ${f(Math.abs(pT - pE))}, Amount: ${f(Math.abs(pT - pE) * qty)}`;
-  const stpTxt = `Stop: ${f(pS)} (${pct(pS).toFixed(2)}%) ${f(riskPer)}, Amount: ${f(riskPer * qty)}`;
+  const tick = g.deps.tickSize?.() || 0;
+  const ticks = (d: number) => (tick > 0 ? ` · ${Math.round(d / tick)} ticks` : "");
+  const tgtTxt = `Target: ${f(pT)} (${pct(pT).toFixed(2)}%) ${f(Math.abs(pT - pE))}${ticks(Math.abs(pT - pE))}, Amount: ${f(Math.abs(pT - pE) * qty)}`;
+  const stpTxt = `Stop: ${f(pS)} (${pct(pS).toFixed(2)}%) ${f(riskPer)}${ticks(riskPer)}, Amount: ${f(riskPer * qty)}`;
   const last = g.deps.lastPrice();
   const open = last != null ? (last - pE) * qty * (long ? 1 : -1) : null;
   const midTxt = `${long ? "Long" : "Short"} · Qty: ${qty} · Risk/Reward Ratio: ${rr.toFixed(2)}${open != null ? `\nOpen P&L: ${open >= 0 ? "+" : ""}${f(open)}` : ""}`;
@@ -1402,6 +1450,18 @@ const GEO: Record<string, (g: G) => Shape[]> = {
   text: (g) => [textShape(g, g.P[0].x, g.P[0].y, { base: "middle" })],
   atext: (g) => [textShape(g, g.P[0].x, g.P[0].y, { base: "middle" })],
   note: (g) => noteGeo(g),
+  pin: (g) => {
+    const a = g.P[0];
+    const head = { x: a.x, y: a.y - 22 };
+    const out: Shape[] = [
+      { k: "line", a, b: { x: a.x, y: a.y - 14 }, width: 2, color: "#9E9E9E" },
+      { k: "ellipse", cx: head.x, cy: head.y, rx: 8, ry: 8, fill: g.col },
+      { k: "ellipse", cx: head.x - 2, cy: head.y - 2, rx: 2.5, ry: 2.5, fill: "rgba(255,255,255,0.75)", color: "rgba(255,255,255,0.75)" },
+    ];
+    // the note opens on hover / selection, like TradingView's pins
+    if (g.d.text && (g.sel || g.deps.hoverId() === g.d.id)) out.push(textShape(g, head.x + 14, head.y, { base: "middle", bg: rgba(g.deps.bgColor(), 0.95), border: g.col, pad: 6 }));
+    return out;
+  },
   anote: (g) => noteGeo(g),
   callout: (g) => {
     const [a, b] = g.P;
@@ -1505,7 +1565,15 @@ const GEO: Record<string, (g: G) => Shape[]> = {
     });
     return out;
   },
-  icon: (g) => [{ k: "text", x: g.P[0].x, y: g.P[0].y, text: g.d.data?.emoji ?? "⭐", size: g.s.fontSize, align: "center", base: "middle" }],
+  icon: (g) => {
+    const a = g.P[0];
+    const st = g.d.data?.sticker;
+    if (st) {
+      const size = Math.max(10, g.s.fontSize * 0.5);
+      return [{ k: "text", x: a.x, y: a.y, text: `${g.d.data?.emoji ?? ""} ${st.text}`.trim(), size, align: "center", base: "middle", bold: true, color: "#FFFFFF", bg: st.color, pad: 7, border: "#FFFFFF" }];
+    }
+    return [{ k: "text", x: a.x, y: a.y, text: g.d.data?.emoji ?? "⭐", size: g.s.fontSize, align: "center", base: "middle", ...(g.d.data?.glyph ? { color: g.col } : {}) }];
+  },
 };
 
 function noteGeo(g: G): Shape[] {
@@ -1663,10 +1731,16 @@ export function hitTest(d: Drawing, x: number, y: number, deps: DrawingDeps, wid
 }
 
 /** Visible on the current interval group? */
-export function visibleNow(d: Drawing, deps: Pick<DrawingDeps, "intervalGroup">): boolean {
+export function visibleNow(d: Drawing, deps: Pick<DrawingDeps, "intervalGroup" | "intervalCount">): boolean {
   if (d.hidden) return false;
   const v = d.vis?.[deps.intervalGroup()];
-  return v !== false;
+  if (v === false) return false;
+  if (v && typeof v === "object") {
+    if (!v.on) return false;
+    const n = deps.intervalCount?.();
+    if (n != null && (n < v.min || n > v.max)) return false;
+  }
+  return true;
 }
 
 /** Bounding box of a drawing's anchors in pixels (floating toolbar placement). */

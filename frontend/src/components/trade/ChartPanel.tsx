@@ -62,6 +62,7 @@ import {
   fetchPlan,
   formatClock,
   formatDate,
+  intervalCount,
   intervalGroup,
   intervalLabel,
   intervalLongLabel,
@@ -115,6 +116,7 @@ import {
   styleOf,
   visibleNow,
   type Drawing,
+  type DrawingData,
   type DrawingDeps,
   type DrawingPoint,
   type DrawingStyle,
@@ -123,7 +125,7 @@ import {
 } from "./drawings";
 import { ShapeSeries, type ShapeMode } from "./customSeries";
 import { beep, evaluate, migrateAlert, newAlert, type AlertItem } from "./alerts";
-import { chartFocus, NO_SYNC, publishSync, pushLog, subscribeSync, type SyncFlags } from "./chartSync";
+import { chartFocus, drawingClipboard, NO_SYNC, publishSync, pushLog, subscribeSync, type SyncFlags } from "./chartSync";
 import { LIGHT, loadSettings, saveSettings, type ChartSettings } from "./chartSettings";
 import ChartSettingsDialog, { type TradingFlags } from "./ChartSettingsDialog";
 import { IndicatorPicker, IndicatorSettings, type IndicatorTemplate, type StrategyItem } from "./IndicatorDialogs";
@@ -770,6 +772,8 @@ export default function ChartPanel(props: ChartPanelProps) {
 
   const theme = useMemo(() => computeTheme(settings), [settings.theme, settings.upColor, settings.downColor]); // eslint-disable-line react-hooks/exhaustive-deps
   const precision = settings.precision ?? (instrument?.tick_size && instrument.tick_size < 0.01 ? 4 : 2);
+  const tickRef = useRef(0.05);
+  tickRef.current = instrument?.tick_size && instrument.tick_size > 0 ? instrument.tick_size : 0.05;
   const fmtPrice = (v: number) => fmtNum(v, precision);
   const intraday = isIntraday(iv);
   const ivLabel = intervalLabel(iv);
@@ -852,8 +856,8 @@ export default function ChartPanel(props: ChartPanelProps) {
   const brickTimer = useRef<number | undefined>(undefined);
   const toolDefaultsRef = useRef<Record<string, Partial<DrawingStyle>>>(loadJson("chart:drawStyles", {}));
   const undoRef = useRef<{ past: Snap[]; future: Snap[] }>({ past: [], future: [] });
-  const clipboardRef = useRef<Drawing | null>(null);
-  const pendingIconRef = useRef<{ emoji?: string; src?: string; w?: number; h?: number } | null>(null);
+  const clipboardRef = drawingClipboard as { current: Drawing | null }; // shared across charts
+  const pendingIconRef = useRef<DrawingData | null>(null);
 
   // drawing store
   const drawingsRef = useRef<Drawing[]>(loadJson<Drawing[]>(`chart:drawings:${symbol}`, []));
@@ -995,6 +999,8 @@ export default function ChartPanel(props: ChartPanelProps) {
       barSpacing,
       candles: () => viewRef.current,
       intervalGroup: () => intervalGroup(ivRef.current),
+      intervalCount: () => intervalCount(ivRef.current),
+      tickSize: () => tickRef.current,
       lineColor: () => colorsRef.current.draw,
       accent: () => colorsRef.current.accent,
       upColor: () => colorsRef.current.up,
@@ -2316,6 +2322,13 @@ export default function ChartPanel(props: ChartPanelProps) {
     const price = yToPrice(pt.y);
     if (time === null || price == null) return;
     const mode = drawModeRef.current;
+    if (mode === "zoom" && !pendingRef.current) {
+      // press-and-drag a rectangle (a click without travel keeps the two-click flow)
+      zoomDragRef.current = { start: { time, price }, startPt: pt, moved: false };
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
     if (mode && pointsNeeded(mode) === "free") {
       freehandRef.current = { type: mode, points: [{ time, price }], last: pt };
       pendingRef.current = { type: mode, points: [{ time, price }], cursor: null };
@@ -2357,6 +2370,7 @@ export default function ChartPanel(props: ChartPanelProps) {
   }
 
   const pressRef = useRef<{ x: number; y: number } | null>(null);
+  const zoomDragRef = useRef<{ start: DrawingPoint; startPt: { x: number; y: number }; moved: boolean } | null>(null);
 
   /** A press + release without travel on the price pane is a click. */
   function onHostMouseUp(e: MouseEvent): void {
@@ -2371,6 +2385,18 @@ export default function ChartPanel(props: ChartPanelProps) {
 
   function onWindowMouseMove(e: MouseEvent): void {
     shiftRef.current = e.shiftKey;
+    const zd = zoomDragRef.current;
+    if (zd) {
+      const pt = paneCoords(e, true);
+      if (!pt) return;
+      if (!zd.moved && Math.hypot(pt.x - zd.startPt.x, pt.y - zd.startPt.y) < 6) return;
+      zd.moved = true;
+      const t = xToTime(pt.x), pr = yToPrice(pt.y);
+      if (t === null || pr === null) return;
+      pendingRef.current = { type: "dprange", points: [zd.start], cursor: { time: t, price: pr } };
+      repaintDrawings();
+      return;
+    }
     const fh = freehandRef.current;
     if (fh) {
       const pt = paneCoords(e, true);
@@ -2431,6 +2457,20 @@ export default function ChartPanel(props: ChartPanelProps) {
   }
 
   function onWindowMouseUp(): void {
+    const zd = zoomDragRef.current;
+    if (zd) {
+      // (a release without travel was already handled as a click by onHostMouseUp)
+      zoomDragRef.current = null;
+      if (zd.moved) {
+        const end = pendingRef.current?.cursor ?? null;
+        pendingRef.current = null;
+        setPendingCount(0);
+        if (end) zoomTo(zd.start, end);
+        setDrawMode(null);
+        repaintDrawings();
+      }
+      return;
+    }
     const fh = freehandRef.current;
     if (fh) {
       freehandRef.current = null;
@@ -3977,6 +4017,30 @@ export default function ChartPanel(props: ChartPanelProps) {
     saveJson("chart:indTemplates", next);
   }
 
+  // ---- named drawing templates (per tool) ----
+  const DRAW_TEMPLATES_KEY = "chart:drawTemplates";
+  function drawTemplates(type: string): { name: string; style: Partial<DrawingStyle> }[] {
+    return loadJson<Record<string, { name: string; style: Partial<DrawingStyle> }[]>>(DRAW_TEMPLATES_KEY, {})[type] ?? [];
+  }
+  function saveDrawTemplate(d: Drawing): void {
+    const name = window.prompt(`Save ${TOOL_BY_ID.get(d.type)?.label ?? "drawing"} template as`, "");
+    if (!name) return;
+    const all = loadJson<Record<string, { name: string; style: Partial<DrawingStyle> }[]>>(DRAW_TEMPLATES_KEY, {});
+    all[d.type] = [...(all[d.type] ?? []).filter((t) => t.name !== name), { name, style: JSON.parse(JSON.stringify(d.style ?? {})) }];
+    saveJson(DRAW_TEMPLATES_KEY, all);
+    addToast(`template "${name}" saved`);
+  }
+  function applyDrawTemplate(d: Drawing, name: string | null): void {
+    const style = name === null ? toolDefaultsRef.current[d.type] ?? {} : drawTemplates(d.type).find((t) => t.name === name)?.style;
+    if (!style) return;
+    updateDrawing(d.id, { style: JSON.parse(JSON.stringify(style)) }, "apply template");
+  }
+  function removeDrawTemplate(type: string, name: string): void {
+    const all = loadJson<Record<string, { name: string; style: Partial<DrawingStyle> }[]>>(DRAW_TEMPLATES_KEY, {});
+    all[type] = (all[type] ?? []).filter((t) => t.name !== name);
+    saveJson(DRAW_TEMPLATES_KEY, all);
+  }
+
   function pasteDrawing(): void {
     const c = clipboardRef.current;
     if (!c) return;
@@ -4596,8 +4660,14 @@ export default function ChartPanel(props: ChartPanelProps) {
               {drawingValueAt(d, viewRef.current[viewRef.current.length - 1]?.time ?? 0, drawingDeps()) !== null && (
                 <button type="button" className="chart-menu-item" onClick={() => { openAlertDialog(undefined, { target: `draw:${d.id}`, targetLabel: d.name || TOOL_BY_ID.get(d.type)?.label }); close(); }}>Add alert on this line</button>
               )}
-              <button type="button" className="chart-menu-item" onClick={() => { toolDefaultsRef.current = { ...toolDefaultsRef.current, [d.type]: { ...(d.style ?? {}), levels: d.style?.levels } }; saveJson("chart:drawStyles", toolDefaultsRef.current); addToast("saved as the default style"); close(); }}>Template: save as default</button>
-              <button type="button" className="chart-menu-item" onClick={() => { updateDrawing(d.id, { style: { ...(toolDefaultsRef.current[d.type] ?? {}) } }, "apply template"); close(); }}>Template: apply default</button>
+              <div className="chart-menu-head">Template</div>
+              {drawTemplates(d.type).map((t) => (
+                <button key={t.name} type="button" className="chart-menu-item" onClick={() => { applyDrawTemplate(d, t.name); close(); }}>▦ {t.name}</button>
+              ))}
+              <button type="button" className="chart-menu-item" onClick={() => { applyDrawTemplate(d, null); close(); }}>Apply default</button>
+              <button type="button" className="chart-menu-item" onClick={() => { close(); saveDrawTemplate(d); }}>Save drawing template as…</button>
+              <button type="button" className="chart-menu-item" onClick={() => { toolDefaultsRef.current = { ...toolDefaultsRef.current, [d.type]: { ...(d.style ?? {}), levels: d.style?.levels } }; saveJson("chart:drawStyles", toolDefaultsRef.current); addToast("saved as the default style"); close(); }}>Save as default</button>
+              <div className="chart-menu-sep" />
               <button type="button" className="chart-menu-item" onClick={() => { setDialog({ k: "drawSettings", id: d.id }); close(); }}>Settings…</button>
               <div className="chart-menu-sep" />
               <button type="button" className="chart-menu-item ctx-sell" onClick={() => { deleteDrawing(d.id); close(); }}>Remove<span className="kbd">Del</span></button>
@@ -4704,7 +4774,7 @@ export default function ChartPanel(props: ChartPanelProps) {
               showFavBar={showFavBar}
               onFavBar={() => setShowFavBar((v) => !v)}
               onCollapse={() => setToolsCollapsed(true)}
-              onEmoji={(e) => { pendingIconRef.current = { emoji: e }; toggleDraw("icon"); }}
+              onIcon={(d) => { pendingIconRef.current = d; toggleDraw("icon"); }}
               onImage={(src, w, h) => { pendingIconRef.current = { src, w, h }; toggleDraw("image"); }}
               alertMode={drawMode === "alert"}
               onAlert={() => setDrawMode(drawModeRef.current === "alert" ? null : "alert")}
@@ -4919,6 +4989,10 @@ export default function ChartPanel(props: ChartPanelProps) {
               }}
               onAlert={() => openAlertDialog(undefined, { target: `draw:${selDrawing.id}`, targetLabel: selDrawing.name || TOOL_BY_ID.get(selDrawing.type)?.label })}
               canAlert={drawingValueAt(selDrawing, viewRef.current[viewRef.current.length - 1]?.time ?? 0, drawingDeps()) !== null}
+              templates={drawTemplates(selDrawing.type).map((t) => t.name)}
+              onApplyTemplate={(name) => applyDrawTemplate(selDrawing, name)}
+              onSaveTemplate={() => saveDrawTemplate(selDrawing)}
+              onRemoveTemplate={(name) => { removeDrawTemplate(selDrawing.type, name); bumpDrawings(); }}
             />
           )}
           {showFavBar && chrome && <FavoritesBar favorites={favTools} drawMode={drawMode} onTool={toggleDraw} onClose={() => setShowFavBar(false)} />}
