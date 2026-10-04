@@ -17,6 +17,8 @@ export interface Bar {
   low: number;
   close: number;
   volume: number;
+  /** Open interest at the bar's close (derivatives, when Fyers sends it). */
+  oi?: number;
   /** Chart-type extras: Kagi thickness (1 = yang), P&F column (1 = X). */
   flag?: number;
 }
@@ -192,6 +194,7 @@ function combine(into: Bar, b: Bar): void {
   if (b.low < into.low) into.low = b.low;
   into.close = b.close;
   into.volume += b.volume;
+  if (b.oi !== undefined) into.oi = b.oi; // a level, not a flow: the bucket's last
 }
 
 /**
@@ -218,7 +221,7 @@ export function aggregate(bars: Bar[], key: string): Bar[] {
       const k = Math.floor((b.time - anchor) / len);
       if (k !== bucket || out.length === 0) {
         bucket = k;
-        out.push({ time: anchor + k * len, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume });
+        out.push({ time: anchor + k * len, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume, ...(b.oi !== undefined ? { oi: b.oi } : {}) });
       } else {
         combine(out[out.length - 1], b);
       }
@@ -230,12 +233,17 @@ export function aggregate(bars: Bar[], key: string): Bar[] {
     const k = calendarBucket(b.time, iv);
     if (k !== bucket || out.length === 0) {
       bucket = k;
-      out.push({ time: b.time, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume });
+      out.push({ time: b.time, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume, ...(b.oi !== undefined ? { oi: b.oi } : {}) });
     } else {
       combine(out[out.length - 1], b);
     }
   }
   return out;
+}
+
+/** Derivative symbols (futures / options) — the ones Fyers has open interest for. */
+export function isDerivative(symbol: string): boolean {
+  return /(FUT|CE|PE)$/i.test(symbol.trim());
 }
 
 /**

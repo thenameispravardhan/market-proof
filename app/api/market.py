@@ -272,11 +272,14 @@ async def market_history(
     resolution: str = "5",
     from_ts: int = Query(..., alias="from"),
     to_ts: int = Query(..., alias="to"),
+    oi: int = 0,
 ) -> dict[str, Any]:
     """OHLCV candles for the Trade-page chart.
 
     `from`/`to` are epoch seconds (inclusive). `resolution` is a Fyers
-    timeframe code ("1", "5", "15", "60", "D", …). Candles come from the
+    timeframe code ("1", "5", "15", "60", "D", …). `oi=1` asks Fyers for
+    open interest on derivative symbols (a 7th value per candle) for the
+    chart's OI indicators. Candles come from the
     connected real Fyers account — there is no public-feed fallback, so
     the response degrades to `{ok: false, reason}` when Fyers isn't
     connected. Always 200 so the chart can render an inline message.
@@ -302,8 +305,9 @@ async def market_history(
             "candles": [],
         }
     try:
+        extra = {"oi": True} if oi else {}
         candles = await backend.get_history_range(
-            sym, resolution=res, from_ts=from_ts, to_ts=to_ts
+            sym, resolution=res, from_ts=from_ts, to_ts=to_ts, **extra
         )
     except Exception as e:  # noqa: BLE001
         log.warning("market.history.failed", symbol=sym, error=str(e))

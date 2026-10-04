@@ -30,6 +30,7 @@ import {
   type OhlcvCandle,
 } from "../../lib/indicators";
 import { EXTRA_INDICATORS } from "./indicatorExtras";
+import { MORE_INDICATORS } from "./indicatorMore";
 import { calendarBucket, intervalCount, intervalGroup, parseInterval, type IntervalGroup } from "./chartData";
 
 export type Source = "close" | "open" | "high" | "low" | "hl2" | "hlc3" | "ohlc4" | "hlcc4";
@@ -53,7 +54,8 @@ export type InputValue = number | string | boolean;
 export interface InputDef {
   key: string;
   label: string;
-  type: "int" | "float" | "source" | "select" | "bool";
+  /** "symbol": another instrument (two-symbol indicators fetch its candles). */
+  type: "int" | "float" | "source" | "select" | "bool" | "symbol";
   def: InputValue;
   min?: number;
   max?: number;
@@ -61,8 +63,18 @@ export interface InputDef {
   options?: string[];
 }
 
-export type PlotKind = "line" | "hist" | "points" | "step";
-
+/** How a plot is drawn. "marks" is an invisible anchor that carries the
+ *  indicator's markers (patterns, fractals, divergences). */
+export type PlotKind = "line" | "hist" | "points" | "step" | "area" | "columns" | "circles" | "marks";
+export const PLOT_KINDS: { v: PlotKind; l: string }[] = [
+  { v: "line", l: "Line" },
+  { v: "step", l: "Step line" },
+  { v: "hist", l: "Histogram" },
+  { v: "columns", l: "Columns" },
+  { v: "area", l: "Area" },
+  { v: "circles", l: "Circles" },
+  { v: "points", l: "Dots" },
+];
 export interface PlotDef {
   key: string;
   label: string;
@@ -74,8 +86,8 @@ export interface PlotDef {
   scale?: string;
 }
 
-export type Category = "Moving averages" | "Bands & channels" | "Trend" | "Oscillators" | "Volume" | "Volatility";
-export const CATEGORIES: Category[] = ["Moving averages", "Bands & channels", "Trend", "Oscillators", "Volume", "Volatility"];
+export type Category = "Moving averages" | "Bands & channels" | "Trend" | "Oscillators" | "Volume" | "Volatility" | "Statistics";
+export const CATEGORIES: Category[] = ["Moving averages", "Bands & channels", "Trend", "Oscillators", "Volume", "Volatility", "Statistics"];
 
 export interface ComputeCtx {
   interval: string;
@@ -83,6 +95,20 @@ export interface ComputeCtx {
   down: string;
   /** Real order flow per chart time: [buy, sell, delta]. */
   flow?: Map<number, [number, number, number]>;
+  /** Another symbol's closes by chart time (two-symbol indicators). */
+  other?: (symbol: string) => Map<number, number> | undefined;
+}
+
+/** A marker on one bar of a plot (pattern, fractal, divergence …). */
+export interface Mark {
+  plot: number;
+  i: number;
+  pos: "above" | "below" | "in";
+  shape: "arrowUp" | "arrowDown" | "circle" | "square";
+  color?: string;
+  text?: string;
+  /** Long name (data window / tooltips). */
+  title?: string;
 }
 
 export interface ComputeResult {
@@ -91,8 +117,19 @@ export interface ComputeResult {
   colors?: ((string | null)[] | null)[];
   /** Bars to shift each plot by (+ = into the future). */
   shifts?: number[];
+  marks?: Mark[];
 }
 
+/** Shaded area between two plots (or a plot and a fixed level). With
+ *  `colorDown`, the fill switches colour where `a` drops below `b`. */
+export interface FillDef {
+  key: string;
+  label: string;
+  a: number | { level: number };
+  b: number | { level: number };
+  color: string;
+  colorDown?: string;
+}
 export interface IndicatorDef {
   type: string;
   name: string;
@@ -106,6 +143,14 @@ export interface IndicatorDef {
   inputs: InputDef[];
   plots: PlotDef[];
   levels?: number[];
+  fills?: FillDef[];
+  /** Fyers desk set (listed under "Fyers indicators" in the picker). */
+  desk?: boolean;
+  isNew?: boolean;
+  /** Not a series: adding it arms this drawing tool (e.g. fixed-range profile). */
+  tool?: string;
+  /** Rendered by the chart itself rather than as series. */
+  special?: "vpvr" | "oiprofile";
   compute: (c: OhlcvCandle[], inp: Record<string, InputValue>, ctx: ComputeCtx) => ComputeResult;
 }
 
@@ -614,8 +659,34 @@ export const INDICATORS: IndicatorDef[] = [
       }
       return { plots: [delta, cvd], colors: [colors, null] };
     },
-  },  ...EXTRA_INDICATORS,
+  },
+  ...EXTRA_INDICATORS,
+  ...MORE_INDICATORS,
 ];
+
+// Shaded areas for the classic bands / oscillator zones, the Fyers desk set
+// and the "new" badges — kept as data next to the defs they decorate.
+const BAND_FILLS: Record<string, FillDef[]> = {
+  ichimoku: [{ key: "cloud", label: "Cloud", a: 3, b: 4, color: "rgba(67,160,71,0.18)", colorDown: "rgba(244,67,54,0.18)" }],
+  bb: [{ key: "bg", label: "Background", a: 1, b: 2, color: "rgba(33,150,243,0.08)" }],
+  keltner: [{ key: "bg", label: "Background", a: 0, b: 2, color: "rgba(33,150,243,0.06)" }],
+  donchian: [{ key: "bg", label: "Background", a: 0, b: 2, color: "rgba(38,198,218,0.06)" }],
+  envelopes: [{ key: "bg", label: "Background", a: 0, b: 2, color: "rgba(255,152,0,0.06)" }],
+  vwapbands: [{ key: "b1", label: "Band #1 fill", a: 1, b: 2, color: "rgba(38,166,154,0.08)" }],
+  rsi: [{ key: "bg", label: "Background", a: { level: 70 }, b: { level: 30 }, color: "rgba(126,87,194,0.08)" }],
+  stoch: [{ key: "bg", label: "Background", a: { level: 80 }, b: { level: 20 }, color: "rgba(33,150,243,0.08)" }],
+  stochrsi: [{ key: "bg", label: "Background", a: { level: 80 }, b: { level: 20 }, color: "rgba(33,150,243,0.08)" }],
+  mfi: [{ key: "bg", label: "Background", a: { level: 80 }, b: { level: 20 }, color: "rgba(255,202,40,0.07)" }],
+  cci: [{ key: "bg", label: "Background", a: { level: 100 }, b: { level: -100 }, color: "rgba(171,71,188,0.07)" }],
+  wpr: [{ key: "bg", label: "Background", a: { level: -20 }, b: { level: -80 }, color: "rgba(236,64,122,0.07)" }],
+};
+const DESK_TYPES = new Set(["atrstop", "chandelier", "orb", "squeeze", "cpr", "pdhl", "rvol"]);
+const NEW_TYPES = new Set(["atrstop", "chandelier", "orb", "squeeze", "jma", "kama"]);
+for (const d of INDICATORS) {
+  if (!d.fills && BAND_FILLS[d.type]) d.fills = BAND_FILLS[d.type];
+  if (DESK_TYPES.has(d.type)) d.desk = true;
+  if (NEW_TYPES.has(d.type)) d.isNew = true;
+}
 
 function withA(hex: string, a: number): string {
   const m = /^#([0-9a-f]{6})$/i.exec(hex.trim());
@@ -634,6 +705,13 @@ export interface PlotStyle {
   color: string;
   width: number;
   dash: 0 | 1 | 2;
+  visible: boolean;
+  /** Plot type override (Style tab); unset = the definition's. */
+  kind?: PlotKind;
+}
+
+export interface FillStyle {
+  color: string;
   visible: boolean;
 }
 
@@ -663,6 +741,11 @@ export interface IndicatorInstance {
   labelsOnScale: boolean;
   valuesInStatus: boolean;
   vis?: Partial<Record<IntervalGroup, VisRange>>;
+  fills?: FillStyle[];
+  /** Pane placement from the legend's More menu: its own pane, the price
+   *  pane, or another indicator's pane (that indicator's uid). */
+  pane?: "own" | "main" | string;
+  scale?: "left" | "right" | "new";
 }
 
 let uidSeq = 0;
@@ -679,6 +762,10 @@ export function defaultPlots(def: IndicatorDef): PlotStyle[] {
   return def.plots.map((p) => ({ color: p.color, width: p.width ?? 1, dash: p.dash ?? 0, visible: true }));
 }
 
+export function defaultFills(def: IndicatorDef): FillStyle[] {
+  return (def.fills ?? []).map((f) => ({ color: f.color, visible: true }));
+}
+
 export function newInstance(type: string, inputs?: Record<string, InputValue>): IndicatorInstance | null {
   const def = INDICATOR_BY_TYPE.get(type);
   if (!def) return null;
@@ -687,6 +774,7 @@ export function newInstance(type: string, inputs?: Record<string, InputValue>): 
     type,
     inputs: { ...defaultInputs(def), ...(inputs ?? {}) },
     plots: defaultPlots(def),
+    fills: defaultFills(def),
     visible: true,
     precision: null,
     labelsOnScale: true,
@@ -701,17 +789,27 @@ export function sanitizeInstance(raw: unknown): IndicatorInstance | null {
   const def = r.type ? INDICATOR_BY_TYPE.get(r.type) : undefined;
   if (!def) return null;
   const plots = defaultPlots(def).map((p, i) => ({ ...p, ...(Array.isArray(r.plots) ? r.plots[i] ?? {} : {}) }));
+  const fills = defaultFills(def).map((f, i) => ({ ...f, ...(Array.isArray(r.fills) ? r.fills[i] ?? {} : {}) }));
   return {
     uid: typeof r.uid === "string" ? r.uid : newUid(),
     type: def.type,
     inputs: { ...defaultInputs(def), ...(r.inputs ?? {}) },
     plots,
+    fills,
     visible: r.visible !== false,
     precision: typeof r.precision === "number" ? r.precision : null,
     labelsOnScale: r.labelsOnScale !== false,
     valuesInStatus: r.valuesInStatus !== false,
     vis: r.vis,
+    ...(r.pane !== undefined ? { pane: r.pane } : {}),
+    ...(r.scale !== undefined ? { scale: r.scale } : {}),
   };
+}
+
+/** Everything "Save as default" keeps (no identity, no placement). */
+export function instanceDefaults(i: IndicatorInstance): Omit<IndicatorInstance, "uid" | "type" | "pane"> {
+  const { uid: _u, type: _t, pane: _p, ...rest } = i;
+  return JSON.parse(JSON.stringify(rest));
 }
 
 /** Legend arguments, e.g. "9 close 0". */
