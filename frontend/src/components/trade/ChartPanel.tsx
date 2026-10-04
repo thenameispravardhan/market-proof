@@ -125,7 +125,7 @@ import {
 } from "./drawings";
 import { ShapeSeries, type ShapeMode } from "./customSeries";
 import { beep, evaluate, migrateAlert, newAlert, type AlertItem } from "./alerts";
-import { chartFocus, drawingClipboard, NO_SYNC, publishSync, pushLog, subscribeSync, type SyncFlags } from "./chartSync";
+import { chartFocus, drawingClipboard, indicatorClipboard, NO_SYNC, publishSync, pushLog, subscribeSync, type SyncFlags } from "./chartSync";
 import { LIGHT, loadSettings, saveSettings, type ChartSettings } from "./chartSettings";
 import ChartSettingsDialog, { type TradingFlags } from "./ChartSettingsDialog";
 import { IndicatorPicker, IndicatorSettings, type IndicatorTemplate, type StrategyItem } from "./IndicatorDialogs";
@@ -141,6 +141,7 @@ import {
 } from "./ChartDialogs";
 import { DrawingFloatBar, FavoritesBar, LeftToolbar, type CursorMode, type Magnet } from "./DrawingToolbar";
 import { AlertsPanel, DataWindow, ObjectTree, type DataRow, type TreeItem } from "./ChartWidgets";
+import { AboutIndicatorDialog, InsightsDialog, ManagePanesDialog } from "./ChartInfoDialogs";
 
 const IST = IST_OFFSET;
 
@@ -262,8 +263,10 @@ type StratRun = { name: string; trades: StratTrade[]; stats: Record<string, numb
 /** An order placed from the chart's right-click menu. */
 export interface ChartOrder {
   side: "BUY" | "SELL";
-  type: "MARKET" | "LIMIT" | "SL-M";
+  /** STOP_LOSS = stop-limit: `price` is the trigger, `limit` the limit price. */
+  type: "MARKET" | "LIMIT" | "SL-M" | "STOP_LOSS";
   price: number | null;
+  limit?: number | null;
 }
 
 /** An open position on the charted symbol and its managed exits. */
@@ -441,6 +444,7 @@ interface ChartPrefs {
   showFavBar?: boolean;
   toolsCollapsed?: boolean;
   pinnedTools?: string[];
+  mainHidden?: boolean;
 }
 
 /** Fetch + normalise one page of candles (sorted, deduped, IST-shifted). */
@@ -618,6 +622,9 @@ type Dialog =
   | { k: "palette" }
   | { k: "shortcuts" }
   | { k: "interval"; txt: string }
+  | { k: "about"; uid: string }
+  | { k: "panes" }
+  | { k: "insights" }
   | null;
 
 interface Ctx {
@@ -718,6 +725,9 @@ export default function ChartPanel(props: ChartPanelProps) {
   const [hide, setHide] = useState(prefs.hide ?? { drawings: false, indicators: false, positions: false });
   const [syncDrawings, setSyncDrawings] = useState(prefs.syncDrawings ?? true);
   const [legendCollapsed, setLegendCollapsed] = useState(prefs.legendCollapsed ?? false);
+  const [mainHidden, setMainHidden] = useState(prefs.mainHidden === true);
+  /** The legend's More (⋯) menu: for the main series or one indicator. */
+  const [legendMenu, setLegendMenu] = useState<{ kind: "main" | "ind"; uid?: string; x: number; y: number } | null>(null);
   const [showFavBar, setShowFavBar] = useState(prefs.showFavBar ?? false);
   const [toolsCollapsed, setToolsCollapsed] = useState(prefs.toolsCollapsed ?? false);
   const [pinnedTools, setPinnedTools] = useState<string[]>(prefs.pinnedTools ?? ["replay"]);
@@ -747,6 +757,8 @@ export default function ChartPanel(props: ChartPanelProps) {
   const [strat, setStrat] = useState<StratRun | null>(null);
   const [dialog, setDialog] = useState<Dialog>(null);
   const [ctx, setCtx] = useState<Ctx | null>(null);
+  /** The context menu's Trade ▸ flyout (rendered beside the menu, which scrolls). */
+  const [tradeFly, setTradeFly] = useState<{ x: number; y: number } | null>(null);
   const [levelDrag, setLevelDrag] = useState<"sl" | "tp" | null>(null);
   const [replay, setReplayState] = useState({ on: false, selecting: false, playing: false, speed: 1, idx: 0 });
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
@@ -1617,8 +1629,12 @@ export default function ChartPanel(props: ChartPanelProps) {
         const st = inst.plots[k];
         if (!st?.visible) return;
         const kind: PlotKind = pd.kind === "marks" ? "marks" : st.kind ?? pd.kind ?? "line";
+        // An oscillator moved onto the price pane (or merged into another
+        // indicator's pane) keeps its own overlay scale, like TradingView —
+        // sharing the price axis would squash the candles.
+        const guest = (!def.overlay && onPrice) || isGuest(inst);
         const scaleId = inst.scale === "left" || inst.scale === "right" ? inst.scale
-          : inst.scale === "new" ? `ind-${inst.uid}`
+          : inst.scale === "new" || (guest && !def.ownScale) ? `ind-${inst.uid}`
           : def.ownScale ? "vol" : pd.scale ?? (def.overlay && !onPrice ? "right" : s.scaleSide);
         const common: Record<string, unknown> = {
           lastValueVisible: kind !== "marks" && s.indValueLabels && inst.labelsOnScale,
@@ -2732,8 +2748,73 @@ export default function ChartPanel(props: ChartPanelProps) {
 
   // Chart subscriptions are attached once at mount; they call through
   // this ref so they always run the latest render's closures.
-  const implRef = useRef({ onCrosshair, onVisibleRange, onKeyDown, onHostMouseDown, onHostMouseUp, onWindowMouseMove, onWindowMouseUp, onHostDblClick });
-  implRef.current = { onCrosshair, onVisibleRange, onKeyDown, onHostMouseDown, onHostMouseUp, onWindowMouseMove, onWindowMouseUp, onHostDblClick };
+  /** Touch: one finger draws / drags drawings like the mouse when a tool
+   *  is active or a drawing is under the finger; two fingers moving
+   *  together pan the time axis (spreading them is left to the engine's
+   *  pinch zoom). Everything else goes to the engine untouched. */
+  const touchRef = useRef<{ mode: "mouse" | "pan" | null; x: number; dist: number }>({ mode: null, x: 0, dist: 0 });
+  function onTouch(e: TouchEvent): void {
+    const t0 = e.touches[0] ?? e.changedTouches[0];
+    if (!t0) return;
+    const asMouse = (t: Touch) =>
+      ({ clientX: t.clientX, clientY: t.clientY, button: 0, target: t.target, shiftKey: false, ctrlKey: false, metaKey: false, altKey: false, preventDefault: () => e.preventDefault(), stopPropagation: () => e.stopPropagation() }) as unknown as MouseEvent;
+    const st = touchRef.current;
+    if (e.type === "touchstart") {
+      if (e.touches.length === 2) {
+        const [a, b] = [e.touches[0], e.touches[1]];
+        touchRef.current = { mode: "pan", x: (a.clientX + b.clientX) / 2, dist: Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY) };
+        return;
+      }
+      if (e.touches.length !== 1) return;
+      const pt = paneCoords(asMouse(t0));
+      const grabbing = pt && !drawModeRef.current && hitDrawingAt(pt.x, pt.y);
+      if (!drawModeRef.current && !grabbing && !pendingRef.current) {
+        touchRef.current = { mode: null, x: 0, dist: 0 };
+        return;
+      }
+      touchRef.current = { mode: "mouse", x: 0, dist: 0 };
+      e.preventDefault();
+      e.stopPropagation();
+      onHostMouseDown(asMouse(t0));
+      onWindowMouseMove(asMouse(t0));
+      return;
+    }
+    if (e.type === "touchmove") {
+      if (st.mode === "mouse") {
+        e.preventDefault();
+        e.stopPropagation();
+        onWindowMouseMove(asMouse(t0));
+        return;
+      }
+      if (st.mode === "pan" && e.touches.length === 2) {
+        const [a, b] = [e.touches[0], e.touches[1]];
+        const x = (a.clientX + b.clientX) / 2;
+        const dist = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+        if (Math.abs(dist - st.dist) > st.dist * 0.12) return; // a pinch: the engine zooms
+        e.preventDefault();
+        e.stopPropagation();
+        const ts = safe(() => chartRef.current!.timeScale());
+        const pos = safe(() => ts!.scrollPosition(), 0) ?? 0;
+        safe(() => ts!.scrollToPosition(pos - (x - st.x) / Math.max(1, barSpacing()), false));
+        touchRef.current = { mode: "pan", x, dist };
+      }
+      return;
+    }
+    // touchend / touchcancel
+    if (st.mode === "mouse") {
+      e.preventDefault();
+      e.stopPropagation();
+      const t = e.changedTouches[0];
+      if (t) {
+        onHostMouseUp(asMouse(t));
+        onWindowMouseUp();
+      }
+    }
+    if (e.touches.length === 0) touchRef.current = { mode: null, x: 0, dist: 0 };
+  }
+
+  const implRef = useRef({ onCrosshair, onVisibleRange, onKeyDown, onHostMouseDown, onHostMouseUp, onWindowMouseMove, onWindowMouseUp, onHostDblClick, onTouch });
+  implRef.current = { onCrosshair, onVisibleRange, onKeyDown, onHostMouseDown, onHostMouseUp, onWindowMouseMove, onWindowMouseUp, onHostDblClick, onTouch };
 
   // ------------------------------------------------------------------
   // Effects
@@ -2791,6 +2872,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     const dblH = (e: MouseEvent) => implRef.current.onHostDblClick(e);
     const winMoveH = (e: MouseEvent) => implRef.current.onWindowMouseMove(e);
     const winUpH = () => implRef.current.onWindowMouseUp();
+    const touchH = (e: TouchEvent) => implRef.current.onTouch(e);
     safe(() => chart.subscribeCrosshairMove(moveH));
     safe(() => chart.timeScale().subscribeVisibleLogicalRangeChange(rangeH));
     window.addEventListener("keydown", keyH);
@@ -2798,6 +2880,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     el.addEventListener("mousedown", downH, true);
     el.addEventListener("mouseup", upH, true);
     el.addEventListener("dblclick", dblH, true);
+    for (const ev of ["touchstart", "touchmove", "touchend", "touchcancel"]) el.addEventListener(ev, touchH as EventListener, { capture: true, passive: false });
     window.addEventListener("mousemove", winMoveH);
     window.addEventListener("mouseup", winUpH);
     return () => {
@@ -2806,6 +2889,7 @@ export default function ChartPanel(props: ChartPanelProps) {
       el.removeEventListener("mousedown", downH, true);
       el.removeEventListener("mouseup", upH, true);
       el.removeEventListener("dblclick", dblH, true);
+      for (const ev of ["touchstart", "touchmove", "touchend", "touchcancel"]) el.removeEventListener(ev, touchH as EventListener, true);
       window.removeEventListener("mousemove", winMoveH);
       window.removeEventListener("mouseup", winUpH);
       window.clearTimeout(indRefreshTimer.current);
@@ -3403,8 +3487,14 @@ export default function ChartPanel(props: ChartPanelProps) {
       showFavBar,
       toolsCollapsed,
       pinnedTools,
+      mainHidden,
     } satisfies ChartPrefs);
-  }, [iv, chartKind, indicators, magnet, cursor, scaleMode, autoScale, invert, scalePriceOnly, favIntervals, customIntervals, favKinds, favTools, favIndicators, lastTool, stay, lockAll, hide, syncDrawings, legendCollapsed, showFavBar, toolsCollapsed, pinnedTools]);
+  }, [iv, chartKind, indicators, magnet, cursor, scaleMode, autoScale, invert, scalePriceOnly, favIntervals, customIntervals, favKinds, favTools, favIndicators, lastTool, stay, lockAll, hide, syncDrawings, legendCollapsed, showFavBar, toolsCollapsed, pinnedTools, mainHidden]);
+
+  // The legend's eye on the main series (and the object tree's) hides it.
+  useEffect(() => {
+    safe(() => mainRef.current?.applyOptions({ visible: !mainHidden } as never));
+  }, [mainHidden, mainVer]);
 
   // 8) Compare-symbol search (debounced).
   useEffect(() => {
@@ -3539,6 +3629,7 @@ export default function ChartPanel(props: ChartPanelProps) {
   }, [menuOpen]);
 
   useEffect(() => {
+    setTradeFly(null);
     if (!ctx) return;
     const close = () => setCtx(null);
     const esc = (e: KeyboardEvent) => {
@@ -3551,6 +3642,21 @@ export default function ChartPanel(props: ChartPanelProps) {
       document.removeEventListener("keydown", esc);
     };
   }, [ctx]);
+
+  useEffect(() => {
+    if (!legendMenu) return;
+    const close = (e: MouseEvent) => {
+      if ((e.target as HTMLElement | null)?.closest?.("[data-more]")) return; // the toggle button handles itself
+      setLegendMenu(null);
+    };
+    const esc = (e: KeyboardEvent) => e.key === "Escape" && setLegendMenu(null);
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", esc);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", esc);
+    };
+  }, [legendMenu]);
 
   // 12) Sync with the other charts of the layout.
   useEffect(
@@ -3727,15 +3833,21 @@ export default function ChartPanel(props: ChartPanelProps) {
   function ctxOrders(price: number): ChartOrder[] {
     const ltp = prevLtpRef.current ?? lastClose();
     const above = ltp != null && price > ltp;
+    const tick = tickRef.current;
+    const round = (p: number) => Math.round(p / tick) * tick;
     const out: ChartOrder[] = [
       { side: "BUY", type: above ? "SL-M" : "LIMIT", price },
       { side: "SELL", type: above || ltp == null ? "LIMIT" : "SL-M", price },
     ];
+    // stop-limit on the breakout side: trigger at the price, limit one tick through it
+    if (ltp != null) out.push(above ? { side: "BUY", type: "STOP_LOSS", price, limit: round(price + tick) } : { side: "SELL", type: "STOP_LOSS", price, limit: round(price - tick) });
     if (ltp != null) out.push({ side: "BUY", type: "MARKET", price: null }, { side: "SELL", type: "MARKET", price: null });
     return out;
   }
   const orderLabel = (o: ChartOrder) =>
-    `${o.side === "BUY" ? "Buy" : "Sell"} ${orderQty ?? ""} ${o.price == null ? "at market" : `@ ${fmtPrice(o.price)} ${o.type === "LIMIT" ? "limit" : "stop"}`}`;
+    `${o.side === "BUY" ? "Buy" : "Sell"} ${orderQty ?? ""} ${
+      o.price == null ? "at market" : o.type === "STOP_LOSS" ? `@ ${fmtPrice(o.price)} stop ${fmtPrice(o.limit ?? o.price)} limit` : `@ ${fmtPrice(o.price)} ${o.type === "LIMIT" ? "limit" : "stop"}`
+    }`;
 
   // Controls render inline, into a shared slot (layouts), or not at all.
   const placeChrome = (el: ReactNode, slot: HTMLElement | null | undefined) => (!chrome ? null : slot ? createPortal(el, slot) : el);
@@ -3979,6 +4091,57 @@ export default function ChartPanel(props: ChartPanelProps) {
     setIndicators(indicatorsRef.current.map((x) => (x.uid === uid ? { ...x, visible: !x.visible } : x)), "hide indicator");
   }
 
+  /** Legend More → Move to: its own new pane, the price pane, or another indicator's pane. */
+  function moveIndicatorTo(uid: string, target: "own" | "main" | string): void {
+    setIndicators(indicatorsRef.current.map((x) => (x.uid === uid ? { ...x, pane: target } : x)), "move indicator");
+    setPaneMode({ max: null, collapsed: [] });
+  }
+
+  function pinIndicatorScale(uid: string, scale: "left" | "right" | "new" | undefined): void {
+    setIndicators(indicatorsRef.current.map((x) => (x.uid === uid ? { ...x, scale } : x)), "pin to scale");
+  }
+
+  /** Visual order: later series paint on top. */
+  function reorderIndicator(uid: string, to: "front" | "back"): void {
+    const list = indicatorsRef.current;
+    const it = list.find((x) => x.uid === uid);
+    if (!it) return;
+    const rest = list.filter((x) => x.uid !== uid);
+    setIndicators(to === "front" ? [...rest, it] : [it, ...rest], "visual order");
+  }
+
+  function copyIndicator(uid: string): void {
+    const it = indicatorsRef.current.find((x) => x.uid === uid);
+    if (!it) return;
+    indicatorClipboard.current = JSON.parse(JSON.stringify(it));
+    addToast(`${instanceTitle(it)} copied — paste it on any chart (right-click → Paste indicator)`);
+  }
+
+  function pasteIndicator(): void {
+    const raw = indicatorClipboard.current as IndicatorInstance | null;
+    const inst = raw ? sanitizeInstance({ ...raw, uid: newUid(), pane: undefined }) : null;
+    if (inst) setIndicators([...indicatorsRef.current, inst], `paste ${instanceTitle(inst)}`);
+  }
+
+  /** Panes below the price pane: index → the indicators in it. */
+  function paneList(): { i: number; insts: IndicatorInstance[] }[] {
+    const by = new Map<number, IndicatorInstance[]>();
+    for (const x of indicatorsRef.current) {
+      const p = indPaneRef.current.get(x.uid);
+      if (p === undefined) continue;
+      by.set(p, [...(by.get(p) ?? []), x]);
+    }
+    return [...by.entries()].sort((a, b) => a[0] - b[0]).map(([i, insts]) => ({ i, insts }));
+  }
+
+  /** Merge every indicator of pane `from` into pane `to` (0 = price pane). */
+  function mergePanes(from: number, to: number): void {
+    const host = to === 0 ? "main" : paneList().find((p) => p.i === to)?.insts[0]?.uid;
+    if (!host) return;
+    setIndicators(indicatorsRef.current.map((x) => (indPaneRef.current.get(x.uid) === from ? { ...x, pane: host } : x)), "merge panes");
+    setPaneMode({ max: null, collapsed: [] });
+  }
+
   /** Move a pane up / down by swapping it with its neighbour pane. */
   function movePane(p: number, by: -1 | 1): void {
     const list = [...indicatorsRef.current];
@@ -4181,7 +4344,7 @@ export default function ChartPanel(props: ChartPanelProps) {
   }
 
   function treePanes(): { title: string; items: TreeItem[] }[] {
-    const mainItems: TreeItem[] = [{ id: symbol, kind: "series", label: `${shortName} · ${ivLabel} · ${CHART_KINDS.find((k) => k.id === chartKind)?.label}`, visible: true }];
+    const mainItems: TreeItem[] = [{ id: symbol, kind: "series", label: `${shortName} · ${ivLabel} · ${CHART_KINDS.find((k) => k.id === chartKind)?.label}`, visible: !mainHidden }];
     for (const c of compares) mainItems.push({ id: c.symbol, kind: "compare", label: c.name, visible: !c.hidden });
     const panes = new Map<number, TreeItem[]>();
     for (const inst of indicators) {
@@ -4277,6 +4440,14 @@ export default function ChartPanel(props: ChartPanelProps) {
   const ltpNow = live?.last_price ?? lastClose();
   const quickTrade = settings.buySellButtons && !!onChartOrder && !hide.positions;
 
+  /** Open the legend's More menu next to the clicked button. */
+  const openLegendMenu = (e: React.MouseEvent, kind: "main" | "ind", uid?: string) => {
+    const host = containerRef.current?.getBoundingClientRect();
+    const b = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    if (!host) return;
+    setLegendMenu((m) => (m && m.kind === kind && m.uid === uid ? null : { kind, uid, x: b.left - host.left, y: b.bottom - host.top + 2 }));
+  };
+
   const indRow = (inst: IndicatorInstance) => {
     const def = INDICATOR_BY_TYPE.get(inst.type);
     if (!def) return null;
@@ -4300,8 +4471,8 @@ export default function ChartPanel(props: ChartPanelProps) {
           {inst.type !== "volume" && (
             <button type="button" title="Add alert on this indicator" onClick={() => openAlertDialog(undefined, { target: `ind:${inst.uid}:0`, targetLabel: `${def.short} ${args} · ${def.plots[0].label}` })}>🔔</button>
           )}
-          <button type="button" title="Duplicate" onClick={() => setIndicators([...indicatorsRef.current, { ...inst, uid: newUid() }], "duplicate indicator")}>⧉</button>
           <button type="button" title="Remove" onClick={() => removeIndicator(inst.uid)} data-testid={`ind-remove-${inst.type}`}>✕</button>
+          <button type="button" title="More" data-more="" onClick={(e) => openLegendMenu(e, "ind", inst.uid)} data-testid={`ind-more-${inst.type}`}>⋯</button>
         </span>
       </div>
     );
@@ -4608,6 +4779,109 @@ export default function ChartPanel(props: ChartPanelProps) {
     </div>
   );
 
+  const legendMenuEl = legendMenu && (() => {
+    const close = () => setLegendMenu(null);
+    const item = (label: ReactNode, run: () => void, extra?: { testid?: string; on?: boolean; disabled?: boolean; kbd?: string }) => (
+      <button type="button" className={`chart-menu-item${extra?.on ? " on" : ""}`} disabled={extra?.disabled} onClick={() => { run(); close(); }} data-testid={extra?.testid}>
+        {label}
+        {extra?.kbd && <span className="kbd">{extra.kbd}</span>}
+      </button>
+    );
+    const hostH = containerRef.current?.clientHeight ?? 600;
+    const style = { left: Math.max(0, Math.min(legendMenu.x, (containerRef.current?.clientWidth ?? 600) - 250)), top: legendMenu.y, maxHeight: hostH - 8, overflowY: "auto" as const };
+    // keep the menu inside the chart: slide it up when it would run off the bottom
+    const fit = (el: HTMLDivElement | null) => {
+      if (!el) return;
+      const maxTop = hostH - el.offsetHeight - 4;
+      if (el.offsetTop > maxTop) el.style.top = `${Math.max(4, maxTop)}px`;
+    };
+    if (legendMenu.kind === "main") {
+      const last = viewRef.current[viewRef.current.length - 1]?.close;
+      return (
+        <div ref={fit} className="chart-menu chart-ctx chart-overlay-ui" style={style} onMouseDown={(e) => e.stopPropagation()} data-testid="legend-menu">
+          <div className="chart-menu-head">{titleText}</div>
+          {item(mainHidden ? "Show series" : "Hide series", () => setMainHidden((v) => !v))}
+          {item("Settings…", () => setDialog({ k: "settings", tab: "symbol" }))}
+          {onSymbolChange && item("Change symbol…", () => setDialog({ k: "symbol", q: "" }))}
+          {item("Change interval…", () => setDialog({ k: "interval", txt: "" }))}
+          {item("Create alert…", () => openAlertDialog(), { kbd: "Alt+A" })}
+          {last != null && item(`Copy last price ${fmtPrice(last)}`, () => { void navigator.clipboard?.writeText(String(last)).catch(() => undefined); addToast(`copied ${fmtPrice(last)}`); })}
+          {onAction && item(`Add ${shortName} to watchlist`, () => onAction("watch:add"), { kbd: "Alt+W" })}
+          {onAction && item("Symbol details", () => onAction("panel:details"))}
+          {item("Insights", () => setDialog({ k: "insights" }))}
+        </div>
+      );
+    }
+    const inst = indicators.find((x) => x.uid === legendMenu.uid);
+    const def = inst ? INDICATOR_BY_TYPE.get(inst.type) : undefined;
+    if (!inst || !def) return null;
+    const myPane = indPaneRef.current.get(inst.uid);
+    const panes = paneList().filter((p) => p.i !== myPane);
+    return (
+      <div ref={fit} className="chart-menu chart-ctx chart-overlay-ui" style={style} onMouseDown={(e) => e.stopPropagation()} data-testid="legend-ind-menu">
+        <div className="chart-menu-head">{def.short} {argsLabel(inst)}</div>
+        {def.plots[0] && inst.type !== "volume" && item(`Add alert on ${def.short}…`, () => openAlertDialog(undefined, { target: `ind:${inst.uid}:0`, targetLabel: `${def.short} ${argsLabel(inst)} · ${def.plots[0].label}` }))}
+        {item("Settings…", () => setDialog({ k: "indSettings", uid: inst.uid }))}
+        {item(inst.visible ? "Hide" : "Show", () => toggleIndicator(inst.uid))}
+        <div className="chart-menu-head">Visual order</div>
+        {item("Bring to front", () => reorderIndicator(inst.uid, "front"))}
+        {item("Send to back", () => reorderIndicator(inst.uid, "back"))}
+        <div className="chart-menu-head">Move to</div>
+        {item("New pane below", () => moveIndicatorTo(inst.uid, "own"), { disabled: myPane !== 0 && inst.pane !== "main" && !def.overlay && inst.pane === undefined && panes.length === 0, testid: "ind-move-new" })}
+        {myPane !== 0 && item("Price pane", () => moveIndicatorTo(inst.uid, "main"), { testid: "ind-move-main" })}
+        {panes.filter((p) => p.i !== 0).map((p) => (
+          <button key={p.i} type="button" className="chart-menu-item" onClick={() => { moveIndicatorTo(inst.uid, p.insts[0].uid); close(); }}>
+            Pane {p.i}: {p.insts.map((x) => INDICATOR_BY_TYPE.get(x.type)?.short ?? x.type).join(", ")}
+          </button>
+        ))}
+        <div className="chart-menu-head">Pin to scale</div>
+        {item("Default", () => pinIndicatorScale(inst.uid, undefined), { on: !inst.scale })}
+        {item("Left scale", () => pinIndicatorScale(inst.uid, "left"), { on: inst.scale === "left" })}
+        {item("Right scale", () => pinIndicatorScale(inst.uid, "right"), { on: inst.scale === "right" })}
+        {item("New scale (overlay)", () => pinIndicatorScale(inst.uid, "new"), { on: inst.scale === "new" })}
+        <div className="chart-menu-sep" />
+        {item("Copy", () => copyIndicator(inst.uid), { testid: "ind-copy" })}
+        {item("Duplicate", () => setIndicators([...indicatorsRef.current, { ...inst, uid: newUid() }], "duplicate indicator"))}
+        {item("Save as default", () => {
+          const all = loadJson<Record<string, Partial<IndicatorInstance>>>("chart:indDefaults", {});
+          all[inst.type] = instanceDefaults(inst);
+          saveJson("chart:indDefaults", all);
+          addToast(`saved as the default for new ${def.short}`);
+        })}
+        {item("About…", () => setDialog({ k: "about", uid: inst.uid }))}
+        <div className="chart-menu-sep" />
+        {item(<span className="down">Remove</span>, () => removeIndicator(inst.uid))}
+      </div>
+    );
+  })();
+
+  function openTradeFly(row: HTMLElement): void {
+    const host = containerRef.current?.getBoundingClientRect();
+    if (!host) return;
+    const r = row.getBoundingClientRect();
+    const w = 290;
+    const right = r.right - host.left + 4;
+    const x = right + w > host.width ? Math.max(0, r.left - host.left - w - 4) : right;
+    setTradeFly({ x, y: Math.max(0, Math.min(r.top - host.top - 8, host.height - 200)) });
+  }
+
+  const tradeFlyEl = ctx && tradeFly && !ctx.confirm && ctx.area === "pane" && (
+    <div className="chart-menu chart-ctx chart-overlay-ui ctx-fly" style={{ left: tradeFly.x, top: tradeFly.y }} onMouseDown={(e) => e.stopPropagation()} data-testid="ctx-trade-menu">
+      {onChartOrder &&
+        ctxOrders(ctx.price).filter((o) => o.price != null).map((o, i) => (
+          <button key={`${o.side}-${o.type}`} type="button" className={`chart-menu-item ctx-${o.side.toLowerCase()}`} onClick={() => pickOrder(o, ctx)}>
+            {o.side === "BUY" ? "⌃" : "⌄"} {orderLabel(o)}{i === 0 && <span className="kbd">Alt+Shift+B</span>}
+          </button>
+        ))}
+      {onPickPrice && (
+        <button type="button" className="chart-menu-item" onClick={() => { onPickPrice(ctx.price); setCtx(null); }}>
+          ⤷ Create new order at {fmtPrice(ctx.price)}…<span className="kbd">Shift+T</span>
+        </button>
+      )}
+      {onChartOrder && trading && <button type="button" className="chart-menu-item" onClick={() => { setDialog({ k: "settings", tab: "trading" }); setCtx(null); }}>Trading settings…</button>}
+    </div>
+  );
+
   const ctxEl = ctx && (
     <div
       className="chart-menu chart-ctx chart-overlay-ui"
@@ -4616,6 +4890,9 @@ export default function ChartPanel(props: ChartPanelProps) {
         top: Math.max(0, Math.min(ctx.y, Math.max(0, (containerRef.current?.clientHeight ?? 400) - 320))),
       }}
       onMouseDown={(e) => e.stopPropagation()}
+      onMouseOver={(e) => {
+        if (tradeFly && !(e.target as HTMLElement).closest('[data-testid="ctx-trade"]')) setTradeFly(null);
+      }}
       ref={(el) => {
         const host = containerRef.current;
         if (!el || !host) return;
@@ -4680,24 +4957,23 @@ export default function ChartPanel(props: ChartPanelProps) {
           <button type="button" className="chart-menu-item" onClick={() => { resetView(); setCtx(null); }}>Reset chart view<span className="kbd">Alt+R</span></button>
           <button type="button" className="chart-menu-item" onClick={() => { void navigator.clipboard?.writeText(String(ctx.price)).catch(() => undefined); addToast(`copied ${fmtPrice(ctx.price)}`); setCtx(null); }}>Copy price {fmtPrice(ctx.price)}</button>
           {clipboardRef.current && <button type="button" className="chart-menu-item" onClick={() => { pasteDrawing(); setCtx(null); }}>Paste<span className="kbd">Ctrl+V</span></button>}
+          {indicatorClipboard.current != null && <button type="button" className="chart-menu-item" onClick={() => { pasteIndicator(); setCtx(null); }} data-testid="ctx-paste-indicator">Paste indicator</button>}
           <div className="chart-menu-sep" />
           <button type="button" className="chart-menu-item" onClick={() => { addAlert(ctx.price); setCtx(null); }}>
             🔔 Add alert on {shortName} at {fmtPrice(ctx.price)}<span className="kbd">Alt+A</span>
           </button>
           <button type="button" className="chart-menu-item" onClick={() => { openAlertDialog(ctx.price); setCtx(null); }}>Create alert…</button>
-          {onChartOrder && <div className="chart-menu-head">Trade</div>}
-          {onChartOrder &&
-            ctxOrders(ctx.price).filter((o) => o.price != null).map((o, i) => (
-              <button key={`${o.side}-${o.type}`} type="button" className={`chart-menu-item ctx-${o.side.toLowerCase()}`} onClick={() => pickOrder(o, ctx)}>
-                {o.side === "BUY" ? "⌃" : "⌄"} {orderLabel(o)}{i === 0 && <span className="kbd">Alt+Shift+B</span>}
-              </button>
-            ))}
-          {onPickPrice && (
-            <button type="button" className="chart-menu-item" onClick={() => { onPickPrice(ctx.price); setCtx(null); }}>
-              ⤷ Create new order at {fmtPrice(ctx.price)}…<span className="kbd">Shift+T</span>
+          {(onChartOrder || onPickPrice) && (
+            <button
+              type="button"
+              className={`chart-menu-item chart-menu-subrow${tradeFly ? " on" : ""}`}
+              data-testid="ctx-trade"
+              onMouseEnter={(e) => openTradeFly(e.currentTarget)}
+              onClick={(e) => openTradeFly(e.currentTarget)}
+            >
+              Trade<span className="kbd">▸</span>
             </button>
           )}
-          {onChartOrder && trading && <button type="button" className="chart-menu-item" onClick={() => { setDialog({ k: "settings", tab: "trading" }); setCtx(null); }}>Trading settings…</button>}
           <div className="chart-menu-sep" />
           <button type="button" className="chart-menu-item" onClick={() => { addHLine(ctx.price); setCtx(null); }}>
             ─ Draw horizontal line at {fmtPrice(ctx.price)}<span className="kbd">Alt+H</span>
@@ -4718,6 +4994,8 @@ export default function ChartPanel(props: ChartPanelProps) {
           {onAction && <button type="button" className="chart-menu-item" onClick={() => { onAction("panel:tape"); setCtx(null); }}>Time & sales</button>}
           {onAction && <button type="button" className="chart-menu-item" onClick={() => { onAction("panel:depth"); setCtx(null); }}>Market depth</button>}
           {onAction && <button type="button" className="chart-menu-item" onClick={() => { onAction("panel:strategy"); setCtx(null); }}>Strategy builder</button>}
+          <button type="button" className="chart-menu-item" onClick={() => { setDialog({ k: "insights" }); setCtx(null); }} data-testid="ctx-insights">Insights</button>
+          {paneRects.length > 1 && <button type="button" className="chart-menu-item" onClick={() => { setDialog({ k: "panes" }); setCtx(null); }}>Manage panes…</button>}
           <button type="button" className="chart-menu-item" onClick={() => { setDialog({ k: "settings" }); setCtx(null); }}>Settings…</button>
           {onChartOrder && <div className="chart-menu-sep" />}
           {onChartOrder &&
@@ -4796,6 +5074,19 @@ export default function ChartPanel(props: ChartPanelProps) {
               {shortName}<span>{ivLabel}</span>
             </div>
           )}
+          {settings.logoWatermark && (
+            <div
+              className="chart-logo-wm"
+              style={{
+                left: (side === "left" ? scaleWidth("left") : 0) + 10,
+                // bottom-left of the price pane (indicator panes sit below it)
+                top: (paneRects.find((r) => r.i === 0) ? (paneRects.find((r) => r.i === 0)!.top + paneRects.find((r) => r.i === 0)!.height) : (containerRef.current?.clientHeight ?? 400) - 28) - 24,
+              }}
+              aria-hidden
+            >
+              <b>◆</b> TRADEBOT
+            </div>
+          )}
           <div className="chart-legend chart-overlay-ui" style={legendStyle}>
             <div className="lg-row lg-main">
               {settings.showTitle && (
@@ -4807,8 +5098,18 @@ export default function ChartPanel(props: ChartPanelProps) {
               {replay.on && !replay.selecting && <span className="lg-replay">REPLAY</span>}
               <span ref={legendRef} className="lg-vals" />
               <span className="lg-acts">
+                <button type="button" title={mainHidden ? "Show the series" : "Hide the series"} onClick={() => setMainHidden((v) => !v)} data-testid="legend-main-eye">{mainHidden ? "◌" : "👁"}</button>
                 <button type="button" title="Chart settings" onClick={() => setDialog({ k: "settings", tab: "symbol" })}>⚙</button>
-                <button type="button" title={legendCollapsed ? "Show indicators" : "Hide indicators legend"} onClick={() => setLegendCollapsed((v) => !v)} data-testid="legend-collapse">{legendCollapsed ? "⌄" : "⌃"}</button>
+                <button type="button" title="More" data-more="" onClick={(e) => openLegendMenu(e, "main")} data-testid="legend-main-more">⋯</button>
+                <button
+                  type="button"
+                  className={legendCollapsed && indicators.length ? "lg-count" : ""}
+                  title={legendCollapsed ? `Show indicators legend (${indicators.length})` : "Hide indicators legend"}
+                  onClick={() => setLegendCollapsed((v) => !v)}
+                  data-testid="legend-collapse"
+                >
+                  {legendCollapsed ? `⌄${indicators.length ? ` ${indicators.length}` : ""}` : "⌃"}
+                </button>
               </span>
             </div>
             {quickTrade && (
@@ -4875,6 +5176,7 @@ export default function ChartPanel(props: ChartPanelProps) {
                   <button type="button" title={paneMode.max === r.i ? "Restore pane" : "Maximize pane"} onClick={() => setPaneMode((m) => ({ max: m.max === r.i ? null : r.i, collapsed: [] }))}>{paneMode.max === r.i ? "❐" : "⬚"}</button>
                   <button type="button" title={paneMode.collapsed.includes(r.i) ? "Restore pane" : "Collapse pane"} onClick={() => setPaneMode((m) => ({ max: null, collapsed: m.collapsed.includes(r.i) ? m.collapsed.filter((x) => x !== r.i) : [...m.collapsed, r.i] }))}>{paneMode.collapsed.includes(r.i) ? "▢" : "▁"}</button>
                   <button type="button" title="Delete pane" onClick={() => deletePane(r.i)}>✕</button>
+                  <button type="button" title="Manage panes" onClick={() => setDialog({ k: "panes" })} data-testid={`pane-manage-${r.i}`}>⚙</button>
                 </div>
               </div>
             );
@@ -4969,6 +5271,8 @@ export default function ChartPanel(props: ChartPanelProps) {
             </button>
           )}
           {ctxEl}
+          {tradeFlyEl}
+          {legendMenuEl}
           {selDrawing && !drawMode && (
             <DrawingFloatBar
               drawing={selDrawing}
@@ -5085,6 +5389,7 @@ export default function ChartPanel(props: ChartPanelProps) {
             panes={treePanes()}
             onVisible={(it) => {
               if (it.kind === "indicator") toggleIndicator(it.id);
+              else if (it.kind === "series") setMainHidden((v) => !v);
               else if (it.kind === "drawing") updateDrawing(it.id, (d) => ({ ...d, hidden: !d.hidden }), "hide drawing");
               else if (it.kind === "compare") setCompares((l) => l.map((x) => (x.symbol === it.id ? { ...x, hidden: !x.hidden } : x)));
             }}
@@ -5183,6 +5488,25 @@ export default function ChartPanel(props: ChartPanelProps) {
       {dlg?.k === "goto" && <GoToDialog onGo={goTo} onClose={() => setDialog(null)} last={viewRef.current[viewRef.current.length - 1]?.time ?? null} />}
       {dlg?.k === "palette" && <CommandPalette commands={commands()} onClose={() => setDialog(null)} />}
       {dlg?.k === "shortcuts" && <ShortcutsDialog onClose={() => setDialog(null)} />}
+      {dlg?.k === "about" && (() => {
+        const inst = indicators.find((x) => x.uid === dlg.uid);
+        const def = inst ? INDICATOR_BY_TYPE.get(inst.type) : undefined;
+        return def ? <AboutIndicatorDialog def={def} onClose={() => setDialog(null)} /> : null;
+      })()}
+      {dlg?.k === "panes" && (
+        <ManagePanesDialog
+          panes={paneList().map((p) => ({ i: p.i, names: p.insts.map((x) => `${INDICATOR_BY_TYPE.get(x.type)?.short ?? x.type} ${argsLabel(x)}`.trim()) })).concat(paneList().some((p) => p.i === 0) ? [] : [{ i: 0, names: [] }]).sort((a, b) => a.i - b.i)}
+          maxPane={paneMode.max}
+          collapsed={paneMode.collapsed}
+          onMove={movePane}
+          onMerge={mergePanes}
+          onDelete={deletePane}
+          onMax={(i) => setPaneMode((m) => ({ max: m.max === i ? null : i, collapsed: [] }))}
+          onCollapse={(i) => setPaneMode((m) => ({ max: null, collapsed: m.collapsed.includes(i) ? m.collapsed.filter((x) => x !== i) : [...m.collapsed, i] }))}
+          onClose={() => setDialog(null)}
+        />
+      )}
+      {dlg?.k === "insights" && <InsightsDialog symbol={symbol} name={shortName} onClose={() => setDialog(null)} />}
       {dlg?.k === "interval" && (
         <IntervalPrompt
           initial={dlg.txt}

@@ -229,6 +229,7 @@ export default function ChartSettingsDialog({
             <Check label="Watermark" checked={s.watermark} onChange={(v) => set("watermark", v)}>
               <ColorInput value={s.watermarkColor} fallback={theme.text} onChange={(c) => set("watermarkColor", c)} />
             </Check>
+            <Check label="Logo watermark" checked={s.logoWatermark} onChange={(v) => set("logoWatermark", v)} />
           </Section>
           <Section title="Scales">
             <Row label="Text">
