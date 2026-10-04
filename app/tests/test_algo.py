@@ -529,3 +529,30 @@ def test_volume_candle_strategy_backtests():
     r = engine.run(spec, {"X": d})
     assert r["trades"] and all(t["exit_t"] in d["tc"] or t["reason"] in ("SL", "TARGET") or t["exit_t"] in d["t"]
                                for t in r["trades"])
+
+
+def test_live_minute_cache_fetches_only_new_minutes(monkeypatch):
+    """Runner path for volume candles: first call loads history, later calls
+    fetch only the minutes since the last one and drop the forming candle."""
+    import asyncio
+
+    from app.algo import data, orderflow
+
+    data._m1_cache.clear()
+    calls = []
+    t0 = DAY0
+
+    class B:
+        async def get_history_range(self, fy, resolution, from_ts, to_ts):
+            calls.append((from_ts, to_ts))
+            return [[t, 100.0, 100.2, 99.8, 100.1, 100] for t in range(max(from_ts, t0) // 60 * 60, to_ts + 1, 60)
+                    if t >= t0]
+
+    monkeypatch.setattr(data, "_backend", lambda: B())
+    now = t0 + 30 * 60 + 5                                  # 09:45:05
+    a = asyncio.run(data.minute_history("NSE:X-EQ", 200, now))
+    assert a["t"][-1] == t0 + 29 * 60                       # the 09:45 minute is still forming
+    b = asyncio.run(data.minute_history("NSE:X-EQ", 200, now + 120))
+    assert calls[-1][0] == t0 + 30 * 60 and b["t"][-1] == t0 + 31 * 60 and len(b["t"]) == 32
+    vb = orderflow.complete_only(orderflow.build_bars(b, "volume", size=450), now + 120)
+    assert all(v >= 450 for v in vb["v"])                   # forming volume candle dropped
