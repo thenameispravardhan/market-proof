@@ -27,6 +27,7 @@ index itself has no trades.
 from __future__ import annotations
 
 import asyncio
+import calendar
 import csv
 import json
 import os
@@ -146,6 +147,8 @@ class TickRecorder:
             return
         recv_ts = recv_ts or time.time()
         exch_ts = int(_f(msg.get("exch_feed_time")) or _f(msg.get("last_traded_time")) or recv_ts)
+        if (exch_ts + IST) // 86400 != (recv_ts + IST) // 86400:
+            return                    # the snapshot Fyers pushes on subscribe: an earlier session's last trade
         bid, ask = _f(msg.get("bid_price")), _f(msg.get("ask_price"))
         row = (round(recv_ts, 3), exch_ts, ltp, vol, 0.0, 0, bid, ask, _f(msg.get("bid_size")),
                _f(msg.get("ask_size")), _f(msg.get("tot_buy_qty")), _f(msg.get("tot_sell_qty")))
@@ -202,6 +205,7 @@ class TickRecorder:
     async def run(self) -> None:
         from app.algo import fno
 
+        await asyncio.to_thread(self.sweep)
         await asyncio.to_thread(self.replay_today)
         while True:
             await asyncio.sleep(15)
@@ -215,8 +219,6 @@ class TickRecorder:
                     except Exception as e:  # noqa: BLE001
                         log.warning("ticks.fno_master_failed", error=str(e)[:200])
                     self._resolved.clear()
-                    with self._lock:
-                        self.stats = {}
                 await asyncio.to_thread(self.flush)
                 if ((now + IST) % 86400) // 60 >= COMPACT_AFTER_MIN and self._compacted_day != day:
                     self._compacted_day = day
@@ -250,10 +252,21 @@ class TickRecorder:
                 n += len(rs)
         return n
 
-    def replay_today(self) -> None:
+    def sweep(self) -> None:
+        """Compact the raw CSV of any EARLIER day (the bot was down at that
+        day's close): replay it through the same classifier, then compact."""
+        today = int((time.time() + IST) // 86400)
+        raw = self.root / "raw"
+        days = {calendar.timegm(time.strptime(f.stem, "%Y%m%d")) // 86400
+                for f in raw.glob("*/*.csv")} if raw.is_dir() else set()
+        for d in sorted(days - {today}):
+            self.replay_today(d)
+            self.compact(d)
+
+    def replay_today(self, day: Optional[int] = None) -> None:
         """Rebuild today's classification state and minute flow from the raw
         CSV after a restart — the same rule, so nothing drifts."""
-        day = int((time.time() + IST) // 86400)
+        day = int((time.time() + IST) // 86400) if day is None else day
         if not (self.root / "raw").is_dir():
             return
         for kdir in (self.root / "raw").iterdir():
@@ -282,7 +295,7 @@ class TickRecorder:
         ym = time.strftime("%Y%m", time.gmtime(day * 86400))
         with self._lock:
             minutes, fp = self._minutes, self._fp
-            self._minutes, self._fp, self._state = {}, {}, {}
+            self._minutes, self._fp, self._state, self.stats = {}, {}, {}, {}
         for key in set(minutes) | set(fp):
             csvp = self._raw_path(key, day, "csv")
             if csvp.exists():
