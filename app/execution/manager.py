@@ -1447,11 +1447,9 @@ class Manager:
             stop_loss = entry * (1.0 + sl_pct)
             target = entry * (1.0 - sl_pct * rr)
 
-        # Manual Trade-page orders respect the SAME global risk caps as
-        # the auto pipeline (so changes you make in Settings actually take
-        # effect here too). A rejected verdict BLOCKS the order unless the
-        # operator explicitly overrides it (`bypass_risk=True`). A risk-
-        # engine *fault* never blocks — it's surfaced as advisory only.
+        # Settings-page risk rules govern the BOT, not the operator: a manual
+        # Trade-page order is never blocked by them. The verdict is still
+        # computed and returned as an advisory `risk_warning` (and logged).
         risk_codes: list[str] = []
         risk_message = ""
         risk_approved = True
@@ -1473,8 +1471,7 @@ class Manager:
                     else "risk limit exceeded"
                 )
                 log.warning(
-                    "manual_order.risk_bypassed" if bypass_risk
-                    else "manual_order.risk_blocked",
+                    "manual_order.risk_advisory",
                     account_id=account.id, symbol=symbol, side=side,
                     quantity=quantity, codes=risk_codes,
                 )
@@ -1482,30 +1479,6 @@ class Manager:
             # Engine fault → advisory only; never block on an engine error.
             log.warning("manual_order.risk_engine_failed", error=str(e))
             risk_message = f"risk check unavailable: {e}"
-
-        # Enforce: a rejected verdict blocks the order unless bypassed. We
-        # return before touching the backend so no order reaches the broker.
-        if not risk_approved and not bypass_risk:
-            return {
-                "ok": False,
-                "blocked": True,
-                "risk_codes": risk_codes,
-                "risk_message": risk_message,
-                "risk_warning": risk_message or None,
-                "bypassed_risk": False,
-                "broker_order_id": None,
-                "status": "REJECTED_RISK",
-                "error": (
-                    f"Blocked by risk limits: {risk_message}. Reduce the "
-                    "order size, relax the limit in Settings, or re-submit "
-                    "with risk override to place it anyway."
-                ),
-                "reason": "risk_block",
-                "entry_used": entry,
-                "stop_loss_used": stop_loss,
-                "target_used": target,
-                "entry_is_synthetic": entry_is_synthetic,
-            }
 
         backend = self._manual_backend_for(account)
         if backend is None:
