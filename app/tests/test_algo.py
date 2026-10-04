@@ -599,3 +599,16 @@ def test_tick_recorder_end_to_end(tmp_path):
     ticks.TickRecorder(tmp_path).sweep()
     assert not list((tmp_path / "raw" / "SBIN").glob("*.csv"))
     assert ticks.TickRecorder(tmp_path).minute_flow("SBIN", y, y + 60) == {y: (400.0, 100.0)}
+
+
+def test_adv_from_daily_candles_unblocks_known_liquid_symbols():
+    """Fyers quotes carry no ADV; it is derived from daily candles so
+    REQUIRE_KNOWN_LIQUIDITY doesn't refuse every live order."""
+    from app.risk.engine import _ADV_CACHE, adv_from_candles, cached_adv
+    import time as _t
+
+    candles = [[0, 1, 1, 1, 800.0, 2_000_000] for _ in range(30)]   # ₹160 cr / day
+    assert abs(adv_from_candles(candles) - 160.0) < 1e-6
+    assert adv_from_candles([]) is None
+    _ADV_CACHE[("NSE:SBIN-EQ", int((_t.time() + 19800) // 86400))] = 160.0
+    assert cached_adv("nse:sbin-eq") == 160.0
