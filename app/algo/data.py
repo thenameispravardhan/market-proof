@@ -253,8 +253,13 @@ _size_cache: dict[tuple, float] = {}
 async def minute_history(fy: str, need: int, now: float) -> dict[str, Any]:
     """The last `need` COMPLETED 1-minute candles, incrementally cached."""
     have = _m1_cache.get(fy)
-    if have is None or len(have["t"]) < need * 0.9:
+    # Full fetch only the first time, or when a strategy now wants a longer
+    # window. NOT when the cache is short: a recently listed symbol has less
+    # history than `need` forever, and refetching it every minute would hammer
+    # Fyers for nothing.
+    if have is None or need > have.get("need", 0):
         have = await recent_bars(fy, 1, bars=need, now=now)
+        have["need"] = need
     else:
         raw = await _backend().get_history_range(fy, resolution="1", from_ts=have["t"][-1] + 60, to_ts=int(now))
         if raw is None:
