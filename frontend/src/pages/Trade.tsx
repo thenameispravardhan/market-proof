@@ -39,6 +39,7 @@ import {
 } from "../hooks/useApi";
 import { useLiveQuote } from "../hooks/useQuotes";
 import ChartPanel, { type BrokerLine, type ChartOrder, type ChartPosition } from "../components/trade/ChartPanel";
+import Scalper from "../components/trade/Scalper";
 import type {
   BrokerAccount,
   InstrumentHit,
@@ -130,6 +131,24 @@ const DOCK: { id: DockId; label: string; short: string; icon: string; hint: stri
   { id: "flow", label: "Order flow", short: "Flow", icon: "Δ", hint: "Real order flow from recorded ticks" },
 ];
 const DEFAULT_DOCK: DockId[] = ["watch", "trade"];
+
+// Multi-chart layouts (TradingView-style). Click a chart to make it the
+// active one: it follows the watchlist / search and drives the ticket.
+type Layout = "1" | "2" | "2v" | "3" | "4";
+const LAYOUTS: { id: Layout; n: number; icon: string; label: string }[] = [
+  { id: "1", n: 1, icon: "▢", label: "1 chart" },
+  { id: "2", n: 2, icon: "◫", label: "2 side by side" },
+  { id: "2v", n: 2, icon: "⊟", label: "2 stacked" },
+  { id: "3", n: 3, icon: "◧", label: "1 large + 2" },
+  { id: "4", n: 4, icon: "⊞", label: "4 (2 × 2)" },
+];
+
+// Polling a symbol's quote keeps it subscribed on the live socket, so a
+// chart that isn't the ticket's symbol still ticks.
+function KeepLive({ symbol }: { symbol: string }) {
+  useQuote(symbol);
+  return null;
+}
 type BottomTab = "positions" | "orders";
 
 // An instrument that HAS an option chain (index or cash stock).
@@ -277,6 +296,12 @@ export default function Trade() {
     return Array.isArray(v) ? v.filter((x) => DOCK.some((d) => d.id === x)) : DEFAULT_DOCK;
   });
   const [dockW, setDockW] = useState(() => Number(stored("trade:dockW", 340)) || 340);
+  const [layout, setLayout] = useState<Layout>(() => stored<Layout>("trade:layout", "1"));
+  const [cells, setCells] = useState<(InstrumentHit | null)[]>(() => stored("trade:cells", []));
+  const [activeCell, setActiveCell] = useState(0);
+  const [layoutOpen, setLayoutOpen] = useState(false);
+  const [scalper, setScalper] = useState(() => stored("trade:scalper", false));
+  useEffect(() => { try { localStorage.setItem("trade:scalper", JSON.stringify(scalper)); } catch { /* best-effort */ } }, [scalper]);
   const dockWidth = dock.includes("chain") ? Math.max(dockW, 400) : dockW;   // the chain's 5 columns need room
   // Panel heights the operator dragged (px); unset = sized by content. The
   // last panel always takes whatever room is left.
@@ -328,6 +353,16 @@ export default function Trade() {
         onDoubleClick={() => setSizes((z) => { const n = { ...z }; delete n[id]; return n; })}
       />
     );
+  const nCells = LAYOUTS.find((l) => l.id === layout)?.n ?? 1;
+  useEffect(() => {
+    setCells((c) => {
+      if (c[activeCell]?.symbol === selected?.symbol) return c;
+      const n = [...c];
+      n[activeCell] = selected;
+      try { localStorage.setItem("trade:cells", JSON.stringify(n)); } catch { /* best-effort */ }
+      return n;
+    });
+  }, [selected, activeCell]);
   const [showResults, setShowResults] = useState(false);
   // Keyboard cursor into the search results (-1 = nothing highlighted).
   const [highlightIdx, setHighlightIdx] = useState(-1);
@@ -379,7 +414,7 @@ export default function Trade() {
   // The chain is available for index underlyings AND F&O stocks. We fetch
   // for both indices and cash equities; a non-F&O stock just returns no
   // strikes and the panel stays hidden.
-  const chainOn = chainBase != null && dock.includes("chain");
+  const chainOn = chainBase != null && (dock.includes("chain") || scalper);
   const { data: chain } = useOptionChain(
     chainOn ? chainBase!.symbol : "",
     chainOn ? chainBase!.short_name : "",
@@ -460,15 +495,16 @@ export default function Trade() {
     },
     refetchInterval: 3000,
   });
-  const chartPosition = useMemo<ChartPosition | null>(() => {
-    const pos = selected && positions?.find((p) => p.symbol === selected.symbol && p.quantity !== 0);
+  // Position line / exits / close for ANY charted symbol (every layout
+  // cell, the scalper's legs).
+  const positionFor = (sym: string): ChartPosition | null => {
+    const pos = positions?.find((p) => p.symbol === sym && p.quantity !== 0);
     if (!pos) return null;
-    const m = managed?.find((x) => x.symbol === pos.symbol);
+    const m = managed?.find((x) => x.symbol === sym);
     return { qty: pos.quantity, avg: pos.average_price, sl: m?.stop_loss ?? null, tp: m?.target ?? null };
-  }, [selected, positions, managed]);
-  const onLevels = async (sl: number | null, tp: number | null) => {
-    if (!selected) return;
-    const r = await fetch(`/api/positions/${encodeURIComponent(selected.symbol)}/levels`, {
+  };
+  const levelsFor = (sym: string) => async (sl: number | null, tp: number | null) => {
+    const r = await fetch(`/api/positions/${encodeURIComponent(sym)}/levels`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ stop_loss: sl, target: tp }),
@@ -477,9 +513,8 @@ export default function Trade() {
     if (!r.ok) throw new Error(j.detail ?? `HTTP ${r.status}`);
     qc.setQueryData<Managed[]>(["managed-positions"], (old) => [...(old ?? []).filter((x) => x.symbol !== j.managed.symbol), j.managed]);
   };
-  const onClosePosition = async () => {
-    if (!selected) return;
-    const r = await fetch(`/api/positions/${encodeURIComponent(selected.symbol)}/close`, { method: "POST" });
+  const closeFor = (sym: string) => async () => {
+    const r = await fetch(`/api/positions/${encodeURIComponent(sym)}/close`, { method: "POST" });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.detail ?? `HTTP ${r.status}`);
     void qc.invalidateQueries({ queryKey: ["positions"] });
@@ -528,6 +563,35 @@ export default function Trade() {
     setOrderType("MARKET");
   };
 
+  // A new layout keeps the active symbol in the first cell and fills new
+  // cells from the watchlist (then the active symbol).
+  const pickLayout = (id: Layout) => {
+    const n = LAYOUTS.find((l) => l.id === id)?.n ?? 1;
+    const out: (InstrumentHit | null)[] = [selected, ...cells.filter((_, i) => i !== activeCell)].slice(0, n);
+    const used = new Set(out.filter(Boolean).map((h) => h!.symbol));
+    for (let i = 0; i < n; i++) {
+      if (out[i]) continue;
+      const next = recent.find((r) => !used.has(r.symbol)) ?? selected;
+      out[i] = next ?? null;
+      if (next) used.add(next.symbol);
+    }
+    setCells(out);
+    setActiveCell(0);
+    setLayout(id);
+    setScalper(false);
+    setLayoutOpen(false);
+    try {
+      localStorage.setItem("trade:layout", JSON.stringify(id));
+      localStorage.setItem("trade:cells", JSON.stringify(out));
+    } catch { /* best-effort */ }
+  };
+  const activate = (i: number) => {
+    if (i === activeCell) return;
+    setActiveCell(i);
+    const h = cells[i];
+    if (h && h.symbol !== selected?.symbol) onSelect(h, true);
+  };
+
   // The strike nearest the spot — highlighted as ATM in the chain.
   const atmStrike = useMemo<number | null>(() => {
     if (!chain || chain.spot == null || chain.strikes.length === 0) return null;
@@ -572,17 +636,17 @@ export default function Trade() {
     if (!dock.includes("trade")) toggleDock("trade");   // the ticket is where the click is going
   };
 
-  // Right-click order from the chart: the ticket's account + quantity, the
-  // clicked price. Risk-blocked or rejected orders come back as errors (the
-  // ticket is where a risk override is typed).
-  const onChartOrder = async (o: ChartOrder): Promise<string> => {
-    if (!selected) throw new Error("no symbol");
+  // An order from a chart (right-click menu, scalper buttons) on the ticket's
+  // account. Risk-blocked or rejected orders come back as errors (the ticket
+  // is where a risk override is typed).
+  const orderFor = (sym: string, name: string, qty: number) => async (o: ChartOrder): Promise<string> => {
     if (!accountId) throw new Error("no live Fyers account connected");
+    if (!(qty > 0)) throw new Error("quantity must be more than 0");
     const r = await placeOrder.mutateAsync({
       account_id: accountId,
-      symbol: selected.symbol,
+      symbol: sym,
       side: o.side,
-      quantity: Number(quantity),
+      quantity: qty,
       order_type: o.type,
       limit_price: o.type === "LIMIT" ? o.price : null,
       stop_price: o.type === "SL-M" ? o.price : null,
@@ -593,7 +657,7 @@ export default function Trade() {
     if (r.status === "REJECTED" || r.status === "REJECTED_RISK" || r.ok === false) {
       throw new Error(cleanError(r.error || r.risk_message, "broker rejected the order"));
     }
-    return `${o.side} ${quantity} ${selected.short_name} ${o.type}${o.price != null ? ` @ ${o.price}` : ""} → ${r.status}`;
+    return `${o.side} ${qty} ${name} ${o.type}${o.price != null ? ` @ ${o.price}` : ""} → ${r.status}`;
   };
 
   const onSubmit = async (opts?: { bypassRisk?: boolean }) => {
@@ -684,32 +748,56 @@ export default function Trade() {
     <div className="trade-page tv">
       <div className="tv-center">
         <div className="tv-chart">
-        {/* ---- TradingView-style chart for the selected instrument ----
-             key={symbol} remounts the panel per symbol so its internal
-             candle store, drawings, and pagination reset cleanly. */}
-        {selected && (
-          <ChartPanel
-            key={selected.symbol}
-            symbol={selected.symbol}
-            shortName={selected.short_name}
-            brokerLines={brokerLines}
-            onPickPrice={onPickPrice}
-            position={chartPosition}
-            onLevels={onLevels}
-            onClosePosition={onClosePosition}
-            onChartOrder={onChartOrder}
-            orderQty={Number(quantity)}
-          />
-        )}
-          {!selected && (
-            <section className="trade-card tv-empty">
-              <div className="empty">
-                No symbol open.{" "}
-                <button type="button" className="btn-sm" onClick={() => { if (!dock.includes("watch")) toggleDock("watch"); setTimeout(() => document.querySelector<HTMLInputElement>('[data-testid="trade-search"]')?.focus(), 0); }}>
-                  Search a symbol
-                </button>
-              </div>
-            </section>
+          {scalper ? (
+            <Scalper
+              base={chainBase}
+              underlyings={[...(chainBase ? [chainBase] : []), ...recent.filter((h) => isUnderlying(h) && h.symbol !== chainBase?.symbol)]}
+              onBase={(h) => onSelect(h, true)}
+              chain={chain}
+              expiry={selectedExpiry}
+              onExpiry={setSelectedExpiry}
+              atmStrike={atmStrike}
+              positions={positions}
+              helpers={{ positionFor, levelsFor, closeFor, orderFor }}
+            />
+          ) : (
+            <div className={`tv-grid l${layout}`}>
+              {Array.from({ length: nCells }, (_, i) => {
+                const h = i === activeCell ? selected : cells[i] ?? null;
+                const active = i === activeCell;
+                return (
+                  <div key={i} className={`tv-cell${active && nCells > 1 ? " active" : ""}`} onMouseDownCapture={() => activate(i)}>
+                    {/* key={symbol} remounts the panel per symbol so its candle
+                        store, drawings and pagination reset cleanly. */}
+                    {h && (
+                      <ChartPanel
+                        key={h.symbol}
+                        symbol={h.symbol}
+                        shortName={h.short_name}
+                        brokerLines={active ? brokerLines : undefined}
+                        onPickPrice={active ? onPickPrice : undefined}
+                        position={positionFor(h.symbol)}
+                        onLevels={levelsFor(h.symbol)}
+                        onClosePosition={closeFor(h.symbol)}
+                        onChartOrder={active ? orderFor(h.symbol, h.short_name, Number(quantity)) : undefined}
+                        orderQty={active ? Number(quantity) : undefined}
+                      />
+                    )}
+                    {h && !active && <KeepLive symbol={h.symbol} />}
+              {!h && (
+                <section className="trade-card tv-empty">
+                  <div className="empty">
+                    No symbol open.{" "}
+                    <button type="button" className="btn-sm" onClick={() => { if (!dock.includes("watch")) toggleDock("watch"); setTimeout(() => document.querySelector<HTMLInputElement>('[data-testid="trade-search"]')?.focus(), 0); }}>
+                      Search a symbol
+                    </button>
+                  </div>
+                </section>
+              )}
+                  </div>
+                );
+              })}
+            </div>
           )}
         </div>
 
@@ -1397,6 +1485,41 @@ export default function Trade() {
             <span className="lbl">{d.short}</span>
           </button>
         ))}
+        <div className="tv-rail-sep" />
+        <div className="tv-rail-pop-wrap">
+          <button
+            type="button"
+            className={`tv-rail-btn${layoutOpen || (!scalper && layout !== "1") ? " on" : ""}`}
+            aria-expanded={layoutOpen}
+            title="Chart layout — several charts at once"
+            onClick={() => setLayoutOpen((o) => !o)}
+            data-testid="rail-layout"
+          >
+            <span className="ico">{LAYOUTS.find((l) => l.id === layout)?.icon ?? "▢"}</span>
+            <span className="lbl">Layout</span>
+          </button>
+          {layoutOpen && (
+            <div className="tv-rail-pop" role="menu">
+              {LAYOUTS.map((l) => (
+                <button key={l.id} type="button" role="menuitem" className={`tv-layout-btn${!scalper && layout === l.id ? " on" : ""}`} onClick={() => pickLayout(l.id)}>
+                  <span className="ico">{l.icon}</span>
+                  {l.label}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+        <button
+          type="button"
+          className={`tv-rail-btn${scalper ? " on" : ""}`}
+          aria-pressed={scalper}
+          title="Option scalper — CE, underlying and PE charts with one-click buy / sell"
+          onClick={() => { setScalper((v) => !v); setLayoutOpen(false); }}
+          data-testid="rail-scalper"
+        >
+          <span className="ico">⚡</span>
+          <span className="lbl">Scalp</span>
+        </button>
       </nav>
     </div>
   );

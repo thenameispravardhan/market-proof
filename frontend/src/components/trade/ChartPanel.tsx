@@ -2352,7 +2352,7 @@ export default function ChartPanel({
         </select>
 
         {/* strategy on chart */}
-        <div className="chart-group chart-menu-wrap">
+        <div className="chart-group chart-menu-wrap chart-opt">
           <button
             type="button"
             className={`chart-btn${strat ? " on" : ""}`}
@@ -2473,7 +2473,7 @@ export default function ChartPanel({
         </div>
 
         {/* compare */}
-        <div className="chart-group chart-menu-wrap">
+        <div className="chart-group chart-menu-wrap chart-opt">
           <button
             type="button"
             className={`chart-btn${compares.length > 0 ? " on" : ""}`}
@@ -2546,7 +2546,7 @@ export default function ChartPanel({
         <div className="chart-group chart-right" role="group" aria-label="chart controls">
           <button
             type="button"
-            className={`chart-btn${scaleMode === "log" ? " on" : ""}`}
+            className={`chart-btn chart-opt${scaleMode === "log" ? " on" : ""}`}
             onClick={() => setScaleMode((m) => (m === "log" ? "normal" : "log"))}
             disabled={compares.length > 0}
             title="Logarithmic price scale"
@@ -2556,7 +2556,7 @@ export default function ChartPanel({
           </button>
           <button
             type="button"
-            className={`chart-btn${scaleMode === "percent" || compares.length > 0 ? " on" : ""}`}
+            className={`chart-btn chart-opt${scaleMode === "percent" || compares.length > 0 ? " on" : ""}`}
             onClick={() => setScaleMode((m) => (m === "percent" ? "normal" : "percent"))}
             disabled={compares.length > 0}
             title="Percentage price scale"
@@ -2566,7 +2566,7 @@ export default function ChartPanel({
           </button>
           <button
             type="button"
-            className="chart-btn"
+            className="chart-btn chart-opt"
             onClick={screenshot}
             title="Download chart as PNG"
             data-testid="chart-screenshot"
