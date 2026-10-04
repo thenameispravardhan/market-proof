@@ -27,6 +27,7 @@ from app.api import (
     core as core_api,
     dataset as dataset_api,
     fyers_callback,
+    fyers_postback,
     health,
     market as market_api,
     metrics as metrics_api,
@@ -618,6 +619,7 @@ app.include_router(health.router)
 app.include_router(settings_api.router)
 app.include_router(trading_mode.router)
 app.include_router(fyers_callback.router)
+app.include_router(fyers_postback.router)
 app.include_router(ws.router)
 app.include_router(notifications_api.router)
 app.include_router(prompts_api.router)
