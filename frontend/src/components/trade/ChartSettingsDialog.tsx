@@ -156,6 +156,7 @@ export default function ChartSettingsDialog({
             <Check label="Arguments" checked={s.indArgs} onChange={(v) => set("indArgs", v)} />
             <Check label="Values" checked={s.indValues} onChange={(v) => set("indValues", v)} />
             <Check label="Background" checked={s.legendBg} onChange={(v) => set("legendBg", v)}>
+              <ColorInput value={s.legendBgColor} fallback={theme.bg} onChange={(c) => set("legendBgColor", c)} title="Background colour" />
               <input type="range" min={0} max={100} value={Math.round(s.legendBgOpacity * 100)} onChange={(e) => set("legendBgOpacity", Number(e.target.value) / 100)} aria-label="Background opacity" />
             </Check>
           </Section>
@@ -165,9 +166,21 @@ export default function ChartSettingsDialog({
         <>
           <Section title="Price scale">
             <Row label="Scale modes (A and L)"><Sel value={s.scaleModesButtons} options={VIS_OPTS} onChange={(v) => set("scaleModesButtons", v)} ariaLabel="Scale modes" /></Row>
-            <Row label="Scales placement"><Sel value={s.scaleSide} options={[{ v: "right", l: "Right" }, { v: "left", l: "Left" }]} onChange={(v) => set("scaleSide", v)} ariaLabel="Scales placement" /></Row>
+            <Check label="Lock price to bar ratio" checked={s.lockRatio} onChange={(v) => set("lockRatio", v)}>
+              <Num value={s.priceBarRatio} min={0} step={0.0001} width={96} onChange={(v) => set("priceBarRatio", Math.max(0, v))} ariaLabel="Price to bar ratio" />
+              <span className="hint">{s.priceBarRatio ? "price per bar" : "taken from the view"}</span>
+            </Check>
+            <Row label="Scales placement">
+              <Sel
+                value={s.scalePlacement ?? s.scaleSide}
+                options={[{ v: "auto", l: "Auto" }, { v: "right", l: "Right" }, { v: "left", l: "Left" }]}
+                onChange={(v) => onChange({ ...s, scalePlacement: v, scaleSide: v === "left" ? "left" : "right" })}
+                ariaLabel="Scales placement"
+              />
+            </Row>
           </Section>
           <Section title="Price labels & lines">
+            <Check label="No overlapping labels" checked={s.noOverlapLabels} onChange={(v) => set("noOverlapLabels", v)} />
             <Check label="Countdown to bar close" checked={s.countdown} onChange={(v) => set("countdown", v)} />
             <Row label="Symbol">
               <Sel
@@ -176,6 +189,13 @@ export default function ChartSettingsDialog({
                 onChange={(v) => onChange({ ...s, lastPriceLabel: v === "vl" || v === "v", lastPriceLine: v === "vl" || v === "l" })}
                 ariaLabel="Symbol label"
               />
+              <Sel
+                value={s.lastPriceScaleValue ? "scale" : "value"}
+                options={[{ v: "scale", l: "Value according to scale" }, { v: "value", l: "Value" }]}
+                onChange={(v) => set("lastPriceScaleValue", v === "scale")}
+                ariaLabel="Symbol label value"
+              />
+              <ColorInput value={s.lastPriceColor} fallback={theme.up} onChange={(c) => set("lastPriceColor", c)} title="Symbol line colour (empty = bar direction)" />
             </Row>
             <Check label="Symbol name label" checked={s.symbolNameLabel} onChange={(v) => set("symbolNameLabel", v)} />
             {([
@@ -254,14 +274,17 @@ export default function ChartSettingsDialog({
           <Section title="General">
             <Check label="Buy/sell buttons" checked={s.buySellButtons} onChange={(v) => set("buySellButtons", v)} />
             {trading && onTrading && <Check label="Instant orders placement (no confirm)" checked={trading.instant} onChange={(v) => onTrading("instant", v)} />}
-            <Check label="Play sound for executions and alerts" checked={s.sound} onChange={(v) => set("sound", v)} />
+            <Check label="Play sound for executions (fills) and alerts" checked={s.sound} onChange={(v) => set("sound", v)} />
             <Row label="Notifications"><Sel value={s.notifications} options={[{ v: "all", l: "All events" }, { v: "rejections", l: "Only rejections" }, { v: "off", l: "Off" }]} onChange={(v) => set("notifications", v)} ariaLabel="Notifications" /></Row>
           </Section>
           <Section title="Appearance">
             {trading && onTrading && <Check label="Positions" checked={trading.showPos} onChange={(v) => onTrading("showPos", v)} />}
-            <Row label="Profit & loss"><Sel value={s.plMode} options={[{ v: "money", l: "Money" }, { v: "percent", l: "Percentage" }]} onChange={(v) => set("plMode", v)} ariaLabel="Profit and loss" /></Row>
+            <Row label="Profit & loss"><Sel value={s.plMode} options={[{ v: "money", l: "Money" }, { v: "ticks", l: "Ticks" }, { v: "percent", l: "Percentage" }]} onChange={(v) => set("plMode", v)} ariaLabel="Profit and loss" /></Row>
             <Check label="Reverse button on hover" checked={s.reverseButton} onChange={(v) => set("reverseButton", v)} />
             {trading && onTrading && <Check label="Orders" checked={trading.showOrders} onChange={(v) => onTrading("showOrders", v)} />}
+            <Check label="Executions" checked={s.executions} onChange={(v) => set("executions", v)} />
+            <Check label="Executions labels" checked={s.executionLabels} onChange={(v) => set("executionLabels", v)} />
+            <Check label="Extended price line for positions & orders" checked={s.extendLines} onChange={(v) => set("extendLines", v)} />
             {trading && onTrading && <Check label="'+' button on the price scale" checked={trading.plus} onChange={(v) => onTrading("plus", v)} />}
             <Row label="Orders & positions alignment"><Sel value={s.ordersAlign} options={[{ v: "right", l: "Right" }, { v: "left", l: "Left" }]} onChange={(v) => set("ordersAlign", v)} ariaLabel="Alignment" /></Row>
           </Section>

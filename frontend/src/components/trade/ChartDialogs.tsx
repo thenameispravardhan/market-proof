@@ -131,12 +131,14 @@ export function GoToDialog({ onGo, onClose, last }: { onGo: (r: { at?: number; f
   const [time, setTime] = useState("");
   const [from, setFrom] = useState(today);
   const [to, setTo] = useState(today);
+  const [fromTime, setFromTime] = useState("");
+  const [toTime, setToTime] = useState("");
   const go = () => {
     if (tab === "date") {
       const at = wallToChart(date, time || "09:15");
       if (at !== null) onGo({ at });
     } else {
-      const f = wallToChart(from, "00:00"), t = wallToChart(to, "23:59");
+      const f = wallToChart(from, fromTime || "00:00"), t = wallToChart(to, toTime || "23:59");
       if (f !== null && t !== null && t > f) onGo({ from: f, to: t });
     }
     onClose();
@@ -145,7 +147,7 @@ export function GoToDialog({ onGo, onClose, last }: { onGo: (r: { at?: number; f
     <Modal
       title="Go to"
       onClose={onClose}
-      width={380}
+      width={420}
       testid="goto-dialog"
       footer={<><span className="grow" /><button type="button" className="cbtn" onClick={onClose}>Cancel</button><button type="button" className="cbtn primary" onClick={go} data-testid="goto-go">Go to</button></>}
     >
@@ -160,8 +162,14 @@ export function GoToDialog({ onGo, onClose, last }: { onGo: (r: { at?: number; f
         </>
       ) : (
         <>
-          <Row label="From"><input type="date" value={from} onChange={(e) => setFrom(e.target.value)} aria-label="From" /></Row>
-          <Row label="To"><input type="date" value={to} onChange={(e) => setTo(e.target.value)} aria-label="To" /></Row>
+          <Row label="From">
+            <input type="date" value={from} onChange={(e) => setFrom(e.target.value)} aria-label="From" />
+            <input type="time" value={fromTime} onChange={(e) => setFromTime(e.target.value)} aria-label="From time" title="Optional time" />
+          </Row>
+          <Row label="To">
+            <input type="date" value={to} onChange={(e) => setTo(e.target.value)} aria-label="To" />
+            <input type="time" value={toTime} onChange={(e) => setToTime(e.target.value)} aria-label="To time" title="Optional time" />
+          </Row>
         </>
       )}
     </Modal>
