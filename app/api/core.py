@@ -161,10 +161,19 @@ def _ser_trade(t: Trade) -> dict[str, Any]:
 @router.get("/api/announcements/recent")
 def recent_announcements(
     limit: int = Query(20, ge=1, le=200),
+    symbol: str | None = Query(
+        None,
+        max_length=64,
+        description="Only this company's filings (ticker, case-insensitive) — "
+        "the chart's event marks and the symbol headlines.",
+    ),
     db: Session = Depends(get_db),
 ) -> list[dict[str, Any]]:
+    stmt = select(Announcement)
+    if symbol and symbol.strip():
+        stmt = stmt.where(func.upper(Announcement.symbol) == symbol.strip().upper())
     rows = db.execute(
-        select(Announcement).order_by(Announcement.received_at.desc()).limit(limit)
+        stmt.order_by(Announcement.received_at.desc()).limit(limit)
     ).scalars().all()
     return [_ser_announcement(a) for a in rows]
 
