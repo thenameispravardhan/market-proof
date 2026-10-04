@@ -2,8 +2,15 @@
 
 These power the Trade page's autocomplete and option-chain panel.
 
-  GET /api/search/symbols?q=<query>&segment=EQ,FO&limit=20
-      -> { hits: [...], count: int, ok: true }
+  GET /api/search/symbols?q=<query>&segment=EQ,FO&limit=20&offset=0
+                         &exchange=NSE,NFO&types=EQ,ETF
+      -> { hits: [...], count: int, offset: int, has_more: bool, ok: true }
+
+      `exchange` takes "sources" (NSE, BSE, MCX, NFO, BFO, CDS, BCD) and
+      `types` takes EQ, ETF, FUT, OPT, IND — see
+      `instrument_master.search_filter` for the exact rules. Filters run
+      inside the ranked search before the page is cut, so consecutive
+      `offset` pages never overlap or skip.
 
   GET /api/search/option-chain?underlying=NIFTY&expiry=2024-12-26
       -> { underlying, expiries, selected_expiry, spot, strikes: [...] }
@@ -18,9 +25,14 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Query
 
-from app.services.instrument_master import get_master
+from app.services.instrument_master import get_master, search_filter
 
 router = APIRouter(tags=["search"])
+
+
+def _csv(value: Optional[str]) -> list[str]:
+    """Split a comma-separated query param into trimmed, non-empty parts."""
+    return [s.strip() for s in (value or "").split(",") if s.strip()]
 
 
 @router.post("/api/search/refresh")
@@ -42,13 +54,27 @@ def search_symbols(
         description="Comma-separated segments to filter on: EQ, FO, COM, CD, INDEX",
     ),
     limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0, description="Skip this many ranked hits (paging)"),
+    exchange: Optional[str] = Query(
+        None,
+        description="Comma-separated sources: NSE, BSE, MCX, NFO, BFO, CDS, BCD",
+    ),
+    types: Optional[str] = Query(
+        None,
+        description="Comma-separated instrument types: EQ, ETF, FUT, OPT, IND",
+    ),
 ) -> dict[str, Any]:
-    segs = [s.strip() for s in (segment or "").split(",") if s.strip()] or None
+    segs = _csv(segment) or None
+    where = search_filter(sources=_csv(exchange), types=_csv(types))
     master = get_master()
-    hits = master.search(q, limit=limit, segments=segs)
+    # One extra hit past the page tells us whether another page exists.
+    found = master.search(q, limit=offset + limit + 1, segments=segs, where=where)
+    hits = found[offset:offset + limit]
     return {
         "ok": True,
         "count": len(hits),
+        "offset": offset,
+        "has_more": len(found) > offset + limit,
         "hits": [h.to_dict() for h in hits],
     }
 
