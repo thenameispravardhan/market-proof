@@ -218,6 +218,38 @@ class RiskDecision:
 # ---- The engine ---------------------------------------------------------
 
 
+# ADV (average daily traded value, ₹ crore) per symbol per IST day. The Fyers
+# quote carries no ADV, so with REQUIRE_KNOWN_LIQUIDITY every live order was
+# refused as "liquidity unknown"; this derives it from Fyers daily candles.
+_ADV_CACHE: dict[tuple[str, int], Optional[float]] = {}
+
+
+def adv_from_candles(candles: list[Any], sessions: int = 20) -> Optional[float]:
+    """Mean of close x volume over the last `sessions` daily candles, in ₹ crore."""
+    rows = [c for c in candles if isinstance(c, (list, tuple)) and len(c) >= 6][-sessions:]
+    if not rows:
+        return None
+    return sum(float(c[4]) * float(c[5]) for c in rows) / len(rows) / 1e7
+
+
+async def warm_adv(symbol: str) -> Optional[float]:
+    import time as _t
+
+    key = (symbol.upper().strip(), int((_t.time() + 19800) // 86400))
+    if key not in _ADV_CACHE:
+        from app.api.market import fetch_history
+
+        candles = await fetch_history(key[0], resolution="D", days=40)
+        _ADV_CACHE[key] = adv_from_candles(candles)    # None when Fyers is unreachable
+    return _ADV_CACHE[key]
+
+
+def cached_adv(symbol: str) -> Optional[float]:
+    import time as _t
+
+    return _ADV_CACHE.get((symbol.upper().strip(), int((_t.time() + 19800) // 86400)))
+
+
 class RiskEngine:
     """Pure-function risk checker.
 
@@ -292,6 +324,11 @@ class RiskEngine:
                 if get_settings().is_live:
                     await self._funds_provider.refresh()
             except Exception:  # noqa: BLE001
+                pass
+        if get_settings().is_live:
+            try:
+                await warm_adv(str(getattr(signal, "symbol", "") or ""))
+            except Exception:  # noqa: BLE001 — unknown ADV is handled by R8
                 pass
         # Run the synchronous DB work in an executor to keep the
         # event loop free. Tests can pass a session directly to
@@ -785,6 +822,8 @@ class RiskEngine:
         adv = None
         if quote is not None and quote.average_daily_volume_crore is not None:
             adv = float(quote.average_daily_volume_crore)
+        if adv is None:
+            adv = cached_adv(symbol)
         if adv is not None and adv < min_liq:
             violations.append({
                 "code": "RISK_MIN_LIQUIDITY",

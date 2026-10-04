@@ -39,7 +39,7 @@ import {
 } from "../hooks/useApi";
 import { useLiveQuote } from "../hooks/useQuotes";
 import ChartPanel, { type BrokerLine, type ChartOrder, type ChartPosition } from "../components/trade/ChartPanel";
-import Scalper from "../components/trade/Scalper";
+import Scalper, { splitDrag } from "../components/trade/Scalper";
 import type {
   BrokerAccount,
   InstrumentHit,
@@ -142,6 +142,41 @@ const LAYOUTS: { id: Layout; n: number; icon: string; label: string }[] = [
   { id: "3", n: 3, icon: "◧", label: "1 large + 2" },
   { id: "4", n: 4, icon: "⊞", label: "4 (2 × 2)" },
 ];
+
+// Trading settings (TradingView's Settings → Trading), kept per browser.
+type TradeSet = { instant: boolean; showPos: boolean; showOrders: boolean; plus: boolean };
+const TRADE_SET_DEFAULT: TradeSet = { instant: false, showPos: true, showOrders: true, plus: true };
+
+function TradeSettings({ s, onChange }: { s: TradeSet; onChange: (k: keyof TradeSet, v: boolean) => void }) {
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    if (!open) return;
+    const close = () => setOpen(false);
+    document.addEventListener("mousedown", close);
+    return () => document.removeEventListener("mousedown", close);
+  }, [open]);
+  const row = (k: keyof TradeSet, label: string, hint: string) => (
+    <label className="tset-row" title={hint}>
+      <input type="checkbox" checked={s[k]} onChange={(e) => onChange(k, e.target.checked)} data-testid={`tset-${k}`} />
+      {label}
+    </label>
+  );
+  return (
+    <div className="tset" onMouseDown={(e) => e.stopPropagation()}>
+      {s.instant && <span className="tset-badge" title="Chart and scalper orders are placed without a confirm">⚡ instant</span>}
+      <button type="button" className={`chart-btn${open ? " on" : ""}`} onClick={() => setOpen((o) => !o)} title="Trading settings" data-testid="trade-settings">⚙</button>
+      {open && (
+        <div className="chart-menu tset-menu">
+          <div className="chart-menu-head">Trading</div>
+          {row("instant", "Instant orders — no confirm", "Chart / '+' / scalper orders go straight to the broker; also arms the scalper hotkeys")}
+          {row("showPos", "Positions on chart (P&L, SL / TP)", "The live position line with draggable stop-loss and target")}
+          {row("showOrders", "Pending orders on chart", "A dashed line per working order")}
+          {row("plus", "'+' button on the price scale", "Alert / order / line at the hovered price")}
+        </div>
+      )}
+    </div>
+  );
+}
 
 // Polling a symbol's quote keeps it subscribed on the live socket, so a
 // chart that isn't the ticket's symbol still ticks.
@@ -300,6 +335,17 @@ export default function Trade() {
   const [cells, setCells] = useState<(InstrumentHit | null)[]>(() => stored("trade:cells", []));
   const [activeCell, setActiveCell] = useState(0);
   const [layoutOpen, setLayoutOpen] = useState(false);
+  const [tset, setTset] = useState<TradeSet>(() => ({ ...TRADE_SET_DEFAULT, ...stored<Partial<TradeSet>>("trade:settings", {}) }));
+  const changeSetting = (k: keyof TradeSet, v: boolean) => {
+    if (k === "instant" && v && !window.confirm("Turn on instant orders?\nEvery order from the chart, the '+' menu and the scalper (and its hotkeys) goes to the broker immediately — no confirm.")) return;
+    const n = { ...tset, [k]: v };
+    setTset(n);
+    try { localStorage.setItem("trade:settings", JSON.stringify(n)); } catch { /* best-effort */ }
+  };
+  const settingsEl = <TradeSettings s={tset} onChange={changeSetting} />;
+  // Layout split positions (fractions), draggable, per layout.
+  const [splits, setSplits] = useState<Record<string, { x: number; y: number }>>(() => stored("trade:splits", {}));
+  useEffect(() => { try { localStorage.setItem("trade:splits", JSON.stringify(splits)); } catch { /* best-effort */ } }, [splits]);
   // One top toolbar + one drawing strip for the whole layout: the active
   // chart renders its own controls into these (TradingView-style).
   const [topSlot, setTopSlot] = useState<HTMLDivElement | null>(null);
@@ -568,6 +614,14 @@ export default function Trade() {
     setOrderType("MARKET");
   };
 
+  const sp = splits[layout] ?? { x: layout === "3" ? 0.6 : 0.5, y: 0.5 };
+  const hasX = layout === "2" || layout === "3" || layout === "4";
+  const hasY = layout === "2v" || layout === "3" || layout === "4";
+  const gridStyle: React.CSSProperties = {
+    ...(hasX ? { gridTemplateColumns: `${sp.x}fr ${1 - sp.x}fr` } : {}),
+    ...(hasY ? { gridTemplateRows: `${sp.y}fr ${1 - sp.y}fr` } : {}),
+  };
+
   // A new layout keeps the active symbol in the first cell and fills new
   // cells from the watchlist (then the active symbol).
   const pickLayout = (id: Layout) => {
@@ -763,14 +817,18 @@ export default function Trade() {
               onExpiry={setSelectedExpiry}
               atmStrike={atmStrike}
               positions={positions}
-              helpers={{ positionFor, levelsFor, closeFor, orderFor }}
+              helpers={{ positionFor: (sym) => (tset.showPos ? positionFor(sym) : null), levelsFor, closeFor, orderFor }}
+              instant={tset.instant}
+              onInstant={(v) => changeSetting("instant", v)}
+              settings={settingsEl}
+              showPlus={tset.plus}
             />
           ) : (
             <div className="tv-layout">
-            <div className="tv-topbar" ref={setTopSlot} />
+            <div className="tv-topbar"><div className="tv-topslot" ref={setTopSlot} />{settingsEl}</div>
             <div className="tv-chartrow">
             <div className="tv-leftbar" ref={setLeftSlot} />
-            <div className={`tv-grid l${layout}`}>
+            <div className={`tv-grid l${layout}`} style={gridStyle}>
               {Array.from({ length: nCells }, (_, i) => {
                 const h = i === activeCell ? selected : cells[i] ?? null;
                 const active = i === activeCell;
@@ -783,9 +841,9 @@ export default function Trade() {
                         key={h.symbol}
                         symbol={h.symbol}
                         shortName={h.short_name}
-                        brokerLines={active ? brokerLines : undefined}
+                        brokerLines={active && tset.showOrders ? brokerLines : undefined}
                         onPickPrice={active ? onPickPrice : undefined}
-                        position={positionFor(h.symbol)}
+                        position={tset.showPos ? positionFor(h.symbol) : null}
                         onLevels={levelsFor(h.symbol)}
                         onClosePosition={closeFor(h.symbol)}
                         onChartOrder={active ? orderFor(h.symbol, h.short_name, Number(quantity)) : undefined}
@@ -793,6 +851,8 @@ export default function Trade() {
                         toolbarSlot={active ? topSlot : undefined}
                         toolsSlot={active ? leftSlot : undefined}
                         chrome={active}
+                        instant={tset.instant}
+                        showPlus={tset.plus}
                       />
                     )}
                     {h && !active && <KeepLive symbol={h.symbol} />}
@@ -809,6 +869,16 @@ export default function Trade() {
                   </div>
                 );
               })}
+              {hasX && (
+                <div className="split-x" style={{ left: `calc(${sp.x * 100}% - 3px)` }} title="Drag to resize · double-click to reset"
+                  onPointerDown={(e) => splitDrag(e, "x", (f) => setSplits((z) => ({ ...z, [layout]: { ...sp, ...z[layout], x: f } })))}
+                  onDoubleClick={() => setSplits((z) => ({ ...z, [layout]: { ...sp, x: 0.5 } }))} />
+              )}
+              {hasY && (
+                <div className="split-y" style={{ top: `calc(${sp.y * 100}% - 3px)`, left: layout === "3" ? `${sp.x * 100}%` : 0 }} title="Drag to resize · double-click to reset"
+                  onPointerDown={(e) => splitDrag(e, "y", (f) => setSplits((z) => ({ ...z, [layout]: { ...sp, ...z[layout], y: f } })))}
+                  onDoubleClick={() => setSplits((z) => ({ ...z, [layout]: { ...sp, y: 0.5 } }))} />
+              )}
             </div>
             </div>
             </div>

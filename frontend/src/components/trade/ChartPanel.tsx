@@ -401,6 +401,8 @@ export default function ChartPanel({
   toolbarSlot,
   toolsSlot,
   chrome = true,
+  instant = false,
+  showPlus = true,
 }: {
   symbol: string;
   shortName: string;
@@ -423,6 +425,10 @@ export default function ChartPanel({
   toolsSlot?: HTMLElement | null;
   /** false = no toolbar / drawing strip at all (an inactive layout cell). */
   chrome?: boolean;
+  /** Trading setting: place chart orders without the confirm step. */
+  instant?: boolean;
+  /** Trading setting: the "+" on the price scale. */
+  showPlus?: boolean;
   /** Position-average / pending-order levels to mark on the chart. */
   brokerLines?: BrokerLine[];
   /** When set, the "→ Ticket" tool sends a clicked price to the caller. */
@@ -1491,7 +1497,7 @@ export default function ChartPanel({
         e.preventDefault();
         const o = ctxOrders(hp)[0];
         const w = containerRef.current?.clientWidth ?? 600;
-        setCtx({ x: w - 300, y: parseFloat(plusRef.current?.style.top || "40"), price: hp, confirm: o });
+        pickOrder(o, { x: w - 300, y: parseFloat(plusRef.current?.style.top || "40"), price: hp });
         return;
       }
     }
@@ -2048,6 +2054,14 @@ export default function ChartPanel({
     document.addEventListener("keydown", esc);
     return () => { document.removeEventListener("mousedown", close); document.removeEventListener("keydown", esc); };
   }, [ctx]);
+
+  function submitOrder(o: ChartOrder): void {
+    setCtx(null);
+    onChartOrder?.(o).then(addToast, (err) => addToast(`Order failed: ${err instanceof Error ? err.message : String(err)}`));
+  }
+  // Instant orders (a trading setting) skip the confirm step.
+  const pickOrder = (o: ChartOrder, at: { x: number; y: number; price: number }) =>
+    instant ? submitOrder(o) : setCtx({ ...at, confirm: o });
 
   function addHLine(price: number): void {
     const t = candlesRef.current[candlesRef.current.length - 1]?.time ?? 0;
@@ -2784,7 +2798,7 @@ export default function ChartPanel({
             )}
           </div>
         )}
-        <button
+        {showPlus && <button
           ref={plusRef}
           type="button"
           className="chart-plus"
@@ -2803,7 +2817,7 @@ export default function ChartPanel({
           data-testid="chart-plus"
         >
           +
-        </button>
+        </button>}
         {ctx && (
           <div
             className="chart-menu chart-ctx"
@@ -2823,11 +2837,7 @@ export default function ChartPanel({
                     type="button"
                     className={`ticket-side-btn ${ctx.confirm.side === "BUY" ? "buy" : "sell"} on`}
                     autoFocus
-                    onClick={() => {
-                      const o = ctx.confirm!;
-                      setCtx(null);
-                      onChartOrder?.(o).then(addToast, (err) => addToast(`Order failed: ${err instanceof Error ? err.message : String(err)}`));
-                    }}
+                    onClick={() => submitOrder(ctx.confirm!)}
                     data-testid="chart-ctx-place"
                   >
                     Place {ctx.confirm.side}
@@ -2844,7 +2854,7 @@ export default function ChartPanel({
                 {onChartOrder && <div className="chart-menu-sep" />}
                 {onChartOrder &&
                   ctxOrders(ctx.price).filter((o) => o.price != null).map((o, i) => (
-                    <button key={`${o.side}-${o.type}`} type="button" className={`chart-menu-item ctx-${o.side.toLowerCase()}`} onClick={() => setCtx({ ...ctx, confirm: o })}>
+                    <button key={`${o.side}-${o.type}`} type="button" className={`chart-menu-item ctx-${o.side.toLowerCase()}`} onClick={() => pickOrder(o, ctx)}>
                       {o.side === "BUY" ? "⌃" : "⌄"} {orderLabel(o)}{i === 0 && <span className="kbd">Alt+Shift+B</span>}
                     </button>
                   ))}
@@ -2860,7 +2870,7 @@ export default function ChartPanel({
                 {onChartOrder && <div className="chart-menu-sep" />}
                 {onChartOrder &&
                   ctxOrders(ctx.price).filter((o) => o.price == null).map((o) => (
-                    <button key={`${o.side}-mkt`} type="button" className={`chart-menu-item ctx-${o.side.toLowerCase()}`} onClick={() => setCtx({ ...ctx, confirm: o })}>
+                    <button key={`${o.side}-mkt`} type="button" className={`chart-menu-item ctx-${o.side.toLowerCase()}`} onClick={() => pickOrder(o, ctx)}>
                       {orderLabel(o)}
                     </button>
                   ))}

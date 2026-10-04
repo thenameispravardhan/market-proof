@@ -3,7 +3,7 @@
 // picked as ATM ± steps and follow the ATM as the spot moves. Every order is
 // a real intraday order: a confirm per click unless "1-click" is switched on
 // for the session — only then do the hotkeys work too.
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import ChartPanel, { type ChartOrder, type ChartPosition } from "./ChartPanel";
 import { useQuote } from "../../hooks/useApi";
 import { useLiveQuote } from "../../hooks/useQuotes";
@@ -35,6 +35,23 @@ function Ltp({ symbol, fallback }: { symbol: string; fallback: number | null }) 
 
 const STEPS = [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5];
 
+// Drag a split line of a grid (layouts, scalper columns): `set` gets the
+// pointer's position as a fraction of the grid's width / height.
+export function splitDrag(e: React.PointerEvent, axis: "x" | "y", set: (f: number) => void, lo = 0.15, hi = 0.85): void {
+  e.preventDefault();
+  const r = (e.currentTarget as HTMLElement).parentElement!.getBoundingClientRect();
+  const move = (ev: PointerEvent) => {
+    const f = axis === "x" ? (ev.clientX - r.left) / r.width : (ev.clientY - r.top) / r.height;
+    set(Math.max(lo, Math.min(hi, f)));
+  };
+  const up = () => {
+    window.removeEventListener("pointermove", move);
+    window.removeEventListener("pointerup", up);
+  };
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", up);
+}
+
 export default function Scalper({
   base,
   underlyings,
@@ -45,6 +62,10 @@ export default function Scalper({
   atmStrike,
   positions,
   helpers,
+  instant,
+  onInstant,
+  settings,
+  showPlus,
 }: {
   base: InstrumentHit | null;
   underlyings: InstrumentHit[];
@@ -55,12 +76,25 @@ export default function Scalper({
   atmStrike: number | null;
   positions: Position[] | undefined;
   helpers: Helpers;
+  /** Trading setting: no confirm per order (also arms the hotkeys). */
+  instant: boolean;
+  onInstant: (v: boolean) => void;
+  /** The settings menu, shown at the end of the shared top bar. */
+  settings: ReactNode;
+  showPlus: boolean;
 }) {
   // Offsets from ATM: + is OTM (a higher CE strike, a lower PE strike).
   const [ceOff, setCeOff] = useState(() => stored("scalp:ceOff", 0));
   const [peOff, setPeOff] = useState(() => stored("scalp:peOff", 0));
   const [lots, setLots] = useState(() => Math.max(1, stored("scalp:lots", 1)));
-  const [oneClick, setOneClick] = useState(false);       // session only, never persisted
+  const oneClick = instant;
+  // One shared toolbar + drawing strip, driven by the clicked (active) chart.
+  const [top, setTop] = useState<HTMLDivElement | null>(null);
+  const [left, setLeft] = useState<HTMLDivElement | null>(null);
+  const [activeCol, setActiveCol] = useState(1);
+  // Column split positions (fractions of the width), draggable.
+  const [cols, setCols] = useState<[number, number]>(() => stored("scalp:cols", [1 / 3, 2 / 3]));
+  useEffect(() => { try { localStorage.setItem("scalp:cols", JSON.stringify(cols)); } catch { /* best-effort */ } }, [cols]);
   const [msg, setMsg] = useState<string | null>(null);
   useEffect(() => {
     try {
@@ -139,11 +173,16 @@ export default function Scalper({
       <button type="button" className="scalp-btn sell" disabled={!l} onClick={() => void trade(l, legName(row, t), "SELL")} data-testid={`scalp-sell-${t}`}>SELL</button>
     </div>
   );
-  const chart = (sym: string, label: string, qty?: number) => (
+  const chart = (sym: string, label: string, col: number, qty?: number) => (
     <ChartPanel
       key={sym}
       symbol={sym}
       shortName={label}
+      chrome={activeCol === col}
+      toolbarSlot={activeCol === col ? top : undefined}
+      toolsSlot={activeCol === col ? left : undefined}
+      instant={instant}
+      showPlus={showPlus}
       position={helpers.positionFor(sym)}
       onLevels={helpers.levelsFor(sym)}
       onClosePosition={helpers.closeFor(sym)}
@@ -177,10 +216,7 @@ export default function Scalper({
           <input
             type="checkbox"
             checked={oneClick}
-            onChange={(e) => {
-              if (e.target.checked && !window.confirm("Turn on 1-click trading?\nEvery BUY / SELL click and hotkey places a REAL order immediately, without a confirm.")) return;
-              setOneClick(e.target.checked);
-            }}
+            onChange={(e) => onInstant(e.target.checked)}
           />
           1-click{oneClick && " · Shift+↑ CE · Shift+↓ PE · Shift+X exit"}
         </label>
@@ -192,18 +228,32 @@ export default function Scalper({
       {strikes.length === 0 ? (
         <section className="trade-card tv-empty"><div className="empty">{chain?.reason ?? (chain ? "No options listed for this underlying." : "Loading the option chain…")}</div></section>
       ) : (
-        <div className="scalp-grid">
-          <div className="scalp-col">
-            {leg(ceRow, ce, "CE", ceOff, setCeOff)}
-            {ce ? chart(ce.symbol, legName(ceRow, "CE"), lots * ce.lot_size) : <section className="trade-card tv-empty" />}
-          </div>
-          <div className="scalp-col">
-            <div className="scalp-leg base"><span className="name">{name}</span><span className="scalp-ltp">{chain?.spot != null ? chain.spot.toFixed(2) : "—"}</span><span className="hint">underlying</span></div>
-            {chart(base.symbol, name)}
-          </div>
-          <div className="scalp-col">
-            {leg(peRow, pe, "PE", peOff, setPeOff)}
-            {pe ? chart(pe.symbol, legName(peRow, "PE"), lots * pe.lot_size) : <section className="trade-card tv-empty" />}
+        <div className="tv-layout">
+          <div className="tv-topbar"><div className="tv-topslot" ref={setTop} />{settings}</div>
+          <div className="tv-chartrow">
+            <div className="tv-leftbar" ref={setLeft} />
+            <div className="scalp-grid" style={{ gridTemplateColumns: `${cols[0]}fr ${cols[1] - cols[0]}fr ${1 - cols[1]}fr` }}>
+              {[0, 1, 2].map((i) => (
+                <div key={i} className={`scalp-col${activeCol === i ? " active" : ""}`} onMouseDownCapture={() => setActiveCol(i)}>
+                  {i === 0 && leg(ceRow, ce, "CE", ceOff, setCeOff)}
+                  {i === 0 && (ce ? chart(ce.symbol, legName(ceRow, "CE"), 0, lots * ce.lot_size) : <section className="trade-card tv-empty" />)}
+                  {i === 1 && <div className="scalp-leg base"><span className="name">{name}</span><span className="scalp-ltp">{chain?.spot != null ? chain.spot.toFixed(2) : "—"}</span><span className="hint">underlying</span></div>}
+                  {i === 1 && chart(base.symbol, name, 1)}
+                  {i === 2 && leg(peRow, pe, "PE", peOff, setPeOff)}
+                  {i === 2 && (pe ? chart(pe.symbol, legName(peRow, "PE"), 2, lots * pe.lot_size) : <section className="trade-card tv-empty" />)}
+                </div>
+              ))}
+              {[0, 1].map((k) => (
+                <div
+                  key={k}
+                  className="split-x"
+                  style={{ left: `calc(${cols[k] * 100}% - 3px)` }}
+                  title="Drag to resize · double-click to reset"
+                  onPointerDown={(e) => splitDrag(e, "x", (f) => setCols((c) => (k === 0 ? [f, c[1]] : [c[0], f])), k === 0 ? 0.1 : cols[0] + 0.1, k === 0 ? cols[1] - 0.1 : 0.9)}
+                  onDoubleClick={() => setCols([1 / 3, 2 / 3])}
+                />
+              ))}
+            </div>
           </div>
         </div>
       )}
