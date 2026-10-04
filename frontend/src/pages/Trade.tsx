@@ -38,15 +38,16 @@ import {
   useServerInfo,
 } from "../hooks/useApi";
 import { useLiveQuote } from "../hooks/useQuotes";
-import ChartPanel, { type BrokerLine, type ChartOrder, type ChartPosition } from "../components/trade/ChartPanel";
+import ChartPanel, { type BrokerLine, type ChartOrder, type ChartPosition, type HostAction } from "../components/trade/ChartPanel";
 import Scalper, { splitDrag } from "../components/trade/Scalper";
+import { AccountManager, LayoutMenu, SymbolDetails, WatchlistTable, useLayouts, type BottomTab, type WatchState } from "../components/trade/TradePanels";
+import type { SyncFlags } from "../components/trade/chartSync";
 import type {
   BrokerAccount,
   InstrumentHit,
   OptionLeg,
   OrderType,
   PlaceOrderRequest,
-  Position,
 } from "../types";
 
 function fmtMoney(v: number | null | undefined): string {
@@ -55,28 +56,6 @@ function fmtMoney(v: number | null | undefined): string {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });
-}
-
-// One open-position row. Overlays the live `/ws` mark over the 5s REST
-// poll and recomputes unrealised P&L from it — (last - avg) * qty handles
-// both long and short (qty is negative for shorts). Falls back to the REST
-// values until the first tick for this symbol streams in.
-function PositionRow({ p }: { p: Position }) {
-  const live = useLiveQuote(p.symbol);
-  const ltp = live?.last_price ?? p.last_price;
-  const pnl =
-    live?.last_price != null
-      ? (live.last_price - p.average_price) * p.quantity
-      : p.unrealized_pnl;
-  return (
-    <tr>
-      <td className="sym">{p.symbol}</td>
-      <td className={p.quantity > 0 ? "up" : "down"}>{p.quantity}</td>
-      <td>{fmtMoney(p.average_price)}</td>
-      <td>{fmtMoney(ltp)}</td>
-      <td className={(pnl ?? 0) >= 0 ? "up" : "down"}>{fmtMoney(pnl)}</td>
-    </tr>
-  );
 }
 
 /** Compact open-interest formatter (Indian units): K / L (lakh) / Cr. */
@@ -123,24 +102,42 @@ function cleanError(raw: unknown, fallback: string): string {
 
 // Right-dock panels, opened / closed from the icon bar. Several can be open;
 // they stack in this order.
-type DockId = "watch" | "trade" | "chain" | "flow";
+type DockId = "watch" | "details" | "trade" | "chain" | "flow" | "data" | "tree" | "alerts";
 const DOCK: { id: DockId; label: string; short: string; icon: string; hint: string }[] = [
   { id: "watch", label: "Watchlist", short: "Watch", icon: "☰", hint: "Watchlist — search and switch symbols" },
+  { id: "details", label: "Details & news", short: "Details", icon: "ⓘ", hint: "Symbol details, performance, technical rating and headlines" },
   { id: "trade", label: "Trade", short: "Trade", icon: "⇅", hint: "Quote and order ticket (buy / sell)" },
   { id: "chain", label: "Option chain", short: "Chain", icon: "⊞", hint: "Option chain — click a price to trade that option" },
   { id: "flow", label: "Order flow", short: "Flow", icon: "Δ", hint: "Real order flow from recorded ticks" },
+  { id: "data", label: "Data window", short: "Data", icon: "▤", hint: "Values under the crosshair — OHLC, volume, every indicator" },
+  { id: "tree", label: "Object tree", short: "Objects", icon: "⌗", hint: "Series, indicators and drawings by pane" },
+  { id: "alerts", label: "Alerts", short: "Alerts", icon: "🔔", hint: "Alerts manager and log" },
 ];
 const DEFAULT_DOCK: DockId[] = ["watch", "trade"];
 
 // Multi-chart layouts (TradingView-style). Click a chart to make it the
 // active one: it follows the watchlist / search and drives the ticket.
-type Layout = "1" | "2" | "2v" | "3" | "4";
+type Layout = "1" | "2" | "2v" | "3" | "3c" | "3r" | "4" | "6" | "8";
 const LAYOUTS: { id: Layout; n: number; icon: string; label: string }[] = [
   { id: "1", n: 1, icon: "▢", label: "1 chart" },
   { id: "2", n: 2, icon: "◫", label: "2 side by side" },
   { id: "2v", n: 2, icon: "⊟", label: "2 stacked" },
   { id: "3", n: 3, icon: "◧", label: "1 large + 2" },
+  { id: "3c", n: 3, icon: "⫴", label: "3 side by side" },
+  { id: "3r", n: 3, icon: "☰", label: "3 stacked" },
   { id: "4", n: 4, icon: "⊞", label: "4 (2 × 2)" },
+  { id: "6", n: 6, icon: "▦", label: "6 (3 × 2)" },
+  { id: "8", n: 8, icon: "▩", label: "8 (4 × 2)" },
+];
+
+type LayoutSync = SyncFlags & { symbol: boolean };
+const SYNC_DEFAULT: LayoutSync = { symbol: false, interval: false, crosshair: true, time: false, drawings: true };
+const SYNC_LABELS: [keyof LayoutSync, string][] = [
+  ["symbol", "Symbol"],
+  ["interval", "Interval"],
+  ["crosshair", "Crosshair"],
+  ["time", "Time / date range"],
+  ["drawings", "Drawings (same symbol)"],
 ];
 
 // Trading settings (TradingView's Settings → Trading), kept per browser.
@@ -184,7 +181,6 @@ function KeepLive({ symbol }: { symbol: string }) {
   useQuote(symbol);
   return null;
 }
-type BottomTab = "positions" | "orders";
 
 // An instrument that HAS an option chain (index or cash stock).
 const isUnderlying = (h: InstrumentHit | null): h is InstrumentHit =>
@@ -224,6 +220,7 @@ function drag(e: React.PointerEvent, axis: "x" | "y", start: number, set: (v: nu
 // it; × removes. Kept local, like the last-open symbol.
 const RECENT_KEY = "trade:recent";
 const LAST_KEY = "trade:last";
+const WATCH_KEY = "trade:watchlists";
 
 function loadRecent(): InstrumentHit[] {
   try {
@@ -233,6 +230,16 @@ function loadRecent(): InstrumentHit[] {
   } catch {
     return [];
   }
+}
+
+function loadWatchState(): WatchState {
+  try {
+    const v = JSON.parse(localStorage.getItem(WATCH_KEY) ?? "null") as WatchState | null;
+    if (v && Array.isArray(v.lists) && v.lists.length) return { active: Math.max(0, Math.min(v.active ?? 0, v.lists.length - 1)), lists: v.lists };
+  } catch {
+    /* fall through */
+  }
+  return { active: 0, lists: [{ name: "Watchlist", items: loadRecent() }] };
 }
 
 // Real order flow for the selected symbol, from the tick recorder: every
@@ -403,27 +410,58 @@ export default function Trade() {
         onDoubleClick={() => setSizes((z) => { const n = { ...z }; delete n[id]; return n; })}
       />
     );
+  const [sync, setSyncState] = useState<LayoutSync>(() => ({ ...SYNC_DEFAULT, ...stored<Partial<LayoutSync>>("trade:sync", {}) }));
+  const setSync = (k: keyof LayoutSync, v: boolean) => {
+    const n = { ...sync, [k]: v };
+    setSyncState(n);
+    try { localStorage.setItem("trade:sync", JSON.stringify(n)); } catch { /* best-effort */ }
+  };
   const nCells = LAYOUTS.find((l) => l.id === layout)?.n ?? 1;
   useEffect(() => {
     setCells((c) => {
+      if (sync.symbol && selected) {
+        if (Array.from({ length: nCells }, (_, i) => c[i]?.symbol).every((x) => x === selected.symbol)) return c;
+        const n = Array.from({ length: Math.max(nCells, c.length) }, () => selected);
+        try { localStorage.setItem("trade:cells", JSON.stringify(n)); } catch { /* best-effort */ }
+        return n;
+      }
       if (c[activeCell]?.symbol === selected?.symbol) return c;
       const n = [...c];
       n[activeCell] = selected;
       try { localStorage.setItem("trade:cells", JSON.stringify(n)); } catch { /* best-effort */ }
       return n;
     });
-  }, [selected, activeCell]);
+  }, [selected, activeCell, sync.symbol, nCells]);
   const [showResults, setShowResults] = useState(false);
   // Keyboard cursor into the search results (-1 = nothing highlighted).
   const [highlightIdx, setHighlightIdx] = useState(-1);
-  const [recent, setRecent] = useState<InstrumentHit[]>(loadRecent);
+  const [wl, setWlState] = useState<WatchState>(loadWatchState);
+  const updateWl = (fn: (w: WatchState) => WatchState) =>
+    setWlState((w) => {
+      const next = fn(w);
+      try {
+        localStorage.setItem(WATCH_KEY, JSON.stringify(next));
+        localStorage.setItem(RECENT_KEY, JSON.stringify(next.lists[next.active]?.items ?? []));
+      } catch { /* best-effort */ }
+      return next;
+    });
+  const recent = wl.lists[wl.active]?.items ?? [];
+  const addToWatch = (h: InstrumentHit) =>
+    updateWl((w) => ({
+      ...w,
+      lists: w.lists.map((l, i) => (i === w.active && !l.items.some((r) => r.symbol === h.symbol) ? { ...l, items: [h, ...l.items].slice(0, 200) } : l)),
+    }));
   const [bottomH, setBottomH] = useState(() => Number(stored("trade:bottomH", 260)) || 260);
-  const saveWatch = (next: InstrumentHit[]) => {
-    try { localStorage.setItem(RECENT_KEY, JSON.stringify(next)); } catch { /* best-effort */ }
-    return next;
-  };
-  const removeWatch = (sym: string) => setRecent((prev) => saveWatch(prev.filter((r) => r.symbol !== sym)));
-  const watchSyms = recent.map((h) => h.symbol).join(",");
+  const [bottomMax, setBottomMax] = useState(false);
+  const [maxCell, setMaxCell] = useState<number | null>(null);
+  const [privacy, setPrivacy] = useState(() => stored("trade:privacy", false));
+  const [layoutMenuOpen, setLayoutMenuOpen] = useState(false);
+  const L = useLayouts();
+  const [rangeSlot, setRangeSlot] = useState<HTMLDivElement | null>(null);
+  const [dataSlot, setDataSlot] = useState<HTMLDivElement | null>(null);
+  const [treeSlot, setTreeSlot] = useState<HTMLDivElement | null>(null);
+  const [alertsSlot, setAlertsSlot] = useState<HTMLDivElement | null>(null);
+  const watchSyms = [...new Set(wl.lists.flatMap((l) => l.items.map((h) => h.symbol)))].slice(0, 50).join(",");
   const { data: watchQuotes } = useQuery<{ quotes: Record<string, { ltp: number; change: number | null; change_pct: number | null }> }>({
     queryKey: ["watch-quotes", watchSyms],
     queryFn: async () => {
@@ -607,7 +645,7 @@ export default function Trade() {
     }
     // An option picked off the chain opens its chart + ticket without
     // flooding the watchlist; a searched symbol joins it.
-    if (!fromChain) setRecent((prev) => (prev.some((r) => r.symbol === h.symbol) ? prev : saveWatch([h, ...prev].slice(0, 40))));
+    if (!fromChain) addToWatch(h);
     try { localStorage.setItem(LAST_KEY, JSON.stringify(h)); } catch { /* best-effort */ }
     // Intraday-only bot — F&O included. Every ticket is MIS/INTRADAY; the
     // backend rejects anything else, so there is nothing per-instrument to set.
@@ -639,6 +677,7 @@ export default function Trade() {
     setLayout(id);
     setScalper(false);
     setLayoutOpen(false);
+    setMaxCell(null);
     try {
       localStorage.setItem("trade:layout", JSON.stringify(id));
       localStorage.setItem("trade:cells", JSON.stringify(out));
@@ -801,6 +840,34 @@ export default function Trade() {
     }
   };
 
+  // Requests from the chart (open a panel, save the layout, maximize …).
+  const hostAction = (a: HostAction) => {
+    if (a.startsWith("panel:")) {
+      const id = a.slice(6) as DockId;
+      if (DOCK.some((d) => d.id === id) && !dock.includes(id)) saveDock([...dock, id]);
+      return;
+    }
+    if (a.startsWith("bottom:")) {
+      openBottom(a.slice(7) as BottomTab);
+      return;
+    }
+    switch (a) {
+      case "scalper": setScalper(true); return;
+      case "layouts": setLayoutMenuOpen(true); return;
+      case "save": L.save(); return;
+      case "maximize": setMaxCell((m) => (m === null && nCells > 1 ? activeCell : null)); return;
+      case "watch:add": if (selected) addToWatch(selected); return;
+      case "privacy": {
+        const v = !privacy;
+        setPrivacy(v);
+        try { localStorage.setItem("trade:privacy", JSON.stringify(v)); } catch { /* best-effort */ }
+        return;
+      }
+    }
+  };
+  const tradingFlags = { instant: tset.instant, showPos: tset.showPos, showOrders: tset.showOrders, plus: tset.plus };
+  const shownCells = maxCell !== null && maxCell < nCells ? [maxCell] : Array.from({ length: nCells }, (_, i) => i);
+
   // -------- render --------
 
   return (
@@ -825,11 +892,11 @@ export default function Trade() {
             />
           ) : (
             <div className="tv-layout">
-            <div className="tv-topbar"><div className="tv-topslot" ref={setTopSlot} />{settingsEl}</div>
+            <div className="tv-topbar"><div className="tv-topslot" ref={setTopSlot} /><LayoutMenu L={L} open={layoutMenuOpen} onOpen={setLayoutMenuOpen} />{settingsEl}</div>
             <div className="tv-chartrow">
             <div className="tv-leftbar" ref={setLeftSlot} />
-            <div className={`tv-grid l${layout}`} style={gridStyle}>
-              {Array.from({ length: nCells }, (_, i) => {
+            <div className={`tv-grid l${maxCell !== null ? "1" : layout}`} style={maxCell !== null ? undefined : gridStyle}>
+              {shownCells.map((i) => {
                 const h = i === activeCell ? selected : cells[i] ?? null;
                 const active = i === activeCell;
                 return (
@@ -848,11 +915,25 @@ export default function Trade() {
                         onClosePosition={closeFor(h.symbol)}
                         onChartOrder={active ? orderFor(h.symbol, h.short_name, Number(quantity)) : undefined}
                         orderQty={active ? Number(quantity) : undefined}
+                        onOrderQty={active ? (n) => setQuantity(n) : undefined}
                         toolbarSlot={active ? topSlot : undefined}
                         toolsSlot={active ? leftSlot : undefined}
+                        rangeSlot={active ? rangeSlot : undefined}
+                        widgetSlots={active ? { data: dataSlot, tree: treeSlot, alerts: alertsSlot } : undefined}
                         chrome={active}
                         instant={tset.instant}
                         showPlus={tset.plus}
+                        trading={tradingFlags}
+                        onTrading={changeSetting}
+                        instrument={h}
+                        onSymbolChange={active ? (x) => onSelect(x) : undefined}
+                        recentSymbols={recent}
+                        onAction={hostAction}
+                        syncId={`cell${i}`}
+                        sync={sync}
+                        multi={nCells > 1}
+                        maximized={maxCell === i}
+                        privacy={privacy}
                       />
                     )}
                     {h && !active && <KeepLive symbol={h.symbol} />}
@@ -869,63 +950,52 @@ export default function Trade() {
                   </div>
                 );
               })}
-              {hasX && (
+              {maxCell === null && hasX && (
                 <div className="split-x" style={{ left: `calc(${sp.x * 100}% - 3px)` }} title="Drag to resize · double-click to reset"
                   onPointerDown={(e) => splitDrag(e, "x", (f) => setSplits((z) => ({ ...z, [layout]: { ...sp, ...z[layout], x: f } })))}
                   onDoubleClick={() => setSplits((z) => ({ ...z, [layout]: { ...sp, x: 0.5 } }))} />
               )}
-              {hasY && (
+              {maxCell === null && hasY && (
                 <div className="split-y" style={{ top: `calc(${sp.y * 100}% - 3px)`, left: layout === "3" ? `${sp.x * 100}%` : 0 }} title="Drag to resize · double-click to reset"
                   onPointerDown={(e) => splitDrag(e, "y", (f) => setSplits((z) => ({ ...z, [layout]: { ...sp, ...z[layout], y: f } })))}
                   onDoubleClick={() => setSplits((z) => ({ ...z, [layout]: { ...sp, y: 0.5 } }))} />
               )}
             </div>
             </div>
+            <div className="tv-rangeslot" ref={setRangeSlot} />
             </div>
           )}
         </div>
 
         {/* ---- bottom bar: click a tab to open it, click it again (or ▾) to close; drag the top edge to resize ---- */}
-        <div className={`tv-bottom${bottomOpen ? "" : " closed"}`} style={bottomOpen ? { height: bottomH } : undefined}>
-          {bottomOpen && <div className="tv-resize" onPointerDown={(e) => drag(e, "y", bottomH, setBottomH, 120, window.innerHeight * 0.7, "trade:bottomH")} title="Drag to resize" />}
-          <div className="tabs trade-tabs" role="tablist">
-            {([["positions", `Positions${positions?.length ? ` (${positions.length})` : ""}`], ["orders", `Orders${pending?.count ? ` (${pending.count})` : ""}`]] as const).map(([k, label]) => (
-              <button key={k} type="button" role="tab" aria-selected={bottomOpen && bottomTab === k} className={`tab ${bottomOpen && bottomTab === k ? "active" : ""}`} onClick={() => openBottom(bottomOpen && bottomTab === k ? null : k)}>{label}</button>
-            ))}
-            <button type="button" className="tab tv-collapse" onClick={() => openBottom(bottomOpen ? null : bottomTab)} title={bottomOpen ? "Close panel" : "Open panel"}>{bottomOpen ? "▾" : "▴"}</button>
-          </div>
-          {bottomOpen && (
-            <div className="tv-bottom-body">
-          {bottomTab === "positions" && !positions?.length && <section className="trade-card"><div className="empty">No open positions.</div></section>}
-          {bottomTab === "positions" && (
-            <>
-        {/* ---- open positions (mini panel) ---- */}
-        {positions && positions.length > 0 && (
-          <section className="trade-card" data-testid="trade-positions">
-            <h2>Open positions</h2>
-            <table className="positions-table">
-              <thead>
-                <tr>
-                  <th>Symbol</th>
-                  <th>Qty</th>
-                  <th>Avg</th>
-                  <th>LTP</th>
-                  <th>P&amp;L</th>
-                </tr>
-              </thead>
-              <tbody>
-                {positions.map((p) => (
-                  <PositionRow key={p.symbol} p={p} />
-                ))}
-              </tbody>
-            </table>
-          </section>
-        )}
-            </>
+        <div className={`tv-bottom${bottomOpen ? "" : " closed"}`} style={bottomOpen ? { height: bottomMax ? "70vh" : bottomH } : undefined}>
+          {bottomOpen && <div className="tv-resize" onPointerDown={(e) => { setBottomMax(false); drag(e, "y", bottomH, setBottomH, 120, window.innerHeight * 0.75, "trade:bottomH"); }} title="Drag to resize" />}
+          {!bottomOpen && (
+            <div className="tabs trade-tabs" role="tablist">
+              {([["positions", `Positions${positions?.filter((p) => p.quantity !== 0).length ? ` (${positions.filter((p) => p.quantity !== 0).length})` : ""}`], ["orders", `Orders${pending?.count ? ` (${pending.count})` : ""}`], ["trades", "Trades"], ["account", "Account"], ["basket", "Basket"], ["log", "Notifications"]] as const).map(([k, label]) => (
+                <button key={k} type="button" role="tab" aria-selected={false} className="tab" onClick={() => openBottom(k)}>{label}</button>
+              ))}
+              <button type="button" className="tab tv-collapse" onClick={() => openBottom(bottomTab)} title="Open panel">▴</button>
+            </div>
           )}
-          {bottomTab === "orders" && (
-            <>
-          {/* PENDING ORDERS */}
+          {bottomOpen && (
+            <AccountManager
+              tab={bottomTab}
+              onTab={(t) => openBottom(t)}
+              positions={positions}
+              managed={managed}
+              pendingCount={pending?.count ?? 0}
+              privacy={privacy}
+              connected={accountId != null}
+              accountLabel={realAccounts[0] ? `${realAccounts[0].name} · INR` : ""}
+              selected={selected}
+              closeFor={closeFor}
+              levelsFor={levelsFor}
+              orderFor={orderFor}
+              maximized={bottomMax}
+              onMaximize={() => setBottomMax((v) => !v)}
+              onCollapse={() => openBottom(null)}
+              pendingSection={
           <section className="trade-card" data-testid="trade-pending">
             <h2>Pending orders</h2>
             {cancelMessage && (
@@ -987,9 +1057,8 @@ export default function Trade() {
               </table>
             )}
           </section>
-            </>
-          )}
-            </div>
+              }
+            />
           )}
         </div>
       </div>
@@ -1086,32 +1155,13 @@ export default function Trade() {
                   </div>
                 )}
                 </div>
-                {recent.length > 0 && (
-                  <div className="tv-watch-list" data-testid="trade-recent">
-                    <div className="tv-watch-head"><span>Symbol</span><span>Last</span><span>Chg%</span><span /></div>
-                    {recent.map((h) => {
-                      const q = watchQuotes?.quotes?.[h.symbol.toUpperCase()];
-                      const pct = q?.change_pct ?? null;
-                      return (
-                        <div
-                          key={h.symbol}
-                          role="button"
-                          tabIndex={0}
-                          className={`tv-watch-row${selected?.symbol === h.symbol ? " on" : ""}`}
-                          onClick={() => onSelect(h)}
-                          onKeyDown={(e) => { if (e.key === "Enter") onSelect(h); }}
-                          title={h.symbol}
-                          data-testid={`recent-chip-${h.symbol}`}
-                        >
-                          <span className="sym">{h.short_name}</span>
-                          <span>{q ? q.ltp.toFixed(2) : "—"}</span>
-                          <span className={pct == null ? "" : pct >= 0 ? "up" : "down"}>{pct == null ? "—" : `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`}</span>
-                          <button type="button" className="x" title="Remove from watchlist" onClick={(e) => { e.stopPropagation(); removeWatch(h.symbol); }}>×</button>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
+                <WatchlistTable
+                  state={wl}
+                  quotes={watchQuotes?.quotes}
+                  selected={selected?.symbol ?? null}
+                  onSelect={(h) => onSelect(h)}
+                  onChange={(next) => updateWl(() => next)}
+                />
               </div>
             </section>
           )}
@@ -1550,6 +1600,34 @@ export default function Trade() {
               <div className="dock-body"><FlowPanel symbol={selected?.symbol ?? null} /></div>
             </section>
           )}
+          {dock.includes("details") && (
+            <section className="dock-panel" data-testid="dock-details" style={panelStyle("details")}>
+              {dockGrip("details")}
+              {dockHead("details", selected?.short_name)}
+              <div className="dock-body"><SymbolDetails hit={selected} /></div>
+            </section>
+          )}
+          {dock.includes("data") && (
+            <section className="dock-panel" data-testid="dock-data" style={panelStyle("data")}>
+              {dockGrip("data")}
+              {dockHead("data")}
+              <div className="dock-body"><div ref={setDataSlot} />{scalper && <div className="hint">Available on the chart layout.</div>}</div>
+            </section>
+          )}
+          {dock.includes("tree") && (
+            <section className="dock-panel" data-testid="dock-tree" style={panelStyle("tree")}>
+              {dockGrip("tree")}
+              {dockHead("tree")}
+              <div className="dock-body"><div ref={setTreeSlot} />{scalper && <div className="hint">Available on the chart layout.</div>}</div>
+            </section>
+          )}
+          {dock.includes("alerts") && (
+            <section className="dock-panel" data-testid="dock-alerts" style={panelStyle("alerts")}>
+              {dockGrip("alerts")}
+              {dockHead("alerts", selected?.short_name)}
+              <div className="dock-body"><div ref={setAlertsSlot} />{scalper && <div className="hint">Available on the chart layout.</div>}</div>
+            </section>
+          )}
         </div>
       )}
 
@@ -1590,6 +1668,15 @@ export default function Trade() {
                   {l.label}
                 </button>
               ))}
+              <div className="tv-sync">
+                <div className="chart-menu-head">Sync in layout</div>
+                {SYNC_LABELS.map(([k, label]) => (
+                  <label key={k} className="tset-row">
+                    <input type="checkbox" checked={sync[k]} onChange={(e) => setSync(k, e.target.checked)} data-testid={`sync-${k}`} />
+                    {label}
+                  </label>
+                ))}
+              </div>
             </div>
           )}
         </div>
