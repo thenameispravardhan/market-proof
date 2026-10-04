@@ -2187,3 +2187,34 @@ kbd {
 .chart-tool-sep { flex-shrink: 0; height: 1px; margin: 3px 2px; background: var(--border); }
 
 .chart-menu-hint { padding: 6px 10px; font-size: 11px; color: var(--text-dim); max-width: 340px; white-space: normal; }
+
+/* Position line tags (TradingView-style): side + qty + live P&L, TP / SL
+   handles to drag out, and draggable stop-loss / target tags. */
+.pos-layer { position: absolute; inset: 0; pointer-events: none; z-index: 6; overflow: hidden; }
+.pos-tag { position: absolute; top: 0; right: 68px; display: flex; align-items: stretch; height: 22px; background: var(--bg-panel); border: 1px solid var(--border-hi); border-radius: 3px; font-family: var(--mono); font-size: 11px; font-weight: 700; white-space: nowrap; user-select: none; pointer-events: auto; overflow: hidden; }
+.pos-tag > * { display: flex; align-items: center; padding: 0 7px; }
+.pos-tag .side { color: #fff; }
+.pos-tag.long { border-color: #2962ff; }
+.pos-tag.long .side { background: #2962ff; }
+.pos-tag.short { border-color: var(--red); }
+.pos-tag.short .side { background: var(--red); }
+.pos-tag .pnl.up { color: var(--green); }
+.pos-tag .pnl.down { color: var(--red); }
+.pos-tag .grab { border-left: 1px solid var(--border); color: var(--text-dim); cursor: ns-resize; }
+.pos-tag .grab.tp:hover { background: var(--green); color: #000; }
+.pos-tag .grab.sl:hover { background: var(--red); color: #fff; }
+.pos-tag .x { background: none; border: 0; border-left: 1px solid var(--border); color: var(--text-faint); font: inherit; cursor: pointer; }
+.pos-tag .x:hover { color: var(--text); background: var(--bg-elev); }
+.pos-tag.lvl { cursor: ns-resize; }
+.pos-tag.lvl.tp { border-color: var(--green); }
+.pos-tag.lvl.tp .side { background: var(--green); color: #000; }
+.pos-tag.lvl.sl { border-color: var(--red); }
+.pos-tag.lvl.sl .side { background: var(--red); }
+.pos-tag.off { opacity: 0.6; }
+
+/* Right-click menu on the chart: orders at the clicked price (confirm step), alert, ticket. */
+.chart-ctx { position: absolute; z-index: 20; min-width: 220px; }
+.chart-ctx .ctx-buy { color: var(--green); }
+.chart-ctx .ctx-sell { color: var(--red); }
+.chart-ctx-confirm { padding: 6px 10px; font-family: var(--mono); font-size: 11px; color: var(--text); white-space: normal; }
+.chart-ctx-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; padding: 4px 8px 8px; }

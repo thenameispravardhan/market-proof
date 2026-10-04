@@ -311,6 +311,32 @@ describe("Trade page", () => {
     expect(success.textContent).toMatch(/NSE:RELIANCE-EQ/);
   });
 
+  it("places a LIMIT buy from the chart's right-click menu only after the confirm", async () => {
+    const posts: Record<string, unknown>[] = [];
+    const stubs = defaultStubs();
+    globalThis.fetch = makeFetchStub((url, init) => {
+      if (/\/api\/orders$/.test(url) && init?.method === "POST") posts.push(JSON.parse(String(init.body)));
+      return stubs(url, init);
+    });
+    const user = userEvent.setup();
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await user.type(await screen.findByTestId("trade-search"), "RELI");
+    await user.click(await screen.findByTestId("search-row-NSE:RELIANCE-EQ"));
+    await waitFor(() => expect(screen.getByTestId("ticket-submit")).not.toBeDisabled());
+
+    // Right-click at a price below the market (the chart stub maps every y to 100).
+    const chart = await screen.findByTestId("trade-chart");
+    fireEvent.contextMenu(chart.querySelector(".chart-container")!, { clientX: 40, clientY: 40 });
+    await user.click(await screen.findByText(/Buy 1 @ 100(\.00)? limit/));
+    expect(posts).toHaveLength(0);                  // nothing reaches the broker before the confirm
+    await user.click(screen.getByTestId("chart-ctx-place"));
+    await waitFor(() => expect(posts).toHaveLength(1));
+    expect(posts[0]).toMatchObject({
+      account_id: 7, symbol: "NSE:RELIANCE-EQ", side: "BUY", quantity: 1,
+      order_type: "LIMIT", limit_price: 100, stop_price: null, product_type: "INTRADAY",
+    });
+  });
+
   it("surfaces a risk warning on a placed order (override / engine-fault)", async () => {
     // When the backend places an order that still carries a risk note
     // (an operator override, or a risk-engine fault that didn't block),

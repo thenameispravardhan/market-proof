@@ -194,6 +194,21 @@ type StratTrade = { side: string; entry_t: number; exit_t: number; entry: number
 type StratRun = { name: string; trades: StratTrade[]; stats: Record<string, number | null>; error?: string; running?: boolean };
 type ScaleMode = "normal" | "log" | "percent";
 
+/** An order placed from the chart's right-click menu. */
+export interface ChartOrder {
+  side: "BUY" | "SELL";
+  type: "MARKET" | "LIMIT" | "SL-M";
+  price: number | null;
+}
+
+/** An open position on the charted symbol and its managed exits. */
+export interface ChartPosition {
+  qty: number;              // signed: + long, - short
+  avg: number;
+  sl: number | null;
+  tp: number | null;
+}
+
 /** A broker-state line drawn on the chart (position avg / pending order). */
 export interface BrokerLine {
   price: number;
@@ -377,9 +392,27 @@ export default function ChartPanel({
   shortName,
   brokerLines,
   onPickPrice,
+  position,
+  onLevels,
+  onClosePosition,
+  onChartOrder,
+  orderQty,
 }: {
   symbol: string;
   shortName: string;
+  /** Open position on this symbol: drawn as a live-P&L line with
+   *  draggable stop-loss / target (TradingView-style). */
+  position?: ChartPosition | null;
+  /** Save new exits (null clears one). Rejects on failure — the chart
+   *  then puts the line back where it was. */
+  onLevels?: (sl: number | null, tp: number | null) => Promise<void>;
+  /** Close the position at market. */
+  onClosePosition?: () => Promise<void>;
+  /** Place an order from the right-click menu; resolves to the message to
+   *  show. Absent = the menu offers no orders. */
+  onChartOrder?: (o: ChartOrder) => Promise<string>;
+  /** Quantity those orders use (the ticket's). */
+  orderQty?: number;
   /** Position-average / pending-order levels to mark on the chart. */
   brokerLines?: BrokerLine[];
   /** When set, the "→ Ticket" tool sends a clicked price to the caller. */
@@ -450,6 +483,13 @@ export default function ChartPanel({
   const compareSeriesRef = useRef<Map<string, ISeriesApi<"Line">>>(new Map());
   const alertLinesRef = useRef<Map<string, IPriceLine>>(new Map());
   const brokerLinesRef = useRef<IPriceLine[]>([]);
+  // Position line + its stop-loss / target lines and the HTML tags riding them.
+  const posLinesRef = useRef<{ entry?: IPriceLine; sl?: IPriceLine; tp?: IPriceLine }>({});
+  const posTagRefs = useRef<{ entry: HTMLDivElement | null; sl: HTMLDivElement | null; tp: HTMLDivElement | null }>({ entry: null, sl: null, tp: null });
+  const levelDragRef = useRef<{ which: "sl" | "tp"; price: number } | null>(null);
+  const [levelDrag, setLevelDrag] = useState<"sl" | "tp" | null>(null);
+  // Right-click menu: orders / alert / ticket at the clicked price.
+  const [ctx, setCtx] = useState<{ x: number; y: number; price: number; confirm?: ChartOrder } | null>(null);
   // HA open/close of the bar BEFORE the live bar (live HA updates).
   const prevHaRef = useRef<{ open: number; close: number } | null>(null);
   const atLiveRef = useRef(true);
@@ -1838,6 +1878,162 @@ export default function ChartPanel({
     brokerLinesRef.current = next;
   }, [brokerLines, chartKind, status.kind]);
 
+  // 5b') Position line + stop-loss / target lines.
+  useEffect(() => {
+    const main = mainRef.current;
+    const old = posLinesRef.current;
+    for (const l of [old.entry, old.sl, old.tp]) {
+      if (l && main) {
+        try { main.removePriceLine(l); } catch { /* gone */ }
+      }
+    }
+    posLinesRef.current = {};
+    if (!main || !position) return;
+    const colors = colorsRef.current;
+    const mk = (price: number, color: string, style: LineStyle) =>
+      main.createPriceLine({ price, color, lineWidth: 1, lineStyle: style, axisLabelVisible: true, title: "" });
+    try {
+      posLinesRef.current.entry = mk(position.avg, position.qty > 0 ? "#2962FF" : colors.down, LineStyle.Solid);
+      const sl = levelDrag === "sl" ? levelDragRef.current?.price : position.sl;
+      const tp = levelDrag === "tp" ? levelDragRef.current?.price : position.tp;
+      if (sl != null) posLinesRef.current.sl = mk(sl, colors.down, LineStyle.Dashed);
+      if (tp != null) posLinesRef.current.tp = mk(tp, colors.up, LineStyle.Dashed);
+    } catch {
+      /* cosmetic */
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [position?.qty, position?.avg, position?.sl, position?.tp, levelDrag, chartKind, status.kind]);
+
+  // 5b'') Glue the tags to their lines every frame and tick the live P&L:
+  // follows pans, zooms, resizes, ticks and drags without wiring each event.
+  useEffect(() => {
+    if (!position) return;
+    let raf = 0;
+    const money = (v: number) => `${v >= 0 ? "+" : "−"}₹${Math.abs(v).toLocaleString("en-IN", { maximumFractionDigits: 2 })}`;
+    const frame = () => {
+      raf = requestAnimationFrame(frame);
+      const main = mainRef.current, chart = chartRef.current;
+      if (!main || !chart) return;
+      const h = paneDims().height;
+      const right = `${(chart.priceScale("right").width() || 60) + 8}px`;
+      const ltp = prevLtpRef.current ?? candlesRef.current[candlesRef.current.length - 1]?.close ?? null;
+      const drag = levelDragRef.current;
+      const levels = {
+        entry: position.avg,
+        sl: drag?.which === "sl" ? drag.price : position.sl,
+        tp: drag?.which === "tp" ? drag.price : position.tp,
+      };
+      for (const k of ["entry", "sl", "tp"] as const) {
+        const el = posTagRefs.current[k];
+        const price = levels[k];
+        if (!el || price == null) continue;
+        const y = main.priceToCoordinate(price);
+        if (y == null) { el.style.visibility = "hidden"; continue; }
+        el.style.visibility = "visible";
+        el.style.right = right;
+        el.style.transform = `translateY(${Math.max(0, Math.min(h - 22, y - 11))}px)`;
+        el.classList.toggle("off", y < 0 || y > h);    // pinned to the edge while off-screen
+        const pnlEl = el.querySelector<HTMLElement>(".pnl");
+        const at = k === "entry" ? ltp : price;
+        if (pnlEl && at != null) {
+          const pnl = (at - position.avg) * position.qty;
+          const pct = ((at - position.avg) / position.avg) * 100 * Math.sign(position.qty);
+          pnlEl.textContent = k === "entry" ? money(pnl) : `${fmtPrice(price)} · ${money(pnl)} (${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%)`;
+          pnlEl.className = `pnl ${pnl >= 0 ? "up" : "down"}`;
+        }
+        if (drag && k === drag.which) posLinesRef.current[k]?.applyOptions({ price });
+      }
+    };
+    raf = requestAnimationFrame(frame);
+    return () => cancelAnimationFrame(raf);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [position?.qty, position?.avg, position?.sl, position?.tp]);
+
+  // Drag a stop-loss / target (or pull a new one out of the position line).
+  function startLevelDrag(e: React.PointerEvent, which: "sl" | "tp"): void {
+    if (!onLevels || !position || e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const host = containerRef.current, main = mainRef.current;
+    if (!host || !main) return;
+    const pos = position;
+    levelDragRef.current = { which, price: pos[which] ?? pos.avg };
+    setLevelDrag(which);
+    const move = (ev: PointerEvent) => {
+      const pr = main.coordinateToPrice(ev.clientY - host.getBoundingClientRect().top);
+      if (pr != null && levelDragRef.current) levelDragRef.current.price = Math.round((pr as number) * 100) / 100;
+    };
+    const up = async () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      const d = levelDragRef.current;
+      if (!d) return;
+      const done = () => { levelDragRef.current = null; setLevelDrag(null); };
+      if (d.price === pos[which]) return done();
+      const ltp = prevLtpRef.current ?? candlesRef.current[candlesRef.current.length - 1]?.close ?? null;
+      const long = pos.qty > 0;
+      // A level on the wrong side of the market would exit on the next tick.
+      const below = which === "sl" ? long : !long;
+      if (ltp != null && (below ? d.price >= ltp : d.price <= ltp)) {
+        addToast(`${which === "sl" ? "Stop-loss" : "Target"} must be ${below ? "below" : "above"} the LTP ${fmtPrice(ltp)} for a ${long ? "long" : "short"} — not changed`);
+        return done();
+      }
+      try {
+        await onLevels(which === "sl" ? d.price : pos.sl, which === "tp" ? d.price : pos.tp);
+        addToast(`${which === "sl" ? "Stop-loss" : "Target"} → ${fmtPrice(d.price)}`);
+      } catch (err) {
+        addToast(`Couldn't save the ${which === "sl" ? "stop-loss" : "target"}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      done();
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  }
+
+  useEffect(() => {
+    if (!ctx) return;
+    const close = () => setCtx(null);
+    const esc = (e: KeyboardEvent) => { if (e.key === "Escape") setCtx(null); };
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", esc);
+    return () => { document.removeEventListener("mousedown", close); document.removeEventListener("keydown", esc); };
+  }, [ctx]);
+
+  function openCtx(e: React.MouseEvent): void {
+    const host = containerRef.current, main = mainRef.current;
+    if (!host || !main) return;
+    const r = host.getBoundingClientRect();
+    const pr = main.coordinateToPrice(e.clientY - r.top);
+    if (pr == null) return;
+    e.preventDefault();
+    setCtx({ x: e.clientX - r.left, y: e.clientY - r.top, price: Math.round((pr as number) * 100) / 100 });
+  }
+
+  // TradingView's rule: a buy below the market rests as a LIMIT, above it
+  // as a STOP (SL-M); a sell the other way round.
+  function ctxOrders(price: number): ChartOrder[] {
+    const ltp = prevLtpRef.current ?? candlesRef.current[candlesRef.current.length - 1]?.close ?? null;
+    const above = ltp != null && price > ltp;
+    const out: ChartOrder[] = [
+      { side: "BUY", type: above ? "SL-M" : "LIMIT", price },
+      { side: "SELL", type: above || ltp == null ? "LIMIT" : "SL-M", price },
+    ];
+    if (ltp != null) out.push({ side: "BUY", type: "MARKET", price: null }, { side: "SELL", type: "MARKET", price: null });
+    return out;
+  }
+  const orderLabel = (o: ChartOrder) =>
+    `${o.side === "BUY" ? "Buy" : "Sell"} ${orderQty ?? ""} ${o.price == null ? "at market" : `@ ${fmtPrice(o.price)} ${o.type === "LIMIT" ? "limit" : "stop"}`}`;
+
+  async function removeLevel(which: "sl" | "tp"): Promise<void> {
+    if (!onLevels || !position) return;
+    try {
+      await onLevels(which === "sl" ? null : position.sl, which === "tp" ? null : position.tp);
+      addToast(`${which === "sl" ? "Stop-loss" : "Target"} removed`);
+    } catch (err) {
+      addToast(`Couldn't remove it: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   // 5c) Volume visibility toggle.
   useEffect(() => {
     try {
@@ -2468,7 +2664,7 @@ export default function ChartPanel({
             🗑
           </button>
         </div>
-      <div className="chart-container">
+      <div className="chart-container" onContextMenu={openCtx}>
         <div ref={containerRef} className="chart-host" />
         <div className="chart-watermark">{shortName}</div>
         <div className="chart-legend">
@@ -2476,6 +2672,112 @@ export default function ChartPanel({
           <div ref={countdownRef} className="chart-countdown" />
           {active.flow && flowNote && <div className="chart-countdown">{flowNote}</div>}
         </div>
+        {position && status.kind === "ready" && (
+          <div className="pos-layer">
+            <div ref={(el) => { posTagRefs.current.entry = el; }} className={`pos-tag ${position.qty > 0 ? "long" : "short"}`} data-testid="chart-position">
+              <span className="side">{position.qty > 0 ? "LONG" : "SHORT"} {Math.abs(position.qty)}</span>
+              <span className="pnl" />
+              {onLevels && position.tp == null && levelDrag !== "tp" && (
+                <span className="grab tp" onPointerDown={(e) => startLevelDrag(e, "tp")} title="Drag up / down to set a target">TP</span>
+              )}
+              {onLevels && position.sl == null && levelDrag !== "sl" && (
+                <span className="grab sl" onPointerDown={(e) => startLevelDrag(e, "sl")} title="Drag up / down to set a stop-loss">SL</span>
+              )}
+              {onClosePosition && (
+                <button
+                  type="button"
+                  className="x"
+                  title="Close the position at market"
+                  onClick={() => {
+                    if (window.confirm(`Close ${position.qty > 0 ? "LONG" : "SHORT"} ${Math.abs(position.qty)} ${shortName} at market?`)) {
+                      onClosePosition().catch((err) => addToast(`Close failed: ${err instanceof Error ? err.message : String(err)}`));
+                    }
+                  }}
+                >
+                  ✕
+                </button>
+              )}
+            </div>
+            {(["tp", "sl"] as const).map((k) =>
+              position[k] != null || levelDrag === k ? (
+                <div
+                  key={k}
+                  ref={(el) => { posTagRefs.current[k] = el; }}
+                  className={`pos-tag lvl ${k}`}
+                  onPointerDown={(e) => startLevelDrag(e, k)}
+                  title={`Drag to move the ${k === "sl" ? "stop-loss" : "target"}`}
+                  data-testid={`chart-${k}`}
+                >
+                  <span className="side">{k.toUpperCase()}</span>
+                  <span className="pnl" />
+                  {onLevels && position[k] != null && (
+                    <button type="button" className="x" title="Remove" onPointerDown={(e) => e.stopPropagation()} onClick={() => void removeLevel(k)}>
+                      ✕
+                    </button>
+                  )}
+                </div>
+              ) : null,
+            )}
+          </div>
+        )}
+        {ctx && (
+          <div
+            className="chart-menu chart-ctx"
+            style={{
+              left: Math.max(0, Math.min(ctx.x, (containerRef.current?.clientWidth ?? 600) - 240)),
+              top: Math.max(0, Math.min(ctx.y, (containerRef.current?.clientHeight ?? 400) - 190)),
+            }}
+            onMouseDown={(e) => e.stopPropagation()}
+            data-testid="chart-ctx"
+          >
+            {ctx.confirm ? (
+              <>
+                <div className="chart-menu-head">Confirm — real order</div>
+                <div className="chart-ctx-confirm">{orderLabel(ctx.confirm)} · {shortName} · intraday</div>
+                <div className="chart-ctx-actions">
+                  <button
+                    type="button"
+                    className={`ticket-side-btn ${ctx.confirm.side === "BUY" ? "buy" : "sell"} on`}
+                    autoFocus
+                    onClick={() => {
+                      const o = ctx.confirm!;
+                      setCtx(null);
+                      onChartOrder?.(o).then(addToast, (err) => addToast(`Order failed: ${err instanceof Error ? err.message : String(err)}`));
+                    }}
+                    data-testid="chart-ctx-place"
+                  >
+                    Place {ctx.confirm.side}
+                  </button>
+                  <button type="button" className="ticket-side-btn" onClick={() => setCtx(null)}>Cancel</button>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="chart-menu-head">{fmtPrice(ctx.price)}</div>
+                {onChartOrder &&
+                  ctxOrders(ctx.price).map((o) => (
+                    <button
+                      key={`${o.side}-${o.type}`}
+                      type="button"
+                      className={`chart-menu-item ctx-${o.side.toLowerCase()}`}
+                      onClick={() => setCtx({ ...ctx, confirm: o })}
+                    >
+                      {orderLabel(o)}
+                    </button>
+                  ))}
+                {onChartOrder && <div className="chart-menu-sep" />}
+                <button type="button" className="chart-menu-item" onClick={() => { addAlert(ctx.price); setCtx(null); }}>
+                  🔔 Alert at {fmtPrice(ctx.price)}
+                </button>
+                {onPickPrice && (
+                  <button type="button" className="chart-menu-item" onClick={() => { onPickPrice(ctx.price); setCtx(null); }}>
+                    ⤷ Use {fmtPrice(ctx.price)} in the ticket
+                  </button>
+                )}
+              </>
+            )}
+          </div>
+        )}
         {status.kind === "loading" && (
           <div className="chart-status">loading chart…</div>
         )}
