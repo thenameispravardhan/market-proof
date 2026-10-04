@@ -51,3 +51,17 @@ def test_ui_state_round_trip_and_guards(client: TestClient) -> None:
     assert client.put("/api/settings/ui/big", json={"value": "x" * 2_000_001}).status_code == 413
     # a UI row must never surface as a global setting
     assert "ui:trade_layouts" not in client.get("/api/settings").text
+
+
+def test_fyers_client_forces_ipv4() -> None:
+    """Orders must leave from the whitelisted static IPv4 (-50 otherwise)."""
+    from app.execution.fyers_live import FyersClient
+
+    async def build():
+        c = FyersClient(app_id="X-100", access_token="t")
+        http = await c._ensure_client()  # noqa: SLF001
+        addr = http._transport._pool._local_address  # noqa: SLF001
+        await http.aclose()
+        return addr
+
+    assert asyncio.run(build()) == "0.0.0.0"
