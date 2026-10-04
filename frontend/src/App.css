@@ -2593,6 +2593,13 @@ div.ind-row { cursor: default; }
 .sym-row .desc { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
 .sym-row .exch { color: var(--text-faint); font-size: 10.5px; text-align: right; }
 .sym-row .badge { font-size: 9px; text-transform: uppercase; }
+.sym-row mark.sym-hl { background: none; color: #2962FF; }
+:root:not([data-theme="light"]) .sym-row mark.sym-hl { color: #5B8DEF; }
+.sym-cols { display: grid; grid-template-columns: 150px minmax(0, 1fr) auto 70px; gap: 10px; padding: 2px 8px 4px; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-faint); border-bottom: 1px solid var(--border-soft); }
+.sym-cols span:last-child { text-align: right; }
+.sym-search .sym-row { grid-template-columns: 150px minmax(0, 1fr) auto 70px; }
+.sym-busy { padding: 8px; text-align: center; }
+.sym-foot { color: var(--text-faint); font-size: 11px; }
 
 /* command palette, shortcuts, interval prompt */
 .cmd-list { display: flex; flex-direction: column; max-height: 55vh; overflow-y: auto; margin-top: 6px; }
@@ -2820,3 +2827,27 @@ a.chart-menu-item { text-decoration: none; color: var(--text); }
 .popout-app { height: 100vh; display: flex; flex-direction: column; background: var(--bg-app); padding: 6px; }
 .popout-chart { flex: 1; min-height: 0; display: flex; }
 .popout-chart > .chart-card { flex: 1; }
+
+/* Compare menu: add buttons per scale option, empty state */
+.cmp-menu { min-width: 340px; }
+.cmp-hit { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 8px; border-bottom: 1px solid var(--border-soft); }
+.cmp-hit .cmp-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cmp-adds { display: flex; gap: 3px; flex-shrink: 0; }
+.cmp-add { font-size: 10px; padding: 2px 6px; border: 1px solid var(--border); border-radius: 3px; background: var(--bg-elev); color: var(--text-dim); cursor: pointer; white-space: nowrap; }
+.cmp-add:hover:not(:disabled) { color: var(--text); border-color: var(--text-faint); }
+.cmp-add:disabled { opacity: 0.45; cursor: default; }
+.cmp-empty { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 14px 10px 10px; color: var(--text-dim); text-align: center; font-size: 12px; }
+.cmp-empty svg { color: var(--text-faint); margin-bottom: 2px; }
+.cmp-row-acts { display: inline-flex; align-items: center; gap: 2px; }
+.cmp-mode { font-size: 10.5px; background: var(--bg-elev); color: var(--text); border: 1px solid var(--border); border-radius: 3px; padding: 1px 2px; }
+
+.iv-sec-head { display: flex; width: 100%; justify-content: space-between; align-items: center; background: none; border: 0; cursor: pointer; text-align: left; }
+.iv-sec-head:hover { color: var(--text); }
+.iv-sec-head .caret { font-size: 9px; }
+
+/* Quick trade ⚡ one-click switch */
+.qt-toggle { display: inline-flex; align-items: center; gap: 4px; }
+.qt-switch { position: relative; width: 22px; height: 12px; border-radius: 6px; background: var(--border); transition: background 0.15s; }
+.qt-switch i { position: absolute; top: 2px; left: 2px; width: 8px; height: 8px; border-radius: 50%; background: var(--text-dim); transition: left 0.15s, background 0.15s; }
+.qt-switch.on { background: rgba(41, 98, 255, 0.55); }
+.qt-switch.on i { left: 12px; background: #fff; }

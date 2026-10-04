@@ -17,6 +17,7 @@ import {
   type PlotKind,
 } from "./indicatorCatalog";
 import { Check, ColorInput, Modal, Num, Row, Sel } from "./chartUi";
+import type { InstrumentHit } from "../../types";
 
 export interface StrategyItem {
   id: number;
@@ -27,6 +28,55 @@ export interface StrategyItem {
 export interface IndicatorTemplate {
   name: string;
   items: IndicatorInstance[];
+  /** Saved with "Remember symbol": applying it switches the chart there. */
+  symbol?: { symbol: string; name: string; hit?: InstrumentHit | null };
+  /** Saved with "Remember interval". */
+  interval?: string;
+}
+
+/** "RELIANCE · 15m" — what a template switches the chart to, if anything. */
+export function templateScope(t: IndicatorTemplate, ivLabel: (k: string) => string = (k) => k): string {
+  return [t.symbol?.name, t.interval ? ivLabel(t.interval) : null].filter(Boolean).join(" · ");
+}
+
+export function SaveTemplateDialog({
+  symbolLabel,
+  intervalLabel,
+  existing,
+  onSave,
+  onClose,
+}: {
+  symbolLabel: string;
+  intervalLabel: string;
+  existing: string[];
+  onSave: (name: string, withSymbol: boolean, withInterval: boolean) => void;
+  onClose: () => void;
+}) {
+  const [name, setName] = useState("");
+  const [withSymbol, setWithSymbol] = useState(false);
+  const [withInterval, setWithInterval] = useState(false);
+  const n = name.trim();
+  const save = () => {
+    if (!n) return;
+    onSave(n, withSymbol, withInterval);
+    onClose();
+  };
+  return (
+    <Modal
+      title="Save indicator template"
+      onClose={onClose}
+      width={400}
+      testid="ind-template-save"
+      footer={<><span className="grow" /><button type="button" className="cbtn" onClick={onClose}>Cancel</button><button type="button" className="cbtn primary" disabled={!n} onClick={save} data-testid="ind-template-save-ok">Save</button></>}
+    >
+      <Row label="Template name">
+        <input className="cform-input" autoFocus value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && save()} aria-label="Template name" data-testid="ind-template-name" />
+      </Row>
+      <Check label={`Remember symbol (${symbolLabel})`} checked={withSymbol} onChange={setWithSymbol} testid="ind-template-symbol" />
+      <Check label={`Remember interval (${intervalLabel})`} checked={withInterval} onChange={setWithInterval} testid="ind-template-interval" />
+      {existing.includes(n) && <div className="hint warn-text">Replaces the existing template "{n}".</div>}
+    </Modal>
+  );
 }
 
 export function IndicatorPicker({
@@ -91,7 +141,7 @@ export function IndicatorPicker({
           {templates.length === 0 && <div className="hint">No templates yet — save one from the templates button (▦) in the toolbar.</div>}
           {templates.map((t) => (
             <button key={t.name} type="button" className="ind-row" onClick={() => { onApplyTemplate(t); onClose(); }}>
-              <span className="ind-name">▦ {t.name}</span>
+              <span className="ind-name">▦ {t.name}{templateScope(t) && <span className="hint"> · {templateScope(t)}</span>}</span>
               <span className="ind-cat">{t.items.map((i) => INDICATOR_BY_TYPE.get(i.type)?.short ?? i.type).join(", ")}</span>
             </button>
           ))}

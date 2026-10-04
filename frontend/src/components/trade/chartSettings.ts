@@ -7,6 +7,43 @@ import type { DateFormat } from "./chartData";
 
 export type LineVisibility = "hover" | "always" | "never";
 
+/** The chart types built from bricks / columns instead of time bars. */
+export type BrickKind = "renko" | "kagi" | "pnf" | "linebreak" | "range";
+
+/** One brick type's inputs (TradingView shows these per chart type). */
+export interface BrickInputs {
+  /** Box size (Kagi: reversal amount) from the ATR or a fixed value. */
+  method: "atr" | "traditional";
+  atrLength: number;
+  /** Traditional box size / Kagi reversal amount / Range size. */
+  box: number;
+  /** P&F: boxes needed to reverse a column. */
+  reversal: number;
+  /** Build from closes, or from each bar's high and low. */
+  source: "close" | "hl";
+  /** Line break: lines to break for a reversal. */
+  lines: number;
+}
+
+export const DEFAULT_BRICKS: Record<BrickKind, BrickInputs> = {
+  renko: { method: "atr", atrLength: 14, box: 0, reversal: 2, source: "close", lines: 3 },
+  kagi: { method: "atr", atrLength: 14, box: 0, reversal: 1, source: "close", lines: 3 },
+  pnf: { method: "atr", atrLength: 14, box: 0, reversal: 3, source: "close", lines: 3 },
+  linebreak: { method: "atr", atrLength: 14, box: 0, reversal: 3, source: "close", lines: 3 },
+  range: { method: "atr", atrLength: 14, box: 0, reversal: 1, source: "close", lines: 3 },
+};
+
+/** A brick type's effective inputs; settings saved before per-type inputs
+ *  (one shared box size / reversal / lines) still apply. */
+export function brickInputs(s: ChartSettings, k: BrickKind): BrickInputs {
+  const legacy: Partial<BrickInputs> = {
+    ...(s.boxSize > 0 ? { method: "traditional" as const, box: s.boxSize } : {}),
+    ...(k === "pnf" && s.reversal ? { reversal: s.reversal } : {}),
+    ...(k === "linebreak" && s.lineBreak ? { lines: s.lineBreak } : {}),
+  };
+  return { ...DEFAULT_BRICKS[k], ...legacy, ...(s.bricks?.[k] ?? {}) };
+}
+
 export interface ChartSettings {
   // ---- Symbol ----
   colorPrevClose: boolean;
@@ -21,10 +58,12 @@ export interface ChartSettings {
   wickDown: string;
   precision: number | null;
   timezone: string;
-  /** Renko / Kagi / P&F / Range box: 0 = auto (ATR). */
+  /** Legacy shared brick inputs (pre per-type inputs); see `bricks`. */
   boxSize: number;
   reversal: number;
   lineBreak: number;
+  /** Per chart type inputs (Renko, Kagi, P&F, Line break, Range). */
+  bricks: Partial<Record<BrickKind, Partial<BrickInputs>>>;
   // ---- Status line ----
   showTitle: boolean;
   titleMode: "description" | "ticker" | "both";
@@ -129,6 +168,7 @@ export const DEFAULT_SETTINGS: ChartSettings = {
   boxSize: 0,
   reversal: 3,
   lineBreak: 3,
+  bricks: {},
   showTitle: true,
   titleMode: "description",
   showOhlc: true,

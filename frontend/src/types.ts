@@ -366,6 +366,9 @@ export interface SearchResponse {
   ok: boolean;
   count: number;
   hits: InstrumentHit[];
+  offset?: number;
+  /** Another page exists past `offset + count`. */
+  has_more?: boolean;
 }
 
 export interface OptionLeg {

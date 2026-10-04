@@ -6,7 +6,7 @@
 import { useState } from "react";
 import { DATE_FORMATS, TIMEZONES } from "./chartData";
 import { Check, ColorInput, Modal, Num, Row, Section, Sel } from "./chartUi";
-import { DEFAULT_SETTINGS, SETTINGS_TEMPLATES_KEY, type ChartSettings, type LineVisibility } from "./chartSettings";
+import { DEFAULT_SETTINGS, SETTINGS_TEMPLATES_KEY, brickInputs, type BrickInputs, type BrickKind, type ChartSettings, type LineVisibility } from "./chartSettings";
 
 export interface TradingFlags {
   instant: boolean;
@@ -37,6 +37,7 @@ export default function ChartSettingsDialog({
   trading,
   onTrading,
   initialTab = "symbol",
+  chartKind,
 }: {
   value: ChartSettings;
   onChange: (s: ChartSettings) => void;
@@ -45,6 +46,8 @@ export default function ChartSettingsDialog({
   trading?: TradingFlags;
   onTrading?: (k: keyof TradingFlags, v: boolean) => void;
   initialTab?: string;
+  /** The chart's type: Renko / Kagi / P&F / Line break / Range show their own inputs. */
+  chartKind?: string;
 }) {
   const [orig] = useState(value);
   const [tab, setTab] = useState(initialTab);
@@ -130,14 +133,7 @@ export default function ChartSettingsDialog({
               <Sel value={s.timezone} options={TIMEZONES.map((t) => ({ v: t.id, l: t.label }))} onChange={(v) => set("timezone", v)} ariaLabel="Timezone" />
             </Row>
           </Section>
-          <Section title="Renko / Kagi / P&F / Range">
-            <Row label="Box size" hint="0 = automatic (ATR 14)">
-              <Num value={s.boxSize} min={0} step={0.05} onChange={(v) => set("boxSize", v)} ariaLabel="Box size" />
-              <span className="hint">{s.boxSize ? "" : "auto (ATR)"}</span>
-            </Row>
-            <Row label="P&F reversal (boxes)"><Num value={s.reversal} min={1} max={10} onChange={(v) => set("reversal", Math.round(v))} ariaLabel="Reversal" /></Row>
-            <Row label="Line break: lines"><Num value={s.lineBreak} min={1} max={10} onChange={(v) => set("lineBreak", Math.round(v))} ariaLabel="Line break" /></Row>
-          </Section>
+          <BrickSection s={s} kind={chartKind} onChange={onChange} />
         </>
       )}
       {tab === "status" && (
@@ -305,5 +301,46 @@ export default function ChartSettingsDialog({
         </Section>
       )}
     </Modal>
+  );
+}
+
+const BRICK_LABEL: Record<BrickKind, string> = { renko: "Renko", kagi: "Kagi", pnf: "Point & figure", linebreak: "Line break", range: "Range" };
+
+/** The current chart type's own inputs, TradingView-style (only brick types have any). */
+function BrickSection({ s, kind, onChange }: { s: ChartSettings; kind?: string; onChange: (s: ChartSettings) => void }) {
+  const k = kind && kind in BRICK_LABEL ? (kind as BrickKind) : null;
+  if (!k) {
+    return (
+      <Section title="Chart type inputs">
+        <div className="hint">Renko, Kagi, Point &amp; figure, Line break and Range each have their own inputs — switch the chart to one of them to edit its inputs here.</div>
+      </Section>
+    );
+  }
+  const b = brickInputs(s, k);
+  const setB = (patch: Partial<BrickInputs>) => onChange({ ...s, bricks: { ...s.bricks, [k]: { ...b, ...patch } } });
+  const what = k === "kagi" ? "Reversal amount" : k === "range" ? "Range" : "Box size";
+  return (
+    <Section title={`${BRICK_LABEL[k]} inputs`}>
+      {k !== "linebreak" && (
+        <>
+          <Row label={`${what} assignment method`}>
+            <Sel value={b.method} options={[{ v: "atr", l: "ATR" }, { v: "traditional", l: "Traditional" }]} onChange={(v) => setB({ method: v })} ariaLabel={`${what} assignment method`} />
+          </Row>
+          {b.method === "atr" ? (
+            <Row label="ATR length"><Num value={b.atrLength} min={1} max={500} onChange={(v) => setB({ atrLength: Math.max(1, Math.round(v)) })} ariaLabel="ATR length" /></Row>
+          ) : (
+            <Row label={what}>
+              <Num value={b.box} min={0} step={0.05} onChange={(v) => setB({ box: Math.max(0, v) })} ariaLabel={what} />
+              {!(b.box > 0) && <span className="hint">0 = ATR</span>}
+            </Row>
+          )}
+        </>
+      )}
+      {k === "pnf" && <Row label="Reversal amount (boxes)"><Num value={b.reversal} min={1} max={10} onChange={(v) => setB({ reversal: Math.max(1, Math.round(v)) })} ariaLabel="Reversal" /></Row>}
+      {k === "linebreak" && <Row label="Number of lines"><Num value={b.lines} min={1} max={10} onChange={(v) => setB({ lines: Math.max(1, Math.round(v)) })} ariaLabel="Number of lines" /></Row>}
+      {(k === "renko" || k === "kagi" || k === "pnf") && (
+        <Row label="Source"><Sel value={b.source} options={[{ v: "close", l: "Close" }, { v: "hl", l: "High / Low" }]} onChange={(v) => setB({ source: v })} ariaLabel="Source" /></Row>
+      )}
+    </Section>
   );
 }

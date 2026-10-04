@@ -127,9 +127,9 @@ import {
 import { ShapeSeries, type ShapeMode } from "./customSeries";
 import { beep, evaluate, migrateAlert, newAlert, type AlertItem } from "./alerts";
 import { chartFocus, drawingClipboard, indicatorClipboard, NO_SYNC, publishSync, pushLog, subscribeSync, type SyncFlags } from "./chartSync";
-import { LIGHT, loadSettings, saveSettings, type ChartSettings } from "./chartSettings";
+import { LIGHT, brickInputs, loadSettings, saveSettings, type BrickKind, type ChartSettings } from "./chartSettings";
 import ChartSettingsDialog, { type TradingFlags } from "./ChartSettingsDialog";
-import { IndicatorPicker, IndicatorSettings, type IndicatorTemplate, type StrategyItem } from "./IndicatorDialogs";
+import { IndicatorPicker, IndicatorSettings, SaveTemplateDialog, templateScope, type IndicatorTemplate, type StrategyItem } from "./IndicatorDialogs";
 import {
   AlertDialog,
   CommandPalette,
@@ -226,7 +226,9 @@ export type HostAction =
   | "panel:chain" | "panel:details" | "panel:tree" | "panel:data" | "panel:alerts" | "panel:watch" | "panel:flow"
   | "panel:depth" | "panel:tape" | "panel:futures" | "panel:strategy"
   | "bottom:positions" | "bottom:orders" | "bottom:basket" | "bottom:smart"
-  | "scalper" | "layouts" | "save" | "maximize" | "watch:add" | "privacy" | "logout" | "usersettings";
+  | "scalper" | "layouts" | "save" | "maximize" | "watch:add" | "privacy" | "logout" | "usersettings"
+  /** Quick trade with one-click OFF: open the order window on that side. */
+  | "ticket:buy" | "ticket:sell";
 
 interface ToolMenuItem {
   id: string;
@@ -306,11 +308,21 @@ const MAX_CANDLES = 20000;
 
 const PREFS_KEY = "chart:prefs";
 
+/** Where a compared symbol plots: on the main scale in %, on its own price
+ *  scale (the opposite axis), or in a pane of its own. */
+type CompareMode = "percent" | "scale" | "pane";
+const COMPARE_MODES: { v: CompareMode; l: string }[] = [
+  { v: "percent", l: "Same % scale" },
+  { v: "scale", l: "New price scale" },
+  { v: "pane", l: "New pane" },
+];
+
 interface CompareItem {
   symbol: string;
   name: string;
   color: string;
   hidden?: boolean;
+  mode?: CompareMode;
 }
 
 interface ChartEvent {
@@ -626,7 +638,7 @@ export interface ChartPanelProps {
 }
 
 type Dialog =
-  | { k: "symbol"; q: string; compare?: boolean }
+  | { k: "symbol"; q: string; compare?: boolean; select?: boolean }
   | { k: "indicators" }
   | { k: "indSettings"; uid: string }
   | { k: "settings"; tab?: string }
@@ -640,6 +652,7 @@ type Dialog =
   | { k: "panes" }
   | { k: "insights" }
   | { k: "whatsnew" }
+  | { k: "saveTemplate" }
   | null;
 
 interface Ctx {
@@ -791,9 +804,16 @@ export default function ChartPanel(props: ChartPanelProps) {
   );
   const [alertLog, setAlertLog] = useState<{ id: number; ts: number; text: string }[]>(() => loadJson(`chart:alertLog:${symbol}`, []));
   const [compares, setCompares] = useState<CompareItem[]>([]);
+  /** A compare on the main scale forces it into percent. */
+  const pctCompare = compares.some((c) => (c.mode ?? "percent") === "percent");
   const comparesLenRef = useRef(0);
-  comparesLenRef.current = compares.length;
+  comparesLenRef.current = pctCompare ? compares.length : 0;
+  /** The opposite axis, shown while a compare sits on its own price scale. */
+  const cmpOtherSide = compares.some((c) => c.mode === "scale") ? (settings.scaleSide === "right" ? "left" : "right") : null;
   const [compareQuery, setCompareQuery] = useState("");
+  /** Interval-menu sections the user folded away (persisted). */
+  const [ivCollapsed, setIvCollapsed] = useState<string[]>(() => loadJson<string[]>("chart:ivCollapsed", []) ?? []);
+  useEffect(() => saveJson("chart:ivCollapsed", ivCollapsed), [ivCollapsed]);
   const [compareHits, setCompareHits] = useState<{ symbol: string; name: string }[]>([]);
   const [atLive, setAtLive] = useState(true);
   const [toasts, setToasts] = useState<{ id: number; text: string }[]>([]);
@@ -814,6 +834,8 @@ export default function ChartPanel(props: ChartPanelProps) {
   const [replay, setReplayState] = useState({ on: false, selecting: false, playing: false, speed: 1, idx: 0 });
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const [paneRects, setPaneRects] = useState<{ i: number; top: number; height: number }[]>([]);
+  /** Width of a visible left price axis — the legends start right of it. */
+  const [leftAxisW, setLeftAxisW] = useState(0);
   const [paneMode, setPaneMode] = useState<{ max: number | null; collapsed: number[] }>({ max: null, collapsed: [] });
   const [events, setEvents] = useState<ChartEvent[]>([]);
   const [eventTip, setEventTip] = useState<{ x: number; text: string } | null>(null);
@@ -885,6 +907,10 @@ export default function ChartPanel(props: ChartPanelProps) {
   /** Option-chain open interest for the OI profile. */
   const oiChainRef = useRef<{ symbol: string; at: number; rows: OiStrike[] } | null>(null);
   const compareSeriesRef = useRef<Map<string, ISeriesApi<"Line">>>(new Map());
+  const comparesRef = useRef<CompareItem[]>([]);
+  comparesRef.current = compares;
+  /** First pane index after the indicator panes (compares in "New pane" go here). */
+  const indPaneCountRef = useRef(1);
   const alertLinesRef = useRef<Map<string, IPriceLine>>(new Map());
   const brokerLinesRef = useRef<IPriceLine[]>([]);
   const extraLinesRef = useRef<Map<string, IPriceLine>>(new Map());
@@ -1634,9 +1660,10 @@ export default function ChartPanel(props: ChartPanelProps) {
     return r.on && !r.selecting ? c.slice(0, r.idx + 1) : c;
   }
 
-  function brickBox(src: Bar[]): number {
-    const s = settingsRef.current;
-    return s.boxSize > 0 ? s.boxSize : autoBox(src);
+  /** A brick type's box (Kagi: reversal amount): fixed, or the ATR's. */
+  function brickBox(src: Bar[], k: BrickKind): number {
+    const b = brickInputs(settingsRef.current, k);
+    return b.method === "traditional" && b.box > 0 ? b.box : autoBox(src, Math.max(1, Math.round(b.atrLength)));
   }
 
   /** Rebuild the displayed series (non-time chart types transform the
@@ -1646,13 +1673,14 @@ export default function ChartPanel(props: ChartPanelProps) {
     const k = kindRef.current;
     let view: Candle[] = src;
     if (BRICK_KINDS.has(k)) {
-      const s = settingsRef.current;
-      const box = brickBox(src);
+      const bk = k as BrickKind;
+      const inp = brickInputs(settingsRef.current, bk);
+      const box = brickBox(src, bk);
       const out =
-        k === "renko" ? renko(src, box)
-          : k === "linebreak" ? lineBreak(src, s.lineBreak)
-            : k === "kagi" ? kagi(src, box)
-              : k === "pnf" ? pointFigure(src, box, s.reversal)
+        bk === "renko" ? renko(src, box, inp.source)
+          : bk === "linebreak" ? lineBreak(src, Math.max(1, Math.round(inp.lines)))
+            : bk === "kagi" ? kagi(src, box, inp.source)
+              : bk === "pnf" ? pointFigure(src, box, Math.max(1, Math.round(inp.reversal)), inp.source)
                 : rangeBars(src, box);
       view = out as Candle[];
       safe(() => mainRef.current?.applyOptions({ box } as never));
@@ -1759,6 +1787,8 @@ export default function ChartPanel(props: ChartPanelProps) {
         ? prev
         : rects,
     );
+    const lw = scaleWidth("left");
+    setLeftAxisW((w) => (Math.abs(w - lw) < 1 ? w : lw));
   }
 
   const LS = [LineStyle.Solid, LineStyle.Dotted, LineStyle.Dashed];
@@ -1869,8 +1899,34 @@ export default function ChartPanel(props: ChartPanelProps) {
         indFillPrimsRef.current.push(prim);
       }
     }
+    indPaneCountRef.current = pane;
     refreshIndicatorData();
     cleanupPanes(chart);
+    placeCompares();
+    applyPaneSizes();
+    setTimeout(measurePanes, 0);
+  }
+
+  /** Put each compare on its scale / pane: % compares share the main scale,
+   *  the first "New price scale" one takes the opposite axis (later ones get
+   *  overlay scales of their own), and "New pane" ones follow the indicator panes. */
+  function placeCompares(): void {
+    const s = settingsRef.current;
+    const main = s.scaleSide;
+    const other = main === "right" ? "left" : "right";
+    let axisTaken = false;
+    let pane = indPaneCountRef.current;
+    for (const c of comparesRef.current) {
+      const series = compareSeriesRef.current.get(c.symbol);
+      if (!series) continue;
+      const mode = c.mode ?? "percent";
+      const scaleId = mode === "percent" ? main : mode === "pane" ? main : !axisTaken ? other : `cmp-${c.symbol}`;
+      if (mode === "scale" && !axisTaken) axisTaken = true;
+      safe(() => series.applyOptions({ priceScaleId: scaleId }));
+      const want = mode === "pane" ? pane++ : 0;
+      const at = safe(() => series.getPane().paneIndex(), 0) ?? 0;
+      if (at !== want) safe(() => series.moveToPane(want));
+    }
     applyPaneSizes();
     setTimeout(measurePanes, 0);
   }
@@ -3201,7 +3257,7 @@ export default function ChartPanel(props: ChartPanelProps) {
   useEffect(() => {
     applyMainStyle(); // the raw-price label swaps in / out with the scale mode
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scaleMode, compares.length]);
+  }, [scaleMode, pctCompare]);
 
   // 2b) Main-series style + chart canvas / scales from the settings.
   useEffect(() => {
@@ -3235,8 +3291,9 @@ export default function ChartPanel(props: ChartPanelProps) {
           horzLines: { visible: s.grid === "both" || s.grid === "horz", color: s.gridColor || c.grid },
         },
         crosshair: { mode: magnet === "strong" ? (3 as CrosshairMode) : magnet === "weak" ? CrosshairMode.Magnet : CrosshairMode.Normal, vertLine: line as never, horzLine: line as never },
-        rightPriceScale: { visible: s.scaleSide === "right", borderColor: border, alignLabels: s.noOverlapLabels },
-        leftPriceScale: { visible: s.scaleSide === "left", borderColor: border, alignLabels: s.noOverlapLabels },
+        // the opposite axis also shows while a compare sits on "New price scale"
+        rightPriceScale: { visible: s.scaleSide === "right" || cmpOtherSide === "right", borderColor: border, alignLabels: s.noOverlapLabels },
+        leftPriceScale: { visible: s.scaleSide === "left" || cmpOtherSide === "left", borderColor: border, alignLabels: s.noOverlapLabels },
         timeScale: {
           borderColor: border,
           rightOffset: s.marginRight,
@@ -3247,16 +3304,18 @@ export default function ChartPanel(props: ChartPanelProps) {
         localization: { locale: "en-IN", timeFormatter: (t: Time) => timeFormatter(t) },
       }),
     );
+    if (cmpOtherSide) safe(() => chart.priceScale(cmpOtherSide).applyOptions({ mode: PriceScaleMode.Normal, autoScale: true }));
+    setTimeout(measurePanes, 30);
     repaintDrawings();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings, theme, cursor, magnet, iv]);
+  }, [settings, theme, cursor, magnet, iv, cmpOtherSide]);
 
   // 2c) Price scale: mode (compare forces percentage), auto, invert, margins.
   useEffect(() => {
     const chart = chartRef.current;
     if (!chart) return;
     const mode =
-      compares.length > 0
+      pctCompare
         ? PriceScaleMode.Percentage
         : scaleMode === "log"
           ? PriceScaleMode.Logarithmic
@@ -3275,7 +3334,8 @@ export default function ChartPanel(props: ChartPanelProps) {
     );
     repaintDrawings();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [compares.length, scaleMode, autoScale, invert, side, settings.marginTop, settings.marginBottom, mainVer]);
+  }, [pctCompare, scaleMode, autoScale, invert, side, settings.marginTop, settings.marginBottom, mainVer]);
+
 
   // 3) Load candles when the symbol / interval changes (the parent also
   //    remounts with a new `key` per symbol).
@@ -3726,8 +3786,9 @@ export default function ChartPanel(props: ChartPanelProps) {
         map.set(c.symbol, s);
         loadCompareData(c.symbol, s);
       }
-      safe(() => s!.applyOptions({ visible: !c.hidden, priceScaleId: side }));
+      safe(() => s!.applyOptions({ visible: !c.hidden }));
     }
+    placeCompares();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [compares, side]);
 
@@ -3935,7 +3996,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     raf = requestAnimationFrame(frame);
     return () => cancelAnimationFrame(raf);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings.lastPriceScaleValue, settings.lastPriceLabel, settings.lastPriceColor, scaleMode, compares.length]);
+  }, [settings.lastPriceScaleValue, settings.lastPriceLabel, settings.lastPriceColor, scaleMode, pctCompare]);
 
   function measureToolbar(): void {
     const el = toolbarRef.current;
@@ -4185,6 +4246,13 @@ export default function ChartPanel(props: ChartPanelProps) {
   // Instant orders (a trading setting) skip the confirm step.
   const pickOrder = (o: ChartOrder, at: { x: number; y: number; price: number }) =>
     instant ? submitOrder(o) : setCtx({ ...at, time: null, area: "pane", confirm: o });
+  // The quick-trade BUY / SELL buttons: one-click (⚡ on) sends at market;
+  // off, they open the order window on that side to review and confirm.
+  const quickOrder = (side: "BUY" | "SELL") => {
+    if (instant) submitOrder({ side, type: "MARKET", price: null });
+    else if (onAction) onAction(side === "BUY" ? "ticket:buy" : "ticket:sell");
+    else pickOrder({ side, type: "MARKET", price: null }, { x: 8, y: 52, price: lastClose() ?? 0 });
+  };
 
   function addHLine(price: number): void {
     const t = lastClose() !== null ? viewRef.current[viewRef.current.length - 1].time : 0;
@@ -4621,17 +4689,45 @@ export default function ChartPanel(props: ChartPanelProps) {
 
   function saveIndTemplate(): void {
     setMenuOpen(null);
-    const name = window.prompt("Indicator template name");
-    if (!name) return;
-    const next = [...templates.filter((t) => t.name !== name), { name, items: indicatorsRef.current }];
+    setDialog({ k: "saveTemplate" });
+  }
+
+  function storeIndTemplate(name: string, withSymbol: boolean, withInterval: boolean): void {
+    const t: IndicatorTemplate = {
+      name,
+      items: indicatorsRef.current,
+      ...(withSymbol ? { symbol: { symbol, name: shortName, hit: instrument ?? null } } : {}),
+      ...(withInterval ? { interval: ivRef.current } : {}),
+    };
+    const next = [...templates.filter((x) => x.name !== name), t];
     setTemplates(next);
     saveJson("chart:indTemplates", next);
     addToast(`template "${name}" saved`);
   }
 
+  function renameIndTemplate(t: IndicatorTemplate): void {
+    const name = window.prompt("Rename template", t.name)?.trim();
+    if (!name || name === t.name) return;
+    if (templates.some((x) => x.name === name) && !window.confirm(`Replace the template "${name}"?`)) return;
+    const next = templates.filter((x) => x.name !== name).map((x) => (x.name === t.name ? { ...x, name } : x));
+    setTemplates(next);
+    saveJson("chart:indTemplates", next);
+  }
+
   function applyIndTemplate(t: IndicatorTemplate): void {
     setMenuOpen(null);
-    setIndicators(t.items.map((i) => sanitizeInstance({ ...i, uid: newUid() })).filter(Boolean) as IndicatorInstance[], "apply template");
+    const items = t.items.map((i) => sanitizeInstance({ ...i, uid: newUid() })).filter(Boolean) as IndicatorInstance[];
+    setIndicators(items, "apply template");
+    const iv2 = t.interval && parseInterval(t.interval) ? t.interval : null;
+    if (iv2 && iv2 !== ivRef.current) changeInterval(iv2);
+    if (t.symbol && t.symbol.symbol !== symbol && onSymbolChange) {
+      // The chart remounts for the new symbol and reads its prefs on mount:
+      // hand it the template's indicators (and interval) before switching.
+      saveJson(PREFS_KEY, { ...loadJson<ChartPrefs>(PREFS_KEY, {}), indicators: items, ...(iv2 ? { interval: iv2 } : {}) });
+      const sym = t.symbol;
+      const [ex] = sym.symbol.split(":");
+      onSymbolChange(sym.hit ?? { symbol: sym.symbol, short_name: sym.name, exchange: ex || "NSE", segment: "EQ", instrument_type: "EQ", lot_size: 1, tick_size: 0.05, expiry: null, strike: null, underlying: null, display: sym.name });
+    }
   }
 
   function deleteIndTemplate(name: string): void {
@@ -4723,7 +4819,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     for (const r of RANGES) out.push({ id: `range:${r.id}`, label: `Range ${r.id} — ${r.title}`, group: "Date range", run: () => applyRange(r) });
     for (const t of TOOLS_MENU) if (!t.host || onAction) out.push({ id: `tool:${t.id}`, label: t.label, group: "Tools", run: () => runTool(t.id) });
     out.push(
-      { id: "a:search", label: "Symbol search", group: "Actions", run: () => setDialog({ k: "symbol", q: "" }) },
+      { id: "a:search", label: "Symbol search", group: "Actions", run: () => setDialog({ k: "symbol", q: shortName ?? "", select: true }) },
       { id: "a:compare", label: "Compare or add symbol", group: "Actions", run: () => setMenuOpen("compare") },
       { id: "a:indicators", label: "Indicators & strategies", group: "Actions", hint: "/", run: () => setDialog({ k: "indicators" }) },
       { id: "a:alert", label: "Create alert", group: "Actions", hint: "Alt+A", run: () => openAlertDialog() },
@@ -4929,7 +5025,10 @@ export default function ChartPanel(props: ChartPanelProps) {
   const toggleIn = <T,>(list: T[], v: T): T[] => (list.includes(v) ? list.filter((x) => x !== v) : [...list, v]);
   const titleText = settings.titleMode === "ticker" ? shortName : settings.titleMode === "both" ? `${shortName} · ${description}` : description;
   const legendBgBase = settings.legendBgColor || (theme.bg.startsWith("#") ? theme.bg : "#111111");
-  const legendStyle = settings.legendBg ? { background: withAlpha(legendBgBase, settings.legendBgOpacity, legendBgBase) } : undefined;
+  const legendStyle =
+    settings.legendBg || leftAxisW > 0
+      ? { ...(settings.legendBg ? { background: withAlpha(legendBgBase, settings.legendBgOpacity, legendBgBase) } : {}), ...(leftAxisW > 0 ? { left: leftAxisW + 10 } : {}) }
+      : undefined;
   const knownPanes = new Set(paneRects.map((r) => r.i));
   const mainLegendInds = indicators.filter((inst) => {
     const p = indPaneRef.current.get(inst.uid);
@@ -4999,7 +5098,7 @@ export default function ChartPanel(props: ChartPanelProps) {
       <button type="button" className={`chart-menu-item${invert ? " on" : ""}`} onClick={() => { setInvert((v) => !v); close(); }}>Invert scale<span className="kbd">Alt+I</span></button>
       <div className="chart-menu-sep" />
       {([["normal", "Regular"], ["percent", "Percent"], ["indexed", "Indexed to 100"], ["log", "Logarithmic"]] as [ScaleMode, string][]).map(([m, l]) => (
-        <button key={m} type="button" className={`chart-menu-item${scaleMode === m ? " on" : ""}`} disabled={compares.length > 0} onClick={() => { setScaleMode(m); close(); }}>
+        <button key={m} type="button" className={`chart-menu-item${scaleMode === m ? " on" : ""}`} disabled={pctCompare} onClick={() => { setScaleMode(m); close(); }}>
           {scaleMode === m ? "● " : "○ "}{l}{m === "percent" ? <span className="kbd">Alt+P</span> : m === "log" ? <span className="kbd">Alt+L</span> : null}
         </button>
       ))}
@@ -5071,7 +5170,7 @@ export default function ChartPanel(props: ChartPanelProps) {
           )}
         </div>
       )}
-      <button type="button" className="chart-btn chart-sym-btn" onClick={() => setDialog({ k: "symbol", q: "" })} title={onSymbolChange ? "Symbol search (type on the chart)" : symbol} disabled={!onSymbolChange} data-testid="chart-symbol">
+      <button type="button" className="chart-btn chart-sym-btn" onClick={() => setDialog({ k: "symbol", q: shortName ?? "", select: true })} title={onSymbolChange ? "Symbol search (type on the chart)" : symbol} disabled={!onSymbolChange} data-testid="chart-symbol">
         <span className="ico">⌕</span><span className="sym">{shortName}</span>
       </button>
       {/* compare */}
@@ -5080,32 +5179,59 @@ export default function ChartPanel(props: ChartPanelProps) {
           ⊕{compares.length > 0 ? ` ${compares.length}` : ""}
         </button>
         {menuOpen === "compare" && (
-          <div className="chart-menu" data-testid="chart-compare-menu">
-            <div className="chart-menu-head">Compare symbol (percent scale)</div>
+          <div className="chart-menu cmp-menu" data-testid="chart-compare-menu">
+            <div className="chart-menu-head">Compare symbol</div>
             <input type="text" className="chart-menu-input" placeholder="search symbol…" value={compareQuery} onChange={(e) => setCompareQuery(e.target.value)} autoFocus data-testid="chart-compare-input" />
             {compareHits
               .filter((h) => !compares.some((c) => c.symbol === h.symbol))
               .map((h) => (
-                <button
-                  key={h.symbol}
-                  type="button"
-                  className="chart-menu-item"
-                  onClick={() => {
-                    if (compares.length >= 4) return;
-                    setCompares((c) => [...c, { symbol: h.symbol, name: h.name, color: COMPARE_COLORS[c.length % COMPARE_COLORS.length] }]);
-                    setCompareQuery("");
-                    setCompareHits([]);
-                  }}
-                  data-testid={`chart-compare-add-${h.symbol}`}
-                >
-                  {h.name} <span className="hint">{h.symbol}</span>
-                </button>
+                <div key={h.symbol} className="cmp-hit">
+                  <span className="cmp-name">{h.name} <span className="hint">{h.symbol}</span></span>
+                  <span className="cmp-adds">
+                    {COMPARE_MODES.map((m) => (
+                      <button
+                        key={m.v}
+                        type="button"
+                        className="cmp-add"
+                        disabled={compares.length >= 4}
+                        title={compares.length >= 4 ? "Up to 4 symbols" : `Add on ${m.l.toLowerCase()}`}
+                        onClick={() => {
+                          setCompares((c) => (c.length >= 4 || c.some((x) => x.symbol === h.symbol) ? c : [...c, { symbol: h.symbol, name: h.name, color: COMPARE_COLORS[c.length % COMPARE_COLORS.length], mode: m.v }]));
+                          setCompareQuery("");
+                          setCompareHits([]);
+                        }}
+                        data-testid={m.v === "percent" ? `chart-compare-add-${h.symbol}` : `chart-compare-add-${m.v}-${h.symbol}`}
+                      >
+                        {m.l}
+                      </button>
+                    ))}
+                  </span>
+                </div>
               ))}
+            {compares.length === 0 && compareHits.length === 0 && (
+              <div className="cmp-empty" data-testid="chart-compare-empty">
+                <svg width="56" height="40" viewBox="0 0 56 40" aria-hidden="true">
+                  <polyline points="2,34 14,22 24,28 36,12 54,18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" />
+                  <polyline points="2,26 14,30 24,16 36,22 54,6" fill="none" stroke="#42A5F5" strokeWidth="2" strokeDasharray="4 3" strokeLinejoin="round" />
+                </svg>
+                <div>No symbols here yet — why not add some?</div>
+                <div className="hint">Search above, then pick Same % scale, New price scale or New pane.</div>
+              </div>
+            )}
             {compares.length > 0 && <div className="chart-menu-sep" />}
             {compares.map((c) => (
               <div key={c.symbol} className="chart-menu-row">
                 <span><span className="chart-dot" style={{ background: c.color }} />{c.name}</span>
-                <span>
+                <span className="cmp-row-acts">
+                  <select
+                    className="cmp-mode"
+                    value={c.mode ?? "percent"}
+                    onChange={(e) => setCompares((l) => l.map((x) => (x.symbol === c.symbol ? { ...x, mode: e.target.value as CompareMode } : x)))}
+                    aria-label={`${c.name} scale`}
+                    data-testid={`chart-compare-mode-${c.symbol}`}
+                  >
+                    {COMPARE_MODES.map((m) => <option key={m.v} value={m.v}>{m.l}</option>)}
+                  </select>
                   <button type="button" className="chart-menu-x" onClick={() => setCompares((l) => l.map((x) => (x.symbol === c.symbol ? { ...x, hidden: !x.hidden } : x)))} title={c.hidden ? "Show" : "Hide"}>{c.hidden ? "◌" : "👁"}</button>
                   <button type="button" className="chart-menu-x" onClick={() => setCompares((list) => list.filter((x) => x.symbol !== c.symbol))} title="Remove" data-testid={`chart-compare-del-${c.symbol}`}>✕</button>
                 </span>
@@ -5156,8 +5282,17 @@ export default function ChartPanel(props: ChartPanelProps) {
             </div>
             {[...INTERVAL_SECTIONS, ...(customIntervals.length ? [{ title: "Custom", keys: customIntervals }] : [])].map((sec) => (
               <div key={sec.title} className="chart-menu-section">
-                <div className="chart-menu-head">{sec.title}</div>
-                {sec.keys.map((k) => (
+                <button
+                  type="button"
+                  className="chart-menu-head iv-sec-head"
+                  onClick={() => setIvCollapsed((l) => toggleIn(l, sec.title))}
+                  aria-expanded={!ivCollapsed.includes(sec.title)}
+                  data-testid={`chart-iv-sec-${sec.title}`}
+                >
+                  <span>{sec.title}</span>
+                  <span className="caret">{ivCollapsed.includes(sec.title) ? "▸" : "▾"}</span>
+                </button>
+                {!ivCollapsed.includes(sec.title) && sec.keys.map((k) => (
                   <div key={k} className={`chart-menu-row iv-row${iv === k ? " on" : ""}`}>
                     <button type="button" className="chart-menu-item" onClick={() => { changeInterval(k); setMenuOpen(null); }} data-testid={`chart-ivm-${k}`}>{intervalLongLabel(k)}</button>
                     {star(favIntervals.includes(k), () => setFavIntervals((l) => toggleIn(l, k)), `Favorite ${intervalLongLabel(k)}`)}
@@ -5189,6 +5324,14 @@ export default function ChartPanel(props: ChartPanelProps) {
                 {star(favKinds.includes(k.id), () => setFavKinds((l) => toggleIn(l, k.id)), `Pin ${k.label}`)}
               </div>
             ))}
+            {BRICK_KINDS.has(chartKind) && (
+              <>
+                <div className="chart-menu-sep" />
+                <button type="button" className="chart-menu-item" onClick={() => { setDialog({ k: "settings", tab: "symbol" }); setMenuOpen(null); }} data-testid="chart-kind-inputs">
+                  ⚙ {CHART_KINDS.find((k) => k.id === chartKind)?.label} inputs…
+                </button>
+              </>
+            )}
           </div>
         )}
       </div>
@@ -5204,7 +5347,10 @@ export default function ChartPanel(props: ChartPanelProps) {
             {templates.length > 0 && <div className="chart-menu-sep" />}
             {templates.map((t) => (
               <div key={t.name} className="chart-menu-row">
-                <button type="button" className="chart-menu-item" onClick={() => applyIndTemplate(t)}>{t.name} <span className="hint">{t.items.length}</span></button>
+                <button type="button" className="chart-menu-item" onClick={() => applyIndTemplate(t)} title={templateScope(t, intervalLongLabel) ? `Also switches to ${templateScope(t, intervalLongLabel)}` : undefined}>
+                  {t.name} <span className="hint">{t.items.length}{templateScope(t, intervalLabel) ? ` · ${templateScope(t, intervalLabel)}` : ""}</span>
+                </button>
+                <button type="button" className="chart-menu-x" title="Rename template" onClick={() => renameIndTemplate(t)} data-testid={`chart-template-rename-${t.name}`}>✎</button>
                 <button type="button" className="chart-menu-x" title="Delete template" onClick={() => deleteIndTemplate(t.name)}>✕</button>
               </div>
             ))}
@@ -5213,8 +5359,21 @@ export default function ChartPanel(props: ChartPanelProps) {
       </div>
       <span className="chart-tsep" />
       {onChartOrder && (
-        <button type="button" className={`chart-btn${settings.buySellButtons ? " on" : ""}`} onClick={() => changeSettings({ ...settings, buySellButtons: !settings.buySellButtons })} title="Quick trade — buy / sell buttons on the chart" data-testid="chart-quick-trade">
-          ⚡{instant ? " 1-click" : ""}
+        <button
+          type="button"
+          className={`chart-btn qt-toggle${instant ? " on" : ""}`}
+          onClick={() => {
+            if (onTrading) {
+              onTrading("instant", !instant);
+              if (!settings.buySellButtons) changeSettings({ ...settings, buySellButtons: true });
+            } else changeSettings({ ...settings, buySellButtons: !settings.buySellButtons });
+          }}
+          role="switch"
+          aria-checked={instant}
+          title={onTrading ? `Quick trade: one-click trading ${instant ? "ON — BUY / SELL send at market" : "OFF — BUY / SELL open the order window"}` : "Quick trade — buy / sell buttons on the chart"}
+          data-testid="chart-quick-trade"
+        >
+          ⚡<span className={`qt-switch${instant ? " on" : ""}`} aria-hidden="true"><i /></span>
         </button>
       )}
       {/* alerts */}
@@ -5328,8 +5487,8 @@ export default function ChartPanel(props: ChartPanelProps) {
         {menuOpen === "tz" && <div className="chart-menu cdrop up right">{timeMenu(() => setMenuOpen(null))}</div>}
       </div>
       <span className="crange-sep" />
-      <button type="button" className={`crange-btn${scaleMode === "percent" || compares.length > 0 ? " on" : ""}`} onClick={() => setScaleMode((m) => (m === "percent" ? "normal" : "percent"))} disabled={compares.length > 0} title="Toggle percentage (Alt+P)" data-testid="chart-scale-pct">%</button>
-      <button type="button" className={`crange-btn${scaleMode === "log" ? " on" : ""}`} onClick={() => setScaleMode((m) => (m === "log" ? "normal" : "log"))} disabled={compares.length > 0} title="Toggle log scale (Alt+L)" data-testid="chart-scale-log">log</button>
+      <button type="button" className={`crange-btn${scaleMode === "percent" || pctCompare ? " on" : ""}`} onClick={() => setScaleMode((m) => (m === "percent" ? "normal" : "percent"))} disabled={pctCompare} title="Toggle percentage (Alt+P)" data-testid="chart-scale-pct">%</button>
+      <button type="button" className={`crange-btn${scaleMode === "log" ? " on" : ""}`} onClick={() => setScaleMode((m) => (m === "log" ? "normal" : "log"))} disabled={pctCompare} title="Toggle log scale (Alt+L)" data-testid="chart-scale-log">log</button>
       <button type="button" className={`crange-btn${autoScale ? " on" : ""}`} onClick={() => setAutoScale((v) => !v)} title="Toggle auto scale" data-testid="chart-scale-auto">auto</button>
     </div>
   );
@@ -5357,7 +5516,7 @@ export default function ChartPanel(props: ChartPanelProps) {
           <div className="chart-menu-head">{titleText}</div>
           {item(mainHidden ? "Show series" : "Hide series", () => setMainHidden((v) => !v))}
           {item("Settings…", () => setDialog({ k: "settings", tab: "symbol" }))}
-          {onSymbolChange && item("Change symbol…", () => setDialog({ k: "symbol", q: "" }))}
+          {onSymbolChange && item("Change symbol…", () => setDialog({ k: "symbol", q: shortName ?? "", select: true }))}
           {item("Change interval…", () => setDialog({ k: "interval", txt: "" }))}
           {item("Create alert…", () => openAlertDialog(), { kbd: "Alt+A" })}
           {last != null && item(`Copy last price ${fmtPrice(last)}`, () => { void navigator.clipboard?.writeText(String(last)).catch(() => undefined); addToast(`copied ${fmtPrice(last)}`); })}
@@ -5645,7 +5804,7 @@ export default function ChartPanel(props: ChartPanelProps) {
           <div className="chart-legend chart-overlay-ui" style={legendStyle}>
             <div className="lg-row lg-main">
               {settings.showTitle && (
-                <button type="button" className="lg-sym" onClick={() => onSymbolChange && setDialog({ k: "symbol", q: "" })} title="Change symbol">{titleText}</button>
+                <button type="button" className="lg-sym" onClick={() => onSymbolChange && setDialog({ k: "symbol", q: shortName ?? "", select: true })} title="Change symbol">{titleText}</button>
               )}
               <button type="button" className="lg-tf" onClick={() => setDialog({ k: "interval", txt: "" })} title="Change interval">{ivLabel}</button>
               {exchange && <span className="lg-exch">{exchange}</span>}
@@ -5669,7 +5828,7 @@ export default function ChartPanel(props: ChartPanelProps) {
             </div>
             {quickTrade && (
               <div className="lg-row lg-trade" data-testid="chart-quick-row">
-                <button type="button" className="qt sell" onClick={() => pickOrder({ side: "SELL", type: "MARKET", price: null }, { x: 8, y: 52, price: ltpNow ?? 0 })} title="Sell at market" data-testid="chart-quick-sell">
+                <button type="button" className="qt sell" onClick={() => quickOrder("SELL")} title={instant ? "Sell at market — one click" : "Sell — opens the order window"} data-testid="chart-quick-sell">
                   <span>SELL</span><b>{bid != null ? fmtPrice(bid) : ltpNow != null ? fmtPrice(ltpNow) : "—"}</b>
                 </button>
                 <span className="qt-spread" title="Spread">{bid != null && ask != null ? fmtNum(ask - bid, 2) : "—"}</span>
@@ -5687,7 +5846,7 @@ export default function ChartPanel(props: ChartPanelProps) {
                     onOrderQty?.(n);
                   }}
                 />
-                <button type="button" className="qt buy" onClick={() => pickOrder({ side: "BUY", type: "MARKET", price: null }, { x: 8, y: 52, price: ltpNow ?? 0 })} title="Buy at market" data-testid="chart-quick-buy">
+                <button type="button" className="qt buy" onClick={() => quickOrder("BUY")} title={instant ? "Buy at market — one click" : "Buy — opens the order window"} data-testid="chart-quick-buy">
                   <span>BUY</span><b>{ask != null ? fmtPrice(ask) : ltpNow != null ? fmtPrice(ltpNow) : "—"}</b>
                 </button>
               </div>
@@ -5747,7 +5906,7 @@ export default function ChartPanel(props: ChartPanelProps) {
           {settings.scaleModesButtons !== "never" && (
             <div className={`chart-scale-modes chart-overlay-ui sm-${settings.scaleModesButtons}`} style={side === "left" ? { left: 26, right: "auto" } : undefined} onMouseDown={(e) => e.stopPropagation()}>
               <button type="button" className={autoScale ? "on" : ""} onClick={() => setAutoScale((v) => !v)} title="Auto (fits data to screen)" data-testid="chart-scale-a">A</button>
-              <button type="button" className={scaleMode === "log" ? "on" : ""} disabled={compares.length > 0} onClick={() => setScaleMode((m) => (m === "log" ? "normal" : "log"))} title="Logarithmic scale (Alt+L)" data-testid="chart-scale-l">L</button>
+              <button type="button" className={scaleMode === "log" ? "on" : ""} disabled={pctCompare} onClick={() => setScaleMode((m) => (m === "log" ? "normal" : "log"))} title="Logarithmic scale (Alt+L)" data-testid="chart-scale-l">L</button>
             </div>
           )}
           <button type="button" className="chart-scale-gear chart-overlay-ui" style={side === "left" ? { left: 2, right: "auto" } : undefined} onClick={(e) => { e.stopPropagation(); setCtx({ x: side === "left" ? 4 : (containerRef.current?.clientWidth ?? 600) - 250, y: Math.max(0, (containerRef.current?.clientHeight ?? 400) - 330), price: 0, time: null, area: "price" }); }} onMouseDown={(e) => e.stopPropagation()} title="Price scale settings" data-testid="chart-scale-gear">⚙</button>
@@ -5981,11 +6140,21 @@ export default function ChartPanel(props: ChartPanelProps) {
       {dlg?.k === "symbol" && (
         <SymbolSearchDialog
           initial={dlg.q}
+          select={dlg.select}
           recent={recentSymbols ?? []}
           onPick={(h) => {
             if (dlg.compare) setCompares((c) => (c.length >= 4 || c.some((x) => x.symbol === h.symbol) ? c : [...c, { symbol: h.symbol, name: h.short_name, color: COMPARE_COLORS[c.length % COMPARE_COLORS.length] }]));
             else onSymbolChange?.(h);
           }}
+          onClose={() => setDialog(null)}
+        />
+      )}
+      {dlg?.k === "saveTemplate" && (
+        <SaveTemplateDialog
+          symbolLabel={shortName}
+          intervalLabel={intervalLongLabel(iv)}
+          existing={templates.map((t) => t.name)}
+          onSave={storeIndTemplate}
           onClose={() => setDialog(null)}
         />
       )}
@@ -6032,6 +6201,7 @@ export default function ChartPanel(props: ChartPanelProps) {
           trading={trading}
           onTrading={onTrading}
           initialTab={dlg.tab}
+          chartKind={chartKind}
         />
       )}
       {dlg?.k === "drawSettings" && dlgDrawing && (
