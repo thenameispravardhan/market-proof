@@ -141,7 +141,7 @@ import {
   type Command,
 } from "./ChartDialogs";
 import { DrawingFloatBar, FavoritesBar, LeftToolbar, type CursorMode, type Magnet } from "./DrawingToolbar";
-import { AlertsPanel, DataWindow, ObjectTree, type DataRow, type TreeItem } from "./ChartWidgets";
+import { AlertsPanel, DataWindow, ObjectTree, type DataRow, type GroupAction, type TreeDrop, type TreeItem } from "./ChartWidgets";
 import { AboutIndicatorDialog, InsightsDialog, ManagePanesDialog, WhatsNewDialog } from "./ChartInfoDialogs";
 import { CHART_SETTINGS_EVENT } from "./UserSettings";
 
@@ -4935,7 +4935,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     return { title: "Data Window", groups };
   }
 
-  function treePanes(): { title: string; items: TreeItem[] }[] {
+  function treePanes(): { title: string; pane: number; items: TreeItem[] }[] {
     const mainItems: TreeItem[] = [{ id: symbol, kind: "series", label: `${shortName} · ${ivLabel} · ${CHART_KINDS.find((k) => k.id === chartKind)?.label}`, visible: !mainHidden }];
     for (const c of compares) mainItems.push({ id: c.symbol, kind: "compare", label: c.name, visible: !c.hidden });
     const panes = new Map<number, TreeItem[]>();
@@ -4947,11 +4947,94 @@ export default function ChartPanel(props: ChartPanelProps) {
     }
     for (const d of [...drawingsList].reverse()) {
       if (TOOL_BY_ID.get(d.type)?.temp) continue;
-      mainItems.push({ id: d.id, kind: "drawing", label: d.name || TOOL_BY_ID.get(d.type)?.label || d.type, visible: !d.hidden, locked: d.locked, selected: d.id === selectedDrawing });
+      mainItems.push({ id: d.id, kind: "drawing", label: d.name || TOOL_BY_ID.get(d.type)?.label || d.type, visible: !d.hidden, locked: d.locked, selected: d.id === selectedDrawing, group: d.group });
     }
-    const out = [{ title: "Main pane", items: mainItems }];
-    for (const [p, items] of [...panes.entries()].sort((a, b) => a[0] - b[0])) out.push({ title: p < 0 ? "Hidden" : `Pane ${p + 1}`, items });
+    const out = [{ title: "Main pane", pane: 0, items: mainItems }];
+    for (const [p, items] of [...panes.entries()].sort((a, b) => a[0] - b[0])) out.push({ title: p < 0 ? "Hidden" : `Pane ${p + 1}`, pane: p, items });
     return out;
+  }
+
+  /** The indicator that owns pane `p` (others in it are its guests). */
+  function paneHost(p: number): string | null {
+    const inPane = indicatorsRef.current.filter((x) => indPaneRef.current.get(x.uid) === p);
+    const host = inPane.find((x) => !(typeof x.pane === "string" && x.pane !== "own" && x.pane !== "main")) ?? inPane[0];
+    return host?.uid ?? null;
+  }
+
+  /** Object tree drag and drop. */
+  function treeDrop(dragged: TreeItem, at: TreeDrop): void {
+    if (dragged.kind === "drawing") {
+      if (at.kind === "group") return updateDrawing(dragged.id, { group: at.group }, "group drawing");
+      if (at.kind === "pane") return updateDrawing(dragged.id, { group: undefined }, "ungroup drawing");
+      if (at.kind !== "item" || at.item.kind !== "drawing") return;
+      const list = [...drawingsRef.current];
+      const from = list.findIndex((d) => d.id === dragged.id);
+      const to = list.findIndex((d) => d.id === at.item.id);
+      if (from < 0 || to < 0) return;
+      pushUndo("visual order");
+      const [d] = list.splice(from, 1);
+      list.splice(to, 0, { ...d, group: at.item.group });
+      drawingsRef.current = list;
+      persistDrawings();
+      repaintDrawings();
+      bumpDrawings();
+      return;
+    }
+    if (dragged.kind !== "indicator") return;
+    if (at.kind === "newpane") return moveIndicatorTo(dragged.id, "own");
+    const targetPane = at.kind === "pane" ? at.pane : at.kind === "item" ? indPaneRef.current.get(at.item.id) ?? 0 : null;
+    if (targetPane == null || targetPane < 0) return;
+    const fromPane = indPaneRef.current.get(dragged.id);
+    if (at.kind === "item" && targetPane === fromPane) {
+      // same pane: take the target's place in the visual (paint) order
+      const list = [...indicatorsRef.current];
+      const from = list.findIndex((x) => x.uid === dragged.id);
+      const to = list.findIndex((x) => x.uid === at.item.id);
+      if (from < 0 || to < 0 || from === to) return;
+      const [it] = list.splice(from, 1);
+      list.splice(to, 0, it);
+      return setIndicators(list, "visual order");
+    }
+    if (targetPane === fromPane) return;
+    const host = targetPane === 0 ? "main" : paneHost(targetPane);
+    if (host && host !== dragged.id) moveIndicatorTo(dragged.id, host);
+  }
+
+  function groupDrawings(ids: string[]): void {
+    const used = new Set(drawingsRef.current.map((d) => d.group).filter(Boolean));
+    let n = 1;
+    while (used.has(`Group ${n}`)) n++;
+    pushUndo("group drawings");
+    drawingsRef.current = drawingsRef.current.map((d) => (ids.includes(d.id) ? { ...d, group: `Group ${n}` } : d));
+    persistDrawings();
+    bumpDrawings();
+  }
+
+  function groupAction(group: string, a: GroupAction): void {
+    const inGroup = (d: Drawing) => d.group === group;
+    if (a === "delete") {
+      const n = drawingsRef.current.filter(inGroup).length;
+      if (!window.confirm(`Delete the ${n} drawing(s) in "${group}"?`)) return;
+      pushUndo("delete group");
+      drawingsRef.current = drawingsRef.current.filter((d) => !inGroup(d));
+      if (selectedIdRef.current && !drawingsRef.current.some((d) => d.id === selectedIdRef.current)) selectDrawing(null);
+    } else {
+      if (typeof a === "object" && drawingsRef.current.some((d) => d.group === a.rename)) {
+        addToast(`a group named "${a.rename}" already exists`);
+        return;
+      }
+      pushUndo(typeof a === "object" ? "rename group" : `${a} group`);
+      drawingsRef.current = drawingsRef.current.map((d) => {
+        if (!inGroup(d)) return d;
+        if (typeof a === "object") return { ...d, group: a.rename };
+        if (a === "ungroup") return { ...d, group: undefined };
+        if (a === "hide" || a === "show") return { ...d, hidden: a === "hide" };
+        return { ...d, locked: a === "lock" };
+      });
+    }
+    persistDrawings();
+    repaintDrawings();
+    bumpDrawings();
   }
 
   const selDrawing = selectedDrawing ? drawingsList.find((d) => d.id === selectedDrawing) ?? null : null;
@@ -6118,6 +6201,9 @@ export default function ChartPanel(props: ChartPanelProps) {
             onSelect={(it) => it.kind === "drawing" && selectDrawing(it.id)}
             onMove={(it, by) => reorderDrawing(it.id, by > 0 ? "forward" : "backward")}
             onSettings={(it) => setDialog(it.kind === "indicator" ? { k: "indSettings", uid: it.id } : { k: "drawSettings", id: it.id })}
+            onDrop={treeDrop}
+            onGroup={groupDrawings}
+            onGroupAction={groupAction}
           />,
           widgetSlots.tree,
         )}

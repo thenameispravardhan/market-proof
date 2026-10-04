@@ -2851,3 +2851,86 @@ a.chart-menu-item { text-decoration: none; color: var(--text); }
 .qt-switch i { position: absolute; top: 2px; left: 2px; width: 8px; height: 8px; border-radius: 50%; background: var(--text-dim); transition: left 0.15s, background 0.15s; }
 .qt-switch.on { background: rgba(41, 98, 255, 0.55); }
 .qt-switch.on i { left: 12px; background: #fff; }
+
+/* ---- account manager: tabs, sortable tables, broker tabs, popups ---- */
+.am-tabs { gap: 0; }
+.am-tab-scroll { display: flex; flex: 1 1 auto; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+.am-tabs .am-status { flex: 0 3 auto; min-width: 0; overflow: hidden; }
+.am-tabs .am-status [data-testid="am-account-line"] { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.am-dt td.sym { white-space: nowrap; }
+.am-dt td .am-link { white-space: nowrap; }
+.am-tab-scroll::-webkit-scrollbar { display: none; }
+.am-tab-scroll .tab { white-space: nowrap; }
+.am-trade-tab { font-weight: 700; border-right: 1px solid var(--border); margin-right: 6px; }
+.am-acct-menu { position: relative; }
+.am-acct-menu .chart-menu { z-index: 70; min-width: 190px; }
+.am-acct-menu a.chart-menu-item { text-decoration: none; display: block; }
+.am-table { position: relative; }
+.am-table .am-toolbar { flex-wrap: wrap; }
+.am-filters { margin: 0; }
+.am-src { margin-left: 6px; }
+.am-check { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text-dim); }
+.am-sep { width: 1px; height: 16px; background: var(--border); margin: 0 2px; }
+.am-chooser { z-index: 70; min-width: 180px; max-height: 300px; overflow-y: auto; }
+.am-chooser label { display: flex; align-items: center; gap: 6px; padding: 3px 10px; font-size: 11.5px; cursor: pointer; white-space: nowrap; }
+.am-dt th.am-th { cursor: pointer; user-select: none; white-space: nowrap; }
+.am-dt th.am-th:hover { color: var(--text); }
+.am-dt th.sorted { color: var(--text); }
+.am-dt .am-sort { margin-left: 3px; font-size: 8px; }
+.am-dt th.num, .am-dt td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.live-dot { display: inline-block; width: 5px; height: 5px; margin-left: 4px; border-radius: 50%; background: var(--green); vertical-align: middle; }
+.am-profile { display: flex; flex-wrap: wrap; gap: 14px; margin: 8px 0; font-size: 11.5px; color: var(--text-dim); }
+.am-profile b { color: var(--text); }
+.am-qty-btns { display: inline-flex; gap: 3px; margin-left: 6px; }
+.smart-table tr.smart-group { cursor: pointer; }
+.smart-table tr.smart-group:hover td { background: var(--bg-elev); }
+.smart-table tr.smart-order td { font-size: 10.5px; background: rgba(127, 127, 127, 0.04); }
+.smart-table td.dim { color: var(--text-faint); }
+.upload-drop { margin: 10px 0; padding: 22px 12px; border: 1px dashed var(--border-hi, var(--border)); border-radius: 6px; text-align: center; color: var(--text-dim); cursor: pointer; }
+.upload-drop:hover { border-color: var(--accent); }
+.upload-file { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 10px 0; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-elev); }
+.upload-file .dim { color: var(--text-faint); }
+
+/* ---- DOM ("Trade" tab) ---- */
+.dom-trade { display: flex; flex-direction: column; gap: 6px; max-width: 640px; }
+.dom-head { display: flex; align-items: center; gap: 6px; }
+.dom-head b { font-size: 12px; }
+.dom-head .chart-menu label { display: flex; align-items: center; gap: 6px; padding: 3px 10px; font-size: 11.5px; white-space: nowrap; }
+.dom-head .chart-menu { z-index: 70; }
+.dom-pos { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; font-size: 11.5px; padding: 4px 6px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-elev); }
+.dom-pos .up { color: var(--green); }
+.dom-pos .down { color: var(--red); }
+.dom-pos .dim { color: var(--text-faint); }
+.dom-btns { display: flex; gap: 4px; }
+.dom-btns .btn-sm { flex: 1; }
+.dom-ladder { max-height: 420px; overflow: auto; }
+.dom-full td.ord { text-align: center; min-width: 54px; }
+.dom-full td.vol { position: relative; text-align: left; color: var(--text-dim); }
+.dom-bar.v { left: 0; background: #64B5F6; }
+.dom-full tr.droppable td { outline: 1px dashed transparent; }
+.dom-full tr.droppable:hover td { background: rgba(41, 98, 255, 0.12); }
+.dom-ord { display: inline-flex; align-items: center; gap: 2px; padding: 0 3px; margin: 0 1px; border-radius: 3px; font-size: 10px; font-weight: 700; cursor: grab; color: #fff; }
+.dom-ord.b { background: #2962FF; }
+.dom-ord.s { background: #F23645; }
+.dom-ord i { font-style: normal; font-weight: 400; font-size: 8.5px; opacity: 0.85; }
+.dom-ord button { background: none; border: 0; padding: 0 0 0 2px; color: inherit; font-size: 9px; cursor: pointer; opacity: 0.8; }
+.dom-ord button:hover { opacity: 1; }
+.dom-trade .dom-actions .qt-qty { width: 80px; }
+
+/* watchlist: drag handle + live dot */
+.wl-grip { display: inline-block; width: 8px; margin-right: 2px; color: var(--text-faint); cursor: grab; opacity: 0; font-weight: 400; }
+.tv-watch-row:hover .wl-grip { opacity: 1; }
+.wl-live { display: inline-block; width: 5px; height: 5px; margin-right: 5px; border-radius: 50%; background: var(--text-faint); opacity: 0.45; vertical-align: middle; }
+.wl-live.on { background: var(--green); opacity: 1; box-shadow: 0 0 4px var(--green); }
+
+/* object tree: drag targets, multi-pick, groups */
+.otree-bar { display: flex; align-items: center; gap: 6px; }
+.otree-row.drop, .otree-ptitle.drop, .otree-newpane.drop { box-shadow: inset 0 -2px #2962FF; background: rgba(41, 98, 255, 0.10); }
+.otree-ptitle { padding: 2px 4px; border-radius: 3px; }
+.otree-group { display: flex; flex-direction: column; }
+.otree-ghead .otree-label { font-weight: 600; }
+.otree-gitems { padding-left: 12px; border-left: 1px dashed var(--border); margin-left: 9px; }
+.otree-newpane { padding: 8px; border: 1px dashed var(--border); border-radius: 4px; text-align: center; color: var(--text-dim); font-size: 11px; }
+.tv-bottom.closed .trade-tabs { overflow-x: auto; scrollbar-width: none; }
+.tv-bottom.closed .trade-tabs::-webkit-scrollbar { display: none; }
+.tv-bottom.closed .trade-tabs .tab { white-space: nowrap; }

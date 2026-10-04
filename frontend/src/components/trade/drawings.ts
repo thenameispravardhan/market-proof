@@ -94,6 +94,8 @@ export interface Drawing {
   /** Per-timeframe visibility; absent / true = shown. */
   vis?: Partial<Record<IntervalGroup, DrawingVis>>;
   data?: DrawingData;
+  /** Object-tree group (its name); grouped drawings hide / lock together. */
+  group?: string;
 }
 
 export interface Pending {
