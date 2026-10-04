@@ -327,6 +327,7 @@ describe("Trade page", () => {
     // Right-click at a price below the market (the chart stub maps every y to 100).
     const chart = await screen.findByTestId("trade-chart");
     fireEvent.contextMenu(chart.querySelector(".chart-container")!, { clientX: 40, clientY: 40 });
+    await user.click(await screen.findByTestId("ctx-trade")); // the Trade ▸ flyout
     await user.click(await screen.findByText(/Buy 1 @ 100(\.00)? limit/));
     expect(posts).toHaveLength(0);                  // nothing reaches the broker before the confirm
     await user.click(screen.getByTestId("chart-ctx-place"));
@@ -335,6 +336,28 @@ describe("Trade page", () => {
       account_id: 7, symbol: "NSE:RELIANCE-EQ", side: "BUY", quantity: 1,
       order_type: "LIMIT", limit_price: 100, stop_price: null, product_type: "INTRADAY",
     });
+  });
+
+  it("places a stop-limit from the Trade ▸ flyout with the trigger and a one-tick limit", async () => {
+    const posts: Record<string, unknown>[] = [];
+    const stubs = defaultStubs();
+    globalThis.fetch = makeFetchStub((url, init) => {
+      if (/\/api\/orders$/.test(url) && init?.method === "POST") posts.push(JSON.parse(String(init.body)));
+      return stubs(url, init);
+    });
+    const user = userEvent.setup();
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await user.type(await screen.findByTestId("trade-search"), "RELI");
+    await user.click(await screen.findByTestId("search-row-NSE:RELIANCE-EQ"));
+    await waitFor(() => expect(screen.getByTestId("ticket-submit")).not.toBeDisabled());
+    const chart = await screen.findByTestId("trade-chart");
+    fireEvent.contextMenu(chart.querySelector(".chart-container")!, { clientX: 40, clientY: 40 });
+    await user.click(await screen.findByTestId("ctx-trade"));
+    // 100 is below the market → the breakdown side: sell stop 100, limit 99.95
+    await user.click(await screen.findByText(/Sell 1 @ 100(\.00)? stop 99\.95 limit/));
+    await user.click(screen.getByTestId("chart-ctx-place"));
+    await waitFor(() => expect(posts).toHaveLength(1));
+    expect(posts[0]).toMatchObject({ side: "SELL", order_type: "STOP_LOSS", stop_price: 100, limit_price: 99.95 });
   });
 
   it("scalper: BUY CE places a market order for lots x lot size on the ATM call", async () => {
