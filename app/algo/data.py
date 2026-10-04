@@ -90,12 +90,15 @@ async def assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str
     every higher timeframe the conditions use, India VIX when options are priced
     off it, and the F&O meta (name, lot, strike step). Returns (data, notes,
     trade_from). One failing symbol is a note, not an error."""
-    from app.algo import engine, fno
+    from app.algo import engine, fno, orderflow
 
     base_tf = spec["timeframe"]
     htfs = sorted(engine.cond_timeframes(spec))
     wb = engine.warmup_bars(spec)
-    lead = max([warmup_days(base_tf, wb)] + [warmup_days(tf, wb) for tf in htfs])
+    minutes = engine.needs_minutes(spec)
+    btype, per_day = spec["bars"]["type"], spec["bars"]["per_day"]
+    base_lead = warmup_days(base_tf, wb) if btype == "time" else int(wb / per_day * 1.5) + 25   # +20 sessions to size bars
+    lead = max([base_lead] + [warmup_days(tf, wb) for tf in htfs])
     lead = min(lead, 800)
     first = start - lead * DAY
     inst = spec["instrument"]
@@ -117,7 +120,24 @@ async def assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str
             info = await ensure(fy, first, end)
             if info["note"]:
                 notes.append({"symbol": fy, "note": info["note"]})
-            bars = await asyncio.to_thread(load, info["key"], base_tf, first, end)
+            size = None
+            if minutes:
+                m1 = await asyncio.to_thread(load, info["key"], 1, first, end)
+                if not m1 or not m1["t"] or m1["t"][-1] < start:
+                    notes.append({"symbol": fy, "note": "no candles in this range"})
+                    continue
+                if btype != "time":
+                    try:
+                        size = orderflow.bar_size(m1, btype, per_day, until=start)
+                    except ValueError as e:
+                        notes.append({"symbol": fy, "note": str(e)})
+                        continue
+                elif not any(m1["v"]):
+                    notes.append({"symbol": fy, "note": "no traded volume (an index) — order-flow values are flat"})
+                bars = await asyncio.to_thread(orderflow.build_bars, m1, btype, base_tf, size)
+                del m1
+            else:
+                bars = await asyncio.to_thread(load, info["key"], base_tf, first, end)
             if not bars or not bars["t"] or bars["t"][-1] < start:
                 notes.append({"symbol": fy, "note": "no candles in this range"})
                 continue
@@ -126,7 +146,7 @@ async def assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str
             if vix and vix["t"]:
                 bars["vix"] = vix
             name = fno.fno_name(fy)
-            bars["meta"] = {"symbol": fy, "name": name, "exch": fno.exchange_of(fy)}
+            bars["meta"] = {"symbol": fy, "name": name, "exch": fno.exchange_of(fy), "bar_size": size}
             if inst["type"] != "equity":
                 if not fno.is_fno(name):
                     notes.append({"symbol": fy, "note": f"{name} has no F&O contracts — skipped"})
@@ -223,12 +243,51 @@ async def recent_bars(fy: str, tf_min: int, bars: int = 400, now: Optional[float
     return bars_from(rows[-bars:], tf_s)
 
 
+# Live 1-minute history per symbol, topped up with only the new minutes.
+# ponytail: process memory, one entry per watched symbol (~13k rows for a
+# volume-candle strategy); a restart refetches once.
+_m1_cache: dict[str, dict[str, Any]] = {}
+_size_cache: dict[tuple, float] = {}
+
+
+async def minute_history(fy: str, need: int, now: float) -> dict[str, Any]:
+    """The last `need` COMPLETED 1-minute candles, incrementally cached."""
+    have = _m1_cache.get(fy)
+    if have is None or len(have["t"]) < need * 0.9:
+        have = await recent_bars(fy, 1, bars=need, now=now)
+    else:
+        raw = await _backend().get_history_range(fy, resolution="1", from_ts=have["t"][-1] + 60, to_ts=int(now))
+        if raw is None:
+            raise RuntimeError(f"Fyers history call failed for {fy}")
+        rows = [r for r in raw if isinstance(r, (list, tuple)) and len(r) >= 6
+                and int(r[0]) > have["t"][-1] and int(r[0]) + 60 <= now]
+        new = bars_from(rows, 60)
+        for k in ("t", "o", "h", "l", "c", "v"):
+            have[k] = (have[k] + new[k])[-need:]
+    _m1_cache[fy] = have
+    return {k: list(v) if isinstance(v, list) else v for k, v in have.items()}
+
+
 async def live_bundle(spec: dict[str, Any], fy: str, now: float) -> dict[str, Any]:
     """Base + higher-timeframe bars and F&O meta for one symbol, for the runner."""
-    from app.algo import engine, fno
+    from app.algo import engine, fno, orderflow
 
     wb = engine.warmup_bars(spec)
-    d = await recent_bars(fy, spec["timeframe"], bars=wb + 60, now=now)
+    if engine.needs_minutes(spec):
+        btype, per_day = spec["bars"]["type"], spec["bars"]["per_day"]
+        per_bar = spec["timeframe"] if btype == "time" else max(1, 375 // per_day)
+        need = min(33000, (wb + 60) * per_bar + (375 * 22 if btype != "time" else 0))
+        m1 = await minute_history(fy, need, now)
+        size = None
+        if btype != "time":
+            today = int(now - (now + 19800) % 86400)
+            key = (fy, btype, per_day, today)
+            if key not in _size_cache:          # fixed for the whole session
+                _size_cache[key] = orderflow.bar_size(m1, btype, per_day, until=today)
+            size = _size_cache[key]
+        d = orderflow.complete_only(orderflow.build_bars(m1, btype, spec["timeframe"], size), now)
+    else:
+        d = await recent_bars(fy, spec["timeframe"], bars=wb + 60, now=now)
     d["tf_min"] = spec["timeframe"]
     d["htf"] = {tf: await recent_bars(fy, tf, bars=wb + 5, now=now) for tf in engine.cond_timeframes(spec)}
     name = fno.fno_name(fy)

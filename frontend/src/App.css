@@ -2085,8 +2085,10 @@ kbd {
 .algo-quad .widget { min-width: 0; }
 .algo-scroll { max-height: 320px; overflow: auto; }
 .algo-scroll table { width: 100%; }
-.algo-fields { display: grid; grid-template-columns: minmax(180px, 2fr) minmax(200px, 2.4fr) minmax(90px, 0.8fr) minmax(150px, 1.2fr); gap: 8px 12px; }
+.algo-fields { display: grid; grid-template-columns: minmax(170px, 2fr) minmax(190px, 2.2fr) minmax(190px, 1.3fr) minmax(140px, 1.1fr); gap: 8px 12px; }
 .algo .algo-fields input, .algo .algo-fields select { width: 100%; }
 .algo-field { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 @media (max-width: 720px) { .algo-fields { grid-template-columns: 1fr 1fr; } }
 .algo .algo-scroll th, .algo .algo-scroll td { padding: 3px 6px; }
+
+.algo .algo-fields .algo-operand select { width: auto; }

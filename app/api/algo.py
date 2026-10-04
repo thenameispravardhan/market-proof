@@ -79,7 +79,7 @@ _heavy = asyncio.Semaphore(1)
 
 def _estimate_bars(spec: dict[str, Any], start: int, end: int) -> int:
     days = (end - start) / 86400 * 5 / 7 + 30
-    per_day = 375 / spec["timeframe"]
+    per_day = 375 if engine.needs_minutes(spec) else 375 / spec["timeframe"]   # built from 1-minute data
     htf = sum(1 if tf == 1440 else 375 / tf for tf in engine.cond_timeframes(spec)) / per_day
     return int(len(spec["symbols"]) * days * per_day * (1 + htf))
 
@@ -158,7 +158,9 @@ async def backtest(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     keep = 8000                         # enough to inspect, small enough to ship
     first = next((i for i, t in enumerate(d["t"]) if t >= trade_from), 0)
     lo = max(first, len(d["t"]) - keep)
-    candles = [[d["t"][i], d["o"][i], d["h"][i], d["l"][i], d["c"][i]] for i in range(lo, len(d["t"]))]
+    flow = d.get("delta") if d.get("flow") else None
+    candles = [[d["t"][i], d["o"][i], d["h"][i], d["l"][i], d["c"][i], d["v"][i], flow[i] if flow else None]
+               for i in range(lo, len(d["t"]))]
     res["trades_total"] = len(res["trades"])
     res["trades"] = res["trades"][-3000:]
     return {**res, "spec": spec, "notes": notes, "elapsed_s": round(time.monotonic() - t0, 2),
