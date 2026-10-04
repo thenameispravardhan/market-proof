@@ -687,12 +687,11 @@ def test_manager_place_manual_order_stub_path(
     assert result["broker_order_id"] == "X1"
 
 
-def test_manual_order_blocked_by_risk_unless_bypassed(
+def test_settings_risk_rules_never_block_a_manual_order(
     client: TestClient, db_session, isolated_db, real_account
 ):
-    """A rejected risk verdict BLOCKS a manual order (so limits set in
-    Settings actually take effect on the Trade page too); the operator
-    can still override it with bypass_risk=True."""
+    """Settings-page risk rules govern the bot, not the Trade page: a
+    rejected verdict is only an advisory warning on a manual order."""
     from app.main import app
     from types import SimpleNamespace
     import asyncio
@@ -727,29 +726,17 @@ def test_manual_order_blocked_by_risk_unless_bypassed(
     original_risk = mgr._risk
     mgr._risk = RejectingRisk()
     try:
-        blocked = asyncio.get_event_loop().run_until_complete(
-            mgr.place_manual_order(
-                account=real_account, symbol="NSE:SBIN-EQ", side="BUY",
-                quantity=2, order_type="MARKET", product_type="INTRADAY",
-            )
-        )
-        assert blocked["ok"] is False
-        assert blocked["blocked"] is True
-        assert blocked["status"] == "REJECTED_RISK"
-        assert blocked["broker_order_id"] is None
-        assert "RISK_MAX_SINGLE_POSITION_PCT" in blocked["risk_codes"]
-
-        # The operator overrides → the order is placed.
         placed = asyncio.get_event_loop().run_until_complete(
             mgr.place_manual_order(
                 account=real_account, symbol="NSE:SBIN-EQ", side="BUY",
                 quantity=2, order_type="MARKET", product_type="INTRADAY",
-                bypass_risk=True,
             )
         )
         assert placed["ok"] is True
         assert placed["broker_order_id"] == "X9"
-        assert placed["bypassed_risk"] is True
+        assert placed.get("blocked") is not True
+        assert "RISK_MAX_SINGLE_POSITION_PCT" in placed["risk_codes"]
+        assert placed["risk_warning"]
     finally:
         mgr._risk = original_risk
 
