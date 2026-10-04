@@ -101,6 +101,41 @@
   --grad-accent: linear-gradient(180deg, var(--accent), var(--accent-dim));
 }
 
+/* Light skin (Tools → Change theme, or the sidebar toggle). */
+:root[data-theme="light"] {
+  --bg-app:    #F2F3F5;
+  --bg-panel:  #FFFFFF;
+  --bg-surface:#F0F3FA;
+  --bg-row:    #F7F8FA;
+  --bg-row-alt:#FBFBFC;
+  --bg-input:  #FFFFFF;
+  --bg-elev:   #FFFFFF;
+  --border:        #D1D4DC;
+  --border-hi:     #B2B5BE;
+  --border-soft:   #E6E8EC;
+  --text:      #131722;
+  --text-dim:  #4A4E59;
+  --text-faint:#787B86;
+  --text-inv:  #FFFFFF;
+  --accent:    #E67700;
+  --accent-dim:#B85F00;
+  --accent-2:  #F08C00;
+  --green:     #089981;
+  --green-dim: #067A67;
+  --red:       #F23645;
+  --red-dim:   #C21F2E;
+  --amber:     #B28600;
+  --cyan:      #0288D1;
+  --green-bg:  rgba(8, 153, 129, 0.10);
+  --red-bg:    rgba(242, 54, 69, 0.08);
+  --amber-bg:  rgba(178, 134, 0, 0.10);
+  --cyan-bg:   rgba(2, 136, 209, 0.08);
+  --shadow-sm: 0 1px 0 rgba(0,0,0,.08);
+  --shadow:    0 2px 8px rgba(0,0,0,.12);
+  --shadow-lg: 0 8px 24px rgba(0,0,0,.16);
+  color-scheme: light;
+}
+
 /* =========================================================================
    2. Reset & base
    ========================================================================= */
@@ -323,6 +358,8 @@ body {
   gap: 4px;
   flex-shrink: 0;
 }
+.theme-toggle { display: flex; align-items: center; gap: 8px; padding: 3px 0; background: none; border: 0; color: var(--text-dim); font: inherit; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; cursor: pointer; }
+.theme-toggle:hover { color: var(--accent); }
 .sidebar-footer .ws-status,
 .sidebar-footer .clock {
   display: flex; align-items: center; gap: 6px;
@@ -1384,12 +1421,24 @@ kbd {
 
 /* CHART (TradingView-style panel) */
 .chart-card { min-height: 0; gap: 8px; }
+.chart-toolbar-wrap { position: relative; min-width: 0; }
 .chart-toolbar {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;     /* wraps to a second row when narrow */
+  flex-wrap: nowrap;   /* scrolls sideways when narrow (arrows at the edges) */
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
   gap: 6px;
 }
+.chart-toolbar::-webkit-scrollbar { display: none; }
+/* menus escape the scroller: positioned against .chart-toolbar-wrap */
+.chart-toolbar .chart-menu-wrap { position: static; }
+.chart-toolbar > * { flex-shrink: 0; }
+.tb-arrow { position: absolute; top: 50%; transform: translateY(-50%); z-index: 4; width: 22px; height: 26px; padding: 0; border: 1px solid var(--border-hi); border-radius: 4px; background: var(--bg-elev); color: var(--text); font-size: 15px; line-height: 1; cursor: pointer; box-shadow: var(--shadow); }
+.tb-arrow.left { left: 0; }
+.tb-arrow.right { right: 0; }
+.tb-arrow:hover { color: var(--accent); }
 .chart-select {
   width: auto;
   flex-shrink: 0;
@@ -2587,6 +2636,22 @@ div.ind-row { cursor: default; }
 .tv-grid.l3r { grid-template: 1fr 1fr 1fr / 1fr; }
 .tv-grid.l6 { grid-template: 1fr 1fr / 1fr 1fr 1fr; }
 .tv-grid.l8 { grid-template: 1fr 1fr / 1fr 1fr 1fr 1fr; }
+.tv-grid.l4c { grid-template: 1fr / repeat(4, 1fr); }
+.tv-grid.l4r { grid-template: repeat(4, 1fr) / 1fr; }
+.tv-grid.l4l { grid-template: repeat(3, 1fr) / 3fr 2fr; }
+.tv-grid.l4l > .tv-cell:first-child { grid-row: span 3; }
+/* 5: two on top, three below (6-column track) */
+.tv-grid.l5 { grid-template: 1fr 1fr / repeat(6, 1fr); }
+.tv-grid.l5 > .tv-cell { grid-column: span 2; }
+.tv-grid.l5 > .tv-cell:nth-child(-n + 2) { grid-column: span 3; }
+.tv-grid.l5l { grid-template: 1fr 1fr / 2fr 1fr 1fr; }
+.tv-grid.l5l > .tv-cell:first-child { grid-row: span 2; }
+.tv-grid.l6v { grid-template: repeat(3, 1fr) / 1fr 1fr; }
+/* 7: three on top, four below (12-column track) */
+.tv-grid.l7 { grid-template: 1fr 1fr / repeat(12, 1fr); }
+.tv-grid.l7 > .tv-cell { grid-column: span 3; }
+.tv-grid.l7 > .tv-cell:nth-child(-n + 3) { grid-column: span 4; }
+.tv-grid.l8v { grid-template: repeat(4, 1fr) / 1fr 1fr; }
 .tv-sync { border-top: 1px solid var(--border); margin-top: 4px; padding-top: 2px; }
 .tv-rangeslot:empty { display: none; }
 .tv-rangeslot { flex-shrink: 0; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; }
@@ -2736,3 +2801,22 @@ div.ind-row { cursor: default; }
 .insight .down { color: var(--red); }
 .insights-note { margin-top: 10px; font-size: 10.5px; }
 .chart-raw-label { position: absolute; z-index: 3; pointer-events: none; height: 18px; line-height: 18px; padding: 0 4px; font-size: 11px; font-family: var(--mono); color: #fff; text-align: left; box-sizing: border-box; }
+.chart-btn.pinned-tool { display: inline-flex; align-items: center; gap: 4px; }
+.chart-btn.pinned-tool .pt-label { font-size: 10.5px; }
+.chart-btn.pinned-tool .ind-new { margin-left: 0; }
+.open-layout-list { display: flex; flex-direction: column; gap: 2px; margin-top: 8px; max-height: 50vh; overflow-y: auto; }
+.open-layout-row { display: flex; align-items: center; gap: 6px; padding: 2px 4px; border-radius: 4px; }
+.open-layout-row:hover, .open-layout-row.on { background: var(--bg-surface); }
+.open-layout-name { flex: 1; display: flex; justify-content: space-between; gap: 12px; padding: 5px 4px; background: none; border: 0; color: var(--text); font: inherit; font-size: 12px; text-align: left; cursor: pointer; text-transform: none; }
+.cmd-sec { margin: 8px 6px 2px; font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-faint); }
+.cmd-switch { display: inline-block; position: relative; width: 26px; height: 14px; border-radius: 7px; background: var(--border-hi); vertical-align: middle; transition: background 0.1s; }
+.cmd-switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 10px; height: 10px; border-radius: 50%; background: var(--bg-panel); transition: left 0.1s; }
+.cmd-switch.on { background: var(--accent); }
+.cmd-switch.on::after { left: 14px; }
+.tv-layout:fullscreen { background: var(--bg-app); padding: 6px; }
+.whats-new { margin: 2px 0 6px 18px; display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--text); }
+.tb-logo { color: var(--accent); font-weight: 800; }
+a.chart-menu-item { text-decoration: none; color: var(--text); }
+.popout-app { height: 100vh; display: flex; flex-direction: column; background: var(--bg-app); padding: 6px; }
+.popout-chart { flex: 1; min-height: 0; display: flex; }
+.popout-chart > .chart-card { flex: 1; }

@@ -10,7 +10,7 @@ import { useLiveQuote } from "../../hooks/useQuotes";
 import { technicalRating, type OhlcvCandle } from "../../lib/indicators";
 import { capTier } from "../../lib/marketCap";
 import { clearLog, getLog, subscribeLog } from "./chartSync";
-import { useOutside } from "./chartUi";
+import { Modal, useOutside } from "./chartUi";
 import type { ChartOrder } from "./ChartPanel";
 
 const fmt = (v: number | null | undefined, d = 2) =>
@@ -940,6 +940,8 @@ export interface SavedLayout {
   name: string;
   saved: number;
   data: Record<string, string>;
+  /** Starred layouts sort first in "Open layout". */
+  starred?: boolean;
 }
 
 const LAYOUTS_KEY = "trade:layouts";
@@ -1072,6 +1074,7 @@ export function useLayouts() {
     persist([...layouts, c], c.id);
   };
   const remove = (id: string) => persist(layouts.filter((l) => l.id !== id), current === id ? null : current);
+  const star = (id: string) => persist(layouts.map((l) => (l.id === id ? { ...l, starred: !l.starred } : l)), current);
   const setAutosave = (v: boolean) => {
     setAutosaveState(v);
     try { localStorage.setItem(AUTOSAVE_KEY, String(v)); } catch { /* best-effort */ }
@@ -1089,11 +1092,38 @@ export function useLayouts() {
     } catch { /* best-effort */ }
     window.location.reload();
   };
-  return { layouts, current: cur, autosave, dirty, save, saveAs, load, rename, copy, remove, setAutosave, newLayout };
+  return { layouts, current: cur, autosave, dirty, save, saveAs, load, rename, copy, remove, star, setAutosave, newLayout };
+}
+
+/** "Open layout…": every saved layout, searchable, starred ones first. */
+export function OpenLayoutDialog({ L, onClose }: { L: ReturnType<typeof useLayouts>; onClose: () => void }) {
+  const [q, setQ] = useState("");
+  const list = L.layouts
+    .filter((l) => !q || l.name.toLowerCase().includes(q.trim().toLowerCase()))
+    .sort((a, b) => Number(!!b.starred) - Number(!!a.starred) || b.saved - a.saved);
+  return (
+    <Modal title="Open layout" onClose={onClose} width={480} testid="open-layout">
+      <input className="chart-menu-input" placeholder="Search layouts" value={q} onChange={(e) => setQ(e.target.value)} autoFocus aria-label="Search layouts" />
+      {list.length === 0 && <div className="hint">{L.layouts.length ? "Nothing matches." : "No saved layouts yet — Save layout (Ctrl+S) to keep this one."}</div>}
+      <div className="open-layout-list">
+        {list.map((l) => (
+          <div key={l.id} className={`open-layout-row${l.id === L.current?.id ? " on" : ""}`}>
+            <button type="button" className={`ind-star${l.starred ? " on" : ""}`} onClick={() => L.star(l.id)} title={l.starred ? "Unstar" : "Star"} aria-label={`Star ${l.name}`}>★</button>
+            <button type="button" className="open-layout-name" onClick={() => (l.id === L.current?.id ? onClose() : L.load(l.id))} data-testid={`open-layout-${l.name}`}>
+              {l.name}
+              <span className="hint">{new Date(l.saved).toLocaleString("en-IN", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}{l.id === L.current?.id ? " · open" : ""}</span>
+            </button>
+            <button type="button" className="chart-menu-x" onClick={() => { if (window.confirm(`Delete layout "${l.name}"?`)) L.remove(l.id); }} title="Delete">✕</button>
+          </div>
+        ))}
+      </div>
+    </Modal>
+  );
 }
 
 export function LayoutMenu({ L, open, onOpen }: { L: ReturnType<typeof useLayouts>; open: boolean; onOpen: (o: boolean) => void }) {
   const ref = useRef<HTMLDivElement | null>(null);
+  const [browse, setBrowse] = useState(false);
   useOutside(ref, open, () => onOpen(false));
   return (
     <div className="chart-menu-wrap layout-menu" ref={ref}>
@@ -1109,17 +1139,20 @@ export function LayoutMenu({ L, open, onOpen }: { L: ReturnType<typeof useLayout
           <button type="button" className="chart-menu-item" onClick={() => { const n = window.prompt("Layout name", L.current ? `${L.current.name} 2` : "My layout"); if (n) L.saveAs(n); onOpen(false); }}>Save as…</button>
           {L.current && <button type="button" className="chart-menu-item" onClick={() => { const n = window.prompt("Rename layout", L.current!.name); if (n) L.rename(L.current!.id, n); onOpen(false); }}>Rename…</button>}
           {L.current && <button type="button" className="chart-menu-item" onClick={() => { L.copy(L.current!.id); onOpen(false); }}>Make a copy</button>}
+          <button type="button" className="chart-menu-item" onClick={() => { setBrowse(true); onOpen(false); }} data-testid="open-layout-btn">Open layout…</button>
           <button type="button" className="chart-menu-item" onClick={() => L.newLayout()}>New layout…</button>
           <label><input type="checkbox" checked={L.autosave} onChange={(e) => L.setAutosave(e.target.checked)} />Autosave</label>
           {L.layouts.length > 0 && <div className="chart-menu-head">Saved layouts</div>}
-          {L.layouts.map((l) => (
+          {[...L.layouts].sort((a, b) => Number(!!b.starred) - Number(!!a.starred)).slice(0, 8).map((l) => (
             <div key={l.id} className={`chart-menu-row${l.id === L.current?.id ? " on" : ""}`}>
-              <button type="button" className="chart-menu-item" onClick={() => (l.id === L.current?.id ? onOpen(false) : L.load(l.id))} title={`saved ${new Date(l.saved).toLocaleString("en-IN")}`}>{l.name}</button>
+              <button type="button" className="chart-menu-item" onClick={() => (l.id === L.current?.id ? onOpen(false) : L.load(l.id))} title={`saved ${new Date(l.saved).toLocaleString("en-IN")}`}>{l.starred ? "★ " : ""}{l.name}</button>
               <button type="button" className="chart-menu-x" onClick={() => { if (window.confirm(`Delete layout "${l.name}"?`)) L.remove(l.id); }} title="Delete">✕</button>
             </div>
           ))}
+          {L.layouts.length > 8 && <button type="button" className="chart-menu-item hint" onClick={() => { setBrowse(true); onOpen(false); }}>All {L.layouts.length} layouts…</button>}
         </div>
       )}
+      {browse && <OpenLayoutDialog L={L} onClose={() => setBrowse(false)} />}
     </div>
   );
 }

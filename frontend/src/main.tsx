@@ -3,6 +3,9 @@ import ReactDOM from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import App from "./App";
 import "./App.css";
+import { applyTheme } from "./lib/theme";
+
+applyTheme(); // before the first paint, so a light skin doesn't flash dark
 
 const queryClient = new QueryClient({
   defaultOptions: {

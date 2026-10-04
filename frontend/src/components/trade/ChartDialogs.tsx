@@ -185,15 +185,24 @@ export interface Command {
   label: string;
   group: string;
   hint?: string;
+  /** A setting: shown with an on / off switch and toggled in place. */
+  toggle?: boolean;
   run: () => void;
 }
+
+/** Quick Search sections, TradingView-style. */
+const SECTION_OF = (g: string): "Drawings" | "Functions" | "Settings" =>
+  g === "Drawing tools" || g === "Drawing" ? "Drawings" : g === "Settings" ? "Settings" : "Functions";
+const SECTIONS = ["Drawings", "Functions", "Settings"] as const;
 
 export function CommandPalette({ commands, onClose }: { commands: Command[]; onClose: () => void }) {
   const [q, setQ] = useState("");
   const [hl, setHl] = useState(0);
   const list = useMemo(() => {
     const words = q.toLowerCase().split(/\s+/).filter(Boolean);
-    return commands.filter((c) => words.every((w) => `${c.label} ${c.group}`.toLowerCase().includes(w))).slice(0, 80);
+    const hits = commands.filter((c) => words.every((w) => `${c.label} ${c.group}`.toLowerCase().includes(w)));
+    // grouped Drawings → Functions → Settings, each capped so all three show
+    return SECTIONS.flatMap((sec) => hits.filter((c) => SECTION_OF(c.group) === sec).slice(0, q ? 40 : 12));
   }, [q, commands]);
   useEffect(() => setHl(0), [q]);
   const listRef = useRef<HTMLDivElement | null>(null);
@@ -212,16 +221,34 @@ export function CommandPalette({ commands, onClose }: { commands: Command[]; onC
         onKeyDown={(e) => {
           if (e.key === "ArrowDown") { e.preventDefault(); setHl((i) => Math.min(list.length - 1, i + 1)); }
           else if (e.key === "ArrowUp") { e.preventDefault(); setHl((i) => Math.max(0, i - 1)); }
-          else if (e.key === "Enter" && list[hl]) { onClose(); list[hl].run(); }
+          else if (e.key === "Enter" && list[hl]) {
+            if (list[hl].toggle === undefined) onClose();
+            list[hl].run();
+          }
         }}
       />
       <div className="cmd-list" ref={listRef}>
         {list.length === 0 && <div className="hint">Nothing matches.</div>}
         {list.map((c, i) => (
-          <button key={c.id} type="button" className={`cmd-row${i === hl ? " hl" : ""}`} onMouseEnter={() => setHl(i)} onClick={() => { onClose(); c.run(); }}>
-            <span>{c.label}</span>
-            <span className="cmd-group">{c.hint ? <span className="kbd">{c.hint}</span> : null}{c.group}</span>
-          </button>
+          <div key={c.id}>
+            {(i === 0 || SECTION_OF(list[i - 1].group) !== SECTION_OF(c.group)) && <div className="cmd-sec">{SECTION_OF(c.group)}</div>}
+            <button
+              type="button"
+              className={`cmd-row${i === hl ? " hl" : ""}`}
+              onMouseEnter={() => setHl(i)}
+              onClick={() => {
+                if (c.toggle === undefined) onClose(); // settings flip in place, the palette stays
+                c.run();
+              }}
+              data-testid={`cmd-${c.id}`}
+            >
+              <span>{c.label}</span>
+              <span className="cmd-group">
+                {c.hint ? <span className="kbd">{c.hint}</span> : null}
+                {c.toggle !== undefined ? <span className={`cmd-switch${c.toggle ? " on" : ""}`} aria-label={c.toggle ? "on" : "off"} /> : c.group}
+              </span>
+            </button>
+          </div>
         ))}
       </div>
     </Modal>
@@ -236,6 +263,7 @@ export const SHORTCUTS: [string, string][] = [
   ["Alt + C", "Cross line"],
   ["Alt + Shift + R", "Rectangle"],
   ["Ctrl + Shift + S", "Copy chart image"],
+  ["Alt + S", "Copy a link to the chart image"],
   ["Alt + F", "Fib retracement"],
   ["Alt + A", "Add alert at the cursor"],
   ["Alt + I", "Invert scale"],
