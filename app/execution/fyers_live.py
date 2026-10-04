@@ -23,10 +23,16 @@ the docstring in `_SDK_CANDIDATES`.
 API surface:
 
     place_order()     POST /orders/sync  (matches the official fyers-apiv3 SDK)
-    cancel_order()    DELETE /orders?id=<id>
+    modify_order()    PATCH /orders/sync {"id", "qty"?, "type"?, "limitPrice"?, "stopPrice"?}
+    cancel_order()    DELETE /orders/sync {"id": <id>}
     get_positions()   GET /positions
     get_order_status  GET /orders?id=<id>
     get_quote()       GET /quotes?symbols=...
+    get_funds()       GET /funds
+    get_profile()     GET /profile
+    get_holdings()    GET /holdings
+    get_gtt_orders()  GET /gtt/orders
+    cancel_gtt()      DELETE /gtt/orders/sync {"id": <id>}
 
 We use /orders/sync (not the plain /orders) because the plain
 endpoint is fronted by a Cloudflare anti-bot layer that returns
@@ -450,6 +456,22 @@ class FyersClient:
         place_order to /orders/sync."""
         return await self._request("DELETE", "/orders/sync", json_body={"id": order_id})
 
+    async def modify_order(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """PATCH /orders/sync — the v3 modify of a PENDING order (the
+        official SDK's `modify_order` hits the same /sync path). Payload:
+        `{"id": <order id>, "qty"?, "type"?, "limitPrice"?, "stopPrice"?}`."""
+        return await self._request("PATCH", "/orders/sync", json_body=payload)
+
+    async def get_gtt_orders(self) -> dict[str, Any]:
+        """GET /gtt/orders — the GTT / OCO order book (same /api/v3 base
+        as the regular orders)."""
+        return await self._request("GET", "/gtt/orders")
+
+    async def cancel_gtt(self, gtt_id: str) -> dict[str, Any]:
+        """DELETE /gtt/orders/sync {"id": <id>} — cancel one GTT / OCO
+        order (the SDK's `cancel_gtt_order`)."""
+        return await self._request("DELETE", "/gtt/orders/sync", json_body={"id": gtt_id})
+
     async def get_orderbook(self) -> dict[str, Any]:
         """GET /orders — today's full order book (app, web and API orders)."""
         return await self._request("GET", "/orders")
@@ -465,6 +487,16 @@ class FyersClient:
         [{"id": 1, "title": "Total Balance", "equityAmount": …}, …]}`.
         """
         return await self._request("GET", "/funds")
+
+    async def get_profile(self) -> dict[str, Any]:
+        """GET /profile — `{"s": "ok", "data": {"fy_id": …, "name": …,
+        "display_name": …, "email_id": …, …}}`."""
+        return await self._request("GET", "/profile")
+
+    async def get_holdings(self) -> dict[str, Any]:
+        """GET /holdings — demat holdings: `{"s": "ok", "overall": {…},
+        "holdings": [{"symbol", "quantity", "costPrice", "ltp", "pl", …}]}`."""
+        return await self._request("GET", "/holdings")
 
     async def get_order_status(self, order_id: str) -> dict[str, Any]:
         """GET /orders?id=<id>."""
@@ -596,6 +628,19 @@ def _fyers_order_type(order_type: OrderType) -> int:
 
 def _fyers_side(side: OrderSide) -> int:
     return 1 if side == OrderSide.BUY else -1
+
+
+def _ensure_ok(data: Any, what: str) -> dict[str, Any]:
+    """Fyers mostly signals failure with a 4xx, but some endpoints answer
+    200 with `{"s": "error", "message": …}`. Raise FyersAPIError for those
+    so a read method never hands an error payload on as data."""
+    if not isinstance(data, dict):
+        return {"data": data}
+    if str(data.get("s") or "").lower() == "error":
+        raise FyersAPIError(
+            f"fyers {what}: {data.get('message') or data.get('code') or 'error'}"
+        )
+    return data
 
 
 def _state_from_str(status: str) -> OrderState:
@@ -1016,6 +1061,72 @@ class FyersLiveBackend:
                         broker_order_id=broker_order_id, error=str(e))
             return False
 
+    async def modify_order(
+        self,
+        broker_order_id: str,
+        *,
+        quantity: Optional[int] = None,
+        limit_price: Optional[float] = None,
+        stop_price: Optional[float] = None,
+        order_type: Optional[OrderType | str] = None,
+    ) -> tuple[bool, str]:
+        """Modify a PENDING order in place (v3 PATCH /orders/sync).
+
+        Only the fields given are sent. A new `order_type` maps through the
+        same codes as `place_order` (`_fyers_order_type`) and, like
+        `place_order`, sends the prices that type needs and zeroes the ones
+        it doesn't — a missing required price is refused locally, never
+        sent. Returns `(ok, message)` with Fyers' own message. A CDN block
+        (FyersBlockedError) is re-raised — the broker never saw the request,
+        so it isn't a "no" — and the API maps it to 503; any other broker
+        error comes back as `(False, <error>)`.
+        """
+        if not broker_order_id:
+            return False, "broker_order_id is required"
+        payload: dict[str, Any] = {"id": str(broker_order_id)}
+        if quantity is not None:
+            if int(quantity) <= 0:
+                return False, "quantity must be > 0"
+            payload["qty"] = int(quantity)
+        if order_type is not None:
+            try:
+                ot = order_type if isinstance(order_type, OrderType) else OrderType(str(order_type).upper())
+            except ValueError:
+                return False, f"unknown order_type {order_type!r}"
+            fyers_type = _fyers_order_type(ot)
+            needs_limit = fyers_type in (1, 4)
+            needs_stop = fyers_type in (3, 4)
+            lp = float(limit_price) if (needs_limit and limit_price is not None) else 0.0
+            sp = float(stop_price) if (needs_stop and stop_price is not None) else 0.0
+            if needs_limit and lp <= 0:
+                return False, f"{ot.value} order requires a limit price > 0"
+            if needs_stop and sp <= 0:
+                return False, f"{ot.value} order requires a stop/trigger price > 0"
+            payload.update({"type": fyers_type, "limitPrice": lp, "stopPrice": sp})
+        else:
+            if limit_price is not None:
+                payload["limitPrice"] = float(limit_price)
+            if stop_price is not None:
+                payload["stopPrice"] = float(stop_price)
+        if len(payload) == 1:
+            return False, "nothing to modify"
+        try:
+            data = await self._client.modify_order(payload)
+        except FyersBlockedError as e:
+            log.error(
+                "fyers.modify.blocked",
+                broker_order_id=broker_order_id, status_code=e.status_code, reason=e.reason,
+            )
+            raise
+        except FyersAPIError as e:
+            log.warning("fyers.modify.failed", broker_order_id=broker_order_id, error=str(e))
+            return False, str(e)
+        message = str(data.get("message") or "")
+        if str(data.get("s") or "").lower() == "error":
+            log.warning("fyers.modify.rejected", broker_order_id=broker_order_id, message=message)
+            return False, message or "Fyers rejected the modify"
+        return True, message or "order modified"
+
     async def get_positions(self) -> list[Position]:
         try:
             data = await self._client.get_positions()
@@ -1089,6 +1200,74 @@ class FyersLiveBackend:
         if total is None or total <= 0:
             return None
         return float(total)
+
+    # -- account views (Account Manager panels; read-only) --------------
+    #
+    # Unlike the fail-safe `get_funds` / `get_positions` above (the risk
+    # layer and manager depend on those never raising), these RAISE
+    # FyersAPIError on a broker failure so `/api/broker/*` can tell the
+    # operator why a panel is empty.
+
+    async def get_fund_rows(self) -> list[dict[str, Any]]:
+        """The raw `/funds` fund_limit rows: `{"id", "title",
+        "equityAmount", "commodityAmount"}` (ids 1..10, Total Balance …
+        Available Balance)."""
+        data = _ensure_ok(await self._client.get_funds(), "funds")
+        rows = data.get("fund_limit") or data.get("data") or []
+        return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+    async def get_profile(self) -> dict[str, Any]:
+        """The account profile: Fyers' `data` object (`fy_id`, `name`,
+        `display_name`, `email_id`, …)."""
+        data = _ensure_ok(await self._client.get_profile(), "profile")
+        inner = data.get("data")
+        return inner if isinstance(inner, dict) else data
+
+    async def get_holdings(self) -> dict[str, Any]:
+        """Demat holdings as Fyers sends them: `{"holdings": [...],
+        "overall": {...}}` (tolerates both nested under `data`)."""
+        data = _ensure_ok(await self._client.get_holdings(), "holdings")
+        inner = data.get("data")
+        rows = data.get("holdings")
+        overall = data.get("overall")
+        if isinstance(inner, dict):
+            rows = inner.get("holdings") if rows is None else rows
+            overall = inner.get("overall") if overall is None else overall
+        elif rows is None and isinstance(inner, list):
+            rows = inner
+        return {
+            "holdings": [h for h in rows if isinstance(h, dict)] if isinstance(rows, list) else [],
+            "overall": overall if isinstance(overall, dict) else {},
+        }
+
+    async def get_gtt_orders(self) -> list[dict[str, Any]]:
+        """The GTT / OCO order book, raw. Fyers lists it under `orderBook`;
+        `data` / `gttOrders` (or either nested in `data`) are tolerated."""
+        data = _ensure_ok(await self._client.get_gtt_orders(), "gtt order book")
+        rows: Any = data.get("orderBook") or data.get("data") or data.get("gttOrders") or []
+        if isinstance(rows, dict):
+            rows = rows.get("orderBook") or rows.get("gttOrders") or []
+        return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+    async def cancel_gtt(self, gtt_id: str) -> bool:
+        """Cancel one GTT / OCO order. True when Fyers accepted it, False
+        when it refused (unknown id, already triggered / cancelled, …). A
+        CDN block (FyersBlockedError) is re-raised — the request never
+        reached Fyers — so the API can answer 503."""
+        if not gtt_id:
+            return False
+        try:
+            data = await self._client.cancel_gtt(gtt_id)
+        except FyersBlockedError as e:
+            log.error("fyers.gtt_cancel.blocked", gtt_id=gtt_id, status_code=e.status_code, reason=e.reason)
+            raise
+        except FyersAPIError as e:
+            log.warning("fyers.gtt_cancel.failed", gtt_id=gtt_id, error=str(e))
+            return False
+        if isinstance(data, dict) and str(data.get("s") or "").lower() == "error":
+            log.warning("fyers.gtt_cancel.rejected", gtt_id=gtt_id, message=data.get("message"))
+            return False
+        return True
 
     async def get_order_status(self, broker_order_id: str) -> OrderStatus:
         if not broker_order_id:

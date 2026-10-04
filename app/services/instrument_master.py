@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 
 # Where the daily CSVs land. Created on first call.
@@ -76,6 +76,79 @@ class Instrument:
             "underlying": self.underlying,
             "display": _format_display(self),
         }
+
+
+# ---------------------------------------------------------------------------
+# Search filters: exchange "sources" and instrument "types"
+# ---------------------------------------------------------------------------
+
+
+def is_etf(inst: Instrument) -> bool:
+    """True for an exchange-traded fund.
+
+    The scrip master has no ETF flag — ETFs trade as plain `EQ` scrips —
+    so this is a NAME HEURISTIC: an `EQ` instrument whose short name,
+    symbol or an alias contains "ETF" or "BEES" (case-insensitive), e.g.
+    NIFTYBEES, GOLDBEES, SETFNIF50, CPSEETF. ETFs without either marker
+    in their ticker (MON100, ICICIB22, …) are classified as stocks."""
+    if inst.instrument_type != "EQ":
+        return False
+    hay = " ".join([inst.short_name, inst.symbol, *inst.aliases]).upper()
+    return "ETF" in hay or "BEES" in hay
+
+
+# Exchange "sources" for `/api/search/symbols?exchange=`: an exchange plus
+# the segments it covers. NSE / BSE mean the cash market (everything but
+# F&O and currency); NFO / BFO are NSE / BSE F&O; CDS / BCD NSE / BSE
+# currency; MCX is every MCX scrip.
+_SEARCH_SOURCES: dict[str, Callable[[Instrument], bool]] = {
+    "NSE": lambda i: i.exchange == "NSE" and i.segment not in ("FO", "CD"),
+    "BSE": lambda i: i.exchange == "BSE" and i.segment not in ("FO", "CD"),
+    "MCX": lambda i: i.exchange == "MCX",
+    "NFO": lambda i: i.exchange == "NSE" and i.segment == "FO",
+    "BFO": lambda i: i.exchange == "BSE" and i.segment == "FO",
+    "CDS": lambda i: i.exchange == "NSE" and i.segment == "CD",
+    "BCD": lambda i: i.exchange == "BSE" and i.segment == "CD",
+}
+
+# Instrument "types" for `/api/search/symbols?types=`. EQ excludes ETFs
+# (see `is_etf`) so "Stocks" and "ETFs" are disjoint.
+_SEARCH_TYPES: dict[str, Callable[[Instrument], bool]] = {
+    "EQ": lambda i: i.instrument_type == "EQ" and not is_etf(i),
+    "ETF": is_etf,
+    "FUT": lambda i: i.instrument_type == "FUT",
+    "OPT": lambda i: i.instrument_type in ("CE", "PE"),
+    "IND": lambda i: i.instrument_type == "IND" or i.segment == "INDEX",
+}
+
+
+def search_filter(
+    sources: Optional[Iterable[str]] = None,
+    types: Optional[Iterable[str]] = None,
+) -> Optional[Callable[[Instrument], bool]]:
+    """Build the `where` predicate for `InstrumentMaster.search` from
+    source names (NSE, BSE, MCX, NFO, BFO, CDS, BCD) and type names (EQ,
+    ETF, FUT, OPT, IND).
+
+    Names within a group OR together; the two groups AND. Unknown names
+    are ignored, so a group made only of unknown names doesn't filter at
+    all. Returns None when nothing filters (the cheap no-predicate path).
+    """
+    def pick(table: dict[str, Callable[[Instrument], bool]], names: Optional[Iterable[str]]):
+        wanted = {(n or "").strip().upper() for n in names or ()}
+        return [table[n] for n in wanted if n in table]
+
+    src = pick(_SEARCH_SOURCES, sources)
+    typ = pick(_SEARCH_TYPES, types)
+    if not src and not typ:
+        return None
+
+    def _where(inst: Instrument) -> bool:
+        if src and not any(p(inst) for p in src):
+            return False
+        return not typ or any(p(inst) for p in typ)
+
+    return _where
 
 
 def _parse_expiry(s: str) -> Optional[datetime]:
@@ -365,15 +438,25 @@ class InstrumentMaster:
         *,
         limit: int = 30,
         segments: Optional[Iterable[str]] = None,
+        where: Optional[Callable[[Instrument], bool]] = None,
     ) -> list[Instrument]:
         """Substring search over short_name, symbol, and aliases.
 
         Cheap rank: exact short_name match > prefix on short_name >
         substring anywhere. Result capped at `limit`. Optional
-        `segments` filter ("EQ", "FO", "INDEX", "COM", "CD").
+        `segments` filter ("EQ", "FO", "INDEX", "COM", "CD") and an
+        optional `where` predicate (e.g. from `search_filter`), both
+        applied inside every rank tier BEFORE the cap — so a caller can
+        page by asking for `offset + limit` results and slicing, and the
+        pages stay consistent.
         """
         q = (query or "").strip().upper()
         seg = set(s.upper() for s in segments) if segments else None
+
+        def keep(inst: Instrument) -> bool:
+            if seg and inst.segment not in seg:
+                return False
+            return where is None or where(inst)
 
         # Empty / very short query → browse popular instruments (in
         # seed order, which is liquidity-ranked) so the dropdown is
@@ -381,7 +464,7 @@ class InstrumentMaster:
         if not q:
             out: list[Instrument] = []
             for inst in self._by_symbol.values():
-                if seg and inst.segment not in seg:
+                if not keep(inst):
                     continue
                 out.append(inst)
                 if len(out) >= limit:
@@ -401,7 +484,7 @@ class InstrumentMaster:
             if inst.symbol in seen:
                 continue
             seen.add(inst.symbol)
-            if seg and inst.segment not in seg:
+            if not keep(inst):
                 continue
             exact.append(inst)
 
@@ -415,7 +498,7 @@ class InstrumentMaster:
             for inst in lst:
                 if inst.symbol in seen:
                     continue
-                if seg and inst.segment not in seg:
+                if not keep(inst):
                     continue
                 seen.add(inst.symbol)
                 prefix.append(inst)
@@ -433,7 +516,7 @@ class InstrumentMaster:
                 for inst in lst:
                     if inst.symbol in seen:
                         continue
-                    if seg and inst.segment not in seg:
+                    if not keep(inst):
                         continue
                     seen.add(inst.symbol)
                     sub.append(inst)

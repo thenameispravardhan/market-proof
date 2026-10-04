@@ -8,6 +8,9 @@ still consulted (always), but with the soft-warn model from
 Endpoints:
   POST /api/orders              place one manual order
   POST /api/orders/cancel       cancel a pending order
+  POST /api/orders/modify       modify a pending order (size down,
+                                price, type) — never a size increase,
+                                refused while trading is halted
   GET  /api/orders/pending      list PENDING trades for the
                                 Trade page's pending-orders panel
   GET  /api/orders/quote        last cached quote for a symbol
@@ -19,6 +22,7 @@ deliberately hidden from the broker picker.
 """
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -36,6 +40,7 @@ from app.execution.base import OrderSide, OrderState, OrderType, ProductType
 from app.execution.fyers_live import FyersBlockedError
 from app.execution.market_data import Quote
 from app.logging_config import get_logger
+from app.risk import circuit_breakers
 
 log = get_logger(__name__)
 
@@ -412,6 +417,273 @@ async def cancel_order(
         response["reason"] = reason
         response["rows_updated"] = len(trades)
     return response
+
+
+def _opt_int_field(body: dict[str, Any], key: str) -> Optional[int]:
+    """An optional whole-number body field: None when absent, 422 when it
+    isn't a whole number (10.5 is refused, not truncated)."""
+    v = body.get(key)
+    if v is None:
+        return None
+    try:
+        f = float(v) if not isinstance(v, bool) else math.nan
+    except (TypeError, ValueError):
+        f = math.nan
+    if not math.isfinite(f) or not f.is_integer():
+        raise HTTPException(status_code=422, detail=f"bad field {key}: {v!r} (whole number expected)")
+    return int(f)
+
+
+def _opt_price_field(body: dict[str, Any], key: str) -> Optional[float]:
+    """An optional price body field: None when absent, 422 unless > 0."""
+    v = body.get(key)
+    if v is None:
+        return None
+    try:
+        f = float(v) if not isinstance(v, bool) else math.nan
+    except (TypeError, ValueError):
+        f = math.nan
+    if not math.isfinite(f) or f <= 0:
+        raise HTTPException(status_code=422, detail=f"bad field {key}: {v!r} (must be > 0)")
+    return f
+
+
+def _trading_halt_reason(db: Session) -> Optional[str]:
+    """Why trading is halted, or None when it isn't. Reads the same
+    `RiskState.trading_disabled` flag `/api/risk/kill` sets (also set by
+    the daily-loss / monthly-drawdown breakers); cleared only by a
+    calendar rollover or `/api/risk/resume`."""
+    state = circuit_breakers.get_or_create_state(db)
+    if state.trading_disabled:
+        return state.disabled_reason or "trading_disabled"
+    return None
+
+
+async def _current_order_qty(trades: list[Trade], backend: Any, broker_order_id: str) -> Optional[int]:
+    """The order's current size, for refusing modify-time increases.
+
+    Prefers the local `trades` rows (the smallest positive quantity — the
+    rows for one order should agree, and the smallest is the safe bound),
+    else the live backend's order status (Fyers' `qty` on the order
+    matching this id). None when neither can say."""
+    known = [int(t.quantity) for t in trades if (t.quantity or 0) > 0]
+    if known:
+        return min(known)
+    if not hasattr(backend, "get_order_status"):
+        return None
+    try:
+        order_status = await backend.get_order_status(broker_order_id)
+    except Exception as e:  # noqa: BLE001
+        log.debug("manual_order.modify_status_failed", broker_order_id=broker_order_id, error=str(e))
+        return None
+    raw = getattr(order_status, "raw", None)
+    if not isinstance(raw, dict) or str(raw.get("id") or "") != broker_order_id:
+        return None
+    try:
+        qty = int(float(raw.get("qty")))
+    except (TypeError, ValueError):
+        return None
+    return qty if qty > 0 else None
+
+
+@router.post("/modify")
+async def modify_order(
+    body: dict[str, Any] = Body(...),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Modify a pending order in place.
+
+    Body:
+      {
+        "account_id":      2,
+        "broker_order_id": "24061300012345",
+        "quantity":        5,          # optional; may only go DOWN
+        "limit_price":     611.0,      # optional
+        "stop_price":      605.0,      # optional
+        "order_type":      "LIMIT"     # optional: LIMIT | MARKET | STOP_LOSS | SL-M
+      }
+
+    Safety:
+      - 409 while trading is halted (kill switch / loss breaker). Cancel
+        stays allowed — only cancelling reduces exposure.
+      - A size INCREASE is refused (422): a bigger order must be placed
+        new so the risk engine checks it. The current size comes from the
+        local `trades` rows, else the broker's order status; when neither
+        knows it, only price / type changes are accepted.
+      - A new order_type needs its prices, exactly as for place_order.
+      - Never changes the product type (intraday-only bot).
+
+    Returns `{ok, broker_order_id, message, rows_updated}` — `message` is
+    the broker's. On success every local `trades` row for the order takes
+    the new quantity / price / type, with one `order.manual_modified`
+    audit row each. 400 when the account's broker can't modify, 503 when
+    the Fyers edge blocks the request, 502 on any other broker failure.
+    """
+    try:
+        account_id = int(body["account_id"])
+        broker_order_id = str(body["broker_order_id"]).strip()
+    except (KeyError, TypeError, ValueError) as e:
+        raise HTTPException(status_code=422, detail=f"missing or bad field: {e}")
+    if not broker_order_id:
+        raise HTTPException(status_code=422, detail="broker_order_id is required")
+    quantity = _opt_int_field(body, "quantity")
+    limit_price = _opt_price_field(body, "limit_price")
+    stop_price = _opt_price_field(body, "stop_price")
+    order_type: Optional[OrderType] = None
+    if body.get("order_type") is not None:
+        try:
+            order_type = OrderType(str(body["order_type"]).strip().upper())
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail=f"order_type must be LIMIT, MARKET, STOP_LOSS or SL-M, got {body['order_type']!r}",
+            )
+    if quantity is None and limit_price is None and stop_price is None and order_type is None:
+        raise HTTPException(
+            status_code=422,
+            detail="nothing to modify — send quantity, limit_price, stop_price and/or order_type",
+        )
+    if quantity is not None and quantity <= 0:
+        raise HTTPException(status_code=422, detail="quantity must be > 0")
+    # Same price rules as place_order (Fyers v3): LIMIT -> limitPrice;
+    # STOP_LOSS (SL-L) -> stopPrice + limitPrice; SL-M -> stopPrice.
+    if order_type in (OrderType.LIMIT, OrderType.STOP_LOSS) and limit_price is None:
+        raise HTTPException(status_code=422, detail="limit_price required for LIMIT / SL-L")
+    if order_type in (OrderType.STOP_LOSS, OrderType.STOP_LOSS_MARKET) and stop_price is None:
+        raise HTTPException(status_code=422, detail="stop_price required for SL-L / SL-M")
+
+    acc = _require_real_account(db, account_id)
+    halt = _trading_halt_reason(db)
+    if halt:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"trading is halted ({halt}) — orders can't be modified while the "
+                "kill switch / loss limit is engaged. Cancel still works; resume "
+                "trading first to modify."
+            ),
+        )
+    backend = _manager()._manual_backend_for(acc)  # noqa: SLF001 — live backend for the chosen account
+    if backend is None:
+        raise HTTPException(status_code=400, detail=f"no backend for account {account_id}")
+    if not hasattr(backend, "modify_order"):
+        raise HTTPException(status_code=400, detail="this broker does not support modify")
+
+    # Not unique (see cancel_order) — read every row for this order.
+    trades = list(
+        db.execute(select(Trade).where(Trade.broker_order_id == broker_order_id)).scalars().all()
+    )
+    if quantity is not None:
+        current = await _current_order_qty(trades, backend, broker_order_id)
+        if current is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "can't verify this order's current quantity, so only price / "
+                    "type changes are allowed — increase size with a new order so "
+                    "the risk engine checks it"
+                ),
+            )
+        if quantity > current:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"quantity can't be raised by a modify ({current} -> {quantity}) — "
+                    "increase size with a new order so the risk engine checks it"
+                ),
+            )
+
+    try:
+        ok, message = await backend.modify_order(
+            broker_order_id,
+            quantity=quantity,
+            limit_price=limit_price,
+            stop_price=stop_price,
+            order_type=order_type,
+        )
+    except FyersBlockedError as e:
+        log.warning(
+            "manual_order.modify_blocked",
+            broker_order_id=broker_order_id, status_code=e.status_code,
+            reason=e.reason,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Fyers edge is blocking the request as a script "
+                "(anti-bot / Cloudflare). The order is untouched on "
+                "the broker; retry once the server's IP / User-Agent "
+                "is accepted. See server logs for the full response."
+            ),
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("manual_order.modify_failed", broker_order_id=broker_order_id, error=str(e))
+        raise HTTPException(status_code=502, detail=f"broker modify failed: {e}")
+
+    rows_updated = 0
+    if ok:
+        new_type = order_type.value if order_type is not None else None
+        for trade in trades:
+            before = {
+                "broker_order_id": broker_order_id,
+                "quantity": trade.quantity,
+                "price": trade.price,
+                "order_type": trade.order_type,
+            }
+            if quantity is not None:
+                trade.quantity = quantity
+            if new_type is not None:
+                trade.order_type = new_type
+            # `price` mirrors the place path (limit, else the SL-M
+            # trigger, 0 for MARKET); a fill later overwrites it.
+            eff_type = (new_type or trade.order_type or "").upper()
+            if limit_price is not None and eff_type not in ("SL-M", "MARKET"):
+                trade.price = limit_price
+            elif stop_price is not None and eff_type == "SL-M":
+                trade.price = stop_price
+            elif new_type == "MARKET":
+                trade.price = 0.0
+            db.add(AuditLog(
+                actor="ui_trade_page",
+                action="order.manual_modified",
+                target=f"account:{account_id}",
+                before=before,
+                after={
+                    "broker_order_id": broker_order_id,
+                    "symbol": trade.symbol,
+                    "quantity": trade.quantity,
+                    "price": trade.price,
+                    "order_type": trade.order_type,
+                    "limit_price": limit_price,
+                    "stop_price": stop_price,
+                    "broker_message": message,
+                },
+            ))
+        if not trades:
+            # An order placed outside the bot (Fyers app / web): nothing
+            # local to update, but the real-money action is still audited.
+            db.add(AuditLog(
+                actor="ui_trade_page",
+                action="order.manual_modified",
+                target=f"account:{account_id}",
+                before=None,
+                after={
+                    "broker_order_id": broker_order_id,
+                    "quantity": quantity,
+                    "limit_price": limit_price,
+                    "stop_price": stop_price,
+                    "order_type": new_type,
+                    "broker_message": message,
+                },
+            ))
+        db.commit()
+        rows_updated = len(trades)
+    return {
+        "ok": bool(ok),
+        "broker_order_id": broker_order_id,
+        "message": message,
+        "rows_updated": rows_updated,
+    }
 
 
 @router.get("/pending")
