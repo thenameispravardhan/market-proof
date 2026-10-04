@@ -2653,3 +2653,7 @@ div.ind-row { cursor: default; }
    the gaps between them still pass through to the chart */
 .chart-legend .lg-row { pointer-events: auto; }
 .cmodal[data-testid="ind-settings"] .cform-check { width: 150px; }
+.chart-scale-modes { position: absolute; right: 26px; bottom: 2px; z-index: 7; display: flex; gap: 2px; opacity: 0; transition: opacity 0.12s; }
+.chart-container:hover .chart-scale-modes, .chart-scale-modes.sm-always { opacity: 1; }
+.chart-scale-modes button { width: 20px; height: 20px; padding: 0; border: 1px solid var(--border); border-radius: 3px; background: var(--bg-elev); color: var(--text-dim); font-size: 10px; font-weight: 700; cursor: pointer; }
+.chart-scale-modes button.on { color: var(--accent); border-color: var(--accent); }

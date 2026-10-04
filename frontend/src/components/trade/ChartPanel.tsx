@@ -4594,6 +4594,12 @@ export default function ChartPanel(props: ChartPanelProps) {
           )}
           <div ref={countdownRef} className="chart-axis-countdown" style={{ display: "none" }} />
           {eventTip && <div className="chart-event-tip chart-overlay-ui" style={{ left: Math.min(eventTip.x + 12, (containerRef.current?.clientWidth ?? 600) - 260) }}>{eventTip.text}</div>}
+          {settings.scaleModesButtons !== "never" && (
+            <div className={`chart-scale-modes chart-overlay-ui sm-${settings.scaleModesButtons}`} style={side === "left" ? { left: 26, right: "auto" } : undefined} onMouseDown={(e) => e.stopPropagation()}>
+              <button type="button" className={autoScale ? "on" : ""} onClick={() => setAutoScale((v) => !v)} title="Auto (fits data to screen)" data-testid="chart-scale-a">A</button>
+              <button type="button" className={scaleMode === "log" ? "on" : ""} disabled={compares.length > 0} onClick={() => setScaleMode((m) => (m === "log" ? "normal" : "log"))} title="Logarithmic scale (Alt+L)" data-testid="chart-scale-l">L</button>
+            </div>
+          )}
           <button type="button" className="chart-scale-gear chart-overlay-ui" style={side === "left" ? { left: 2, right: "auto" } : undefined} onClick={(e) => { e.stopPropagation(); setCtx({ x: side === "left" ? 4 : (containerRef.current?.clientWidth ?? 600) - 250, y: Math.max(0, (containerRef.current?.clientHeight ?? 400) - 330), price: 0, time: null, area: "price" }); }} onMouseDown={(e) => e.stopPropagation()} title="Price scale settings" data-testid="chart-scale-gear">⚙</button>
           {showPos && status.kind === "ready" && (
             <div className="pos-layer">
