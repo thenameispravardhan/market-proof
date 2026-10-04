@@ -19,6 +19,7 @@ import {
   sanitizeInstance,
   visibleOnInterval,
 } from "../components/trade/indicatorCatalog";
+import { candlePatterns, zigzag } from "../components/trade/indicatorMore";
 import type { Bar } from "../components/trade/chartData";
 
 // ---------------------------------------------------------------------------
@@ -146,19 +147,57 @@ describe("drawings", () => {
 // ---------------------------------------------------------------------------
 
 describe("indicator catalog", () => {
-  const candles = Array.from({ length: 300 }, (_, i) => {
-    const c = 100 + Math.sin(i / 7) * 5 + i * 0.05;
-    return { time: 1000 + i * 300, open: c - 0.3, high: c + 1, low: c - 1, close: c, volume: 1000 + (i % 13) * 50 };
+  // 60 sessions of 5-minute bars (09:15 → 15:25), so daily / weekly / monthly
+  // indicators (ADR, CPR W / M, previous-day levels) have history to use.
+  const candles = Array.from({ length: 60 * 75 }, (_, i) => {
+    const day = Math.floor(i / 75);
+    const c = 100 + Math.sin(i / 7) * 5 + i * 0.01;
+    return {
+      time: (20000 + day) * 86400 + 33300 + (i % 75) * 300,
+      open: i % 9 === 0 ? c : c - 0.3,
+      high: c + 1,
+      low: c - 1,
+      close: c,
+      volume: 1000 + (i % 13) * 50,
+      oi: 50000 + (i % 40) * 100,
+    };
   });
+  const other = new Map(candles.map((k, i) => [k.time, k.close * 1.5 + Math.cos(i / 3)]));
 
   it("every indicator computes plots aligned to the candles", () => {
     for (const def of INDICATORS) {
       const inst = newInstance(def.type)!;
-      const res = def.compute(candles, inst.inputs, { interval: "5", up: "#0f0", down: "#f00", flow: new Map() });
-      expect(res.plots).toHaveLength(def.plots.length);
+      const res = def.compute(candles, inst.inputs, { interval: "5", up: "#0f0", down: "#f00", flow: new Map(), other: () => other });
+      expect(res.plots, def.type).toHaveLength(def.plots.length);
       for (const p of res.plots) expect(p.length).toBe(candles.length);
-      if (def.type !== "flow") expect(res.plots[0].some((v) => v !== null), `${def.type} is all null`).toBe(true);
+      for (const p of res.plots) expect(p.every((v) => v === null || Number.isFinite(v)), `${def.type} has NaN`).toBe(true);
+      if (def.type !== "flow" && def.plots.length) expect(res.plots[0].some((v) => v !== null), `${def.type} is all null`).toBe(true);
+      for (const m of res.marks ?? []) expect(m.i >= 0 && m.i < candles.length && m.plot < def.plots.length).toBe(true);
     }
+  });
+
+  it("covers the spec's indicator list", () => {
+    const names = new Set(INDICATORS.map((d) => d.name.toLowerCase()));
+    for (const n of [
+      "Arnaud Legoux Moving Average", "Hull Moving Average", "McGinley Dynamic", "Guppy Multiple Moving Average", "EMA Cross", "MA with EMA Cross",
+      "Bollinger Bands %B", "Bollinger Bands Width", "Chande Kroll Stop", "Price Channel", "Standard Error Bands",
+      "Connors RSI", "Fisher Transform", "Know Sure Thing", "True Strength Index", "Ultimate Oscillator", "SMI Ergodic Indicator",
+      "Vortex Indicator", "Williams Alligator", "Williams Fractal", "Zig Zag", "Accumulative Swing Index",
+      "Accumulation/Distribution", "Klinger Oscillator", "Price Volume Trend", "Volume Profile Visible Range",
+      "Relative Volatility Index", "Volatility O-H-L-C", "Correlation Coefficient", "Ratio", "Spread",
+      "Jurik Moving Average", "Auto Fib Retracement", "Candlestick Patterns", "RSI Momentum Divergence", "Open Interest",
+    ]) expect(names.has(n.toLowerCase()), n).toBe(true);
+    expect(INDICATORS.length).toBeGreaterThanOrEqual(130);
+    expect(INDICATORS.filter((d) => d.desk).length).toBeGreaterThanOrEqual(20);
+  });
+
+  it("finds classic candlestick patterns and zig zag swings", () => {
+    const bar = (o: number, h: number, l: number, c: number, i: number) => ({ time: i * 60, open: o, high: h, low: l, close: c, volume: 1 });
+    const engulf = [bar(10, 10.2, 9, 9.2, 0), bar(9.1, 10.6, 9, 10.5, 1)];
+    expect(candlePatterns(engulf).map((h) => h.name)).toContain("Bullish Engulfing");
+    const swings = [10, 12, 14, 16, 13, 10, 8, 11, 15].map((c, i) => bar(c, c + 0.1, c - 0.1, c, i));
+    const zz = zigzag(swings, 10, 1);
+    expect(zz.filter((p) => p.confirmed).map((p) => p.high)).toEqual([false, true, false]);
   });
 
   it("instances keep their own inputs; legend args read like TradingView", () => {

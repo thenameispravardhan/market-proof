@@ -12,6 +12,8 @@ export interface OhlcvCandle {
   low: number;
   close: number;
   volume: number;
+  /** Open interest (futures / options), when the feed carries it. */
+  oi?: number;
 }
 
 /** Simple moving average of `values` over `period`. */

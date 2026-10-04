@@ -28,6 +28,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   useBrokerAccounts,
   useCancelOrder,
+  useFyersDisconnect,
   useOptionChain,
   usePendingOrders,
   usePlaceOrder,
@@ -40,8 +41,9 @@ import {
 import { useLiveQuote } from "../hooks/useQuotes";
 import ChartPanel, { type BrokerLine, type ChartOrder, type ChartPosition, type HostAction } from "../components/trade/ChartPanel";
 import Scalper, { splitDrag } from "../components/trade/Scalper";
-import { AccountManager, LayoutMenu, SymbolDetails, WatchlistTable, useLayouts, type BottomTab, type WatchState } from "../components/trade/TradePanels";
+import { AccountManager, BOTTOM_TABS, LayoutMenu, SymbolDetails, WatchlistTable, useLayouts, type BottomTab, type WatchState } from "../components/trade/TradePanels";
 import { BookPanel, FnoPanel, type DeskTab } from "../components/trade/ProPanels";
+import { loadUserPrefs, UserSettingsDialog, type UserPrefs } from "../components/trade/UserSettings";
 import type { SyncFlags } from "../components/trade/chartSync";
 import type {
   BrokerAccount,
@@ -120,7 +122,7 @@ const DEFAULT_DOCK: DockId[] = ["watch", "trade"];
 
 // Multi-chart layouts (TradingView-style). Click a chart to make it the
 // active one: it follows the watchlist / search and drives the ticket.
-type Layout = "1" | "2" | "2v" | "3" | "3c" | "3r" | "4" | "6" | "8";
+type Layout = "1" | "2" | "2v" | "3" | "3c" | "3r" | "4" | "4c" | "4r" | "4l" | "5" | "5l" | "6" | "6v" | "7" | "8" | "8v";
 const LAYOUTS: { id: Layout; n: number; icon: string; label: string }[] = [
   { id: "1", n: 1, icon: "▢", label: "1 chart" },
   { id: "2", n: 2, icon: "◫", label: "2 side by side" },
@@ -129,17 +131,26 @@ const LAYOUTS: { id: Layout; n: number; icon: string; label: string }[] = [
   { id: "3c", n: 3, icon: "⫴", label: "3 side by side" },
   { id: "3r", n: 3, icon: "☰", label: "3 stacked" },
   { id: "4", n: 4, icon: "⊞", label: "4 (2 × 2)" },
+  { id: "4c", n: 4, icon: "⫴", label: "4 side by side" },
+  { id: "4r", n: 4, icon: "☰", label: "4 stacked" },
+  { id: "4l", n: 4, icon: "◧", label: "1 large + 3" },
+  { id: "5", n: 5, icon: "⊞", label: "5 (2 + 3)" },
+  { id: "5l", n: 5, icon: "◧", label: "1 large + 4" },
   { id: "6", n: 6, icon: "▦", label: "6 (3 × 2)" },
+  { id: "6v", n: 6, icon: "▤", label: "6 (2 × 3)" },
+  { id: "7", n: 7, icon: "▦", label: "7 (3 + 4)" },
   { id: "8", n: 8, icon: "▩", label: "8 (4 × 2)" },
+  { id: "8v", n: 8, icon: "▤", label: "8 (2 × 4)" },
 ];
 
 type LayoutSync = SyncFlags & { symbol: boolean };
-const SYNC_DEFAULT: LayoutSync = { symbol: false, interval: false, crosshair: true, time: false, drawings: true };
+const SYNC_DEFAULT: LayoutSync = { symbol: false, interval: false, crosshair: true, time: false, dateRange: false, drawings: true };
 const SYNC_LABELS: [keyof LayoutSync, string][] = [
   ["symbol", "Symbol"],
   ["interval", "Interval"],
   ["crosshair", "Crosshair"],
-  ["time", "Time / date range"],
+  ["time", "Time (scroll)"],
+  ["dateRange", "Date range"],
   ["drawings", "Drawings (same symbol)"],
 ];
 
@@ -506,19 +517,23 @@ export default function Trade() {
   // for both indices and cash equities; a non-F&O stock just returns no
   // strikes and the panel stays hidden.
   const chainOn = chainBase != null && (dock.includes("chain") || dock.includes("fno") || scalper);
+  // User settings → order window defaults, chain strikes
+  const [userPrefs, setUserPrefs] = useState<UserPrefs>(loadUserPrefs);
+  const [userSettingsOpen, setUserSettingsOpen] = useState(false);
   const { data: chain } = useOptionChain(
     chainOn ? chainBase!.symbol : "",
     chainOn ? chainBase!.short_name : "",
     selectedExpiry,
-    12,
+    userPrefs.chainStrikes,
   );
   const { data: pending } = usePendingOrders(accountId);
   const { data: positions } = usePositions();
 
   // --- Ticket state ---
   const [side, setSide] = useState<"BUY" | "SELL">("BUY");
-  const [quantity, setQuantity] = useState<number>(1);
-  const [orderType, setOrderType] = useState<OrderType>("MARKET");
+  const [quantity, setQuantity] = useState<number>(() => loadUserPrefs().defaultQty);
+  const [orderType, setOrderType] = useState<OrderType>(() => loadUserPrefs().defaultOrderType);
+  const fyersDisconnect = useFyersDisconnect();
   const [limitPrice, setLimitPrice] = useState<string>("");
   const [stopPrice, setStopPrice] = useState<string>("");
   const [lastResult, setLastResult] = useState<{
@@ -761,8 +776,8 @@ export default function Trade() {
       side: o.side,
       quantity: qty,
       order_type: o.type,
-      limit_price: o.type === "LIMIT" ? o.price : null,
-      stop_price: o.type === "SL-M" ? o.price : null,
+      limit_price: o.type === "LIMIT" ? o.price : o.type === "STOP_LOSS" ? o.limit ?? o.price : null,
+      stop_price: o.type === "SL-M" || o.type === "STOP_LOSS" ? o.price : null,
       product_type: "INTRADAY",
       bypass_risk: false,
       operator: "ui_chart",
@@ -770,7 +785,7 @@ export default function Trade() {
     if (r.status === "REJECTED" || r.status === "REJECTED_RISK" || r.ok === false) {
       throw new Error(cleanError(r.error || r.risk_message, "broker rejected the order"));
     }
-    return `${o.side} ${qty} ${name} ${o.type}${o.price != null ? ` @ ${o.price}` : ""} → ${r.status}`;
+    return `${o.side} ${qty} ${name} ${o.type === "STOP_LOSS" ? "STOP-LIMIT" : o.type}${o.price != null ? ` @ ${o.price}` : ""}${o.type === "STOP_LOSS" && o.limit != null ? ` lmt ${o.limit}` : ""} → ${r.status}`;
   };
 
   const onSubmit = async (opts?: { bypassRisk?: boolean }) => {
@@ -876,6 +891,15 @@ export default function Trade() {
       return;
     }
     switch (a) {
+      case "usersettings": setUserSettingsOpen(true); return;
+      case "ticket:buy": onBookMarket("BUY"); return;
+      case "ticket:sell": onBookMarket("SELL"); return;
+      case "logout": {
+        if (window.confirm("Log out of the Fyers trading session? Orders already at the broker stay working; reconnect from Accounts.")) {
+          fyersDisconnect.mutate(undefined, { onSuccess: () => setLastResult({ type: "success", message: "Logged out of Fyers — reconnect from Accounts" }) });
+        }
+        return;
+      }
       case "scalper": setScalper(true); return;
       case "layouts": setLayoutMenuOpen(true); return;
       case "save": L.save(); return;
@@ -996,9 +1020,11 @@ export default function Trade() {
           {bottomOpen && <div className="tv-resize" onPointerDown={(e) => { setBottomMax(false); drag(e, "y", bottomH, setBottomH, 120, window.innerHeight * 0.75, "trade:bottomH"); }} title="Drag to resize" />}
           {!bottomOpen && (
             <div className="tabs trade-tabs" role="tablist">
-              {([["positions", `Positions${positions?.filter((p) => p.quantity !== 0).length ? ` (${positions.filter((p) => p.quantity !== 0).length})` : ""}`], ["orders", `Orders${pending?.count ? ` (${pending.count})` : ""}`], ["trades", "Trades"], ["account", "Account"], ["basket", "Basket"], ["broker", "Fyers live"], ["log", "Notifications"]] as const).map(([k, label]) => (
-                <button key={k} type="button" role="tab" aria-selected={false} className="tab" onClick={() => openBottom(k)}>{label}</button>
-              ))}
+              <button type="button" role="tab" aria-selected={false} className="tab am-trade-tab" onClick={() => openBottom("trade")} title="DOM — trade from the price ladder">Trade</button>
+              {BOTTOM_TABS.map(([k, l]) => {
+                const n = k === "positions" ? positions?.filter((p) => p.quantity !== 0).length ?? 0 : k === "orders" ? pending?.count ?? 0 : 0;
+                return <button key={k} type="button" role="tab" aria-selected={false} className="tab" onClick={() => openBottom(k)}>{l}{n ? ` (${n})` : ""}</button>;
+              })}
               <button type="button" className="tab tv-collapse" onClick={() => openBottom(bottomTab)} title="Open panel">▴</button>
             </div>
           )}
@@ -1008,7 +1034,15 @@ export default function Trade() {
               onTab={(t) => openBottom(t)}
               positions={positions}
               managed={managed}
-              pendingCount={pending?.count ?? 0}
+              pendingOrders={pending?.orders ?? []}
+              onCancel={(id) => void onCancel(id)}
+              cancelBusyId={cancelOrder.isPending ? cancelOrder.variables?.broker_order_id ?? null : null}
+              cancelBanner={cancelMessage && (
+                <div className={`result ${cancelMessage.type}`} data-testid="cancel-result">
+                  {cancelMessage.text}
+                </div>
+              )}
+              accountId={accountId}
               privacy={privacy}
               connected={accountId != null}
               accountLabel={realAccounts[0] ? `${realAccounts[0].name} · INR` : ""}
@@ -1016,72 +1050,13 @@ export default function Trade() {
               closeFor={closeFor}
               levelsFor={levelsFor}
               orderFor={orderFor}
+              instant={tset.instant}
+              qty={Number(quantity)}
+              onQty={(n) => setQuantity(n)}
+              onLogout={() => hostAction("logout")}
               maximized={bottomMax}
               onMaximize={() => setBottomMax((v) => !v)}
               onCollapse={() => openBottom(null)}
-              pendingSection={
-          <section className="trade-card" data-testid="trade-pending">
-            <h2>Pending orders</h2>
-            {cancelMessage && (
-              <div
-                className={`result ${cancelMessage.type}`}
-                data-testid="cancel-result"
-              >
-                {cancelMessage.text}
-              </div>
-            )}
-            {(pending?.count ?? 0) === 0 ? (
-              <div className="empty">No pending orders.</div>
-            ) : (
-              <table className="pending-table">
-                <thead>
-                  <tr>
-                    <th>Symbol</th>
-                    <th>Side</th>
-                    <th>Qty</th>
-                    <th>Type</th>
-                    <th>ID</th>
-                    <th />
-                  </tr>
-                </thead>
-                <tbody>
-                  {pending!.orders.map((o) => {
-                    // The mutation's `variables` carries the request body
-                    // while it's in flight; use it to disable just the
-                    // button that was clicked so the rest of the rows
-                    // stay clickable.
-                    const pendingId =
-                      cancelOrder.isPending &&
-                      cancelOrder.variables?.broker_order_id === o.broker_order_id
-                        ? o.broker_order_id
-                        : null;
-                    return (
-                      <tr key={o.id}>
-                        <td className="sym">{o.symbol}</td>
-                        <td className={o.side === "BUY" ? "up" : "down"}>{o.side}</td>
-                        <td>{o.quantity}</td>
-                        <td>{o.order_type}</td>
-                        <td className="broker-id">{o.broker_order_id ?? "—"}</td>
-                        <td>
-                          {o.broker_order_id && (
-                            <button
-                              className="btn small"
-                              onClick={() => onCancel(o.broker_order_id!)}
-                              disabled={pendingId !== null}
-                              data-testid={`cancel-${o.broker_order_id}`}
-                            >
-                              {pendingId !== null ? "cancelling…" : "Cancel"}
-                            </button>
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            )}
-          </section>
-              }
             />
           )}
         </div>
@@ -1567,9 +1542,12 @@ export default function Trade() {
                         <tbody>
                           {chain.strikes.map((s) => {
                             const atm = s.strike === atmStrike;
+                            const maxOi = Math.max(1, ...chain.strikes.map((x) => Math.max(x.ce?.oi ?? 0, x.pe?.oi ?? 0)));
+                            const oiBar = (v: number | null | undefined, side: "ce" | "pe") =>
+                              userPrefs.chainOiBars && v ? { background: `linear-gradient(to ${side === "ce" ? "left" : "right"}, ${side === "ce" ? "rgba(239,83,80,0.22)" : "rgba(38,166,154,0.22)"} ${(v / maxOi) * 100}%, transparent 0)` } : undefined;
                             return (
                               <tr key={s.strike} className={atm ? "atm" : ""} ref={atm ? atmRef : undefined}>
-                                <td className="oi">{fmtOi(s.ce?.oi)}</td>
+                                <td className="oi" style={oiBar(s.ce?.oi, "ce")}>{fmtOi(s.ce?.oi)}</td>
                                 <td className="ce-cell">
                                   {s.ce ? (
                                     <button
@@ -1602,7 +1580,7 @@ export default function Trade() {
                                     "—"
                                   )}
                                 </td>
-                                <td className="oi">{fmtOi(s.pe?.oi)}</td>
+                                <td className="oi" style={oiBar(s.pe?.oi, "pe")}>{fmtOi(s.pe?.oi)}</td>
                               </tr>
                             );
                           })}
@@ -1674,6 +1652,23 @@ export default function Trade() {
       )}
 
       {/* ---- icon bar: each button opens / closes its panel ---- */}
+      {userSettingsOpen && (
+        <UserSettingsDialog
+          onClose={() => setUserSettingsOpen(false)}
+          host={{
+            tset,
+            onTset: changeSetting,
+            privacy,
+            onPrivacy: (v) => {
+              setPrivacy(v);
+              try { localStorage.setItem("trade:privacy", JSON.stringify(v)); } catch { /* best-effort */ }
+            },
+            autosave: L.autosave,
+            onAutosave: L.setAutosave,
+            onPrefs: setUserPrefs,
+          }}
+        />
+      )}
       <nav className="tv-rail" aria-label="Panels">
         {DOCK.map((d) => (
           <button
@@ -1714,7 +1709,7 @@ export default function Trade() {
                 <div className="chart-menu-head">Sync in layout</div>
                 {SYNC_LABELS.map(([k, label]) => (
                   <label key={k} className="tset-row">
-                    <input type="checkbox" checked={sync[k]} onChange={(e) => setSync(k, e.target.checked)} data-testid={`sync-${k}`} />
+                    <input type="checkbox" checked={!!sync[k]} onChange={(e) => setSync(k, e.target.checked)} data-testid={`sync-${k}`} />
                     {label}
                   </label>
                 ))}

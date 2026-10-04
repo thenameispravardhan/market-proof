@@ -6,14 +6,18 @@ import {
   CATEGORIES,
   INDICATORS,
   INDICATOR_BY_TYPE,
+  PLOT_KINDS,
   SOURCES,
   VIS_GROUPS,
+  defaultFills,
   defaultInputs,
   defaultPlots,
   type IndicatorInstance,
   type InputValue,
+  type PlotKind,
 } from "./indicatorCatalog";
 import { Check, ColorInput, Modal, Num, Row, Sel } from "./chartUi";
+import type { InstrumentHit } from "../../types";
 
 export interface StrategyItem {
   id: number;
@@ -24,6 +28,55 @@ export interface StrategyItem {
 export interface IndicatorTemplate {
   name: string;
   items: IndicatorInstance[];
+  /** Saved with "Remember symbol": applying it switches the chart there. */
+  symbol?: { symbol: string; name: string; hit?: InstrumentHit | null };
+  /** Saved with "Remember interval". */
+  interval?: string;
+}
+
+/** "RELIANCE · 15m" — what a template switches the chart to, if anything. */
+export function templateScope(t: IndicatorTemplate, ivLabel: (k: string) => string = (k) => k): string {
+  return [t.symbol?.name, t.interval ? ivLabel(t.interval) : null].filter(Boolean).join(" · ");
+}
+
+export function SaveTemplateDialog({
+  symbolLabel,
+  intervalLabel,
+  existing,
+  onSave,
+  onClose,
+}: {
+  symbolLabel: string;
+  intervalLabel: string;
+  existing: string[];
+  onSave: (name: string, withSymbol: boolean, withInterval: boolean) => void;
+  onClose: () => void;
+}) {
+  const [name, setName] = useState("");
+  const [withSymbol, setWithSymbol] = useState(false);
+  const [withInterval, setWithInterval] = useState(false);
+  const n = name.trim();
+  const save = () => {
+    if (!n) return;
+    onSave(n, withSymbol, withInterval);
+    onClose();
+  };
+  return (
+    <Modal
+      title="Save indicator template"
+      onClose={onClose}
+      width={400}
+      testid="ind-template-save"
+      footer={<><span className="grow" /><button type="button" className="cbtn" onClick={onClose}>Cancel</button><button type="button" className="cbtn primary" disabled={!n} onClick={save} data-testid="ind-template-save-ok">Save</button></>}
+    >
+      <Row label="Template name">
+        <input className="cform-input" autoFocus value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && save()} aria-label="Template name" data-testid="ind-template-name" />
+      </Row>
+      <Check label={`Remember symbol (${symbolLabel})`} checked={withSymbol} onChange={setWithSymbol} testid="ind-template-symbol" />
+      <Check label={`Remember interval (${intervalLabel})`} checked={withInterval} onChange={setWithInterval} testid="ind-template-interval" />
+      {existing.includes(n) && <div className="hint warn-text">Replaces the existing template "{n}".</div>}
+    </Modal>
+  );
 }
 
 export function IndicatorPicker({
@@ -55,11 +108,14 @@ export function IndicatorPicker({
     let items = INDICATORS;
     if (ql) items = items.filter((d) => d.name.toLowerCase().includes(ql) || d.short.toLowerCase().includes(ql) || d.category.toLowerCase().includes(ql));
     else if (tab === "fav") items = items.filter((d) => favorites.includes(d.type));
-    else if (tab !== "all") items = items.filter((d) => d.category === tab);
+    else if (tab === "desk") items = items.filter((d) => d.desk);
+    else if (tab === "all") items = items.filter((d) => !d.desk);
+    else items = items.filter((d) => d.category === tab);
     return items;
   }, [q, tab, favorites]);
   const tabs = [
     { id: "fav", label: "★ Favorites" },
+    { id: "desk", label: "Fyers indicators" },
     { id: "all", label: "Built-ins" },
     ...CATEGORIES.map((c) => ({ id: c, label: `  ${c}` })),
     { id: "strategies", label: "Strategies" },
@@ -85,7 +141,7 @@ export function IndicatorPicker({
           {templates.length === 0 && <div className="hint">No templates yet — save one from the templates button (▦) in the toolbar.</div>}
           {templates.map((t) => (
             <button key={t.name} type="button" className="ind-row" onClick={() => { onApplyTemplate(t); onClose(); }}>
-              <span className="ind-name">▦ {t.name}</span>
+              <span className="ind-name">▦ {t.name}{templateScope(t) && <span className="hint"> · {templateScope(t)}</span>}</span>
               <span className="ind-cat">{t.items.map((i) => INDICATOR_BY_TYPE.get(i.type)?.short ?? i.type).join(", ")}</span>
             </button>
           ))}
@@ -107,8 +163,9 @@ export function IndicatorPicker({
                   data-testid={`chart-ind-${d.type}`}
                 >
                   {d.name}
+                  {d.isNew && <span className="ind-new">NEW</span>}
                 </button>
-                <span className="ind-cat">{off ? "intraday only" : d.category}</span>
+                <span className="ind-cat">{off ? "intraday only" : d.tool ? "drawing tool" : d.category}</span>
               </div>
             );
           })}
@@ -164,7 +221,16 @@ export function IndicatorSettings({
             <button type="button" className="cbtn" onClick={() => setMenu((m) => !m)}>Defaults ▾</button>
             {menu && (
               <div className="chart-menu cdrop up">
-                <button type="button" className="chart-menu-item" onClick={() => { set({ inputs: defaultInputs(def), plots: defaultPlots(def), precision: null }); setMenu(false); }}>Reset settings</button>
+                <button
+                  type="button"
+                  className="chart-menu-item"
+                  onClick={() => {
+                    set({ inputs: defaultInputs(def), plots: defaultPlots(def), fills: defaultFills(def), precision: null, labelsOnScale: true, valuesInStatus: true, vis: undefined });
+                    setMenu(false);
+                  }}
+                >
+                  Reset settings
+                </button>
                 <button type="button" className="chart-menu-item" onClick={() => { onSaveDefault(inst); setMenu(false); }}>Save as default</button>
               </div>
             )}
@@ -184,6 +250,16 @@ export function IndicatorSettings({
               <Sel value={String(inst.inputs[i.key] ?? i.def)} options={(i.options ?? []).map((s) => ({ v: s, l: s }))} onChange={(v) => setInput(i.key, v)} ariaLabel={i.label} />
             ) : i.type === "bool" ? (
               <input type="checkbox" checked={inst.inputs[i.key] === true} onChange={(e) => setInput(i.key, e.target.checked)} aria-label={i.label} />
+            ) : i.type === "symbol" ? (
+              <input
+                className="cform-input"
+                defaultValue={String(inst.inputs[i.key] ?? i.def)}
+                onBlur={(e) => setInput(i.key, e.target.value.trim().toUpperCase())}
+                onKeyDown={(e) => e.key === "Enter" && (e.target as HTMLInputElement).blur()}
+                placeholder="EXCHANGE:SYMBOL"
+                aria-label={i.label}
+                spellCheck={false}
+              />
             ) : (
               <Num value={Number(inst.inputs[i.key] ?? i.def)} min={i.min} max={i.max} step={i.step ?? (i.type === "int" ? 1 : 0.1)} onChange={(v) => setInput(i.key, i.type === "int" ? Math.round(v) : v)} ariaLabel={i.label} />
             )}
@@ -193,6 +269,8 @@ export function IndicatorSettings({
         <>
           {def.plots.map((p, i) => {
             const st = inst.plots[i];
+            const kind: PlotKind = st.kind ?? p.kind ?? "line";
+            const bar = kind === "hist" || kind === "columns";
             return (
               <div key={p.key} className="cform-row">
                 <label className="cform-check">
@@ -201,12 +279,33 @@ export function IndicatorSettings({
                 </label>
                 <span className="cform-ctl">
                   <ColorInput value={st.color} fallback={p.color} onChange={(c) => setPlot(i, { color: c || p.color })} />
-                  {p.kind !== "hist" && (
+                  {p.kind !== "marks" && (
+                    <Sel value={kind} options={PLOT_KINDS} onChange={(k) => setPlot(i, { kind: k === (p.kind ?? "line") ? undefined : k })} ariaLabel={`${p.label} plot type`} />
+                  )}
+                  {!bar && p.kind !== "marks" && (
                     <>
                       <Sel value={st.width} options={[1, 2, 3, 4].map((w) => ({ v: w, l: `${w}px` }))} onChange={(w) => setPlot(i, { width: w })} ariaLabel="Thickness" />
-                      <Sel value={st.dash} options={DASH_OPTS} onChange={(d) => setPlot(i, { dash: d })} ariaLabel="Line style" />
+                      {(kind === "line" || kind === "step" || kind === "area") && <Sel value={st.dash} options={DASH_OPTS} onChange={(d) => setPlot(i, { dash: d })} ariaLabel="Line style" />}
                     </>
                   )}
+                </span>
+              </div>
+            );
+          })}
+          {(def.fills ?? []).map((f, k) => {
+            const st = inst.fills?.[k] ?? { color: f.color, visible: true };
+            const put = (patch: Partial<typeof st>) => {
+              const fills = (inst.fills ?? defaultFills(def)).map((x, j) => (j === k ? { ...x, ...patch } : x));
+              set({ fills });
+            };
+            return (
+              <div key={f.key} className="cform-row">
+                <label className="cform-check">
+                  <input type="checkbox" checked={st.visible} onChange={(e) => put({ visible: e.target.checked })} />
+                  {f.label}
+                </label>
+                <span className="cform-ctl">
+                  <ColorInput value={st.color} fallback={f.color} onChange={(c) => put({ color: c || f.color })} />
                 </span>
               </div>
             );

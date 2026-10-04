@@ -134,6 +134,45 @@ def test_history_accepts_second_resolutions(client: TestClient, monkeypatch) -> 
     assert stub.calls[0]["resolution"] == "15S"
 
 
+def test_history_asks_for_open_interest_only_when_requested(client: TestClient, monkeypatch) -> None:
+    """`oi=1` (the chart's OI indicators on a derivative) reaches the broker
+    as `oi=True`; plain requests keep the old call shape."""
+    seen: list[dict] = []
+
+    class _OiBackend:
+        async def get_history_range(self, symbol: str, **kw):  # noqa: ANN003
+            seen.append(kw)
+            return [[1750000000, 1.0, 2.0, 0.5, 1.5, 10, 4500]]
+
+    monkeypatch.setattr(market, "_fyers_backend", lambda: _OiBackend())
+    base = {"symbol": "NSE:NIFTY26OCTFUT", "resolution": "5", "from": 1, "to": 2}
+    body = client.get("/api/market/history", params={**base, "oi": 1}).json()
+    assert body["ok"] is True and body["candles"][0][6] == 4500
+    client.get("/api/market/history", params=base)
+    assert seen[0].get("oi") is True
+    assert "oi" not in seen[1]
+
+
+def test_fyers_client_sends_oi_flag(monkeypatch) -> None:
+    """The REST call carries oi_flag=1 only when asked."""
+    import asyncio
+
+    from app.execution.fyers_live import FyersClient
+
+    client = FyersClient(app_id="APP-100", access_token="tok")
+    calls: list[dict] = []
+
+    async def fake_request(method, path, params=None, base_url=None, **kw):  # noqa: ANN001, ANN003
+        calls.append(params or {})
+        return {"candles": []}
+
+    monkeypatch.setattr(client, "_request", fake_request)
+    asyncio.run(client.get_history("NSE:X", resolution="5", range_from="1", range_to="2", date_format=0, oi_flag=1))
+    asyncio.run(client.get_history("NSE:X", resolution="5", range_from="1", range_to="2", date_format=0))
+    assert calls[0]["oi_flag"] == "1"
+    assert "oi_flag" not in calls[1]
+
+
 def test_funds_degrades_without_fyers(client: TestClient, monkeypatch) -> None:
     monkeypatch.setattr(market, "_fyers_backend", lambda: None)
     body = client.get("/api/market/funds").json()

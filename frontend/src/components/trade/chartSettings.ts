@@ -7,6 +7,43 @@ import type { DateFormat } from "./chartData";
 
 export type LineVisibility = "hover" | "always" | "never";
 
+/** The chart types built from bricks / columns instead of time bars. */
+export type BrickKind = "renko" | "kagi" | "pnf" | "linebreak" | "range";
+
+/** One brick type's inputs (TradingView shows these per chart type). */
+export interface BrickInputs {
+  /** Box size (Kagi: reversal amount) from the ATR or a fixed value. */
+  method: "atr" | "traditional";
+  atrLength: number;
+  /** Traditional box size / Kagi reversal amount / Range size. */
+  box: number;
+  /** P&F: boxes needed to reverse a column. */
+  reversal: number;
+  /** Build from closes, or from each bar's high and low. */
+  source: "close" | "hl";
+  /** Line break: lines to break for a reversal. */
+  lines: number;
+}
+
+export const DEFAULT_BRICKS: Record<BrickKind, BrickInputs> = {
+  renko: { method: "atr", atrLength: 14, box: 0, reversal: 2, source: "close", lines: 3 },
+  kagi: { method: "atr", atrLength: 14, box: 0, reversal: 1, source: "close", lines: 3 },
+  pnf: { method: "atr", atrLength: 14, box: 0, reversal: 3, source: "close", lines: 3 },
+  linebreak: { method: "atr", atrLength: 14, box: 0, reversal: 3, source: "close", lines: 3 },
+  range: { method: "atr", atrLength: 14, box: 0, reversal: 1, source: "close", lines: 3 },
+};
+
+/** A brick type's effective inputs; settings saved before per-type inputs
+ *  (one shared box size / reversal / lines) still apply. */
+export function brickInputs(s: ChartSettings, k: BrickKind): BrickInputs {
+  const legacy: Partial<BrickInputs> = {
+    ...(s.boxSize > 0 ? { method: "traditional" as const, box: s.boxSize } : {}),
+    ...(k === "pnf" && s.reversal ? { reversal: s.reversal } : {}),
+    ...(k === "linebreak" && s.lineBreak ? { lines: s.lineBreak } : {}),
+  };
+  return { ...DEFAULT_BRICKS[k], ...legacy, ...(s.bricks?.[k] ?? {}) };
+}
+
 export interface ChartSettings {
   // ---- Symbol ----
   colorPrevClose: boolean;
@@ -21,10 +58,12 @@ export interface ChartSettings {
   wickDown: string;
   precision: number | null;
   timezone: string;
-  /** Renko / Kagi / P&F / Range box: 0 = auto (ATR). */
+  /** Legacy shared brick inputs (pre per-type inputs); see `bricks`. */
   boxSize: number;
   reversal: number;
   lineBreak: number;
+  /** Per chart type inputs (Renko, Kagi, P&F, Line break, Range). */
+  bricks: Partial<Record<BrickKind, Partial<BrickInputs>>>;
   // ---- Status line ----
   showTitle: boolean;
   titleMode: "description" | "ticker" | "both";
@@ -37,6 +76,8 @@ export interface ChartSettings {
   indValues: boolean;
   legendBg: boolean;
   legendBgOpacity: number;
+  /** Legend background colour ("" = the panel colour). */
+  legendBgColor: string;
   // ---- Scales and lines ----
   lastPriceLabel: boolean;
   lastPriceLine: boolean;
@@ -53,6 +94,18 @@ export interface ChartSettings {
   indValueLabels: boolean;
   countdown: boolean;
   scaleSide: "right" | "left";
+  /** The dialog's "Scales placement": Auto keeps the price scale on the right. */
+  scalePlacement: "auto" | "right" | "left";
+  /** Price-axis labels are nudged apart instead of overlapping. */
+  noOverlapLabels: boolean;
+  /** Keep price-per-bar fixed while zooming the time axis. */
+  lockRatio: boolean;
+  /** Price units per bar width when locked (0 = take the current view). */
+  priceBarRatio: number;
+  /** Symbol label in scale units (%, indexed) — off shows the raw price. */
+  lastPriceScaleValue: boolean;
+  /** Last-price line / label colour ("" = the last bar's direction). */
+  lastPriceColor: string;
   scaleModesButtons: LineVisibility;
   dateFormat: DateFormat;
   hour12: boolean;
@@ -68,6 +121,8 @@ export interface ChartSettings {
   crosshairStyle: 0 | 1 | 2 | 3;
   watermark: boolean;
   watermarkColor: string;
+  /** Brand logo, bottom-left of the price pane. */
+  logoWatermark: boolean;
   textColor: string;
   fontSize: number;
   scaleLineColor: string;
@@ -80,9 +135,14 @@ export interface ChartSettings {
   buySellButtons: boolean;
   sound: boolean;
   notifications: "all" | "rejections" | "off";
-  plMode: "money" | "percent";
+  plMode: "money" | "percent" | "ticks";
   reverseButton: boolean;
   ordersAlign: "right" | "left";
+  /** Fills from the trade book as marks on the bars, optionally labelled. */
+  executions: boolean;
+  executionLabels: boolean;
+  /** Position / order lines across the whole pane (off = a short stub at the label). */
+  extendLines: boolean;
   // ---- Events ----
   showEvents: boolean;
   sessionBreaks: boolean;
@@ -108,6 +168,7 @@ export const DEFAULT_SETTINGS: ChartSettings = {
   boxSize: 0,
   reversal: 3,
   lineBreak: 3,
+  bricks: {},
   showTitle: true,
   titleMode: "description",
   showOhlc: true,
@@ -119,6 +180,7 @@ export const DEFAULT_SETTINGS: ChartSettings = {
   indValues: true,
   legendBg: false,
   legendBgOpacity: 0.5,
+  legendBgColor: "",
   lastPriceLabel: true,
   lastPriceLine: true,
   symbolNameLabel: false,
@@ -134,6 +196,12 @@ export const DEFAULT_SETTINGS: ChartSettings = {
   indValueLabels: true,
   countdown: true,
   scaleSide: "right",
+  scalePlacement: "auto",
+  noOverlapLabels: true,
+  lockRatio: false,
+  priceBarRatio: 0,
+  lastPriceScaleValue: true,
+  lastPriceColor: "",
   scaleModesButtons: "hover",
   dateFormat: "dd MMM 'yy",
   hour12: false,
@@ -148,6 +216,7 @@ export const DEFAULT_SETTINGS: ChartSettings = {
   crosshairStyle: 3,
   watermark: true,
   watermarkColor: "",
+  logoWatermark: true,
   textColor: "",
   fontSize: 11,
   scaleLineColor: "",
@@ -162,6 +231,9 @@ export const DEFAULT_SETTINGS: ChartSettings = {
   plMode: "money",
   reverseButton: true,
   ordersAlign: "right",
+  executions: true,
+  executionLabels: false,
+  extendLines: true,
   showEvents: true,
   sessionBreaks: false,
   showMarks: true,

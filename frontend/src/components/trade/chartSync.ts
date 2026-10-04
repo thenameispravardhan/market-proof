@@ -7,16 +7,20 @@ export type SyncEvent =
   | { type: "crosshair"; src: string; time: number | null }
   | { type: "range"; src: string; from: number; to: number }
   | { type: "interval"; src: string; interval: string }
-  | { type: "drawings"; src: string; symbol: string };
+  | { type: "drawings"; src: string; symbol: string }
+  /** A date-range preset (1D, 5D, 1M …) or a go-to range picked on one chart. */
+  | { type: "daterange"; src: string; preset?: string; from?: number; to?: number; at?: number };
 
 export interface SyncFlags {
   crosshair: boolean;
   time: boolean;
   interval: boolean;
   drawings: boolean;
+  /** Date-range presets / go-to apply to every chart (separate from scroll sync). */
+  dateRange?: boolean;
 }
 
-export const NO_SYNC: SyncFlags = { crosshair: false, time: false, interval: false, drawings: true };
+export const NO_SYNC: SyncFlags = { crosshair: false, time: false, interval: false, drawings: true, dateRange: false };
 
 type Listener = (e: SyncEvent) => void;
 const listeners = new Set<Listener>();
@@ -76,3 +80,10 @@ export function subscribeLog(l: () => void): () => void {
 
 /** Which chart the pointer is over (keyboard shortcuts go to it). */
 export const chartFocus: { hover: string | null } = { hover: null };
+
+/** The copied drawing, shared by every chart on the page (Ctrl+C in one
+ *  chart, Ctrl+V in another or after switching symbol). */
+export const drawingClipboard: { current: unknown } = { current: null };
+
+/** The copied indicator (legend More → Copy), pasted onto any chart. */
+export const indicatorClipboard: { current: unknown } = { current: null };
