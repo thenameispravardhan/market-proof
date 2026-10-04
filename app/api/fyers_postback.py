@@ -17,6 +17,7 @@ Caddy exempts only the exact path /api/fyers/postback from basic auth.
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -25,7 +26,7 @@ from sqlalchemy.orm import Session
 from app.api import market
 from app.db.models import Trade
 from app.db.session import get_db
-from app.execution.order_reconcile import _unwrap_fyers, reconcile_order_update
+from app.execution.order_reconcile import UNMATCHED_RETRY_S, _unwrap_fyers, reconcile_order_update
 
 router = APIRouter(prefix="/api/fyers", tags=["fyers"])
 
@@ -42,8 +43,14 @@ async def fyers_postback(request: Request, db: Session = Depends(get_db)) -> dic
     if not order_id:
         return {"ok": False, "reason": "no order id"}
     # Only our own orders cost a Fyers call; manual / unknown ids stop here.
-    if db.query(Trade.id).filter(Trade.broker_order_id == order_id).first() is None:
-        return {"ok": True, "matched": False, "order_id": order_id}
+    # Fyers can call before the placing request has committed our row, so
+    # an unknown id gets one more look after a short wait.
+    mine = lambda: db.query(Trade.id).filter(Trade.broker_order_id == order_id).first() is not None  # noqa: E731
+    if not mine():
+        await asyncio.sleep(UNMATCHED_RETRY_S)
+        db.rollback()  # end the read snapshot so the re-check sees a just-committed row
+        if not mine():
+            return {"ok": True, "matched": False, "order_id": order_id}
     backend = market._fyers_backend()  # noqa: SLF001
     if backend is None or not hasattr(backend, "get_order_status"):
         return {"ok": False, "reason": "Fyers not connected", "order_id": order_id}

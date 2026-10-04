@@ -21,6 +21,7 @@ DB-free module; this module owns the DB + event-bus side effects.
 """
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
@@ -32,18 +33,22 @@ from app.services.event_bus import event_bus
 
 log = get_logger(__name__)
 
-# Fyers numeric order-status codes -> text labels.
+# Fyers v3 numeric order-status codes -> text labels (same table as
+# fyers_live._state_from_str). The old table had 4/5/6 shifted, so a real
+# rejection (5) read as "AMO_MODIFIED" and the trade stayed "placed".
 FYERS_STATUS_HINTS: dict[str, str] = {
     "1": "CANCELLED",
     "2": "FILLED",
-    "4": "REJECTED",
-    "5": "AMO_MODIFIED",
-    "6": "AMO_CANCELLED",
-    "7": "MODIFIED",
-    "8": "EXPIRED",
-    "10": "TRIGGERED",
-    "11": "AMO_FROZEN",
+    "4": "TRANSIT",
+    "5": "REJECTED",
+    "6": "PENDING",
+    "7": "EXPIRED",
 }
+
+# Seconds to wait before re-matching an update that beat its own trade row:
+# Fyers can reject within milliseconds, before the placing request commits.
+UNMATCHED_RETRY_S = 2.0
+_retries: set = set()  # strong refs so pending retry tasks aren't GC'd
 
 
 def _split_symbol(raw: str) -> tuple[str, str]:
@@ -94,11 +99,21 @@ _STATUS_MAP = {
     "FILLED": "filled",
     "CANCELLED": "cancelled",
     "REJECTED": "rejected",
+    "EXPIRED": "cancelled",
 }
+_TERMINAL = {"filled", "rejected", "cancelled"}
+
+
+async def _retry_unmatched(payload: dict[str, Any], source: str) -> None:
+    await asyncio.sleep(UNMATCHED_RETRY_S)
+    from app.db.session import SessionLocal
+
+    with SessionLocal() as db:
+        await reconcile_order_update(db, payload, source=source, retry=False)
 
 
 async def reconcile_order_update(
-    db: Session, payload: Mapping[str, Any], *, source: str = "fyers"
+    db: Session, payload: Mapping[str, Any], *, source: str = "fyers", retry: bool = True
 ) -> dict[str, Any]:
     """Reconcile a single Fyers order update against the trades table.
 
@@ -129,8 +144,12 @@ async def reconcile_order_update(
         # update must NEVER spin up a new signal.
         log.info(
             "fyers.reconcile.unmatched_order",
-            source=source, order_id=order_id, status=status_text,
+            source=source, order_id=order_id, status=status_text, retry=retry,
         )
+        if retry:
+            t = asyncio.create_task(_retry_unmatched(dict(payload), source))
+            _retries.add(t)
+            t.add_done_callback(_retries.discard)
         return {"ok": True, "matched": False, "order_id": order_id, "status": new_status}
 
     # Dual-confirmation dedup: the same fill can arrive via the order
@@ -149,7 +168,10 @@ async def reconcile_order_update(
             "ok": True, "matched": True, "deduped": True,
             "trade_id": trade.id, "status": new_status,
         }
-    if trade.status == "filled" and new_status != "filled":
+    # A terminal row never goes back: no fill downgraded, and a late
+    # "transit"/"pending" echo (retries can land out of order) can't
+    # resurrect a rejected or cancelled order.
+    if (trade.status == "filled" and new_status != "filled") or (trade.status in _TERMINAL and new_status == "placed"):
         log.info(
             "fyers.reconcile.kept_fill",
             source=source, order_id=order_id, ignored_status=new_status,

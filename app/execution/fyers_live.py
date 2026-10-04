@@ -445,8 +445,10 @@ class FyersClient:
         return await self._request("POST", "/orders/sync", json_body=payload)
 
     async def cancel_order(self, order_id: str) -> dict[str, Any]:
-        """DELETE /orders?id=<id>."""
-        return await self._request("DELETE", "/orders", params={"id": order_id})
+        """DELETE /orders/sync {"id": <id>} — the v3 cancel. The bare
+        /orders path hits the same Cloudflare anti-bot 403 that moved
+        place_order to /orders/sync."""
+        return await self._request("DELETE", "/orders/sync", json_body={"id": order_id})
 
     async def get_positions(self) -> dict[str, Any]:
         """GET /positions."""
@@ -594,10 +596,11 @@ def _state_from_str(status: str) -> OrderState:
     Fyers' documented status codes (string digits):
         1 = Cancelled
         2 = Traded (filled)
-        3 = (unused / partial)
-        4 = Pending
+        3 = (for future use)
+        4 = Transit
         5 = Rejected
-        6 = Expired
+        6 = Pending
+        7 = Expired
     We also accept the upper-cased English form for tolerance.
     """
     s = (status or "").strip()
@@ -608,7 +611,8 @@ def _state_from_str(status: str) -> OrderState:
             "3": OrderState.PENDING,
             "4": OrderState.PENDING,
             "5": OrderState.REJECTED,
-            "6": OrderState.EXPIRED,
+            "6": OrderState.PENDING,
+            "7": OrderState.EXPIRED,
         }.get(s, OrderState.PENDING)
     upper = s.upper()
     return {
