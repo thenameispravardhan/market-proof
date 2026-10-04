@@ -29,7 +29,8 @@
 // handed to the chart — labels then read as IST market time. The same
 // shift is undone when paging older history from the API.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import {
   AreaSeries,
   BarSeries,
@@ -397,6 +398,9 @@ export default function ChartPanel({
   onClosePosition,
   onChartOrder,
   orderQty,
+  toolbarSlot,
+  toolsSlot,
+  chrome = true,
 }: {
   symbol: string;
   shortName: string;
@@ -413,6 +417,12 @@ export default function ChartPanel({
   onChartOrder?: (o: ChartOrder) => Promise<string>;
   /** Quantity those orders use (the ticket's). */
   orderQty?: number;
+  /** Shared top-toolbar / drawing-strip containers (multi-chart layouts):
+   *  the active chart renders its controls there instead of inside itself. */
+  toolbarSlot?: HTMLElement | null;
+  toolsSlot?: HTMLElement | null;
+  /** false = no toolbar / drawing strip at all (an inactive layout cell). */
+  chrome?: boolean;
   /** Position-average / pending-order levels to mark on the chart. */
   brokerLines?: BrokerLine[];
   /** When set, the "→ Ticket" tool sends a clicked price to the caller. */
@@ -488,6 +498,11 @@ export default function ChartPanel({
   const posTagRefs = useRef<{ entry: HTMLDivElement | null; sl: HTMLDivElement | null; tp: HTMLDivElement | null }>({ entry: null, sl: null, tp: null });
   const levelDragRef = useRef<{ which: "sl" | "tp"; price: number } | null>(null);
   const [levelDrag, setLevelDrag] = useState<"sl" | "tp" | null>(null);
+  // "+" riding the price scale at the crosshair (TradingView): opens the same menu.
+  const plusRef = useRef<HTMLButtonElement | null>(null);
+  const plusPriceRef = useRef<number | null>(null);
+  const overPlusRef = useRef(false);
+  const plusHideRef = useRef<number | undefined>(undefined);
   // Right-click menu: orders / alert / ticket at the clicked price.
   const [ctx, setCtx] = useState<{ x: number; y: number; price: number; confirm?: ChartOrder } | null>(null);
   // HA open/close of the bar BEFORE the live bar (live HA updates).
@@ -1192,6 +1207,26 @@ export default function ChartPanel({
   // ------------------------------------------------------------------
 
   function onCrosshair(param: MouseEventParams): void {
+    const plus = plusRef.current;
+    if (plus) {
+      const pr = param.point && (param.paneIndex ?? 0) === 0 ? mainRef.current?.coordinateToPrice(param.point.y) : null;
+      if (param.point && pr != null) {
+        window.clearTimeout(plusHideRef.current);
+        plusPriceRef.current = Math.round((pr as number) * 100) / 100;
+        plus.style.top = `${param.point.y - 9}px`;
+        plus.style.right = `${(chartRef.current?.priceScale("right").width() || 60) + 3}px`;
+        plus.style.display = "grid";
+      } else if (!overPlusRef.current) {
+        // Moving onto the "+" itself leaves the chart: give the pointer a
+        // moment to arrive before hiding it.
+        window.clearTimeout(plusHideRef.current);
+        plusHideRef.current = window.setTimeout(() => {
+          if (overPlusRef.current || !plusRef.current) return;
+          plusRef.current.style.display = "none";
+          plusPriceRef.current = null;
+        }, 250);
+      }
+    }
     // ghost preview for in-progress two-click drawings
     const pending = pendingRef.current;
     if (pending && param.point && (param.paneIndex ?? 0) === 0) {
@@ -1445,6 +1480,21 @@ export default function ChartPanel({
     const target = e.target as HTMLElement | null;
     const typing =
       target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA");
+    // TradingView's price shortcuts, for the chart under the mouse only.
+    const hp = plusPriceRef.current;
+    if (hp != null && !typing && target?.tagName !== "SELECT") {
+      const k = e.key.toLowerCase();
+      if (e.altKey && !e.shiftKey && k === "a") { e.preventDefault(); addAlert(hp); return; }
+      if (e.altKey && !e.shiftKey && k === "h") { e.preventDefault(); addHLine(hp); return; }
+      if (!e.altKey && e.shiftKey && k === "t" && onPickPrice) { e.preventDefault(); onPickPrice(hp); return; }
+      if (e.altKey && e.shiftKey && k === "b" && onChartOrder) {
+        e.preventDefault();
+        const o = ctxOrders(hp)[0];
+        const w = containerRef.current?.clientWidth ?? 600;
+        setCtx({ x: w - 300, y: parseFloat(plusRef.current?.style.top || "40"), price: hp, confirm: o });
+        return;
+      }
+    }
     if (e.key === "Escape") {
       if (typing) return;
       const drag = dragRef.current;
@@ -1999,6 +2049,16 @@ export default function ChartPanel({
     return () => { document.removeEventListener("mousedown", close); document.removeEventListener("keydown", esc); };
   }, [ctx]);
 
+  function addHLine(price: number): void {
+    const t = candlesRef.current[candlesRef.current.length - 1]?.time ?? 0;
+    addDrawing({ id: newDrawingId(), type: "hline", points: [{ time: t as number, price }] });
+    addToast(`horizontal line at ${fmtPrice(price)}`);
+  }
+
+  // Controls render inline, into a shared slot (layouts), or not at all.
+  const placeChrome = (el: ReactNode, slot: HTMLElement | null | undefined) =>
+    !chrome ? null : slot ? createPortal(el, slot) : el;
+
   function openCtx(e: React.MouseEvent): void {
     const host = containerRef.current, main = mainRef.current;
     if (!host || !main) return;
@@ -2321,6 +2381,7 @@ export default function ChartPanel({
       className="trade-card chart-card"
       data-testid="trade-chart"
     >
+      {placeChrome(
       <div className="chart-toolbar">
         <div className="chart-symbol" title={symbol}>
           <span className="sym">{shortName}</span>
@@ -2589,8 +2650,10 @@ export default function ChartPanel({
           </button>
         </div>
       </div>
+      , toolbarSlot)}
 
       <div className="chart-body">
+        {placeChrome(
         <div className="chart-tools" role="toolbar" aria-label="drawing tools">
           <button
             type="button"
@@ -2664,6 +2727,7 @@ export default function ChartPanel({
             🗑
           </button>
         </div>
+        , toolsSlot)}
       <div className="chart-container" onContextMenu={openCtx}>
         <div ref={containerRef} className="chart-host" />
         <div className="chart-watermark">{shortName}</div>
@@ -2720,6 +2784,26 @@ export default function ChartPanel({
             )}
           </div>
         )}
+        <button
+          ref={plusRef}
+          type="button"
+          className="chart-plus"
+          style={{ display: "none" }}
+          title="Alert, orders and a line at this price"
+          onMouseEnter={() => { overPlusRef.current = true; window.clearTimeout(plusHideRef.current); }}
+          onMouseLeave={() => { overPlusRef.current = false; }}
+          onMouseDown={(e) => e.stopPropagation()}
+          onClick={() => {
+            const pr = plusPriceRef.current;
+            if (pr == null) return;
+            const w = containerRef.current?.clientWidth ?? 600;
+            const ps = chartRef.current?.priceScale("right").width() || 60;
+            setCtx({ x: w - ps - 250, y: parseFloat(plusRef.current?.style.top || "0") + 22, price: pr });
+          }}
+          data-testid="chart-plus"
+        >
+          +
+        </button>
         {ctx && (
           <div
             className="chart-menu chart-ctx"
@@ -2753,27 +2837,33 @@ export default function ChartPanel({
               </>
             ) : (
               <>
-                <div className="chart-menu-head">{fmtPrice(ctx.price)}</div>
+                <div className="chart-menu-head">{shortName} · {fmtPrice(ctx.price)}</div>
+                <button type="button" className="chart-menu-item" onClick={() => { addAlert(ctx.price); setCtx(null); }}>
+                  🔔 Add alert on {shortName} at {fmtPrice(ctx.price)}<span className="kbd">Alt+A</span>
+                </button>
+                {onChartOrder && <div className="chart-menu-sep" />}
                 {onChartOrder &&
-                  ctxOrders(ctx.price).map((o) => (
-                    <button
-                      key={`${o.side}-${o.type}`}
-                      type="button"
-                      className={`chart-menu-item ctx-${o.side.toLowerCase()}`}
-                      onClick={() => setCtx({ ...ctx, confirm: o })}
-                    >
+                  ctxOrders(ctx.price).filter((o) => o.price != null).map((o, i) => (
+                    <button key={`${o.side}-${o.type}`} type="button" className={`chart-menu-item ctx-${o.side.toLowerCase()}`} onClick={() => setCtx({ ...ctx, confirm: o })}>
+                      {o.side === "BUY" ? "⌃" : "⌄"} {orderLabel(o)}{i === 0 && <span className="kbd">Alt+Shift+B</span>}
+                    </button>
+                  ))}
+                {onPickPrice && (
+                  <button type="button" className="chart-menu-item" onClick={() => { onPickPrice(ctx.price); setCtx(null); }}>
+                    ⤷ Add order on {shortName} at {fmtPrice(ctx.price)}…<span className="kbd">Shift+T</span>
+                  </button>
+                )}
+                <div className="chart-menu-sep" />
+                <button type="button" className="chart-menu-item" onClick={() => { addHLine(ctx.price); setCtx(null); }}>
+                  ─ Draw horizontal line at {fmtPrice(ctx.price)}<span className="kbd">Alt+H</span>
+                </button>
+                {onChartOrder && <div className="chart-menu-sep" />}
+                {onChartOrder &&
+                  ctxOrders(ctx.price).filter((o) => o.price == null).map((o) => (
+                    <button key={`${o.side}-mkt`} type="button" className={`chart-menu-item ctx-${o.side.toLowerCase()}`} onClick={() => setCtx({ ...ctx, confirm: o })}>
                       {orderLabel(o)}
                     </button>
                   ))}
-                {onChartOrder && <div className="chart-menu-sep" />}
-                <button type="button" className="chart-menu-item" onClick={() => { addAlert(ctx.price); setCtx(null); }}>
-                  🔔 Alert at {fmtPrice(ctx.price)}
-                </button>
-                {onPickPrice && (
-                  <button type="button" className="chart-menu-item" onClick={() => { onPickPrice(ctx.price); setCtx(null); }}>
-                    ⤷ Use {fmtPrice(ctx.price)} in the ticket
-                  </button>
-                )}
               </>
             )}
           </div>
