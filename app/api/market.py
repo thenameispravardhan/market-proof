@@ -38,7 +38,11 @@ router = APIRouter(tags=["market"])
 # is rejected before it reaches the broker ("D" = daily, numbers are
 # minutes).
 CHART_RESOLUTIONS: frozenset[str] = frozenset(
-    {"1", "2", "3", "5", "10", "15", "20", "30", "45", "60", "120", "180", "240", "D"}
+    {
+        # Fyers v3 second candles (recent sessions only)
+        "5S", "10S", "15S", "30S", "45S",
+        "1", "2", "3", "5", "10", "15", "20", "30", "45", "60", "120", "180", "240", "D",
+    }
 )
 
 
@@ -330,6 +334,20 @@ async def market_quotes(symbols: str = "") -> dict[str, Any]:
     qs = await fyers_quotes(syms)
     return {"quotes": {s: {"ltp": q.last_price, "change": q.change, "change_pct": q.change_pct}
                        for s, q in qs.items()}}
+
+
+@router.get("/api/market/funds")
+async def market_funds() -> dict[str, Any]:
+    """Available funds (₹) of the connected Fyers account for the Trade
+    page's account manager. Always 200; `ok: false` with a reason when
+    Fyers isn't connected or the broker call fails."""
+    backend = _fyers_backend()
+    if backend is None or not hasattr(backend, "get_funds"):
+        return {"ok": False, "available": None, "reason": "connect a Fyers account for funds"}
+    available = await fetch_funds()
+    if available is None:
+        return {"ok": False, "available": None, "reason": "broker funds call failed"}
+    return {"ok": True, "available": available, "reason": None}
 
 
 @router.get("/api/market/indices")
