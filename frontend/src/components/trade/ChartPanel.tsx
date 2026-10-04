@@ -27,7 +27,7 @@
 // other display time zones are applied by the formatters. The same shift
 // is undone when paging older history from the API.
 
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import {
   AreaSeries,
@@ -53,6 +53,7 @@ import {
   type UTCTimestamp,
 } from "lightweight-charts";
 import { api } from "../../api/client";
+import { getTheme, THEME_EVENT, toggleTheme } from "../../lib/theme";
 import { useLiveQuote } from "../../hooks/useQuotes";
 import { heikinAshi, heikinAshiBar, type OhlcvCandle } from "../../lib/indicators";
 import type { HistoryResponse, InstrumentHit, SearchResponse } from "../../types";
@@ -62,10 +63,12 @@ import {
   fetchPlan,
   formatClock,
   formatDate,
+  intervalCount,
   intervalGroup,
   intervalLabel,
   intervalLongLabel,
   intervalSeconds,
+  isDerivative,
   isIntraday,
   kagi,
   lineBreak,
@@ -86,6 +89,7 @@ import {
 import {
   INDICATOR_BY_TYPE,
   argsLabel,
+  instanceDefaults,
   instanceTitle,
   migrateActive,
   newInstance,
@@ -93,7 +97,11 @@ import {
   sanitizeInstance,
   visibleOnInterval,
   type IndicatorInstance,
+  type Mark,
+  type PlotKind,
 } from "./indicatorCatalog";
+import { symbolInputs, volumeProfileRows } from "./indicatorMore";
+import { FillPrimitive, paintOiProfile, paintProfile, type FillBand, type OiStrike } from "./indicatorRender";
 import {
   DrawingsPrimitive,
   TOOL_BY_ID,
@@ -109,6 +117,7 @@ import {
   styleOf,
   visibleNow,
   type Drawing,
+  type DrawingData,
   type DrawingDeps,
   type DrawingPoint,
   type DrawingStyle,
@@ -117,10 +126,10 @@ import {
 } from "./drawings";
 import { ShapeSeries, type ShapeMode } from "./customSeries";
 import { beep, evaluate, migrateAlert, newAlert, type AlertItem } from "./alerts";
-import { chartFocus, NO_SYNC, publishSync, pushLog, subscribeSync, type SyncFlags } from "./chartSync";
-import { LIGHT, loadSettings, saveSettings, type ChartSettings } from "./chartSettings";
+import { chartFocus, drawingClipboard, indicatorClipboard, NO_SYNC, publishSync, pushLog, subscribeSync, type SyncFlags } from "./chartSync";
+import { LIGHT, brickInputs, loadSettings, saveSettings, type BrickKind, type ChartSettings } from "./chartSettings";
 import ChartSettingsDialog, { type TradingFlags } from "./ChartSettingsDialog";
-import { IndicatorPicker, IndicatorSettings, type IndicatorTemplate, type StrategyItem } from "./IndicatorDialogs";
+import { IndicatorPicker, IndicatorSettings, SaveTemplateDialog, templateScope, type IndicatorTemplate, type StrategyItem } from "./IndicatorDialogs";
 import {
   AlertDialog,
   CommandPalette,
@@ -132,7 +141,9 @@ import {
   type Command,
 } from "./ChartDialogs";
 import { DrawingFloatBar, FavoritesBar, LeftToolbar, type CursorMode, type Magnet } from "./DrawingToolbar";
-import { AlertsPanel, DataWindow, ObjectTree, type DataRow, type TreeItem } from "./ChartWidgets";
+import { AlertsPanel, DataWindow, ObjectTree, type DataRow, type GroupAction, type TreeDrop, type TreeItem } from "./ChartWidgets";
+import { AboutIndicatorDialog, InsightsDialog, ManagePanesDialog, WhatsNewDialog } from "./ChartInfoDialogs";
+import { CHART_SETTINGS_EVENT } from "./UserSettings";
 
 const IST = IST_OFFSET;
 
@@ -214,8 +225,10 @@ const RANGES: RangeDef[] = [
 export type HostAction =
   | "panel:chain" | "panel:details" | "panel:tree" | "panel:data" | "panel:alerts" | "panel:watch" | "panel:flow"
   | "panel:depth" | "panel:tape" | "panel:futures" | "panel:strategy"
-  | "bottom:positions" | "bottom:orders" | "bottom:basket"
-  | "scalper" | "layouts" | "save" | "maximize" | "watch:add" | "privacy";
+  | "bottom:positions" | "bottom:orders" | "bottom:basket" | "bottom:smart"
+  | "scalper" | "layouts" | "save" | "maximize" | "watch:add" | "privacy" | "logout" | "usersettings"
+  /** Quick trade with one-click OFF: open the order window on that side. */
+  | "ticket:buy" | "ticket:sell";
 
 interface ToolMenuItem {
   id: string;
@@ -223,14 +236,18 @@ interface ToolMenuItem {
   icon: string;
   host?: HostAction;
   badge?: string;
+  /** Label when pinned to the top bar. */
+  short?: string;
+  /** A Fyers account page (funds, MTF, eDIS …) opened in a new tab. */
+  href?: string;
 }
 
 const TOOLS_MENU: ToolMenuItem[] = [
-  { id: "replay", label: "Bar Replay", icon: "⏪" },
-  { id: "flow", label: "Order Flow", icon: "Δ", host: "panel:flow", badge: "NEW" },
-  { id: "chain", label: "Option Chain", icon: "⊞", host: "panel:chain" },
-  { id: "scalper", label: "Option Scalper", icon: "⚡", host: "scalper" },
-  { id: "positions", label: "Manage Positions & Orders", icon: "⇅", host: "bottom:positions" },
+  { id: "replay", label: "Bar Replay", icon: "⏪", short: "Replay" },
+  { id: "flow", label: "Order Flow", icon: "Δ", host: "panel:flow", badge: "NEW", short: "Order Flow" },
+  { id: "chain", label: "Option Chain", icon: "⊞", host: "panel:chain", short: "Option Chain" },
+  { id: "scalper", label: "Option Scalper", icon: "⚡", host: "scalper", short: "Scalper" },
+  { id: "positions", label: "Manage Positions & Orders", icon: "⇅", host: "bottom:positions", short: "Positions" },
   { id: "basket", label: "Basket Orders", icon: "🧺", host: "bottom:basket" },
   { id: "strategy", label: "Strategy Builder", icon: "⚖", host: "panel:strategy" },
   { id: "depth", label: "Market Depth (DOM)", icon: "≣", host: "panel:depth" },
@@ -242,20 +259,30 @@ const TOOLS_MENU: ToolMenuItem[] = [
   { id: "theme", label: "Change Theme (dark / light)", icon: "◐" },
   { id: "privacy", label: "Privacy (mask P&L)", icon: "🙈", host: "privacy" },
   { id: "settings", label: "User Settings", icon: "⚙" },
+  { id: "smartbook", label: "Smart Orderbook", icon: "📑", host: "bottom:smart" },
   { id: "shortcuts", label: "Keyboard Shortcuts", icon: "⌨" },
+  // Broker account services live on Fyers' own site: these open it.
+  { id: "funds", label: "Add Funds", icon: "₹", href: "https://trade.fyers.in/" },
+  { id: "mtf", label: "Pay later (MTF)", icon: "⏳", href: "https://fyers.in/" },
+  { id: "edis", label: "Holding Authorization (eDIS)", icon: "🔐", href: "https://trade.fyers.in/" },
+  { id: "fia", label: "FIA", icon: "✦", href: "https://fyers.in/" },
+  { id: "refer", label: "Refer & Earn", icon: "🎁", href: "https://fyers.in/" },
+  { id: "prime", label: "FYERS Prime", icon: "★", href: "https://fyers.in/" },
 ];
 
 type ScaleMode = "normal" | "log" | "percent" | "indexed";
 type DrawMode = string | null; // a tool id, "alert", "ticket", "zoom", "image", or null
-type MenuId = "interval" | "kind" | "templates" | "alerts" | "compare" | "tools" | "snapshot" | "scale" | "tz" | null;
+type MenuId = "interval" | "kind" | "templates" | "alerts" | "compare" | "tools" | "snapshot" | "scale" | "tz" | "products" | null;
 type StratTrade = { side: string; entry_t: number; exit_t: number; entry: number; exit: number; net: number; reason: string; instrument: string };
 type StratRun = { name: string; trades: StratTrade[]; stats: Record<string, number | null>; error?: string; running?: boolean };
 
 /** An order placed from the chart's right-click menu. */
 export interface ChartOrder {
   side: "BUY" | "SELL";
-  type: "MARKET" | "LIMIT" | "SL-M";
+  /** STOP_LOSS = stop-limit: `price` is the trigger, `limit` the limit price. */
+  type: "MARKET" | "LIMIT" | "SL-M" | "STOP_LOSS";
   price: number | null;
+  limit?: number | null;
 }
 
 /** An open position on the charted symbol and its managed exits. */
@@ -281,11 +308,21 @@ const MAX_CANDLES = 20000;
 
 const PREFS_KEY = "chart:prefs";
 
+/** Where a compared symbol plots: on the main scale in %, on its own price
+ *  scale (the opposite axis), or in a pane of its own. */
+type CompareMode = "percent" | "scale" | "pane";
+const COMPARE_MODES: { v: CompareMode; l: string }[] = [
+  { v: "percent", l: "Same % scale" },
+  { v: "scale", l: "New price scale" },
+  { v: "pane", l: "New pane" },
+];
+
 interface CompareItem {
   symbol: string;
   name: string;
   color: string;
   hidden?: boolean;
+  mode?: CompareMode;
 }
 
 interface ChartEvent {
@@ -306,6 +343,10 @@ interface ThemeColors {
   draw: string;
   crosshair: string;
   bg: string;
+}
+
+function escapeHtml(t: string): string {
+  return t.replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch] ?? ch);
 }
 
 /** #RGB / #RRGGBB → rgba() at the given alpha; `fallback` otherwise. */
@@ -429,6 +470,7 @@ interface ChartPrefs {
   showFavBar?: boolean;
   toolsCollapsed?: boolean;
   pinnedTools?: string[];
+  mainHidden?: boolean;
 }
 
 /** Fetch + normalise one page of candles (sorted, deduped, IST-shifted). */
@@ -445,13 +487,15 @@ async function fetchHistory(
       from: String(Math.max(0, Math.floor(fromTs))),
       to: String(Math.floor(toTs)),
     });
+    // Futures / options: ask for open interest too (the OI indicators read it).
+    if (isDerivative(symbol)) qs.set("oi", "1");
     const r = await api.get<HistoryResponse>(`/api/market/history?${qs.toString()}`);
     if (!r.ok) return { candles: [], reason: r.reason ?? "chart data unavailable" };
     const rows = Array.isArray(r.candles) ? r.candles : [];
     const out: Candle[] = [];
     for (const row of rows) {
       if (!Array.isArray(row) || row.length < 5) continue;
-      const [ts, o, h, l, c, v] = row;
+      const [ts, o, h, l, c, v, oi] = row as number[];
       const nums = [ts, o, h, l, c];
       if (!nums.every((x) => typeof x === "number" && Number.isFinite(x))) continue;
       out.push({
@@ -461,6 +505,7 @@ async function fetchHistory(
         low: l,
         close: c,
         volume: typeof v === "number" && Number.isFinite(v) ? v : 0,
+        ...(typeof oi === "number" && Number.isFinite(oi) ? { oi } : {}),
       });
     }
     out.sort((a, b) => a.time - b.time);
@@ -593,7 +638,7 @@ export interface ChartPanelProps {
 }
 
 type Dialog =
-  | { k: "symbol"; q: string; compare?: boolean }
+  | { k: "symbol"; q: string; compare?: boolean; select?: boolean }
   | { k: "indicators" }
   | { k: "indSettings"; uid: string }
   | { k: "settings"; tab?: string }
@@ -603,6 +648,11 @@ type Dialog =
   | { k: "palette" }
   | { k: "shortcuts" }
   | { k: "interval"; txt: string }
+  | { k: "about"; uid: string }
+  | { k: "panes" }
+  | { k: "insights" }
+  | { k: "whatsnew" }
+  | { k: "saveTemplate" }
   | null;
 
 interface Ctx {
@@ -621,6 +671,80 @@ interface Snap {
   indicators: IndicatorInstance[];
   kind: ChartKind;
   iv: string;
+  /** Set on "change symbol" steps: undo switches the chart back. */
+  symbol?: string;
+  hit?: InstrumentHit | null;
+  /** Set on "change settings" steps. */
+  settings?: ChartSettings;
+  /** Set on "reset scales" steps: the view to return to. */
+  view?: { auto: boolean; mode: ScaleMode; invert: boolean; range: { from: number; to: number } | null; price: { from: number; to: number } | null };
+}
+
+/** Undo history per chart cell, kept across the remount a symbol change
+ *  causes — so "Undo change symbol" can bring the previous symbol back. */
+interface UndoStore {
+  past: Snap[];
+  future: Snap[];
+  symbol: string | null;
+  hit: InstrumentHit | null;
+  /** An undo / redo is switching the symbol: don't record it as a new change. */
+  restoring: boolean;
+}
+const UNDO_STORES = new Map<string, UndoStore>();
+function undoStore(key: string): UndoStore {
+  let st = UNDO_STORES.get(key);
+  if (!st) {
+    st = { past: [], future: [], symbol: null, hit: null, restoring: false };
+    UNDO_STORES.set(key, st);
+  }
+  return st;
+}
+
+/** A cell's history is capped: drop its oldest step and that step's journal entry. */
+function dropOldest(st: UndoStore): void {
+  st.past.shift();
+  for (const [key, v] of UNDO_STORES) {
+    if (v !== st) continue;
+    const k = UNDO_JOURNAL.past.indexOf(key);
+    if (k >= 0) UNDO_JOURNAL.past.splice(k, 1);
+  }
+}
+
+/** One history for the whole layout, like TradingView's: the cells keep
+ *  their own snapshots, the journal keeps the order steps happened in
+ *  across cells. Undo / redo in any chart replays the latest step,
+ *  whichever chart it was in. */
+export const UNDO_JOURNAL: { past: string[]; future: string[] } = { past: [], future: [] };
+const UNDO_HANDLERS = new Map<string, { undo: () => boolean; redo: () => boolean; label: (which: "past" | "future") => string }>();
+const journalListeners = new Set<() => void>();
+function journalChanged(): void {
+  journalListeners.forEach((f) => f());
+}
+
+/** A new step in `cell`: it goes on the journal, and every redo is gone. */
+export function journalPush(cell: string): void {
+  UNDO_JOURNAL.past.push(cell);
+  if (UNDO_JOURNAL.past.length > 300) UNDO_JOURNAL.past.shift();
+  UNDO_JOURNAL.future = [];
+  for (const st of UNDO_STORES.values()) st.future = [];
+  journalChanged();
+}
+
+/** Undo / redo the layout's latest step; false when there's none. Steps
+ *  of a chart that's gone (a smaller layout) are skipped. */
+export function journalStep(which: "undo" | "redo"): boolean {
+  const from = which === "undo" ? UNDO_JOURNAL.past : UNDO_JOURNAL.future;
+  const to = which === "undo" ? UNDO_JOURNAL.future : UNDO_JOURNAL.past;
+  while (from.length) {
+    const cell = from.pop()!;
+    if (UNDO_HANDLERS.get(cell)?.[which]()) {
+      to.push(cell);
+      journalChanged();
+      return true;
+    }
+  }
+  journalChanged();
+  return false;
 }
 
 function computeTheme(s: ChartSettings): ThemeColors {
@@ -689,8 +813,14 @@ export default function ChartPanel(props: ChartPanelProps) {
   );
   const [cursor, setCursor] = useState<CursorMode>(prefs.cursor ?? "cross");
   const [scaleMode, setScaleMode] = useState<ScaleMode>(prefs.scaleMode ?? "normal");
+  const scaleModeRef = useRef(scaleMode);
+  scaleModeRef.current = scaleMode;
   const [autoScale, setAutoScale] = useState(prefs.autoScale ?? true);
+  const autoScaleRef = useRef(autoScale);
+  autoScaleRef.current = autoScale;
   const [invert, setInvert] = useState(prefs.invert ?? false);
+  const invertRef = useRef(invert);
+  invertRef.current = invert;
   const [scalePriceOnly, setScalePriceOnly] = useState(prefs.scalePriceOnly ?? false);
   const [favIntervals, setFavIntervals] = useState<string[]>(prefs.favIntervals ?? DEFAULT_FAV_INTERVALS);
   const [customIntervals, setCustomIntervals] = useState<string[]>(prefs.customIntervals ?? []);
@@ -703,9 +833,13 @@ export default function ChartPanel(props: ChartPanelProps) {
   const [hide, setHide] = useState(prefs.hide ?? { drawings: false, indicators: false, positions: false });
   const [syncDrawings, setSyncDrawings] = useState(prefs.syncDrawings ?? true);
   const [legendCollapsed, setLegendCollapsed] = useState(prefs.legendCollapsed ?? false);
+  const [mainHidden, setMainHidden] = useState(prefs.mainHidden === true);
+  /** The legend's More (⋯) menu: for the main series or one indicator. */
+  const [legendMenu, setLegendMenu] = useState<{ kind: "main" | "ind"; uid?: string; x: number; y: number } | null>(null);
   const [showFavBar, setShowFavBar] = useState(prefs.showFavBar ?? false);
   const [toolsCollapsed, setToolsCollapsed] = useState(prefs.toolsCollapsed ?? false);
-  const [pinnedTools, setPinnedTools] = useState<string[]>(prefs.pinnedTools ?? ["replay"]);
+  // TradingView / Fyers pin these to the top bar out of the box
+  const [pinnedTools, setPinnedTools] = useState<string[]>(prefs.pinnedTools ?? ["flow", "scalper", "positions", "chain", "replay"]);
 
   // ---- state: transient ----
   const [drawMode, setDrawModeState] = useState<DrawMode>(null);
@@ -717,7 +851,16 @@ export default function ChartPanel(props: ChartPanelProps) {
   );
   const [alertLog, setAlertLog] = useState<{ id: number; ts: number; text: string }[]>(() => loadJson(`chart:alertLog:${symbol}`, []));
   const [compares, setCompares] = useState<CompareItem[]>([]);
+  /** A compare on the main scale forces it into percent. */
+  const pctCompare = compares.some((c) => (c.mode ?? "percent") === "percent");
+  const comparesLenRef = useRef(0);
+  comparesLenRef.current = pctCompare ? compares.length : 0;
+  /** The opposite axis, shown while a compare sits on its own price scale. */
+  const cmpOtherSide = compares.some((c) => c.mode === "scale") ? (settings.scaleSide === "right" ? "left" : "right") : null;
   const [compareQuery, setCompareQuery] = useState("");
+  /** Interval-menu sections the user folded away (persisted). */
+  const [ivCollapsed, setIvCollapsed] = useState<string[]>(() => loadJson<string[]>("chart:ivCollapsed", []) ?? []);
+  useEffect(() => saveJson("chart:ivCollapsed", ivCollapsed), [ivCollapsed]);
   const [compareHits, setCompareHits] = useState<{ symbol: string; name: string }[]>([]);
   const [atLive, setAtLive] = useState(true);
   const [toasts, setToasts] = useState<{ id: number; text: string }[]>([]);
@@ -732,10 +875,14 @@ export default function ChartPanel(props: ChartPanelProps) {
   const [strat, setStrat] = useState<StratRun | null>(null);
   const [dialog, setDialog] = useState<Dialog>(null);
   const [ctx, setCtx] = useState<Ctx | null>(null);
+  /** The context menu's Trade ▸ flyout (rendered beside the menu, which scrolls). */
+  const [tradeFly, setTradeFly] = useState<{ x: number; y: number } | null>(null);
   const [levelDrag, setLevelDrag] = useState<"sl" | "tp" | null>(null);
   const [replay, setReplayState] = useState({ on: false, selecting: false, playing: false, speed: 1, idx: 0 });
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const [paneRects, setPaneRects] = useState<{ i: number; top: number; height: number }[]>([]);
+  /** Width of a visible left price axis — the legends start right of it. */
+  const [leftAxisW, setLeftAxisW] = useState(0);
   const [paneMode, setPaneMode] = useState<{ max: number | null; collapsed: number[] }>({ max: null, collapsed: [] });
   const [events, setEvents] = useState<ChartEvent[]>([]);
   const [eventTip, setEventTip] = useState<{ x: number; text: string } | null>(null);
@@ -755,8 +902,22 @@ export default function ChartPanel(props: ChartPanelProps) {
     return () => document.removeEventListener("fullscreenchange", on);
   }, []);
 
-  const theme = useMemo(() => computeTheme(settings), [settings.theme, settings.upColor, settings.downColor]); // eslint-disable-line react-hooks/exhaustive-deps
+  // the app skin changes the CSS variables the chart colours come from
+  const [skin, setSkin] = useState(getTheme);
+  useEffect(() => {
+    const on = () => setSkin(getTheme());
+    window.addEventListener(THEME_EVENT, on);
+    return () => window.removeEventListener(THEME_EVENT, on);
+  }, []);
+  const theme = useMemo(() => computeTheme(settings), [settings.theme, settings.upColor, settings.downColor, skin]); // eslint-disable-line react-hooks/exhaustive-deps
   const precision = settings.precision ?? (instrument?.tick_size && instrument.tick_size < 0.01 ? 4 : 2);
+  const tickRef = useRef(0.05);
+  const liveQuoteRef = useRef<ReturnType<typeof useLiveQuote>>(undefined);
+  const brokerLinesPropRef = useRef(brokerLines);
+  brokerLinesPropRef.current = brokerLines;
+  const positionRef = useRef(position);
+  positionRef.current = position;
+  tickRef.current = instrument?.tick_size && instrument.tick_size > 0 ? instrument.tick_size : 0.05;
   const fmtPrice = (v: number) => fmtNum(v, precision);
   const intraday = isIntraday(iv);
   const ivLabel = intervalLabel(iv);
@@ -769,6 +930,10 @@ export default function ChartPanel(props: ChartPanelProps) {
   const [hostEl, setHostEl] = useState<HTMLDivElement | null>(null);
   const legendRef = useRef<HTMLSpanElement | null>(null);
   const countdownRef = useRef<HTMLDivElement | null>(null);
+  /** The top toolbar scrolls sideways when narrow; arrows show what's hidden. */
+  const toolbarRef = useRef<HTMLDivElement | null>(null);
+  const [tbScroll, setTbScroll] = useState({ left: false, right: false });
+  const rawLabelRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const mainRef = useRef<ISeriesApi<SeriesType> | null>(null);
   const indEntriesRef = useRef<{ uid: string; plot: number; series: ISeriesApi<SeriesType> }[]>([]);
@@ -776,7 +941,23 @@ export default function ChartPanel(props: ChartPanelProps) {
   const indPaneRef = useRef<Map<string, number>>(new Map());
   const indLegendRefs = useRef<Map<string, HTMLSpanElement>>(new Map());
   const indHasDataRef = useRef<Map<string, boolean[]>>(new Map());
+  /** Shaded fills per indicator (bar-indexed, shifted plots included). */
+  const indFillDataRef = useRef<Map<string, FillBand[]>>(new Map());
+  const indFillPrimsRef = useRef<FillPrimitive[]>([]);
+  /** Marker plugins on indicator series (patterns, fractals, divergences). */
+  const indMarkerPluginsRef = useRef<Map<ISeriesApi<SeriesType>, { setMarkers: (m: unknown[]) => void }>>(new Map());
+  /** Markers per indicator by bar index (legend / data window text). */
+  const indMarksRef = useRef<Map<string, Map<number, Mark[]>>>(new Map());
+  /** Other symbols' closes by chart time (two-symbol indicators). */
+  const otherDataRef = useRef<Map<string, { from: number; closes: Map<number, number> }>>(new Map());
+  const otherLoadingRef = useRef<Set<string>>(new Set());
+  /** Option-chain open interest for the OI profile. */
+  const oiChainRef = useRef<{ symbol: string; at: number; rows: OiStrike[] } | null>(null);
   const compareSeriesRef = useRef<Map<string, ISeriesApi<"Line">>>(new Map());
+  const comparesRef = useRef<CompareItem[]>([]);
+  comparesRef.current = compares;
+  /** First pane index after the indicator panes (compares in "New pane" go here). */
+  const indPaneCountRef = useRef(1);
   const alertLinesRef = useRef<Map<string, IPriceLine>>(new Map());
   const brokerLinesRef = useRef<IPriceLine[]>([]);
   const extraLinesRef = useRef<Map<string, IPriceLine>>(new Map());
@@ -826,9 +1007,25 @@ export default function ChartPanel(props: ChartPanelProps) {
   const indRefreshTimer = useRef<number | undefined>(undefined);
   const brickTimer = useRef<number | undefined>(undefined);
   const toolDefaultsRef = useRef<Record<string, Partial<DrawingStyle>>>(loadJson("chart:drawStyles", {}));
-  const undoRef = useRef<{ past: Snap[]; future: Snap[] }>({ past: [], future: [] });
-  const clipboardRef = useRef<Drawing | null>(null);
-  const pendingIconRef = useRef<{ emoji?: string; src?: string; w?: number; h?: number } | null>(null);
+  const undoRef = useRef<UndoStore>(undoStore(myId));
+  // A new symbol in this cell (search, watchlist, undo …) is a history step.
+  useEffect(() => {
+    const st = undoRef.current;
+    if (st.symbol && st.symbol !== symbol) {
+      if (st.restoring) st.restoring = false;
+      else {
+        st.past.push({ label: "change symbol", drawings: [], indicators: [], kind: kindRef.current, iv: ivRef.current, symbol: st.symbol, hit: st.hit });
+        if (st.past.length > 100) dropOldest(st);
+        journalPush(myId);
+      }
+      setUndoVer((v) => v + 1);
+    }
+    st.symbol = symbol;
+    st.hit = instrument ?? st.hit;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [symbol]);
+  const clipboardRef = drawingClipboard as { current: Drawing | null }; // shared across charts
+  const pendingIconRef = useRef<DrawingData | null>(null);
 
   // drawing store
   const drawingsRef = useRef<Drawing[]>(loadJson<Drawing[]>(`chart:drawings:${symbol}`, []));
@@ -970,6 +1167,8 @@ export default function ChartPanel(props: ChartPanelProps) {
       barSpacing,
       candles: () => viewRef.current,
       intervalGroup: () => intervalGroup(ivRef.current),
+      intervalCount: () => intervalCount(ivRef.current),
+      tickSize: () => tickRef.current,
       lineColor: () => colorsRef.current.draw,
       accent: () => colorsRef.current.accent,
       upColor: () => colorsRef.current.up,
@@ -1018,6 +1217,58 @@ export default function ChartPanel(props: ChartPanelProps) {
         ctx.stroke();
       }
     }
+    // Short position / order lines when "extended price line" is off.
+    if (!s.extendLines && !hideRef.current.positions) {
+      const left = s.ordersAlign === "left";
+      const stub = (price: number, color: string, dashed: boolean) => {
+        const y = priceToY(price);
+        if (y == null) return;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1;
+        ctx.setLineDash(dashed ? [4, 3] : []);
+        ctx.beginPath();
+        ctx.moveTo(left ? 0 : w - 90, y);
+        ctx.lineTo(left ? 90 : w, y);
+        ctx.stroke();
+      };
+      for (const b of brokerLinesPropRef.current ?? []) stub(b.price, b.kind === "order" ? "#4A90D9" : b.kind === "position-long" ? colorsRef.current.up : colorsRef.current.down, b.kind === "order");
+      const pos = positionRef.current;
+      if (pos) {
+        stub(pos.avg, pos.qty > 0 ? "#2962FF" : colorsRef.current.down, false);
+        if (pos.sl != null) stub(pos.sl, colorsRef.current.down, true);
+        if (pos.tp != null) stub(pos.tp, colorsRef.current.up, true);
+      }
+      ctx.setLineDash([]);
+    }
+    // Chart-drawn indicators: visible-range volume profile, option-chain OI profile.
+    if (!hideRef.current.indicators && c.length > 1) {
+      for (const inst of indicatorsRef.current) {
+        if (!inst.visible || !visibleOnInterval(inst, ivRef.current)) continue;
+        if (inst.type === "vpvr") {
+          const r = safe(() => chartRef.current!.timeScale().getVisibleLogicalRange());
+          const from = Math.max(0, Math.floor(r?.from ?? 0));
+          const to = Math.min(c.length - 1, Math.ceil(r?.to ?? c.length - 1));
+          const prof = to > from ? volumeProfileRows(c.slice(from, to + 1), Number(inst.inputs.rows) || 24, (Number(inst.inputs.va) || 70) / 100) : null;
+          if (prof) {
+            paintProfile(ctx, prof, {
+              w,
+              widthPct: Number(inst.inputs.width) || 30,
+              side: inst.inputs.side === "Left" ? "Left" : "Right",
+              priceToY,
+              up: inst.plots[0]?.color ?? "#26A69A",
+              down: inst.plots[1]?.color ?? "#EF5350",
+              poc: "#F23645",
+            });
+          }
+        }
+        if (inst.type === "oiprofile") {
+          const strikes = Number(inst.inputs.strikes) || 10;
+          ensureOiChain(strikes);
+          const rows = oiChainRef.current?.symbol === symbol ? oiChainRef.current.rows : [];
+          if (rows.length) paintOiProfile(ctx, rows, { w, widthPct: Number(inst.inputs.width) || 25, priceToY, text: colorsRef.current.text });
+        }
+      }
+    }
     const p = pointerRef.current;
     if (replayRef.current.selecting && p) {
       ctx.strokeStyle = "#2962FF";
@@ -1059,8 +1310,8 @@ export default function ChartPanel(props: ChartPanelProps) {
   function pushUndo(label: string, snap?: Snap): void {
     const u = undoRef.current;
     u.past.push(snap ?? snapshot(label));
-    if (u.past.length > 100) u.past.shift();
-    u.future = [];
+    if (u.past.length > 100) dropOldest(u);
+    journalPush(myId);
     setUndoVer((v) => v + 1);
   }
 
@@ -1077,22 +1328,105 @@ export default function ChartPanel(props: ChartPanelProps) {
     bumpDrawings();
   }
 
-  function undo(): void {
+  /** The state to put on the other stack when `s` is undone / redone. */
+  function counterSnap(s: Snap): Snap {
+    if (s.symbol !== undefined) return { ...snapshot(s.label), symbol, hit: instrument ?? null };
+    if (s.settings) return { ...snapshot(s.label), settings: settingsRef.current };
+    if (s.view) return { ...snapshot(s.label), view: viewState() };
+    return snapshot(s.label);
+  }
+
+  function applySnap(s: Snap): void {
+    if (s.symbol !== undefined) {
+      // back to the other symbol: the chart remounts and loads its own drawings
+      if (s.hit && onSymbolChange && s.symbol !== symbol) {
+        undoRef.current.restoring = true;
+        onSymbolChange(s.hit);
+      }
+      return;
+    }
+    if (s.settings) {
+      changeSettings(s.settings);
+      return;
+    }
+    if (s.view) {
+      restoreView(s.view);
+      return;
+    }
+    restoreSnap(s);
+  }
+
+  /** Undo / redo this cell's latest step (the journal decides which cell). */
+  function undoHere(): boolean {
     const u = undoRef.current;
     const s = u.past.pop();
-    if (!s) return;
-    u.future.push(snapshot(s.label));
-    restoreSnap(s);
+    if (!s) return false;
+    u.future.push(counterSnap(s));
+    applySnap(s);
     setUndoVer((v) => v + 1);
+    return true;
+  }
+
+  function redoHere(): boolean {
+    const u = undoRef.current;
+    const s = u.future.pop();
+    if (!s) return false;
+    u.past.push(counterSnap(s));
+    applySnap(s);
+    setUndoVer((v) => v + 1);
+    return true;
+  }
+
+  // the layout-wide history (the journal) reaches this cell through these
+  const undoFnsRef = useRef({ undo: undoHere, redo: redoHere });
+  undoFnsRef.current = { undo: undoHere, redo: redoHere };
+  useEffect(() => {
+    const h = {
+      undo: () => undoFnsRef.current.undo(),
+      redo: () => undoFnsRef.current.redo(),
+      label: (which: "past" | "future") => {
+        const l = undoRef.current[which];
+        return l.length ? l[l.length - 1].label : "";
+      },
+    };
+    UNDO_HANDLERS.set(myId, h);
+    const onJournal = () => setUndoVer((v) => v + 1);
+    journalListeners.add(onJournal);
+    return () => {
+      if (UNDO_HANDLERS.get(myId) === h) UNDO_HANDLERS.delete(myId);
+      journalListeners.delete(onJournal);
+    };
+  }, [myId]);
+
+  function undo(): void {
+    if (!journalStep("undo")) undoHere();
   }
 
   function redo(): void {
-    const u = undoRef.current;
-    const s = u.future.pop();
-    if (!s) return;
-    u.past.push(snapshot(s.label));
-    restoreSnap(s);
-    setUndoVer((v) => v + 1);
+    if (!journalStep("redo")) redoHere();
+  }
+
+  /** Scale / view state ("reset scales" is undoable). */
+  function viewState(): NonNullable<Snap["view"]> {
+    const lr = safe(() => chartRef.current!.timeScale().getVisibleLogicalRange());
+    const h = paneDims().height;
+    const top = safe(() => mainRef.current?.coordinateToPrice(0) as number | null, null);
+    const bot = safe(() => mainRef.current?.coordinateToPrice(h) as number | null, null);
+    return {
+      auto: autoScaleRef.current,
+      mode: scaleModeRef.current,
+      invert: invertRef.current,
+      range: lr ? { from: lr.from as number, to: lr.to as number } : null,
+      price: top != null && bot != null ? { from: Math.min(top, bot), to: Math.max(top, bot) } : null,
+    };
+  }
+
+  function restoreView(v: NonNullable<Snap["view"]>): void {
+    setScaleMode(v.mode);
+    setInvert(v.invert);
+    setAutoScale(v.auto);
+    if (v.range) safe(() => chartRef.current!.timeScale().setVisibleLogicalRange({ from: v.range!.from as Logical, to: v.range!.to as Logical }));
+    if (!v.auto && v.price) setTimeout(() => safe(() => mainRef.current?.priceScale().setVisibleRange(v.price!)), 0);
   }
 
   function selectDrawing(id: string | null): void {
@@ -1334,14 +1668,9 @@ export default function ChartPanel(props: ChartPanelProps) {
         }
         if (s.showBarChange) html += `<span class="${cls}">${chg >= 0 ? "+" : ""}${pf(chg)} (${chg >= 0 ? "+" : ""}${pct.toFixed(2)}%)</span>`;
         if (s.showVolume) html += `<span>Vol<b>${fmtVol(c.volume)}</b></span>`;
-        if (s.showLastDayChange && isIntraday(ivRef.current)) {
-          const day = Math.floor(c.time / 86400);
-          let j = i;
-          while (j >= 0 && Math.floor(view[j].time / 86400) === day) j--;
-          if (j >= 0) {
-            const d = c.close - view[j].close;
-            html += `<span class="${d >= 0 ? "up" : "down"}">Day ${d >= 0 ? "+" : ""}${pf(d)} (${((d / view[j].close) * 100).toFixed(2)}%)</span>`;
-          }
+        if (s.showLastDayChange) {
+          const ld = lastDayChange();
+          if (ld) html += `<span class="${ld.d >= 0 ? "up" : "down"}">Day ${ld.d >= 0 ? "+" : ""}${pf(ld.d)} (${ld.d >= 0 ? "+" : ""}${ld.pct.toFixed(2)}%)</span>`;
         }
         el.innerHTML = html;
       }
@@ -1355,14 +1684,17 @@ export default function ChartPanel(props: ChartPanelProps) {
         continue;
       }
       const prec = inst.precision ?? (def.overlay && !def.ownScale ? s.precision ?? 2 : 2);
-      span.innerHTML = def.plots
-        .map((p, k) => {
-          if (!inst.plots[k]?.visible || indHasDataRef.current.get(uid)?.[k] === false) return "";
-          const v = vals[k]?.[i];
-          const txt = v == null ? "∅" : inst.type === "volume" || inst.type === "obv" || inst.type === "flow" ? fmtVol(v) : fmtNum(v, prec);
-          return `<b style="color:${inst.plots[k].color}">${txt}</b>`;
-        })
-        .join(" ");
+      const marks = indMarksRef.current.get(uid)?.get(i) ?? [];
+      span.innerHTML =
+        def.plots
+          .map((p, k) => {
+            if (p.kind === "marks" || !inst.plots[k]?.visible || indHasDataRef.current.get(uid)?.[k] === false) return "";
+            const v = vals[k]?.[i];
+            const txt = v == null ? "∅" : inst.type === "volume" || inst.type === "obv" || inst.type === "flow" || inst.type === "oi" ? fmtVol(v) : fmtNum(v, prec);
+            return `<b style="color:${inst.plots[k].color}">${txt}</b>`;
+          })
+          .join(" ") +
+        marks.map((m) => ` <b style="color:${m.color ?? "inherit"}">${escapeHtml(m.title ?? m.text ?? "")}</b>`).join("");
     }
     if (widgetSlotsRef.current?.data) {
       cancelAnimationFrame(hoverRaf.current);
@@ -1371,6 +1703,26 @@ export default function ChartPanel(props: ChartPanelProps) {
   }
   const widgetSlotsRef = useRef(widgetSlots);
   widgetSlotsRef.current = widgetSlots;
+
+  /** Today's change (the latest session vs the previous close) — fixed,
+   *  not the hovered bar's: the live quote's when there is one, else from bars. */
+  function lastDayChange(): { d: number; pct: number } | null {
+    const q = liveQuoteRef.current;
+    if (q?.change != null && q.change_pct != null) return { d: q.change, pct: q.change_pct };
+    const c = candlesRef.current;
+    const n = c.length;
+    if (n < 2) return null;
+    const last = c[n - 1];
+    let prev: number | null = null;
+    if (isIntraday(ivRef.current)) {
+      const day = Math.floor(last.time / 86400);
+      let j = n - 1;
+      while (j >= 0 && Math.floor(c[j].time / 86400) === day) j--;
+      if (j >= 0) prev = c[j].close;
+    } else if (intervalGroup(ivRef.current) === "days") prev = c[n - 2].close;
+    if (prev == null || !prev) return null;
+    return { d: last.close - prev, pct: ((last.close - prev) / prev) * 100 };
+  }
 
   function legendLastBar(): void {
     renderLegend(null);
@@ -1387,9 +1739,10 @@ export default function ChartPanel(props: ChartPanelProps) {
     return r.on && !r.selecting ? c.slice(0, r.idx + 1) : c;
   }
 
-  function brickBox(src: Bar[]): number {
-    const s = settingsRef.current;
-    return s.boxSize > 0 ? s.boxSize : autoBox(src);
+  /** A brick type's box (Kagi: reversal amount): fixed, or the ATR's. */
+  function brickBox(src: Bar[], k: BrickKind): number {
+    const b = brickInputs(settingsRef.current, k);
+    return b.method === "traditional" && b.box > 0 ? b.box : autoBox(src, Math.max(1, Math.round(b.atrLength)));
   }
 
   /** Rebuild the displayed series (non-time chart types transform the
@@ -1399,13 +1752,14 @@ export default function ChartPanel(props: ChartPanelProps) {
     const k = kindRef.current;
     let view: Candle[] = src;
     if (BRICK_KINDS.has(k)) {
-      const s = settingsRef.current;
-      const box = brickBox(src);
+      const bk = k as BrickKind;
+      const inp = brickInputs(settingsRef.current, bk);
+      const box = brickBox(src, bk);
       const out =
-        k === "renko" ? renko(src, box)
-          : k === "linebreak" ? lineBreak(src, s.lineBreak)
-            : k === "kagi" ? kagi(src, box)
-              : k === "pnf" ? pointFigure(src, box, s.reversal)
+        bk === "renko" ? renko(src, box, inp.source)
+          : bk === "linebreak" ? lineBreak(src, Math.max(1, Math.round(inp.lines)))
+            : bk === "kagi" ? kagi(src, box, inp.source)
+              : bk === "pnf" ? pointFigure(src, box, Math.max(1, Math.round(inp.reversal)), inp.source)
                 : rangeBars(src, box);
       view = out as Candle[];
       safe(() => mainRef.current?.applyOptions({ box } as never));
@@ -1512,6 +1866,8 @@ export default function ChartPanel(props: ChartPanelProps) {
         ? prev
         : rects,
     );
+    const lw = scaleWidth("left");
+    setLeftAxisW((w) => (Math.abs(w - lw) < 1 ? w : lw));
   }
 
   const LS = [LineStyle.Solid, LineStyle.Dotted, LineStyle.Dashed];
@@ -1526,46 +1882,76 @@ export default function ChartPanel(props: ChartPanelProps) {
     indEntriesRef.current = [];
     indPaneRef.current = new Map();
     indValuesRef.current = new Map();
+    indFillPrimsRef.current = [];
+    indMarkerPluginsRef.current = new Map();
     const s = settingsRef.current;
     const ivk = ivRef.current;
     const intra = isIntraday(ivk);
     let pane = 1;
-    for (const inst of indicatorsRef.current) {
+    const list = indicatorsRef.current;
+    const isGuest = (i: IndicatorInstance) => typeof i.pane === "string" && i.pane !== "own" && i.pane !== "main" && list.some((x) => x.uid === i.pane);
+    // Hosts first so an indicator merged into another's pane finds it.
+    const order = [...list.filter((i) => !isGuest(i)), ...list.filter(isGuest)];
+    for (const inst of order) {
       const def = INDICATOR_BY_TYPE.get(inst.type);
-      if (!def) continue;
+      if (!def || def.tool) continue;
       const shown = !hideRef.current.indicators && inst.visible && visibleOnInterval(inst, ivk) && !(def.intradayOnly && !intra);
       if (!shown) continue;
-      const p = def.overlay ? 0 : pane++;
+      let p: number;
+      if (def.special || inst.pane === "main") p = 0;
+      else if (isGuest(inst) && indPaneRef.current.has(inst.pane as string)) p = indPaneRef.current.get(inst.pane as string) as number;
+      else if (def.overlay && inst.pane !== "own") p = 0;
+      else p = pane++;
       indPaneRef.current.set(inst.uid, p);
+      const onPrice = p === 0;
       const prec = inst.precision ?? (def.overlay && !def.ownScale ? s.precision ?? 2 : 2);
       let first: ISeriesApi<SeriesType> | null = null;
       def.plots.forEach((pd, k) => {
         const st = inst.plots[k];
         if (!st?.visible) return;
-        const kind = pd.kind ?? "line";
-        const scaleId = def.ownScale ? "vol" : pd.scale ?? s.scaleSide;
+        const kind: PlotKind = pd.kind === "marks" ? "marks" : st.kind ?? pd.kind ?? "line";
+        // An oscillator moved onto the price pane (or merged into another
+        // indicator's pane) keeps its own overlay scale, like TradingView —
+        // sharing the price axis would squash the candles.
+        const guest = (!def.overlay && onPrice) || isGuest(inst);
+        const scaleId = inst.scale === "left" || inst.scale === "right" ? inst.scale
+          : inst.scale === "new" || (guest && !def.ownScale) ? `ind-${inst.uid}`
+          : def.ownScale ? "vol" : pd.scale ?? (def.overlay && !onPrice ? "right" : s.scaleSide);
         const common: Record<string, unknown> = {
-          lastValueVisible: s.indValueLabels && inst.labelsOnScale,
+          lastValueVisible: kind !== "marks" && s.indValueLabels && inst.labelsOnScale,
           priceLineVisible: false,
-          title: s.indNameLabels ? (def.plots.length > 1 ? `${def.short} ${pd.label}` : def.short) : "",
+          title: kind !== "marks" && s.indNameLabels ? (def.plots.length > 1 ? `${def.short} ${pd.label}` : def.short) : "",
           priceScaleId: scaleId,
           priceFormat: inst.type === "volume" ? { type: "volume" } : { type: "price", precision: prec, minMove: 10 ** -prec },
-          ...(scalePriceOnlyRef.current && def.overlay && !def.ownScale ? { autoscaleInfoProvider: () => null } : {}),
+          ...((scalePriceOnlyRef.current && def.overlay && !def.ownScale) || kind === "marks" ? { autoscaleInfoProvider: () => null } : {}),
+        };
+        const lineCommon = {
+          color: st.color,
+          lineWidth: Math.max(1, Math.min(4, st.width)) as 1 | 2 | 3 | 4,
+          lineStyle: LS[st.dash] ?? LineStyle.Solid,
+          crosshairMarkerVisible: false,
         };
         let series: ISeriesApi<SeriesType> | undefined;
-        if (kind === "hist") {
+        if (kind === "hist" || kind === "columns") {
           series = safe(() => chart.addSeries(HistogramSeries, { ...common, color: st.color }, p) as ISeriesApi<SeriesType>);
+        } else if (kind === "area") {
+          series = safe(() =>
+            chart.addSeries(
+              AreaSeries,
+              { ...common, ...lineCommon, lineColor: st.color, topColor: withAlpha(st.color, 0.3, st.color), bottomColor: withAlpha(st.color, 0.02, st.color) },
+              p,
+            ) as ISeriesApi<SeriesType>,
+          );
         } else {
           series = safe(() =>
             chart.addSeries(
               LineSeries,
               {
                 ...common,
-                color: st.color,
-                lineWidth: Math.max(1, Math.min(4, st.width)) as 1 | 2 | 3 | 4,
-                lineStyle: LS[st.dash] ?? LineStyle.Solid,
-                crosshairMarkerVisible: false,
+                ...lineCommon,
                 ...(kind === "points" ? { lineVisible: false, pointMarkersVisible: true, pointMarkersRadius: 1.5 } : {}),
+                ...(kind === "circles" ? { lineVisible: false, pointMarkersVisible: true, pointMarkersRadius: Math.max(2.5, st.width + 1.5) } : {}),
+                ...(kind === "marks" ? { lineVisible: false, pointMarkersVisible: false } : {}),
                 ...(kind === "step" ? { lineType: 1 } : {}),
               },
               p,
@@ -1575,8 +1961,9 @@ export default function ChartPanel(props: ChartPanelProps) {
         if (!series) return;
         if (def.ownScale) safe(() => series!.priceScale().applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } }));
         indEntriesRef.current.push({ uid: inst.uid, plot: k, series });
-        if (!first) first = series;
+        if (!first && kind !== "marks") first = series;
       });
+      if (!first) first = indEntriesRef.current.find((e) => e.uid === inst.uid)?.series ?? null;
       if (first && def.levels) {
         for (const level of def.levels) {
           safe(() =>
@@ -1584,11 +1971,90 @@ export default function ChartPanel(props: ChartPanelProps) {
           );
         }
       }
+      if (first && def.fills?.length) {
+        const uid = inst.uid;
+        const prim = new FillPrimitive(() => indFillDataRef.current.get(uid) ?? [], fillX, fillSpan);
+        safe(() => first!.attachPrimitive(prim));
+        indFillPrimsRef.current.push(prim);
+      }
     }
+    indPaneCountRef.current = pane;
     refreshIndicatorData();
     cleanupPanes(chart);
+    placeCompares();
     applyPaneSizes();
     setTimeout(measurePanes, 0);
+  }
+
+  /** Put each compare on its scale / pane: % compares share the main scale,
+   *  the first "New price scale" one takes the opposite axis (later ones get
+   *  overlay scales of their own), and "New pane" ones follow the indicator panes. */
+  function placeCompares(): void {
+    const s = settingsRef.current;
+    const main = s.scaleSide;
+    const other = main === "right" ? "left" : "right";
+    let axisTaken = false;
+    let pane = indPaneCountRef.current;
+    for (const c of comparesRef.current) {
+      const series = compareSeriesRef.current.get(c.symbol);
+      if (!series) continue;
+      const mode = c.mode ?? "percent";
+      const scaleId = mode === "percent" ? main : mode === "pane" ? main : !axisTaken ? other : `cmp-${c.symbol}`;
+      if (mode === "scale" && !axisTaken) axisTaken = true;
+      safe(() => series.applyOptions({ priceScaleId: scaleId }));
+      const want = mode === "pane" ? pane++ : 0;
+      const at = safe(() => series.getPane().paneIndex(), 0) ?? 0;
+      if (at !== want) safe(() => series.moveToPane(want));
+    }
+    applyPaneSizes();
+    setTimeout(measurePanes, 0);
+  }
+
+  /** x of a bar index (logical), also past the last bar for shifted plots. */
+  function fillX(j: number): number | null {
+    return safe(() => chartRef.current!.timeScale().logicalToCoordinate(j as Logical) as number | null, null) ?? null;
+  }
+
+  function fillSpan(): [number, number] {
+    const r = safe(() => chartRef.current!.timeScale().getVisibleLogicalRange());
+    return r ? [Math.floor(r.from) - 2, Math.ceil(r.to) + 2] : [0, viewRef.current.length + 500];
+  }
+
+  /** Fetch another symbol's candles over the loaded span (two-symbol indicators). */
+  function ensureOther(sym: string): void {
+    const v = viewRef.current;
+    if (!v.length || otherLoadingRef.current.has(sym)) return;
+    const need = v[0].time;
+    const have = otherDataRef.current.get(sym);
+    if (have && have.from <= need) return;
+    otherLoadingRef.current.add(sym);
+    const pl = fetchPlan(ivRef.current);
+    const seq = fetchSeqRef.current;
+    const iv = ivRef.current;
+    void fetchHistory(sym, pl.res, need - IST - 86400, Math.floor(Date.now() / 1000)).then((r) => {
+      otherLoadingRef.current.delete(sym);
+      if (seq !== fetchSeqRef.current || iv !== ivRef.current) return;
+      const rows = pl.aggregate ? (aggregate(r.candles, iv) as Candle[]) : r.candles;
+      otherDataRef.current.set(sym, { from: rows.length ? Math.min(need, rows[0].time) : need, closes: new Map(rows.map((k) => [k.time as number, k.close])) });
+      refreshIndicatorData();
+    });
+  }
+
+  /** Option-chain OI for the OI profile (refreshed every 30 s while shown). */
+  function ensureOiChain(strikes: number): void {
+    const cur = oiChainRef.current;
+    const now = Date.now();
+    if (cur && cur.symbol === symbol && now - cur.at < 30000) return;
+    oiChainRef.current = { symbol, at: now, rows: cur?.symbol === symbol ? cur.rows : [] };
+    const qs = new URLSearchParams({ symbol, underlying: shortName ?? "", strikecount: String(strikes) });
+    void api
+      .get<{ strikes?: { strike: number; ce: { oi: number | null } | null; pe: { oi: number | null } | null }[] }>(`/api/options/chain?${qs.toString()}`)
+      .then((r) => {
+        if (oiChainRef.current?.symbol !== symbol) return;
+        oiChainRef.current = { symbol, at: Date.now(), rows: (r.strikes ?? []).map((k) => ({ strike: k.strike, ce: k.ce?.oi ?? null, pe: k.pe?.oi ?? null })) };
+        repaintDrawings();
+      })
+      .catch(() => undefined);
   }
   const scalePriceOnlyRef = useRef(scalePriceOnly);
   scalePriceOnlyRef.current = scalePriceOnly;
@@ -1598,13 +2064,20 @@ export default function ChartPanel(props: ChartPanelProps) {
   function refreshIndicatorData(): void {
     const view = viewRef.current;
     const n = view.length;
-    const ctxC = { interval: ivRef.current, up: colorsRef.current.volUp, down: colorsRef.current.volDown, flow: flowRef.current };
+    const ctxC = {
+      interval: ivRef.current,
+      up: colorsRef.current.volUp,
+      down: colorsRef.current.volDown,
+      flow: flowRef.current,
+      other: (sym: string) => otherDataRef.current.get(sym.trim().toUpperCase())?.closes,
+    };
     const uids = [...new Set(indEntriesRef.current.map((e) => e.uid))];
     const interval = barInterval();
     for (const uid of uids) {
       const inst = indicatorsRef.current.find((x) => x.uid === uid);
       const def = inst ? INDICATOR_BY_TYPE.get(inst.type) : undefined;
       if (!inst || !def) continue;
+      for (const sym of symbolInputs(def, inst.inputs)) ensureOther(sym);
       let res;
       try {
         res = def.compute(view, inst.inputs, ctxC);
@@ -1622,12 +2095,36 @@ export default function ChartPanel(props: ChartPanelProps) {
       });
       indValuesRef.current.set(uid, aligned);
       indHasDataRef.current.set(uid, res.plots.map((vals) => vals.some((v) => v !== null)));
+      // shaded fills: bar-indexed, running past the last bar for forward-shifted plots
+      if (def.fills?.length) {
+        const len = n + Math.max(0, ...(res.shifts ?? [0]));
+        const ext = res.plots.map((vals, k) => {
+          const sh = res.shifts?.[k] ?? 0;
+          const out = new Array<number | null>(len).fill(null);
+          vals.forEach((v, i) => {
+            const j = i + sh;
+            if (j >= 0 && j < len) out[j] = v;
+          });
+          return out;
+        });
+        const side = (x: number | { level: number }) => (typeof x === "number" ? ext[x] ?? [] : new Array<number | null>(len).fill(x.level));
+        const bands: FillBand[] = [];
+        def.fills.forEach((f, k) => {
+          const st = inst.fills?.[k];
+          if (st && !st.visible) return;
+          bands.push({ a: side(f.a), b: side(f.b), color: st?.color || f.color, colorDown: f.colorDown });
+        });
+        indFillDataRef.current.set(uid, bands);
+      }
+      const byIdx = new Map<number, Mark[]>();
+      for (const m of res.marks ?? []) byIdx.set(m.i, [...(byIdx.get(m.i) ?? []), m]);
+      indMarksRef.current.set(uid, byIdx);
       for (const e of indEntriesRef.current) {
         if (e.uid !== uid) continue;
         const vals = res.plots[e.plot] ?? [];
         const sh = res.shifts?.[e.plot] ?? 0;
         const colors = res.colors?.[e.plot] ?? null;
-        const kind = def.plots[e.plot]?.kind ?? "line";
+        const kind = inst.plots[e.plot]?.kind ?? def.plots[e.plot]?.kind ?? "line";
         const data: Record<string, unknown>[] = [];
         let started = false;
         for (let i = 0; i < vals.length; i++) {
@@ -1637,15 +2134,42 @@ export default function ChartPanel(props: ChartPanelProps) {
           if (t === null) continue;
           const v = vals[i];
           if (v === null || !Number.isFinite(v)) {
-            if (started && kind !== "hist") data.push({ time: t });
+            if (started && kind !== "hist" && kind !== "columns") data.push({ time: t });
             continue;
           }
           started = true;
           data.push(colors && colors[i] ? { time: t, value: v, color: colors[i] } : { time: t, value: v });
         }
         safe(() => e.series.setData(data as never));
+        // markers ride on their plot's series
+        const ms = (res.marks ?? []).filter((m) => m.plot === e.plot);
+        const plug = indMarkerPluginsRef.current.get(e.series);
+        if (ms.length || plug) {
+          const color = inst.plots[e.plot]?.color ?? def.plots[e.plot]?.color;
+          const markers = ms
+            .map((m) => {
+              const j = m.i + sh;
+              if (j < 0 || j >= n) return null;
+              return {
+                time: view[j].time,
+                position: m.pos === "above" ? "aboveBar" : m.pos === "below" ? "belowBar" : "inBar",
+                shape: m.shape,
+                color: m.color ?? color,
+                ...(m.text ? { text: m.text } : {}),
+                size: 1,
+              };
+            })
+            .filter((m): m is NonNullable<typeof m> => m !== null)
+            .sort((a, b) => a.time - b.time);
+          if (plug) safe(() => plug.setMarkers(markers));
+          else {
+            const made = safe(() => createSeriesMarkers(e.series, markers as never[])) as unknown as { setMarkers: (m: unknown[]) => void } | undefined;
+            if (made) indMarkerPluginsRef.current.set(e.series, made);
+          }
+        }
       }
     }
+    for (const prim of indFillPrimsRef.current) prim.requestUpdate();
   }
 
   /** Coalesce indicator recomputes during live ticks (≤ 1 per second). */
@@ -2082,6 +2606,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     cancelAnimationFrame(rangeRaf.current);
     rangeRaf.current = requestAnimationFrame(() => {
       updateExtraLines();
+      applyRatioLock();
       if (syncRef.current.time && Date.now() - syncApplyRef.current > 200) {
         const tr = safe(() => chartRef.current!.timeScale().getVisibleRange());
         if (tr) publishSync({ type: "range", src: myId, from: tr.from as number, to: tr.to as number });
@@ -2089,6 +2614,31 @@ export default function ChartPanel(props: ChartPanelProps) {
     });
   }
   const rangeRaf = useRef(0);
+
+  /** Lock price to bar ratio: keep price units per bar width fixed as the
+   *  time axis zooms (the price range follows the bar spacing). */
+  function applyRatioLock(): void {
+    const s = settingsRef.current;
+    const main = mainRef.current;
+    if (!s.lockRatio || !main || scaleModeRef.current === "log") return;
+    const h = paneDims().height;
+    const top = safe(() => main.coordinateToPrice(0) as number | null, null);
+    const bot = safe(() => main.coordinateToPrice(h) as number | null, null);
+    if (!(h > 0) || top == null || bot == null) return;
+    const range = Math.abs(top - bot);
+    const bs = barSpacing();
+    if (!(range > 0) || !(bs > 0)) return;
+    let r = s.priceBarRatio;
+    if (!(r > 0)) {
+      r = (range / h) * bs; // take the current view as the ratio
+      changeSettings({ ...s, priceBarRatio: Number(r.toPrecision(6)) });
+    }
+    const want = (r / bs) * h;
+    if (Math.abs(want - range) / range < 0.002) return;
+    const mid = (top + bot) / 2;
+    if (autoScaleRef.current) setAutoScale(false);
+    safe(() => main.priceScale().setVisibleRange({ from: mid - want / 2, to: mid + want / 2 }));
+  }
 
   // ---- drag-to-modify drawings (DOM-level, capture phase) ----
 
@@ -2121,6 +2671,13 @@ export default function ChartPanel(props: ChartPanelProps) {
     const price = yToPrice(pt.y);
     if (time === null || price == null) return;
     const mode = drawModeRef.current;
+    if (mode === "zoom" && !pendingRef.current) {
+      // press-and-drag a rectangle (a click without travel keeps the two-click flow)
+      zoomDragRef.current = { start: { time, price }, startPt: pt, moved: false };
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
     if (mode && pointsNeeded(mode) === "free") {
       freehandRef.current = { type: mode, points: [{ time, price }], last: pt };
       pendingRef.current = { type: mode, points: [{ time, price }], cursor: null };
@@ -2162,6 +2719,7 @@ export default function ChartPanel(props: ChartPanelProps) {
   }
 
   const pressRef = useRef<{ x: number; y: number } | null>(null);
+  const zoomDragRef = useRef<{ start: DrawingPoint; startPt: { x: number; y: number }; moved: boolean } | null>(null);
 
   /** A press + release without travel on the price pane is a click. */
   function onHostMouseUp(e: MouseEvent): void {
@@ -2176,6 +2734,18 @@ export default function ChartPanel(props: ChartPanelProps) {
 
   function onWindowMouseMove(e: MouseEvent): void {
     shiftRef.current = e.shiftKey;
+    const zd = zoomDragRef.current;
+    if (zd) {
+      const pt = paneCoords(e, true);
+      if (!pt) return;
+      if (!zd.moved && Math.hypot(pt.x - zd.startPt.x, pt.y - zd.startPt.y) < 6) return;
+      zd.moved = true;
+      const t = xToTime(pt.x), pr = yToPrice(pt.y);
+      if (t === null || pr === null) return;
+      pendingRef.current = { type: "dprange", points: [zd.start], cursor: { time: t, price: pr } };
+      repaintDrawings();
+      return;
+    }
     const fh = freehandRef.current;
     if (fh) {
       const pt = paneCoords(e, true);
@@ -2236,6 +2806,20 @@ export default function ChartPanel(props: ChartPanelProps) {
   }
 
   function onWindowMouseUp(): void {
+    const zd = zoomDragRef.current;
+    if (zd) {
+      // (a release without travel was already handled as a click by onHostMouseUp)
+      zoomDragRef.current = null;
+      if (zd.moved) {
+        const end = pendingRef.current?.cursor ?? null;
+        pendingRef.current = null;
+        setPendingCount(0);
+        if (end) zoomTo(zd.start, end);
+        setDrawMode(null);
+        repaintDrawings();
+      }
+      return;
+    }
     const fh = freehandRef.current;
     if (fh) {
       freehandRef.current = null;
@@ -2383,6 +2967,7 @@ export default function ChartPanel(props: ChartPanelProps) {
   }
 
   function resetView(): void {
+    pushUndo("reset scales", { ...snapshot("reset scales"), view: viewState() });
     setAutoScale(true);
     safe(() => mainRef.current?.priceScale().applyOptions({ autoScale: true }));
     showLatest(90);
@@ -2439,6 +3024,7 @@ export default function ChartPanel(props: ChartPanelProps) {
         r: () => resetView(),
         a: () => openAlertDialog(),
         w: () => onAction?.("watch:add"),
+        s: () => void takeSnapshot("link"),
       };
       if (e.key === "Enter") { e.preventDefault(); onAction?.("maximize"); return; }
       if (map[letter]) { e.preventDefault(); map[letter](); return; }
@@ -2497,8 +3083,73 @@ export default function ChartPanel(props: ChartPanelProps) {
 
   // Chart subscriptions are attached once at mount; they call through
   // this ref so they always run the latest render's closures.
-  const implRef = useRef({ onCrosshair, onVisibleRange, onKeyDown, onHostMouseDown, onHostMouseUp, onWindowMouseMove, onWindowMouseUp, onHostDblClick });
-  implRef.current = { onCrosshair, onVisibleRange, onKeyDown, onHostMouseDown, onHostMouseUp, onWindowMouseMove, onWindowMouseUp, onHostDblClick };
+  /** Touch: one finger draws / drags drawings like the mouse when a tool
+   *  is active or a drawing is under the finger; two fingers moving
+   *  together pan the time axis (spreading them is left to the engine's
+   *  pinch zoom). Everything else goes to the engine untouched. */
+  const touchRef = useRef<{ mode: "mouse" | "pan" | null; x: number; dist: number }>({ mode: null, x: 0, dist: 0 });
+  function onTouch(e: TouchEvent): void {
+    const t0 = e.touches[0] ?? e.changedTouches[0];
+    if (!t0) return;
+    const asMouse = (t: Touch) =>
+      ({ clientX: t.clientX, clientY: t.clientY, button: 0, target: t.target, shiftKey: false, ctrlKey: false, metaKey: false, altKey: false, preventDefault: () => e.preventDefault(), stopPropagation: () => e.stopPropagation() }) as unknown as MouseEvent;
+    const st = touchRef.current;
+    if (e.type === "touchstart") {
+      if (e.touches.length === 2) {
+        const [a, b] = [e.touches[0], e.touches[1]];
+        touchRef.current = { mode: "pan", x: (a.clientX + b.clientX) / 2, dist: Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY) };
+        return;
+      }
+      if (e.touches.length !== 1) return;
+      const pt = paneCoords(asMouse(t0));
+      const grabbing = pt && !drawModeRef.current && hitDrawingAt(pt.x, pt.y);
+      if (!drawModeRef.current && !grabbing && !pendingRef.current) {
+        touchRef.current = { mode: null, x: 0, dist: 0 };
+        return;
+      }
+      touchRef.current = { mode: "mouse", x: 0, dist: 0 };
+      e.preventDefault();
+      e.stopPropagation();
+      onHostMouseDown(asMouse(t0));
+      onWindowMouseMove(asMouse(t0));
+      return;
+    }
+    if (e.type === "touchmove") {
+      if (st.mode === "mouse") {
+        e.preventDefault();
+        e.stopPropagation();
+        onWindowMouseMove(asMouse(t0));
+        return;
+      }
+      if (st.mode === "pan" && e.touches.length === 2) {
+        const [a, b] = [e.touches[0], e.touches[1]];
+        const x = (a.clientX + b.clientX) / 2;
+        const dist = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+        if (Math.abs(dist - st.dist) > st.dist * 0.12) return; // a pinch: the engine zooms
+        e.preventDefault();
+        e.stopPropagation();
+        const ts = safe(() => chartRef.current!.timeScale());
+        const pos = safe(() => ts!.scrollPosition(), 0) ?? 0;
+        safe(() => ts!.scrollToPosition(pos - (x - st.x) / Math.max(1, barSpacing()), false));
+        touchRef.current = { mode: "pan", x, dist };
+      }
+      return;
+    }
+    // touchend / touchcancel
+    if (st.mode === "mouse") {
+      e.preventDefault();
+      e.stopPropagation();
+      const t = e.changedTouches[0];
+      if (t) {
+        onHostMouseUp(asMouse(t));
+        onWindowMouseUp();
+      }
+    }
+    if (e.touches.length === 0) touchRef.current = { mode: null, x: 0, dist: 0 };
+  }
+
+  const implRef = useRef({ onCrosshair, onVisibleRange, onKeyDown, onHostMouseDown, onHostMouseUp, onWindowMouseMove, onWindowMouseUp, onHostDblClick, onTouch });
+  implRef.current = { onCrosshair, onVisibleRange, onKeyDown, onHostMouseDown, onHostMouseUp, onWindowMouseMove, onWindowMouseUp, onHostDblClick, onTouch };
 
   // ------------------------------------------------------------------
   // Effects
@@ -2556,6 +3207,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     const dblH = (e: MouseEvent) => implRef.current.onHostDblClick(e);
     const winMoveH = (e: MouseEvent) => implRef.current.onWindowMouseMove(e);
     const winUpH = () => implRef.current.onWindowMouseUp();
+    const touchH = (e: TouchEvent) => implRef.current.onTouch(e);
     safe(() => chart.subscribeCrosshairMove(moveH));
     safe(() => chart.timeScale().subscribeVisibleLogicalRangeChange(rangeH));
     window.addEventListener("keydown", keyH);
@@ -2563,6 +3215,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     el.addEventListener("mousedown", downH, true);
     el.addEventListener("mouseup", upH, true);
     el.addEventListener("dblclick", dblH, true);
+    for (const ev of ["touchstart", "touchmove", "touchend", "touchcancel"]) el.addEventListener(ev, touchH as EventListener, { capture: true, passive: false });
     window.addEventListener("mousemove", winMoveH);
     window.addEventListener("mouseup", winUpH);
     return () => {
@@ -2571,6 +3224,7 @@ export default function ChartPanel(props: ChartPanelProps) {
       el.removeEventListener("mousedown", downH, true);
       el.removeEventListener("mouseup", upH, true);
       el.removeEventListener("dblclick", dblH, true);
+      for (const ev of ["touchstart", "touchmove", "touchend", "touchcancel"]) el.removeEventListener(ev, touchH as EventListener, true);
       window.removeEventListener("mousemove", winMoveH);
       window.removeEventListener("mouseup", winUpH);
       window.clearTimeout(indRefreshTimer.current);
@@ -2633,6 +3287,12 @@ export default function ChartPanel(props: ChartPanelProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chartKind, side]);
 
+  /** The symbol label should show the raw price while the scale shows % / indexed values. */
+  function rawPriceLabelOn(): boolean {
+    const s = settingsRef.current;
+    return s.lastPriceLabel && !s.lastPriceScaleValue && (scaleModeRef.current === "percent" || scaleModeRef.current === "indexed" || comparesLenRef.current > 0);
+  }
+
   function applyMainStyle(): void {
     const main = mainRef.current;
     if (!main) return;
@@ -2641,11 +3301,14 @@ export default function ChartPanel(props: ChartPanelProps) {
     const k = kindRef.current;
     const clear = "rgba(0,0,0,0)";
     const prec = s.precision ?? precision;
+    // "Value" (not "according to scale") in % / indexed modes: our own raw-price label replaces the axis one.
+    const rawLabel = rawPriceLabelOn();
     const opts: Record<string, unknown> = {
       priceLineVisible: s.lastPriceLine,
-      lastValueVisible: s.lastPriceLabel,
+      lastValueVisible: s.lastPriceLabel && !rawLabel,
       title: s.symbolNameLabel ? shortName : "",
       priceFormat: { type: "price", precision: prec, minMove: 10 ** -prec },
+      priceLineColor: s.lastPriceColor || "",
     };
     if (["candles", "hollow", "heikin", "renko", "linebreak", "range"].includes(k)) {
       Object.assign(opts, {
@@ -2669,6 +3332,11 @@ export default function ChartPanel(props: ChartPanelProps) {
     else if (CUSTOM_MODE[k]) Object.assign(opts, { upColor: c.up, downColor: c.down });
     safe(() => main.applyOptions(opts));
   }
+
+  useEffect(() => {
+    applyMainStyle(); // the raw-price label swaps in / out with the scale mode
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scaleMode, pctCompare]);
 
   // 2b) Main-series style + chart canvas / scales from the settings.
   useEffect(() => {
@@ -2702,8 +3370,9 @@ export default function ChartPanel(props: ChartPanelProps) {
           horzLines: { visible: s.grid === "both" || s.grid === "horz", color: s.gridColor || c.grid },
         },
         crosshair: { mode: magnet === "strong" ? (3 as CrosshairMode) : magnet === "weak" ? CrosshairMode.Magnet : CrosshairMode.Normal, vertLine: line as never, horzLine: line as never },
-        rightPriceScale: { visible: s.scaleSide === "right", borderColor: border },
-        leftPriceScale: { visible: s.scaleSide === "left", borderColor: border },
+        // the opposite axis also shows while a compare sits on "New price scale"
+        rightPriceScale: { visible: s.scaleSide === "right" || cmpOtherSide === "right", borderColor: border, alignLabels: s.noOverlapLabels },
+        leftPriceScale: { visible: s.scaleSide === "left" || cmpOtherSide === "left", borderColor: border, alignLabels: s.noOverlapLabels },
         timeScale: {
           borderColor: border,
           rightOffset: s.marginRight,
@@ -2714,16 +3383,18 @@ export default function ChartPanel(props: ChartPanelProps) {
         localization: { locale: "en-IN", timeFormatter: (t: Time) => timeFormatter(t) },
       }),
     );
+    if (cmpOtherSide) safe(() => chart.priceScale(cmpOtherSide).applyOptions({ mode: PriceScaleMode.Normal, autoScale: true }));
+    setTimeout(measurePanes, 30);
     repaintDrawings();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings, theme, cursor, magnet, iv]);
+  }, [settings, theme, cursor, magnet, iv, cmpOtherSide]);
 
   // 2c) Price scale: mode (compare forces percentage), auto, invert, margins.
   useEffect(() => {
     const chart = chartRef.current;
     if (!chart) return;
     const mode =
-      compares.length > 0
+      pctCompare
         ? PriceScaleMode.Percentage
         : scaleMode === "log"
           ? PriceScaleMode.Logarithmic
@@ -2742,7 +3413,8 @@ export default function ChartPanel(props: ChartPanelProps) {
     );
     repaintDrawings();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [compares.length, scaleMode, autoScale, invert, side, settings.marginTop, settings.marginBottom, mainVer]);
+  }, [pctCompare, scaleMode, autoScale, invert, side, settings.marginTop, settings.marginBottom, mainVer]);
+
 
   // 3) Load candles when the symbol / interval changes (the parent also
   //    remounts with a new `key` per symbol).
@@ -2750,6 +3422,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     const seq = ++fetchSeqRef.current;
     candlesRef.current = [];
     viewRef.current = [];
+    otherDataRef.current = new Map(); // other symbols' bars follow the interval
     haveMoreRef.current = true;
     loadingOlderRef.current = null;
     setDrawMode(null);
@@ -2883,6 +3556,53 @@ export default function ChartPanel(props: ChartPanelProps) {
     };
   }, [symbol, shortName, settings.showEvents]);
 
+  // 4c') Executions: the bot's fills on this symbol from the trade book,
+  //      refetched when the position changes or any order update arrives.
+  const [executions, setExecutions] = useState<{ time: number; side: "BUY" | "SELL"; qty: number; price: number }[]>([]);
+  const [execNonce, setExecNonce] = useState(0);
+  useEffect(() => {
+    const on = () => setExecNonce((n) => n + 1);
+    window.addEventListener("broker:order", on);
+    return () => window.removeEventListener("broker:order", on);
+  }, []);
+  useEffect(() => {
+    if (!settings.executions) {
+      setExecutions([]);
+      return;
+    }
+    let stop = false;
+    void fetch("/api/trades?limit=200")
+      .then((r) => (r.ok ? r.json() : []))
+      .then((rows: unknown) => {
+        if (stop || !Array.isArray(rows)) return;
+        const out: { time: number; side: "BUY" | "SELL"; qty: number; price: number }[] = [];
+        for (const t of rows as { symbol?: string; side?: string; quantity?: number; price?: number; status?: string; executed_at?: string | null }[]) {
+          if ((t.symbol ?? "").toUpperCase() !== symbol.toUpperCase() || !t.executed_at || (t.status ?? "").toLowerCase() !== "filled") continue;
+          const ts = Date.parse(t.executed_at);
+          if (!Number.isFinite(ts) || t.price == null) continue;
+          out.push({ time: Math.floor(ts / 1000) + IST, side: t.side === "SELL" ? "SELL" : "BUY", qty: Number(t.quantity ?? 0), price: Number(t.price) });
+        }
+        setExecutions(out);
+      })
+      .catch(() => undefined);
+    return () => {
+      stop = true;
+    };
+  }, [symbol, settings.executions, execNonce]);
+
+  // A fill moves the position: that is an execution (sound + log), not the order acceptance.
+  const lastQtyRef = useRef<number | null>(null);
+  useEffect(() => {
+    const q = position?.qty ?? 0;
+    const prev = lastQtyRef.current;
+    lastQtyRef.current = q;
+    if (prev === null || prev === q) return;
+    if (settingsRef.current.sound) beep();
+    pushLog("order", `execution — ${shortName} position ${prev} → ${q}`);
+    setExecNonce((n) => n + 1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [position?.qty]);
+
   // 4d) Marks on bars: strategy trades + events (re-attached if the main
   //     series is rebuilt).
   useEffect(() => {
@@ -2910,6 +3630,17 @@ export default function ChartPanel(props: ChartPanelProps) {
       ms.push({ time: snapT(t.entry_t + IST) as UTCTimestamp, position: buy ? "belowBar" : "aboveBar", color: buy ? col.up : col.down, shape: buy ? "arrowUp" : "arrowDown", text: buy ? "L" : "S" });
       ms.push({ time: snapT(t.exit_t + IST) as UTCTimestamp, position: buy ? "aboveBar" : "belowBar", color: t.net >= 0 ? col.up : col.down, shape: "circle", text: `${t.net >= 0 ? "+" : ""}${Math.round(t.net)}` });
     }
+    for (const x of executions) {
+      if (x.time < times[0]) continue;
+      const buy = x.side === "BUY";
+      ms.push({
+        time: snapT(x.time) as UTCTimestamp,
+        position: buy ? "belowBar" : "aboveBar",
+        color: buy ? "#2962FF" : col.down,
+        shape: buy ? "arrowUp" : "arrowDown",
+        text: settings.executionLabels ? `${buy ? "B" : "S"} ${x.qty} @ ${fmtNum(x.price, 2)}` : "",
+      });
+    }
     const evColor: Record<ChartEvent["kind"], string> = { D: "#F23645", S: "#2962FF", E: "#FF9800", B: "#9C27B0" };
     for (const ev of events) {
       if (ev.time < times[0]) continue;
@@ -2921,7 +3652,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     ms.sort((a, b) => a.time - b.time);
     markersRef.current = (safe(() => createSeriesMarkers(main, ms as never[])) as unknown as typeof markersRef.current) ?? null;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [strat, events, settings.showMarks, mainVer, dataVer]);
+  }, [strat, events, executions, settings.showMarks, settings.executionLabels, mainVer, dataVer]);
 
   async function runStrategy(s: StrategyItem): Promise<void> {
     const c = candlesRef.current;
@@ -3014,6 +3745,7 @@ export default function ChartPanel(props: ChartPanelProps) {
             color: b.kind === "order" ? "#4A90D9" : b.kind === "position-long" ? colors.up : colors.down,
             lineWidth: 1,
             lineStyle: b.kind === "order" ? LineStyle.Dashed : LineStyle.Solid,
+            lineVisible: settingsRef.current.extendLines,
             axisLabelVisible: true,
             title: b.title,
           }),
@@ -3022,7 +3754,7 @@ export default function ChartPanel(props: ChartPanelProps) {
       }
     }
     brokerLinesRef.current = next;
-  }, [brokerLines, mainVer, hide.positions]);
+  }, [brokerLines, mainVer, hide.positions, settings.extendLines]);
 
   const showPos = position && !hide.positions ? position : null;
 
@@ -3035,14 +3767,14 @@ export default function ChartPanel(props: ChartPanelProps) {
     if (!main || !showPos) return;
     const colors = colorsRef.current;
     const mk = (price: number, color: string, style: LineStyle) =>
-      safe(() => main.createPriceLine({ price, color, lineWidth: 1, lineStyle: style, axisLabelVisible: true, title: "" }));
+      safe(() => main.createPriceLine({ price, color, lineWidth: 1, lineStyle: style, lineVisible: settingsRef.current.extendLines, axisLabelVisible: true, title: "" }));
     posLinesRef.current.entry = mk(showPos.avg, showPos.qty > 0 ? "#2962FF" : colors.down, LineStyle.Solid);
     const sl = levelDrag === "sl" ? levelDragRef.current?.price : showPos.sl;
     const tp = levelDrag === "tp" ? levelDragRef.current?.price : showPos.tp;
     if (sl != null) posLinesRef.current.sl = mk(sl, colors.down, LineStyle.Dashed);
     if (tp != null) posLinesRef.current.tp = mk(tp, colors.up, LineStyle.Dashed);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showPos?.qty, showPos?.avg, showPos?.sl, showPos?.tp, levelDrag, mainVer]);
+  }, [showPos?.qty, showPos?.avg, showPos?.sl, showPos?.tp, levelDrag, mainVer, settings.extendLines]);
 
   // 5b'') Glue the tags to their lines every frame and tick the live P&L:
   // follows pans, zooms, resizes, ticks and drags without wiring each event.
@@ -3061,6 +3793,7 @@ export default function ChartPanel(props: ChartPanelProps) {
       const drag = levelDragRef.current;
       const levels = { entry: showPos.avg, sl: drag?.which === "sl" ? drag.price : showPos.sl, tp: drag?.which === "tp" ? drag.price : showPos.tp };
       const pctMode = settingsRef.current.plMode === "percent";
+      const tickMode = settingsRef.current.plMode === "ticks";
       // Desired tops, clamped into the pane, then pushed apart so tags
       // pinned to an edge (or close together) don't sit on each other.
       const want: { k: "entry" | "sl" | "tp"; y: number; top: number }[] = [];
@@ -3100,7 +3833,8 @@ export default function ChartPanel(props: ChartPanelProps) {
         if (pnlEl && at != null) {
           const pnl = (at - showPos.avg) * showPos.qty;
           const pct = ((at - showPos.avg) / showPos.avg) * 100 * Math.sign(showPos.qty);
-          const main$ = pctMode ? `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%` : money(pnl);
+          const ticks = Math.round(((at - showPos.avg) / tickRef.current) * Math.sign(showPos.qty));
+          const main$ = pctMode ? `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%` : tickMode ? `${ticks >= 0 ? "+" : ""}${ticks} ticks` : money(pnl);
           pnlEl.textContent = k === "entry" ? main$ : `${fmtNum(price, 2)} · ${money(pnl)} (${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%)`;
           pnlEl.className = `pnl ${pnl >= 0 ? "up" : "down"}`;
         }
@@ -3131,8 +3865,9 @@ export default function ChartPanel(props: ChartPanelProps) {
         map.set(c.symbol, s);
         loadCompareData(c.symbol, s);
       }
-      safe(() => s!.applyOptions({ visible: !c.hidden, priceScaleId: side }));
+      safe(() => s!.applyOptions({ visible: !c.hidden }));
     }
+    placeCompares();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [compares, side]);
 
@@ -3167,8 +3902,25 @@ export default function ChartPanel(props: ChartPanelProps) {
       showFavBar,
       toolsCollapsed,
       pinnedTools,
+      mainHidden,
     } satisfies ChartPrefs);
-  }, [iv, chartKind, indicators, magnet, cursor, scaleMode, autoScale, invert, scalePriceOnly, favIntervals, customIntervals, favKinds, favTools, favIndicators, lastTool, stay, lockAll, hide, syncDrawings, legendCollapsed, showFavBar, toolsCollapsed, pinnedTools]);
+  }, [iv, chartKind, indicators, magnet, cursor, scaleMode, autoScale, invert, scalePriceOnly, favIntervals, customIntervals, favKinds, favTools, favIndicators, lastTool, stay, lockAll, hide, syncDrawings, legendCollapsed, showFavBar, toolsCollapsed, pinnedTools, mainHidden]);
+
+  // User Settings (outside the chart) edited chart:settings — pick them up.
+  useEffect(() => {
+    const on = () => {
+      const s = loadSettings();
+      settingsRef.current = s;
+      setSettingsState(s);
+    };
+    window.addEventListener(CHART_SETTINGS_EVENT, on);
+    return () => window.removeEventListener(CHART_SETTINGS_EVENT, on);
+  }, []);
+
+  // The legend's eye on the main series (and the object tree's) hides it.
+  useEffect(() => {
+    safe(() => mainRef.current?.applyOptions({ visible: !mainHidden } as never));
+  }, [mainHidden, mainVer]);
 
   // 8) Compare-symbol search (debounced).
   useEffect(() => {
@@ -3188,6 +3940,7 @@ export default function ChartPanel(props: ChartPanelProps) {
 
   // 9) Live last bar from the `/ws` quote stream + alert triggers.
   const live = useLiveQuote(symbol);
+  liveQuoteRef.current = live;
   useEffect(() => {
     if (!live || live.last_price == null) return;
     const lp = live.last_price;
@@ -3291,6 +4044,78 @@ export default function ChartPanel(props: ChartPanelProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // 10b) Raw last price on the axis while it shows % / indexed values ("Value" mode).
+  useEffect(() => {
+    const el = rawLabelRef.current;
+    if (!el) return;
+    if (!rawPriceLabelOn()) {
+      el.style.display = "none";
+      return;
+    }
+    let raf = 0;
+    const frame = () => {
+      raf = requestAnimationFrame(frame);
+      const v = viewRef.current;
+      const last = v[v.length - 1];
+      const y = last ? priceToY(last.close) : null;
+      if (!last || y == null) {
+        el.style.display = "none";
+        return;
+      }
+      const s = settingsRef.current;
+      const left = s.scaleSide === "left";
+      el.style.display = "block";
+      el.style.top = `${y - 9}px`;
+      el.style.width = `${scaleWidth(left ? "left" : "right") || 56}px`;
+      el.style.left = left ? "0px" : "auto";
+      el.style.right = left ? "auto" : "0px";
+      el.style.background = s.lastPriceColor || (last.close >= last.open ? colorsRef.current.up : colorsRef.current.down);
+      el.textContent = fmtNum(last.close, s.precision ?? precision);
+    };
+    raf = requestAnimationFrame(frame);
+    return () => cancelAnimationFrame(raf);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings.lastPriceScaleValue, settings.lastPriceLabel, settings.lastPriceColor, scaleMode, pctCompare]);
+
+  function measureToolbar(): void {
+    const el = toolbarRef.current;
+    if (!el) return;
+    const left = el.scrollLeft > 2;
+    const right = el.scrollLeft + el.clientWidth < el.scrollWidth - 2;
+    setTbScroll((p) => (p.left === left && p.right === right ? p : { left, right }));
+  }
+  useEffect(() => {
+    const el = toolbarRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => measureToolbar());
+    ro.observe(el);
+    measureToolbar();
+    return () => ro.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [toolbarSlot, chrome]);
+  // The scroller clips its children, so an open toolbar menu is positioned
+  // against the (unclipped) wrapper, under its button.
+  function positionToolbarMenu(): void {
+    const bar = toolbarRef.current;
+    const wrap = bar?.parentElement;
+    if (!bar || !wrap) return;
+    const menu = bar.querySelector<HTMLElement>(".chart-menu-wrap > .chart-menu");
+    const anchor = menu?.parentElement;
+    if (!menu || !anchor) return;
+    const a = anchor.getBoundingClientRect();
+    const cb = wrap.getBoundingClientRect();
+    const w = menu.offsetWidth;
+    const alignRight = menu.classList.contains("right");
+    const left = alignRight ? a.right - cb.left - w : a.left - cb.left;
+    menu.style.left = `${Math.max(0, Math.min(left, cb.width - w))}px`;
+    menu.style.right = "auto";
+    menu.style.top = `${a.bottom - cb.top + 6}px`;
+  }
+  // (scrolling the bar — e.g. a half-hidden button taking focus — moves the open menu along)
+  useLayoutEffect(() => {
+    if (menuOpen) positionToolbarMenu();
+  }, [menuOpen]);
+
   // 11) Close menus on outside click; the context menu on any click / Esc.
   useEffect(() => {
     if (!menuOpen) return;
@@ -3303,6 +4128,7 @@ export default function ChartPanel(props: ChartPanelProps) {
   }, [menuOpen]);
 
   useEffect(() => {
+    setTradeFly(null);
     if (!ctx) return;
     const close = () => setCtx(null);
     const esc = (e: KeyboardEvent) => {
@@ -3315,6 +4141,21 @@ export default function ChartPanel(props: ChartPanelProps) {
       document.removeEventListener("keydown", esc);
     };
   }, [ctx]);
+
+  useEffect(() => {
+    if (!legendMenu) return;
+    const close = (e: MouseEvent) => {
+      if ((e.target as HTMLElement | null)?.closest?.("[data-more]")) return; // the toggle button handles itself
+      setLegendMenu(null);
+    };
+    const esc = (e: KeyboardEvent) => e.key === "Escape" && setLegendMenu(null);
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", esc);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", esc);
+    };
+  }, [legendMenu]);
 
   // 12) Sync with the other charts of the layout.
   useEffect(
@@ -3329,6 +4170,11 @@ export default function ChartPanel(props: ChartPanelProps) {
             repaintDrawings();
             bumpDrawings();
           }
+        } else if (e.type === "daterange") {
+          if (!s.dateRange) return;
+          const preset = e.preset ? RANGES.find((r) => r.id === e.preset) : undefined;
+          if (preset) applyRange(preset, true);
+          else goTo({ at: e.at, from: e.from, to: e.to }, true);
         } else if (e.type === "interval") {
           if (s.interval) changeInterval(e.interval, true);
         } else if (e.type === "range") {
@@ -3467,7 +4313,7 @@ export default function ChartPanel(props: ChartPanelProps) {
       (msg) => {
         pushLog("order", `${shortName}: ${msg}`);
         if (s.notifications === "all") addToast(msg);
-        if (s.sound) beep();
+        // the sound waits for the fill (the position changes), not the acceptance
       },
       (err) => {
         const msg = `Order failed: ${err instanceof Error ? err.message : String(err)}`;
@@ -3479,6 +4325,13 @@ export default function ChartPanel(props: ChartPanelProps) {
   // Instant orders (a trading setting) skip the confirm step.
   const pickOrder = (o: ChartOrder, at: { x: number; y: number; price: number }) =>
     instant ? submitOrder(o) : setCtx({ ...at, time: null, area: "pane", confirm: o });
+  // The quick-trade BUY / SELL buttons: one-click (⚡ on) sends at market;
+  // off, they open the order window on that side to review and confirm.
+  const quickOrder = (side: "BUY" | "SELL") => {
+    if (instant) submitOrder({ side, type: "MARKET", price: null });
+    else if (onAction) onAction(side === "BUY" ? "ticket:buy" : "ticket:sell");
+    else pickOrder({ side, type: "MARKET", price: null }, { x: 8, y: 52, price: lastClose() ?? 0 });
+  };
 
   function addHLine(price: number): void {
     const t = lastClose() !== null ? viewRef.current[viewRef.current.length - 1].time : 0;
@@ -3491,15 +4344,21 @@ export default function ChartPanel(props: ChartPanelProps) {
   function ctxOrders(price: number): ChartOrder[] {
     const ltp = prevLtpRef.current ?? lastClose();
     const above = ltp != null && price > ltp;
+    const tick = tickRef.current;
+    const round = (p: number) => Math.round(p / tick) * tick;
     const out: ChartOrder[] = [
       { side: "BUY", type: above ? "SL-M" : "LIMIT", price },
       { side: "SELL", type: above || ltp == null ? "LIMIT" : "SL-M", price },
     ];
+    // stop-limit on the breakout side: trigger at the price, limit one tick through it
+    if (ltp != null) out.push(above ? { side: "BUY", type: "STOP_LOSS", price, limit: round(price + tick) } : { side: "SELL", type: "STOP_LOSS", price, limit: round(price - tick) });
     if (ltp != null) out.push({ side: "BUY", type: "MARKET", price: null }, { side: "SELL", type: "MARKET", price: null });
     return out;
   }
   const orderLabel = (o: ChartOrder) =>
-    `${o.side === "BUY" ? "Buy" : "Sell"} ${orderQty ?? ""} ${o.price == null ? "at market" : `@ ${fmtPrice(o.price)} ${o.type === "LIMIT" ? "limit" : "stop"}`}`;
+    `${o.side === "BUY" ? "Buy" : "Sell"} ${orderQty ?? ""} ${
+      o.price == null ? "at market" : o.type === "STOP_LOSS" ? `@ ${fmtPrice(o.price)} stop ${fmtPrice(o.limit ?? o.price)} limit` : `@ ${fmtPrice(o.price)} ${o.type === "LIMIT" ? "limit" : "stop"}`
+    }`;
 
   // Controls render inline, into a shared slot (layouts), or not at all.
   const placeChrome = (el: ReactNode, slot: HTMLElement | null | undefined) => (!chrome ? null : slot ? createPortal(el, slot) : el);
@@ -3543,37 +4402,131 @@ export default function ChartPanel(props: ChartPanelProps) {
   }
 
   function toggleFullscreen(): void {
-    // The whole trade workspace (chart + panels + bottom bar) goes
-    // fullscreen, not the chart alone. Esc exits (browser).
+    // The chart area (toolbars, drawing strip, charts, date-range bar) goes
+    // fullscreen — not the side panels or the account manager. Esc exits.
     if (document.fullscreenElement) void document.exitFullscreen();
-    else void (wrapRef.current?.closest(".trade-page") ?? wrapRef.current?.closest(".chart-card"))?.requestFullscreen?.();
+    else void (wrapRef.current?.closest(".tv-layout") ?? wrapRef.current?.closest(".chart-card"))?.requestFullscreen?.();
   }
 
-  /** PNG of the chart with a title strip (symbol, interval, last OHLC). */
-  async function takeSnapshot(kind: "download" | "copy" | "open"): Promise<void> {
-    setMenuOpen(null);
+  /** PNG of the chart: a title strip (symbol, interval, last OHLC, change),
+   *  the legend's indicator values, compare symbols and the watermarks. */
+  async function snapshotBlob(): Promise<Blob> {
     const chart = chartRef.current;
-    if (!chart) return;
-    try {
-      const canvas = chart.takeScreenshot();
-      const out = document.createElement("canvas");
-      const head = 28;
-      out.width = canvas.width;
-      out.height = canvas.height + head;
-      const g = out.getContext("2d");
-      if (g) {
-        g.fillStyle = settingsRef.current.theme === "light" ? "#FFFFFF" : colorsRef.current.bg;
-        g.fillRect(0, 0, out.width, out.height);
-        g.drawImage(canvas, 0, head);
-        const v = viewRef.current;
-        const c = v[v.length - 1];
-        g.fillStyle = settingsRef.current.theme === "light" ? "#131722" : "#E8E8E8";
-        g.font = '13px "JetBrains Mono", monospace';
-        const when = new Date().toLocaleString("en-IN");
-        g.fillText(`${shortName} · ${ivLabel} · ${exchange}${c ? `   O ${fmtPrice(c.open)} H ${fmtPrice(c.high)} L ${fmtPrice(c.low)} C ${fmtPrice(c.close)}` : ""}   ${when}`, 10, 19);
+    if (!chart) throw new Error("no chart");
+    const canvas = chart.takeScreenshot();
+    const out = document.createElement("canvas");
+    const head = 30;
+    out.width = canvas.width;
+    out.height = canvas.height + head;
+    const g = out.getContext("2d");
+    if (!g) throw new Error("no canvas");
+    const light = getTheme() === "light" || settingsRef.current.theme === "light";
+    const fg = light ? "#131722" : "#E8E8E8";
+    const faint = light ? "rgba(19,23,34,0.10)" : "rgba(232,232,232,0.08)";
+    g.fillStyle = light ? "#FFFFFF" : colorsRef.current.bg;
+    g.fillRect(0, 0, out.width, out.height);
+    g.drawImage(canvas, 0, head);
+    const v = viewRef.current;
+    const c = v[v.length - 1];
+    const p = v[v.length - 2];
+    const s = settingsRef.current;
+    // watermarks (the chart canvas doesn't contain the HTML ones)
+    if (s.watermark) {
+      g.save();
+      g.fillStyle = faint;
+      g.textAlign = "center";
+      g.textBaseline = "middle";
+      g.font = `700 ${Math.round(out.width / 14)}px "JetBrains Mono", monospace`;
+      g.fillText(shortName, out.width / 2, head + canvas.height * 0.42);
+      g.font = `600 ${Math.round(out.width / 40)}px "JetBrains Mono", monospace`;
+      g.fillText(ivLabel, out.width / 2, head + canvas.height * 0.42 + out.width / 18);
+      g.restore();
+    }
+    if (s.logoWatermark) {
+      g.save();
+      g.globalAlpha = 0.55;
+      g.font = '800 12px "JetBrains Mono", monospace';
+      g.fillStyle = colorsRef.current.accent;
+      g.fillText("◆", 12, head + canvas.height - 36);
+      g.fillStyle = light ? "#787B86" : "#666666";
+      g.fillText("TRADEBOT", 26, head + canvas.height - 36);
+      g.restore();
+    }
+    // title strip
+    g.font = '13px "JetBrains Mono", monospace';
+    g.fillStyle = fg;
+    let x = 10;
+    const put = (t: string, color = fg) => {
+      g.fillStyle = color;
+      g.fillText(t, x, 20);
+      x += g.measureText(t).width + 10;
+    };
+    put(`${shortName} · ${ivLabel} · ${exchange}`);
+    if (c) {
+      put(`O ${fmtPrice(c.open)} H ${fmtPrice(c.high)} L ${fmtPrice(c.low)} C ${fmtPrice(c.close)}`);
+      if (p) {
+        const ch = c.close - p.close;
+        put(`${ch >= 0 ? "+" : ""}${fmtPrice(ch)} (${ch >= 0 ? "+" : ""}${((ch / p.close) * 100).toFixed(2)}%)`, ch >= 0 ? colorsRef.current.up : colorsRef.current.down);
       }
-      const blob: Blob | null = await new Promise((res) => out.toBlob((b) => res(b)));
-      if (!blob) throw new Error("no image");
+    }
+    put(new Date().toLocaleString("en-IN"), light ? "#787B86" : "#999999");
+    // legend: compares + indicator values at the last bar
+    g.font = '11px "JetBrains Mono", monospace';
+    let y = head + 18;
+    const line = (parts: [string, string][]) => {
+      let lx = 10;
+      for (const [t, col] of parts) {
+        g.fillStyle = col;
+        g.fillText(t, lx, y);
+        lx += g.measureText(t).width + 6;
+      }
+      y += 15;
+    };
+    for (const cmp of compares.filter((q) => !q.hidden)) line([["●", cmp.color], [cmp.name, fg]]);
+    const i = v.length - 1;
+    for (const inst of indicatorsRef.current) {
+      const def = INDICATOR_BY_TYPE.get(inst.type);
+      const vals = indValuesRef.current.get(inst.uid);
+      if (!def || !inst.visible || !indPaneRef.current.has(inst.uid)) continue;
+      const prec = inst.precision ?? 2;
+      const parts: [string, string][] = [[`${def.short} ${argsLabel(inst)}`.trim(), fg]];
+      def.plots.forEach((pd, k) => {
+        const val = vals?.[k]?.[i];
+        if (pd.kind === "marks" || !inst.plots[k]?.visible || val == null) return;
+        parts.push([inst.type === "volume" ? fmtVol(val) : fmtNum(val, prec), inst.plots[k].color]);
+      });
+      line(parts);
+      if (y > head + canvas.height * 0.45) break;
+    }
+    const blob: Blob | null = await new Promise((res) => out.toBlob((b) => res(b)));
+    if (!blob) throw new Error("no image");
+    return blob;
+  }
+
+  /** Upload the image to this terminal's snapshot store; returns its absolute URL. */
+  async function snapshotLink(): Promise<string> {
+    const blob = await snapshotBlob();
+    const r = await fetch("/api/snapshots", { method: "POST", headers: { "Content-Type": "image/png" }, body: blob });
+    if (!r.ok) throw new Error(`upload failed (${r.status})`);
+    const j = (await r.json()) as { url: string };
+    return new URL(j.url, window.location.origin).toString();
+  }
+
+  async function takeSnapshot(kind: "download" | "copy" | "open" | "link" | "tweet"): Promise<void> {
+    setMenuOpen(null);
+    try {
+      if (kind === "link" || kind === "tweet") {
+        const url = await snapshotLink();
+        if (kind === "link") {
+          await navigator.clipboard?.writeText(url).catch(() => undefined);
+          addToast("snapshot link copied — it opens for anyone signed in to this terminal");
+        } else {
+          const text = `${shortName} ${ivLabel} chart`;
+          window.open(`https://twitter.com/intent/tweet?text=${encodeURIComponent(text)}&url=${encodeURIComponent(url)}`, "_blank", "noopener");
+        }
+        return;
+      }
+      const blob = await snapshotBlob();
       if (kind === "copy") {
         const CI = (window as unknown as { ClipboardItem?: new (d: Record<string, Blob>) => unknown }).ClipboardItem;
         if (!CI || !navigator.clipboard?.write) throw new Error("clipboard images aren't supported here");
@@ -3701,25 +4654,35 @@ export default function ChartPanel(props: ChartPanelProps) {
     }
   }
 
-  function applyRange(r: RangeDef): void {
+  function applyRange(r: RangeDef, fromSync = false): void {
     pendingRangeRef.current = r;
-    if (normalizeInterval(r.interval) !== iv) changeInterval(r.interval);
+    if (normalizeInterval(r.interval) !== iv) changeInterval(r.interval, fromSync);
     else void applyPendingRange();
+    if (!fromSync && syncRef.current.dateRange) publishSync({ type: "daterange", src: myId, preset: r.id });
   }
 
-  function goTo(r: { at?: number; from?: number; to?: number }): void {
+  function goTo(r: { at?: number; from?: number; to?: number }, fromSync = false): void {
     pendingRangeRef.current = r;
     void applyPendingRange();
+    if (!fromSync && syncRef.current.dateRange) publishSync({ type: "daterange", src: myId, ...r });
   }
 
   // ---- indicators ----
 
   function addIndicator(type: string): void {
+    const def = INDICATOR_BY_TYPE.get(type);
+    if (def?.tool) {
+      // e.g. the fixed-range volume profile is a drawing: arm it and let the user pick the range
+      setDialog(null);
+      toggleDraw(def.tool);
+      addToast(`${def.name}: click the first and the last bar of the range`);
+      return;
+    }
     const defaults = loadJson<Record<string, Partial<IndicatorInstance>>>("chart:indDefaults", {})[type];
-    const inst = newInstance(type, defaults?.inputs);
-    if (!inst) return;
-    if (defaults?.plots) inst.plots = inst.plots.map((p, i) => ({ ...p, ...(defaults.plots?.[i] ?? {}) }));
-    if (defaults && defaults.precision !== undefined) inst.precision = defaults.precision ?? null;
+    const base = newInstance(type, defaults?.inputs);
+    if (!base) return;
+    // saved defaults cover styles, outputs and visibility too (sanitize merges them)
+    const inst = defaults ? sanitizeInstance({ ...base, ...defaults, inputs: base.inputs, uid: base.uid, type }) ?? base : base;
     setIndicators([...indicatorsRef.current, inst], `add ${instanceTitle(inst)}`);
   }
 
@@ -3733,6 +4696,57 @@ export default function ChartPanel(props: ChartPanelProps) {
 
   function toggleIndicator(uid: string): void {
     setIndicators(indicatorsRef.current.map((x) => (x.uid === uid ? { ...x, visible: !x.visible } : x)), "hide indicator");
+  }
+
+  /** Legend More → Move to: its own new pane, the price pane, or another indicator's pane. */
+  function moveIndicatorTo(uid: string, target: "own" | "main" | string): void {
+    setIndicators(indicatorsRef.current.map((x) => (x.uid === uid ? { ...x, pane: target } : x)), "move indicator");
+    setPaneMode({ max: null, collapsed: [] });
+  }
+
+  function pinIndicatorScale(uid: string, scale: "left" | "right" | "new" | undefined): void {
+    setIndicators(indicatorsRef.current.map((x) => (x.uid === uid ? { ...x, scale } : x)), "pin to scale");
+  }
+
+  /** Visual order: later series paint on top. */
+  function reorderIndicator(uid: string, to: "front" | "back"): void {
+    const list = indicatorsRef.current;
+    const it = list.find((x) => x.uid === uid);
+    if (!it) return;
+    const rest = list.filter((x) => x.uid !== uid);
+    setIndicators(to === "front" ? [...rest, it] : [it, ...rest], "visual order");
+  }
+
+  function copyIndicator(uid: string): void {
+    const it = indicatorsRef.current.find((x) => x.uid === uid);
+    if (!it) return;
+    indicatorClipboard.current = JSON.parse(JSON.stringify(it));
+    addToast(`${instanceTitle(it)} copied — paste it on any chart (right-click → Paste indicator)`);
+  }
+
+  function pasteIndicator(): void {
+    const raw = indicatorClipboard.current as IndicatorInstance | null;
+    const inst = raw ? sanitizeInstance({ ...raw, uid: newUid(), pane: undefined }) : null;
+    if (inst) setIndicators([...indicatorsRef.current, inst], `paste ${instanceTitle(inst)}`);
+  }
+
+  /** Panes below the price pane: index → the indicators in it. */
+  function paneList(): { i: number; insts: IndicatorInstance[] }[] {
+    const by = new Map<number, IndicatorInstance[]>();
+    for (const x of indicatorsRef.current) {
+      const p = indPaneRef.current.get(x.uid);
+      if (p === undefined) continue;
+      by.set(p, [...(by.get(p) ?? []), x]);
+    }
+    return [...by.entries()].sort((a, b) => a[0] - b[0]).map(([i, insts]) => ({ i, insts }));
+  }
+
+  /** Merge every indicator of pane `from` into pane `to` (0 = price pane). */
+  function mergePanes(from: number, to: number): void {
+    const host = to === 0 ? "main" : paneList().find((p) => p.i === to)?.insts[0]?.uid;
+    if (!host) return;
+    setIndicators(indicatorsRef.current.map((x) => (indPaneRef.current.get(x.uid) === from ? { ...x, pane: host } : x)), "merge panes");
+    setPaneMode({ max: null, collapsed: [] });
   }
 
   /** Move a pane up / down by swapping it with its neighbour pane. */
@@ -3754,23 +4768,75 @@ export default function ChartPanel(props: ChartPanelProps) {
 
   function saveIndTemplate(): void {
     setMenuOpen(null);
-    const name = window.prompt("Indicator template name");
-    if (!name) return;
-    const next = [...templates.filter((t) => t.name !== name), { name, items: indicatorsRef.current }];
+    setDialog({ k: "saveTemplate" });
+  }
+
+  function storeIndTemplate(name: string, withSymbol: boolean, withInterval: boolean): void {
+    const t: IndicatorTemplate = {
+      name,
+      items: indicatorsRef.current,
+      ...(withSymbol ? { symbol: { symbol, name: shortName, hit: instrument ?? null } } : {}),
+      ...(withInterval ? { interval: ivRef.current } : {}),
+    };
+    const next = [...templates.filter((x) => x.name !== name), t];
     setTemplates(next);
     saveJson("chart:indTemplates", next);
     addToast(`template "${name}" saved`);
   }
 
+  function renameIndTemplate(t: IndicatorTemplate): void {
+    const name = window.prompt("Rename template", t.name)?.trim();
+    if (!name || name === t.name) return;
+    if (templates.some((x) => x.name === name) && !window.confirm(`Replace the template "${name}"?`)) return;
+    const next = templates.filter((x) => x.name !== name).map((x) => (x.name === t.name ? { ...x, name } : x));
+    setTemplates(next);
+    saveJson("chart:indTemplates", next);
+  }
+
   function applyIndTemplate(t: IndicatorTemplate): void {
     setMenuOpen(null);
-    setIndicators(t.items.map((i) => sanitizeInstance({ ...i, uid: newUid() })).filter(Boolean) as IndicatorInstance[], "apply template");
+    const items = t.items.map((i) => sanitizeInstance({ ...i, uid: newUid() })).filter(Boolean) as IndicatorInstance[];
+    setIndicators(items, "apply template");
+    const iv2 = t.interval && parseInterval(t.interval) ? t.interval : null;
+    if (iv2 && iv2 !== ivRef.current) changeInterval(iv2);
+    if (t.symbol && t.symbol.symbol !== symbol && onSymbolChange) {
+      // The chart remounts for the new symbol and reads its prefs on mount:
+      // hand it the template's indicators (and interval) before switching.
+      saveJson(PREFS_KEY, { ...loadJson<ChartPrefs>(PREFS_KEY, {}), indicators: items, ...(iv2 ? { interval: iv2 } : {}) });
+      const sym = t.symbol;
+      const [ex] = sym.symbol.split(":");
+      onSymbolChange(sym.hit ?? { symbol: sym.symbol, short_name: sym.name, exchange: ex || "NSE", segment: "EQ", instrument_type: "EQ", lot_size: 1, tick_size: 0.05, expiry: null, strike: null, underlying: null, display: sym.name });
+    }
   }
 
   function deleteIndTemplate(name: string): void {
     const next = templates.filter((t) => t.name !== name);
     setTemplates(next);
     saveJson("chart:indTemplates", next);
+  }
+
+  // ---- named drawing templates (per tool) ----
+  const DRAW_TEMPLATES_KEY = "chart:drawTemplates";
+  function drawTemplates(type: string): { name: string; style: Partial<DrawingStyle> }[] {
+    return loadJson<Record<string, { name: string; style: Partial<DrawingStyle> }[]>>(DRAW_TEMPLATES_KEY, {})[type] ?? [];
+  }
+  function saveDrawTemplate(d: Drawing): void {
+    const name = window.prompt(`Save ${TOOL_BY_ID.get(d.type)?.label ?? "drawing"} template as`, "");
+    if (!name) return;
+    const all = loadJson<Record<string, { name: string; style: Partial<DrawingStyle> }[]>>(DRAW_TEMPLATES_KEY, {});
+    all[d.type] = [...(all[d.type] ?? []).filter((t) => t.name !== name), { name, style: JSON.parse(JSON.stringify(d.style ?? {})) }];
+    saveJson(DRAW_TEMPLATES_KEY, all);
+    addToast(`template "${name}" saved`);
+  }
+  function applyDrawTemplate(d: Drawing, name: string | null): void {
+    const style = name === null ? toolDefaultsRef.current[d.type] ?? {} : drawTemplates(d.type).find((t) => t.name === name)?.style;
+    if (!style) return;
+    updateDrawing(d.id, { style: JSON.parse(JSON.stringify(style)) }, "apply template");
+  }
+  function removeDrawTemplate(type: string, name: string): void {
+    const all = loadJson<Record<string, { name: string; style: Partial<DrawingStyle> }[]>>(DRAW_TEMPLATES_KEY, {});
+    all[type] = (all[type] ?? []).filter((t) => t.name !== name);
+    saveJson(DRAW_TEMPLATES_KEY, all);
   }
 
   function pasteDrawing(): void {
@@ -3805,12 +4871,20 @@ export default function ChartPanel(props: ChartPanelProps) {
     switch (id) {
       case "replay": return replayRef.current.on ? stopReplay() : startReplaySelect();
       case "popout": {
-        window.open(`${window.location.pathname}#/trade`, "_blank", "popup,width=1200,height=760");
+        // a window with just this chart, on this symbol and interval
+        const q = new URLSearchParams({ popout: "1", symbol, name: shortName, iv: ivRef.current });
+        window.open(`${window.location.pathname}#/trade?${q.toString()}`, "_blank", "popup,width=1200,height=760");
         return;
       }
       case "refresh": return setReloadNonce((n) => n + 1);
-      case "theme": return changeSettings({ ...settingsRef.current, theme: settingsRef.current.theme === "light" ? "app" : "light" });
-      case "settings": return setDialog({ k: "settings" });
+      case "theme": {
+        // the whole app flips skin; the chart follows it ("App theme")
+        const next = toggleTheme();
+        if (settingsRef.current.theme !== "app") changeSettings({ ...settingsRef.current, theme: "app" });
+        addToast(`${next === "light" ? "Light" : "Dark"} theme`);
+        return;
+      }
+      case "settings": return onAction ? onAction("usersettings") : setDialog({ k: "settings" });
       case "shortcuts": return setDialog({ k: "shortcuts" });
     }
   }
@@ -3824,7 +4898,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     for (const r of RANGES) out.push({ id: `range:${r.id}`, label: `Range ${r.id} — ${r.title}`, group: "Date range", run: () => applyRange(r) });
     for (const t of TOOLS_MENU) if (!t.host || onAction) out.push({ id: `tool:${t.id}`, label: t.label, group: "Tools", run: () => runTool(t.id) });
     out.push(
-      { id: "a:search", label: "Symbol search", group: "Actions", run: () => setDialog({ k: "symbol", q: "" }) },
+      { id: "a:search", label: "Symbol search", group: "Actions", run: () => setDialog({ k: "symbol", q: shortName ?? "", select: true }) },
       { id: "a:compare", label: "Compare or add symbol", group: "Actions", run: () => setMenuOpen("compare") },
       { id: "a:indicators", label: "Indicators & strategies", group: "Actions", hint: "/", run: () => setDialog({ k: "indicators" }) },
       { id: "a:alert", label: "Create alert", group: "Actions", hint: "Alt+A", run: () => openAlertDialog() },
@@ -3837,17 +4911,45 @@ export default function ChartPanel(props: ChartPanelProps) {
       { id: "a:copyimg", label: "Copy chart image", group: "Actions", run: () => void takeSnapshot("copy") },
       { id: "a:full", label: "Fullscreen", group: "Actions", hint: "Shift+F", run: toggleFullscreen },
       { id: "a:settings", label: "Chart settings…", group: "Settings", run: () => setDialog({ k: "settings" }) },
-      { id: "a:log", label: "Toggle log scale", group: "Settings", hint: "Alt+L", run: () => setScaleMode((m) => (m === "log" ? "normal" : "log")) },
-      { id: "a:pct", label: "Toggle percent scale", group: "Settings", hint: "Alt+P", run: () => setScaleMode((m) => (m === "percent" ? "normal" : "percent")) },
-      { id: "a:idx", label: "Indexed to 100 scale", group: "Settings", run: () => setScaleMode((m) => (m === "indexed" ? "normal" : "indexed")) },
-      { id: "a:auto", label: "Toggle auto scale", group: "Settings", run: () => setAutoScale((v) => !v) },
-      { id: "a:inv", label: "Invert scale", group: "Settings", hint: "Alt+I", run: () => setInvert((v) => !v) },
-      { id: "a:magnet", label: "Toggle magnet mode", group: "Drawing", run: () => setMagnet((m) => (m === "off" ? "weak" : "off")) },
-      { id: "a:lock", label: lockAll ? "Unlock all drawings" : "Lock all drawings", group: "Drawing", run: () => setLockAll((v) => !v) },
-      { id: "a:hide", label: "Hide / show drawings", group: "Drawing", run: () => setHideKind("drawings") },
+      { id: "a:log", label: "Log scale", group: "Settings", hint: "Alt+L", toggle: scaleMode === "log", run: () => setScaleMode((m) => (m === "log" ? "normal" : "log")) },
+      { id: "a:pct", label: "Percent scale", group: "Settings", hint: "Alt+P", toggle: scaleMode === "percent", run: () => setScaleMode((m) => (m === "percent" ? "normal" : "percent")) },
+      { id: "a:idx", label: "Indexed to 100 scale", group: "Settings", toggle: scaleMode === "indexed", run: () => setScaleMode((m) => (m === "indexed" ? "normal" : "indexed")) },
+      { id: "a:auto", label: "Auto scale", group: "Settings", toggle: autoScale, run: () => setAutoScale((v) => !v) },
+      { id: "a:inv", label: "Invert scale", group: "Settings", hint: "Alt+I", toggle: invert, run: () => setInvert((v) => !v) },
+      ...([
+        ["sessionBreaks", "Session breaks"],
+        ["countdown", "Countdown to bar close"],
+        ["noOverlapLabels", "No overlapping labels"],
+        ["lockRatio", "Lock price to bar ratio"],
+        ["symbolNameLabel", "Symbol name label"],
+        ["prevCloseLine", "Previous day close line"],
+        ["highLowLabels", "High and low price labels"],
+        ["bidAskLines", "Bid and ask lines"],
+        ["showEvents", "Corporate events on bars"],
+        ["showMarks", "Marks on bars"],
+        ["watermark", "Symbol watermark"],
+        ["logoWatermark", "Logo watermark"],
+        ["showVolume", "Volume in the status line"],
+        ["showLastDayChange", "Last day change in the status line"],
+        ["indValues", "Indicator values in the status line"],
+        ["executions", "Executions on the chart"],
+        ["extendLines", "Extended position / order lines"],
+        ["buySellButtons", "Buy / sell buttons"],
+        ["sound", "Sound for executions and alerts"],
+      ] as [keyof ChartSettings, string][]).map(([k, label]): Command => ({
+        id: `set:${k}`,
+        label,
+        group: "Settings",
+        toggle: settings[k] === true,
+        run: () => changeSettings({ ...settingsRef.current, [k]: !settingsRef.current[k] }),
+      })),
+      { id: "a:magnet", label: "Magnet mode", group: "Drawing", toggle: magnet !== "off", run: () => setMagnet((m) => (m === "off" ? "weak" : "off")) },
+      { id: "a:lock", label: "Lock all drawings", group: "Drawing", toggle: lockAll, run: () => setLockAll((v) => !v) },
+      { id: "a:hide", label: "Hide drawings", group: "Drawing", toggle: hide.drawings, run: () => setHideKind("drawings") },
+      { id: "a:stay", label: "Stay in drawing mode", group: "Drawing", toggle: stay, run: () => setStay((v) => !v) },
       { id: "a:rmd", label: "Remove all drawings", group: "Drawing", run: () => clearDrawings() },
       { id: "a:rmi", label: "Remove all indicators", group: "Drawing", run: () => removeKind("indicators") },
-      { id: "a:quick", label: settings.buySellButtons ? "Hide buy / sell buttons" : "Show buy / sell buttons (quick trade)", group: "Trading", run: () => changeSettings({ ...settingsRef.current, buySellButtons: !settingsRef.current.buySellButtons }) },
+
       { id: "a:keys", label: "Keyboard shortcuts", group: "Help", hint: "?", run: () => setDialog({ k: "shortcuts" }) },
     );
     if (onAction) {
@@ -3895,21 +4997,25 @@ export default function ChartPanel(props: ChartPanelProps) {
         const def = INDICATOR_BY_TYPE.get(inst.type);
         const vals = indValuesRef.current.get(inst.uid);
         if (!def || !vals) continue;
+        const marks = indMarksRef.current.get(inst.uid)?.get(i) ?? [];
         groups.push({
           title: `${def.short} ${argsLabel(inst)}`,
-          rows: def.plots.filter((_, k) => indHasDataRef.current.get(inst.uid)?.[k] !== false).map((p) => {
-            const k = def.plots.indexOf(p);
-            const x = vals[k]?.[i];
-            return { label: p.label, value: x == null ? "∅" : inst.type === "volume" || inst.type === "obv" ? fmtVol(x) : fmtNum(x, inst.precision ?? 2), color: inst.plots[k]?.color };
-          }),
+          rows: [
+            ...def.plots.filter((p, k) => p.kind !== "marks" && indHasDataRef.current.get(inst.uid)?.[k] !== false).map((p) => {
+              const k = def.plots.indexOf(p);
+              const x = vals[k]?.[i];
+              return { label: p.label, value: x == null ? "∅" : inst.type === "volume" || inst.type === "obv" || inst.type === "oi" ? fmtVol(x) : fmtNum(x, inst.precision ?? 2), color: inst.plots[k]?.color };
+            }),
+            ...marks.map((m) => ({ label: "Signal", value: m.title ?? m.text ?? "●", color: m.color })),
+          ],
         });
       }
     }
     return { title: "Data Window", groups };
   }
 
-  function treePanes(): { title: string; items: TreeItem[] }[] {
-    const mainItems: TreeItem[] = [{ id: symbol, kind: "series", label: `${shortName} · ${ivLabel} · ${CHART_KINDS.find((k) => k.id === chartKind)?.label}`, visible: true }];
+  function treePanes(): { title: string; pane: number; items: TreeItem[] }[] {
+    const mainItems: TreeItem[] = [{ id: symbol, kind: "series", label: `${shortName} · ${ivLabel} · ${CHART_KINDS.find((k) => k.id === chartKind)?.label}`, visible: !mainHidden }];
     for (const c of compares) mainItems.push({ id: c.symbol, kind: "compare", label: c.name, visible: !c.hidden });
     const panes = new Map<number, TreeItem[]>();
     for (const inst of indicators) {
@@ -3920,11 +5026,94 @@ export default function ChartPanel(props: ChartPanelProps) {
     }
     for (const d of [...drawingsList].reverse()) {
       if (TOOL_BY_ID.get(d.type)?.temp) continue;
-      mainItems.push({ id: d.id, kind: "drawing", label: d.name || TOOL_BY_ID.get(d.type)?.label || d.type, visible: !d.hidden, locked: d.locked, selected: d.id === selectedDrawing });
+      mainItems.push({ id: d.id, kind: "drawing", label: d.name || TOOL_BY_ID.get(d.type)?.label || d.type, visible: !d.hidden, locked: d.locked, selected: d.id === selectedDrawing, group: d.group });
     }
-    const out = [{ title: "Main pane", items: mainItems }];
-    for (const [p, items] of [...panes.entries()].sort((a, b) => a[0] - b[0])) out.push({ title: p < 0 ? "Hidden" : `Pane ${p + 1}`, items });
+    const out = [{ title: "Main pane", pane: 0, items: mainItems }];
+    for (const [p, items] of [...panes.entries()].sort((a, b) => a[0] - b[0])) out.push({ title: p < 0 ? "Hidden" : `Pane ${p + 1}`, pane: p, items });
     return out;
+  }
+
+  /** The indicator that owns pane `p` (others in it are its guests). */
+  function paneHost(p: number): string | null {
+    const inPane = indicatorsRef.current.filter((x) => indPaneRef.current.get(x.uid) === p);
+    const host = inPane.find((x) => !(typeof x.pane === "string" && x.pane !== "own" && x.pane !== "main")) ?? inPane[0];
+    return host?.uid ?? null;
+  }
+
+  /** Object tree drag and drop. */
+  function treeDrop(dragged: TreeItem, at: TreeDrop): void {
+    if (dragged.kind === "drawing") {
+      if (at.kind === "group") return updateDrawing(dragged.id, { group: at.group }, "group drawing");
+      if (at.kind === "pane") return updateDrawing(dragged.id, { group: undefined }, "ungroup drawing");
+      if (at.kind !== "item" || at.item.kind !== "drawing") return;
+      const list = [...drawingsRef.current];
+      const from = list.findIndex((d) => d.id === dragged.id);
+      const to = list.findIndex((d) => d.id === at.item.id);
+      if (from < 0 || to < 0) return;
+      pushUndo("visual order");
+      const [d] = list.splice(from, 1);
+      list.splice(to, 0, { ...d, group: at.item.group });
+      drawingsRef.current = list;
+      persistDrawings();
+      repaintDrawings();
+      bumpDrawings();
+      return;
+    }
+    if (dragged.kind !== "indicator") return;
+    if (at.kind === "newpane") return moveIndicatorTo(dragged.id, "own");
+    const targetPane = at.kind === "pane" ? at.pane : at.kind === "item" ? indPaneRef.current.get(at.item.id) ?? 0 : null;
+    if (targetPane == null || targetPane < 0) return;
+    const fromPane = indPaneRef.current.get(dragged.id);
+    if (at.kind === "item" && targetPane === fromPane) {
+      // same pane: take the target's place in the visual (paint) order
+      const list = [...indicatorsRef.current];
+      const from = list.findIndex((x) => x.uid === dragged.id);
+      const to = list.findIndex((x) => x.uid === at.item.id);
+      if (from < 0 || to < 0 || from === to) return;
+      const [it] = list.splice(from, 1);
+      list.splice(to, 0, it);
+      return setIndicators(list, "visual order");
+    }
+    if (targetPane === fromPane) return;
+    const host = targetPane === 0 ? "main" : paneHost(targetPane);
+    if (host && host !== dragged.id) moveIndicatorTo(dragged.id, host);
+  }
+
+  function groupDrawings(ids: string[]): void {
+    const used = new Set(drawingsRef.current.map((d) => d.group).filter(Boolean));
+    let n = 1;
+    while (used.has(`Group ${n}`)) n++;
+    pushUndo("group drawings");
+    drawingsRef.current = drawingsRef.current.map((d) => (ids.includes(d.id) ? { ...d, group: `Group ${n}` } : d));
+    persistDrawings();
+    bumpDrawings();
+  }
+
+  function groupAction(group: string, a: GroupAction): void {
+    const inGroup = (d: Drawing) => d.group === group;
+    if (a === "delete") {
+      const n = drawingsRef.current.filter(inGroup).length;
+      if (!window.confirm(`Delete the ${n} drawing(s) in "${group}"?`)) return;
+      pushUndo("delete group");
+      drawingsRef.current = drawingsRef.current.filter((d) => !inGroup(d));
+      if (selectedIdRef.current && !drawingsRef.current.some((d) => d.id === selectedIdRef.current)) selectDrawing(null);
+    } else {
+      if (typeof a === "object" && drawingsRef.current.some((d) => d.group === a.rename)) {
+        addToast(`a group named "${a.rename}" already exists`);
+        return;
+      }
+      pushUndo(typeof a === "object" ? "rename group" : `${a} group`);
+      drawingsRef.current = drawingsRef.current.map((d) => {
+        if (!inGroup(d)) return d;
+        if (typeof a === "object") return { ...d, group: a.rename };
+        if (a === "ungroup") return { ...d, group: undefined };
+        if (a === "hide" || a === "show") return { ...d, hidden: a === "hide" };
+        return { ...d, locked: a === "lock" };
+      });
+    }
+    persistDrawings();
+    repaintDrawings();
+    bumpDrawings();
   }
 
   const selDrawing = selectedDrawing ? drawingsList.find((d) => d.id === selectedDrawing) ?? null : null;
@@ -3961,10 +5150,18 @@ export default function ChartPanel(props: ChartPanelProps) {
                       : `${activeTool.label}: ${pendingCount ? `point ${pendingCount + 1} of ${activeTool.points}` : `click ${activeTool.points === 1 ? "a point" : "the first point"}`}${stay ? " · stay in drawing mode" : ""} (Shift snaps 45°, Esc cancels)`
                   : null;
   void undoVer;
-  const canUndo = undoRef.current.past.length > 0;
-  const canRedo = undoRef.current.future.length > 0;
-  const undoLabel = canUndo ? undoRef.current.past[undoRef.current.past.length - 1].label : "";
-  const redoLabel = canRedo ? undoRef.current.future[undoRef.current.future.length - 1].label : "";
+  // the layout's history: the latest step in any chart (else this chart's own)
+  const jPast = UNDO_JOURNAL.past.filter((c) => UNDO_HANDLERS.has(c));
+  const jFuture = UNDO_JOURNAL.future.filter((c) => UNDO_HANDLERS.has(c));
+  const canUndo = jPast.length > 0 || undoRef.current.past.length > 0;
+  const canRedo = jFuture.length > 0 || undoRef.current.future.length > 0;
+  const stepLabel = (cell: string | undefined, which: "past" | "future") => {
+    if (!cell) return undoRef.current[which].length ? undoRef.current[which][undoRef.current[which].length - 1].label : "";
+    const l = UNDO_HANDLERS.get(cell)?.label(which) ?? "";
+    return cell === myId || !multi ? l : `${l} (another chart)`;
+  };
+  const undoLabel = canUndo ? stepLabel(jPast[jPast.length - 1], "past") : "";
+  const redoLabel = canRedo ? stepLabel(jFuture[jFuture.length - 1], "future") : "";
   const lightVars = settings.theme === "light"
     ? ({
         "--bg-panel": LIGHT.panel, "--bg-surface": LIGHT.surface, "--bg-elev": LIGHT.elev, "--bg-input": LIGHT.bg,
@@ -3975,7 +5172,11 @@ export default function ChartPanel(props: ChartPanelProps) {
   // snapshot of the drawing when its settings dialog opens (one undo step)
   const dialogSnapRef = useRef<Snap | null>(null);
   useEffect(() => {
-    dialogSnapRef.current = dialog?.k === "drawSettings" ? snapshot("edit drawing") : null;
+    dialogSnapRef.current =
+      dialog?.k === "drawSettings" ? snapshot("edit drawing")
+      : dialog?.k === "settings" ? { ...snapshot("change settings"), settings: settingsRef.current }
+      : dialog?.k === "indSettings" ? snapshot("change indicator settings")
+      : null;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dialog?.k, dialog?.k === "drawSettings" ? dialog.id : null]);
 
@@ -3993,7 +5194,11 @@ export default function ChartPanel(props: ChartPanelProps) {
   );
   const toggleIn = <T,>(list: T[], v: T): T[] => (list.includes(v) ? list.filter((x) => x !== v) : [...list, v]);
   const titleText = settings.titleMode === "ticker" ? shortName : settings.titleMode === "both" ? `${shortName} · ${description}` : description;
-  const legendStyle = settings.legendBg ? { background: withAlpha(theme.bg.startsWith("#") ? theme.bg : "#111111", settings.legendBgOpacity, theme.bg) } : undefined;
+  const legendBgBase = settings.legendBgColor || (theme.bg.startsWith("#") ? theme.bg : "#111111");
+  const legendStyle =
+    settings.legendBg || leftAxisW > 0
+      ? { ...(settings.legendBg ? { background: withAlpha(legendBgBase, settings.legendBgOpacity, legendBgBase) } : {}), ...(leftAxisW > 0 ? { left: leftAxisW + 10 } : {}) }
+      : undefined;
   const knownPanes = new Set(paneRects.map((r) => r.i));
   const mainLegendInds = indicators.filter((inst) => {
     const p = indPaneRef.current.get(inst.uid);
@@ -4004,6 +5209,14 @@ export default function ChartPanel(props: ChartPanelProps) {
   const ask = live?.ask ?? null;
   const ltpNow = live?.last_price ?? lastClose();
   const quickTrade = settings.buySellButtons && !!onChartOrder && !hide.positions;
+
+  /** Open the legend's More menu next to the clicked button. */
+  const openLegendMenu = (e: React.MouseEvent, kind: "main" | "ind", uid?: string) => {
+    const host = containerRef.current?.getBoundingClientRect();
+    const b = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    if (!host) return;
+    setLegendMenu((m) => (m && m.kind === kind && m.uid === uid ? null : { kind, uid, x: b.left - host.left, y: b.bottom - host.top + 2 }));
+  };
 
   const indRow = (inst: IndicatorInstance) => {
     const def = INDICATOR_BY_TYPE.get(inst.type);
@@ -4028,8 +5241,8 @@ export default function ChartPanel(props: ChartPanelProps) {
           {inst.type !== "volume" && (
             <button type="button" title="Add alert on this indicator" onClick={() => openAlertDialog(undefined, { target: `ind:${inst.uid}:0`, targetLabel: `${def.short} ${args} · ${def.plots[0].label}` })}>🔔</button>
           )}
-          <button type="button" title="Duplicate" onClick={() => setIndicators([...indicatorsRef.current, { ...inst, uid: newUid() }], "duplicate indicator")}>⧉</button>
           <button type="button" title="Remove" onClick={() => removeIndicator(inst.uid)} data-testid={`ind-remove-${inst.type}`}>✕</button>
+          <button type="button" title="More" data-more="" onClick={(e) => openLegendMenu(e, "ind", inst.uid)} data-testid={`ind-more-${inst.type}`}>⋯</button>
         </span>
       </div>
     );
@@ -4038,11 +5251,24 @@ export default function ChartPanel(props: ChartPanelProps) {
   const scaleMenu = (close: () => void) => (
     <>
       <button type="button" className={`chart-menu-item${autoScale ? " on" : ""}`} onClick={() => { setAutoScale((v) => !v); close(); }}>Auto (fits data to screen)</button>
+      <button
+        type="button"
+        className={`chart-menu-item${settings.lockRatio ? " on" : ""}`}
+        disabled={scaleMode === "log"}
+        onClick={() => {
+          changeSettings({ ...settings, lockRatio: !settings.lockRatio, priceBarRatio: settings.lockRatio ? settings.priceBarRatio : 0 });
+          close();
+          setTimeout(applyRatioLock, 0);
+        }}
+        data-testid="scale-lock-ratio"
+      >
+        Lock price to bar ratio{settings.lockRatio && settings.priceBarRatio ? ` (${settings.priceBarRatio})` : ""}
+      </button>
       <button type="button" className={`chart-menu-item${scalePriceOnly ? " on" : ""}`} onClick={() => { setScalePriceOnly((v) => !v); close(); }}>Scale price chart only</button>
       <button type="button" className={`chart-menu-item${invert ? " on" : ""}`} onClick={() => { setInvert((v) => !v); close(); }}>Invert scale<span className="kbd">Alt+I</span></button>
       <div className="chart-menu-sep" />
       {([["normal", "Regular"], ["percent", "Percent"], ["indexed", "Indexed to 100"], ["log", "Logarithmic"]] as [ScaleMode, string][]).map(([m, l]) => (
-        <button key={m} type="button" className={`chart-menu-item${scaleMode === m ? " on" : ""}`} disabled={compares.length > 0} onClick={() => { setScaleMode(m); close(); }}>
+        <button key={m} type="button" className={`chart-menu-item${scaleMode === m ? " on" : ""}`} disabled={pctCompare} onClick={() => { setScaleMode(m); close(); }}>
           {scaleMode === m ? "● " : "○ "}{l}{m === "percent" ? <span className="kbd">Alt+P</span> : m === "log" ? <span className="kbd">Alt+L</span> : null}
         </button>
       ))}
@@ -4098,8 +5324,23 @@ export default function ChartPanel(props: ChartPanelProps) {
   );
 
   const toolbar = (
-    <div className="chart-toolbar" data-testid="chart-toolbar">
-      <button type="button" className="chart-btn chart-sym-btn" onClick={() => setDialog({ k: "symbol", q: "" })} title={onSymbolChange ? "Symbol search (type on the chart)" : symbol} disabled={!onSymbolChange} data-testid="chart-symbol">
+    <div className={`chart-toolbar-wrap${tbScroll.left || tbScroll.right ? " scrolls" : ""}`}>
+    <div className="chart-toolbar" data-testid="chart-toolbar" ref={toolbarRef} onScroll={() => { measureToolbar(); positionToolbarMenu(); }}>
+      {onAction && (
+        <div className="chart-group chart-menu-wrap">
+          <button type="button" className={`chart-btn tb-logo${menuOpen === "products" ? " on" : ""}`} onClick={menuBtn("products")} title="Products" data-testid="chart-products">◆▾</button>
+          {menuOpen === "products" && (
+            <div className="chart-menu cdrop" data-testid="products-menu">
+              <div className="chart-menu-head">Fyers products</div>
+              <a className="chart-menu-item" href="https://trade.fyers.in/" target="_blank" rel="noopener noreferrer" onClick={() => setMenuOpen(null)}>FYERS Web ↗</a>
+              <button type="button" className="chart-menu-item" onClick={() => { setMenuOpen(null); onAction("panel:flow"); }}>Smart Charts (order flow)</button>
+              <button type="button" className="chart-menu-item" onClick={() => { setMenuOpen(null); onAction("scalper"); }}>Option Scalper</button>
+              <button type="button" className="chart-menu-item" onClick={() => { setMenuOpen(null); setDialog({ k: "whatsnew" }); }} data-testid="whats-new">What's New</button>
+            </div>
+          )}
+        </div>
+      )}
+      <button type="button" className="chart-btn chart-sym-btn" onClick={() => setDialog({ k: "symbol", q: shortName ?? "", select: true })} title={onSymbolChange ? "Symbol search (type on the chart)" : symbol} disabled={!onSymbolChange} data-testid="chart-symbol">
         <span className="ico">⌕</span><span className="sym">{shortName}</span>
       </button>
       {/* compare */}
@@ -4108,32 +5349,59 @@ export default function ChartPanel(props: ChartPanelProps) {
           ⊕{compares.length > 0 ? ` ${compares.length}` : ""}
         </button>
         {menuOpen === "compare" && (
-          <div className="chart-menu" data-testid="chart-compare-menu">
-            <div className="chart-menu-head">Compare symbol (percent scale)</div>
+          <div className="chart-menu cmp-menu" data-testid="chart-compare-menu">
+            <div className="chart-menu-head">Compare symbol</div>
             <input type="text" className="chart-menu-input" placeholder="search symbol…" value={compareQuery} onChange={(e) => setCompareQuery(e.target.value)} autoFocus data-testid="chart-compare-input" />
             {compareHits
               .filter((h) => !compares.some((c) => c.symbol === h.symbol))
               .map((h) => (
-                <button
-                  key={h.symbol}
-                  type="button"
-                  className="chart-menu-item"
-                  onClick={() => {
-                    if (compares.length >= 4) return;
-                    setCompares((c) => [...c, { symbol: h.symbol, name: h.name, color: COMPARE_COLORS[c.length % COMPARE_COLORS.length] }]);
-                    setCompareQuery("");
-                    setCompareHits([]);
-                  }}
-                  data-testid={`chart-compare-add-${h.symbol}`}
-                >
-                  {h.name} <span className="hint">{h.symbol}</span>
-                </button>
+                <div key={h.symbol} className="cmp-hit">
+                  <span className="cmp-name">{h.name} <span className="hint">{h.symbol}</span></span>
+                  <span className="cmp-adds">
+                    {COMPARE_MODES.map((m) => (
+                      <button
+                        key={m.v}
+                        type="button"
+                        className="cmp-add"
+                        disabled={compares.length >= 4}
+                        title={compares.length >= 4 ? "Up to 4 symbols" : `Add on ${m.l.toLowerCase()}`}
+                        onClick={() => {
+                          setCompares((c) => (c.length >= 4 || c.some((x) => x.symbol === h.symbol) ? c : [...c, { symbol: h.symbol, name: h.name, color: COMPARE_COLORS[c.length % COMPARE_COLORS.length], mode: m.v }]));
+                          setCompareQuery("");
+                          setCompareHits([]);
+                        }}
+                        data-testid={m.v === "percent" ? `chart-compare-add-${h.symbol}` : `chart-compare-add-${m.v}-${h.symbol}`}
+                      >
+                        {m.l}
+                      </button>
+                    ))}
+                  </span>
+                </div>
               ))}
+            {compares.length === 0 && compareHits.length === 0 && (
+              <div className="cmp-empty" data-testid="chart-compare-empty">
+                <svg width="56" height="40" viewBox="0 0 56 40" aria-hidden="true">
+                  <polyline points="2,34 14,22 24,28 36,12 54,18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" />
+                  <polyline points="2,26 14,30 24,16 36,22 54,6" fill="none" stroke="#42A5F5" strokeWidth="2" strokeDasharray="4 3" strokeLinejoin="round" />
+                </svg>
+                <div>No symbols here yet — why not add some?</div>
+                <div className="hint">Search above, then pick Same % scale, New price scale or New pane.</div>
+              </div>
+            )}
             {compares.length > 0 && <div className="chart-menu-sep" />}
             {compares.map((c) => (
               <div key={c.symbol} className="chart-menu-row">
                 <span><span className="chart-dot" style={{ background: c.color }} />{c.name}</span>
-                <span>
+                <span className="cmp-row-acts">
+                  <select
+                    className="cmp-mode"
+                    value={c.mode ?? "percent"}
+                    onChange={(e) => setCompares((l) => l.map((x) => (x.symbol === c.symbol ? { ...x, mode: e.target.value as CompareMode } : x)))}
+                    aria-label={`${c.name} scale`}
+                    data-testid={`chart-compare-mode-${c.symbol}`}
+                  >
+                    {COMPARE_MODES.map((m) => <option key={m.v} value={m.v}>{m.l}</option>)}
+                  </select>
                   <button type="button" className="chart-menu-x" onClick={() => setCompares((l) => l.map((x) => (x.symbol === c.symbol ? { ...x, hidden: !x.hidden } : x)))} title={c.hidden ? "Show" : "Hide"}>{c.hidden ? "◌" : "👁"}</button>
                   <button type="button" className="chart-menu-x" onClick={() => setCompares((list) => list.filter((x) => x.symbol !== c.symbol))} title="Remove" data-testid={`chart-compare-del-${c.symbol}`}>✕</button>
                 </span>
@@ -4184,8 +5452,17 @@ export default function ChartPanel(props: ChartPanelProps) {
             </div>
             {[...INTERVAL_SECTIONS, ...(customIntervals.length ? [{ title: "Custom", keys: customIntervals }] : [])].map((sec) => (
               <div key={sec.title} className="chart-menu-section">
-                <div className="chart-menu-head">{sec.title}</div>
-                {sec.keys.map((k) => (
+                <button
+                  type="button"
+                  className="chart-menu-head iv-sec-head"
+                  onClick={() => setIvCollapsed((l) => toggleIn(l, sec.title))}
+                  aria-expanded={!ivCollapsed.includes(sec.title)}
+                  data-testid={`chart-iv-sec-${sec.title}`}
+                >
+                  <span>{sec.title}</span>
+                  <span className="caret">{ivCollapsed.includes(sec.title) ? "▸" : "▾"}</span>
+                </button>
+                {!ivCollapsed.includes(sec.title) && sec.keys.map((k) => (
                   <div key={k} className={`chart-menu-row iv-row${iv === k ? " on" : ""}`}>
                     <button type="button" className="chart-menu-item" onClick={() => { changeInterval(k); setMenuOpen(null); }} data-testid={`chart-ivm-${k}`}>{intervalLongLabel(k)}</button>
                     {star(favIntervals.includes(k), () => setFavIntervals((l) => toggleIn(l, k)), `Favorite ${intervalLongLabel(k)}`)}
@@ -4217,6 +5494,14 @@ export default function ChartPanel(props: ChartPanelProps) {
                 {star(favKinds.includes(k.id), () => setFavKinds((l) => toggleIn(l, k.id)), `Pin ${k.label}`)}
               </div>
             ))}
+            {BRICK_KINDS.has(chartKind) && (
+              <>
+                <div className="chart-menu-sep" />
+                <button type="button" className="chart-menu-item" onClick={() => { setDialog({ k: "settings", tab: "symbol" }); setMenuOpen(null); }} data-testid="chart-kind-inputs">
+                  ⚙ {CHART_KINDS.find((k) => k.id === chartKind)?.label} inputs…
+                </button>
+              </>
+            )}
           </div>
         )}
       </div>
@@ -4232,7 +5517,10 @@ export default function ChartPanel(props: ChartPanelProps) {
             {templates.length > 0 && <div className="chart-menu-sep" />}
             {templates.map((t) => (
               <div key={t.name} className="chart-menu-row">
-                <button type="button" className="chart-menu-item" onClick={() => applyIndTemplate(t)}>{t.name} <span className="hint">{t.items.length}</span></button>
+                <button type="button" className="chart-menu-item" onClick={() => applyIndTemplate(t)} title={templateScope(t, intervalLongLabel) ? `Also switches to ${templateScope(t, intervalLongLabel)}` : undefined}>
+                  {t.name} <span className="hint">{t.items.length}{templateScope(t, intervalLabel) ? ` · ${templateScope(t, intervalLabel)}` : ""}</span>
+                </button>
+                <button type="button" className="chart-menu-x" title="Rename template" onClick={() => renameIndTemplate(t)} data-testid={`chart-template-rename-${t.name}`}>✎</button>
                 <button type="button" className="chart-menu-x" title="Delete template" onClick={() => deleteIndTemplate(t.name)}>✕</button>
               </div>
             ))}
@@ -4241,8 +5529,21 @@ export default function ChartPanel(props: ChartPanelProps) {
       </div>
       <span className="chart-tsep" />
       {onChartOrder && (
-        <button type="button" className={`chart-btn${settings.buySellButtons ? " on" : ""}`} onClick={() => changeSettings({ ...settings, buySellButtons: !settings.buySellButtons })} title="Quick trade — buy / sell buttons on the chart" data-testid="chart-quick-trade">
-          ⚡{instant ? " 1-click" : ""}
+        <button
+          type="button"
+          className={`chart-btn qt-toggle${instant ? " on" : ""}`}
+          onClick={() => {
+            if (onTrading) {
+              onTrading("instant", !instant);
+              if (!settings.buySellButtons) changeSettings({ ...settings, buySellButtons: true });
+            } else changeSettings({ ...settings, buySellButtons: !settings.buySellButtons });
+          }}
+          role="switch"
+          aria-checked={instant}
+          title={onTrading ? `Quick trade: one-click trading ${instant ? "ON — BUY / SELL send at market" : "OFF — BUY / SELL open the order window"}` : "Quick trade — buy / sell buttons on the chart"}
+          data-testid="chart-quick-trade"
+        >
+          ⚡<span className={`qt-switch${instant ? " on" : ""}`} aria-hidden="true"><i /></span>
         </button>
       )}
       {/* alerts */}
@@ -4268,9 +5569,17 @@ export default function ChartPanel(props: ChartPanelProps) {
       {pinnedTools.map((id) => {
         const t = TOOLS_MENU.find((x) => x.id === id);
         if (!t || (t.host && !onAction)) return null;
+        if (t.href)
+          return (
+            <a key={id} className="chart-btn pinned-tool" href={t.href} target="_blank" rel="noopener noreferrer" title={`${t.label} (opens Fyers)`} data-testid={`chart-tool-${id}`}>
+              {t.icon}<span className="pt-label">{t.label}</span>
+            </a>
+          );
         return (
-          <button key={id} type="button" className={`chart-btn${id === "replay" && replay.on ? " on" : ""}`} onClick={() => runTool(id)} title={t.label} data-testid={`chart-tool-${id}`}>
+          <button key={id} type="button" className={`chart-btn pinned-tool${id === "replay" && replay.on ? " on" : ""}`} onClick={() => runTool(id)} title={t.label} data-testid={`chart-tool-${id}`}>
             {t.icon}
+            {t.short && <span className="pt-label">{t.short}</span>}
+            {t.badge && <span className="ind-new">{t.badge}</span>}
           </button>
         );
       })}
@@ -4280,11 +5589,17 @@ export default function ChartPanel(props: ChartPanelProps) {
           <div className="chart-menu">
             {TOOLS_MENU.filter((t) => !t.host || onAction).map((t) => (
               <div key={t.id} className="chart-menu-row">
+                {t.href ? (
+                  <a className="chart-menu-item" href={t.href} target="_blank" rel="noopener noreferrer" onClick={() => setMenuOpen(null)} title="Opens Fyers in a new tab">
+                    <span className="ico">{t.icon}</span> {t.label} <span className="hint">↗</span>
+                  </a>
+                ) : (
                 <button type="button" className="chart-menu-item" onClick={() => runTool(t.id)}>
                   <span className="ico">{t.icon}</span> {t.label}{t.badge && <span className="badge-new">{t.badge}</span>}
                   {t.id === "theme" && <span className="hint"> ({settings.theme === "light" ? "light" : "dark"})</span>}
                   {t.id === "privacy" && privacy && <span className="hint"> (on)</span>}
                 </button>
+                )}
                 {star(pinnedTools.includes(t.id), () => setPinnedTools((l) => toggleIn(l, t.id)), `Pin ${t.label}`)}
               </div>
             ))}
@@ -4308,12 +5623,24 @@ export default function ChartPanel(props: ChartPanelProps) {
           {menuOpen === "snapshot" && (
             <div className="chart-menu cdrop right">
               <button type="button" className="chart-menu-item" onClick={() => void takeSnapshot("download")} data-testid="chart-snapshot-download">Download image<span className="kbd">Ctrl+Alt+S</span></button>
-              <button type="button" className="chart-menu-item" onClick={() => void takeSnapshot("copy")}>Copy image</button>
+              <button type="button" className="chart-menu-item" onClick={() => void takeSnapshot("copy")}>Copy image<span className="kbd">Ctrl+Shift+S</span></button>
+              <button type="button" className="chart-menu-item" onClick={() => void takeSnapshot("link")} data-testid="chart-snapshot-link">Copy link<span className="kbd">Alt+S</span></button>
               <button type="button" className="chart-menu-item" onClick={() => void takeSnapshot("open")}>Open in new tab</button>
+              <button type="button" className="chart-menu-item" onClick={() => void takeSnapshot("tweet")}>Tweet image</button>
             </div>
           )}
         </div>
+        {onAction && (
+          <button type="button" className="chart-btn" onClick={() => onAction("logout")} title="Logout from the trading terminal (disconnects Fyers)" data-testid="chart-logout">⏻</button>
+        )}
       </div>
+    </div>
+      {tbScroll.left && (
+        <button type="button" className="tb-arrow left" onClick={() => toolbarRef.current?.scrollBy({ left: -240, behavior: "smooth" })} title="Scroll left" aria-label="Scroll toolbar left">‹</button>
+      )}
+      {tbScroll.right && (
+        <button type="button" className="tb-arrow right" onClick={() => toolbarRef.current?.scrollBy({ left: 240, behavior: "smooth" })} title="More tools" aria-label="Scroll toolbar right" data-testid="toolbar-more">›</button>
+      )}
     </div>
   );
 
@@ -4330,9 +5657,112 @@ export default function ChartPanel(props: ChartPanelProps) {
         {menuOpen === "tz" && <div className="chart-menu cdrop up right">{timeMenu(() => setMenuOpen(null))}</div>}
       </div>
       <span className="crange-sep" />
-      <button type="button" className={`crange-btn${scaleMode === "percent" || compares.length > 0 ? " on" : ""}`} onClick={() => setScaleMode((m) => (m === "percent" ? "normal" : "percent"))} disabled={compares.length > 0} title="Toggle percentage (Alt+P)" data-testid="chart-scale-pct">%</button>
-      <button type="button" className={`crange-btn${scaleMode === "log" ? " on" : ""}`} onClick={() => setScaleMode((m) => (m === "log" ? "normal" : "log"))} disabled={compares.length > 0} title="Toggle log scale (Alt+L)" data-testid="chart-scale-log">log</button>
+      <button type="button" className={`crange-btn${scaleMode === "percent" || pctCompare ? " on" : ""}`} onClick={() => setScaleMode((m) => (m === "percent" ? "normal" : "percent"))} disabled={pctCompare} title="Toggle percentage (Alt+P)" data-testid="chart-scale-pct">%</button>
+      <button type="button" className={`crange-btn${scaleMode === "log" ? " on" : ""}`} onClick={() => setScaleMode((m) => (m === "log" ? "normal" : "log"))} disabled={pctCompare} title="Toggle log scale (Alt+L)" data-testid="chart-scale-log">log</button>
       <button type="button" className={`crange-btn${autoScale ? " on" : ""}`} onClick={() => setAutoScale((v) => !v)} title="Toggle auto scale" data-testid="chart-scale-auto">auto</button>
+    </div>
+  );
+
+  const legendMenuEl = legendMenu && (() => {
+    const close = () => setLegendMenu(null);
+    const item = (label: ReactNode, run: () => void, extra?: { testid?: string; on?: boolean; disabled?: boolean; kbd?: string }) => (
+      <button type="button" className={`chart-menu-item${extra?.on ? " on" : ""}`} disabled={extra?.disabled} onClick={() => { run(); close(); }} data-testid={extra?.testid}>
+        {label}
+        {extra?.kbd && <span className="kbd">{extra.kbd}</span>}
+      </button>
+    );
+    const hostH = containerRef.current?.clientHeight ?? 600;
+    const style = { left: Math.max(0, Math.min(legendMenu.x, (containerRef.current?.clientWidth ?? 600) - 250)), top: legendMenu.y, maxHeight: hostH - 8, overflowY: "auto" as const };
+    // keep the menu inside the chart: slide it up when it would run off the bottom
+    const fit = (el: HTMLDivElement | null) => {
+      if (!el) return;
+      const maxTop = hostH - el.offsetHeight - 4;
+      if (el.offsetTop > maxTop) el.style.top = `${Math.max(4, maxTop)}px`;
+    };
+    if (legendMenu.kind === "main") {
+      const last = viewRef.current[viewRef.current.length - 1]?.close;
+      return (
+        <div ref={fit} className="chart-menu chart-ctx chart-overlay-ui" style={style} onMouseDown={(e) => e.stopPropagation()} data-testid="legend-menu">
+          <div className="chart-menu-head">{titleText}</div>
+          {item(mainHidden ? "Show series" : "Hide series", () => setMainHidden((v) => !v))}
+          {item("Settings…", () => setDialog({ k: "settings", tab: "symbol" }))}
+          {onSymbolChange && item("Change symbol…", () => setDialog({ k: "symbol", q: shortName ?? "", select: true }))}
+          {item("Change interval…", () => setDialog({ k: "interval", txt: "" }))}
+          {item("Create alert…", () => openAlertDialog(), { kbd: "Alt+A" })}
+          {last != null && item(`Copy last price ${fmtPrice(last)}`, () => { void navigator.clipboard?.writeText(String(last)).catch(() => undefined); addToast(`copied ${fmtPrice(last)}`); })}
+          {onAction && item(`Add ${shortName} to watchlist`, () => onAction("watch:add"), { kbd: "Alt+W" })}
+          {onAction && item("Symbol details", () => onAction("panel:details"))}
+          {item("Insights", () => setDialog({ k: "insights" }))}
+        </div>
+      );
+    }
+    const inst = indicators.find((x) => x.uid === legendMenu.uid);
+    const def = inst ? INDICATOR_BY_TYPE.get(inst.type) : undefined;
+    if (!inst || !def) return null;
+    const myPane = indPaneRef.current.get(inst.uid);
+    const panes = paneList().filter((p) => p.i !== myPane);
+    return (
+      <div ref={fit} className="chart-menu chart-ctx chart-overlay-ui" style={style} onMouseDown={(e) => e.stopPropagation()} data-testid="legend-ind-menu">
+        <div className="chart-menu-head">{def.short} {argsLabel(inst)}</div>
+        {def.plots[0] && inst.type !== "volume" && item(`Add alert on ${def.short}…`, () => openAlertDialog(undefined, { target: `ind:${inst.uid}:0`, targetLabel: `${def.short} ${argsLabel(inst)} · ${def.plots[0].label}` }))}
+        {item("Settings…", () => setDialog({ k: "indSettings", uid: inst.uid }))}
+        {item(inst.visible ? "Hide" : "Show", () => toggleIndicator(inst.uid))}
+        <div className="chart-menu-head">Visual order</div>
+        {item("Bring to front", () => reorderIndicator(inst.uid, "front"))}
+        {item("Send to back", () => reorderIndicator(inst.uid, "back"))}
+        <div className="chart-menu-head">Move to</div>
+        {item("New pane below", () => moveIndicatorTo(inst.uid, "own"), { disabled: myPane !== 0 && inst.pane !== "main" && !def.overlay && inst.pane === undefined && panes.length === 0, testid: "ind-move-new" })}
+        {myPane !== 0 && item("Price pane", () => moveIndicatorTo(inst.uid, "main"), { testid: "ind-move-main" })}
+        {panes.filter((p) => p.i !== 0).map((p) => (
+          <button key={p.i} type="button" className="chart-menu-item" onClick={() => { moveIndicatorTo(inst.uid, p.insts[0].uid); close(); }}>
+            Pane {p.i}: {p.insts.map((x) => INDICATOR_BY_TYPE.get(x.type)?.short ?? x.type).join(", ")}
+          </button>
+        ))}
+        <div className="chart-menu-head">Pin to scale</div>
+        {item("Default", () => pinIndicatorScale(inst.uid, undefined), { on: !inst.scale })}
+        {item("Left scale", () => pinIndicatorScale(inst.uid, "left"), { on: inst.scale === "left" })}
+        {item("Right scale", () => pinIndicatorScale(inst.uid, "right"), { on: inst.scale === "right" })}
+        {item("New scale (overlay)", () => pinIndicatorScale(inst.uid, "new"), { on: inst.scale === "new" })}
+        <div className="chart-menu-sep" />
+        {item("Copy", () => copyIndicator(inst.uid), { testid: "ind-copy" })}
+        {item("Duplicate", () => setIndicators([...indicatorsRef.current, { ...inst, uid: newUid() }], "duplicate indicator"))}
+        {item("Save as default", () => {
+          const all = loadJson<Record<string, Partial<IndicatorInstance>>>("chart:indDefaults", {});
+          all[inst.type] = instanceDefaults(inst);
+          saveJson("chart:indDefaults", all);
+          addToast(`saved as the default for new ${def.short}`);
+        })}
+        {item("About…", () => setDialog({ k: "about", uid: inst.uid }))}
+        <div className="chart-menu-sep" />
+        {item(<span className="down">Remove</span>, () => removeIndicator(inst.uid))}
+      </div>
+    );
+  })();
+
+  function openTradeFly(row: HTMLElement): void {
+    const host = containerRef.current?.getBoundingClientRect();
+    if (!host) return;
+    const r = row.getBoundingClientRect();
+    const w = 290;
+    const right = r.right - host.left + 4;
+    const x = right + w > host.width ? Math.max(0, r.left - host.left - w - 4) : right;
+    setTradeFly({ x, y: Math.max(0, Math.min(r.top - host.top - 8, host.height - 200)) });
+  }
+
+  const tradeFlyEl = ctx && tradeFly && !ctx.confirm && ctx.area === "pane" && (
+    <div className="chart-menu chart-ctx chart-overlay-ui ctx-fly" style={{ left: tradeFly.x, top: tradeFly.y }} onMouseDown={(e) => e.stopPropagation()} data-testid="ctx-trade-menu">
+      {onChartOrder &&
+        ctxOrders(ctx.price).filter((o) => o.price != null).map((o, i) => (
+          <button key={`${o.side}-${o.type}`} type="button" className={`chart-menu-item ctx-${o.side.toLowerCase()}`} onClick={() => pickOrder(o, ctx)}>
+            {o.side === "BUY" ? "⌃" : "⌄"} {orderLabel(o)}{i === 0 && <span className="kbd">Alt+Shift+B</span>}
+          </button>
+        ))}
+      {onPickPrice && (
+        <button type="button" className="chart-menu-item" onClick={() => { onPickPrice(ctx.price); setCtx(null); }}>
+          ⤷ Create new order at {fmtPrice(ctx.price)}…<span className="kbd">Shift+T</span>
+        </button>
+      )}
+      {onChartOrder && trading && <button type="button" className="chart-menu-item" onClick={() => { setDialog({ k: "settings", tab: "trading" }); setCtx(null); }}>Trading settings…</button>}
     </div>
   );
 
@@ -4344,6 +5774,9 @@ export default function ChartPanel(props: ChartPanelProps) {
         top: Math.max(0, Math.min(ctx.y, Math.max(0, (containerRef.current?.clientHeight ?? 400) - 320))),
       }}
       onMouseDown={(e) => e.stopPropagation()}
+      onMouseOver={(e) => {
+        if (tradeFly && !(e.target as HTMLElement).closest('[data-testid="ctx-trade"]')) setTradeFly(null);
+      }}
       ref={(el) => {
         const host = containerRef.current;
         if (!el || !host) return;
@@ -4388,8 +5821,14 @@ export default function ChartPanel(props: ChartPanelProps) {
               {drawingValueAt(d, viewRef.current[viewRef.current.length - 1]?.time ?? 0, drawingDeps()) !== null && (
                 <button type="button" className="chart-menu-item" onClick={() => { openAlertDialog(undefined, { target: `draw:${d.id}`, targetLabel: d.name || TOOL_BY_ID.get(d.type)?.label }); close(); }}>Add alert on this line</button>
               )}
-              <button type="button" className="chart-menu-item" onClick={() => { toolDefaultsRef.current = { ...toolDefaultsRef.current, [d.type]: { ...(d.style ?? {}), levels: d.style?.levels } }; saveJson("chart:drawStyles", toolDefaultsRef.current); addToast("saved as the default style"); close(); }}>Template: save as default</button>
-              <button type="button" className="chart-menu-item" onClick={() => { updateDrawing(d.id, { style: { ...(toolDefaultsRef.current[d.type] ?? {}) } }, "apply template"); close(); }}>Template: apply default</button>
+              <div className="chart-menu-head">Template</div>
+              {drawTemplates(d.type).map((t) => (
+                <button key={t.name} type="button" className="chart-menu-item" onClick={() => { applyDrawTemplate(d, t.name); close(); }}>▦ {t.name}</button>
+              ))}
+              <button type="button" className="chart-menu-item" onClick={() => { applyDrawTemplate(d, null); close(); }}>Apply default</button>
+              <button type="button" className="chart-menu-item" onClick={() => { close(); saveDrawTemplate(d); }}>Save drawing template as…</button>
+              <button type="button" className="chart-menu-item" onClick={() => { toolDefaultsRef.current = { ...toolDefaultsRef.current, [d.type]: { ...(d.style ?? {}), levels: d.style?.levels } }; saveJson("chart:drawStyles", toolDefaultsRef.current); addToast("saved as the default style"); close(); }}>Save as default</button>
+              <div className="chart-menu-sep" />
               <button type="button" className="chart-menu-item" onClick={() => { setDialog({ k: "drawSettings", id: d.id }); close(); }}>Settings…</button>
               <div className="chart-menu-sep" />
               <button type="button" className="chart-menu-item ctx-sell" onClick={() => { deleteDrawing(d.id); close(); }}>Remove<span className="kbd">Del</span></button>
@@ -4402,24 +5841,23 @@ export default function ChartPanel(props: ChartPanelProps) {
           <button type="button" className="chart-menu-item" onClick={() => { resetView(); setCtx(null); }}>Reset chart view<span className="kbd">Alt+R</span></button>
           <button type="button" className="chart-menu-item" onClick={() => { void navigator.clipboard?.writeText(String(ctx.price)).catch(() => undefined); addToast(`copied ${fmtPrice(ctx.price)}`); setCtx(null); }}>Copy price {fmtPrice(ctx.price)}</button>
           {clipboardRef.current && <button type="button" className="chart-menu-item" onClick={() => { pasteDrawing(); setCtx(null); }}>Paste<span className="kbd">Ctrl+V</span></button>}
+          {indicatorClipboard.current != null && <button type="button" className="chart-menu-item" onClick={() => { pasteIndicator(); setCtx(null); }} data-testid="ctx-paste-indicator">Paste indicator</button>}
           <div className="chart-menu-sep" />
           <button type="button" className="chart-menu-item" onClick={() => { addAlert(ctx.price); setCtx(null); }}>
             🔔 Add alert on {shortName} at {fmtPrice(ctx.price)}<span className="kbd">Alt+A</span>
           </button>
           <button type="button" className="chart-menu-item" onClick={() => { openAlertDialog(ctx.price); setCtx(null); }}>Create alert…</button>
-          {onChartOrder && <div className="chart-menu-head">Trade</div>}
-          {onChartOrder &&
-            ctxOrders(ctx.price).filter((o) => o.price != null).map((o, i) => (
-              <button key={`${o.side}-${o.type}`} type="button" className={`chart-menu-item ctx-${o.side.toLowerCase()}`} onClick={() => pickOrder(o, ctx)}>
-                {o.side === "BUY" ? "⌃" : "⌄"} {orderLabel(o)}{i === 0 && <span className="kbd">Alt+Shift+B</span>}
-              </button>
-            ))}
-          {onPickPrice && (
-            <button type="button" className="chart-menu-item" onClick={() => { onPickPrice(ctx.price); setCtx(null); }}>
-              ⤷ Create new order at {fmtPrice(ctx.price)}…<span className="kbd">Shift+T</span>
+          {(onChartOrder || onPickPrice) && (
+            <button
+              type="button"
+              className={`chart-menu-item chart-menu-subrow${tradeFly ? " on" : ""}`}
+              data-testid="ctx-trade"
+              onMouseEnter={(e) => openTradeFly(e.currentTarget)}
+              onClick={(e) => openTradeFly(e.currentTarget)}
+            >
+              Trade<span className="kbd">▸</span>
             </button>
           )}
-          {onChartOrder && trading && <button type="button" className="chart-menu-item" onClick={() => { setDialog({ k: "settings", tab: "trading" }); setCtx(null); }}>Trading settings…</button>}
           <div className="chart-menu-sep" />
           <button type="button" className="chart-menu-item" onClick={() => { addHLine(ctx.price); setCtx(null); }}>
             ─ Draw horizontal line at {fmtPrice(ctx.price)}<span className="kbd">Alt+H</span>
@@ -4440,6 +5878,8 @@ export default function ChartPanel(props: ChartPanelProps) {
           {onAction && <button type="button" className="chart-menu-item" onClick={() => { onAction("panel:tape"); setCtx(null); }}>Time & sales</button>}
           {onAction && <button type="button" className="chart-menu-item" onClick={() => { onAction("panel:depth"); setCtx(null); }}>Market depth</button>}
           {onAction && <button type="button" className="chart-menu-item" onClick={() => { onAction("panel:strategy"); setCtx(null); }}>Strategy builder</button>}
+          <button type="button" className="chart-menu-item" onClick={() => { setDialog({ k: "insights" }); setCtx(null); }} data-testid="ctx-insights">Insights</button>
+          {paneRects.length > 1 && <button type="button" className="chart-menu-item" onClick={() => { setDialog({ k: "panes" }); setCtx(null); }}>Manage panes…</button>}
           <button type="button" className="chart-menu-item" onClick={() => { setDialog({ k: "settings" }); setCtx(null); }}>Settings…</button>
           {onChartOrder && <div className="chart-menu-sep" />}
           {onChartOrder &&
@@ -4496,7 +5936,7 @@ export default function ChartPanel(props: ChartPanelProps) {
               showFavBar={showFavBar}
               onFavBar={() => setShowFavBar((v) => !v)}
               onCollapse={() => setToolsCollapsed(true)}
-              onEmoji={(e) => { pendingIconRef.current = { emoji: e }; toggleDraw("icon"); }}
+              onIcon={(d) => { pendingIconRef.current = d; toggleDraw("icon"); }}
               onImage={(src, w, h) => { pendingIconRef.current = { src, w, h }; toggleDraw("image"); }}
               alertMode={drawMode === "alert"}
               onAlert={() => setDrawMode(drawModeRef.current === "alert" ? null : "alert")}
@@ -4518,10 +5958,23 @@ export default function ChartPanel(props: ChartPanelProps) {
               {shortName}<span>{ivLabel}</span>
             </div>
           )}
+          {settings.logoWatermark && (
+            <div
+              className="chart-logo-wm"
+              style={{
+                left: (side === "left" ? scaleWidth("left") : 0) + 10,
+                // bottom-left of the price pane (indicator panes sit below it)
+                top: (paneRects.find((r) => r.i === 0) ? (paneRects.find((r) => r.i === 0)!.top + paneRects.find((r) => r.i === 0)!.height) : (containerRef.current?.clientHeight ?? 400) - 28) - 24,
+              }}
+              aria-hidden
+            >
+              <b>◆</b> TRADEBOT
+            </div>
+          )}
           <div className="chart-legend chart-overlay-ui" style={legendStyle}>
             <div className="lg-row lg-main">
               {settings.showTitle && (
-                <button type="button" className="lg-sym" onClick={() => onSymbolChange && setDialog({ k: "symbol", q: "" })} title="Change symbol">{titleText}</button>
+                <button type="button" className="lg-sym" onClick={() => onSymbolChange && setDialog({ k: "symbol", q: shortName ?? "", select: true })} title="Change symbol">{titleText}</button>
               )}
               <button type="button" className="lg-tf" onClick={() => setDialog({ k: "interval", txt: "" })} title="Change interval">{ivLabel}</button>
               {exchange && <span className="lg-exch">{exchange}</span>}
@@ -4529,13 +5982,23 @@ export default function ChartPanel(props: ChartPanelProps) {
               {replay.on && !replay.selecting && <span className="lg-replay">REPLAY</span>}
               <span ref={legendRef} className="lg-vals" />
               <span className="lg-acts">
+                <button type="button" title={mainHidden ? "Show the series" : "Hide the series"} onClick={() => setMainHidden((v) => !v)} data-testid="legend-main-eye">{mainHidden ? "◌" : "👁"}</button>
                 <button type="button" title="Chart settings" onClick={() => setDialog({ k: "settings", tab: "symbol" })}>⚙</button>
-                <button type="button" title={legendCollapsed ? "Show indicators" : "Hide indicators legend"} onClick={() => setLegendCollapsed((v) => !v)} data-testid="legend-collapse">{legendCollapsed ? "⌄" : "⌃"}</button>
+                <button type="button" title="More" data-more="" onClick={(e) => openLegendMenu(e, "main")} data-testid="legend-main-more">⋯</button>
+                <button
+                  type="button"
+                  className={legendCollapsed && indicators.length ? "lg-count" : ""}
+                  title={legendCollapsed ? `Show indicators legend (${indicators.length})` : "Hide indicators legend"}
+                  onClick={() => setLegendCollapsed((v) => !v)}
+                  data-testid="legend-collapse"
+                >
+                  {legendCollapsed ? `⌄${indicators.length ? ` ${indicators.length}` : ""}` : "⌃"}
+                </button>
               </span>
             </div>
             {quickTrade && (
               <div className="lg-row lg-trade" data-testid="chart-quick-row">
-                <button type="button" className="qt sell" onClick={() => pickOrder({ side: "SELL", type: "MARKET", price: null }, { x: 8, y: 52, price: ltpNow ?? 0 })} title="Sell at market" data-testid="chart-quick-sell">
+                <button type="button" className="qt sell" onClick={() => quickOrder("SELL")} title={instant ? "Sell at market — one click" : "Sell — opens the order window"} data-testid="chart-quick-sell">
                   <span>SELL</span><b>{bid != null ? fmtPrice(bid) : ltpNow != null ? fmtPrice(ltpNow) : "—"}</b>
                 </button>
                 <span className="qt-spread" title="Spread">{bid != null && ask != null ? fmtNum(ask - bid, 2) : "—"}</span>
@@ -4553,7 +6016,7 @@ export default function ChartPanel(props: ChartPanelProps) {
                     onOrderQty?.(n);
                   }}
                 />
-                <button type="button" className="qt buy" onClick={() => pickOrder({ side: "BUY", type: "MARKET", price: null }, { x: 8, y: 52, price: ltpNow ?? 0 })} title="Buy at market" data-testid="chart-quick-buy">
+                <button type="button" className="qt buy" onClick={() => quickOrder("BUY")} title={instant ? "Buy at market — one click" : "Buy — opens the order window"} data-testid="chart-quick-buy">
                   <span>BUY</span><b>{ask != null ? fmtPrice(ask) : ltpNow != null ? fmtPrice(ltpNow) : "—"}</b>
                 </button>
               </div>
@@ -4597,6 +6060,7 @@ export default function ChartPanel(props: ChartPanelProps) {
                   <button type="button" title={paneMode.max === r.i ? "Restore pane" : "Maximize pane"} onClick={() => setPaneMode((m) => ({ max: m.max === r.i ? null : r.i, collapsed: [] }))}>{paneMode.max === r.i ? "❐" : "⬚"}</button>
                   <button type="button" title={paneMode.collapsed.includes(r.i) ? "Restore pane" : "Collapse pane"} onClick={() => setPaneMode((m) => ({ max: null, collapsed: m.collapsed.includes(r.i) ? m.collapsed.filter((x) => x !== r.i) : [...m.collapsed, r.i] }))}>{paneMode.collapsed.includes(r.i) ? "▢" : "▁"}</button>
                   <button type="button" title="Delete pane" onClick={() => deletePane(r.i)}>✕</button>
+                  <button type="button" title="Manage panes" onClick={() => setDialog({ k: "panes" })} data-testid={`pane-manage-${r.i}`}>⚙</button>
                 </div>
               </div>
             );
@@ -4607,11 +6071,12 @@ export default function ChartPanel(props: ChartPanelProps) {
             </div>
           )}
           <div ref={countdownRef} className="chart-axis-countdown" style={{ display: "none" }} />
+          <div ref={rawLabelRef} className="chart-raw-label" style={{ display: "none" }} data-testid="chart-raw-label" />
           {eventTip && <div className="chart-event-tip chart-overlay-ui" style={{ left: Math.min(eventTip.x + 12, (containerRef.current?.clientWidth ?? 600) - 260) }}>{eventTip.text}</div>}
           {settings.scaleModesButtons !== "never" && (
             <div className={`chart-scale-modes chart-overlay-ui sm-${settings.scaleModesButtons}`} style={side === "left" ? { left: 26, right: "auto" } : undefined} onMouseDown={(e) => e.stopPropagation()}>
               <button type="button" className={autoScale ? "on" : ""} onClick={() => setAutoScale((v) => !v)} title="Auto (fits data to screen)" data-testid="chart-scale-a">A</button>
-              <button type="button" className={scaleMode === "log" ? "on" : ""} disabled={compares.length > 0} onClick={() => setScaleMode((m) => (m === "log" ? "normal" : "log"))} title="Logarithmic scale (Alt+L)" data-testid="chart-scale-l">L</button>
+              <button type="button" className={scaleMode === "log" ? "on" : ""} disabled={pctCompare} onClick={() => setScaleMode((m) => (m === "log" ? "normal" : "log"))} title="Logarithmic scale (Alt+L)" data-testid="chart-scale-l">L</button>
             </div>
           )}
           <button type="button" className="chart-scale-gear chart-overlay-ui" style={side === "left" ? { left: 2, right: "auto" } : undefined} onClick={(e) => { e.stopPropagation(); setCtx({ x: side === "left" ? 4 : (containerRef.current?.clientWidth ?? 600) - 250, y: Math.max(0, (containerRef.current?.clientHeight ?? 400) - 330), price: 0, time: null, area: "price" }); }} onMouseDown={(e) => e.stopPropagation()} title="Price scale settings" data-testid="chart-scale-gear">⚙</button>
@@ -4691,6 +6156,8 @@ export default function ChartPanel(props: ChartPanelProps) {
             </button>
           )}
           {ctxEl}
+          {tradeFlyEl}
+          {legendMenuEl}
           {selDrawing && !drawMode && (
             <DrawingFloatBar
               drawing={selDrawing}
@@ -4711,6 +6178,10 @@ export default function ChartPanel(props: ChartPanelProps) {
               }}
               onAlert={() => openAlertDialog(undefined, { target: `draw:${selDrawing.id}`, targetLabel: selDrawing.name || TOOL_BY_ID.get(selDrawing.type)?.label })}
               canAlert={drawingValueAt(selDrawing, viewRef.current[viewRef.current.length - 1]?.time ?? 0, drawingDeps()) !== null}
+              templates={drawTemplates(selDrawing.type).map((t) => t.name)}
+              onApplyTemplate={(name) => applyDrawTemplate(selDrawing, name)}
+              onSaveTemplate={() => saveDrawTemplate(selDrawing)}
+              onRemoveTemplate={(name) => { removeDrawTemplate(selDrawing.type, name); bumpDrawings(); }}
             />
           )}
           {showFavBar && chrome && <FavoritesBar favorites={favTools} drawMode={drawMode} onTool={toggleDraw} onClose={() => setShowFavBar(false)} />}
@@ -4803,6 +6274,7 @@ export default function ChartPanel(props: ChartPanelProps) {
             panes={treePanes()}
             onVisible={(it) => {
               if (it.kind === "indicator") toggleIndicator(it.id);
+              else if (it.kind === "series") setMainHidden((v) => !v);
               else if (it.kind === "drawing") updateDrawing(it.id, (d) => ({ ...d, hidden: !d.hidden }), "hide drawing");
               else if (it.kind === "compare") setCompares((l) => l.map((x) => (x.symbol === it.id ? { ...x, hidden: !x.hidden } : x)));
             }}
@@ -4816,6 +6288,9 @@ export default function ChartPanel(props: ChartPanelProps) {
             onSelect={(it) => it.kind === "drawing" && selectDrawing(it.id)}
             onMove={(it, by) => reorderDrawing(it.id, by > 0 ? "forward" : "backward")}
             onSettings={(it) => setDialog(it.kind === "indicator" ? { k: "indSettings", uid: it.id } : { k: "drawSettings", id: it.id })}
+            onDrop={treeDrop}
+            onGroup={groupDrawings}
+            onGroupAction={groupAction}
           />,
           widgetSlots.tree,
         )}
@@ -4838,11 +6313,21 @@ export default function ChartPanel(props: ChartPanelProps) {
       {dlg?.k === "symbol" && (
         <SymbolSearchDialog
           initial={dlg.q}
+          select={dlg.select}
           recent={recentSymbols ?? []}
           onPick={(h) => {
             if (dlg.compare) setCompares((c) => (c.length >= 4 || c.some((x) => x.symbol === h.symbol) ? c : [...c, { symbol: h.symbol, name: h.short_name, color: COMPARE_COLORS[c.length % COMPARE_COLORS.length] }]));
             else onSymbolChange?.(h);
           }}
+          onClose={() => setDialog(null)}
+        />
+      )}
+      {dlg?.k === "saveTemplate" && (
+        <SaveTemplateDialog
+          symbolLabel={shortName}
+          intervalLabel={intervalLongLabel(iv)}
+          existing={templates.map((t) => t.name)}
+          onSave={storeIndTemplate}
           onClose={() => setDialog(null)}
         />
       )}
@@ -4863,10 +6348,14 @@ export default function ChartPanel(props: ChartPanelProps) {
         <IndicatorSettings
           inst={dlgInd}
           onChange={updateIndicator}
-          onClose={() => setDialog(null)}
+          onClose={() => {
+            const snap = dialogSnapRef.current;
+            if (snap && JSON.stringify(snap.indicators) !== JSON.stringify(indicatorsRef.current)) pushUndo(snap.label, snap);
+            setDialog(null);
+          }}
           onSaveDefault={(i) => {
             const all = loadJson<Record<string, Partial<IndicatorInstance>>>("chart:indDefaults", {});
-            all[i.type] = { inputs: i.inputs, plots: i.plots, precision: i.precision };
+            all[i.type] = instanceDefaults(i);
             saveJson("chart:indDefaults", all);
             addToast("saved as the default for new copies");
           }}
@@ -4876,11 +6365,16 @@ export default function ChartPanel(props: ChartPanelProps) {
         <ChartSettingsDialog
           value={settings}
           onChange={changeSettings}
-          onClose={() => setDialog(null)}
+          onClose={() => {
+            const snap = dialogSnapRef.current;
+            if (snap?.settings && JSON.stringify(snap.settings) !== JSON.stringify(settingsRef.current)) pushUndo(snap.label, snap);
+            setDialog(null);
+          }}
           theme={{ up: theme.up, down: theme.down, text: theme.text, grid: theme.grid, bg: theme.bg, accent: theme.accent, crosshair: theme.crosshair, border: theme.border }}
           trading={trading}
           onTrading={onTrading}
           initialTab={dlg.tab}
+          chartKind={chartKind}
         />
       )}
       {dlg?.k === "drawSettings" && dlgDrawing && (
@@ -4901,6 +6395,26 @@ export default function ChartPanel(props: ChartPanelProps) {
       {dlg?.k === "goto" && <GoToDialog onGo={goTo} onClose={() => setDialog(null)} last={viewRef.current[viewRef.current.length - 1]?.time ?? null} />}
       {dlg?.k === "palette" && <CommandPalette commands={commands()} onClose={() => setDialog(null)} />}
       {dlg?.k === "shortcuts" && <ShortcutsDialog onClose={() => setDialog(null)} />}
+      {dlg?.k === "about" && (() => {
+        const inst = indicators.find((x) => x.uid === dlg.uid);
+        const def = inst ? INDICATOR_BY_TYPE.get(inst.type) : undefined;
+        return def ? <AboutIndicatorDialog def={def} onClose={() => setDialog(null)} /> : null;
+      })()}
+      {dlg?.k === "panes" && (
+        <ManagePanesDialog
+          panes={paneList().map((p) => ({ i: p.i, names: p.insts.map((x) => `${INDICATOR_BY_TYPE.get(x.type)?.short ?? x.type} ${argsLabel(x)}`.trim()) })).concat(paneList().some((p) => p.i === 0) ? [] : [{ i: 0, names: [] }]).sort((a, b) => a.i - b.i)}
+          maxPane={paneMode.max}
+          collapsed={paneMode.collapsed}
+          onMove={movePane}
+          onMerge={mergePanes}
+          onDelete={deletePane}
+          onMax={(i) => setPaneMode((m) => ({ max: m.max === i ? null : i, collapsed: [] }))}
+          onCollapse={(i) => setPaneMode((m) => ({ max: null, collapsed: m.collapsed.includes(i) ? m.collapsed.filter((x) => x !== i) : [...m.collapsed, i] }))}
+          onClose={() => setDialog(null)}
+        />
+      )}
+      {dlg?.k === "insights" && <InsightsDialog symbol={symbol} name={shortName} onClose={() => setDialog(null)} />}
+      {dlg?.k === "whatsnew" && <WhatsNewDialog onClose={() => setDialog(null)} />}
       {dlg?.k === "interval" && (
         <IntervalPrompt
           initial={dlg.txt}

@@ -5,16 +5,44 @@
 // named-layout manager (save / load / autosave).
 
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
-import type { InstrumentHit, Position } from "../../types";
+import type { InstrumentHit, PendingOrder, Position } from "../../types";
 import { useLiveQuote } from "../../hooks/useQuotes";
 import { technicalRating, type OhlcvCandle } from "../../lib/indicators";
 import { capTier } from "../../lib/marketCap";
 import { clearLog, getLog, subscribeLog } from "./chartSync";
-import { useOutside } from "./chartUi";
+import { Modal, useOutside } from "./chartUi";
 import type { ChartOrder } from "./ChartPanel";
+import {
+  AccountMenu,
+  AllPositionsPanel,
+  Baskets,
+  DataTable,
+  ExitPositionDialog,
+  FundsPanel,
+  GttPanel,
+  HoldingsPanel,
+  LiveLtp,
+  ModifyOrderDialog,
+  OrdersTable,
+  SmartOrderbook,
+  TradesTable,
+  fmt,
+  livePnl,
+  orderRows,
+  useApiJson,
+  type BrokerBook,
+  type BrokerPosition,
+  type Col,
+  type ExitTarget,
+  type FundsResp,
+  type GttResp,
+  type HoldingsResp,
+  type OrderRow,
+  type TradeRow,
+} from "./AccountPanels";
+import { DomPanel } from "./DomPanel";
 
-const fmt = (v: number | null | undefined, d = 2) =>
-  v == null || !Number.isFinite(v) ? "—" : v.toLocaleString("en-IN", { minimumFractionDigits: d, maximumFractionDigits: d });
+export { livePnl };
 
 function fmtVol(v: number): string {
   const a = Math.abs(v);
@@ -43,6 +71,22 @@ export const FLAG_COLORS = ["#F23645", "#FF9800", "#4CAF50", "#2962FF", "#9C27B0
 
 type Quote = { ltp: number; change: number | null; change_pct: number | null };
 type SortKey = "symbol" | "last" | "chg" | "chgp";
+
+/** Green while ticks are arriving for the symbol (one in the last 15s). */
+function LiveDot({ symbol }: { symbol: string }) {
+  const q = useLiveQuote(symbol);
+  const [seen, setSeen] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (q && !q.simulated) setSeen(Date.now());
+  }, [q]);
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 5000);
+    return () => clearInterval(id);
+  }, []);
+  const live = seen > 0 && now - seen < 15000;
+  return <span className={`wl-live${live ? " on" : ""}`} title={live ? "Live — ticking" : seen ? "No tick in the last 15s" : "No live ticks yet"} />;
+}
 
 export function WatchlistTable({
   state,
@@ -171,7 +215,7 @@ export function WatchlistTable({
             const pct = x?.change_pct ?? null;
             const chg = x?.change ?? null;
             const flag = list.flags?.[h.symbol];
-            const idx = list.items.findIndex((i) => i.symbol === h.symbol);
+            const idx = rows.findIndex((i) => i.symbol === h.symbol);
             return (
               <div
                 key={h.symbol}
@@ -181,23 +225,25 @@ export function WatchlistTable({
                 onClick={() => onSelect(h)}
                 onKeyDown={(e) => { if (e.key === "Enter") onSelect(h); }}
                 onContextMenu={(e) => { e.preventDefault(); setMenu({ sym: h.symbol, x: e.clientX, y: e.clientY }); }}
-                draggable={!sort}
+                draggable
                 onDragStart={() => { dragFrom.current = idx; }}
-                onDragOver={(e) => { if (!sort) e.preventDefault(); }}
+                onDragOver={(e) => e.preventDefault()}
                 onDrop={() => {
                   const from = dragFrom.current;
                   dragFrom.current = null;
                   if (from === null || from === idx) return;
-                  const items = [...list.items];
+                  // Reorder what's on screen: a sorted list adopts that order as its own.
+                  const items = [...rows];
                   const [m] = items.splice(from, 1);
                   items.splice(idx, 0, m);
                   putList({ items });
+                  setSort(null);
                 }}
-                title={`${h.symbol} — right-click for options, drag to reorder`}
+                title={`${h.symbol} — right-click for options, drag ⋮ to reorder`}
                 data-testid={`recent-chip-${h.symbol}`}
                 style={flag ? { boxShadow: `inset 3px 0 ${flag}` } : undefined}
               >
-                <span className="sym">{h.short_name}</span>
+                <span className="sym"><span className="wl-grip" aria-hidden="true">⋮</span><LiveDot symbol={h.symbol} />{h.short_name}</span>
                 <span>{x ? x.ltp.toFixed(2) : "—"}</span>
                 <span className={chg == null ? "" : chg >= 0 ? "up" : "down"}>{chg == null ? "—" : `${chg >= 0 ? "+" : ""}${chg.toFixed(2)}`}</span>
                 <span className={pct == null ? "" : pct >= 0 ? "up" : "down"}>{pct == null ? "—" : `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`}</span>
@@ -216,16 +262,28 @@ export function WatchlistTable({
             ))}
             <button type="button" className="none" onClick={() => { const f = { ...(list.flags ?? {}) }; delete f[menu.sym]; putList({ flags: f }); setMenu(null); }}>none</button>
           </div>
-          {state.lists.length > 1 && <div className="chart-menu-head">Add to list</div>}
-          {state.lists.map((l, i) =>
-            i === state.active ? null : (
-              <button key={i} type="button" className="chart-menu-item" onClick={() => {
-                const h = list.items.find((x) => x.symbol === menu.sym);
-                if (h) onChange({ ...state, lists: state.lists.map((y, j) => (j === i && !y.items.some((z) => z.symbol === h.symbol) ? { ...y, items: [...y.items, h] } : y)) });
-                setMenu(null);
-              }}>{l.name}</button>
-            ),
-          )}
+          {state.lists.length > 1 && (["add", "move"] as const).map((how) => (
+            <div key={how}>
+              <div className="chart-menu-head">{how === "add" ? "Add to list" : "Move to list"}</div>
+              {state.lists.map((l, i) =>
+                i === state.active ? null : (
+                  <button key={i} type="button" className="chart-menu-item" data-testid={`wl-${how}-${i}`} onClick={() => {
+                    const h = list.items.find((x) => x.symbol === menu.sym);
+                    if (h) {
+                      onChange({
+                        ...state,
+                        lists: state.lists.map((y, j) =>
+                          j === i && !y.items.some((z) => z.symbol === h.symbol) ? { ...y, items: [...y.items, h] }
+                            : how === "move" && j === state.active ? { ...y, items: y.items.filter((z) => z.symbol !== h.symbol) }
+                              : y),
+                      });
+                    }
+                    setMenu(null);
+                  }}>{l.name}</button>
+                ),
+              )}
+            </div>
+          ))}
           <div className="chart-menu-sep" />
           <button type="button" className="chart-menu-item ctx-sell" onClick={() => { putList({ items: list.items.filter((i) => i.symbol !== menu.sym) }); setMenu(null); }}>Remove from list</button>
         </div>
@@ -395,110 +453,46 @@ export function SymbolDetails({ hit }: { hit: InstrumentHit | null }) {
 // Account manager
 // ---------------------------------------------------------------------------
 
-export type BottomTab = "positions" | "orders" | "trades" | "account" | "basket" | "broker" | "log";
+export type BottomTab =
+  | "trade" | "positions" | "allpositions" | "orders" | "smart" | "trades" | "holdings" | "gtt" | "funds"
+  | "account" | "basket" | "broker" | "log";
 
-interface TradeRow {
-  id: number;
-  symbol: string;
-  side: string;
-  quantity: number;
-  price: number | null;
-  order_type: string;
-  status: string;
-  broker_order_id: string | null;
-  pnl: number | null;
-  executed_at: string | null;
-  created_at: string | null;
+/** Tab labels (the collapsed bar shows them too). "Trade" is the DOM, beside the Account Manager. */
+export const BOTTOM_TABS: [BottomTab, string][] = [
+  ["positions", "Positions"],
+  ["allpositions", "All positions"],
+  ["orders", "Orders"],
+  ["smart", "Smart orderbook"],
+  ["trades", "Trades"],
+  ["holdings", "Holdings"],
+  ["gtt", "GTT"],
+  ["funds", "Funds"],
+  ["account", "Account"],
+  ["basket", "Basket"],
+  ["broker", "Fyers live"],
+  ["log", "Notifications"],
+];
+
+interface ProfileResp { ok: boolean; client_id?: string | null; name?: string | null; email?: string | null; reason?: string }
+
+function LocalPnl({ p, privacy }: { p: Position; privacy: boolean }) {
+  const live = useLiveQuote(p.symbol)?.last_price ?? null;
+  const v = live != null ? (live - p.average_price) * p.quantity : p.unrealized_pnl;
+  return <span className={(v ?? 0) >= 0 ? "up" : "down"}>{privacy ? "•••" : fmt(v)}</span>;
 }
 
-function useJson<T>(url: string | null, every = 0): { data: T | null; reload: () => void } {
-  const [data, setData] = useState<T | null>(null);
-  const [nonce, setNonce] = useState(0);
-  useEffect(() => {
-    if (!url) return;
-    let stop = false;
-    const load = () =>
-      fetch(url)
-        .then((r) => (r.ok ? r.json() : null))
-        .then((j) => !stop && setData(j as T))
-        .catch(() => undefined);
-    void load();
-    const id = every ? setInterval(load, every) : undefined;
-    return () => {
-      stop = true;
-      if (id) clearInterval(id);
-    };
-  }, [url, every, nonce]);
-  return { data, reload: () => setNonce((n) => n + 1) };
-}
-
-function PositionRowAM({
-  p,
-  sl,
-  tp,
-  privacy,
-  onClose,
-  onReverse,
-  onLevels,
-  cols,
-}: {
-  p: Position;
-  sl: number | null;
-  tp: number | null;
-  privacy: boolean;
-  onClose: () => void;
-  onReverse: () => void;
-  onLevels: (sl: number | null, tp: number | null) => void;
-  cols: Record<string, boolean>;
-}) {
-  const live = useLiveQuote(p.symbol);
-  const ltp = live?.last_price ?? p.last_price;
-  const pnl = live?.last_price != null ? (live.last_price - p.average_price) * p.quantity : p.unrealized_pnl;
-  const money = (v: number | null | undefined) => (privacy ? "•••" : fmt(v));
-  const ask = (which: "SL" | "TP") => {
-    const cur = which === "SL" ? sl : tp;
-    const v = window.prompt(`${which} for ${p.symbol} (blank clears)`, cur != null ? String(cur) : "");
-    if (v === null) return;
-    const n = v.trim() === "" ? null : Number(v);
-    if (n !== null && !Number.isFinite(n)) return;
-    onLevels(which === "SL" ? n : sl, which === "TP" ? n : tp);
-  };
-  return (
-    <tr>
-      <td className="sym">{p.symbol}</td>
-      {cols.side && <td className={p.quantity > 0 ? "up" : "down"}>{p.quantity > 0 ? "BUY" : "SELL"}</td>}
-      <td className={p.quantity > 0 ? "up" : "down"}>{p.quantity}</td>
-      <td>{fmt(p.average_price)}</td>
-      <td>{fmt(ltp)}</td>
-      <td className={(pnl ?? 0) >= 0 ? "up" : "down"}>{money(pnl)}</td>
-      {cols.levels && <td><button type="button" className="am-link" onClick={() => ask("SL")}>{sl != null ? fmt(sl) : "+ SL"}</button></td>}
-      {cols.levels && <td><button type="button" className="am-link" onClick={() => ask("TP")}>{tp != null ? fmt(tp) : "+ TP"}</button></td>}
-      <td className="am-acts">
-        <button type="button" className="btn-sm" onClick={onReverse} title="Reverse at market">⇅</button>
-        <button type="button" className="btn-sm danger" onClick={onClose} title="Close at market">Close</button>
-      </td>
-    </tr>
-  );
-}
-
-interface BasketLeg {
-  id: number;
-  symbol: string;
-  name: string;
-  side: "BUY" | "SELL";
-  qty: number;
-  type: "MARKET" | "LIMIT";
-  price: number | null;
-  result?: string;
-}
+const CONVERT_HINT = "This terminal is intraday-only — positions square off before the close, so converting to delivery / carry-forward (CNC / NRML) is turned off.";
 
 export function AccountManager({
   tab,
   onTab,
   positions,
   managed,
-  pendingSection,
-  pendingCount,
+  pendingOrders,
+  onCancel,
+  cancelBusyId,
+  cancelBanner,
+  accountId,
   privacy,
   connected,
   accountLabel,
@@ -506,6 +500,10 @@ export function AccountManager({
   closeFor,
   levelsFor,
   orderFor,
+  instant = false,
+  qty,
+  onQty,
+  onLogout,
   onMaximize,
   maximized,
   onCollapse,
@@ -514,8 +512,12 @@ export function AccountManager({
   onTab: (t: BottomTab | null) => void;
   positions: Position[] | undefined;
   managed: { symbol: string; stop_loss: number | null; target: number | null }[] | undefined;
-  pendingSection: ReactNode;
-  pendingCount: number;
+  /** The bot's working orders (`/api/orders/pending`). */
+  pendingOrders: PendingOrder[];
+  onCancel: (brokerOrderId: string) => void;
+  cancelBusyId: string | null;
+  cancelBanner?: ReactNode;
+  accountId: number | null;
   privacy: boolean;
   connected: boolean;
   accountLabel: string;
@@ -523,33 +525,42 @@ export function AccountManager({
   closeFor: (sym: string) => () => Promise<void>;
   levelsFor: (sym: string) => (sl: number | null, tp: number | null) => Promise<void>;
   orderFor: (sym: string, name: string, qty: number) => (o: ChartOrder) => Promise<string>;
+  instant?: boolean;
+  /** The ticket quantity (shared with the DOM). */
+  qty: number;
+  onQty: (n: number) => void;
+  onLogout?: () => void;
   onMaximize: () => void;
   maximized: boolean;
   onCollapse: () => void;
 }) {
   const [msg, setMsg] = useState<string | null>(null);
-  const [orderFilter, setOrderFilter] = useState<"all" | "working" | "filled" | "cancelled" | "rejected">("all");
-  const [cols, setCols] = useState<Record<string, boolean>>({ side: true, levels: true });
-  const [colMenu, setColMenu] = useState(false);
-  const colRef = useRef<HTMLDivElement | null>(null);
-  useOutside(colRef, colMenu, () => setColMenu(false));
-  const trades = useJson<TradeRow[]>(tab === "orders" || tab === "trades" || tab === "account" ? "/api/trades?limit=200" : null, 10000);
-  const funds = useJson<{ ok: boolean; available: number | null; reason?: string | null }>(tab === "account" || tab === "positions" ? "/api/market/funds" : null, 30000);
+  const [modify, setModify] = useState<OrderRow | null>(null);
+  const [exit, setExit] = useState<{ pos: ExitTarget; local: boolean } | null>(null);
+  const bookTabs: BottomTab[] = ["orders", "smart", "allpositions", "positions", "trade"];
+  const book = useApiJson<BrokerBook>(connected && bookTabs.includes(tab) ? "/api/broker/book" : null, 15000);
+  const trades = useApiJson<TradeRow[]>(["orders", "trades", "account", "smart", "positions"].includes(tab) ? "/api/trades?limit=200" : null, 10000);
+  const funds = useApiJson<{ ok: boolean; available: number | null; reason?: string | null }>(tab === "account" || tab === "positions" ? "/api/market/funds" : null, 30000);
+  const fundsFull = useApiJson<FundsResp>(tab === "funds" ? "/api/broker/funds" : null, 30000);
+  const holdings = useApiJson<HoldingsResp>(tab === "holdings" || tab === "account" ? "/api/broker/holdings" : null, 60000);
+  const gtt = useApiJson<GttResp>(tab === "gtt" ? "/api/broker/gtt" : null, 30000);
+  const profile = useApiJson<ProfileResp>(connected ? "/api/broker/profile" : null);
   const log = useSyncExternalStore(subscribeLog, getLog);
   const open = (positions ?? []).filter((p) => p.quantity !== 0);
   const totalPnl = open.reduce((a, p) => a + (p.unrealized_pnl ?? 0), 0);
   const money = (v: number | null | undefined) => (privacy ? "•••" : fmt(v));
   const tradeRows = Array.isArray(trades.data) ? trades.data : [];
-  const statusOf = (s: string) => s.toLowerCase();
-  const filteredTrades = tradeRows.filter((t) => {
-    const s = statusOf(t.status);
-    if (orderFilter === "all") return true;
-    if (orderFilter === "working") return /pending|open|trigger|working/.test(s);
-    if (orderFilter === "filled") return /fill|complete|traded|executed/.test(s);
-    if (orderFilter === "cancelled") return /cancel/.test(s);
-    return /reject/.test(s);
-  });
-  const realized = tradeRows.filter((t) => t.pnl != null && t.executed_at && new Date(t.executed_at).toDateString() === new Date().toDateString()).reduce((a, t) => a + (t.pnl ?? 0), 0);
+  const today = new Date().toDateString();
+  const realizedBy = (sym: string) => {
+    const bp = book.data?.ok ? book.data.positions.filter((x) => x.symbol === sym) : [];
+    if (bp.length) return bp.reduce((a, x) => a + (x.realized ?? 0), 0);
+    const ts = tradeRows.filter((t) => t.symbol === sym && t.pnl != null && t.executed_at && new Date(t.executed_at).toDateString() === today);
+    return ts.length ? ts.reduce((a, t) => a + (t.pnl ?? 0), 0) : null;
+  };
+  const productOf = (sym: string) => (book.data?.ok ? book.data.positions.find((x) => x.symbol === sym && x.net_qty !== 0)?.product : null) ?? "INTRADAY";
+  const realized = tradeRows.filter((t) => t.pnl != null && t.executed_at && new Date(t.executed_at).toDateString() === today).reduce((a, t) => a + (t.pnl ?? 0), 0);
+  const rows = orderRows(book.data, pendingOrders, tradeRows);
+  const workingCount = rows.filter((r) => r.bucket === "working").length;
   const run = async (label: string, f: () => Promise<unknown>) => {
     try {
       const r = await f();
@@ -558,174 +569,158 @@ export function AccountManager({
       setMsg(`${label} failed: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
-  const tabs: [BottomTab, string][] = [
-    ["positions", `Positions${open.length ? ` (${open.length})` : ""}`],
-    ["orders", `Orders${pendingCount ? ` (${pendingCount})` : ""}`],
-    ["trades", "Trades"],
-    ["account", "Account"],
-    ["basket", "Basket"],
-    ["log", `Notifications${log.length ? ` (${log.length})` : ""}`],
+  const lotOf = (sym: string) => (selected?.symbol === sym && selected.lot_size > 1 ? selected.lot_size : 1);
+  /** Move a working order to `price` (the DOM's drag): the stop for stop
+   *  orders (a stop-limit's limit keeps its offset), else the limit. */
+  const modifyPrice = async (o: OrderRow, price: number): Promise<string> => {
+    if (!accountId || !o.id) throw new Error("no live account");
+    const stopType = o.type === "SL-M" || o.type === "STOP_LOSS";
+    const body: Record<string, unknown> = { account_id: accountId, broker_order_id: o.id, order_type: o.type };
+    if (stopType) body.stop_price = price;
+    if (o.type === "STOP_LOSS") body.limit_price = Math.round(((o.limit ?? price) + (price - (o.stop ?? price))) * 100) / 100;
+    if (!stopType) body.limit_price = price;
+    const r = await fetch("/api/orders/modify", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(typeof j.detail === "string" ? j.detail : `HTTP ${r.status}`);
+    if (j.ok === false) throw new Error(j.message || "the broker refused the change");
+    book.reload();
+    return `Moved ${o.side} ${o.remaining ?? o.qty} ${o.symbol} to ${fmt(price)}`;
+  };
+  const prof = profile.data?.ok ? profile.data : null;
+  const acctText = !connected ? "No live account" : prof?.client_id ? `Account: ${prof.client_id}${prof.name ? ` : ${prof.name}` : ""} INR` : accountLabel;
+  const label = (k: BottomTab, l: string) =>
+    k === "positions" && open.length ? `${l} (${open.length})` : k === "orders" && workingCount ? `${l} (${workingCount})` : k === "log" && log.length ? `${l} (${log.length})` : l;
+  const posCols: Col<Position>[] = [
+    { id: "symbol", label: "Symbol", get: (p) => p.symbol, fixed: true, cls: () => "sym" },
+    { id: "side", label: "Buy/Sell", get: (p) => (p.quantity > 0 ? "BUY" : "SELL"), cls: (p) => (p.quantity > 0 ? "up" : "down") },
+    { id: "product", label: "Product", get: (p) => productOf(p.symbol) },
+    { id: "qty", label: "Net qty", get: (p) => p.quantity, render: (p) => p.quantity, cls: (p) => (p.quantity > 0 ? "up" : "down"), num: true },
+    { id: "avg", label: "Avg", get: (p) => p.average_price, num: true },
+    { id: "ltp", label: "LTP", get: (p) => p.last_price, render: (p) => <LiveLtp symbol={p.symbol} fallback={p.last_price} />, num: true },
+    { id: "pnl", label: "Unrealized P&L", get: (p) => p.unrealized_pnl, render: (p) => <LocalPnl p={p} privacy={privacy} />, num: true },
+    { id: "realized", label: "Realized P&L", get: (p) => realizedBy(p.symbol), render: (p) => { const v = realizedBy(p.symbol); return <span className={v == null ? "" : v >= 0 ? "up" : "down"}>{money(v)}</span>; }, num: true },
+    {
+      id: "sl", label: "SL", get: (p) => managed?.find((x) => x.symbol === p.symbol)?.stop_loss ?? null,
+      render: (p) => { const m = managed?.find((x) => x.symbol === p.symbol); return <button type="button" className="am-link" onClick={() => askLevel(p.symbol, "SL", m?.stop_loss ?? null, m?.target ?? null)}>{m?.stop_loss != null ? fmt(m.stop_loss) : "+ SL"}</button>; },
+    },
+    {
+      id: "tp", label: "TP", get: (p) => managed?.find((x) => x.symbol === p.symbol)?.target ?? null,
+      render: (p) => { const m = managed?.find((x) => x.symbol === p.symbol); return <button type="button" className="am-link" onClick={() => askLevel(p.symbol, "TP", m?.stop_loss ?? null, m?.target ?? null)}>{m?.target != null ? fmt(m.target) : "+ TP"}</button>; },
+    },
   ];
+  function askLevel(sym: string, which: "SL" | "TP", sl: number | null, tp: number | null): void {
+    const cur = which === "SL" ? sl : tp;
+    const v = window.prompt(`${which} for ${sym} (blank clears)`, cur != null ? String(cur) : "");
+    if (v === null) return;
+    const n = v.trim() === "" ? null : Number(v);
+    if (n !== null && !Number.isFinite(n)) return;
+    void run(`Exits ${sym}`, () => levelsFor(sym)(which === "SL" ? n : sl, which === "TP" ? n : tp));
+  }
+  const domPos = selected ? open.find((p) => p.symbol === selected.symbol) : undefined;
   return (
     <>
       <div className="tabs trade-tabs am-tabs" role="tablist">
+        <button type="button" role="tab" aria-selected={tab === "trade"} className={`tab am-trade-tab ${tab === "trade" ? "active" : ""}`} onClick={() => onTab("trade")} title="DOM — trade from the price ladder" data-testid="am-tab-trade">Trade</button>
         <span className="am-title">Account Manager</span>
-        {tabs.map(([k, label]) => (
-          <button key={k} type="button" role="tab" aria-selected={tab === k} className={`tab ${tab === k ? "active" : ""}`} onClick={() => onTab(k)}>{label}</button>
-        ))}
+        <div className="am-tab-scroll">
+          {BOTTOM_TABS.map(([k, l]) => (
+            <button key={k} type="button" role="tab" aria-selected={tab === k} className={`tab ${tab === k ? "active" : ""}`} onClick={() => onTab(k)} data-testid={`am-tab-${k}`}>{label(k, l)}</button>
+          ))}
+        </div>
         <span className="am-status">
-          <span className={`lg-dot ${connected ? "open" : "closed"}`} /> {connected ? accountLabel : "No live account"}
+          <span className={`lg-dot ${connected ? "open" : "closed"}`} /> <span data-testid="am-account-line">{acctText}</span>
           {funds.data?.available != null && <> · Funds <b>{money(funds.data.available)}</b></>}
           {open.length > 0 && <> · P&L <b className={totalPnl >= 0 ? "up" : "down"}>{money(totalPnl)}</b></>}
         </span>
+        <AccountMenu connected={connected} onLogout={onLogout} onTab={(t) => onTab(t)} onRefresh={() => { book.reload(); trades.reload(); funds.reload(); fundsFull.reload(); holdings.reload(); gtt.reload(); profile.reload(); setMsg("Account data refreshed"); }} />
         <button type="button" className="tab tv-collapse" onClick={onMaximize} title={maximized ? "Restore panel" : "Maximize panel"}>{maximized ? "❐" : "⬚"}</button>
         <button type="button" className="tab" onClick={onCollapse} title="Close panel">▾</button>
       </div>
       <div className="tv-bottom-body">
         {msg && <div className="result info am-msg" onClick={() => setMsg(null)}>{msg}</div>}
+        {tab === "trade" && (
+          <DomPanel
+            symbol={selected}
+            position={domPos ? { qty: domPos.quantity, avg: domPos.average_price } : null}
+            orders={rows.filter((r) => r.bucket === "working" && selected != null && r.symbol === selected.symbol)}
+            qty={qty}
+            onQty={onQty}
+            instant={instant}
+            onOrder={(o, q) => (selected ? orderFor(selected.symbol, selected.short_name, q)(o) : Promise.reject(new Error("no symbol")))}
+            onCancel={onCancel}
+            onModify={modifyPrice}
+            onFlatten={() => (selected ? closeFor(selected.symbol)() : Promise.resolve())}
+            onClose={onCollapse}
+            onMsg={setMsg}
+          />
+        )}
         {tab === "positions" && (
           <section className="trade-card" data-testid="trade-positions">
-            {open.length === 0 ? (
-              <div className="empty">There are no open positions in your trading account yet.</div>
-            ) : (
-              <>
-                <div className="am-toolbar">
-                  <button type="button" className="btn-sm danger" onClick={() => {
-                    if (!window.confirm(`Exit all ${open.length} open position(s) at market?`)) return;
-                    void run("Exit all", async () => {
-                      const r = await fetch("/api/positions/close-all", { method: "POST" });
-                      const j = await r.json().catch(() => ({}));
-                      if (!r.ok) throw new Error(j.detail ?? `HTTP ${r.status}`);
-                      return "sent";
-                    });
-                  }}>Exit all</button>
-                  <div className="chart-menu-wrap" ref={colRef}>
-                    <button type="button" className="btn-sm" onClick={() => setColMenu((o) => !o)} title="Columns">||||</button>
-                    {colMenu && (
-                      <div className="chart-menu cdrop right">
-                        {([["side", "Buy/Sell"], ["levels", "Stop-loss / target"]] as const).map(([k, l]) => (
-                          <label key={k}><input type="checkbox" checked={cols[k]} onChange={(e) => setCols((c) => ({ ...c, [k]: e.target.checked }))} />{l}</label>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                </div>
-                <table className="positions-table">
-                  <thead>
-                    <tr>
-                      <th>Symbol</th>
-                      {cols.side && <th>Buy/Sell</th>}
-                      <th>Net qty</th>
-                      <th>Avg</th>
-                      <th>LTP</th>
-                      <th>Unrealized P&amp;L</th>
-                      {cols.levels && <th>SL</th>}
-                      {cols.levels && <th>TP</th>}
-                      <th />
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {open.map((p) => {
-                      const m = managed?.find((x) => x.symbol === p.symbol);
-                      return (
-                        <PositionRowAM
-                          key={p.symbol}
-                          p={p}
-                          sl={m?.stop_loss ?? null}
-                          tp={m?.target ?? null}
-                          privacy={privacy}
-                          cols={cols}
-                          onClose={() => {
-                            if (window.confirm(`Close ${p.symbol} at market?`)) void run(`Close ${p.symbol}`, closeFor(p.symbol));
-                          }}
-                          onReverse={() => {
-                            const q = Math.abs(p.quantity) * 2;
-                            if (window.confirm(`Reverse ${p.symbol}: ${p.quantity > 0 ? "SELL" : "BUY"} ${q} at market?`)) {
-                              void run(`Reverse ${p.symbol}`, () => orderFor(p.symbol, p.symbol, q)({ side: p.quantity > 0 ? "SELL" : "BUY", type: "MARKET", price: null }));
-                            }
-                          }}
-                          onLevels={(sl, tp) => void run(`Exits ${p.symbol}`, () => levelsFor(p.symbol)(sl, tp))}
-                        />
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </>
-            )}
+            <DataTable
+              id="positions"
+              cols={posCols}
+              rows={open}
+              rowKey={(p) => p.symbol}
+              empty="There are no open positions in your trading account yet."
+              toolbar={
+                <button type="button" className="btn-sm danger" disabled={!open.length} onClick={() => {
+                  if (!window.confirm(`Exit all ${open.length} open position(s) at market?`)) return;
+                  void run("Exit all", async () => {
+                    const r = await fetch("/api/positions/close-all", { method: "POST" });
+                    const j = await r.json().catch(() => ({}));
+                    if (!r.ok) throw new Error(j.detail ?? `HTTP ${r.status}`);
+                    return "sent";
+                  });
+                }}>Exit all</button>
+              }
+              actions={(p) => (
+                <>
+                  <button type="button" className="btn-sm" title="Reverse at market" onClick={() => {
+                    const q = Math.abs(p.quantity) * 2;
+                    if (window.confirm(`Reverse ${p.symbol}: ${p.quantity > 0 ? "SELL" : "BUY"} ${q} at market?`)) {
+                      void run(`Reverse ${p.symbol}`, () => orderFor(p.symbol, p.symbol, q)({ side: p.quantity > 0 ? "SELL" : "BUY", type: "MARKET", price: null }));
+                    }
+                  }}>⇅</button>
+                  <span title={CONVERT_HINT}><button type="button" className="btn-sm" disabled>Convert</button></span>
+                  <button type="button" className="btn-sm danger" title="Exit — full or partial, market or limit" onClick={() => setExit({ pos: { symbol: p.symbol, name: p.symbol, qty: p.quantity, avg: p.average_price, ltp: p.last_price, lot: lotOf(p.symbol) }, local: true })} data-testid={`exit-${p.symbol}`}>Exit</button>
+                </>
+              )}
+            />
           </section>
+        )}
+        {tab === "allpositions" && (
+          <AllPositionsPanel book={book.data} privacy={privacy} onExit={(p) => setExit({ pos: { symbol: p.symbol, name: p.symbol, qty: p.net_qty, avg: p.avg_price, ltp: p.ltp, lot: lotOf(p.symbol) }, local: false })} />
         )}
         {tab === "orders" && (
-          <>
-            <div className="sym-filters">
-              {(["all", "working", "filled", "cancelled", "rejected"] as const).map((f) => (
-                <button key={f} type="button" className={`chip${orderFilter === f ? " on" : ""}`} onClick={() => setOrderFilter(f)}>{f[0].toUpperCase() + f.slice(1)}</button>
-              ))}
-            </div>
-            {(orderFilter === "all" || orderFilter === "working") && pendingSection}
-            {orderFilter !== "working" && (
-              <section className="trade-card">
-                <h2>Order history</h2>
-                {filteredTrades.length === 0 ? (
-                  <div className="empty">No {orderFilter === "all" ? "" : orderFilter} orders.</div>
-                ) : (
-                  <table className="pending-table">
-                    <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Type</th><th>Qty</th><th>Price</th><th>Status</th><th>ID</th></tr></thead>
-                    <tbody>
-                      {filteredTrades.map((t) => (
-                        <tr key={t.id}>
-                          <td>{t.created_at ? new Date(t.created_at).toLocaleString("en-IN") : "—"}</td>
-                          <td className="sym">{t.symbol}</td>
-                          <td className={t.side === "BUY" ? "up" : "down"}>{t.side}</td>
-                          <td>{t.order_type}</td>
-                          <td>{t.quantity}</td>
-                          <td>{fmt(t.price)}</td>
-                          <td>{t.status}</td>
-                          <td className="broker-id">{t.broker_order_id ?? "—"}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                )}
-              </section>
-            )}
-          </>
+          <OrdersTable rows={rows} privacy={privacy} onCancel={onCancel} cancelBusyId={cancelBusyId} onModify={setModify} banner={cancelBanner} live={!!book.data?.ok} />
         )}
-        {tab === "trades" && (
-          <section className="trade-card">
-            {tradeRows.filter((t) => t.executed_at).length === 0 ? (
-              <div className="empty">No executed trades yet.</div>
-            ) : (
-              <table className="pending-table">
-                <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Qty</th><th>Traded price</th><th>P&amp;L</th></tr></thead>
-                <tbody>
-                  {tradeRows.filter((t) => t.executed_at).map((t) => (
-                    <tr key={t.id}>
-                      <td>{new Date(t.executed_at!).toLocaleString("en-IN")}</td>
-                      <td className="sym">{t.symbol}</td>
-                      <td className={t.side === "BUY" ? "up" : "down"}>{t.side}</td>
-                      <td>{t.quantity}</td>
-                      <td>{fmt(t.price)}</td>
-                      <td className={(t.pnl ?? 0) >= 0 ? "up" : "down"}>{t.pnl == null ? "—" : money(t.pnl)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-          </section>
-        )}
+        {tab === "smart" && <SmartOrderbook rows={rows} privacy={privacy} onCancel={onCancel} onModify={setModify} />}
+        {tab === "trades" && <TradesTable rows={tradeRows} privacy={privacy} />}
+        {tab === "holdings" && <HoldingsPanel data={holdings.data} privacy={privacy} />}
+        {tab === "funds" && <FundsPanel data={fundsFull.data} privacy={privacy} />}
+        {tab === "gtt" && <GttPanel data={gtt.data} accountId={accountId} privacy={privacy} onDone={(m) => { setMsg(m); gtt.reload(); }} />}
         {tab === "account" && (
           <section className="trade-card am-account">
             <div className="quote-row">
               <div className="quote-cell"><div className="k">FUNDS AVAILABLE</div><div className="v">{funds.data?.available != null ? money(funds.data.available) : "—"}</div></div>
               <div className="quote-cell"><div className="k">POSITIONS P&amp;L</div><div className={`v ${totalPnl >= 0 ? "up" : "down"}`}>{money(totalPnl)}</div></div>
               <div className="quote-cell"><div className="k">REALIZED TODAY</div><div className={`v ${realized >= 0 ? "up" : "down"}`}>{money(realized)}</div></div>
+              <div className="quote-cell" title="Demat holdings: overall P&L"><div className="k">HOLDINGS P&amp;L</div><div className={`v ${(holdings.data?.overall?.pnl ?? 0) >= 0 ? "up" : "down"}`}>{holdings.data?.ok ? money(holdings.data.overall?.pnl ?? null) : "—"}</div></div>
               <div className="quote-cell"><div className="k">OPEN POSITIONS</div><div className="v">{open.length}</div></div>
-              <div className="quote-cell"><div className="k">WORKING ORDERS</div><div className="v">{pendingCount}</div></div>
+              <div className="quote-cell"><div className="k">WORKING ORDERS</div><div className="v">{workingCount}</div></div>
             </div>
+            {prof && (
+              <div className="am-profile">
+                <span>Client ID <b>{prof.client_id ?? "—"}</b></span>
+                <span>Name <b>{prof.name ?? "—"}</b></span>
+                {prof.email && <span>Email <b>{privacy ? "•••" : prof.email}</b></span>}
+                <span>Currency <b>INR</b></span>
+              </div>
+            )}
             {funds.data && !funds.data.ok && <div className="hint warn-text">{funds.data.reason ?? "funds unavailable — connect a Fyers account"}</div>}
           </section>
         )}
-        {tab === "basket" && <Basket selected={selected} orderFor={orderFor} />}
+        {tab === "basket" && <Baskets selected={selected} orderFor={orderFor} />}
         {tab === "broker" && <BrokerLive privacy={privacy} />}
         {tab === "log" && (
           <section className="trade-card">
@@ -750,75 +745,20 @@ export function AccountManager({
           </section>
         )}
       </div>
-    </>
-  );
-}
-
-function Basket({ selected, orderFor }: { selected: InstrumentHit | null; orderFor: (sym: string, name: string, qty: number) => (o: ChartOrder) => Promise<string> }) {
-  const [name, setName] = useState(() => localStorage.getItem("trade:basketName") ?? "Basket 1");
-  const [legs, setLegs] = useState<BasketLeg[]>(() => {
-    try { return JSON.parse(localStorage.getItem("trade:basket") ?? "[]"); } catch { return []; }
-  });
-  const [busy, setBusy] = useState(false);
-  useEffect(() => {
-    try {
-      localStorage.setItem("trade:basket", JSON.stringify(legs.map(({ result: _r, ...l }) => l)));
-      localStorage.setItem("trade:basketName", name);
-    } catch { /* best-effort */ }
-  }, [legs, name]);
-  const put = (id: number, patch: Partial<BasketLeg>) => setLegs((l) => l.map((x) => (x.id === id ? { ...x, ...patch } : x)));
-  const placeAll = async () => {
-    if (!legs.length || !window.confirm(`Place ${legs.length} order(s) in "${name}" now? These are real orders.`)) return;
-    setBusy(true);
-    for (const leg of legs) {
-      try {
-        const r = await orderFor(leg.symbol, leg.name, leg.qty)({ side: leg.side, type: leg.type, price: leg.type === "LIMIT" ? leg.price : null });
-        put(leg.id, { result: `✓ ${r}` });
-      } catch (e) {
-        put(leg.id, { result: `✕ ${e instanceof Error ? e.message : String(e)}` });
-      }
-    }
-    setBusy(false);
-  };
-  return (
-    <section className="trade-card" data-testid="basket">
-      <div className="am-toolbar">
-        <input className="basket-name" value={name} onChange={(e) => setName(e.target.value)} aria-label="Basket name" />
-        <button type="button" className="btn-sm" disabled={!selected} onClick={() => selected && setLegs((l) => [...l, { id: Date.now(), symbol: selected.symbol, name: selected.short_name, side: "BUY", qty: selected.lot_size || 1, type: "MARKET", price: null }])}>
-          + Add {selected?.short_name ?? "the chart symbol"}
-        </button>
-        <span className="grow" />
-        <button type="button" className="btn-sm" disabled={!legs.length} onClick={() => setLegs([])}>Clear</button>
-        <button type="button" className="btn-sm primary" disabled={!legs.length || busy} onClick={() => void placeAll()} data-testid="basket-place">{busy ? "placing…" : `Place all (${legs.length})`}</button>
-      </div>
-      {legs.length === 0 ? (
-        <div className="empty">Add legs from the charted symbol, then place them together. Every leg is an intraday order on the live account.</div>
-      ) : (
-        <table className="pending-table">
-          <thead><tr><th>Symbol</th><th>Side</th><th>Qty</th><th>Type</th><th>Price</th><th>Result</th><th /></tr></thead>
-          <tbody>
-            {legs.map((l) => (
-              <tr key={l.id}>
-                <td className="sym">{l.name}</td>
-                <td>
-                  <button type="button" className={`btn-sm ${l.side === "BUY" ? "primary" : "danger"}`} onClick={() => put(l.id, { side: l.side === "BUY" ? "SELL" : "BUY" })}>{l.side}</button>
-                </td>
-                <td><input type="number" min={1} value={l.qty} onChange={(e) => put(l.id, { qty: Math.max(1, Math.floor(Number(e.target.value) || 1)) })} style={{ width: 70 }} aria-label="Quantity" /></td>
-                <td>
-                  <select value={l.type} onChange={(e) => put(l.id, { type: e.target.value as BasketLeg["type"] })} aria-label="Order type">
-                    <option value="MARKET">MARKET</option>
-                    <option value="LIMIT">LIMIT</option>
-                  </select>
-                </td>
-                <td>{l.type === "LIMIT" ? <input type="number" step="0.05" value={l.price ?? ""} onChange={(e) => put(l.id, { price: e.target.value === "" ? null : Number(e.target.value) })} style={{ width: 90 }} aria-label="Limit price" /> : "—"}</td>
-                <td className="hint">{l.result ?? ""}</td>
-                <td><button type="button" className="chart-menu-x" onClick={() => setLegs((x) => x.filter((y) => y.id !== l.id))} title="Remove leg">✕</button></td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      {modify && <ModifyOrderDialog order={modify} accountId={accountId} onClose={() => setModify(null)} onDone={(m) => { setMsg(m); book.reload(); }} />}
+      {exit && (
+        <ExitPositionDialog
+          pos={exit.pos}
+          onClose={() => setExit(null)}
+          onExit={async (q, o, full) => {
+            const r = full && exit.local ? await closeFor(exit.pos.symbol)().then(() => `Closed ${exit.pos.symbol} at market`) : await orderFor(exit.pos.symbol, exit.pos.name, q)(o);
+            setMsg(`Exit ${exit.pos.symbol}: ${r}`);
+            book.reload();
+            return r;
+          }}
+        />
       )}
-    </section>
+    </>
   );
 }
 
@@ -827,16 +767,6 @@ function Basket({ selected, orderFor }: { selected: InstrumentHit | null; orderF
 // Fyers app / web. Reloads on every `broker` event (order WebSocket or
 // postback, dispatched by App as "broker:order"); P&L ticks with live quotes.
 // ---------------------------------------------------------------------------
-
-interface BrokerOrder { id: string; symbol: string; side: string; type: string; product: string | null; qty: number; filled: number; remaining: number; limit_price: number | null; stop_price: number | null; traded_price: number | null; status: string; message: string; time: string | null; source: string | null; ours: boolean }
-interface BrokerPosition { symbol: string; product: string | null; net_qty: number; avg_price: number | null; buy_qty: number; buy_avg: number | null; sell_qty: number; sell_avg: number | null; ltp: number | null; realized: number | null; unrealized: number | null; pl: number | null }
-interface BrokerBook { ok: boolean; reason?: string; orders: BrokerOrder[]; positions: BrokerPosition[]; errors?: string[] }
-
-/** Live P&L: realized + (live LTP − avg) × net qty; the Fyers figure until a tick arrives. */
-export function livePnl(p: BrokerPosition, ltp: number | null | undefined): number | null {
-  if (ltp == null || p.net_qty === 0 || p.avg_price == null) return p.pl;
-  return (p.realized ?? 0) + (ltp - p.avg_price) * p.net_qty;
-}
 
 const SOURCES: Record<string, string> = { M: "Mobile", W: "Web", A: "API", ITS: "API", R: "Admin" };
 
@@ -860,16 +790,16 @@ function BrokerPositionRow({ p, privacy, onPnl }: { p: BrokerPosition; privacy: 
 }
 
 export function BrokerLive({ privacy }: { privacy: boolean }) {
-  const book = useJson<BrokerBook>("/api/broker/book", 15000); // events drive it; the poll is a fallback
+  // events drive it (useApiJson reloads on each `broker:order`); the poll is a fallback
+  const book = useApiJson<BrokerBook>("/api/broker/book", 15000);
   const [pnl, setPnl] = useState<Record<string, number>>({});
   const [flash, setFlash] = useState(false);
   useEffect(() => {
     let t: ReturnType<typeof setTimeout> | undefined;
-    // One order fires several events (transit → rejected, socket + postback): coalesce them.
+    // One order fires several events (transit → rejected, socket + postback): one flash.
     const on = () => {
       clearTimeout(t);
       t = setTimeout(() => {
-        book.reload();
         setFlash(true);
         setTimeout(() => setFlash(false), 800);
       }, 150);
@@ -940,6 +870,8 @@ export interface SavedLayout {
   name: string;
   saved: number;
   data: Record<string, string>;
+  /** Starred layouts sort first in "Open layout". */
+  starred?: boolean;
 }
 
 const LAYOUTS_KEY = "trade:layouts";
@@ -1072,6 +1004,7 @@ export function useLayouts() {
     persist([...layouts, c], c.id);
   };
   const remove = (id: string) => persist(layouts.filter((l) => l.id !== id), current === id ? null : current);
+  const star = (id: string) => persist(layouts.map((l) => (l.id === id ? { ...l, starred: !l.starred } : l)), current);
   const setAutosave = (v: boolean) => {
     setAutosaveState(v);
     try { localStorage.setItem(AUTOSAVE_KEY, String(v)); } catch { /* best-effort */ }
@@ -1089,11 +1022,38 @@ export function useLayouts() {
     } catch { /* best-effort */ }
     window.location.reload();
   };
-  return { layouts, current: cur, autosave, dirty, save, saveAs, load, rename, copy, remove, setAutosave, newLayout };
+  return { layouts, current: cur, autosave, dirty, save, saveAs, load, rename, copy, remove, star, setAutosave, newLayout };
+}
+
+/** "Open layout…": every saved layout, searchable, starred ones first. */
+export function OpenLayoutDialog({ L, onClose }: { L: ReturnType<typeof useLayouts>; onClose: () => void }) {
+  const [q, setQ] = useState("");
+  const list = L.layouts
+    .filter((l) => !q || l.name.toLowerCase().includes(q.trim().toLowerCase()))
+    .sort((a, b) => Number(!!b.starred) - Number(!!a.starred) || b.saved - a.saved);
+  return (
+    <Modal title="Open layout" onClose={onClose} width={480} testid="open-layout">
+      <input className="chart-menu-input" placeholder="Search layouts" value={q} onChange={(e) => setQ(e.target.value)} autoFocus aria-label="Search layouts" />
+      {list.length === 0 && <div className="hint">{L.layouts.length ? "Nothing matches." : "No saved layouts yet — Save layout (Ctrl+S) to keep this one."}</div>}
+      <div className="open-layout-list">
+        {list.map((l) => (
+          <div key={l.id} className={`open-layout-row${l.id === L.current?.id ? " on" : ""}`}>
+            <button type="button" className={`ind-star${l.starred ? " on" : ""}`} onClick={() => L.star(l.id)} title={l.starred ? "Unstar" : "Star"} aria-label={`Star ${l.name}`}>★</button>
+            <button type="button" className="open-layout-name" onClick={() => (l.id === L.current?.id ? onClose() : L.load(l.id))} data-testid={`open-layout-${l.name}`}>
+              {l.name}
+              <span className="hint">{new Date(l.saved).toLocaleString("en-IN", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}{l.id === L.current?.id ? " · open" : ""}</span>
+            </button>
+            <button type="button" className="chart-menu-x" onClick={() => { if (window.confirm(`Delete layout "${l.name}"?`)) L.remove(l.id); }} title="Delete">✕</button>
+          </div>
+        ))}
+      </div>
+    </Modal>
+  );
 }
 
 export function LayoutMenu({ L, open, onOpen }: { L: ReturnType<typeof useLayouts>; open: boolean; onOpen: (o: boolean) => void }) {
   const ref = useRef<HTMLDivElement | null>(null);
+  const [browse, setBrowse] = useState(false);
   useOutside(ref, open, () => onOpen(false));
   return (
     <div className="chart-menu-wrap layout-menu" ref={ref}>
@@ -1109,17 +1069,20 @@ export function LayoutMenu({ L, open, onOpen }: { L: ReturnType<typeof useLayout
           <button type="button" className="chart-menu-item" onClick={() => { const n = window.prompt("Layout name", L.current ? `${L.current.name} 2` : "My layout"); if (n) L.saveAs(n); onOpen(false); }}>Save as…</button>
           {L.current && <button type="button" className="chart-menu-item" onClick={() => { const n = window.prompt("Rename layout", L.current!.name); if (n) L.rename(L.current!.id, n); onOpen(false); }}>Rename…</button>}
           {L.current && <button type="button" className="chart-menu-item" onClick={() => { L.copy(L.current!.id); onOpen(false); }}>Make a copy</button>}
+          <button type="button" className="chart-menu-item" onClick={() => { setBrowse(true); onOpen(false); }} data-testid="open-layout-btn">Open layout…</button>
           <button type="button" className="chart-menu-item" onClick={() => L.newLayout()}>New layout…</button>
           <label><input type="checkbox" checked={L.autosave} onChange={(e) => L.setAutosave(e.target.checked)} />Autosave</label>
           {L.layouts.length > 0 && <div className="chart-menu-head">Saved layouts</div>}
-          {L.layouts.map((l) => (
+          {[...L.layouts].sort((a, b) => Number(!!b.starred) - Number(!!a.starred)).slice(0, 8).map((l) => (
             <div key={l.id} className={`chart-menu-row${l.id === L.current?.id ? " on" : ""}`}>
-              <button type="button" className="chart-menu-item" onClick={() => (l.id === L.current?.id ? onOpen(false) : L.load(l.id))} title={`saved ${new Date(l.saved).toLocaleString("en-IN")}`}>{l.name}</button>
+              <button type="button" className="chart-menu-item" onClick={() => (l.id === L.current?.id ? onOpen(false) : L.load(l.id))} title={`saved ${new Date(l.saved).toLocaleString("en-IN")}`}>{l.starred ? "★ " : ""}{l.name}</button>
               <button type="button" className="chart-menu-x" onClick={() => { if (window.confirm(`Delete layout "${l.name}"?`)) L.remove(l.id); }} title="Delete">✕</button>
             </div>
           ))}
+          {L.layouts.length > 8 && <button type="button" className="chart-menu-item hint" onClick={() => { setBrowse(true); onOpen(false); }}>All {L.layouts.length} layouts…</button>}
         </div>
       )}
+      {browse && <OpenLayoutDialog L={L} onClose={() => setBrowse(false)} />}
     </div>
   );
 }

@@ -4,7 +4,7 @@
 
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { EMOJIS, TOOLS, TOOL_BY_ID, TOOL_GROUPS, type Drawing, type DrawingStyle, type ToolGroupId } from "./drawings";
+import { EMOJIS, GLYPHS, STICKERS, TOOLS, TOOL_BY_ID, TOOL_GROUPS, type Drawing, type DrawingData, type DrawingStyle, type ToolGroupId } from "./drawings";
 import { ColorInput, overlayRoot, useOutside } from "./chartUi";
 
 export type CursorMode = "cross" | "dot" | "arrow" | "demo" | "eraser";
@@ -89,7 +89,8 @@ export interface LeftToolbarProps {
   showFavBar: boolean;
   onFavBar: () => void;
   onCollapse: () => void;
-  onEmoji: (e: string) => void;
+  /** Place an icon: an emoji, a monochrome glyph or a sticker badge. */
+  onIcon: (d: DrawingData) => void;
   onImage: (src: string, w: number, h: number) => void;
   alertMode: boolean;
   onAlert: () => void;
@@ -97,10 +98,46 @@ export interface LeftToolbarProps {
   onPick?: () => void;
 }
 
+const RECENT_ICONS_KEY = "chart:recentIcons";
+
+function readRecentIcons(): DrawingData[] {
+  try {
+    const v = JSON.parse(localStorage.getItem(RECENT_ICONS_KEY) ?? "[]");
+    return Array.isArray(v) ? v.slice(0, 16) : [];
+  } catch {
+    return [];
+  }
+}
+
+const iconKey = (d: DrawingData) => `${d.emoji ?? ""}|${d.glyph ? 1 : 0}|${d.sticker?.text ?? ""}`;
+
 export function LeftToolbar(p: LeftToolbarProps) {
   const [open, setOpen] = useState<string | null>(null);
   const [anchor, setAnchor] = useState<HTMLElement | null>(null);
   const [emojiQ, setEmojiQ] = useState("");
+  const [iconTab, setIconTab] = useState<"emojis" | "stickers" | "icons">("emojis");
+  const [recent, setRecent] = useState<DrawingData[]>(readRecentIcons);
+  const pickIcon = (d: DrawingData) => {
+    const next = [d, ...recent.filter((r) => iconKey(r) !== iconKey(d))].slice(0, 16);
+    setRecent(next);
+    try {
+      localStorage.setItem(RECENT_ICONS_KEY, JSON.stringify(next));
+    } catch {
+      /* best-effort */
+    }
+    p.onIcon(d);
+    setOpen(null);
+  };
+  const iconBtn = (d: DrawingData, title: string, key: string) =>
+    d.sticker ? (
+      <button key={key} type="button" className="dtb-sticker" style={{ background: d.sticker.color }} title={title} onClick={() => pickIcon(d)}>
+        {d.emoji} {d.sticker.text}
+      </button>
+    ) : (
+      <button key={key} type="button" className={d.glyph ? "glyph" : ""} title={title} onClick={() => pickIcon(d)}>
+        {d.emoji}
+      </button>
+    );
   const fileRef = useRef<HTMLInputElement | null>(null);
   const toggle = (id: string, e?: React.MouseEvent) => {
     if (e) setAnchor((e.currentTarget as HTMLElement).closest(".dtb-group") as HTMLElement | null);
@@ -134,9 +171,10 @@ export function LeftToolbar(p: LeftToolbarProps) {
                 {sec && <div className="dtb-fly-sec">{sec}</div>}
                 {tools.filter((t) => (t.section ?? "") === sec).map((t) => (
                   <div key={t.id} className={`dtb-fly-row${p.drawMode === t.id ? " on" : ""}`}>
-                    <button type="button" className="dtb-fly-item" onClick={() => { p.onTool(t.id); setOpen(null); }} data-testid={`chart-draw-${t.id}`}>
+                    <button type="button" className="dtb-fly-item" onClick={() => { p.onTool(t.id); setOpen(null); }} data-testid={`chart-draw-${t.id}`} title={t.kbd ? `${t.label} (${t.kbd})` : t.label}>
                       <span className="ico">{t.icon}</span>
                       {t.label}
+                      {t.kbd && <span className="kbd">{t.kbd}</span>}
                     </button>
                     <button type="button" className={`dtb-star${p.favorites.includes(t.id) ? " on" : ""}`} onClick={() => p.onFav(t.id)} title="Add to favorites" aria-label={`Favorite ${t.label}`}>★</button>
                   </div>
@@ -147,21 +185,37 @@ export function LeftToolbar(p: LeftToolbarProps) {
         )}
         {open === "icons" && g === "icons" && (
           <Flyout anchor={anchor} onClose={() => setOpen(null)} wide>
-            <input className="chart-menu-input" placeholder="Search icons" value={emojiQ} onChange={(e) => setEmojiQ(e.target.value)} autoFocus aria-label="Search icons" />
-            {[...new Set(EMOJIS.map((e) => e.cat))].map((cat) => {
-              const list = EMOJIS.filter((e) => e.cat === cat && (!emojiQ || e.k.includes(emojiQ.toLowerCase())));
-              if (!list.length) return null;
-              return (
-                <div key={cat}>
-                  <div className="dtb-fly-sec">{cat}</div>
-                  <div className="dtb-emoji">
-                    {list.map((e) => (
-                      <button key={e.e} type="button" title={e.k} onClick={() => { p.onEmoji(e.e); setOpen(null); }}>{e.e}</button>
-                    ))}
+            <div className="seg dtb-icon-tabs" role="tablist">
+              {(["emojis", "stickers", "icons"] as const).map((t) => (
+                <button key={t} type="button" role="tab" aria-selected={iconTab === t} className={iconTab === t ? "on" : ""} onClick={() => setIconTab(t)} data-testid={`icon-tab-${t}`}>
+                  {t === "emojis" ? "Emojis" : t === "stickers" ? "Stickers" : "Icons"}
+                </button>
+              ))}
+            </div>
+            {iconTab !== "stickers" && (
+              <input className="chart-menu-input" placeholder={iconTab === "icons" ? "Search icons" : "Search emojis"} value={emojiQ} onChange={(e) => setEmojiQ(e.target.value)} autoFocus aria-label="Search icons" />
+            )}
+            {recent.length > 0 && !emojiQ && (
+              <div>
+                <div className="dtb-fly-sec">Recently used</div>
+                <div className="dtb-emoji">{recent.map((d, i) => iconBtn(d, d.sticker?.text ?? d.emoji ?? "", `r${i}`))}</div>
+              </div>
+            )}
+            {iconTab === "emojis" &&
+              [...new Set(EMOJIS.map((e) => e.cat))].map((cat) => {
+                const list = EMOJIS.filter((e) => e.cat === cat && (!emojiQ || e.k.includes(emojiQ.toLowerCase())));
+                if (!list.length) return null;
+                return (
+                  <div key={cat}>
+                    <div className="dtb-fly-sec">{cat}</div>
+                    <div className="dtb-emoji">{list.map((e) => iconBtn({ emoji: e.e }, e.k, e.e))}</div>
                   </div>
-                </div>
-              );
-            })}
+                );
+              })}
+            {iconTab === "stickers" && <div className="dtb-stickers">{STICKERS.map((st) => iconBtn({ emoji: st.emoji, sticker: { text: st.text, color: st.color } }, st.text, st.text))}</div>}
+            {iconTab === "icons" && (
+              <div className="dtb-emoji">{GLYPHS.filter((g2) => !emojiQ || g2.includes(emojiQ)).map((g2) => iconBtn({ emoji: g2, glyph: true }, "takes the drawing colour", g2))}</div>
+            )}
           </Flyout>
         )}
       </div>
@@ -227,7 +281,7 @@ export function LeftToolbar(p: LeftToolbarProps) {
       </div>
       <div className="chart-tool-sep" />
       <button type="button" className={`chart-tool${p.drawMode === "measure" ? " on" : ""}`} onClick={() => p.onTool("measure")} title="Measure — click start, click end" data-testid="chart-measure">📏</button>
-      <button type="button" className={`chart-tool${p.drawMode === "zoom" ? " on" : ""}`} onClick={() => p.onTool("zoom")} title="Zoom in — click two corners of the area" data-testid="chart-zoom">🔍</button>
+      <button type="button" className={`chart-tool${p.drawMode === "zoom" ? " on" : ""}`} onClick={() => p.onTool("zoom")} title="Zoom in — drag a rectangle (or click two corners)" data-testid="chart-zoom">🔍</button>
       <div className="dtb-group">
         <button
           type="button"
@@ -284,7 +338,11 @@ export function LeftToolbar(p: LeftToolbarProps) {
           <Flyout anchor={anchor} onClose={() => setOpen(null)}>
             <div className="dtb-fly-row"><button type="button" className="dtb-fly-item" disabled={!p.drawingCount} onClick={() => { p.onRemove("drawings"); setOpen(null); }} data-testid="chart-remove-drawings">Remove {p.drawingCount} drawing{p.drawingCount === 1 ? "" : "s"}</button></div>
             <div className="dtb-fly-row"><button type="button" className="dtb-fly-item" disabled={!p.indicatorCount} onClick={() => { p.onRemove("indicators"); setOpen(null); }}>Remove {p.indicatorCount} indicator{p.indicatorCount === 1 ? "" : "s"}</button></div>
-            <div className="dtb-fly-row"><button type="button" className="dtb-fly-item" onClick={() => { p.onRemove("all"); setOpen(null); }}>Remove drawings & indicators</button></div>
+            <div className="dtb-fly-row">
+              <button type="button" className="dtb-fly-item" disabled={!p.drawingCount && !p.indicatorCount} onClick={() => { p.onRemove("all"); setOpen(null); }}>
+                Remove {p.drawingCount} drawing{p.drawingCount === 1 ? "" : "s"} & {p.indicatorCount} indicator{p.indicatorCount === 1 ? "" : "s"}
+              </button>
+            </div>
           </Flyout>
         )}
       </div>
@@ -334,6 +392,13 @@ export function FavoritesBar({ favorites, drawMode, onTool, onClose }: { favorit
 
 const WIDTHS = [1, 2, 3, 4];
 
+/** Tools whose shapes take a background fill. */
+const FILL_TOOLS = new Set([
+  "rect", "rotrect", "circle", "ellipse", "triangle", "polyline", "path", "arc", "curve", "dcurve", "channel", "flattop", "disjoint",
+  "regression", "pitchfork", "schiff", "mschiff", "ipitchfork", "fib", "fibext", "fibchannel", "fibcircles", "fibarcs", "fibwedge",
+  "fibfan", "pitchfan", "gannbox", "gannfan", "gannsquare", "gannsqfixed", "pricerange", "daterange", "dprange", "timecycles",
+]);
+
 /** The floating toolbar over a selected drawing. */
 export function DrawingFloatBar({
   drawing,
@@ -350,6 +415,10 @@ export function DrawingFloatBar({
   onSaveDefault,
   onAlert,
   canAlert,
+  templates,
+  onApplyTemplate,
+  onSaveTemplate,
+  onRemoveTemplate,
 }: {
   drawing: Drawing;
   style: DrawingStyle;
@@ -365,15 +434,49 @@ export function DrawingFloatBar({
   onSaveDefault: () => void;
   onAlert: () => void;
   canAlert: boolean;
+  templates: string[];
+  onApplyTemplate: (name: string | null) => void;
+  onSaveTemplate: () => void;
+  onRemoveTemplate: (name: string) => void;
 }) {
   const [more, setMore] = useState(false);
+  const [tpl, setTpl] = useState(false);
   const ref = useRef<HTMLDivElement | null>(null);
+  const tplRef = useRef<HTMLDivElement | null>(null);
   useOutside(ref, more, () => setMore(false));
+  useOutside(tplRef, tpl, () => setTpl(false));
   const tool = TOOL_BY_ID.get(drawing.type);
+  const hasText = !!tool?.text || !!drawing.text;
   return (
     <div className="dfloat" data-testid="drawing-floatbar" onMouseDown={(e) => e.stopPropagation()}>
       <span className="dfloat-name">{drawing.name || tool?.label}</span>
+      <div className="chart-menu-wrap" ref={tplRef}>
+        <button type="button" className="chart-tool" onClick={() => setTpl((m) => !m)} title="Template" data-testid="drawing-template-btn">▦▾</button>
+        {tpl && (
+          <div className="chart-menu cdrop" data-testid="drawing-template-menu">
+            {templates.map((n) => (
+              <div key={n} className="chart-menu-row">
+                <button type="button" className="chart-menu-item" onClick={() => { onApplyTemplate(n); setTpl(false); }}>{n}</button>
+                <button type="button" className="chart-menu-x" title={`Delete ${n}`} onClick={() => onRemoveTemplate(n)}>×</button>
+              </div>
+            ))}
+            {templates.length > 0 && <div className="chart-menu-sep" />}
+            <button type="button" className="chart-menu-item" onClick={() => { onApplyTemplate(null); setTpl(false); }}>Apply default</button>
+            <button type="button" className="chart-menu-item" onClick={() => { setTpl(false); onSaveTemplate(); }}>Save drawing template as…</button>
+          </div>
+        )}
+      </div>
       <ColorInput value={style.color} fallback={fallbackColor} onChange={(c) => onStyle({ color: c })} title="Line color" />
+      {FILL_TOOLS.has(drawing.type) && (
+        <span className="dfloat-fill" title="Background">
+          <ColorInput value={style.fill ? style.fillColor : ""} fallback={style.color || fallbackColor} onChange={(c) => onStyle(c ? { fill: true, fillColor: c } : { fill: false })} title="Fill color" />
+        </span>
+      )}
+      {hasText && (
+        <span className="dfloat-text" title="Text color">
+          <ColorInput value={style.textColor} fallback={style.color || fallbackColor} onChange={(c) => onStyle({ textColor: c })} title="Text color" />
+        </span>
+      )}
       <select className="cform-sel" value={style.width} onChange={(e) => onStyle({ width: Number(e.target.value) })} aria-label="Line width">
         {WIDTHS.map((w) => <option key={w} value={w}>{w}px</option>)}
       </select>

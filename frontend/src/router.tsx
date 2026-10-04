@@ -40,7 +40,7 @@ const VALID_TABS = new Set<TabKey>([
 ]);
 
 function parseHash(): TabKey {
-  const hash = window.location.hash.replace(/^#\/?/, "");
+  const hash = window.location.hash.replace(/^#\/?/, "").split("?")[0];
   return VALID_TABS.has(hash as TabKey) ? (hash as TabKey) : "dashboard";
 }
 

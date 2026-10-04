@@ -23,6 +23,7 @@ from app.analyzer.service import Service as AnalyzerService
 from app.api import (
     algo as algo_api,
     audit_log as audit_log_api,
+    broker as broker_api,
     broker_accounts as broker_accounts_api,
     core as core_api,
     dataset as dataset_api,
@@ -42,6 +43,7 @@ from app.api import (
     rules as rules_api,
     search as search_api,
     settings_api,
+    snapshots as snapshots_api,
     strategies as strategies_api,
     system as system_api,
     trading_mode,
@@ -630,6 +632,7 @@ app.include_router(audit_log_api.router)
 app.include_router(positions_api.router)
 app.include_router(risk_api.router)
 app.include_router(market_api.router)
+app.include_router(broker_api.router)
 app.include_router(core_api.router)
 app.include_router(orders_api.router)
 app.include_router(search_api.router)
@@ -641,6 +644,7 @@ app.include_router(warehouse_api.router)
 app.include_router(model_api.router)
 app.include_router(system_api.router)
 app.include_router(algo_api.router)
+app.include_router(snapshots_api.router)
 
 
 # -------------------------------------------------------------------------

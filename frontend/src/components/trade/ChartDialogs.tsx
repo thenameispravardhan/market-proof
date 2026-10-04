@@ -1,7 +1,7 @@
 // ChartDialogs — symbol search, go to date, the command palette (Quick
 // Search), keyboard shortcuts, the alert editor, and drawing settings.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api } from "../../api/client";
 import type { InstrumentHit, SearchResponse } from "../../types";
 import { Check, ColorInput, Modal, Num, Row, Sel } from "./chartUi";
@@ -13,58 +13,158 @@ import { VIS_GROUPS } from "./indicatorCatalog";
 // Symbol search
 // ---------------------------------------------------------------------------
 
-const SEGMENTS: { id: string; label: string; seg: string | null }[] = [
-  { id: "all", label: "All", seg: null },
-  { id: "stocks", label: "Stocks", seg: "EQ" },
-  { id: "fno", label: "Futures & options", seg: "FO" },
-  { id: "indices", label: "Indices", seg: "INDEX" },
+/** Type chips → the search API's `segment` / `types` filters. */
+const TYPE_CHIPS: { id: string; label: string; seg?: string; types?: string }[] = [
+  { id: "all", label: "All" },
+  { id: "stocks", label: "Stocks", types: "EQ" },
+  { id: "futures", label: "Futures", types: "FUT" },
+  { id: "options", label: "Options", types: "OPT" },
+  { id: "indices", label: "Indices", types: "IND" },
+  { id: "etf", label: "ETFs", types: "ETF" },
   { id: "commodity", label: "Commodities", seg: "COM" },
   { id: "currency", label: "Currency", seg: "CD" },
 ];
 
+/** Sources: exchange + segment (NFO = NSE F&O, BFO = BSE F&O, CDS = NSE currency). */
+const SOURCES: { v: string; l: string }[] = [
+  { v: "all", l: "All sources" },
+  { v: "NSE", l: "NSE" },
+  { v: "BSE", l: "BSE" },
+  { v: "MCX", l: "MCX" },
+  { v: "NFO", l: "NFO · NSE F&O" },
+  { v: "BFO", l: "BFO · BSE F&O" },
+  { v: "CDS", l: "CDS · currency" },
+];
+
 const TYPE_BADGE: Record<string, string> = { EQ: "stock", FUT: "futures", CE: "call", PE: "put", IND: "index" };
+const PAGE = 50;
+
+const isEtf = (h: InstrumentHit) => h.instrument_type === "EQ" && /ETF|BEES/i.test(`${h.short_name} ${h.symbol}`);
+
+/** Same rules as the search API, for the (client-side) recent list. */
+export function hitMatches(h: InstrumentHit, chip: string, src: string): boolean {
+  const c = TYPE_CHIPS.find((x) => x.id === chip);
+  if (c?.seg && h.segment !== c.seg) return false;
+  if (c?.types) {
+    const t = h.instrument_type;
+    const ok = c.types === "EQ" ? t === "EQ" && !isEtf(h)
+      : c.types === "ETF" ? isEtf(h)
+        : c.types === "OPT" ? t === "CE" || t === "PE"
+          : c.types === "IND" ? t === "IND" || h.segment === "INDEX"
+            : t === c.types;
+    if (!ok) return false;
+  }
+  if (src === "all") return true;
+  const fo = h.segment === "FO", cd = h.segment === "CD";
+  if (src === "NSE" || src === "BSE") return h.exchange === src && !fo && !cd;
+  if (src === "MCX") return h.exchange === "MCX";
+  if (src === "NFO") return h.exchange === "NSE" && fo;
+  if (src === "BFO") return h.exchange === "BSE" && fo;
+  if (src === "CDS") return h.exchange === "NSE" && cd;
+  return true;
+}
+
+/** "NSE:SBIN-EQ" → "NSE:SBIN" (TradingView's EXCHANGE:TICKER). */
+export function exchTicker(h: Pick<InstrumentHit, "symbol" | "exchange">): string {
+  const raw = h.symbol.includes(":") ? h.symbol.slice(h.symbol.indexOf(":") + 1) : h.symbol;
+  return `${h.exchange}:${raw.replace(/-(EQ|BE|INDEX)$/i, "")}`;
+}
+
+/** Wrap every case-insensitive match of the query's words in <mark>. */
+export function highlight(text: string, q: string): ReactNode {
+  const words = q.trim().split(/\s+/).filter(Boolean).map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  if (!words.length) return text;
+  const parts = text.split(new RegExp(`(${words.join("|")})`, "ig"));
+  return parts.map((p, i) => (i % 2 === 1 ? <mark key={i} className="sym-hl">{p}</mark> : p));
+}
 
 export function SymbolSearchDialog({
   initial = "",
+  select = false,
   title = "Symbol Search",
   recent,
   onPick,
   onClose,
 }: {
   initial?: string;
+  /** Pre-select the initial text (opened from the toolbar with the current symbol). */
+  select?: boolean;
   title?: string;
   recent: InstrumentHit[];
   onPick: (h: InstrumentHit) => void;
   onClose: () => void;
 }) {
   const [q, setQ] = useState(initial);
-  const [seg, setSeg] = useState("all");
-  const [exch, setExch] = useState("all");
+  const [chip, setChip] = useState("all");
+  const [src, setSrc] = useState("all");
   const [hits, setHits] = useState<InstrumentHit[]>([]);
+  const [more, setMore] = useState(false);
   const [busy, setBusy] = useState(false);
   const [hl, setHl] = useState(0);
-  useEffect(() => {
-    const query = q.trim();
-    if (!query) {
-      setHits([]);
-      return;
-    }
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const seqRef = useRef(0);
+  const query = q.trim();
+  const url = (offset: number) => {
+    const c = TYPE_CHIPS.find((x) => x.id === chip);
+    return `/api/search/symbols?q=${encodeURIComponent(query)}&limit=${PAGE}&offset=${offset}` +
+      `${c?.seg ? `&segment=${c.seg}` : ""}${c?.types ? `&types=${c.types}` : ""}${src !== "all" ? `&exchange=${src}` : ""}`;
+  };
+  const load = (offset: number) => {
+    const seq = ++seqRef.current;
     setBusy(true);
-    const s = SEGMENTS.find((x) => x.id === seg)?.seg;
-    const h = setTimeout(() => {
-      void api
-        .get<SearchResponse>(`/api/search/symbols?q=${encodeURIComponent(query)}&limit=50${s ? `&segment=${s}` : ""}`)
-        .then((r) => setHits(r.hits ?? []))
-        .catch(() => setHits([]))
-        .finally(() => setBusy(false));
-    }, 200);
+    return api
+      .get<SearchResponse>(url(offset))
+      .then((r) => {
+        if (seq !== seqRef.current) return;
+        const page = r.hits ?? [];
+        setHits((h) => {
+          if (!offset) return page;
+          const seen = new Set(h.map((x) => x.symbol));
+          return [...h, ...page.filter((x) => !seen.has(x.symbol))];
+        });
+        setMore(r.has_more ?? page.length >= PAGE);
+      })
+      .catch(() => {
+        if (seq !== seqRef.current) return;
+        if (!offset) setHits([]);
+        setMore(false);
+      })
+      .finally(() => seq === seqRef.current && setBusy(false));
+  };
+  useEffect(() => {
+    const h = setTimeout(() => void load(0), 200);
     return () => clearTimeout(h);
-  }, [q, seg]);
-  const shown = (q.trim() ? hits : recent).filter((h) => exch === "all" || h.exchange === exch);
-  useEffect(() => setHl(0), [q, seg, exch]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query, chip, src]);
+  useEffect(() => {
+    if (select) inputRef.current?.select();
+  }, [select]);
+  const recentShown = query ? [] : recent.filter((h) => hitMatches(h, chip, src));
+  const shown = [...recentShown, ...hits.filter((h) => !recentShown.some((r) => r.symbol === h.symbol))];
+  useEffect(() => setHl(0), [query, chip, src]);
+  useEffect(() => {
+    listRef.current?.querySelector(".sym-row.hl")?.scrollIntoView?.({ block: "nearest" });
+  }, [hl]);
+  const onScroll = () => {
+    const el = listRef.current;
+    if (el && more && !busy && el.scrollTop + el.clientHeight >= el.scrollHeight - 80) void load(hits.length);
+  };
+  const pick = (h: InstrumentHit) => {
+    onPick(h);
+    onClose();
+  };
   return (
-    <Modal title={title} onClose={onClose} width={620} testid="symbol-search" className="sym-search">
+    <Modal
+      title={title}
+      onClose={onClose}
+      width={660}
+      testid="symbol-search"
+      className="sym-search"
+      footer={<span className="sym-foot">Simply start typing while on the chart to pull up this search box</span>}
+    >
       <input
+        ref={inputRef}
         className="chart-menu-input sym-input"
         value={q}
         autoFocus
@@ -72,38 +172,44 @@ export function SymbolSearchDialog({
         aria-label="Search symbol"
         onChange={(e) => setQ(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === "ArrowDown") { e.preventDefault(); setHl((i) => Math.min(shown.length - 1, i + 1)); }
-          else if (e.key === "ArrowUp") { e.preventDefault(); setHl((i) => Math.max(0, i - 1)); }
-          else if (e.key === "Enter" && shown[hl]) { onPick(shown[hl]); onClose(); }
+          if (e.key === "ArrowDown") {
+            e.preventDefault();
+            setHl((i) => Math.min(shown.length - 1, i + 1));
+            if (hl >= shown.length - 3 && more && !busy) void load(hits.length);
+          } else if (e.key === "ArrowUp") { e.preventDefault(); setHl((i) => Math.max(0, i - 1)); }
+          else if (e.key === "Enter" && shown[hl]) pick(shown[hl]);
         }}
         data-testid="symbol-search-input"
       />
       <div className="sym-filters">
-        {SEGMENTS.map((s) => (
-          <button key={s.id} type="button" className={`chip${seg === s.id ? " on" : ""}`} onClick={() => setSeg(s.id)}>{s.label}</button>
+        {TYPE_CHIPS.map((c) => (
+          <button key={c.id} type="button" className={`chip${chip === c.id ? " on" : ""}`} onClick={() => setChip(c.id)} data-testid={`symbol-chip-${c.id}`}>{c.label}</button>
         ))}
         <span className="grow" />
-        <Sel value={exch} options={[{ v: "all", l: "All exchanges" }, { v: "NSE", l: "NSE" }, { v: "BSE", l: "BSE" }, { v: "MCX", l: "MCX" }]} onChange={setExch} ariaLabel="Exchange" />
+        <Sel value={src} options={SOURCES.map((x) => ({ v: x.v, l: x.l }))} onChange={setSrc} ariaLabel="Source" />
       </div>
-      <div className="sym-list">
-        {!q.trim() && recent.length > 0 && <div className="sym-head">Recently searched</div>}
-        {busy && <div className="hint">searching…</div>}
-        {!busy && q.trim() && shown.length === 0 && <div className="hint">No symbols match "{q}".</div>}
+      <div className="sym-cols"><span>Symbol</span><span>Description</span><span /><span>Source</span></div>
+      <div className="sym-list" ref={listRef} onScroll={onScroll} data-testid="symbol-search-list">
+        {recentShown.length > 0 && <div className="sym-head">Recently searched</div>}
         {shown.map((h, i) => (
-          <button
-            key={h.symbol}
-            type="button"
-            className={`sym-row${i === hl ? " hl" : ""}`}
-            onMouseEnter={() => setHl(i)}
-            onClick={() => { onPick(h); onClose(); }}
-            data-testid={`symbol-search-row-${h.symbol}`}
-          >
-            <span className="sym">{h.short_name}</span>
-            <span className="desc">{h.display}</span>
-            <span className="badge neutral">{TYPE_BADGE[h.instrument_type] ?? h.instrument_type}</span>
-            <span className="exch">{h.exchange}</span>
-          </button>
+          <Fragment key={h.symbol}>
+            {!query && i === recentShown.length && recentShown.length > 0 && <div className="sym-head">Popular</div>}
+            <button
+              type="button"
+              className={`sym-row${i === hl ? " hl" : ""}`}
+              onMouseEnter={() => setHl(i)}
+              onClick={() => pick(h)}
+              data-testid={`symbol-search-row-${h.symbol}`}
+            >
+              <span className="sym">{highlight(exchTicker(h), query)}</span>
+              <span className="desc">{highlight(h.display, query)}</span>
+              <span className="badge neutral">{isEtf(h) ? "etf" : TYPE_BADGE[h.instrument_type] ?? h.instrument_type}</span>
+              <span className="exch">{h.exchange}{h.segment === "FO" ? " F&O" : ""}</span>
+            </button>
+          </Fragment>
         ))}
+        {busy && <div className="hint sym-busy">{hits.length ? "loading more…" : "searching…"}</div>}
+        {!busy && shown.length === 0 && <div className="hint">{query ? `No symbols match "${q}".` : "No symbols for this filter."}</div>}
       </div>
     </Modal>
   );
@@ -131,12 +237,14 @@ export function GoToDialog({ onGo, onClose, last }: { onGo: (r: { at?: number; f
   const [time, setTime] = useState("");
   const [from, setFrom] = useState(today);
   const [to, setTo] = useState(today);
+  const [fromTime, setFromTime] = useState("");
+  const [toTime, setToTime] = useState("");
   const go = () => {
     if (tab === "date") {
       const at = wallToChart(date, time || "09:15");
       if (at !== null) onGo({ at });
     } else {
-      const f = wallToChart(from, "00:00"), t = wallToChart(to, "23:59");
+      const f = wallToChart(from, fromTime || "00:00"), t = wallToChart(to, toTime || "23:59");
       if (f !== null && t !== null && t > f) onGo({ from: f, to: t });
     }
     onClose();
@@ -145,7 +253,7 @@ export function GoToDialog({ onGo, onClose, last }: { onGo: (r: { at?: number; f
     <Modal
       title="Go to"
       onClose={onClose}
-      width={380}
+      width={420}
       testid="goto-dialog"
       footer={<><span className="grow" /><button type="button" className="cbtn" onClick={onClose}>Cancel</button><button type="button" className="cbtn primary" onClick={go} data-testid="goto-go">Go to</button></>}
     >
@@ -160,8 +268,14 @@ export function GoToDialog({ onGo, onClose, last }: { onGo: (r: { at?: number; f
         </>
       ) : (
         <>
-          <Row label="From"><input type="date" value={from} onChange={(e) => setFrom(e.target.value)} aria-label="From" /></Row>
-          <Row label="To"><input type="date" value={to} onChange={(e) => setTo(e.target.value)} aria-label="To" /></Row>
+          <Row label="From">
+            <input type="date" value={from} onChange={(e) => setFrom(e.target.value)} aria-label="From" />
+            <input type="time" value={fromTime} onChange={(e) => setFromTime(e.target.value)} aria-label="From time" title="Optional time" />
+          </Row>
+          <Row label="To">
+            <input type="date" value={to} onChange={(e) => setTo(e.target.value)} aria-label="To" />
+            <input type="time" value={toTime} onChange={(e) => setToTime(e.target.value)} aria-label="To time" title="Optional time" />
+          </Row>
         </>
       )}
     </Modal>
@@ -177,15 +291,24 @@ export interface Command {
   label: string;
   group: string;
   hint?: string;
+  /** A setting: shown with an on / off switch and toggled in place. */
+  toggle?: boolean;
   run: () => void;
 }
+
+/** Quick Search sections, TradingView-style. */
+const SECTION_OF = (g: string): "Drawings" | "Functions" | "Settings" =>
+  g === "Drawing tools" || g === "Drawing" ? "Drawings" : g === "Settings" ? "Settings" : "Functions";
+const SECTIONS = ["Drawings", "Functions", "Settings"] as const;
 
 export function CommandPalette({ commands, onClose }: { commands: Command[]; onClose: () => void }) {
   const [q, setQ] = useState("");
   const [hl, setHl] = useState(0);
   const list = useMemo(() => {
     const words = q.toLowerCase().split(/\s+/).filter(Boolean);
-    return commands.filter((c) => words.every((w) => `${c.label} ${c.group}`.toLowerCase().includes(w))).slice(0, 80);
+    const hits = commands.filter((c) => words.every((w) => `${c.label} ${c.group}`.toLowerCase().includes(w)));
+    // grouped Drawings → Functions → Settings, each capped so all three show
+    return SECTIONS.flatMap((sec) => hits.filter((c) => SECTION_OF(c.group) === sec).slice(0, q ? 40 : 12));
   }, [q, commands]);
   useEffect(() => setHl(0), [q]);
   const listRef = useRef<HTMLDivElement | null>(null);
@@ -204,16 +327,34 @@ export function CommandPalette({ commands, onClose }: { commands: Command[]; onC
         onKeyDown={(e) => {
           if (e.key === "ArrowDown") { e.preventDefault(); setHl((i) => Math.min(list.length - 1, i + 1)); }
           else if (e.key === "ArrowUp") { e.preventDefault(); setHl((i) => Math.max(0, i - 1)); }
-          else if (e.key === "Enter" && list[hl]) { onClose(); list[hl].run(); }
+          else if (e.key === "Enter" && list[hl]) {
+            if (list[hl].toggle === undefined) onClose();
+            list[hl].run();
+          }
         }}
       />
       <div className="cmd-list" ref={listRef}>
         {list.length === 0 && <div className="hint">Nothing matches.</div>}
         {list.map((c, i) => (
-          <button key={c.id} type="button" className={`cmd-row${i === hl ? " hl" : ""}`} onMouseEnter={() => setHl(i)} onClick={() => { onClose(); c.run(); }}>
-            <span>{c.label}</span>
-            <span className="cmd-group">{c.hint ? <span className="kbd">{c.hint}</span> : null}{c.group}</span>
-          </button>
+          <div key={c.id}>
+            {(i === 0 || SECTION_OF(list[i - 1].group) !== SECTION_OF(c.group)) && <div className="cmd-sec">{SECTION_OF(c.group)}</div>}
+            <button
+              type="button"
+              className={`cmd-row${i === hl ? " hl" : ""}`}
+              onMouseEnter={() => setHl(i)}
+              onClick={() => {
+                if (c.toggle === undefined) onClose(); // settings flip in place, the palette stays
+                c.run();
+              }}
+              data-testid={`cmd-${c.id}`}
+            >
+              <span>{c.label}</span>
+              <span className="cmd-group">
+                {c.hint ? <span className="kbd">{c.hint}</span> : null}
+                {c.toggle !== undefined ? <span className={`cmd-switch${c.toggle ? " on" : ""}`} aria-label={c.toggle ? "on" : "off"} /> : c.group}
+              </span>
+            </button>
+          </div>
         ))}
       </div>
     </Modal>
@@ -228,6 +369,7 @@ export const SHORTCUTS: [string, string][] = [
   ["Alt + C", "Cross line"],
   ["Alt + Shift + R", "Rectangle"],
   ["Ctrl + Shift + S", "Copy chart image"],
+  ["Alt + S", "Copy a link to the chart image"],
   ["Alt + F", "Fib retracement"],
   ["Alt + A", "Add alert at the cursor"],
   ["Alt + I", "Invert scale"],
@@ -364,7 +506,7 @@ export function DrawingSettingsDialog({
   fmt,
 }: {
   drawing: Drawing;
-  deps: Pick<DrawingDeps, "toolDefaults" | "lineColor">;
+  deps: Pick<DrawingDeps, "toolDefaults" | "lineColor"> & Partial<Pick<DrawingDeps, "candles" | "timeToLogical">>;
   onChange: (d: Drawing) => void;
   onClose: (commit: boolean) => void;
   fmt: (n: number) => string;
@@ -400,7 +542,14 @@ export function DrawingSettingsDialog({
       {tab === "inputs" && isPos && (
         <>
           <Row label="Account size"><Num value={d.data?.account ?? 100000} min={0} step={1000} width={110} onChange={(v) => onChange({ ...d, data: { ...d.data, account: v } })} ariaLabel="Account size" /></Row>
-          <Row label="Risk %"><Num value={d.data?.risk ?? 1} min={0} max={100} step={0.25} onChange={(v) => onChange({ ...d, data: { ...d.data, risk: v } })} ariaLabel="Risk" /></Row>
+          <Row label="Risk">
+            <Sel value={d.data?.riskMode ?? "pct"} options={[{ v: "pct", l: "% of account" }, { v: "amount", l: "Amount (₹)" }]} onChange={(v) => onChange({ ...d, data: { ...d.data, riskMode: v as "pct" | "amount" } })} ariaLabel="Risk mode" />
+            {(d.data?.riskMode ?? "pct") === "pct" ? (
+              <Num value={d.data?.risk ?? 1} min={0} max={100} step={0.25} onChange={(v) => onChange({ ...d, data: { ...d.data, risk: v } })} ariaLabel="Risk" />
+            ) : (
+              <Num value={d.data?.riskAmount ?? 1000} min={0} step={100} width={100} onChange={(v) => onChange({ ...d, data: { ...d.data, riskAmount: v } })} ariaLabel="Risk amount" />
+            )}
+          </Row>
           <Row label="Lot size"><Num value={d.data?.lot ?? 1} min={1} onChange={(v) => onChange({ ...d, data: { ...d.data, lot: Math.round(v) } })} ariaLabel="Lot size" /></Row>
           <Row label="Quantity" hint="0 = sized from account × risk"><Num value={d.data?.qty ?? 0} min={0} onChange={(v) => onChange({ ...d, data: { ...d.data, qty: Math.round(v) } })} ariaLabel="Quantity" /></Row>
           {(["Entry price", "Target price", "Stop price"] as const).map((lbl, i) => (
@@ -457,9 +606,29 @@ export function DrawingSettingsDialog({
       {tab === "coords" &&
         d.points.map((p, i) => {
           const w = chartToWall(p.time);
+          const bars = deps.candles?.() ?? [];
+          const bar = deps.timeToLogical?.(p.time);
+          const timeOfBar = (k: number): number | null => {
+            if (!bars.length) return null;
+            if (k >= 0 && k < bars.length) return bars[k].time;
+            const step = bars.length > 1 ? bars[bars.length - 1].time - bars[bars.length - 2].time : 60;
+            return k < 0 ? bars[0].time + k * step : bars[bars.length - 1].time + (k - bars.length + 1) * step;
+          };
           return (
             <Row key={i} label={`#${i + 1}`}>
               <Num value={Math.round(p.price * 100) / 100} step={0.05} width={100} onChange={(v) => onChange({ ...d, points: d.points.map((q, j) => (j === i ? { ...q, price: v } : q)) })} ariaLabel={`Point ${i + 1} price`} />
+              {bar != null && (
+                <Num
+                  value={Math.round(bar)}
+                  step={1}
+                  width={70}
+                  onChange={(v) => {
+                    const t = timeOfBar(Math.round(v));
+                    if (t !== null) onChange({ ...d, points: d.points.map((q, j) => (j === i ? { ...q, time: t } : q)) });
+                  }}
+                  ariaLabel={`Point ${i + 1} bar`}
+                />
+              )}
               <input
                 type="datetime-local"
                 value={`${w.date}T${w.time}`}
@@ -474,9 +643,28 @@ export function DrawingSettingsDialog({
           );
         })}
       {tab === "visibility" &&
-        VIS_GROUPS.map((g) => (
-          <Check key={g.id} label={g.label} checked={d.vis?.[g.id] !== false} onChange={(v) => onChange({ ...d, vis: { ...(d.vis ?? {}), [g.id]: v } })} />
-        ))}
+        VIS_GROUPS.map((g) => {
+          const raw = d.vis?.[g.id];
+          const v = raw && typeof raw === "object" ? raw : { on: raw !== false, min: 1, max: g.max };
+          const put = (patch: Partial<typeof v>) => {
+            const next = { ...v, ...patch };
+            const whole = next.min <= 1 && next.max >= g.max;
+            onChange({ ...d, vis: { ...(d.vis ?? {}), [g.id]: whole ? next.on : next } });
+          };
+          return (
+            <div key={g.id} className="cform-row">
+              <label className="cform-check">
+                <input type="checkbox" checked={v.on} onChange={(e) => put({ on: e.target.checked })} />
+                {g.label}
+              </label>
+              <span className="cform-ctl">
+                <Num value={v.min} min={1} max={g.max} width={56} onChange={(n) => put({ min: Math.round(n) })} ariaLabel={`${g.label} from`} />
+                <span className="hint">–</span>
+                <Num value={v.max} min={1} max={g.max} width={56} onChange={(n) => put({ max: Math.round(n) })} ariaLabel={`${g.label} to`} />
+              </span>
+            </div>
+          );
+        })}
     </Modal>
   );
 }

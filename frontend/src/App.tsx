@@ -11,6 +11,7 @@ import {
   type IndexQuote,
 } from "./hooks/useApi";
 import { WorkflowBar } from "./components/common/WorkflowBar";
+import { getTheme, THEME_EVENT, toggleTheme, type AppTheme } from "./lib/theme";
 
 // Persisted sidebar open/closed state. Default open. Stored in
 // localStorage so the choice survives reloads.
@@ -31,6 +32,7 @@ function readSidebarOpen(): boolean {
 
 const Dashboard = lazy(() => import("./pages/Dashboard"));
 const Trade = lazy(() => import("./pages/Trade"));
+const ChartPopout = lazy(() => import("./components/trade/ChartPopout"));
 const TradeHistory = lazy(() => import("./pages/TradeHistory"));
 const Outcomes = lazy(() => import("./pages/Outcomes"));
 const Dataset = lazy(() => import("./pages/Dataset"));
@@ -237,6 +239,12 @@ export default function App() {
     },
   });
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(readSidebarOpen);
+  const [skin, setSkin] = useState<AppTheme>(getTheme);
+  useEffect(() => {
+    const on = () => setSkin(getTheme());
+    window.addEventListener(THEME_EVENT, on);
+    return () => window.removeEventListener(THEME_EVENT, on);
+  }, []);
 
   // Restore/persist per-panel sizes for whichever page is showing. The
   // resizing itself is CSS; this only remembers it across refreshes.
@@ -255,6 +263,17 @@ export default function App() {
 
   // Group the nav by section for the Bloomberg-style grouped sidebar.
   const sections: NavGroup[] = NAV_GROUPS;
+
+  // Tools → Popout Chart: a window with just the chart (#/trade?popout=1&symbol=…)
+  if (tab === "trade" && new URLSearchParams(window.location.hash.split("?")[1] ?? "").get("popout") === "1") {
+    return (
+      <div className="popout-app">
+        <Suspense fallback={<div className="hint">loading chart…</div>}>
+          <ChartPopout />
+        </Suspense>
+      </div>
+    );
+  }
 
   return (
     <div className="app">
@@ -308,6 +327,9 @@ export default function App() {
         </ul>
 
         <div className="sidebar-footer">
+          <button type="button" className="theme-toggle" onClick={() => setSkin(toggleTheme())} title={`Switch to the ${skin === "light" ? "dark" : "light"} theme`} data-testid="theme-toggle">
+            {skin === "light" ? "☾" : "☀"}{sidebarOpen && <span>{skin === "light" ? "Dark theme" : "Light theme"}</span>}
+          </button>
           <span className={`ws-status ${status}`} title={`WebSocket: ${status}`}>
             <span className="dot" />
             {sidebarOpen && <span className="ws-status-text">{status.toUpperCase()}</span>}

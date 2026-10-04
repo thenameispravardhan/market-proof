@@ -6,7 +6,7 @@
 import { useState } from "react";
 import { DATE_FORMATS, TIMEZONES } from "./chartData";
 import { Check, ColorInput, Modal, Num, Row, Section, Sel } from "./chartUi";
-import { DEFAULT_SETTINGS, SETTINGS_TEMPLATES_KEY, type ChartSettings, type LineVisibility } from "./chartSettings";
+import { DEFAULT_SETTINGS, SETTINGS_TEMPLATES_KEY, brickInputs, type BrickInputs, type BrickKind, type ChartSettings, type LineVisibility } from "./chartSettings";
 
 export interface TradingFlags {
   instant: boolean;
@@ -37,6 +37,7 @@ export default function ChartSettingsDialog({
   trading,
   onTrading,
   initialTab = "symbol",
+  chartKind,
 }: {
   value: ChartSettings;
   onChange: (s: ChartSettings) => void;
@@ -45,6 +46,8 @@ export default function ChartSettingsDialog({
   trading?: TradingFlags;
   onTrading?: (k: keyof TradingFlags, v: boolean) => void;
   initialTab?: string;
+  /** The chart's type: Renko / Kagi / P&F / Line break / Range show their own inputs. */
+  chartKind?: string;
 }) {
   const [orig] = useState(value);
   const [tab, setTab] = useState(initialTab);
@@ -130,14 +133,7 @@ export default function ChartSettingsDialog({
               <Sel value={s.timezone} options={TIMEZONES.map((t) => ({ v: t.id, l: t.label }))} onChange={(v) => set("timezone", v)} ariaLabel="Timezone" />
             </Row>
           </Section>
-          <Section title="Renko / Kagi / P&F / Range">
-            <Row label="Box size" hint="0 = automatic (ATR 14)">
-              <Num value={s.boxSize} min={0} step={0.05} onChange={(v) => set("boxSize", v)} ariaLabel="Box size" />
-              <span className="hint">{s.boxSize ? "" : "auto (ATR)"}</span>
-            </Row>
-            <Row label="P&F reversal (boxes)"><Num value={s.reversal} min={1} max={10} onChange={(v) => set("reversal", Math.round(v))} ariaLabel="Reversal" /></Row>
-            <Row label="Line break: lines"><Num value={s.lineBreak} min={1} max={10} onChange={(v) => set("lineBreak", Math.round(v))} ariaLabel="Line break" /></Row>
-          </Section>
+          <BrickSection s={s} kind={chartKind} onChange={onChange} />
         </>
       )}
       {tab === "status" && (
@@ -156,6 +152,7 @@ export default function ChartSettingsDialog({
             <Check label="Arguments" checked={s.indArgs} onChange={(v) => set("indArgs", v)} />
             <Check label="Values" checked={s.indValues} onChange={(v) => set("indValues", v)} />
             <Check label="Background" checked={s.legendBg} onChange={(v) => set("legendBg", v)}>
+              <ColorInput value={s.legendBgColor} fallback={theme.bg} onChange={(c) => set("legendBgColor", c)} title="Background colour" />
               <input type="range" min={0} max={100} value={Math.round(s.legendBgOpacity * 100)} onChange={(e) => set("legendBgOpacity", Number(e.target.value) / 100)} aria-label="Background opacity" />
             </Check>
           </Section>
@@ -165,9 +162,21 @@ export default function ChartSettingsDialog({
         <>
           <Section title="Price scale">
             <Row label="Scale modes (A and L)"><Sel value={s.scaleModesButtons} options={VIS_OPTS} onChange={(v) => set("scaleModesButtons", v)} ariaLabel="Scale modes" /></Row>
-            <Row label="Scales placement"><Sel value={s.scaleSide} options={[{ v: "right", l: "Right" }, { v: "left", l: "Left" }]} onChange={(v) => set("scaleSide", v)} ariaLabel="Scales placement" /></Row>
+            <Check label="Lock price to bar ratio" checked={s.lockRatio} onChange={(v) => set("lockRatio", v)}>
+              <Num value={s.priceBarRatio} min={0} step={0.0001} width={96} onChange={(v) => set("priceBarRatio", Math.max(0, v))} ariaLabel="Price to bar ratio" />
+              <span className="hint">{s.priceBarRatio ? "price per bar" : "taken from the view"}</span>
+            </Check>
+            <Row label="Scales placement">
+              <Sel
+                value={s.scalePlacement ?? s.scaleSide}
+                options={[{ v: "auto", l: "Auto" }, { v: "right", l: "Right" }, { v: "left", l: "Left" }]}
+                onChange={(v) => onChange({ ...s, scalePlacement: v, scaleSide: v === "left" ? "left" : "right" })}
+                ariaLabel="Scales placement"
+              />
+            </Row>
           </Section>
           <Section title="Price labels & lines">
+            <Check label="No overlapping labels" checked={s.noOverlapLabels} onChange={(v) => set("noOverlapLabels", v)} />
             <Check label="Countdown to bar close" checked={s.countdown} onChange={(v) => set("countdown", v)} />
             <Row label="Symbol">
               <Sel
@@ -176,6 +185,13 @@ export default function ChartSettingsDialog({
                 onChange={(v) => onChange({ ...s, lastPriceLabel: v === "vl" || v === "v", lastPriceLine: v === "vl" || v === "l" })}
                 ariaLabel="Symbol label"
               />
+              <Sel
+                value={s.lastPriceScaleValue ? "scale" : "value"}
+                options={[{ v: "scale", l: "Value according to scale" }, { v: "value", l: "Value" }]}
+                onChange={(v) => set("lastPriceScaleValue", v === "scale")}
+                ariaLabel="Symbol label value"
+              />
+              <ColorInput value={s.lastPriceColor} fallback={theme.up} onChange={(c) => set("lastPriceColor", c)} title="Symbol line colour (empty = bar direction)" />
             </Row>
             <Check label="Symbol name label" checked={s.symbolNameLabel} onChange={(v) => set("symbolNameLabel", v)} />
             {([
@@ -229,6 +245,7 @@ export default function ChartSettingsDialog({
             <Check label="Watermark" checked={s.watermark} onChange={(v) => set("watermark", v)}>
               <ColorInput value={s.watermarkColor} fallback={theme.text} onChange={(c) => set("watermarkColor", c)} />
             </Check>
+            <Check label="Logo watermark" checked={s.logoWatermark} onChange={(v) => set("logoWatermark", v)} />
           </Section>
           <Section title="Scales">
             <Row label="Text">
@@ -253,14 +270,17 @@ export default function ChartSettingsDialog({
           <Section title="General">
             <Check label="Buy/sell buttons" checked={s.buySellButtons} onChange={(v) => set("buySellButtons", v)} />
             {trading && onTrading && <Check label="Instant orders placement (no confirm)" checked={trading.instant} onChange={(v) => onTrading("instant", v)} />}
-            <Check label="Play sound for executions and alerts" checked={s.sound} onChange={(v) => set("sound", v)} />
+            <Check label="Play sound for executions (fills) and alerts" checked={s.sound} onChange={(v) => set("sound", v)} />
             <Row label="Notifications"><Sel value={s.notifications} options={[{ v: "all", l: "All events" }, { v: "rejections", l: "Only rejections" }, { v: "off", l: "Off" }]} onChange={(v) => set("notifications", v)} ariaLabel="Notifications" /></Row>
           </Section>
           <Section title="Appearance">
             {trading && onTrading && <Check label="Positions" checked={trading.showPos} onChange={(v) => onTrading("showPos", v)} />}
-            <Row label="Profit & loss"><Sel value={s.plMode} options={[{ v: "money", l: "Money" }, { v: "percent", l: "Percentage" }]} onChange={(v) => set("plMode", v)} ariaLabel="Profit and loss" /></Row>
+            <Row label="Profit & loss"><Sel value={s.plMode} options={[{ v: "money", l: "Money" }, { v: "ticks", l: "Ticks" }, { v: "percent", l: "Percentage" }]} onChange={(v) => set("plMode", v)} ariaLabel="Profit and loss" /></Row>
             <Check label="Reverse button on hover" checked={s.reverseButton} onChange={(v) => set("reverseButton", v)} />
             {trading && onTrading && <Check label="Orders" checked={trading.showOrders} onChange={(v) => onTrading("showOrders", v)} />}
+            <Check label="Executions" checked={s.executions} onChange={(v) => set("executions", v)} />
+            <Check label="Executions labels" checked={s.executionLabels} onChange={(v) => set("executionLabels", v)} />
+            <Check label="Extended price line for positions & orders" checked={s.extendLines} onChange={(v) => set("extendLines", v)} />
             {trading && onTrading && <Check label="'+' button on the price scale" checked={trading.plus} onChange={(v) => onTrading("plus", v)} />}
             <Row label="Orders & positions alignment"><Sel value={s.ordersAlign} options={[{ v: "right", l: "Right" }, { v: "left", l: "Left" }]} onChange={(v) => set("ordersAlign", v)} ariaLabel="Alignment" /></Row>
           </Section>
@@ -281,5 +301,46 @@ export default function ChartSettingsDialog({
         </Section>
       )}
     </Modal>
+  );
+}
+
+const BRICK_LABEL: Record<BrickKind, string> = { renko: "Renko", kagi: "Kagi", pnf: "Point & figure", linebreak: "Line break", range: "Range" };
+
+/** The current chart type's own inputs, TradingView-style (only brick types have any). */
+function BrickSection({ s, kind, onChange }: { s: ChartSettings; kind?: string; onChange: (s: ChartSettings) => void }) {
+  const k = kind && kind in BRICK_LABEL ? (kind as BrickKind) : null;
+  if (!k) {
+    return (
+      <Section title="Chart type inputs">
+        <div className="hint">Renko, Kagi, Point &amp; figure, Line break and Range each have their own inputs — switch the chart to one of them to edit its inputs here.</div>
+      </Section>
+    );
+  }
+  const b = brickInputs(s, k);
+  const setB = (patch: Partial<BrickInputs>) => onChange({ ...s, bricks: { ...s.bricks, [k]: { ...b, ...patch } } });
+  const what = k === "kagi" ? "Reversal amount" : k === "range" ? "Range" : "Box size";
+  return (
+    <Section title={`${BRICK_LABEL[k]} inputs`}>
+      {k !== "linebreak" && (
+        <>
+          <Row label={`${what} assignment method`}>
+            <Sel value={b.method} options={[{ v: "atr", l: "ATR" }, { v: "traditional", l: "Traditional" }]} onChange={(v) => setB({ method: v })} ariaLabel={`${what} assignment method`} />
+          </Row>
+          {b.method === "atr" ? (
+            <Row label="ATR length"><Num value={b.atrLength} min={1} max={500} onChange={(v) => setB({ atrLength: Math.max(1, Math.round(v)) })} ariaLabel="ATR length" /></Row>
+          ) : (
+            <Row label={what}>
+              <Num value={b.box} min={0} step={0.05} onChange={(v) => setB({ box: Math.max(0, v) })} ariaLabel={what} />
+              {!(b.box > 0) && <span className="hint">0 = ATR</span>}
+            </Row>
+          )}
+        </>
+      )}
+      {k === "pnf" && <Row label="Reversal amount (boxes)"><Num value={b.reversal} min={1} max={10} onChange={(v) => setB({ reversal: Math.max(1, Math.round(v)) })} ariaLabel="Reversal" /></Row>}
+      {k === "linebreak" && <Row label="Number of lines"><Num value={b.lines} min={1} max={10} onChange={(v) => setB({ lines: Math.max(1, Math.round(v)) })} ariaLabel="Number of lines" /></Row>}
+      {(k === "renko" || k === "kagi" || k === "pnf") && (
+        <Row label="Source"><Sel value={b.source} options={[{ v: "close", l: "Close" }, { v: "hl", l: "High / Low" }]} onChange={(v) => setB({ source: v })} ariaLabel="Source" /></Row>
+      )}
+    </Section>
   );
 }

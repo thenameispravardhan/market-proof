@@ -17,6 +17,8 @@ export interface Bar {
   low: number;
   close: number;
   volume: number;
+  /** Open interest at the bar's close (derivatives, when Fyers sends it). */
+  oi?: number;
   /** Chart-type extras: Kagi thickness (1 = yang), P&F column (1 = X). */
   flag?: number;
 }
@@ -192,6 +194,7 @@ function combine(into: Bar, b: Bar): void {
   if (b.low < into.low) into.low = b.low;
   into.close = b.close;
   into.volume += b.volume;
+  if (b.oi !== undefined) into.oi = b.oi; // a level, not a flow: the bucket's last
 }
 
 /**
@@ -218,7 +221,7 @@ export function aggregate(bars: Bar[], key: string): Bar[] {
       const k = Math.floor((b.time - anchor) / len);
       if (k !== bucket || out.length === 0) {
         bucket = k;
-        out.push({ time: anchor + k * len, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume });
+        out.push({ time: anchor + k * len, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume, ...(b.oi !== undefined ? { oi: b.oi } : {}) });
       } else {
         combine(out[out.length - 1], b);
       }
@@ -230,12 +233,17 @@ export function aggregate(bars: Bar[], key: string): Bar[] {
     const k = calendarBucket(b.time, iv);
     if (k !== bucket || out.length === 0) {
       bucket = k;
-      out.push({ time: b.time, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume });
+      out.push({ time: b.time, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume, ...(b.oi !== undefined ? { oi: b.oi } : {}) });
     } else {
       combine(out[out.length - 1], b);
     }
   }
   return out;
+}
+
+/** Derivative symbols (futures / options) — the ones Fyers has open interest for. */
+export function isDerivative(symbol: string): boolean {
+  return /(FUT|CE|PE)$/i.test(symbol.trim());
 }
 
 /**
@@ -318,8 +326,17 @@ function stamp(out: Bar[], t: number): number {
   return t > prev ? t : prev + 1;
 }
 
-/** Traditional Renko on closes: one box to continue, two to reverse. */
-export function renko(bars: Bar[], box: number): Bar[] {
+export type BrickSource = "close" | "hl";
+
+/** The prices a bar feeds a brick chart: its close, or its low and high in
+ *  the order they most likely traded (an up bar dips first, a down bar rallies first). */
+export function pricePath(b: Bar, source: BrickSource = "close"): number[] {
+  if (source === "close") return [b.close];
+  return b.close >= b.open ? [b.low, b.high] : [b.high, b.low];
+}
+
+/** Traditional Renko: one box to continue, two to reverse. */
+export function renko(bars: Bar[], box: number, source: BrickSource = "close"): Bar[] {
   const out: Bar[] = [];
   if (bars.length === 0 || !(box > 0)) return out;
   let hi = Math.round(bars[0].close / box) * box;
@@ -327,20 +344,21 @@ export function renko(bars: Bar[], box: number): Bar[] {
   let vol = 0;
   for (const b of bars) {
     vol += b.volume;
-    const c = b.close;
-    while (c >= hi + box) {
-      const o = hi;
-      hi += box;
-      lo = hi - box;
-      out.push({ time: stamp(out, b.time), open: o, high: hi, low: o, close: hi, volume: vol });
-      vol = 0;
-    }
-    while (c <= lo - box) {
-      const o = lo;
-      lo -= box;
-      hi = lo + box;
-      out.push({ time: stamp(out, b.time), open: o, high: o, low: lo, close: lo, volume: vol });
-      vol = 0;
+    for (const c of pricePath(b, source)) {
+      while (c >= hi + box) {
+        const o = hi;
+        hi += box;
+        lo = hi - box;
+        out.push({ time: stamp(out, b.time), open: o, high: hi, low: o, close: hi, volume: vol });
+        vol = 0;
+      }
+      while (c <= lo - box) {
+        const o = lo;
+        lo -= box;
+        hi = lo + box;
+        out.push({ time: stamp(out, b.time), open: o, high: o, low: lo, close: lo, volume: vol });
+        vol = 0;
+      }
     }
   }
   return out;
@@ -386,9 +404,9 @@ export function lineBreak(bars: Bar[], lines = 3): Bar[] {
   return out;
 }
 
-/** Kagi on closes. Each segment is a bar: open = start, close = end;
+/** Kagi on closes (or highs / lows). Each segment is a bar: open = start, close = end;
  *  flag 1 = yang (thick, above the last shoulder), 0 = yin. */
-export function kagi(bars: Bar[], reversal: number): Bar[] {
+export function kagi(bars: Bar[], reversal: number, source: BrickSource = "close"): Bar[] {
   const out: Bar[] = [];
   if (bars.length < 2 || !(reversal > 0)) return out;
   let start = bars[0].close;
@@ -409,31 +427,32 @@ export function kagi(bars: Bar[], reversal: number): Bar[] {
     vol = 0;
   };
   for (let i = 1; i < bars.length; i++) {
-    const c = bars[i].close;
     vol += bars[i].volume;
-    if (dir === 0) {
-      if (Math.abs(c - start) >= reversal) {
-        dir = c > start ? 1 : -1;
-        cur = c;
-        t = bars[i].time;
+    for (const c of pricePath(bars[i], source)) {
+      if (dir === 0) {
+        if (Math.abs(c - start) >= reversal) {
+          dir = c > start ? 1 : -1;
+          cur = c;
+          t = bars[i].time;
+        }
+        continue;
       }
-      continue;
-    }
-    if (dir > 0) {
-      if (c > cur) { cur = c; t = bars[i].time; }
-      else if (cur - c >= reversal) { push(t); start = cur; cur = c; dir = -1; t = bars[i].time; }
-    } else {
-      if (c < cur) { cur = c; t = bars[i].time; }
-      else if (c - cur >= reversal) { push(t); start = cur; cur = c; dir = 1; t = bars[i].time; }
+      if (dir > 0) {
+        if (c > cur) { cur = c; t = bars[i].time; }
+        else if (cur - c >= reversal) { push(t); start = cur; cur = c; dir = -1; t = bars[i].time; }
+      } else {
+        if (c < cur) { cur = c; t = bars[i].time; }
+        else if (c - cur >= reversal) { push(t); start = cur; cur = c; dir = 1; t = bars[i].time; }
+      }
     }
   }
   if (dir !== 0) push(t);
   return out;
 }
 
-/** Point & figure on closes. A column is a bar from its bottom box to its
+/** Point & figure on closes (or highs / lows). A column is a bar from its bottom box to its
  *  top box; flag 1 = X (rising) column, 0 = O. */
-export function pointFigure(bars: Bar[], box: number, reversal = 3): Bar[] {
+export function pointFigure(bars: Bar[], box: number, reversal = 3, source: BrickSource = "close"): Bar[] {
   const out: Bar[] = [];
   if (bars.length === 0 || !(box > 0)) return out;
   const fl = (p: number) => Math.floor(p / box + 1e-9) * box;
@@ -443,26 +462,29 @@ export function pointFigure(bars: Bar[], box: number, reversal = 3): Bar[] {
   let vol = 0;
   for (const b of bars) {
     vol += b.volume;
-    const c = b.close;
+    // High/low source: a column first tries to extend with the bar's
+    // extreme in its own direction, and only then to reverse with the other.
+    const hi = source === "hl" ? b.high : b.close;
+    const lo = source === "hl" ? b.low : b.close;
     if (!col) {
-      if (c >= base + box) col = { time: b.time, open: base, high: fl(c), low: base, close: fl(c), volume: vol, flag: 1 };
-      else if (c <= base - box) col = { time: b.time, open: base, high: base, low: cl(c), close: cl(c), volume: vol, flag: 0 };
+      if (hi >= base + box) col = { time: b.time, open: base, high: fl(hi), low: base, close: fl(hi), volume: vol, flag: 1 };
+      else if (lo <= base - box) col = { time: b.time, open: base, high: base, low: cl(lo), close: cl(lo), volume: vol, flag: 0 };
       if (col) { out.push(col); vol = 0; }
       continue;
     }
     if (col.flag === 1) {
-      if (c >= col.high + box) { col.high = fl(c); col.close = col.high; col.volume += vol; vol = 0; }
-      else if (c <= col.high - reversal * box) {
+      if (hi >= col.high + box) { col.high = fl(hi); col.close = col.high; col.volume += vol; vol = 0; }
+      else if (lo <= col.high - reversal * box) {
         const top = col.high - box;
-        col = { time: stamp(out, b.time), open: top, high: top, low: cl(c), close: cl(c), volume: vol, flag: 0 };
+        col = { time: stamp(out, b.time), open: top, high: top, low: cl(lo), close: cl(lo), volume: vol, flag: 0 };
         out.push(col);
         vol = 0;
       }
     } else {
-      if (c <= col.low - box) { col.low = cl(c); col.close = col.low; col.volume += vol; vol = 0; }
-      else if (c >= col.low + reversal * box) {
+      if (lo <= col.low - box) { col.low = cl(lo); col.close = col.low; col.volume += vol; vol = 0; }
+      else if (hi >= col.low + reversal * box) {
         const bottom = col.low + box;
-        col = { time: stamp(out, b.time), open: bottom, high: fl(c), low: bottom, close: fl(c), volume: vol, flag: 1 };
+        col = { time: stamp(out, b.time), open: bottom, high: fl(hi), low: bottom, close: fl(hi), volume: vol, flag: 1 };
         out.push(col);
         vol = 0;
       }
