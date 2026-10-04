@@ -213,6 +213,7 @@ const RANGES: RangeDef[] = [
 /** Actions the chart asks its host (the Trade page) to perform. */
 export type HostAction =
   | "panel:chain" | "panel:details" | "panel:tree" | "panel:data" | "panel:alerts" | "panel:watch" | "panel:flow"
+  | "panel:depth" | "panel:tape" | "panel:futures" | "panel:strategy"
   | "bottom:positions" | "bottom:orders" | "bottom:basket"
   | "scalper" | "layouts" | "save" | "maximize" | "watch:add" | "privacy";
 
@@ -231,6 +232,10 @@ const TOOLS_MENU: ToolMenuItem[] = [
   { id: "scalper", label: "Option Scalper", icon: "⚡", host: "scalper" },
   { id: "positions", label: "Manage Positions & Orders", icon: "⇅", host: "bottom:positions" },
   { id: "basket", label: "Basket Orders", icon: "🧺", host: "bottom:basket" },
+  { id: "strategy", label: "Strategy Builder", icon: "⚖", host: "panel:strategy" },
+  { id: "depth", label: "Market Depth (DOM)", icon: "≣", host: "panel:depth" },
+  { id: "tape", label: "Time & Sales", icon: "⌚", host: "panel:tape" },
+  { id: "futures", label: "Futures Chain", icon: "⧗", host: "panel:futures" },
   { id: "popout", label: "Popout Chart", icon: "⧉" },
   { id: "saved", label: "View Saved Charts", icon: "🗂", host: "layouts" },
   { id: "refresh", label: "Refresh Chart", icon: "↻" },
@@ -2415,14 +2420,18 @@ export default function ChartPanel(props: ChartPanelProps) {
       }
       if (letter === "v" && clipboardRef.current) { e.preventDefault(); pasteDrawing(); return; }
       if (letter === "k") { e.preventDefault(); setDialog({ k: "palette" }); return; }
+      if (letter === "s" && e.shiftKey) { e.preventDefault(); void takeSnapshot("copy"); return; }
       if (letter === "s") { e.preventDefault(); onAction?.("save"); return; }
     }
+    if (e.altKey && e.shiftKey && !ctrl && letter === "r") { e.preventDefault(); toggleDraw("rect"); return; }
     if (ctrl && e.altKey && letter === "s") { e.preventDefault(); void takeSnapshot("download"); return; }
     if (e.altKey && !ctrl && !e.shiftKey) {
       const map: Record<string, () => void> = {
         t: () => toggleDraw("trend"),
         h: () => toggleDraw("hline"),
         v: () => toggleDraw("vline"),
+        j: () => toggleDraw("hray"),
+        c: () => toggleDraw("cross"),
         f: () => toggleDraw("fib"),
         i: () => setInvert((v) => !v),
         l: () => setScaleMode((m) => (m === "log" ? "normal" : "log")),
@@ -4426,6 +4435,11 @@ export default function ChartPanel(props: ChartPanelProps) {
           <button type="button" className="chart-menu-item" onClick={() => { changeSettings({ ...settings, highLowLabels: !settings.highLowLabels, highLowLines: !settings.highLowLabels }); setCtx(null); }}>{settings.highLowLabels ? "☑" : "☐"} Highs & lows</button>
           {onAction && <button type="button" className="chart-menu-item" onClick={() => { onAction("panel:chain"); setCtx(null); }}>Option chain</button>}
           {onAction && <button type="button" className="chart-menu-item" onClick={() => { onAction("panel:details"); setCtx(null); }}>Symbol details</button>}
+          {onAction && <button type="button" className="chart-menu-item" onClick={() => { onAction("panel:futures"); setCtx(null); }}>Futures chain</button>}
+          {onAction && <button type="button" className="chart-menu-item" onClick={() => { changeSettings({ ...settings, showEvents: true, showMarks: true }); onAction("panel:details"); setCtx(null); }} title="Filed announcements as marks on bars + the headlines list">Corporate actions</button>}
+          {onAction && <button type="button" className="chart-menu-item" onClick={() => { onAction("panel:tape"); setCtx(null); }}>Time & sales</button>}
+          {onAction && <button type="button" className="chart-menu-item" onClick={() => { onAction("panel:depth"); setCtx(null); }}>Market depth</button>}
+          {onAction && <button type="button" className="chart-menu-item" onClick={() => { onAction("panel:strategy"); setCtx(null); }}>Strategy builder</button>}
           <button type="button" className="chart-menu-item" onClick={() => { setDialog({ k: "settings" }); setCtx(null); }}>Settings…</button>
           {onChartOrder && <div className="chart-menu-sep" />}
           {onChartOrder &&

@@ -41,6 +41,7 @@ import { useLiveQuote } from "../hooks/useQuotes";
 import ChartPanel, { type BrokerLine, type ChartOrder, type ChartPosition, type HostAction } from "../components/trade/ChartPanel";
 import Scalper, { splitDrag } from "../components/trade/Scalper";
 import { AccountManager, LayoutMenu, SymbolDetails, WatchlistTable, useLayouts, type BottomTab, type WatchState } from "../components/trade/TradePanels";
+import { BookPanel, FnoPanel, type DeskTab } from "../components/trade/ProPanels";
 import type { SyncFlags } from "../components/trade/chartSync";
 import type {
   BrokerAccount,
@@ -102,13 +103,15 @@ function cleanError(raw: unknown, fallback: string): string {
 
 // Right-dock panels, opened / closed from the icon bar. Several can be open;
 // they stack in this order.
-type DockId = "watch" | "details" | "trade" | "chain" | "flow" | "data" | "tree" | "alerts";
+type DockId = "watch" | "details" | "trade" | "chain" | "flow" | "book" | "fno" | "data" | "tree" | "alerts";
 const DOCK: { id: DockId; label: string; short: string; icon: string; hint: string }[] = [
   { id: "watch", label: "Watchlist", short: "Watch", icon: "☰", hint: "Watchlist — search and switch symbols" },
   { id: "details", label: "Details & news", short: "Details", icon: "ⓘ", hint: "Symbol details, performance, technical rating and headlines" },
   { id: "trade", label: "Trade", short: "Trade", icon: "⇅", hint: "Quote and order ticket (buy / sell)" },
   { id: "chain", label: "Option chain", short: "Chain", icon: "⊞", hint: "Option chain — click a price to trade that option" },
   { id: "flow", label: "Order flow", short: "Flow", icon: "Δ", hint: "Real order flow from recorded ticks" },
+  { id: "book", label: "Market depth", short: "Depth", icon: "≣", hint: "DOM price ladder, 5-level depth with book imbalance, and time & sales" },
+  { id: "fno", label: "F&O tools", short: "F&O", icon: "⚖", hint: "Futures chain (basis, carry) and options strategy builder (payoff)" },
   { id: "data", label: "Data window", short: "Data", icon: "▤", hint: "Values under the crosshair — OHLC, volume, every indicator" },
   { id: "tree", label: "Object tree", short: "Objects", icon: "⌗", hint: "Series, indicators and drawings by pane" },
   { id: "alerts", label: "Alerts", short: "Alerts", icon: "🔔", hint: "Alerts manager and log" },
@@ -502,7 +505,7 @@ export default function Trade() {
   // The chain is available for index underlyings AND F&O stocks. We fetch
   // for both indices and cash equities; a non-F&O stock just returns no
   // strikes and the panel stays hidden.
-  const chainOn = chainBase != null && (dock.includes("chain") || scalper);
+  const chainOn = chainBase != null && (dock.includes("chain") || dock.includes("fno") || scalper);
   const { data: chain } = useOptionChain(
     chainOn ? chainBase!.symbol : "",
     chainOn ? chainBase!.short_name : "",
@@ -607,6 +610,18 @@ export default function Trade() {
     if (!r.ok) throw new Error(j.detail ?? `HTTP ${r.status}`);
     void qc.invalidateQueries({ queryKey: ["positions"] });
     void qc.invalidateQueries({ queryKey: ["managed-positions"] });
+  };
+
+  const [deskTab, setDeskTab] = useState<Record<"book" | "fno", DeskTab>>({ book: "depth", fno: "futures" });
+  // DOM ladder click → limit ticket on that side; Buy/Sell Mkt → market ticket.
+  const onBookPrice = (price: number, s: "BUY" | "SELL") => {
+    setSide(s);
+    onPickPrice(price);
+  };
+  const onBookMarket = (s: "BUY" | "SELL") => {
+    if (!dock.includes("trade")) toggleDock("trade");
+    setSide(s);
+    setOrderType("MARKET");
   };
 
   // Chart "⤷ Ticket" tool → prefill the ticket as a LIMIT order.
@@ -842,6 +857,15 @@ export default function Trade() {
 
   // Requests from the chart (open a panel, save the layout, maximize …).
   const hostAction = (a: HostAction) => {
+    const desk: Partial<Record<HostAction, [DockId, DeskTab]>> = {
+      "panel:depth": ["book", "depth"], "panel:tape": ["book", "tape"], "panel:futures": ["fno", "futures"], "panel:strategy": ["fno", "strategy"],
+    };
+    const dk = desk[a];
+    if (dk) {
+      setDeskTab((t) => ({ ...t, [dk[0]]: dk[1] }));
+      if (!dock.includes(dk[0])) saveDock([...dock, dk[0]]);
+      return;
+    }
     if (a.startsWith("panel:")) {
       const id = a.slice(6) as DockId;
       if (DOCK.some((d) => d.id === id) && !dock.includes(id)) saveDock([...dock, id]);
@@ -1598,6 +1622,24 @@ export default function Trade() {
               {dockGrip("flow")}
               {dockHead("flow", selected?.short_name)}
               <div className="dock-body"><FlowPanel symbol={selected?.symbol ?? null} /></div>
+            </section>
+          )}
+          {dock.includes("book") && (
+            <section className="dock-panel" data-testid="dock-book" style={panelStyle("book")}>
+              {dockGrip("book")}
+              {dockHead("book", selected?.short_name)}
+              <div className="dock-body">
+                <BookPanel symbol={selected?.symbol ?? null} tick={selected?.tick_size ?? 0.05} tab={deskTab.book} onTab={(t) => setDeskTab((x) => ({ ...x, book: t }))} onPrice={onBookPrice} onMarket={onBookMarket} />
+              </div>
+            </section>
+          )}
+          {dock.includes("fno") && (
+            <section className="dock-panel" data-testid="dock-fno" style={panelStyle("fno")}>
+              {dockGrip("fno")}
+              {dockHead("fno", chainBase?.short_name)}
+              <div className="dock-body">
+                <FnoPanel base={chainBase ?? selected} chain={chain} tab={deskTab.fno} onTab={(t) => setDeskTab((x) => ({ ...x, fno: t }))} onOpen={(h) => onSelect(h, true)} />
+              </div>
             </section>
           )}
           {dock.includes("details") && (

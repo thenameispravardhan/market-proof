@@ -659,3 +659,37 @@ async def update_credentials(
     await event_bus.publish("settings.updated", {"changed_keys": list(updates.keys())})
 
     return _credentials_view(get_settings())
+
+
+# ---- UI state (chart layouts etc.) kept on the server -----------------------
+# Rows are "ui:<name>" in app_settings; _GLOBAL_KEYS never contains them, so
+# they never leak into os.environ or the settings page.
+
+_UI_NAME = re.compile(r"^[a-z0-9_.-]{1,64}$")
+_UI_MAX_BYTES = 2_000_000
+
+
+@router.get("/ui/{name}")
+def get_ui_state(name: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+    if not _UI_NAME.match(name):
+        raise HTTPException(status_code=422, detail="bad name")
+    row = db.get(AppSetting, f"ui:{name}")
+    if row is None or row.value is None:
+        return {"name": name, "value": None, "updated_at": None}
+    return {"name": name, "value": json.loads(row.value), "updated_at": row.updated_at.isoformat() if row.updated_at else None}
+
+
+@router.put("/ui/{name}")
+def put_ui_state(name: str, body: dict[str, Any], db: Session = Depends(get_db)) -> dict[str, Any]:
+    if not _UI_NAME.match(name):
+        raise HTTPException(status_code=422, detail="bad name")
+    raw = json.dumps(body.get("value"))
+    if len(raw) > _UI_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="ui state too large")
+    row = db.get(AppSetting, f"ui:{name}")
+    if row is None:
+        db.add(AppSetting(key=f"ui:{name}", value=raw))
+    else:
+        row.value = raw
+    db.commit()
+    return {"ok": True, "name": name, "bytes": len(raw)}

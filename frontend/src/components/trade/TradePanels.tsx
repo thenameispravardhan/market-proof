@@ -858,6 +858,20 @@ function readLayouts(): SavedLayout[] {
   }
 }
 
+const SERVER_KEY = "trade_layouts";
+
+/** Union of two layout lists by id; the copy saved later wins.
+ *  ponytail: no tombstones, so a layout deleted here can come back from a
+ *  second browser's stale list; add deleted-ids if two browsers ever race. */
+export function mergeLayouts(local: SavedLayout[], remote: SavedLayout[]): SavedLayout[] {
+  const by = new Map<string, SavedLayout>();
+  for (const l of [...local, ...remote]) {
+    const have = by.get(l.id);
+    if (!have || (l.saved ?? 0) > (have.saved ?? 0)) by.set(l.id, l);
+  }
+  return [...by.values()].sort((a, b) => a.saved - b.saved);
+}
+
 export function useLayouts() {
   const [layouts, setLayouts] = useState<SavedLayout[]>(readLayouts);
   const [current, setCurrent] = useState<string | null>(() => localStorage.getItem(CURRENT_KEY));
@@ -873,7 +887,22 @@ export function useLayouts() {
     } catch {
       /* quota — layouts are best-effort */
     }
+    // Mirror to the server so layouts follow the operator to another browser.
+    void fetch(`/api/settings/ui/${SERVER_KEY}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ value: list }) }).catch(() => undefined);
   };
+  // Pull the server copy once: union by id, the newer save wins.
+  useEffect(() => {
+    void fetch(`/api/settings/ui/${SERVER_KEY}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => {
+        const remote = Array.isArray(j?.value) ? (j.value as SavedLayout[]) : [];
+        if (!remote.length) return;
+        const merged = mergeLayouts(readLayouts(), remote);
+        if (JSON.stringify(merged) !== JSON.stringify(readLayouts())) persist(merged, localStorage.getItem(CURRENT_KEY));
+      })
+      .catch(() => undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const cur = layouts.find((l) => l.id === current) ?? null;
   // Dirty check + autosave every few seconds.
   useEffect(() => {
