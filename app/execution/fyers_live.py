@@ -501,14 +501,16 @@ class FyersClient:
         range_to: str,
         date_format: int = 1,
         cont_flag: int = 1,
+        oi_flag: int = 0,
     ) -> dict[str, Any]:
         """GET /data/history — OHLCV candles for a symbol.
 
         `resolution` is the Fyers timeframe code ("5" = 5-minute, "15",
         "60", "D", …). `range_from`/`range_to` are `yyyy-mm-dd` when
         `date_format=1` (epoch seconds when 0). Returns the raw Fyers
-        payload `{"candles": [[ts, o, h, l, c, v], ...]}`. Market-data
-        endpoint → the `/data` host.
+        payload `{"candles": [[ts, o, h, l, c, v], ...]}`; with
+        `oi_flag=1` derivative candles carry open interest as a 7th
+        value. Market-data endpoint → the `/data` host.
         """
         params = {
             "symbol": symbol,
@@ -518,6 +520,8 @@ class FyersClient:
             "range_to": str(range_to),
             "cont_flag": str(cont_flag),
         }
+        if oi_flag:
+            params["oi_flag"] = "1"
         return await self._request(
             "GET", "/history", params=params, base_url=self._data_base_url
         )
@@ -1240,7 +1244,7 @@ class FyersLiveBackend:
         return candles if isinstance(candles, list) else []
 
     async def get_history_range(
-        self, symbol: str, *, resolution: str = "5", from_ts: int, to_ts: int
+        self, symbol: str, *, resolution: str = "5", from_ts: int, to_ts: int, oi: bool = False
     ) -> Optional[list[Any]]:
         """OHLCV candles between two epoch bounds (for the Trade-page chart).
 
@@ -1250,7 +1254,8 @@ class FyersLiveBackend:
         (oldest→newest), `[]` when the broker genuinely has no candles in
         the range, or None when the broker CALL failed — the API layer
         maps None to `ok: false` so the chart can offer a retry instead
-        of rendering a misleading "no data". Never raises."""
+        of rendering a misleading "no data". `oi=True` asks for open
+        interest (a 7th value per candle, derivatives only). Never raises."""
         try:
             data = await self._client.get_history(
                 symbol,
@@ -1258,6 +1263,7 @@ class FyersLiveBackend:
                 range_from=str(int(from_ts)),
                 range_to=str(int(to_ts)),
                 date_format=0,
+                oi_flag=1 if oi else 0,
             )
         except FyersAPIError as e:
             log.warning("fyers.history_range.failed", symbol=symbol, error=str(e))

@@ -66,6 +66,7 @@ import {
   intervalLabel,
   intervalLongLabel,
   intervalSeconds,
+  isDerivative,
   isIntraday,
   kagi,
   lineBreak,
@@ -86,6 +87,7 @@ import {
 import {
   INDICATOR_BY_TYPE,
   argsLabel,
+  instanceDefaults,
   instanceTitle,
   migrateActive,
   newInstance,
@@ -93,7 +95,11 @@ import {
   sanitizeInstance,
   visibleOnInterval,
   type IndicatorInstance,
+  type Mark,
+  type PlotKind,
 } from "./indicatorCatalog";
+import { symbolInputs, volumeProfileRows } from "./indicatorMore";
+import { FillPrimitive, paintOiProfile, paintProfile, type FillBand, type OiStrike } from "./indicatorRender";
 import {
   DrawingsPrimitive,
   TOOL_BY_ID,
@@ -308,6 +314,10 @@ interface ThemeColors {
   bg: string;
 }
 
+function escapeHtml(t: string): string {
+  return t.replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch] ?? ch);
+}
+
 /** #RGB / #RRGGBB → rgba() at the given alpha; `fallback` otherwise. */
 function withAlpha(hex: string, a: number, fallback: string): string {
   const m = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(hex.trim());
@@ -445,13 +455,15 @@ async function fetchHistory(
       from: String(Math.max(0, Math.floor(fromTs))),
       to: String(Math.floor(toTs)),
     });
+    // Futures / options: ask for open interest too (the OI indicators read it).
+    if (isDerivative(symbol)) qs.set("oi", "1");
     const r = await api.get<HistoryResponse>(`/api/market/history?${qs.toString()}`);
     if (!r.ok) return { candles: [], reason: r.reason ?? "chart data unavailable" };
     const rows = Array.isArray(r.candles) ? r.candles : [];
     const out: Candle[] = [];
     for (const row of rows) {
       if (!Array.isArray(row) || row.length < 5) continue;
-      const [ts, o, h, l, c, v] = row;
+      const [ts, o, h, l, c, v, oi] = row as number[];
       const nums = [ts, o, h, l, c];
       if (!nums.every((x) => typeof x === "number" && Number.isFinite(x))) continue;
       out.push({
@@ -461,6 +473,7 @@ async function fetchHistory(
         low: l,
         close: c,
         volume: typeof v === "number" && Number.isFinite(v) ? v : 0,
+        ...(typeof oi === "number" && Number.isFinite(oi) ? { oi } : {}),
       });
     }
     out.sort((a, b) => a.time - b.time);
@@ -776,6 +789,18 @@ export default function ChartPanel(props: ChartPanelProps) {
   const indPaneRef = useRef<Map<string, number>>(new Map());
   const indLegendRefs = useRef<Map<string, HTMLSpanElement>>(new Map());
   const indHasDataRef = useRef<Map<string, boolean[]>>(new Map());
+  /** Shaded fills per indicator (bar-indexed, shifted plots included). */
+  const indFillDataRef = useRef<Map<string, FillBand[]>>(new Map());
+  const indFillPrimsRef = useRef<FillPrimitive[]>([]);
+  /** Marker plugins on indicator series (patterns, fractals, divergences). */
+  const indMarkerPluginsRef = useRef<Map<ISeriesApi<SeriesType>, { setMarkers: (m: unknown[]) => void }>>(new Map());
+  /** Markers per indicator by bar index (legend / data window text). */
+  const indMarksRef = useRef<Map<string, Map<number, Mark[]>>>(new Map());
+  /** Other symbols' closes by chart time (two-symbol indicators). */
+  const otherDataRef = useRef<Map<string, { from: number; closes: Map<number, number> }>>(new Map());
+  const otherLoadingRef = useRef<Set<string>>(new Set());
+  /** Option-chain open interest for the OI profile. */
+  const oiChainRef = useRef<{ symbol: string; at: number; rows: OiStrike[] } | null>(null);
   const compareSeriesRef = useRef<Map<string, ISeriesApi<"Line">>>(new Map());
   const alertLinesRef = useRef<Map<string, IPriceLine>>(new Map());
   const brokerLinesRef = useRef<IPriceLine[]>([]);
@@ -1016,6 +1041,35 @@ export default function ChartPanel(props: ChartPanelProps) {
         ctx.moveTo(x, 0);
         ctx.lineTo(x, h);
         ctx.stroke();
+      }
+    }
+    // Chart-drawn indicators: visible-range volume profile, option-chain OI profile.
+    if (!hideRef.current.indicators && c.length > 1) {
+      for (const inst of indicatorsRef.current) {
+        if (!inst.visible || !visibleOnInterval(inst, ivRef.current)) continue;
+        if (inst.type === "vpvr") {
+          const r = safe(() => chartRef.current!.timeScale().getVisibleLogicalRange());
+          const from = Math.max(0, Math.floor(r?.from ?? 0));
+          const to = Math.min(c.length - 1, Math.ceil(r?.to ?? c.length - 1));
+          const prof = to > from ? volumeProfileRows(c.slice(from, to + 1), Number(inst.inputs.rows) || 24, (Number(inst.inputs.va) || 70) / 100) : null;
+          if (prof) {
+            paintProfile(ctx, prof, {
+              w,
+              widthPct: Number(inst.inputs.width) || 30,
+              side: inst.inputs.side === "Left" ? "Left" : "Right",
+              priceToY,
+              up: inst.plots[0]?.color ?? "#26A69A",
+              down: inst.plots[1]?.color ?? "#EF5350",
+              poc: "#F23645",
+            });
+          }
+        }
+        if (inst.type === "oiprofile") {
+          const strikes = Number(inst.inputs.strikes) || 10;
+          ensureOiChain(strikes);
+          const rows = oiChainRef.current?.symbol === symbol ? oiChainRef.current.rows : [];
+          if (rows.length) paintOiProfile(ctx, rows, { w, widthPct: Number(inst.inputs.width) || 25, priceToY, text: colorsRef.current.text });
+        }
       }
     }
     const p = pointerRef.current;
@@ -1355,14 +1409,17 @@ export default function ChartPanel(props: ChartPanelProps) {
         continue;
       }
       const prec = inst.precision ?? (def.overlay && !def.ownScale ? s.precision ?? 2 : 2);
-      span.innerHTML = def.plots
-        .map((p, k) => {
-          if (!inst.plots[k]?.visible || indHasDataRef.current.get(uid)?.[k] === false) return "";
-          const v = vals[k]?.[i];
-          const txt = v == null ? "∅" : inst.type === "volume" || inst.type === "obv" || inst.type === "flow" ? fmtVol(v) : fmtNum(v, prec);
-          return `<b style="color:${inst.plots[k].color}">${txt}</b>`;
-        })
-        .join(" ");
+      const marks = indMarksRef.current.get(uid)?.get(i) ?? [];
+      span.innerHTML =
+        def.plots
+          .map((p, k) => {
+            if (p.kind === "marks" || !inst.plots[k]?.visible || indHasDataRef.current.get(uid)?.[k] === false) return "";
+            const v = vals[k]?.[i];
+            const txt = v == null ? "∅" : inst.type === "volume" || inst.type === "obv" || inst.type === "flow" || inst.type === "oi" ? fmtVol(v) : fmtNum(v, prec);
+            return `<b style="color:${inst.plots[k].color}">${txt}</b>`;
+          })
+          .join(" ") +
+        marks.map((m) => ` <b style="color:${m.color ?? "inherit"}">${escapeHtml(m.title ?? m.text ?? "")}</b>`).join("");
     }
     if (widgetSlotsRef.current?.data) {
       cancelAnimationFrame(hoverRaf.current);
@@ -1526,46 +1583,72 @@ export default function ChartPanel(props: ChartPanelProps) {
     indEntriesRef.current = [];
     indPaneRef.current = new Map();
     indValuesRef.current = new Map();
+    indFillPrimsRef.current = [];
+    indMarkerPluginsRef.current = new Map();
     const s = settingsRef.current;
     const ivk = ivRef.current;
     const intra = isIntraday(ivk);
     let pane = 1;
-    for (const inst of indicatorsRef.current) {
+    const list = indicatorsRef.current;
+    const isGuest = (i: IndicatorInstance) => typeof i.pane === "string" && i.pane !== "own" && i.pane !== "main" && list.some((x) => x.uid === i.pane);
+    // Hosts first so an indicator merged into another's pane finds it.
+    const order = [...list.filter((i) => !isGuest(i)), ...list.filter(isGuest)];
+    for (const inst of order) {
       const def = INDICATOR_BY_TYPE.get(inst.type);
-      if (!def) continue;
+      if (!def || def.tool) continue;
       const shown = !hideRef.current.indicators && inst.visible && visibleOnInterval(inst, ivk) && !(def.intradayOnly && !intra);
       if (!shown) continue;
-      const p = def.overlay ? 0 : pane++;
+      let p: number;
+      if (def.special || inst.pane === "main") p = 0;
+      else if (isGuest(inst) && indPaneRef.current.has(inst.pane as string)) p = indPaneRef.current.get(inst.pane as string) as number;
+      else if (def.overlay && inst.pane !== "own") p = 0;
+      else p = pane++;
       indPaneRef.current.set(inst.uid, p);
+      const onPrice = p === 0;
       const prec = inst.precision ?? (def.overlay && !def.ownScale ? s.precision ?? 2 : 2);
       let first: ISeriesApi<SeriesType> | null = null;
       def.plots.forEach((pd, k) => {
         const st = inst.plots[k];
         if (!st?.visible) return;
-        const kind = pd.kind ?? "line";
-        const scaleId = def.ownScale ? "vol" : pd.scale ?? s.scaleSide;
+        const kind: PlotKind = pd.kind === "marks" ? "marks" : st.kind ?? pd.kind ?? "line";
+        const scaleId = inst.scale === "left" || inst.scale === "right" ? inst.scale
+          : inst.scale === "new" ? `ind-${inst.uid}`
+          : def.ownScale ? "vol" : pd.scale ?? (def.overlay && !onPrice ? "right" : s.scaleSide);
         const common: Record<string, unknown> = {
-          lastValueVisible: s.indValueLabels && inst.labelsOnScale,
+          lastValueVisible: kind !== "marks" && s.indValueLabels && inst.labelsOnScale,
           priceLineVisible: false,
-          title: s.indNameLabels ? (def.plots.length > 1 ? `${def.short} ${pd.label}` : def.short) : "",
+          title: kind !== "marks" && s.indNameLabels ? (def.plots.length > 1 ? `${def.short} ${pd.label}` : def.short) : "",
           priceScaleId: scaleId,
           priceFormat: inst.type === "volume" ? { type: "volume" } : { type: "price", precision: prec, minMove: 10 ** -prec },
-          ...(scalePriceOnlyRef.current && def.overlay && !def.ownScale ? { autoscaleInfoProvider: () => null } : {}),
+          ...((scalePriceOnlyRef.current && def.overlay && !def.ownScale) || kind === "marks" ? { autoscaleInfoProvider: () => null } : {}),
+        };
+        const lineCommon = {
+          color: st.color,
+          lineWidth: Math.max(1, Math.min(4, st.width)) as 1 | 2 | 3 | 4,
+          lineStyle: LS[st.dash] ?? LineStyle.Solid,
+          crosshairMarkerVisible: false,
         };
         let series: ISeriesApi<SeriesType> | undefined;
-        if (kind === "hist") {
+        if (kind === "hist" || kind === "columns") {
           series = safe(() => chart.addSeries(HistogramSeries, { ...common, color: st.color }, p) as ISeriesApi<SeriesType>);
+        } else if (kind === "area") {
+          series = safe(() =>
+            chart.addSeries(
+              AreaSeries,
+              { ...common, ...lineCommon, lineColor: st.color, topColor: withAlpha(st.color, 0.3, st.color), bottomColor: withAlpha(st.color, 0.02, st.color) },
+              p,
+            ) as ISeriesApi<SeriesType>,
+          );
         } else {
           series = safe(() =>
             chart.addSeries(
               LineSeries,
               {
                 ...common,
-                color: st.color,
-                lineWidth: Math.max(1, Math.min(4, st.width)) as 1 | 2 | 3 | 4,
-                lineStyle: LS[st.dash] ?? LineStyle.Solid,
-                crosshairMarkerVisible: false,
+                ...lineCommon,
                 ...(kind === "points" ? { lineVisible: false, pointMarkersVisible: true, pointMarkersRadius: 1.5 } : {}),
+                ...(kind === "circles" ? { lineVisible: false, pointMarkersVisible: true, pointMarkersRadius: Math.max(2.5, st.width + 1.5) } : {}),
+                ...(kind === "marks" ? { lineVisible: false, pointMarkersVisible: false } : {}),
                 ...(kind === "step" ? { lineType: 1 } : {}),
               },
               p,
@@ -1575,8 +1658,9 @@ export default function ChartPanel(props: ChartPanelProps) {
         if (!series) return;
         if (def.ownScale) safe(() => series!.priceScale().applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } }));
         indEntriesRef.current.push({ uid: inst.uid, plot: k, series });
-        if (!first) first = series;
+        if (!first && kind !== "marks") first = series;
       });
+      if (!first) first = indEntriesRef.current.find((e) => e.uid === inst.uid)?.series ?? null;
       if (first && def.levels) {
         for (const level of def.levels) {
           safe(() =>
@@ -1584,11 +1668,64 @@ export default function ChartPanel(props: ChartPanelProps) {
           );
         }
       }
+      if (first && def.fills?.length) {
+        const uid = inst.uid;
+        const prim = new FillPrimitive(() => indFillDataRef.current.get(uid) ?? [], fillX, fillSpan);
+        safe(() => first!.attachPrimitive(prim));
+        indFillPrimsRef.current.push(prim);
+      }
     }
     refreshIndicatorData();
     cleanupPanes(chart);
     applyPaneSizes();
     setTimeout(measurePanes, 0);
+  }
+
+  /** x of a bar index (logical), also past the last bar for shifted plots. */
+  function fillX(j: number): number | null {
+    return safe(() => chartRef.current!.timeScale().logicalToCoordinate(j as Logical) as number | null, null) ?? null;
+  }
+
+  function fillSpan(): [number, number] {
+    const r = safe(() => chartRef.current!.timeScale().getVisibleLogicalRange());
+    return r ? [Math.floor(r.from) - 2, Math.ceil(r.to) + 2] : [0, viewRef.current.length + 500];
+  }
+
+  /** Fetch another symbol's candles over the loaded span (two-symbol indicators). */
+  function ensureOther(sym: string): void {
+    const v = viewRef.current;
+    if (!v.length || otherLoadingRef.current.has(sym)) return;
+    const need = v[0].time;
+    const have = otherDataRef.current.get(sym);
+    if (have && have.from <= need) return;
+    otherLoadingRef.current.add(sym);
+    const pl = fetchPlan(ivRef.current);
+    const seq = fetchSeqRef.current;
+    const iv = ivRef.current;
+    void fetchHistory(sym, pl.res, need - IST - 86400, Math.floor(Date.now() / 1000)).then((r) => {
+      otherLoadingRef.current.delete(sym);
+      if (seq !== fetchSeqRef.current || iv !== ivRef.current) return;
+      const rows = pl.aggregate ? (aggregate(r.candles, iv) as Candle[]) : r.candles;
+      otherDataRef.current.set(sym, { from: rows.length ? Math.min(need, rows[0].time) : need, closes: new Map(rows.map((k) => [k.time as number, k.close])) });
+      refreshIndicatorData();
+    });
+  }
+
+  /** Option-chain OI for the OI profile (refreshed every 30 s while shown). */
+  function ensureOiChain(strikes: number): void {
+    const cur = oiChainRef.current;
+    const now = Date.now();
+    if (cur && cur.symbol === symbol && now - cur.at < 30000) return;
+    oiChainRef.current = { symbol, at: now, rows: cur?.symbol === symbol ? cur.rows : [] };
+    const qs = new URLSearchParams({ symbol, underlying: shortName ?? "", strikecount: String(strikes) });
+    void api
+      .get<{ strikes?: { strike: number; ce: { oi: number | null } | null; pe: { oi: number | null } | null }[] }>(`/api/options/chain?${qs.toString()}`)
+      .then((r) => {
+        if (oiChainRef.current?.symbol !== symbol) return;
+        oiChainRef.current = { symbol, at: Date.now(), rows: (r.strikes ?? []).map((k) => ({ strike: k.strike, ce: k.ce?.oi ?? null, pe: k.pe?.oi ?? null })) };
+        repaintDrawings();
+      })
+      .catch(() => undefined);
   }
   const scalePriceOnlyRef = useRef(scalePriceOnly);
   scalePriceOnlyRef.current = scalePriceOnly;
@@ -1598,13 +1735,20 @@ export default function ChartPanel(props: ChartPanelProps) {
   function refreshIndicatorData(): void {
     const view = viewRef.current;
     const n = view.length;
-    const ctxC = { interval: ivRef.current, up: colorsRef.current.volUp, down: colorsRef.current.volDown, flow: flowRef.current };
+    const ctxC = {
+      interval: ivRef.current,
+      up: colorsRef.current.volUp,
+      down: colorsRef.current.volDown,
+      flow: flowRef.current,
+      other: (sym: string) => otherDataRef.current.get(sym.trim().toUpperCase())?.closes,
+    };
     const uids = [...new Set(indEntriesRef.current.map((e) => e.uid))];
     const interval = barInterval();
     for (const uid of uids) {
       const inst = indicatorsRef.current.find((x) => x.uid === uid);
       const def = inst ? INDICATOR_BY_TYPE.get(inst.type) : undefined;
       if (!inst || !def) continue;
+      for (const sym of symbolInputs(def, inst.inputs)) ensureOther(sym);
       let res;
       try {
         res = def.compute(view, inst.inputs, ctxC);
@@ -1622,12 +1766,36 @@ export default function ChartPanel(props: ChartPanelProps) {
       });
       indValuesRef.current.set(uid, aligned);
       indHasDataRef.current.set(uid, res.plots.map((vals) => vals.some((v) => v !== null)));
+      // shaded fills: bar-indexed, running past the last bar for forward-shifted plots
+      if (def.fills?.length) {
+        const len = n + Math.max(0, ...(res.shifts ?? [0]));
+        const ext = res.plots.map((vals, k) => {
+          const sh = res.shifts?.[k] ?? 0;
+          const out = new Array<number | null>(len).fill(null);
+          vals.forEach((v, i) => {
+            const j = i + sh;
+            if (j >= 0 && j < len) out[j] = v;
+          });
+          return out;
+        });
+        const side = (x: number | { level: number }) => (typeof x === "number" ? ext[x] ?? [] : new Array<number | null>(len).fill(x.level));
+        const bands: FillBand[] = [];
+        def.fills.forEach((f, k) => {
+          const st = inst.fills?.[k];
+          if (st && !st.visible) return;
+          bands.push({ a: side(f.a), b: side(f.b), color: st?.color || f.color, colorDown: f.colorDown });
+        });
+        indFillDataRef.current.set(uid, bands);
+      }
+      const byIdx = new Map<number, Mark[]>();
+      for (const m of res.marks ?? []) byIdx.set(m.i, [...(byIdx.get(m.i) ?? []), m]);
+      indMarksRef.current.set(uid, byIdx);
       for (const e of indEntriesRef.current) {
         if (e.uid !== uid) continue;
         const vals = res.plots[e.plot] ?? [];
         const sh = res.shifts?.[e.plot] ?? 0;
         const colors = res.colors?.[e.plot] ?? null;
-        const kind = def.plots[e.plot]?.kind ?? "line";
+        const kind = inst.plots[e.plot]?.kind ?? def.plots[e.plot]?.kind ?? "line";
         const data: Record<string, unknown>[] = [];
         let started = false;
         for (let i = 0; i < vals.length; i++) {
@@ -1637,15 +1805,42 @@ export default function ChartPanel(props: ChartPanelProps) {
           if (t === null) continue;
           const v = vals[i];
           if (v === null || !Number.isFinite(v)) {
-            if (started && kind !== "hist") data.push({ time: t });
+            if (started && kind !== "hist" && kind !== "columns") data.push({ time: t });
             continue;
           }
           started = true;
           data.push(colors && colors[i] ? { time: t, value: v, color: colors[i] } : { time: t, value: v });
         }
         safe(() => e.series.setData(data as never));
+        // markers ride on their plot's series
+        const ms = (res.marks ?? []).filter((m) => m.plot === e.plot);
+        const plug = indMarkerPluginsRef.current.get(e.series);
+        if (ms.length || plug) {
+          const color = inst.plots[e.plot]?.color ?? def.plots[e.plot]?.color;
+          const markers = ms
+            .map((m) => {
+              const j = m.i + sh;
+              if (j < 0 || j >= n) return null;
+              return {
+                time: view[j].time,
+                position: m.pos === "above" ? "aboveBar" : m.pos === "below" ? "belowBar" : "inBar",
+                shape: m.shape,
+                color: m.color ?? color,
+                ...(m.text ? { text: m.text } : {}),
+                size: 1,
+              };
+            })
+            .filter((m): m is NonNullable<typeof m> => m !== null)
+            .sort((a, b) => a.time - b.time);
+          if (plug) safe(() => plug.setMarkers(markers));
+          else {
+            const made = safe(() => createSeriesMarkers(e.series, markers as never[])) as unknown as { setMarkers: (m: unknown[]) => void } | undefined;
+            if (made) indMarkerPluginsRef.current.set(e.series, made);
+          }
+        }
       }
     }
+    for (const prim of indFillPrimsRef.current) prim.requestUpdate();
   }
 
   /** Coalesce indicator recomputes during live ticks (≤ 1 per second). */
@@ -2750,6 +2945,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     const seq = ++fetchSeqRef.current;
     candlesRef.current = [];
     viewRef.current = [];
+    otherDataRef.current = new Map(); // other symbols' bars follow the interval
     haveMoreRef.current = true;
     loadingOlderRef.current = null;
     setDrawMode(null);
@@ -3715,11 +3911,19 @@ export default function ChartPanel(props: ChartPanelProps) {
   // ---- indicators ----
 
   function addIndicator(type: string): void {
+    const def = INDICATOR_BY_TYPE.get(type);
+    if (def?.tool) {
+      // e.g. the fixed-range volume profile is a drawing: arm it and let the user pick the range
+      setDialog(null);
+      toggleDraw(def.tool);
+      addToast(`${def.name}: click the first and the last bar of the range`);
+      return;
+    }
     const defaults = loadJson<Record<string, Partial<IndicatorInstance>>>("chart:indDefaults", {})[type];
-    const inst = newInstance(type, defaults?.inputs);
-    if (!inst) return;
-    if (defaults?.plots) inst.plots = inst.plots.map((p, i) => ({ ...p, ...(defaults.plots?.[i] ?? {}) }));
-    if (defaults && defaults.precision !== undefined) inst.precision = defaults.precision ?? null;
+    const base = newInstance(type, defaults?.inputs);
+    if (!base) return;
+    // saved defaults cover styles, outputs and visibility too (sanitize merges them)
+    const inst = defaults ? sanitizeInstance({ ...base, ...defaults, inputs: base.inputs, uid: base.uid, type }) ?? base : base;
     setIndicators([...indicatorsRef.current, inst], `add ${instanceTitle(inst)}`);
   }
 
@@ -3895,13 +4099,17 @@ export default function ChartPanel(props: ChartPanelProps) {
         const def = INDICATOR_BY_TYPE.get(inst.type);
         const vals = indValuesRef.current.get(inst.uid);
         if (!def || !vals) continue;
+        const marks = indMarksRef.current.get(inst.uid)?.get(i) ?? [];
         groups.push({
           title: `${def.short} ${argsLabel(inst)}`,
-          rows: def.plots.filter((_, k) => indHasDataRef.current.get(inst.uid)?.[k] !== false).map((p) => {
-            const k = def.plots.indexOf(p);
-            const x = vals[k]?.[i];
-            return { label: p.label, value: x == null ? "∅" : inst.type === "volume" || inst.type === "obv" ? fmtVol(x) : fmtNum(x, inst.precision ?? 2), color: inst.plots[k]?.color };
-          }),
+          rows: [
+            ...def.plots.filter((p, k) => p.kind !== "marks" && indHasDataRef.current.get(inst.uid)?.[k] !== false).map((p) => {
+              const k = def.plots.indexOf(p);
+              const x = vals[k]?.[i];
+              return { label: p.label, value: x == null ? "∅" : inst.type === "volume" || inst.type === "obv" || inst.type === "oi" ? fmtVol(x) : fmtNum(x, inst.precision ?? 2), color: inst.plots[k]?.color };
+            }),
+            ...marks.map((m) => ({ label: "Signal", value: m.title ?? m.text ?? "●", color: m.color })),
+          ],
         });
       }
     }
@@ -4866,7 +5074,7 @@ export default function ChartPanel(props: ChartPanelProps) {
           onClose={() => setDialog(null)}
           onSaveDefault={(i) => {
             const all = loadJson<Record<string, Partial<IndicatorInstance>>>("chart:indDefaults", {});
-            all[i.type] = { inputs: i.inputs, plots: i.plots, precision: i.precision };
+            all[i.type] = instanceDefaults(i);
             saveJson("chart:indDefaults", all);
             addToast("saved as the default for new copies");
           }}
