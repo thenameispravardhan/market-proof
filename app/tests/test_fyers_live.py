@@ -564,8 +564,11 @@ async def test_fyers_live_backend_place_order_converts_block_to_rejected() -> No
 @pytest.mark.asyncio
 async def test_cancel_order_succeeds() -> None:
     def handler(req: httpx.Request) -> httpx.Response:
+        # v3 cancel: DELETE /orders/sync with {"id": ...}; the bare /orders
+        # path is behind Fyers' Cloudflare anti-bot 403.
         assert req.method == "DELETE"
-        assert "id=FX12345" in str(req.url)
+        assert req.url.path.endswith("/orders/sync")
+        assert b'"id":"FX12345"' in req.content.replace(b" ", b"")
         return httpx.Response(200, json={"s": "ok", "code": 200})
 
     client = _make_client(handler)
