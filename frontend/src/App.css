@@ -2357,6 +2357,13 @@ kbd {
 .dtb-emoji { display: grid; grid-template-columns: repeat(8, 1fr); gap: 2px; padding: 2px 4px; }
 .dtb-emoji button { background: none; border: 0; border-radius: 4px; font-size: 18px; padding: 3px 0; cursor: pointer; }
 .dtb-emoji button:hover { background: var(--bg-surface); }
+.dtb-emoji button.glyph { color: var(--text); font-size: 17px; }
+.dtb-emoji .dtb-sticker { grid-column: span 4; }
+.dtb-icon-tabs { margin: 2px 4px 6px; }
+.dtb-stickers { display: grid; grid-template-columns: repeat(2, 1fr); gap: 4px; padding: 2px 4px 4px; }
+.dtb-sticker { padding: 5px 6px; border: 1.5px solid #fff; border-radius: 12px; color: #fff; font-size: 10.5px; font-weight: 700; letter-spacing: 0.02em; cursor: pointer; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dtb-sticker:hover { filter: brightness(1.12); }
+.dtb-fly-item .kbd { margin: 0 0 0 auto; padding-left: 12px; border: 0; }
 
 /* cursors */
 .chart-container.cur-dot .chart-host canvas { cursor: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><circle cx='4' cy='4' r='3' fill='%23999'/></svg>") 4 4, crosshair !important; }
