@@ -68,6 +68,8 @@ export interface ChartSettings {
   crosshairStyle: 0 | 1 | 2 | 3;
   watermark: boolean;
   watermarkColor: string;
+  /** Brand logo, bottom-left of the price pane. */
+  logoWatermark: boolean;
   textColor: string;
   fontSize: number;
   scaleLineColor: string;
@@ -148,6 +150,7 @@ export const DEFAULT_SETTINGS: ChartSettings = {
   crosshairStyle: 3,
   watermark: true,
   watermarkColor: "",
+  logoWatermark: true,
   textColor: "",
   fontSize: 11,
   scaleLineColor: "",

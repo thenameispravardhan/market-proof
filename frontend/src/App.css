@@ -2215,7 +2215,7 @@ kbd {
 .pos-tag.off { opacity: 0.6; }
 
 /* Right-click menu on the chart: orders at the clicked price (confirm step), alert, ticket. */
-.chart-ctx { position: absolute; z-index: 20; min-width: 220px; }
+.chart-ctx { position: absolute; z-index: 60; min-width: 220px; } /* above the engine's pane separators (z 50) */
 .chart-ctx .ctx-buy { color: var(--green); }
 .chart-ctx .ctx-sell { color: var(--red); }
 .chart-ctx-confirm { padding: 6px 10px; font-family: var(--mono); font-size: 11px; color: var(--text); white-space: normal; }
@@ -2714,3 +2714,24 @@ div.ind-row { cursor: default; }
 .broker-live .live-dot { display: inline-block; width: 5px; height: 5px; margin-left: 4px; border-radius: 50%; background: var(--green); vertical-align: middle; }
 .broker-live.flash { box-shadow: inset 0 0 0 1px var(--accent); transition: box-shadow 0.2s; }
 .broker-live td.dim { color: var(--text-faint); font-size: 10px; }
+
+/* ---- legend More menus, trade submenu, info dialogs ---- */
+.chart-legend .lg-acts .lg-count { color: var(--accent); font-weight: 700; }
+.chart-menu-subrow.on { background: var(--bg-surface); }
+.chart-ctx.ctx-fly { z-index: 61; min-width: 290px; max-height: none; }
+.chart-logo-wm { position: absolute; z-index: 2; pointer-events: none; font-size: 12px; font-weight: 800; letter-spacing: 0.14em; color: var(--text-faint); opacity: 0.45; }
+.chart-logo-wm b { color: var(--accent); }
+.about-desc { margin: 0 0 10px; color: var(--text); line-height: 1.45; }
+.about-grid { display: grid; grid-template-columns: 110px 1fr; gap: 6px 12px; font-size: 12px; }
+.about-plots { display: flex; flex-wrap: wrap; gap: 4px 12px; }
+.about-plots i { display: inline-block; width: 10px; height: 3px; margin-right: 5px; vertical-align: middle; border-radius: 2px; }
+.panes-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.panes-table th { text-align: left; color: var(--text-faint); font-weight: 600; padding: 4px 6px; border-bottom: 1px solid var(--border); }
+.panes-table td { padding: 5px 6px; border-bottom: 1px solid var(--border-soft, var(--border)); vertical-align: middle; }
+.panes-table .cbtn { padding: 2px 7px; margin-right: 3px; }
+.panes-acts { white-space: nowrap; text-align: right; }
+.insights-grid { display: flex; flex-direction: column; gap: 2px; }
+.insight { display: grid; grid-template-columns: 130px 1fr; gap: 10px; padding: 5px 0; border-bottom: 1px solid var(--border-soft, var(--border)); font-size: 12px; }
+.insight .up { color: var(--green); }
+.insight .down { color: var(--red); }
+.insights-note { margin-top: 10px; font-size: 10.5px; }

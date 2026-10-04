@@ -761,8 +761,8 @@ export default function Trade() {
       side: o.side,
       quantity: qty,
       order_type: o.type,
-      limit_price: o.type === "LIMIT" ? o.price : null,
-      stop_price: o.type === "SL-M" ? o.price : null,
+      limit_price: o.type === "LIMIT" ? o.price : o.type === "STOP_LOSS" ? o.limit ?? o.price : null,
+      stop_price: o.type === "SL-M" || o.type === "STOP_LOSS" ? o.price : null,
       product_type: "INTRADAY",
       bypass_risk: false,
       operator: "ui_chart",
@@ -770,7 +770,7 @@ export default function Trade() {
     if (r.status === "REJECTED" || r.status === "REJECTED_RISK" || r.ok === false) {
       throw new Error(cleanError(r.error || r.risk_message, "broker rejected the order"));
     }
-    return `${o.side} ${qty} ${name} ${o.type}${o.price != null ? ` @ ${o.price}` : ""} → ${r.status}`;
+    return `${o.side} ${qty} ${name} ${o.type === "STOP_LOSS" ? "STOP-LIMIT" : o.type}${o.price != null ? ` @ ${o.price}` : ""}${o.type === "STOP_LOSS" && o.limit != null ? ` lmt ${o.limit}` : ""} → ${r.status}`;
   };
 
   const onSubmit = async (opts?: { bypassRisk?: boolean }) => {

@@ -80,3 +80,6 @@ export const chartFocus: { hover: string | null } = { hover: null };
 /** The copied drawing, shared by every chart on the page (Ctrl+C in one
  *  chart, Ctrl+V in another or after switching symbol). */
 export const drawingClipboard: { current: unknown } = { current: null };
+
+/** The copied indicator (legend More → Copy), pasted onto any chart. */
+export const indicatorClipboard: { current: unknown } = { current: null };
