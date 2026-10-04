@@ -325,7 +325,7 @@ export default function App() {
             ☰
           </button>
         )}
-        <WorkflowBar tab={tab} navigate={navigate} />
+        {tab !== "trade" && <WorkflowBar tab={tab} navigate={navigate} />}
         <div className="content-scroll">
           <Suspense fallback={<div className="empty loading">Loading…</div>}>
             <PageContent tab={tab} />

@@ -2124,37 +2124,32 @@ export default function ChartPanel({
       <div className="chart-toolbar">
         <div className="chart-symbol" title={symbol}>
           <span className="sym">{shortName}</span>
-          <span className="exch">{symbol}</span>
         </div>
 
-        <div className="chart-group" role="group" aria-label="timeframe">
+        <select
+          className="chart-select"
+          value={resolution}
+          onChange={(e) => setResolution(e.target.value)}
+          title="Timeframe"
+          aria-label="Timeframe"
+          data-testid="chart-tf"
+        >
           {TIMEFRAMES.map((t) => (
-            <button
-              key={t.res}
-              type="button"
-              className={`chart-btn${resolution === t.res ? " on" : ""}`}
-              onClick={() => setResolution(t.res)}
-              data-testid={`chart-tf-${t.label}`}
-            >
-              {t.label}
-            </button>
+            <option key={t.res} value={t.res}>{t.label}</option>
           ))}
-        </div>
-
-        <div className="chart-group" role="group" aria-label="chart type">
+        </select>
+        <select
+          className="chart-select"
+          value={chartKind}
+          onChange={(e) => setChartKind(e.target.value as ChartKind)}
+          title={CHART_KINDS.find((k) => k.id === chartKind)?.title ?? "Chart type"}
+          aria-label="Chart type"
+          data-testid="chart-type"
+        >
           {CHART_KINDS.map((k) => (
-            <button
-              key={k.id}
-              type="button"
-              className={`chart-btn${chartKind === k.id ? " on" : ""}`}
-              onClick={() => setChartKind(k.id)}
-              title={k.title}
-              data-testid={`chart-type-${k.id}`}
-            >
-              {k.label}
-            </button>
+            <option key={k.id} value={k.id} title={k.title}>{k.label}</option>
           ))}
-        </div>
+        </select>
 
         {/* strategy on chart */}
         <div className="chart-group chart-menu-wrap">
@@ -2168,7 +2163,7 @@ export default function ChartPanel({
               try { setStrategies(((await (await fetch("/api/algo/strategies")).json()).strategies ?? [])); } catch { setStrategies([]); }
             }}
           >
-            ⚙ Strategy{strat ? `: ${strat.running ? "…" : `${strat.stats.trades ?? 0} trades ₹${Math.round(Number(strat.stats.net_pnl ?? 0)).toLocaleString("en-IN")}`}` : ""} ▾
+            ⚙ Algo{strat ? (strat.running ? " …" : ` · ${strat.stats.trades ?? 0}`) : ""}
           </button>
           {menuOpen === "strategy" && (
             <div className="chart-menu">
@@ -2187,8 +2182,6 @@ export default function ChartPanel({
           )}
         </div>
 
-        {active.flow && flowNote && <span className="chart-menu-hint" style={{ alignSelf: "center" }}>{flowNote}</span>}
-
         {/* indicators */}
         <div className="chart-group chart-menu-wrap">
           <button
@@ -2197,7 +2190,7 @@ export default function ChartPanel({
             onClick={() => setMenuOpen(menuOpen === "ind" ? null : "ind")}
             data-testid="chart-indicators-btn"
           >
-            Indicators ▾
+            ƒx Indicators
           </button>
           {menuOpen === "ind" && (
             <div className="chart-menu chart-ind-menu" data-testid="chart-ind-menu">
@@ -2237,23 +2230,6 @@ export default function ChartPanel({
           )}
         </div>
 
-        {/* send a chart price to the order ticket */}
-        {onPickPrice && (
-          <div className="chart-group">
-            <button
-              type="button"
-              className={`chart-btn${drawMode === "ticket" ? " on" : ""}`}
-              onClick={() =>
-                setDrawMode(drawModeRef.current === "ticket" ? null : "ticket")
-              }
-              title="Click a chart price to prefill the ticket's limit price"
-              data-testid="chart-pick-price"
-            >
-              ⤷ Ticket
-            </button>
-          </div>
-        )}
-
         {/* alerts */}
         <div className="chart-group chart-menu-wrap">
           <button
@@ -2262,7 +2238,7 @@ export default function ChartPanel({
             onClick={() => setMenuOpen(menuOpen === "alerts" ? null : "alerts")}
             data-testid="chart-alerts-btn"
           >
-            🔔 {alerts.length > 0 ? alerts.length : ""} ▾
+            🔔{alerts.length > 0 ? ` ${alerts.length}` : ""}
           </button>
           {menuOpen === "alerts" && (
             <div className="chart-menu" data-testid="chart-alerts-menu">
@@ -2304,7 +2280,7 @@ export default function ChartPanel({
             onClick={() => setMenuOpen(menuOpen === "compare" ? null : "compare")}
             data-testid="chart-compare-btn"
           >
-            ⇄ Compare{compares.length > 0 ? ` ${compares.length}` : ""} ▾
+            ⇄ Compare{compares.length > 0 ? ` ${compares.length}` : ""}
           </button>
           {menuOpen === "compare" && (
             <div className="chart-menu" data-testid="chart-compare-menu">
@@ -2404,7 +2380,7 @@ export default function ChartPanel({
             title={fullscreen ? "Exit fullscreen (Esc)" : "Fullscreen"}
             data-testid="chart-fullscreen-btn"
           >
-            {fullscreen ? "🗕 Exit" : "⛶ Full"}
+            {fullscreen ? "🗕" : "⛶"}
           </button>
         </div>
       </div>
@@ -2451,6 +2427,17 @@ export default function ChartPanel({
           >
             🔔
           </button>
+          {onPickPrice && (
+            <button
+              type="button"
+              className={`chart-tool${drawMode === "ticket" ? " on" : ""}`}
+              onClick={() => setDrawMode(drawModeRef.current === "ticket" ? null : "ticket")}
+              title="Click a chart price to load it into the ticket as a LIMIT"
+              data-testid="chart-pick-price"
+            >
+              ⤷
+            </button>
+          )}
           <div className="chart-tool-sep" />
           <button
             type="button"
@@ -2478,6 +2465,7 @@ export default function ChartPanel({
         <div className="chart-legend">
           <div ref={legendRef} className="chart-legend-main" />
           <div ref={countdownRef} className="chart-countdown" />
+          {active.flow && flowNote && <div className="chart-countdown">{flowNote}</div>}
         </div>
         {status.kind === "loading" && (
           <div className="chart-status">loading chart…</div>
