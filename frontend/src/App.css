@@ -2094,13 +2094,56 @@ kbd {
 .algo .algo-fields .algo-operand select { width: auto; }
 
 /* Trade page — TradingView layout: chart + bottom tabs left, quote + ticket right */
-.trade-layout { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 14px; align-items: start; }
-.trade-left { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
-.trade-right { display: flex; flex-direction: column; gap: 12px; position: sticky; top: 8px; max-height: calc(100vh - 70px); overflow: auto; }
+/* Trade page — TradingView layout: chart (with a vertical drawing strip) over
+   a resizable tabbed bottom panel, watchlist + quote + ticket rail on the right.
+   The workspace fills the viewport; each section scrolls inside itself. */
+[data-page="trade"] .content-scroll { padding: 8px 10px; }
+.trade-page.tv { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 8px; height: 100%; min-height: 620px; padding: 0; }
+.tv-center { display: flex; flex-direction: column; gap: 8px; min-width: 0; min-height: 0; }
+.tv-chart { flex: 1; min-height: 280px; display: flex; flex-direction: column; }
+.tv-chart > .trade-card { flex: 1; min-height: 0; }
+.tv-chart .chart-body { flex: 1; }
+.tv-chart .chart-container { height: auto; }
+.tv-bottom { position: relative; flex-shrink: 0; display: flex; flex-direction: column; min-height: 0; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; }
+.tv-resize { position: absolute; top: -6px; left: 0; right: 0; height: 9px; cursor: ns-resize; z-index: 5; }
+.tv-resize:hover { background: var(--accent-dim); }
 .trade-tabs { margin-bottom: 0; }
+.tv-bottom .trade-tabs { padding: 0 8px; flex-shrink: 0; }
+.tv-collapse { margin-left: auto; }
+.tv-bottom-body { flex: 1; min-height: 0; overflow: auto; padding: 0 8px 8px; }
+.tv-bottom-body .trade-card { border: 0; background: transparent; padding: 8px 2px; }
+.tv-right { display: flex; flex-direction: column; gap: 8px; min-height: 0; overflow: auto; }
+.tv-right > .trade-card { flex-shrink: 0; }
+.tv-right .trade-search-row { grid-template-columns: minmax(0, 1fr) auto auto; }
+.tv-right .trade-search-row .disp { display: none; }
+.tv-watch-list { display: flex; flex-direction: column; max-height: 240px; overflow: auto; margin: 0 -6px; }
+.tv-watch-head, .tv-watch-row { display: grid; grid-template-columns: minmax(0, 1fr) 74px 62px 14px; gap: 6px; align-items: center; padding: 4px 6px; font-family: var(--mono); font-size: 11px; }
+.tv-watch-head { color: var(--text-faint); font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.06em; }
+.tv-watch-head > span:not(:first-child), .tv-watch-row > span:not(.sym) { text-align: right; }
+.tv-watch-row { cursor: pointer; border-radius: 3px; color: var(--text); }
+.tv-watch-row:hover { background: var(--bg-elev); }
+.tv-watch-row.on { background: var(--bg-elev); box-shadow: inset 2px 0 var(--accent); }
+.tv-watch-row .sym { font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tv-watch-row .up { color: var(--green); }
+.tv-watch-row .down { color: var(--red); }
+.tv-watch-row .x { background: none; border: 0; padding: 0; color: var(--text-faint); cursor: pointer; visibility: hidden; }
+.tv-watch-row:hover .x { visibility: visible; }
+.tv-watch-row .x:hover { color: var(--red); }
 @media (max-width: 1100px) {
-  .trade-layout { grid-template-columns: 1fr; }
-  .trade-right { position: static; max-height: none; }
+  .trade-page.tv { grid-template-columns: 1fr; height: auto; }
+  .tv-chart { min-height: 520px; }
+  .tv-right { overflow: visible; }
 }
+
+/* chart: vertical drawing strip left of the plot */
+.chart-body { display: flex; gap: 6px; min-height: 0; }
+.chart-body .chart-container { flex: 1; min-width: 0; }
+.chart-fullscreen .chart-body { flex: 1; }
+.chart-tools { display: flex; flex-direction: column; gap: 2px; padding: 2px; overflow-y: auto; scrollbar-width: none; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-surface); }
+.chart-tool { flex-shrink: 0; width: 28px; height: 28px; display: grid; place-items: center; background: transparent; border: 0; border-radius: 3px; color: var(--text-dim); font-size: 14px; cursor: pointer; }
+.chart-tool:hover:not(:disabled) { background: var(--bg-elev); color: var(--text); }
+.chart-tool.on { background: var(--accent); color: var(--text-inv); }
+.chart-tool:disabled { opacity: 0.35; cursor: default; }
+.chart-tool-sep { flex-shrink: 0; height: 1px; margin: 3px 2px; background: var(--border); }
 
 .chart-menu-hint { padding: 6px 10px; font-size: 11px; color: var(--text-dim); max-width: 340px; white-space: normal; }

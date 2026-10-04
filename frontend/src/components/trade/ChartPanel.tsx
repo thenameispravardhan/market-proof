@@ -189,7 +189,7 @@ const DRAW_TOOLS: { id: DrawingType; label: string; hint: string }[] = [
 ];
 
 type DrawMode = DrawingType | "alert" | "ticket" | null;
-type MenuId = "ind" | "draw" | "alerts" | "compare" | "strategy" | null;
+type MenuId = "ind" | "alerts" | "compare" | "strategy" | null;
 type StratTrade = { side: string; entry_t: number; exit_t: number; entry: number; exit: number; net: number; reason: string; instrument: string };
 type StratRun = { name: string; trades: StratTrade[]; stats: Record<string, number | null>; error?: string; running?: boolean };
 type ScaleMode = "normal" | "log" | "percent";
@@ -2237,58 +2237,6 @@ export default function ChartPanel({
           )}
         </div>
 
-        {/* drawing tools */}
-        <div className="chart-group chart-menu-wrap">
-          <button
-            type="button"
-            className={`chart-btn${drawMode && drawMode !== "alert" ? " on" : ""}`}
-            onClick={() => setMenuOpen(menuOpen === "draw" ? null : "draw")}
-            data-testid="chart-draw-btn"
-          >
-            {activeTool ? activeTool.label : "Draw"} ▾
-          </button>
-          {menuOpen === "draw" && (
-            <div className="chart-menu" data-testid="chart-draw-menu">
-              {DRAW_TOOLS.map((t) => (
-                <button
-                  key={t.id}
-                  type="button"
-                  className={`chart-menu-item${drawMode === t.id ? " on" : ""}`}
-                  onClick={() => toggleDraw(t.id)}
-                  data-testid={`chart-draw-${t.id}`}
-                >
-                  {t.label}
-                </button>
-              ))}
-              <div className="chart-menu-sep" />
-              {selectedDrawing && (
-                <button
-                  type="button"
-                  className="chart-menu-item"
-                  onClick={() => {
-                    deleteDrawing(selectedDrawing);
-                    setMenuOpen(null);
-                  }}
-                  data-testid="chart-draw-delete"
-                >
-                  ✕ Delete selected
-                </button>
-              )}
-              <button
-                type="button"
-                className="chart-menu-item"
-                onClick={() => {
-                  clearDrawings();
-                  setMenuOpen(null);
-                }}
-                data-testid="chart-draw-clear"
-              >
-                ✕ Clear all drawings
-              </button>
-            </div>
-          )}
-        </div>
-
         {/* send a chart price to the order ticket */}
         {onPickPrice && (
           <div className="chart-group">
@@ -2442,15 +2390,6 @@ export default function ChartPanel({
           </button>
           <button
             type="button"
-            className={`chart-btn${magnet ? " on" : ""}`}
-            onClick={() => setMagnet((m) => !m)}
-            title="Crosshair magnet — snap to OHLC values"
-            data-testid="chart-magnet"
-          >
-            🧲
-          </button>
-          <button
-            type="button"
             className="chart-btn"
             onClick={screenshot}
             title="Download chart as PNG"
@@ -2470,6 +2409,69 @@ export default function ChartPanel({
         </div>
       </div>
 
+      <div className="chart-body">
+        <div className="chart-tools" role="toolbar" aria-label="drawing tools">
+          <button
+            type="button"
+            className={`chart-tool${!drawMode ? " on" : ""}`}
+            onClick={() => setDrawMode(null)}
+            title="Crosshair (Esc)"
+            data-testid="chart-draw-none"
+          >
+            ✛
+          </button>
+          {DRAW_TOOLS.map((t) => (
+            <button
+              key={t.id}
+              type="button"
+              className={`chart-tool${drawMode === t.id ? " on" : ""}`}
+              onClick={() => toggleDraw(t.id)}
+              title={`${t.label.slice(t.label.indexOf(" ") + 1)} — ${t.hint}`}
+              data-testid={`chart-draw-${t.id}`}
+            >
+              {t.label.slice(0, t.label.indexOf(" "))}
+            </button>
+          ))}
+          <div className="chart-tool-sep" />
+          <button
+            type="button"
+            className={`chart-tool${magnet ? " on" : ""}`}
+            onClick={() => setMagnet((m) => !m)}
+            title="Crosshair magnet — snap to OHLC values"
+            data-testid="chart-magnet"
+          >
+            🧲
+          </button>
+          <button
+            type="button"
+            className={`chart-tool${drawMode === "alert" ? " on" : ""}`}
+            onClick={() => setDrawMode(drawModeRef.current === "alert" ? null : "alert")}
+            title="Price alert — click a price"
+            data-testid="chart-draw-alert"
+          >
+            🔔
+          </button>
+          <div className="chart-tool-sep" />
+          <button
+            type="button"
+            className="chart-tool"
+            disabled={!selectedDrawing}
+            onClick={() => selectedDrawing && deleteDrawing(selectedDrawing)}
+            title="Delete selected drawing"
+            data-testid="chart-draw-delete"
+          >
+            ⌫
+          </button>
+          <button
+            type="button"
+            className="chart-tool"
+            onClick={clearDrawings}
+            title="Clear all drawings"
+            data-testid="chart-draw-clear"
+          >
+            🗑
+          </button>
+        </div>
       <div className="chart-container">
         <div ref={containerRef} className="chart-host" />
         <div className="chart-watermark">{shortName}</div>
@@ -2576,6 +2578,7 @@ export default function ChartPanel({
             </div>
           ))}
         </div>
+      </div>
       </div>
     </section>
   );

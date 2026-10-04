@@ -204,6 +204,7 @@ describe("Trade page", () => {
   let originalFetch: typeof fetch;
 
   beforeEach(() => {
+    localStorage.clear();
     originalFetch = globalThis.fetch;
   });
   afterEach(() => {
