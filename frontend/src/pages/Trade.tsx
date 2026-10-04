@@ -145,21 +145,22 @@ function stored<T>(key: string, fallback: T): T {
   }
 }
 
-// Drag-to-resize for the bottom bar (y) and the right dock (x): dragging
-// toward the chart grows the panel. The size persists under `key`.
+// Drag-to-resize. dir 1: dragging toward the chart (up / left) grows the
+// panel (bottom bar, dock width); dir -1: dragging down grows it (a dock
+// panel's bottom edge). The size persists under `key` when one is given.
 function drag(e: React.PointerEvent, axis: "x" | "y", start: number, set: (v: number) => void,
-              min: number, max: number, key: string) {
+              min: number, max: number, key: string | null, dir = 1) {
   e.preventDefault();
   const p0 = axis === "x" ? e.clientX : e.clientY;
   let v = start;
   const move = (ev: PointerEvent) => {
-    v = Math.max(min, Math.min(max, start + p0 - (axis === "x" ? ev.clientX : ev.clientY)));
+    v = Math.max(min, Math.min(max, start + dir * (p0 - (axis === "x" ? ev.clientX : ev.clientY))));
     set(v);
   };
   const up = () => {
     window.removeEventListener("pointermove", move);
     window.removeEventListener("pointerup", up);
-    try { localStorage.setItem(key, String(Math.round(v))); } catch { /* best-effort */ }
+    if (key) try { localStorage.setItem(key, String(Math.round(v))); } catch { /* best-effort */ }
   };
   window.addEventListener("pointermove", move);
   window.addEventListener("pointerup", up);
@@ -270,25 +271,63 @@ export default function Trade() {
   });
   // The chain stays on the last UNDERLYING picked, so clicking one of its
   // options (which opens that option's chart + ticket) keeps the chain up.
-  const [chainBase, setChainBase] = useState<InstrumentHit | null>(() => (isUnderlying(selected) ? selected : null));
+  const [chainBase, setChainBase] = useState<InstrumentHit | null>(() => (isUnderlying(selected) ? selected : stored<InstrumentHit | null>("trade:chainBase", null)));
   const [dock, setDock] = useState<DockId[]>(() => {
     const v = stored<DockId[]>("trade:dock", DEFAULT_DOCK);
     return Array.isArray(v) ? v.filter((x) => DOCK.some((d) => d.id === x)) : DEFAULT_DOCK;
   });
   const [dockW, setDockW] = useState(() => Number(stored("trade:dockW", 340)) || 340);
-  const toggleDock = (id: DockId) => {
-    const next = dock.includes(id) ? dock.filter((x) => x !== id) : [...dock, id];
-    if (id === "chain" && !dock.includes(id)) setDockW((w) => Math.max(w, 400));   // 5 columns need room
+  const dockWidth = dock.includes("chain") ? Math.max(dockW, 400) : dockW;   // the chain's 5 columns need room
+  // Panel heights the operator dragged (px); unset = sized by content. The
+  // last panel always takes whatever room is left.
+  const [sizes, setSizes] = useState<Partial<Record<DockId, number>>>(() => stored("trade:dockSizes", {}));
+  useEffect(() => { try { localStorage.setItem("trade:dockSizes", JSON.stringify(sizes)); } catch { /* best-effort */ } }, [sizes]);
+  const saveDock = (next: DockId[]) => {
     setDock(next);
     try { localStorage.setItem("trade:dock", JSON.stringify(next)); } catch { /* best-effort */ }
   };
-  const dockHead = (id: DockId, sub?: string) => (
-    <header className="dock-head">
-      <span>{DOCK.find((d) => d.id === id)!.label}</span>
-      {sub && <span className="sub">{sub}</span>}
-      <button type="button" className="dock-x" onClick={() => toggleDock(id)} title="Close panel" aria-label={`Close ${DOCK.find((d) => d.id === id)!.label}`}>×</button>
-    </header>
-  );
+  const toggleDock = (id: DockId) => saveDock(dock.includes(id) ? dock.filter((x) => x !== id) : [...dock, id]);
+  const moveDock = (id: DockId, by: -1 | 1) => {
+    const i = dock.indexOf(id), j = i + by;
+    if (j < 0 || j >= dock.length) return;
+    const next = [...dock];
+    [next[i], next[j]] = [next[j], next[i]];
+    saveDock(next);
+  };
+  const panelStyle = (id: DockId): React.CSSProperties => {
+    const last = dock.indexOf(id) === dock.length - 1;
+    return { order: dock.indexOf(id), ...(last ? { flex: "1 1 auto" } : sizes[id] ? { flex: `0 0 ${sizes[id]}px` } : {}) };
+  };
+  const dockHead = (id: DockId, sub?: string) => {
+    const label = DOCK.find((d) => d.id === id)!.label;
+    const i = dock.indexOf(id);
+    return (
+      <header className="dock-head">
+        <span>{label}</span>
+        {sub && <span className="sub">{sub}</span>}
+        <span className="dock-tools">
+          <button type="button" disabled={i === 0} onClick={() => moveDock(id, -1)} title="Move panel up" aria-label={`Move ${label} up`}>▲</button>
+          <button type="button" disabled={i === dock.length - 1} onClick={() => moveDock(id, 1)} title="Move panel down" aria-label={`Move ${label} down`}>▼</button>
+          <button type="button" className="dock-x" onClick={() => toggleDock(id)} title="Close panel" aria-label={`Close ${label}`}>×</button>
+        </span>
+      </header>
+    );
+  };
+  // Bottom edge of every panel but the last: drag to resize, double-click to
+  // hand the height back to the content.
+  const dockGrip = (id: DockId) =>
+    dock.indexOf(id) < dock.length - 1 && (
+      <div
+        className="dock-grip"
+        title="Drag to resize · double-click to reset"
+        onPointerDown={(e) => {
+          const panel = e.currentTarget.parentElement!;
+          const room = panel.parentElement!.clientHeight - (dock.length - 1) * 148;   // the others keep their 140px minimum
+          drag(e, "y", panel.offsetHeight, (v) => setSizes((z) => ({ ...z, [id]: v })), 140, Math.max(140, room), null, -1);
+        }}
+        onDoubleClick={() => setSizes((z) => { const n = { ...z }; delete n[id]; return n; })}
+      />
+    );
   const [showResults, setShowResults] = useState(false);
   // Keyboard cursor into the search results (-1 = nothing highlighted).
   const [highlightIdx, setHighlightIdx] = useState(-1);
@@ -449,6 +488,7 @@ export default function Trade() {
     setLastResult(null);
     if (isUnderlying(h)) {
       setChainBase(h);
+      try { localStorage.setItem("trade:chainBase", JSON.stringify(h)); } catch { /* best-effort */ }
       setSelectedExpiry(null); // load the nearest expiry for the new underlying
     }
     // An option picked off the chain opens its chart + ticket without
@@ -727,10 +767,11 @@ export default function Trade() {
 
       {/* ---- right dock: the panels opened from the icon bar, stacked; each scrolls inside itself ---- */}
       {dock.length > 0 && (
-        <div className="tv-dock" style={{ width: dockW }}>
-          <div className="tv-dock-resize" onPointerDown={(e) => drag(e, "x", dockW, setDockW, 280, 760, "trade:dockW")} title="Drag to resize" />
+        <div className="tv-dock" style={{ width: dockWidth }}>
+          <div className="tv-dock-resize" onPointerDown={(e) => drag(e, "x", dockWidth, setDockW, 280, 760, "trade:dockW")} title="Drag to resize" />
           {dock.includes("watch") && (
-            <section className="dock-panel" data-testid="dock-watch">
+            <section className="dock-panel" data-testid="dock-watch" style={panelStyle("watch")}>
+              {dockGrip("watch")}
               {dockHead("watch")}
               <div className="dock-body">
                 <div className="trade-search">
@@ -846,7 +887,8 @@ export default function Trade() {
             </section>
           )}
           {dock.includes("trade") && (
-            <section className="dock-panel dock-trade" data-testid="dock-trade">
+            <section className="dock-panel dock-trade" data-testid="dock-trade" style={panelStyle("trade")}>
+              {dockGrip("trade")}
               {dockHead("trade", selected?.short_name)}
               <div className="dock-body">
                 {/* QUOTE */}
@@ -1156,7 +1198,8 @@ export default function Trade() {
             </section>
           )}
           {dock.includes("chain") && (
-            <section className="dock-panel" data-testid="dock-chain">
+            <section className="dock-panel" data-testid="dock-chain" style={panelStyle("chain")}>
+              {dockGrip("chain")}
               {dockHead("chain", chainBase?.short_name)}
               <div className="dock-body">
                 {/* ---- option chain (index underlyings + F&O stocks) ----
@@ -1272,7 +1315,8 @@ export default function Trade() {
             </section>
           )}
           {dock.includes("flow") && (
-            <section className="dock-panel" data-testid="dock-flow">
+            <section className="dock-panel" data-testid="dock-flow" style={panelStyle("flow")}>
+              {dockGrip("flow")}
               {dockHead("flow", selected?.short_name)}
               <div className="dock-body"><FlowPanel symbol={selected?.symbol ?? null} /></div>
             </section>

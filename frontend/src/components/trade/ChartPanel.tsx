@@ -419,6 +419,11 @@ export default function ChartPanel({
     value: string;
   } | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
+  useEffect(() => {
+    const on = () => setFullscreen(document.fullscreenElement != null);
+    document.addEventListener("fullscreenchange", on);
+    return () => document.removeEventListener("fullscreenchange", on);
+  }, []);
   const [menuOpen, setMenuOpen] = useState<MenuId>(null);
   const [status, setStatus] = useState<ChartStatus>({ kind: "loading" });
   const [reloadNonce, setReloadNonce] = useState(0);
@@ -1424,7 +1429,6 @@ export default function ChartPanel({
         repaintDrawings();
       } else {
         setMenuOpen(null);
-        setFullscreen(false);
       }
       return;
     }
@@ -2118,7 +2122,7 @@ export default function ChartPanel({
 
   return (
     <section
-      className={`trade-card chart-card${fullscreen ? " chart-fullscreen" : ""}`}
+      className="trade-card chart-card"
       data-testid="trade-chart"
     >
       <div className="chart-toolbar">
@@ -2376,7 +2380,12 @@ export default function ChartPanel({
           <button
             type="button"
             className={`chart-btn${fullscreen ? " on" : ""}`}
-            onClick={() => setFullscreen((f) => !f)}
+            onClick={() => {
+              // The whole trade workspace (chart + panels + bottom bar) goes
+              // fullscreen, not the chart alone. Esc exits (browser).
+              if (document.fullscreenElement) void document.exitFullscreen();
+              else void (containerRef.current?.closest(".trade-page") ?? containerRef.current?.closest(".chart-card"))?.requestFullscreen?.();
+            }}
             title={fullscreen ? "Exit fullscreen (Esc)" : "Fullscreen"}
             data-testid="chart-fullscreen-btn"
           >

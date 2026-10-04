@@ -1384,15 +1384,6 @@ kbd {
 
 /* CHART (TradingView-style panel) */
 .chart-card { min-height: 0; gap: 8px; }
-.chart-card.chart-fullscreen {
-  position: fixed;
-  inset: 0;
-  z-index: 1000;
-  margin: 0;
-  border-radius: 0;
-  border: none;
-  background: var(--bg-app);
-}
 .chart-toolbar {
   display: flex;
   align-items: center;
@@ -1592,7 +1583,6 @@ kbd {
   height: 480px;
   min-height: 0;
 }
-.chart-fullscreen .chart-container { flex: 1; height: auto; }
 .chart-host { position: absolute; inset: 0; }
 .chart-legend {
   position: absolute;
@@ -2132,10 +2122,21 @@ kbd {
 .tv-dock-resize { position: absolute; left: 0; top: 0; bottom: 0; width: 6px; cursor: ew-resize; z-index: 5; }
 .tv-dock-resize:hover { background: var(--accent-dim); }
 .dock-panel { flex: 0 1 auto; min-height: 140px; display: flex; flex-direction: column; overflow: hidden; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; }
-.dock-panel.dock-trade { flex-shrink: 0.3; }   /* the ticket keeps its room; lists and the chain give way first */
+.dock-panel.dock-trade { flex-shrink: 0.3; }
+.dock-panel { position: relative; }
+.dock-grip { position: absolute; left: 0; right: 0; bottom: 0; height: 7px; cursor: ns-resize; z-index: 3; }
+.dock-grip:hover { background: var(--accent-dim); }
+.dock-tools { margin-left: auto; display: flex; align-items: center; gap: 2px; }
+.dock-tools button { background: none; border: 0; border-radius: 3px; padding: 0 5px; font-size: 9px; line-height: 1.8; color: var(--text-faint); cursor: pointer; }
+.dock-tools button:hover:not(:disabled) { background: var(--bg-elev); color: var(--text); }
+.dock-tools button:disabled { opacity: 0.25; cursor: default; }
+.dock-tools .dock-x { font-size: 16px; line-height: 1.2; }
+.dock-body .quote-row { grid-template-columns: repeat(auto-fit, minmax(64px, 1fr)); }
+.dock-body .quote-cell .v.big { font-size: 18px; }
+.trade-page.tv:fullscreen { background: var(--bg-app); padding: 8px; }   /* the ticket keeps its room; lists and the chain give way first */
 .dock-head { flex-shrink: 0; display: flex; align-items: center; gap: 8px; padding: 6px 6px 6px 12px; border-bottom: 1px solid var(--border); font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-dim); }
 .dock-head .sub { color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dock-x { margin-left: auto; background: none; border: 0; border-radius: 3px; padding: 0 6px; font-size: 16px; line-height: 1.2; color: var(--text-faint); cursor: pointer; }
+.dock-x { background: none; border: 0; border-radius: 3px; padding: 0 6px; font-size: 16px; line-height: 1.2; color: var(--text-faint); cursor: pointer; }
 .dock-x:hover { background: var(--bg-elev); color: var(--text); }
 .dock-body { flex: 1; min-height: 0; overflow: auto; padding: 8px 10px; display: flex; flex-direction: column; gap: 12px; }
 .dock-body .trade-card { border: 0; background: transparent; padding: 0; min-height: 0; flex-shrink: 0; }
@@ -2178,7 +2179,6 @@ kbd {
 /* chart: vertical drawing strip left of the plot */
 .chart-body { display: flex; gap: 6px; min-height: 0; }
 .chart-body .chart-container { flex: 1; min-width: 0; }
-.chart-fullscreen .chart-body { flex: 1; }
 .chart-tools { display: flex; flex-direction: column; gap: 2px; padding: 2px; overflow-y: auto; scrollbar-width: none; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-surface); }
 .chart-tool { flex-shrink: 0; width: 28px; height: 28px; display: grid; place-items: center; background: transparent; border: 0; border-radius: 3px; color: var(--text-dim); font-size: 14px; cursor: pointer; }
 .chart-tool:hover:not(:disabled) { background: var(--bg-elev); color: var(--text); }
