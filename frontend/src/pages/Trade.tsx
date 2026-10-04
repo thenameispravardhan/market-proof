@@ -24,6 +24,7 @@
 // "I ACCEPT THE RISK" into before re-submitting.
 
 import { useEffect, useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import {
   useBrokerAccounts,
   useCancelOrder,
@@ -119,9 +120,10 @@ function cleanError(raw: unknown, fallback: string): string {
   return s;
 }
 
-// Recently charted symbols (TradingView-watchlist-style quick switch).
-// Kept tiny and local: the last 8 instruments picked on this page.
+// Watchlist (TradingView-style): every instrument picked on this page joins
+// it; × removes. Kept local, like the last-open symbol.
 const RECENT_KEY = "trade:recent";
+const LAST_KEY = "trade:last";
 
 function loadRecent(): InstrumentHit[] {
   try {
@@ -209,11 +211,44 @@ function FlowPanel({ symbol }: { symbol: string | null }) {
 export default function Trade() {
   const [bottomTab, setBottomTab] = useState<"positions" | "orders" | "chain" | "flow">("orders");
   const [query, setQuery] = useState("");
-  const [selected, setSelected] = useState<InstrumentHit | null>(null);
+  const [selected, setSelected] = useState<InstrumentHit | null>(() => {
+    try { return JSON.parse(localStorage.getItem(LAST_KEY) ?? "null"); } catch { return null; }
+  });
   const [showResults, setShowResults] = useState(false);
   // Keyboard cursor into the search results (-1 = nothing highlighted).
   const [highlightIdx, setHighlightIdx] = useState(-1);
   const [recent, setRecent] = useState<InstrumentHit[]>(loadRecent);
+  const [bottomOpen, setBottomOpen] = useState(true);
+  const [bottomH, setBottomH] = useState(() => Number(localStorage.getItem("trade:bottomH")) || 260);
+  const startResize = (e: React.PointerEvent) => {
+    e.preventDefault();
+    const y0 = e.clientY, h0 = bottomH;
+    let h = h0;
+    const move = (ev: PointerEvent) => { h = Math.max(120, Math.min(window.innerHeight * 0.7, h0 + y0 - ev.clientY)); setBottomH(h); };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      try { localStorage.setItem("trade:bottomH", String(Math.round(h))); } catch { /* best-effort */ }
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
+  const saveWatch = (next: InstrumentHit[]) => {
+    try { localStorage.setItem(RECENT_KEY, JSON.stringify(next)); } catch { /* best-effort */ }
+    return next;
+  };
+  const removeWatch = (sym: string) => setRecent((prev) => saveWatch(prev.filter((r) => r.symbol !== sym)));
+  const watchSyms = recent.map((h) => h.symbol).join(",");
+  const { data: watchQuotes } = useQuery<{ quotes: Record<string, { ltp: number; change: number | null; change_pct: number | null }> }>({
+    queryKey: ["watch-quotes", watchSyms],
+    queryFn: async () => {
+      const r = await fetch(`/api/market/quotes?symbols=${encodeURIComponent(watchSyms)}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    },
+    enabled: watchSyms.length > 0,
+    refetchInterval: 5000,
+  });
 
   const { data: accounts } = useBrokerAccounts();
   // Trade page is REAL-MONEY ONLY. Filter out paper-mode rows.
@@ -351,18 +386,11 @@ export default function Trade() {
   const onSelect = (h: InstrumentHit) => {
     setSelected(h);
     setShowResults(false);
-    setQuery(h.display);
+    setQuery(""); // the watchlist row + chart header show the pick; the box is for the next search
     setLastResult(null);
     setSelectedExpiry(null); // load the nearest expiry for the new symbol
-    setRecent((prev) => {
-      const next = [h, ...prev.filter((r) => r.symbol !== h.symbol)].slice(0, 8);
-      try {
-        localStorage.setItem(RECENT_KEY, JSON.stringify(next));
-      } catch {
-        /* persistence is best-effort */
-      }
-      return next;
-    });
+    setRecent((prev) => (prev.some((r) => r.symbol === h.symbol) ? prev : saveWatch([h, ...prev].slice(0, 40))));
+    try { localStorage.setItem(LAST_KEY, JSON.stringify(h)); } catch { /* best-effort */ }
     // Intraday-only bot — F&O included. Every ticket is MIS/INTRADAY; the
     // backend rejects anything else, so there is nothing per-instrument to set.
     setOrderType("MARKET");
@@ -491,113 +519,9 @@ export default function Trade() {
   // -------- render --------
 
   return (
-    <div className="trade-page">
-      <h1 className="page-title">Trade</h1>
-
-      {/* ---- search ---- */}
-      <div className="trade-search">
-        <div className="trade-search-bar">
-          <input
-            type="text"
-            value={query}
-            onChange={(e) => {
-              setQuery(e.target.value);
-              setShowResults(true);
-              setHighlightIdx(-1);
-              setLastResult(null);
-            }}
-            onFocus={() => {
-              // Reopen only for a genuine query — not for the display
-              // string a selection left behind (which has no hits and
-              // would show a stale "no results" box).
-              if (query && query !== selected?.display) setShowResults(true);
-            }}
-            onKeyDown={(e) => {
-              const hits = searchData?.hits ?? [];
-              if (e.key === "Escape") {
-                setShowResults(false);
-                setHighlightIdx(-1);
-                return;
-              }
-              if (!showResults || hits.length === 0) return;
-              if (e.key === "ArrowDown") {
-                e.preventDefault();
-                setHighlightIdx((i) => (i + 1) % hits.length);
-              } else if (e.key === "ArrowUp") {
-                e.preventDefault();
-                setHighlightIdx((i) => (i <= 0 ? hits.length - 1 : i - 1));
-              } else if (e.key === "Enter") {
-                e.preventDefault();
-                const pick = hits[highlightIdx >= 0 ? highlightIdx : 0];
-                if (pick) {
-                  onSelect(pick);
-                  setHighlightIdx(-1);
-                }
-              }
-            }}
-            placeholder="Search symbol — e.g. RELIANCE, NIFTY, BANKNIFTY"
-            data-testid="trade-search"
-            autoComplete="off"
-          />
-          <button
-            type="button"
-            className="btn-sm"
-            onClick={() => refreshInstruments.mutate()}
-            disabled={refreshInstruments.isPending}
-            data-testid="refresh-instruments"
-            title="Download the full NSE + BSE stock list from Fyers"
-          >
-            {refreshInstruments.isPending
-              ? "loading…"
-              : refreshInstruments.isSuccess
-              ? `✓ ${refreshInstruments.data?.instrument_count?.toLocaleString() ?? ""} symbols`
-              : "↻ Load all NSE/BSE"}
-          </button>
-        </div>
-        {recent.length > 0 && (
-          <div className="trade-recent" data-testid="trade-recent">
-            <span className="trade-recent-label">recent</span>
-            {recent.map((h) => (
-              <button
-                key={h.symbol}
-                type="button"
-                className={`trade-recent-chip${selected?.symbol === h.symbol ? " on" : ""}`}
-                onClick={() => onSelect(h)}
-                title={h.symbol}
-                data-testid={`recent-chip-${h.symbol}`}
-              >
-                {h.short_name}
-              </button>
-            ))}
-          </div>
-        )}
-        {showResults && query && (
-          <div className="trade-search-results" data-testid="trade-search-results">
-            {searching && <div className="hint">searching…</div>}
-            {!searching && (searchData?.count ?? 0) === 0 && (
-              <div className="hint">no results for "{query}"</div>
-            )}
-            {(searchData?.hits ?? []).map((h, i) => (
-              <button
-                key={h.symbol}
-                type="button"
-                className={`trade-search-row${i === highlightIdx ? " hl" : ""}`}
-                onClick={() => onSelect(h)}
-                onMouseEnter={() => setHighlightIdx(i)}
-                data-testid={`search-row-${h.symbol}`}
-              >
-                <span className="sym">{h.short_name}</span>
-                <span className="exch">{h.exchange}:{h.segment}</span>
-                <span className="disp">{h.display}</span>
-                {h.lot_size > 1 && <span className="lot">lot {h.lot_size}</span>}
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
-
-      <div className="trade-layout">
-        <div className="trade-left">
+    <div className="trade-page tv">
+      <div className="tv-center">
+        <div className="tv-chart">
         {/* ---- TradingView-style chart for the selected instrument ----
              key={symbol} remounts the panel per symbol so its internal
              candle store, drawings, and pagination reset cleanly. */}
@@ -610,15 +534,22 @@ export default function Trade() {
             onPickPrice={onPickPrice}
           />
         )}
-  
           {!selected && (
-            <section className="trade-card"><div className="empty">Search a symbol above to open its chart.</div></section>
+            <section className="trade-card tv-empty"><div className="empty">Pick a symbol from the watchlist on the right to open its chart.</div></section>
           )}
+        </div>
+
+        {/* ---- bottom panel: drag the top edge to resize, ▾ collapses ---- */}
+        <div className={`tv-bottom${bottomOpen ? "" : " closed"}`} style={bottomOpen ? { height: bottomH } : undefined}>
+          {bottomOpen && <div className="tv-resize" onPointerDown={startResize} title="Drag to resize" />}
           <div className="tabs trade-tabs" role="tablist">
             {([["positions", `Positions${positions?.length ? ` (${positions.length})` : ""}`], ["orders", `Orders${pending?.count ? ` (${pending.count})` : ""}`], ["chain", "Option chain"], ["flow", "Order flow"]] as const).map(([k, label]) => (
-              <button key={k} type="button" role="tab" aria-selected={bottomTab === k} className={`tab ${bottomTab === k ? "active" : ""}`} onClick={() => setBottomTab(k)}>{label}</button>
+              <button key={k} type="button" role="tab" aria-selected={bottomTab === k} className={`tab ${bottomTab === k ? "active" : ""}`} onClick={() => { setBottomTab(k); setBottomOpen(true); }}>{label}</button>
             ))}
+            <button type="button" className="tab tv-collapse" onClick={() => setBottomOpen((o) => !o)} title={bottomOpen ? "Collapse panel" : "Expand panel"}>{bottomOpen ? "▾" : "▴"}</button>
           </div>
+          {bottomOpen && (
+            <div className="tv-bottom-body">
           {bottomTab === "positions" && !positions?.length && <section className="trade-card"><div className="empty">No open positions.</div></section>}
           {bottomTab === "positions" && (
             <>
@@ -827,10 +758,125 @@ export default function Trade() {
             </>
           )}
           {bottomTab === "flow" && <FlowPanel symbol={selected?.symbol ?? null} />}
+            </div>
+          )}
         </div>
+      </div>
 
-        {/* ---- right rail: quote + order ticket (TradingView-style) ---- */}
-        <aside className="trade-right">
+      {/* ---- right rail: watchlist + quote + order ticket (TradingView-style) ---- */}
+      <aside className="tv-right">
+        <section className="trade-card tv-watch">
+          <h2>Watchlist</h2>
+          <div className="trade-search">
+          <div className="trade-search-bar">
+            <input
+              type="text"
+              value={query}
+              onChange={(e) => {
+                setQuery(e.target.value);
+                setShowResults(true);
+                setHighlightIdx(-1);
+                setLastResult(null);
+              }}
+              onFocus={() => {
+                // Reopen only for a genuine query — not for the display
+                // string a selection left behind (which has no hits and
+                // would show a stale "no results" box).
+                if (query && query !== selected?.display) setShowResults(true);
+              }}
+              onKeyDown={(e) => {
+                const hits = searchData?.hits ?? [];
+                if (e.key === "Escape") {
+                  setShowResults(false);
+                  setHighlightIdx(-1);
+                  return;
+                }
+                if (!showResults || hits.length === 0) return;
+                if (e.key === "ArrowDown") {
+                  e.preventDefault();
+                  setHighlightIdx((i) => (i + 1) % hits.length);
+                } else if (e.key === "ArrowUp") {
+                  e.preventDefault();
+                  setHighlightIdx((i) => (i <= 0 ? hits.length - 1 : i - 1));
+                } else if (e.key === "Enter") {
+                  e.preventDefault();
+                  const pick = hits[highlightIdx >= 0 ? highlightIdx : 0];
+                  if (pick) {
+                    onSelect(pick);
+                    setHighlightIdx(-1);
+                  }
+                }
+              }}
+              placeholder="+ Add symbol — RELIANCE, NIFTY…"
+              data-testid="trade-search"
+              autoComplete="off"
+            />
+            <button
+              type="button"
+              className="btn-sm"
+              onClick={() => refreshInstruments.mutate()}
+              disabled={refreshInstruments.isPending}
+              data-testid="refresh-instruments"
+              title="Download the full NSE + BSE stock list from Fyers"
+            >
+              {refreshInstruments.isPending
+                ? "loading…"
+                : refreshInstruments.isSuccess
+                ? `✓ ${refreshInstruments.data?.instrument_count?.toLocaleString() ?? ""} symbols`
+                : "↻ NSE/BSE"}
+            </button>
+          </div>
+          {showResults && query && (
+            <div className="trade-search-results" data-testid="trade-search-results">
+              {searching && <div className="hint">searching…</div>}
+              {!searching && (searchData?.count ?? 0) === 0 && (
+                <div className="hint">no results for "{query}"</div>
+              )}
+              {(searchData?.hits ?? []).map((h, i) => (
+                <button
+                  key={h.symbol}
+                  type="button"
+                  className={`trade-search-row${i === highlightIdx ? " hl" : ""}`}
+                  onClick={() => onSelect(h)}
+                  onMouseEnter={() => setHighlightIdx(i)}
+                  data-testid={`search-row-${h.symbol}`}
+                >
+                  <span className="sym">{h.short_name}</span>
+                  <span className="exch">{h.exchange}:{h.segment}</span>
+                  <span className="disp">{h.display}</span>
+                  {h.lot_size > 1 && <span className="lot">lot {h.lot_size}</span>}
+                </button>
+              ))}
+            </div>
+          )}
+          </div>
+          {recent.length > 0 && (
+            <div className="tv-watch-list" data-testid="trade-recent">
+              <div className="tv-watch-head"><span>Symbol</span><span>Last</span><span>Chg%</span><span /></div>
+              {recent.map((h) => {
+                const q = watchQuotes?.quotes?.[h.symbol.toUpperCase()];
+                const pct = q?.change_pct ?? null;
+                return (
+                  <div
+                    key={h.symbol}
+                    role="button"
+                    tabIndex={0}
+                    className={`tv-watch-row${selected?.symbol === h.symbol ? " on" : ""}`}
+                    onClick={() => onSelect(h)}
+                    onKeyDown={(e) => { if (e.key === "Enter") onSelect(h); }}
+                    title={h.symbol}
+                    data-testid={`recent-chip-${h.symbol}`}
+                  >
+                    <span className="sym">{h.short_name}</span>
+                    <span>{q ? q.ltp.toFixed(2) : "—"}</span>
+                    <span className={pct == null ? "" : pct >= 0 ? "up" : "down"}>{pct == null ? "—" : `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`}</span>
+                    <button type="button" className="x" title="Remove from watchlist" onClick={(e) => { e.stopPropagation(); removeWatch(h.symbol); }}>×</button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </section>
           {/* QUOTE */}
           <section className="trade-card" data-testid="trade-quote">
             <h2>Quote</h2>
@@ -1134,8 +1180,7 @@ export default function Trade() {
               </div>
             )}
           </section>
-        </aside>
-      </div>
+      </aside>
     </div>
   );
 }

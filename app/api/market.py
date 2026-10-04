@@ -322,6 +322,16 @@ async def market_history(
     }
 
 
+@router.get("/api/market/quotes")
+async def market_quotes(symbols: str = "") -> dict[str, Any]:
+    """Watchlist: last price / change / % for up to 50 comma-separated
+    symbols in one Fyers call. Empty `quotes` when Fyers isn't connected."""
+    syms = list(dict.fromkeys(s.strip().upper() for s in symbols.split(",") if s.strip()))[:50]
+    qs = await fyers_quotes(syms)
+    return {"quotes": {s: {"ltp": q.last_price, "change": q.change, "change_pct": q.change_pct}
+                       for s, q in qs.items()}}
+
+
 @router.get("/api/market/indices")
 async def market_indices() -> dict[str, Any]:
     """NIFTY 50 / SENSEX / BANK NIFTY last price, change, and %.
