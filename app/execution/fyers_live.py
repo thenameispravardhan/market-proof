@@ -248,7 +248,12 @@ class FyersClient:
             # impersonating any specific browser — that the Fyers edge
             # accepts as a normal client.
             self._client = httpx.AsyncClient(
-                transport=self._transport or httpx.AsyncHTTPTransport(),
+                # local_address="0.0.0.0" forces IPv4. Fyers only accepts orders
+                # from the whitelisted static IPv4; the async stack (anyio happy
+                # eyeballs) tries IPv6 FIRST and ignores /etc/gai.conf, so
+                # without this live orders were rejected with -50 naming the
+                # server's IPv6 address.
+                transport=self._transport or httpx.AsyncHTTPTransport(local_address="0.0.0.0"),
                 timeout=self._timeout_s,
                 headers={
                     "User-Agent": (
