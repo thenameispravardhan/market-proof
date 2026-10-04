@@ -37,6 +37,8 @@ export interface ChartSettings {
   indValues: boolean;
   legendBg: boolean;
   legendBgOpacity: number;
+  /** Legend background colour ("" = the panel colour). */
+  legendBgColor: string;
   // ---- Scales and lines ----
   lastPriceLabel: boolean;
   lastPriceLine: boolean;
@@ -53,6 +55,18 @@ export interface ChartSettings {
   indValueLabels: boolean;
   countdown: boolean;
   scaleSide: "right" | "left";
+  /** The dialog's "Scales placement": Auto keeps the price scale on the right. */
+  scalePlacement: "auto" | "right" | "left";
+  /** Price-axis labels are nudged apart instead of overlapping. */
+  noOverlapLabels: boolean;
+  /** Keep price-per-bar fixed while zooming the time axis. */
+  lockRatio: boolean;
+  /** Price units per bar width when locked (0 = take the current view). */
+  priceBarRatio: number;
+  /** Symbol label in scale units (%, indexed) — off shows the raw price. */
+  lastPriceScaleValue: boolean;
+  /** Last-price line / label colour ("" = the last bar's direction). */
+  lastPriceColor: string;
   scaleModesButtons: LineVisibility;
   dateFormat: DateFormat;
   hour12: boolean;
@@ -82,9 +96,14 @@ export interface ChartSettings {
   buySellButtons: boolean;
   sound: boolean;
   notifications: "all" | "rejections" | "off";
-  plMode: "money" | "percent";
+  plMode: "money" | "percent" | "ticks";
   reverseButton: boolean;
   ordersAlign: "right" | "left";
+  /** Fills from the trade book as marks on the bars, optionally labelled. */
+  executions: boolean;
+  executionLabels: boolean;
+  /** Position / order lines across the whole pane (off = a short stub at the label). */
+  extendLines: boolean;
   // ---- Events ----
   showEvents: boolean;
   sessionBreaks: boolean;
@@ -121,6 +140,7 @@ export const DEFAULT_SETTINGS: ChartSettings = {
   indValues: true,
   legendBg: false,
   legendBgOpacity: 0.5,
+  legendBgColor: "",
   lastPriceLabel: true,
   lastPriceLine: true,
   symbolNameLabel: false,
@@ -136,6 +156,12 @@ export const DEFAULT_SETTINGS: ChartSettings = {
   indValueLabels: true,
   countdown: true,
   scaleSide: "right",
+  scalePlacement: "auto",
+  noOverlapLabels: true,
+  lockRatio: false,
+  priceBarRatio: 0,
+  lastPriceScaleValue: true,
+  lastPriceColor: "",
   scaleModesButtons: "hover",
   dateFormat: "dd MMM 'yy",
   hour12: false,
@@ -165,6 +191,9 @@ export const DEFAULT_SETTINGS: ChartSettings = {
   plMode: "money",
   reverseButton: true,
   ordersAlign: "right",
+  executions: true,
+  executionLabels: false,
+  extendLines: true,
   showEvents: true,
   sessionBreaks: false,
   showMarks: true,

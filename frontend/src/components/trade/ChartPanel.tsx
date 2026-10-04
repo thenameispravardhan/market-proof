@@ -711,7 +711,11 @@ export default function ChartPanel(props: ChartPanelProps) {
   );
   const [cursor, setCursor] = useState<CursorMode>(prefs.cursor ?? "cross");
   const [scaleMode, setScaleMode] = useState<ScaleMode>(prefs.scaleMode ?? "normal");
+  const scaleModeRef = useRef(scaleMode);
+  scaleModeRef.current = scaleMode;
   const [autoScale, setAutoScale] = useState(prefs.autoScale ?? true);
+  const autoScaleRef = useRef(autoScale);
+  autoScaleRef.current = autoScale;
   const [invert, setInvert] = useState(prefs.invert ?? false);
   const [scalePriceOnly, setScalePriceOnly] = useState(prefs.scalePriceOnly ?? false);
   const [favIntervals, setFavIntervals] = useState<string[]>(prefs.favIntervals ?? DEFAULT_FAV_INTERVALS);
@@ -742,6 +746,8 @@ export default function ChartPanel(props: ChartPanelProps) {
   );
   const [alertLog, setAlertLog] = useState<{ id: number; ts: number; text: string }[]>(() => loadJson(`chart:alertLog:${symbol}`, []));
   const [compares, setCompares] = useState<CompareItem[]>([]);
+  const comparesLenRef = useRef(0);
+  comparesLenRef.current = compares.length;
   const [compareQuery, setCompareQuery] = useState("");
   const [compareHits, setCompareHits] = useState<{ symbol: string; name: string }[]>([]);
   const [atLive, setAtLive] = useState(true);
@@ -785,6 +791,11 @@ export default function ChartPanel(props: ChartPanelProps) {
   const theme = useMemo(() => computeTheme(settings), [settings.theme, settings.upColor, settings.downColor]); // eslint-disable-line react-hooks/exhaustive-deps
   const precision = settings.precision ?? (instrument?.tick_size && instrument.tick_size < 0.01 ? 4 : 2);
   const tickRef = useRef(0.05);
+  const liveQuoteRef = useRef<ReturnType<typeof useLiveQuote>>(undefined);
+  const brokerLinesPropRef = useRef(brokerLines);
+  brokerLinesPropRef.current = brokerLines;
+  const positionRef = useRef(position);
+  positionRef.current = position;
   tickRef.current = instrument?.tick_size && instrument.tick_size > 0 ? instrument.tick_size : 0.05;
   const fmtPrice = (v: number) => fmtNum(v, precision);
   const intraday = isIntraday(iv);
@@ -798,6 +809,7 @@ export default function ChartPanel(props: ChartPanelProps) {
   const [hostEl, setHostEl] = useState<HTMLDivElement | null>(null);
   const legendRef = useRef<HTMLSpanElement | null>(null);
   const countdownRef = useRef<HTMLDivElement | null>(null);
+  const rawLabelRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const mainRef = useRef<ISeriesApi<SeriesType> | null>(null);
   const indEntriesRef = useRef<{ uid: string; plot: number; series: ISeriesApi<SeriesType> }[]>([]);
@@ -1060,6 +1072,29 @@ export default function ChartPanel(props: ChartPanelProps) {
         ctx.lineTo(x, h);
         ctx.stroke();
       }
+    }
+    // Short position / order lines when "extended price line" is off.
+    if (!s.extendLines && !hideRef.current.positions) {
+      const left = s.ordersAlign === "left";
+      const stub = (price: number, color: string, dashed: boolean) => {
+        const y = priceToY(price);
+        if (y == null) return;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1;
+        ctx.setLineDash(dashed ? [4, 3] : []);
+        ctx.beginPath();
+        ctx.moveTo(left ? 0 : w - 90, y);
+        ctx.lineTo(left ? 90 : w, y);
+        ctx.stroke();
+      };
+      for (const b of brokerLinesPropRef.current ?? []) stub(b.price, b.kind === "order" ? "#4A90D9" : b.kind === "position-long" ? colorsRef.current.up : colorsRef.current.down, b.kind === "order");
+      const pos = positionRef.current;
+      if (pos) {
+        stub(pos.avg, pos.qty > 0 ? "#2962FF" : colorsRef.current.down, false);
+        if (pos.sl != null) stub(pos.sl, colorsRef.current.down, true);
+        if (pos.tp != null) stub(pos.tp, colorsRef.current.up, true);
+      }
+      ctx.setLineDash([]);
     }
     // Chart-drawn indicators: visible-range volume profile, option-chain OI profile.
     if (!hideRef.current.indicators && c.length > 1) {
@@ -1406,14 +1441,9 @@ export default function ChartPanel(props: ChartPanelProps) {
         }
         if (s.showBarChange) html += `<span class="${cls}">${chg >= 0 ? "+" : ""}${pf(chg)} (${chg >= 0 ? "+" : ""}${pct.toFixed(2)}%)</span>`;
         if (s.showVolume) html += `<span>Vol<b>${fmtVol(c.volume)}</b></span>`;
-        if (s.showLastDayChange && isIntraday(ivRef.current)) {
-          const day = Math.floor(c.time / 86400);
-          let j = i;
-          while (j >= 0 && Math.floor(view[j].time / 86400) === day) j--;
-          if (j >= 0) {
-            const d = c.close - view[j].close;
-            html += `<span class="${d >= 0 ? "up" : "down"}">Day ${d >= 0 ? "+" : ""}${pf(d)} (${((d / view[j].close) * 100).toFixed(2)}%)</span>`;
-          }
+        if (s.showLastDayChange) {
+          const ld = lastDayChange();
+          if (ld) html += `<span class="${ld.d >= 0 ? "up" : "down"}">Day ${ld.d >= 0 ? "+" : ""}${pf(ld.d)} (${ld.d >= 0 ? "+" : ""}${ld.pct.toFixed(2)}%)</span>`;
         }
         el.innerHTML = html;
       }
@@ -1446,6 +1476,26 @@ export default function ChartPanel(props: ChartPanelProps) {
   }
   const widgetSlotsRef = useRef(widgetSlots);
   widgetSlotsRef.current = widgetSlots;
+
+  /** Today's change (the latest session vs the previous close) — fixed,
+   *  not the hovered bar's: the live quote's when there is one, else from bars. */
+  function lastDayChange(): { d: number; pct: number } | null {
+    const q = liveQuoteRef.current;
+    if (q?.change != null && q.change_pct != null) return { d: q.change, pct: q.change_pct };
+    const c = candlesRef.current;
+    const n = c.length;
+    if (n < 2) return null;
+    const last = c[n - 1];
+    let prev: number | null = null;
+    if (isIntraday(ivRef.current)) {
+      const day = Math.floor(last.time / 86400);
+      let j = n - 1;
+      while (j >= 0 && Math.floor(c[j].time / 86400) === day) j--;
+      if (j >= 0) prev = c[j].close;
+    } else if (intervalGroup(ivRef.current) === "days") prev = c[n - 2].close;
+    if (prev == null || !prev) return null;
+    return { d: last.close - prev, pct: ((last.close - prev) / prev) * 100 };
+  }
 
   function legendLastBar(): void {
     renderLegend(null);
@@ -2299,6 +2349,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     cancelAnimationFrame(rangeRaf.current);
     rangeRaf.current = requestAnimationFrame(() => {
       updateExtraLines();
+      applyRatioLock();
       if (syncRef.current.time && Date.now() - syncApplyRef.current > 200) {
         const tr = safe(() => chartRef.current!.timeScale().getVisibleRange());
         if (tr) publishSync({ type: "range", src: myId, from: tr.from as number, to: tr.to as number });
@@ -2306,6 +2357,31 @@ export default function ChartPanel(props: ChartPanelProps) {
     });
   }
   const rangeRaf = useRef(0);
+
+  /** Lock price to bar ratio: keep price units per bar width fixed as the
+   *  time axis zooms (the price range follows the bar spacing). */
+  function applyRatioLock(): void {
+    const s = settingsRef.current;
+    const main = mainRef.current;
+    if (!s.lockRatio || !main || scaleModeRef.current === "log") return;
+    const h = paneDims().height;
+    const top = safe(() => main.coordinateToPrice(0) as number | null, null);
+    const bot = safe(() => main.coordinateToPrice(h) as number | null, null);
+    if (!(h > 0) || top == null || bot == null) return;
+    const range = Math.abs(top - bot);
+    const bs = barSpacing();
+    if (!(range > 0) || !(bs > 0)) return;
+    let r = s.priceBarRatio;
+    if (!(r > 0)) {
+      r = (range / h) * bs; // take the current view as the ratio
+      changeSettings({ ...s, priceBarRatio: Number(r.toPrecision(6)) });
+    }
+    const want = (r / bs) * h;
+    if (Math.abs(want - range) / range < 0.002) return;
+    const mid = (top + bot) / 2;
+    if (autoScaleRef.current) setAutoScale(false);
+    safe(() => main.priceScale().setVisibleRange({ from: mid - want / 2, to: mid + want / 2 }));
+  }
 
   // ---- drag-to-modify drawings (DOM-level, capture phase) ----
 
@@ -2952,6 +3028,12 @@ export default function ChartPanel(props: ChartPanelProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chartKind, side]);
 
+  /** The symbol label should show the raw price while the scale shows % / indexed values. */
+  function rawPriceLabelOn(): boolean {
+    const s = settingsRef.current;
+    return s.lastPriceLabel && !s.lastPriceScaleValue && (scaleModeRef.current === "percent" || scaleModeRef.current === "indexed" || comparesLenRef.current > 0);
+  }
+
   function applyMainStyle(): void {
     const main = mainRef.current;
     if (!main) return;
@@ -2960,11 +3042,14 @@ export default function ChartPanel(props: ChartPanelProps) {
     const k = kindRef.current;
     const clear = "rgba(0,0,0,0)";
     const prec = s.precision ?? precision;
+    // "Value" (not "according to scale") in % / indexed modes: our own raw-price label replaces the axis one.
+    const rawLabel = rawPriceLabelOn();
     const opts: Record<string, unknown> = {
       priceLineVisible: s.lastPriceLine,
-      lastValueVisible: s.lastPriceLabel,
+      lastValueVisible: s.lastPriceLabel && !rawLabel,
       title: s.symbolNameLabel ? shortName : "",
       priceFormat: { type: "price", precision: prec, minMove: 10 ** -prec },
+      priceLineColor: s.lastPriceColor || "",
     };
     if (["candles", "hollow", "heikin", "renko", "linebreak", "range"].includes(k)) {
       Object.assign(opts, {
@@ -2988,6 +3073,11 @@ export default function ChartPanel(props: ChartPanelProps) {
     else if (CUSTOM_MODE[k]) Object.assign(opts, { upColor: c.up, downColor: c.down });
     safe(() => main.applyOptions(opts));
   }
+
+  useEffect(() => {
+    applyMainStyle(); // the raw-price label swaps in / out with the scale mode
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scaleMode, compares.length]);
 
   // 2b) Main-series style + chart canvas / scales from the settings.
   useEffect(() => {
@@ -3021,8 +3111,8 @@ export default function ChartPanel(props: ChartPanelProps) {
           horzLines: { visible: s.grid === "both" || s.grid === "horz", color: s.gridColor || c.grid },
         },
         crosshair: { mode: magnet === "strong" ? (3 as CrosshairMode) : magnet === "weak" ? CrosshairMode.Magnet : CrosshairMode.Normal, vertLine: line as never, horzLine: line as never },
-        rightPriceScale: { visible: s.scaleSide === "right", borderColor: border },
-        leftPriceScale: { visible: s.scaleSide === "left", borderColor: border },
+        rightPriceScale: { visible: s.scaleSide === "right", borderColor: border, alignLabels: s.noOverlapLabels },
+        leftPriceScale: { visible: s.scaleSide === "left", borderColor: border, alignLabels: s.noOverlapLabels },
         timeScale: {
           borderColor: border,
           rightOffset: s.marginRight,
@@ -3203,6 +3293,53 @@ export default function ChartPanel(props: ChartPanelProps) {
     };
   }, [symbol, shortName, settings.showEvents]);
 
+  // 4c') Executions: the bot's fills on this symbol from the trade book,
+  //      refetched when the position changes or any order update arrives.
+  const [executions, setExecutions] = useState<{ time: number; side: "BUY" | "SELL"; qty: number; price: number }[]>([]);
+  const [execNonce, setExecNonce] = useState(0);
+  useEffect(() => {
+    const on = () => setExecNonce((n) => n + 1);
+    window.addEventListener("broker:order", on);
+    return () => window.removeEventListener("broker:order", on);
+  }, []);
+  useEffect(() => {
+    if (!settings.executions) {
+      setExecutions([]);
+      return;
+    }
+    let stop = false;
+    void fetch("/api/trades?limit=200")
+      .then((r) => (r.ok ? r.json() : []))
+      .then((rows: unknown) => {
+        if (stop || !Array.isArray(rows)) return;
+        const out: { time: number; side: "BUY" | "SELL"; qty: number; price: number }[] = [];
+        for (const t of rows as { symbol?: string; side?: string; quantity?: number; price?: number; status?: string; executed_at?: string | null }[]) {
+          if ((t.symbol ?? "").toUpperCase() !== symbol.toUpperCase() || !t.executed_at || (t.status ?? "").toLowerCase() !== "filled") continue;
+          const ts = Date.parse(t.executed_at);
+          if (!Number.isFinite(ts) || t.price == null) continue;
+          out.push({ time: Math.floor(ts / 1000) + IST, side: t.side === "SELL" ? "SELL" : "BUY", qty: Number(t.quantity ?? 0), price: Number(t.price) });
+        }
+        setExecutions(out);
+      })
+      .catch(() => undefined);
+    return () => {
+      stop = true;
+    };
+  }, [symbol, settings.executions, execNonce]);
+
+  // A fill moves the position: that is an execution (sound + log), not the order acceptance.
+  const lastQtyRef = useRef<number | null>(null);
+  useEffect(() => {
+    const q = position?.qty ?? 0;
+    const prev = lastQtyRef.current;
+    lastQtyRef.current = q;
+    if (prev === null || prev === q) return;
+    if (settingsRef.current.sound) beep();
+    pushLog("order", `execution — ${shortName} position ${prev} → ${q}`);
+    setExecNonce((n) => n + 1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [position?.qty]);
+
   // 4d) Marks on bars: strategy trades + events (re-attached if the main
   //     series is rebuilt).
   useEffect(() => {
@@ -3230,6 +3367,17 @@ export default function ChartPanel(props: ChartPanelProps) {
       ms.push({ time: snapT(t.entry_t + IST) as UTCTimestamp, position: buy ? "belowBar" : "aboveBar", color: buy ? col.up : col.down, shape: buy ? "arrowUp" : "arrowDown", text: buy ? "L" : "S" });
       ms.push({ time: snapT(t.exit_t + IST) as UTCTimestamp, position: buy ? "aboveBar" : "belowBar", color: t.net >= 0 ? col.up : col.down, shape: "circle", text: `${t.net >= 0 ? "+" : ""}${Math.round(t.net)}` });
     }
+    for (const x of executions) {
+      if (x.time < times[0]) continue;
+      const buy = x.side === "BUY";
+      ms.push({
+        time: snapT(x.time) as UTCTimestamp,
+        position: buy ? "belowBar" : "aboveBar",
+        color: buy ? "#2962FF" : col.down,
+        shape: buy ? "arrowUp" : "arrowDown",
+        text: settings.executionLabels ? `${buy ? "B" : "S"} ${x.qty} @ ${fmtNum(x.price, 2)}` : "",
+      });
+    }
     const evColor: Record<ChartEvent["kind"], string> = { D: "#F23645", S: "#2962FF", E: "#FF9800", B: "#9C27B0" };
     for (const ev of events) {
       if (ev.time < times[0]) continue;
@@ -3241,7 +3389,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     ms.sort((a, b) => a.time - b.time);
     markersRef.current = (safe(() => createSeriesMarkers(main, ms as never[])) as unknown as typeof markersRef.current) ?? null;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [strat, events, settings.showMarks, mainVer, dataVer]);
+  }, [strat, events, executions, settings.showMarks, settings.executionLabels, mainVer, dataVer]);
 
   async function runStrategy(s: StrategyItem): Promise<void> {
     const c = candlesRef.current;
@@ -3334,6 +3482,7 @@ export default function ChartPanel(props: ChartPanelProps) {
             color: b.kind === "order" ? "#4A90D9" : b.kind === "position-long" ? colors.up : colors.down,
             lineWidth: 1,
             lineStyle: b.kind === "order" ? LineStyle.Dashed : LineStyle.Solid,
+            lineVisible: settingsRef.current.extendLines,
             axisLabelVisible: true,
             title: b.title,
           }),
@@ -3342,7 +3491,7 @@ export default function ChartPanel(props: ChartPanelProps) {
       }
     }
     brokerLinesRef.current = next;
-  }, [brokerLines, mainVer, hide.positions]);
+  }, [brokerLines, mainVer, hide.positions, settings.extendLines]);
 
   const showPos = position && !hide.positions ? position : null;
 
@@ -3355,14 +3504,14 @@ export default function ChartPanel(props: ChartPanelProps) {
     if (!main || !showPos) return;
     const colors = colorsRef.current;
     const mk = (price: number, color: string, style: LineStyle) =>
-      safe(() => main.createPriceLine({ price, color, lineWidth: 1, lineStyle: style, axisLabelVisible: true, title: "" }));
+      safe(() => main.createPriceLine({ price, color, lineWidth: 1, lineStyle: style, lineVisible: settingsRef.current.extendLines, axisLabelVisible: true, title: "" }));
     posLinesRef.current.entry = mk(showPos.avg, showPos.qty > 0 ? "#2962FF" : colors.down, LineStyle.Solid);
     const sl = levelDrag === "sl" ? levelDragRef.current?.price : showPos.sl;
     const tp = levelDrag === "tp" ? levelDragRef.current?.price : showPos.tp;
     if (sl != null) posLinesRef.current.sl = mk(sl, colors.down, LineStyle.Dashed);
     if (tp != null) posLinesRef.current.tp = mk(tp, colors.up, LineStyle.Dashed);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showPos?.qty, showPos?.avg, showPos?.sl, showPos?.tp, levelDrag, mainVer]);
+  }, [showPos?.qty, showPos?.avg, showPos?.sl, showPos?.tp, levelDrag, mainVer, settings.extendLines]);
 
   // 5b'') Glue the tags to their lines every frame and tick the live P&L:
   // follows pans, zooms, resizes, ticks and drags without wiring each event.
@@ -3381,6 +3530,7 @@ export default function ChartPanel(props: ChartPanelProps) {
       const drag = levelDragRef.current;
       const levels = { entry: showPos.avg, sl: drag?.which === "sl" ? drag.price : showPos.sl, tp: drag?.which === "tp" ? drag.price : showPos.tp };
       const pctMode = settingsRef.current.plMode === "percent";
+      const tickMode = settingsRef.current.plMode === "ticks";
       // Desired tops, clamped into the pane, then pushed apart so tags
       // pinned to an edge (or close together) don't sit on each other.
       const want: { k: "entry" | "sl" | "tp"; y: number; top: number }[] = [];
@@ -3420,7 +3570,8 @@ export default function ChartPanel(props: ChartPanelProps) {
         if (pnlEl && at != null) {
           const pnl = (at - showPos.avg) * showPos.qty;
           const pct = ((at - showPos.avg) / showPos.avg) * 100 * Math.sign(showPos.qty);
-          const main$ = pctMode ? `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%` : money(pnl);
+          const ticks = Math.round(((at - showPos.avg) / tickRef.current) * Math.sign(showPos.qty));
+          const main$ = pctMode ? `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%` : tickMode ? `${ticks >= 0 ? "+" : ""}${ticks} ticks` : money(pnl);
           pnlEl.textContent = k === "entry" ? main$ : `${fmtNum(price, 2)} · ${money(pnl)} (${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%)`;
           pnlEl.className = `pnl ${pnl >= 0 ? "up" : "down"}`;
         }
@@ -3514,6 +3665,7 @@ export default function ChartPanel(props: ChartPanelProps) {
 
   // 9) Live last bar from the `/ws` quote stream + alert triggers.
   const live = useLiveQuote(symbol);
+  liveQuoteRef.current = live;
   useEffect(() => {
     if (!live || live.last_price == null) return;
     const lp = live.last_price;
@@ -3616,6 +3768,39 @@ export default function ChartPanel(props: ChartPanelProps) {
     return () => clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // 10b) Raw last price on the axis while it shows % / indexed values ("Value" mode).
+  useEffect(() => {
+    const el = rawLabelRef.current;
+    if (!el) return;
+    if (!rawPriceLabelOn()) {
+      el.style.display = "none";
+      return;
+    }
+    let raf = 0;
+    const frame = () => {
+      raf = requestAnimationFrame(frame);
+      const v = viewRef.current;
+      const last = v[v.length - 1];
+      const y = last ? priceToY(last.close) : null;
+      if (!last || y == null) {
+        el.style.display = "none";
+        return;
+      }
+      const s = settingsRef.current;
+      const left = s.scaleSide === "left";
+      el.style.display = "block";
+      el.style.top = `${y - 9}px`;
+      el.style.width = `${scaleWidth(left ? "left" : "right") || 56}px`;
+      el.style.left = left ? "0px" : "auto";
+      el.style.right = left ? "auto" : "0px";
+      el.style.background = s.lastPriceColor || (last.close >= last.open ? colorsRef.current.up : colorsRef.current.down);
+      el.textContent = fmtNum(last.close, s.precision ?? precision);
+    };
+    raf = requestAnimationFrame(frame);
+    return () => cancelAnimationFrame(raf);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings.lastPriceScaleValue, settings.lastPriceLabel, settings.lastPriceColor, scaleMode, compares.length]);
 
   // 11) Close menus on outside click; the context menu on any click / Esc.
   useEffect(() => {
@@ -3809,7 +3994,7 @@ export default function ChartPanel(props: ChartPanelProps) {
       (msg) => {
         pushLog("order", `${shortName}: ${msg}`);
         if (s.notifications === "all") addToast(msg);
-        if (s.sound) beep();
+        // the sound waits for the fill (the position changes), not the acceptance
       },
       (err) => {
         const msg = `Order failed: ${err instanceof Error ? err.message : String(err)}`;
@@ -4428,7 +4613,8 @@ export default function ChartPanel(props: ChartPanelProps) {
   );
   const toggleIn = <T,>(list: T[], v: T): T[] => (list.includes(v) ? list.filter((x) => x !== v) : [...list, v]);
   const titleText = settings.titleMode === "ticker" ? shortName : settings.titleMode === "both" ? `${shortName} · ${description}` : description;
-  const legendStyle = settings.legendBg ? { background: withAlpha(theme.bg.startsWith("#") ? theme.bg : "#111111", settings.legendBgOpacity, theme.bg) } : undefined;
+  const legendBgBase = settings.legendBgColor || (theme.bg.startsWith("#") ? theme.bg : "#111111");
+  const legendStyle = settings.legendBg ? { background: withAlpha(legendBgBase, settings.legendBgOpacity, legendBgBase) } : undefined;
   const knownPanes = new Set(paneRects.map((r) => r.i));
   const mainLegendInds = indicators.filter((inst) => {
     const p = indPaneRef.current.get(inst.uid);
@@ -4481,6 +4667,19 @@ export default function ChartPanel(props: ChartPanelProps) {
   const scaleMenu = (close: () => void) => (
     <>
       <button type="button" className={`chart-menu-item${autoScale ? " on" : ""}`} onClick={() => { setAutoScale((v) => !v); close(); }}>Auto (fits data to screen)</button>
+      <button
+        type="button"
+        className={`chart-menu-item${settings.lockRatio ? " on" : ""}`}
+        disabled={scaleMode === "log"}
+        onClick={() => {
+          changeSettings({ ...settings, lockRatio: !settings.lockRatio, priceBarRatio: settings.lockRatio ? settings.priceBarRatio : 0 });
+          close();
+          setTimeout(applyRatioLock, 0);
+        }}
+        data-testid="scale-lock-ratio"
+      >
+        Lock price to bar ratio{settings.lockRatio && settings.priceBarRatio ? ` (${settings.priceBarRatio})` : ""}
+      </button>
       <button type="button" className={`chart-menu-item${scalePriceOnly ? " on" : ""}`} onClick={() => { setScalePriceOnly((v) => !v); close(); }}>Scale price chart only</button>
       <button type="button" className={`chart-menu-item${invert ? " on" : ""}`} onClick={() => { setInvert((v) => !v); close(); }}>Invert scale<span className="kbd">Alt+I</span></button>
       <div className="chart-menu-sep" />
@@ -5187,6 +5386,7 @@ export default function ChartPanel(props: ChartPanelProps) {
             </div>
           )}
           <div ref={countdownRef} className="chart-axis-countdown" style={{ display: "none" }} />
+          <div ref={rawLabelRef} className="chart-raw-label" style={{ display: "none" }} data-testid="chart-raw-label" />
           {eventTip && <div className="chart-event-tip chart-overlay-ui" style={{ left: Math.min(eventTip.x + 12, (containerRef.current?.clientWidth ?? 600) - 260) }}>{eventTip.text}</div>}
           {settings.scaleModesButtons !== "never" && (
             <div className={`chart-scale-modes chart-overlay-ui sm-${settings.scaleModesButtons}`} style={side === "left" ? { left: 26, right: "auto" } : undefined} onMouseDown={(e) => e.stopPropagation()}>

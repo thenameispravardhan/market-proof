@@ -2735,3 +2735,4 @@ div.ind-row { cursor: default; }
 .insight .up { color: var(--green); }
 .insight .down { color: var(--red); }
 .insights-note { margin-top: 10px; font-size: 10.5px; }
+.chart-raw-label { position: absolute; z-index: 3; pointer-events: none; height: 18px; line-height: 18px; padding: 0 4px; font-size: 11px; font-family: var(--mono); color: #fff; text-align: left; box-sizing: border-box; }
