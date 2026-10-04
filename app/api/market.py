@@ -336,6 +336,23 @@ async def market_quotes(symbols: str = "") -> dict[str, Any]:
                        for s, q in qs.items()}}
 
 
+@router.get("/api/market/depth")
+async def market_depth(symbol: str) -> dict[str, Any]:
+    """5-level order book for the DOM / Market Depth panels. Always 200;
+    `ok: false` with a reason when Fyers isn't connected (Fyers-only data)."""
+    backend = _fyers_backend()
+    if backend is None or not hasattr(backend, "get_depth"):
+        return {"ok": False, "reason": "connect a Fyers account for market depth"}
+    try:
+        book = await backend.get_depth(symbol.strip().upper())
+    except Exception as e:  # noqa: BLE001
+        log.debug("market.fyers_depth_failed", symbol=symbol, error=str(e))
+        book = None
+    if not book:
+        return {"ok": False, "reason": "depth unavailable for this symbol"}
+    return {"ok": True, "symbol": symbol.strip().upper(), **book}
+
+
 @router.get("/api/market/funds")
 async def market_funds() -> dict[str, Any]:
     """Available funds (₹) of the connected Fyers account for the Trade

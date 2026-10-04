@@ -474,6 +474,13 @@ class FyersClient:
             base_url=self._data_base_url,
         )
 
+    async def get_depth(self, symbol: str) -> dict[str, Any]:
+        """GET /data/depth — 5-level book (bids / asks: price, volume, orders)."""
+        return await self._request(
+            "GET", "/depth", params={"symbol": symbol, "ohlcv_flag": 1},
+            base_url=self._data_base_url,
+        )
+
     async def get_history(
         self,
         symbol: str,
@@ -1151,6 +1158,31 @@ class FyersLiveBackend:
             except Exception:  # noqa: BLE001
                 log.exception("fyers.quote.parse_error")
         return out
+
+    async def get_depth(self, symbol: str) -> Optional[dict[str, Any]]:
+        """5-level market depth, normalised: {bids, asks: [[price, qty, orders]],
+        total_buy, total_sell, ltp}. None when Fyers can't serve it."""
+        try:
+            data = await self._client.get_depth(symbol)
+        except FyersAPIError as e:
+            log.warning("fyers.depth.failed", error=str(e))
+            return None
+        d = data.get("d") or {}
+        book = d.get(symbol) or (next(iter(d.values())) if len(d) == 1 else None)
+        if not isinstance(book, dict):
+            return None
+
+        def side(rows: Any) -> list[list[float]]:
+            return [[safe_float(r.get("price")), safe_float(r.get("volume")), safe_float(r.get("ord"))]
+                    for r in (rows or []) if isinstance(r, dict) and safe_float(r.get("price")) > 0]
+
+        return {
+            "bids": side(book.get("bids")),
+            "asks": side(book.get("ask") or book.get("asks")),
+            "total_buy": safe_float(book.get("totalbuyqty")),
+            "total_sell": safe_float(book.get("totalsellqty")),
+            "ltp": safe_float(book.get("ltp")) or None,
+        }
 
     # -- history (candles, for ATR) -------------------------------------
 

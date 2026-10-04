@@ -262,6 +262,8 @@ export const TOOLS: ToolDef[] = [
   { id: "arrowmarker", label: "Arrow Marker", group: "annotate", section: "Arrows", icon: "➚", points: 2 },
   { id: "arrowup", label: "Arrow Mark Up", group: "annotate", section: "Arrows", icon: "⬆", points: 1 },
   { id: "arrowdown", label: "Arrow Mark Down", group: "annotate", section: "Arrows", icon: "⬇", points: 1 },
+  { id: "arrowleft", label: "Arrow Mark Left", group: "annotate", section: "Arrows", icon: "⬅", points: 1 },
+  { id: "arrowright", label: "Arrow Mark Right", group: "annotate", section: "Arrows", icon: "➡", points: 1 },
   { id: "flag", label: "Flag Mark", group: "annotate", section: "Arrows", icon: "⚑", points: 1 },
   // ---- icons / measure ----
   { id: "icon", label: "Icon", group: "icons", icon: "☺", points: 1, defaults: { fontSize: 28 } },
@@ -1459,6 +1461,15 @@ const GEO: Record<string, (g: G) => Shape[]> = {
       { k: "poly", pts: [{ x: a.x, y: a.y - 4 }, { x: a.x - 9, y: a.y - 16 }, { x: a.x - 4, y: a.y - 16 }, { x: a.x - 4, y: a.y - 30 }, { x: a.x + 4, y: a.y - 30 }, { x: a.x + 4, y: a.y - 16 }, { x: a.x + 9, y: a.y - 16 }], closed: true, fill: col, color: col },
       ...(g.d.text ? [textShape(g, a.x, a.y - 34, { align: "center", base: "bottom", color: col })] : []),
     ];
+  },
+  // Left / right marks: the up arrow's outline with x and y swapped (tip at the point).
+  arrowleft: (g) => {
+    const a = g.P[0];
+    return [{ k: "poly", pts: [[4, 0], [16, -9], [16, -4], [30, -4], [30, 4], [16, 4], [16, 9]].map(([dx, dy]) => ({ x: a.x + dx, y: a.y + dy })), closed: true, fill: g.col, color: g.col }];
+  },
+  arrowright: (g) => {
+    const a = g.P[0];
+    return [{ k: "poly", pts: [[-4, 0], [-16, -9], [-16, -4], [-30, -4], [-30, 4], [-16, 4], [-16, 9]].map(([dx, dy]) => ({ x: a.x + dx, y: a.y + dy })), closed: true, fill: g.col, color: g.col }];
   },
   flag: (g) => {
     const a = g.P[0];

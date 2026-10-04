@@ -2149,7 +2149,7 @@ kbd {
 .dock-body .chain-table .chain-ltp { min-width: 0; padding: 2px 4px; font-size: 11px; }
 .chain-table .chain-ltp.on { background: var(--accent); color: var(--text-inv); }
 
-.tv-rail { width: 52px; flex-shrink: 0; display: flex; flex-direction: column; gap: 4px; padding: 4px; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; }
+.tv-rail { position: relative; width: 52px; flex-shrink: 0; display: flex; flex-direction: column; gap: 4px; padding: 4px; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; }
 .tv-rail-btn { display: flex; flex-direction: column; align-items: center; gap: 3px; padding: 8px 0 6px; background: transparent; border: 0; border-radius: 4px; color: var(--text-dim); cursor: pointer; }
 .tv-rail-btn .ico { font-size: 16px; line-height: 1; }
 .tv-rail-btn .lbl { font-size: 9px; letter-spacing: 0.04em; text-transform: uppercase; }
@@ -2179,11 +2179,13 @@ kbd {
 /* chart: vertical drawing strip left of the plot */
 .chart-body { display: flex; gap: 6px; min-height: 0; }
 .chart-body .chart-container { flex: 1; min-width: 0; }
-.chart-tools { display: flex; flex-direction: column; gap: 2px; padding: 2px; overflow-y: auto; scrollbar-width: none; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-surface); }
+.chart-tools { display: flex; flex-direction: column; gap: 2px; padding: 2px; overflow-x: hidden; overflow-y: auto; scrollbar-width: none; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-surface); }
 .chart-tool { flex-shrink: 0; width: 28px; height: 28px; display: grid; place-items: center; background: transparent; border: 0; border-radius: 3px; color: var(--text-dim); font-size: 14px; cursor: pointer; }
 .chart-tool:hover:not(:disabled) { background: var(--bg-elev); color: var(--text); }
 .chart-tool.on { background: var(--accent); color: var(--text-inv); }
 .chart-tool:disabled { opacity: 0.35; cursor: default; }
+.chart-tools .chart-tool:not(.on) { filter: grayscale(1); }   /* emoji glyphs (magnet, lock, bell) render mono like the rest */
+@media (max-height: 860px) { .chart-tools .chart-tool { height: 24px; } .chart-tools .chart-tool-sep { margin: 2px; } }
 .chart-tool-sep { flex-shrink: 0; height: 1px; margin: 3px 2px; background: var(--border); }
 
 .chart-menu-hint { padding: 6px 10px; font-size: 11px; color: var(--text-dim); max-width: 340px; white-space: normal; }
@@ -2238,8 +2240,8 @@ kbd {
   .chart-toolbar .chart-symbol { display: none; }   /* the scalper leg / cell already names it */
 }
 .tv-rail-sep { height: 1px; margin: 4px 2px; background: var(--border); }
-.tv-rail-pop-wrap { position: relative; }
-.tv-rail-pop { position: absolute; right: calc(100% + 8px); top: 0; z-index: 30; display: flex; flex-direction: column; gap: 2px; padding: 4px; min-width: 170px; background: var(--bg-panel); border: 1px solid var(--border-hi); border-radius: 6px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4); }
+.tv-rail-pop-wrap { position: static; }   /* the pop anchors to the whole rail so it can never outgrow the page */
+.tv-rail-pop { position: absolute; right: calc(100% + 8px); top: 0; max-height: 100%; overflow-y: auto; overscroll-behavior: contain; z-index: 30; display: flex; flex-direction: column; gap: 2px; padding: 4px; min-width: 170px; background: var(--bg-panel); border: 1px solid var(--border-hi); border-radius: 6px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4); }
 .tv-layout-btn { display: flex; align-items: center; gap: 8px; padding: 6px 8px; background: transparent; border: 0; border-radius: 4px; color: var(--text-dim); font-size: 11px; text-align: left; cursor: pointer; }
 .tv-layout-btn .ico { font-size: 16px; width: 18px; text-align: center; }
 .tv-layout-btn:hover { background: var(--bg-elev); color: var(--text); }
@@ -2337,7 +2339,7 @@ kbd {
 
 /* drawing strip */
 .dtb-group { position: relative; display: flex; flex-shrink: 0; }
-.dtb-more { position: absolute; right: -3px; bottom: 0; width: 10px; height: 14px; padding: 0; border: 0; background: transparent; color: var(--text-faint); font-size: 10px; line-height: 1; cursor: pointer; opacity: 0; }
+.dtb-more { position: absolute; right: 0; bottom: 0; width: 10px; height: 14px; padding: 0; border: 0; background: transparent; color: var(--text-faint); font-size: 10px; line-height: 1; cursor: pointer; opacity: 0.35; }
 .dtb-group:hover .dtb-more { opacity: 1; }
 .dtb-more:hover { color: var(--accent); }
 .chart-tools .grow { min-height: 4px; }
@@ -2657,3 +2659,44 @@ div.ind-row { cursor: default; }
 .chart-container:hover .chart-scale-modes, .chart-scale-modes.sm-always { opacity: 1; }
 .chart-scale-modes button { width: 20px; height: 20px; padding: 0; border: 1px solid var(--border); border-radius: 3px; background: var(--bg-elev); color: var(--text-dim); font-size: 10px; font-weight: 700; cursor: pointer; }
 .chart-scale-modes button.on { color: var(--accent); border-color: var(--accent); }
+
+/* ---- Desk panels: DOM / depth / tape / futures / strategy (ProPanels.tsx) ---- */
+.seg { display: flex; gap: 2px; padding: 2px; background: var(--bg-elev); border-radius: 4px; }
+.seg button { flex: 1; padding: 4px 6px; background: transparent; border: 0; border-radius: 3px; color: var(--text-dim); font-size: 10.5px; cursor: pointer; }
+.seg button.on { background: var(--bg-panel); color: var(--accent); }
+.dom, .tape, .strat { display: flex; flex-direction: column; gap: 6px; min-height: 0; }
+.dom-stats { display: flex; justify-content: space-between; gap: 6px; font-size: 10.5px; color: var(--text-dim); }
+.dom-stats b { color: var(--text); font-weight: 600; }
+.dom-stats b.up, .dom-table .up { color: var(--green); }
+.dom-stats b.down, .dom-table .down { color: var(--red); }
+.dom-imb { height: 4px; background: var(--red-dim); border-radius: 2px; overflow: hidden; }
+.dom-imb .b { display: block; height: 100%; background: var(--green-dim); }
+.dom-table { width: 100%; border-collapse: collapse; font-size: 11px; font-variant-numeric: tabular-nums; }
+.dom-table th { position: sticky; top: 0; background: var(--bg-panel); color: var(--text-faint); font-weight: 500; font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.04em; padding: 3px 4px; text-align: right; }
+.dom-table td { padding: 2px 4px; text-align: right; border-bottom: 1px solid var(--border-soft); }
+.dom-table td.bid, .dom-table td.ask { position: relative; cursor: pointer; }
+.dom-table td.bid:hover, .dom-table td.ask:hover { background: var(--bg-elev); }
+.dom-table td span { position: relative; }
+.dom-bar { position: absolute; top: 1px; bottom: 1px; opacity: 0.22; }
+.dom-bar.b { right: 0; background: var(--green); }
+.dom-bar.a { left: 0; background: var(--red); }
+.dom-table td.px { text-align: center; color: var(--text); }
+.dom-table td.px.lo { color: #64B5F6; }
+.dom-table tr.ltp td { background: var(--bg-elev); font-weight: 700; }
+.dom-table tr.ltp td.px { color: var(--accent); }
+.dom-table tr.tot td { color: var(--text-dim); font-weight: 600; border-top: 1px solid var(--border); }
+.dom-table tr.click { cursor: pointer; }
+.dom-table tr.click:hover td { background: var(--bg-elev); }
+.tape-table tr.big td { font-weight: 700; background: var(--bg-elev); }
+.dom-actions { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.dom-actions .buy, .dom-actions .sell { padding: 5px 10px; border: 0; border-radius: 3px; font-size: 11px; font-weight: 600; cursor: pointer; color: #000; }
+.dom-actions .buy { background: var(--green); }
+.dom-actions .sell { background: var(--red); color: #fff; }
+.strat-presets { display: flex; flex-wrap: wrap; gap: 4px; }
+.strat-add { display: flex; gap: 4px; }
+.strat-add select, .strat-add input { min-width: 0; flex: 1; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 3px; color: var(--text); font-size: 11px; padding: 3px; }
+.strat-add input { max-width: 48px; }
+.strat-chart { width: 100%; height: auto; background: var(--bg-elev); border-radius: 4px; }
+.strat-chart .zero { stroke: var(--border-hi); stroke-width: 1; }
+.strat-chart .spot { stroke: var(--accent); stroke-width: 1; stroke-dasharray: 3 3; }
+.strat-chart .pnl { fill: none; stroke: #64B5F6; stroke-width: 1.5; }

@@ -29,6 +29,7 @@ import {
   type MaType,
   type OhlcvCandle,
 } from "../../lib/indicators";
+import { EXTRA_INDICATORS } from "./indicatorExtras";
 import { calendarBucket, intervalCount, intervalGroup, parseInterval, type IntervalGroup } from "./chartData";
 
 export type Source = "close" | "open" | "high" | "low" | "hl2" | "hlc3" | "ohlc4" | "hlcc4";
@@ -613,7 +614,7 @@ export const INDICATORS: IndicatorDef[] = [
       }
       return { plots: [delta, cvd], colors: [colors, null] };
     },
-  },
+  },  ...EXTRA_INDICATORS,
 ];
 
 function withA(hex: string, a: number): string {
