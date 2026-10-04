@@ -996,7 +996,7 @@ export default function Trade() {
           {bottomOpen && <div className="tv-resize" onPointerDown={(e) => { setBottomMax(false); drag(e, "y", bottomH, setBottomH, 120, window.innerHeight * 0.75, "trade:bottomH"); }} title="Drag to resize" />}
           {!bottomOpen && (
             <div className="tabs trade-tabs" role="tablist">
-              {([["positions", `Positions${positions?.filter((p) => p.quantity !== 0).length ? ` (${positions.filter((p) => p.quantity !== 0).length})` : ""}`], ["orders", `Orders${pending?.count ? ` (${pending.count})` : ""}`], ["trades", "Trades"], ["account", "Account"], ["basket", "Basket"], ["log", "Notifications"]] as const).map(([k, label]) => (
+              {([["positions", `Positions${positions?.filter((p) => p.quantity !== 0).length ? ` (${positions.filter((p) => p.quantity !== 0).length})` : ""}`], ["orders", `Orders${pending?.count ? ` (${pending.count})` : ""}`], ["trades", "Trades"], ["account", "Account"], ["basket", "Basket"], ["broker", "Fyers live"], ["log", "Notifications"]] as const).map(([k, label]) => (
                 <button key={k} type="button" role="tab" aria-selected={false} className="tab" onClick={() => openBottom(k)}>{label}</button>
               ))}
               <button type="button" className="tab tv-collapse" onClick={() => openBottom(bottomTab)} title="Open panel">▴</button>

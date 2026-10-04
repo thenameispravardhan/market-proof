@@ -229,9 +229,11 @@ function StatusBar({ wsStatus }: { wsStatus: string }) {
 export default function App() {
   const [tab, navigate] = useRouter();
   const { status } = useWebSocket({
-    channels: ["signals", "trades", "positions", "quotes"],
+    channels: ["signals", "trades", "positions", "quotes", "broker"],
     onEvent: (msg) => {
       if (msg.channel === "quotes") ingestQuote(msg.payload);
+      // Any order update on the Fyers account (bot, app or web) -> the Trade page's live broker view reloads.
+      if (msg.channel === "broker") window.dispatchEvent(new Event("broker:order"));
     },
   });
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(readSidebarOpen);

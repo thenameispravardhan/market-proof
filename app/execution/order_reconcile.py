@@ -45,10 +45,30 @@ FYERS_STATUS_HINTS: dict[str, str] = {
     "7": "EXPIRED",
 }
 
-# Seconds to wait before re-matching an update that beat its own trade row:
-# Fyers can reject within milliseconds, before the placing request commits.
-UNMATCHED_RETRY_S = 2.0
-_retries: set = set()  # strong refs so pending retry tasks aren't GC'd
+# Fyers can confirm / reject within milliseconds — before the placing
+# request has committed its trades row. An update that beats its row is
+# re-matched after these waits (seconds, ~2s total); the row usually lands
+# in tens of ms, so the first short wait catches it.
+RETRY_DELAYS = (0.1, 0.3, 0.6, 1.0)
+_tasks: set = set()  # strong refs so background retries aren't GC'd
+
+
+def spawn(coro: Any) -> None:
+    t = asyncio.create_task(coro)
+    _tasks.add(t)
+    t.add_done_callback(_tasks.discard)
+
+
+async def wait_for_trade(order_id: str) -> bool:
+    """True once a trades row with this broker_order_id is committed."""
+    from app.db.session import SessionLocal
+
+    for d in RETRY_DELAYS:
+        await asyncio.sleep(d)
+        with SessionLocal() as db:
+            if db.query(TradeRow.id).filter(TradeRow.broker_order_id == order_id).first() is not None:
+                return True
+    return False
 
 
 def _split_symbol(raw: str) -> tuple[str, str]:
@@ -104,12 +124,12 @@ _STATUS_MAP = {
 _TERMINAL = {"filled", "rejected", "cancelled"}
 
 
-async def _retry_unmatched(payload: dict[str, Any], source: str) -> None:
-    await asyncio.sleep(UNMATCHED_RETRY_S)
-    from app.db.session import SessionLocal
+async def _retry_unmatched(order_id: str, payload: dict[str, Any], source: str) -> None:
+    if await wait_for_trade(order_id):
+        from app.db.session import SessionLocal
 
-    with SessionLocal() as db:
-        await reconcile_order_update(db, payload, source=source, retry=False)
+        with SessionLocal() as db:
+            await reconcile_order_update(db, payload, source=source, retry=False)
 
 
 async def reconcile_order_update(
@@ -134,6 +154,10 @@ async def reconcile_order_update(
         return {"ok": False, "reason": "no order id in payload"}
 
     new_status = _STATUS_MAP.get(status_text, "placed")
+    # Nudge the UI's live broker view on EVERY update — including orders
+    # placed outside the bot (Fyers app / web), which never get a trades row.
+    if retry:
+        await event_bus.publish("broker", {"order_id": order_id, "status": status_text, "symbol": sym, "source": source})
 
     trade = (
         db.query(TradeRow).filter(TradeRow.broker_order_id == order_id).one_or_none()
@@ -147,9 +171,7 @@ async def reconcile_order_update(
             source=source, order_id=order_id, status=status_text, retry=retry,
         )
         if retry:
-            t = asyncio.create_task(_retry_unmatched(dict(payload), source))
-            _retries.add(t)
-            t.add_done_callback(_retries.discard)
+            spawn(_retry_unmatched(order_id, dict(payload), source))
         return {"ok": True, "matched": False, "order_id": order_id, "status": new_status}
 
     # Dual-confirmation dedup: the same fill can arrive via the order

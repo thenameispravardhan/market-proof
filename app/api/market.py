@@ -336,6 +336,91 @@ async def market_quotes(symbols: str = "") -> dict[str, Any]:
                        for s, q in qs.items()}}
 
 
+_ORDER_TYPES = {1: "LIMIT", 2: "MARKET", 3: "SL-M", 4: "SL-L"}
+
+
+def _num(v: Any) -> Optional[float]:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+@router.get("/api/broker/book")
+async def broker_book() -> dict[str, Any]:
+    """Live view of the Fyers ACCOUNT — today's orders and net positions,
+    including ones placed from the Fyers app / web, not just the bot's.
+    Read-only. The UI refetches on every `broker` event (order WebSocket /
+    postback) and keeps open-position symbols on the tick feed for live P&L."""
+    backend = _fyers_backend()
+    if backend is None or not hasattr(backend, "broker_book"):
+        return {"ok": False, "reason": "connect a Fyers account to see broker orders and positions", "orders": [], "positions": []}
+    try:
+        raw = await backend.broker_book()
+    except Exception as e:  # noqa: BLE001
+        log.debug("market.broker_book_failed", error=str(e))
+        return {"ok": False, "reason": "Fyers order book unavailable", "orders": [], "positions": []}
+
+    from app.db import session as db_session
+    from app.db.models import Trade
+    from app.execution.order_reconcile import _status_text
+
+    ids = [str(o.get("id") or "") for o in raw["orders"]]
+    with db_session.SessionLocal() as db:
+        ours = {r[0] for r in db.query(Trade.broker_order_id).filter(Trade.broker_order_id.in_(ids)).all()} if ids else set()
+    orders = [
+        {
+            "id": str(o.get("id") or ""),
+            "symbol": o.get("symbol"),
+            "side": "BUY" if int(o.get("side") or 0) == 1 else "SELL",
+            "type": _ORDER_TYPES.get(int(o.get("type") or 0), str(o.get("type"))),
+            "product": o.get("productType"),
+            "qty": int(o.get("qty") or 0),
+            "filled": int(o.get("filledQty") or 0),
+            "remaining": int(o.get("remainingQuantity") or 0),
+            "limit_price": _num(o.get("limitPrice")),
+            "stop_price": _num(o.get("stopPrice")),
+            "traded_price": _num(o.get("tradedPrice")),
+            "status": _status_text(o.get("status")),
+            "message": o.get("message") or "",
+            "time": o.get("orderDateTime"),
+            "source": o.get("source"),
+            "ours": str(o.get("id") or "") in ours,
+        }
+        for o in raw["orders"]
+    ]
+    positions = [
+        {
+            "symbol": p.get("symbol"),
+            "product": p.get("productType"),
+            "net_qty": int(p.get("netQty") or 0),
+            "avg_price": _num(p.get("netAvg")) or _num(p.get("buyAvg")),
+            "buy_qty": int(p.get("buyQty") or 0),
+            "buy_avg": _num(p.get("buyAvg")),
+            "sell_qty": int(p.get("sellQty") or 0),
+            "sell_avg": _num(p.get("sellAvg")),
+            "ltp": _num(p.get("ltp")),
+            "realized": _num(p.get("realized_profit")),
+            "unrealized": _num(p.get("unrealized_profit")),
+            "pl": _num(p.get("pl")),
+        }
+        for p in raw["positions"]
+    ]
+    # Keep live symbols on the Fyers tick feed so the UI's P&L moves per tick.
+    from app.api.orders import _fyers_stream
+
+    stream = _fyers_stream()
+    if stream is not None:
+        live = {p["symbol"] for p in positions if p["net_qty"]} | {o["symbol"] for o in orders if o["status"] in ("PENDING", "TRANSIT")}
+        for sym in filter(None, live):
+            try:
+                stream.touch_interest(str(sym).upper())
+            except Exception:  # noqa: BLE001
+                pass
+    orders.sort(key=lambda o: str(o["time"] or ""), reverse=True)  # same-day "dd-Mon-yyyy HH:MM:SS"
+    return {"ok": True, "orders": orders, "positions": positions, "errors": raw.get("errors") or []}
+
+
 @router.get("/api/market/depth")
 async def market_depth(symbol: str) -> dict[str, Any]:
     """5-level order book for the DOM / Market Depth panels. Always 200;
