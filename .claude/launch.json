@@ -7,6 +7,12 @@
       "runtimeArgs": ["run", "dev"],
       "cwd": "frontend",
       "port": 5173
+    },
+    {
+      "name": "api-testing",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-c", "import os; os.environ['TESTING']='1'; import uvicorn; uvicorn.run('app.main:app', host='127.0.0.1', port=8000)"],
+      "port": 8000
     }
   ]
 }

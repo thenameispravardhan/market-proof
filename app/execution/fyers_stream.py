@@ -143,6 +143,7 @@ class FyersStreamManager:
         session_factory: Optional[Callable[[], Any]] = None,
         resolve_fn: Optional[Callable[[str], Optional[str]]] = None,
         always_subscribe: Optional[list[str]] = None,
+        extra_symbols: Optional[Callable[[], list[str]]] = None,
         reconcile_interval_s: float = 2.0,
         fresh_window_s: float = 6.0,
         ondemand_ttl_s: float = 12.0,
@@ -163,6 +164,12 @@ class FyersStreamManager:
         # BANKNIFTY) so it streams sub-second like everything else. Their bus
         # key IS the full id, so the dashboard matches on the index symbol.
         self._always_subscribe = [s.upper() for s in (always_subscribe or [])]
+        # More full ids to keep subscribed (the tick recorder's list), asked
+        # each reconcile so edits and futures rolls apply without a restart.
+        self._extra_symbols = extra_symbols
+        # Called on the SDK thread with (full_id, raw frame, receive time) for
+        # every frame — the tick recorder hangs off this. Must be cheap.
+        self.tick_listeners: list[Callable[[str, dict[str, Any], float], None]] = []
         self._interval = float(reconcile_interval_s)
         # A bus tick counts as "live" for this long; an on-demand
         # subscription is protected from the reconcile sweep for this long
@@ -415,6 +422,12 @@ class FyersStreamManager:
         # tick publishes back under the symbol the dashboard renders.
         for full in self._always_subscribe:
             desired[full] = full
+        if self._extra_symbols is not None:
+            try:
+                for full in self._extra_symbols():
+                    desired[full.upper()] = full.upper()
+            except Exception:  # noqa: BLE001 — a broken provider must not stop the feed
+                log.exception("fyers_stream.extra_symbols_failed")
         for short in watched:
             full = self._resolve(short) or (short if ":" in short else None)
             if full:
@@ -622,6 +635,14 @@ class FyersStreamManager:
             if ltp <= 0:
                 self._drop_count += 1
                 return
+            if self.tick_listeners:
+                full = self._subscribed.get(short, short)
+                recv = time.time()
+                for fn in self.tick_listeners:
+                    try:
+                        fn(full, message, recv)
+                    except Exception:  # noqa: BLE001 — a listener must never break the feed
+                        log.exception("fyers_stream.tick_listener_failed")
             bid = safe_float(message.get("bid_price") or message.get("bid")) or None
             ask = safe_float(message.get("ask_price") or message.get("ask")) or None
             vol_raw = message.get("vol_traded_today") or message.get("volume")

@@ -556,3 +556,34 @@ def test_live_minute_cache_fetches_only_new_minutes(monkeypatch):
     assert calls[-1][0] == t0 + 30 * 60 and b["t"][-1] == t0 + 31 * 60 and len(b["t"]) == 32
     vb = orderflow.complete_only(orderflow.build_bars(b, "volume", size=450), now + 120)
     assert all(v >= 450 for v in vb["v"])                   # forming volume candle dropped
+
+
+def test_tick_recorder_end_to_end(tmp_path):
+    """Frames -> Lee-Ready classification -> raw CSV -> after-close compaction ->
+    minute flow readable for backtests; a restart replays today's CSV."""
+    import time as _t
+
+    from app.algo import orderflow as of
+    from app.algo import ticks
+
+    rec = ticks.TickRecorder(tmp_path)
+    day0 = int(_t.time()) - (int(_t.time()) + 19800) % 86400
+    t0 = day0 + 33300                                       # 09:15 today (IST)
+    seq = [(100.0, 1000, 99.95, 100.05), (100.05, 1300, 100.0, 100.05),   # +300 at ask: buy
+           (100.0, 1400, 100.0, 100.05), (100.1, 1500, 100.05, 100.1)]   # +100 at bid: sell; +100 uptick: buy
+    for k, (ltp, vol, bid, ask) in enumerate(seq):
+        rec.on_tick("NSE:SBIN-EQ", {"ltp": ltp, "vol_traded_today": vol, "bid_price": bid, "ask_price": ask,
+                                     "exch_feed_time": t0 + 10 * k})
+    assert rec.flush() == 4
+    flow = rec.minute_flow("SBIN", t0, t0 + 60)
+    assert flow == {t0: (400.0, 100.0)}
+    again = ticks.TickRecorder(tmp_path)                    # restart mid-day
+    again.replay_today()
+    assert again.minute_flow("SBIN", t0, t0 + 60) == flow
+    again.compact((t0 + 19800) // 86400)
+    assert not list((tmp_path / "raw" / "SBIN").glob("*.csv")) and (tmp_path / "flow" / "SBIN").is_dir()
+    assert again.minute_flow("SBIN", t0, t0 + 60) == flow     # now read back from parquet
+    assert again.footprint("SBIN", t0, t0 + 60)[0][1] in (100.0, 100.05, 100.1)
+    m1 = {"t": [t0], "o": [100.0], "h": [100.1], "l": [99.95], "c": [100.1], "v": [500]}
+    b = of.build_bars(m1, "time", 1, real=flow)
+    assert b["buy_v"][0] == 400 and b["real_pct"][0] == 100.0  # the candle's split IS the recorded one

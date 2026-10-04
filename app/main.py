@@ -253,13 +253,31 @@ async def lifespan(app: FastAPI):
     # time. No-op until a live Fyers account is connected.
     from app.api.market import INDICES as _INDICES
 
+    from app.algo.ticks import recorder as _get_recorder
+
+    _tick_recorder = _get_recorder()
     fyers_stream = FyersStreamManager(
         market_data=execution_manager.market_data,
         quote_feed=quote_feed,
         # Keep the index symbols streaming all session so the status-bar
         # ticker is sub-second, not REST-polled.
         always_subscribe=[idx["symbol"] for idx in _INDICES],
+        extra_symbols=_tick_recorder.symbols,
     )
+    # Real order flow: every frame for a recorded symbol is classified and
+    # kept (app/algo/ticks.py). Only symbols on the recorder's list.
+    _rec_ids: dict[str, float] = {"ts": 0.0}
+    _rec_set: set[str] = set()
+
+    def _record_tick(full: str, msg: dict, recv: float) -> None:
+        if recv - _rec_ids["ts"] > 30:          # refresh the cheap membership set
+            _rec_set.clear()
+            _rec_set.update(s.upper() for s in _tick_recorder.symbols())
+            _rec_ids["ts"] = recv
+        if full.upper() in _rec_set:
+            _tick_recorder.on_tick(full, msg, recv)
+
+    fyers_stream.tick_listeners.append(_record_tick)
 
     # Bridge every market-data tick onto the /ws event bus so the dashboard
     # gets sub-second price pushes instead of polling REST. Publishing to a
@@ -299,6 +317,7 @@ async def lifespan(app: FastAPI):
     dataset_eod_task: asyncio.Task[None] | None = None
     ai_schedule_task: asyncio.Task[None] | None = None
     algo_task: asyncio.Task[None] | None = None
+    tick_task: asyncio.Task[None] | None = None
     if not settings.TESTING:
         # T3: start the analyzer before the monitors so its event-bus
         # subscription is live before the first `announcements.new`
@@ -496,6 +515,7 @@ async def lifespan(app: FastAPI):
         from app.algo.runner import AlgoRunner
 
         app.state.algo_runner = AlgoRunner()
+        tick_task = asyncio.create_task(_tick_recorder.run(), name="tick-recorder")
         algo_task = asyncio.create_task(app.state.algo_runner.run(), name="algo-runner")
         app.state.algo_task = algo_task
 
@@ -504,7 +524,7 @@ async def lifespan(app: FastAPI):
     finally:
         if not settings.TESTING:
             # Stop the breaker monitor first.
-            for _t in (risk_monitor_task, dataset_eod_task, ai_schedule_task, algo_task):
+            for _t in (risk_monitor_task, dataset_eod_task, ai_schedule_task, algo_task, tick_task):
                 if _t is not None:
                     _t.cancel()
                     try:

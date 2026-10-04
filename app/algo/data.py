@@ -85,6 +85,18 @@ def warmup_days(tf_min: int, bars: int) -> int:
 VIX = "NSE:INDIAVIX-INDEX"
 
 
+def real_flow(fy: str, start: int, end: int) -> dict[int, tuple[float, float]]:
+    """Recorded buy/sell volume per minute for a symbol (an index reads its
+    future's), or {} where nothing was recorded."""
+    from app.algo import ticks
+
+    try:
+        return ticks.recorder().minute_flow(ticks.flow_key(fy), start, end)
+    except Exception as e:  # noqa: BLE001 — real flow is an upgrade, never a blocker
+        log.warning("algo.real_flow_failed", symbol=fy, error=str(e)[:200])
+        return {}
+
+
 async def assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str, dict], list[dict], int]:
     """Everything one backtest needs, per symbol: base bars from `start - warmup`,
     every higher timeframe the conditions use, India VIX when options are priced
@@ -134,7 +146,8 @@ async def assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str
                         continue
                 elif not any(m1["v"]):
                     notes.append({"symbol": fy, "note": "no traded volume (an index) — order-flow values are flat"})
-                bars = await asyncio.to_thread(orderflow.build_bars, m1, btype, base_tf, size)
+                real = await asyncio.to_thread(real_flow, fy, first, end)
+                bars = await asyncio.to_thread(orderflow.build_bars, m1, btype, base_tf, size, real)
                 del m1
             else:
                 bars = await asyncio.to_thread(load, info["key"], base_tf, first, end)
@@ -290,7 +303,8 @@ async def live_bundle(spec: dict[str, Any], fy: str, now: float) -> dict[str, An
             if key not in _size_cache:          # fixed for the whole session
                 _size_cache[key] = orderflow.bar_size(m1, btype, per_day, until=today)
             size = _size_cache[key]
-        d = orderflow.complete_only(orderflow.build_bars(m1, btype, spec["timeframe"], size), now)
+        real = await asyncio.to_thread(real_flow, fy, m1["t"][0] if m1["t"] else int(now), int(now) + 60)
+        d = orderflow.complete_only(orderflow.build_bars(m1, btype, spec["timeframe"], size, real), now)
     else:
         d = await recent_bars(fy, spec["timeframe"], bars=wb + 60, now=now)
     d["tf_min"] = spec["timeframe"]

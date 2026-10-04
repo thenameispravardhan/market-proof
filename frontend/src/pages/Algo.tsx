@@ -116,7 +116,8 @@ type BtResult = {
   trades_total: number;
   notes: { symbol: string; note: string }[];
   elapsed_s: number;
-  chart: { symbol: string; candles: number[][]; trades: BtTrade[] };
+  chart: { symbol: string; candles: number[][]; trades: BtTrade[]; overlays?: { label: string; price: boolean; values: (number | null)[] }[] };
+  flow_source?: Record<string, number>;
   spec: Spec;
 };
 type OptRow = { params: Record<string, number>; trades: number; win_rate: number; net_pnl: number; profit_factor: number | null; sharpe: number | null; max_drawdown: number; return_pct: number; expectancy: number; t_stat: number | null; oos: Summary | null };
@@ -801,6 +802,15 @@ function TradeChart({ chart }: { chart: BtResult["chart"] }) {
     });
     markers.sort((a, b) => (a.time as number) - (b.time as number));
     createSeriesMarkers(s, markers);
+    // The strategy's own indicators — what it actually sees.
+    const PAL = ["#FFB74D", "#42A5F5", "#AB47BC", "#26C6DA", "#EC407A", "#9CCC65", "#FFD54F", "#8D6E63"];
+    let extraPane = chart.candles.some((k) => k[5]) ? (chart.candles.some((k) => k[6] !== null && k[6] !== undefined) ? 3 : 2) : 1;
+    (chart.overlays ?? []).forEach((ov, k) => {
+      const pane = ov.price ? 0 : extraPane++;
+      const ls = c.addSeries(LineSeries, { color: PAL[k % PAL.length], lineWidth: 1, priceLineVisible: false, lastValueVisible: false, title: ov.label }, pane);
+      ls.setData(ov.values.map((v, i) => (v === null ? { time: (chart.candles[i][0] + IST_S) as UTCTimestamp } : { time: (chart.candles[i][0] + IST_S) as UTCTimestamp, value: v })));
+      if (pane > 0) c.panes()[pane]?.setHeight(70);
+    });
     // Volume (pane 1) coloured by the candle's delta when it carries order flow,
     // else by its direction; cumulative delta for the session (pane 2).
     if (chart.candles.some((k) => k[5])) {
@@ -828,7 +838,8 @@ function TradeChart({ chart }: { chart: BtResult["chart"] }) {
     c.timeScale().setVisibleLogicalRange({ from: Math.max(0, times.length - 300), to: times.length + 5 });
     return () => c.remove();
   }, [chart]);
-  return <div ref={ref} style={{ height: chart.candles.some((k) => k[5]) ? 440 : 380, width: "100%" }} />;
+  const extra = (chart.overlays ?? []).filter((o) => !o.price).length;
+  return <div ref={ref} style={{ height: (chart.candles.some((k) => k[5]) ? 440 : 380) + extra * 75, width: "100%" }} />;
 }
 
 function tradesCsv(trades: BtTrade[]): string {
@@ -855,6 +866,11 @@ function Results({ r }: { r: BtResult }) {
   const skipped = Object.entries(s.skipped ?? {}).filter(([, v]) => v > 0);
   return (
     <>
+      {r.flow_source && Object.keys(r.flow_source).length > 0 && (
+        <div className="meta" style={{ marginBottom: 8 }}>
+          Order flow: {Object.entries(r.flow_source).map(([k, v]) => `${shortSym(k)} ${v}% real ticks`).join(" · ")} — the rest is estimated per minute (BVC). Coverage grows as the recorder runs.
+        </div>
+      )}
       {r.notes.length > 0 && (
         <div className="widget widget-wide" style={{ marginBottom: 12, borderColor: "var(--amber)" }}>
           {r.notes.map((n) => <div key={n.symbol} className="meta">⚠ {n.symbol}: {n.note}</div>)}
@@ -1249,6 +1265,142 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
   );
 }
 
+type RecStatus = { enabled: boolean; config_symbols: string[]; strategy_symbols: string[]; subscribed: string[];
+  today: Record<string, { ticks: number; trades: number; buy: number; sell: number; last: number }>;
+  days_recorded: Record<string, number>; disk_mb: number };
+
+function RecorderPanel() {
+  const qc = useQueryClient();
+  const st = useQuery({ queryKey: ["algo", "ticks"], queryFn: () => api.get<RecStatus>("/api/algo/ticks/status"), refetchInterval: 10000 });
+  const [syms, setSyms] = useState<string[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const list = syms ?? st.data?.config_symbols ?? [];
+  const save = async (enabled: boolean, symbols: string[]) => {
+    setErr(null);
+    try { await api.put("/api/algo/ticks/config", { enabled, symbols }); setSyms(null); qc.invalidateQueries({ queryKey: ["algo", "ticks"] }); }
+    catch (e) { setErr(errMsg(e)); }
+  };
+  const fmt = (v: number) => Math.round(v).toLocaleString("en-IN");
+  const keys = Array.from(new Set([...Object.keys(st.data?.today ?? {}), ...Object.keys(st.data?.days_recorded ?? {})])).sort();
+  return (
+    <div className="widget widget-wide" style={{ marginBottom: 12 }}>
+      <h3>Real tick recorder <span className="meta">every Fyers tick classified buy / sell (Lee-Ready) → real order flow for backtests, live candles and the chart</span></h3>
+      {err && <div className="pnl-neg">{err}</div>}
+      <div className="algo-operand" style={{ gap: 10 }}>
+        <Toggle on={!!st.data?.enabled} onChange={(on: boolean) => save(on, list)} label="recording" />
+        <span className="meta">{st.data ? `${st.data.subscribed.length} subscribed · ${st.data.disk_mb} MB on disk` : "…"}</span>
+      </div>
+      <div className="meta" style={{ margin: "8px 0 4px" }}>Symbols to record ("NIFTY:FUT" = the current NIFTY future, rolls by itself; an index records its future). Symbols of switched-on strategies are added automatically.</div>
+      <SymbolPicker value={list} onChange={(v) => setSyms(v)} />
+      <div className="algo-operand" style={{ gap: 6, marginTop: 6 }}>
+        {["NIFTY:FUT", "BANKNIFTY:FUT", "FINNIFTY:FUT", "MIDCPNIFTY:FUT", "SENSEX:FUT"].filter((x) => !list.includes(x)).map((x) => (
+          <button key={x} type="button" className="btn-sm ghost" onClick={() => setSyms([...list, x])}>+ {x.replace(":FUT", " future")}</button>
+        ))}
+        {syms && <button type="button" className="primary" onClick={() => save(st.data?.enabled ?? true, list)}>Save list</button>}
+        {(st.data?.strategy_symbols ?? []).length > 0 && <span className="meta">+ from strategies: {st.data!.strategy_symbols.map(shortSym).join(", ")}</span>}
+      </div>
+      {keys.length > 0 && (
+        <div className="algo-scroll" style={{ marginTop: 8 }}>
+          <table>
+            <thead><tr><th>Key</th><th>Ticks today</th><th>Trades</th><th>Buy vol</th><th>Sell vol</th><th>Delta</th><th>Buy %</th><th>Last tick</th><th>Days stored</th></tr></thead>
+            <tbody>{keys.map((k) => {
+              const t = st.data?.today[k];
+              return (
+                <tr key={k}><td>{k}</td><td className="mono">{t ? fmt(t.ticks) : "—"}</td><td className="mono">{t ? fmt(t.trades) : "—"}</td>
+                  <td className="mono up">{t ? fmt(t.buy) : "—"}</td><td className="mono down">{t ? fmt(t.sell) : "—"}</td>
+                  <td className={`mono ${t && t.buy >= t.sell ? "pnl-pos" : "pnl-neg"}`}>{t ? fmt(t.buy - t.sell) : "—"}</td>
+                  <td className="mono">{t && t.buy + t.sell ? ((t.buy / (t.buy + t.sell)) * 100).toFixed(1) : "—"}</td>
+                  <td className="mono">{t?.last ? ist(t.last) : "—"}</td><td className="mono">{st.data?.days_recorded[k] ?? 0}</td></tr>
+              );
+            })}</tbody>
+          </table>
+        </div>
+      )}
+      {keys.length === 0 && <div className="empty">Nothing recorded yet — ticks arrive during market hours (09:15–15:30 IST).</div>}
+    </div>
+  );
+}
+
+function CompareTab({ cat, range, draft }: { cat: Catalog; range: { start: string; end: string }; draft: Spec }) {
+  const strategies = useQuery({ queryKey: ["algo", "strategies"], queryFn: () => api.get<{ strategies: Saved[] }>("/api/algo/strategies") });
+  const [pick, setPick] = useState<string[]>(["draft"]);
+  const [oos, setOos] = useState(0);
+  const [rows, setRows] = useState<{ name: string; stats: Stats | null; error?: string }[]>([]);
+  const [running, setRunning] = useState(false);
+  const options = [{ key: "draft", name: "Builder draft", spec: draft },
+    ...(strategies.data?.strategies ?? []).map((s) => ({ key: String(s.id), name: `${s.name} (v${s.version})`, spec: s.spec }))];
+  const run = async () => {
+    setRunning(true);
+    const out: typeof rows = [];
+    for (const o of options.filter((x) => pick.includes(x.key))) {
+      try {
+        const r = await longPost<BtResult>("/api/algo/backtest", { spec: tidy(withDefaults(cat.defaults, o.spec)), ...range, oos_pct: oos || undefined });
+        out.push({ name: o.name, stats: r.stats });
+      } catch (e) { out.push({ name: o.name, stats: null, error: errMsg(e) }); }
+      setRows([...out]);
+    }
+    setRunning(false);
+  };
+  const PAL = ["#FF8C00", "#42A5F5", "#9CCC65", "#AB47BC", "#EC407A", "#26C6DA"];
+  const curve = useMemo(() => {   // equity curves merged on time, carried forward
+    const ok = rows.filter((r) => r.stats);
+    const times = Array.from(new Set(ok.flatMap((r) => r.stats!.equity.map((p) => p[0])))).sort((a, b) => a - b);
+    const step = Math.max(1, Math.ceil(times.length / 600));
+    const last: number[] = ok.map((r) => Number(r.stats!.equity[0]?.[1] ?? 0));
+    const idx = ok.map(() => 0);
+    const out: Record<string, number | string>[] = [];
+    times.forEach((t, n) => {
+      ok.forEach((r, k) => { const e = r.stats!.equity; while (idx[k] < e.length && e[idx[k]][0] <= t) { last[k] = e[idx[k]][1]; idx[k]++; } });
+      if (n % step === 0 || n === times.length - 1) out.push({ t: ist(t), ...Object.fromEntries(ok.map((r, k) => [r.name, last[k]])) });
+    });
+    return out;
+  }, [rows]);
+  const METRICS: [string, string, number][] = [["trades", "Trades", 0], ["win_rate", "Win %", 1], ["net_pnl", "Net ₹", 0], ["profit_factor", "Profit factor", 2],
+    ["sharpe", "Sharpe", 2], ["t_stat", "t-stat", 2], ["max_drawdown_pct", "Max DD %", 1], ["expectancy", "Expectancy ₹", 0], ["kelly_pct", "Kelly %", 1],
+    ["exposure_pct", "Exposure %", 1], ["buy_hold_pct", "Buy & hold %", 2]];
+  return (
+    <div className="widget widget-wide">
+      <h3>Compare <span className="meta">run several strategies (or the builder draft) on {range.start} → {range.end} and line them up</span></h3>
+      <div className="algo-operand" style={{ gap: 10 }}>
+        {options.map((o) => (
+          <label key={o.key} className="meta"><input type="checkbox" checked={pick.includes(o.key)} onChange={(e) => setPick(e.target.checked ? [...pick, o.key] : pick.filter((x) => x !== o.key))} /> {o.name}</label>
+        ))}
+      </div>
+      <div className="algo-operand" style={{ gap: 10, marginTop: 8 }}>
+        <label className="meta">out-of-sample <NumInput width={36} value={oos} onChange={(n) => setOos(Math.max(0, Math.min(80, Math.floor(n ?? 0))))} />%</label>
+        <button type="button" className="primary" disabled={running || !pick.length} onClick={run}>{running ? `Running ${rows.length + 1}/${pick.length}…` : "Run comparison"}</button>
+      </div>
+      {rows.length > 0 && (
+        <>
+          <div className="algo-scroll" style={{ marginTop: 10 }}>
+            <table>
+              <thead><tr><th></th>{rows.map((r) => <th key={r.name}>{r.name}</th>)}</tr></thead>
+              <tbody>
+                {METRICS.map(([k, lab, dp]) => (
+                  <tr key={k}><td>{lab}</td>{rows.map((r) => <td key={r.name} className={`mono ${k === "net_pnl" ? pnlCls(r.stats?.[k]) : ""}`}>{r.error ? "—" : num(r.stats?.[k], dp)}</td>)}</tr>
+                ))}
+                {oos > 0 && <tr><td>OOS net ₹ / PF</td>{rows.map((r) => <td key={r.name} className="mono">{r.stats?.out_of_sample ? `${num(r.stats.out_of_sample.net_pnl, 0)} / ${num(r.stats.out_of_sample.profit_factor)}` : "—"}</td>)}</tr>}
+                {rows.some((r) => r.error) && <tr><td>Error</td>{rows.map((r) => <td key={r.name} className="meta pnl-neg" style={{ whiteSpace: "normal" }}>{r.error ?? ""}</td>)}</tr>}
+              </tbody>
+            </table>
+          </div>
+          {curve.length > 1 && (
+            <ResponsiveContainer width="100%" height={260}>
+              <LineChart data={curve}>
+                <CartesianGrid stroke="var(--border-soft)" />
+                <XAxis dataKey="t" tick={{ fontSize: 10, fill: "var(--text-dim)" }} minTickGap={60} />
+                <YAxis tick={{ fontSize: 10, fill: "var(--text-dim)" }} domain={["auto", "auto"]} width={70} />
+                <Tooltip contentStyle={{ background: "var(--bg-panel)", border: "1px solid var(--border)" }} formatter={(v: number) => inr(v)} />
+                {rows.filter((r) => r.stats).map((r, k) => <Line key={r.name} type="monotone" dataKey={r.name} stroke={PAL[k % PAL.length]} dot={false} strokeWidth={1.5} isAnimationActive={false} />)}
+              </LineChart>
+            </ResponsiveContainer>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 function DataTab() {
   const [symbols, setSymbols] = useState<string[]>(["NSE:NIFTY50-INDEX", "NSE:SBIN-EQ"]);
   const [days, setDays] = useState(365);
@@ -1290,7 +1442,7 @@ function DataTab() {
 // page
 // ---------------------------------------------------------------------------
 
-type Tab = "builder" | "optimize" | "automations" | "data";
+type Tab = "builder" | "optimize" | "compare" | "automations" | "data";
 
 export default function Algo() {
   const cat = useQuery({ queryKey: ["algo", "catalog"], queryFn: () => api.get<Catalog>("/api/algo/indicators"), staleTime: Infinity });
@@ -1404,9 +1556,9 @@ export default function Algo() {
         }}>＋ New algo</button>
       </div>
       <div className="tabs">
-        {(["builder", "optimize", "automations", "data"] as Tab[]).map((t) => (
+        {(["builder", "optimize", "compare", "automations", "data"] as Tab[]).map((t) => (
           <button type="button" key={t} className={`tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
-            {{ builder: "Builder & backtest", optimize: "Optimise", automations: "Automations", data: "Data" }[t]}
+            {{ builder: "Builder & backtest", optimize: "Optimise", compare: "Compare", automations: "Automations", data: "Data" }[t]}
           </button>
         ))}
       </div>
@@ -1415,7 +1567,8 @@ export default function Algo() {
         setName(s.name); setEditing(s.id); setViewing(s.version);
         setSpec(withDefaults(c.defaults, s.spec)); setTab("builder");
       }} />}
-      {tab === "data" && <DataTab />}
+      {tab === "data" && <><RecorderPanel /><DataTab /></>}
+      {tab === "compare" && <CompareTab cat={c} range={range} draft={spec} />}
       {tab === "optimize" && (
         <Optimizer spec={spec} cat={c} range={range} onApply={(params) => {
           const s = clone(spec);
