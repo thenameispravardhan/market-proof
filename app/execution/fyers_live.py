@@ -450,6 +450,10 @@ class FyersClient:
         place_order to /orders/sync."""
         return await self._request("DELETE", "/orders/sync", json_body={"id": order_id})
 
+    async def get_orderbook(self) -> dict[str, Any]:
+        """GET /orders — today's full order book (app, web and API orders)."""
+        return await self._request("GET", "/orders")
+
     async def get_positions(self) -> dict[str, Any]:
         """GET /positions."""
         return await self._request("GET", "/positions")
@@ -1038,6 +1042,20 @@ class FyersLiveBackend:
             except Exception:  # noqa: BLE001
                 log.exception("fyers.positions.parse_error")
         return out
+
+    async def broker_book(self) -> dict[str, Any]:
+        """Raw orderBook + netPositions straight from Fyers — every order and
+        position on the account, wherever it was placed. Errors per half, so
+        a failing positions call still shows the orders."""
+        orders, positions = await asyncio.gather(
+            self._client.get_orderbook(), self._client.get_positions(), return_exceptions=True,
+        )
+        errors = [str(x) for x in (orders, positions) if isinstance(x, BaseException)]
+        return {
+            "orders": (orders.get("orderBook") or []) if isinstance(orders, dict) else [],
+            "positions": (positions.get("netPositions") or []) if isinstance(positions, dict) else [],
+            "errors": errors,
+        }
 
     async def get_funds(self) -> Optional[float]:
         """Total equity balance (₹) in the Fyers account, or None.

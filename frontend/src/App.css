@@ -2700,3 +2700,8 @@ div.ind-row { cursor: default; }
 .strat-chart .zero { stroke: var(--border-hi); stroke-width: 1; }
 .strat-chart .spot { stroke: var(--accent); stroke-width: 1; stroke-dasharray: 3 3; }
 .strat-chart .pnl { fill: none; stroke: #64B5F6; stroke-width: 1.5; }
+
+/* Fyers live tab (TradePanels BrokerLive) */
+.broker-live .live-dot { display: inline-block; width: 5px; height: 5px; margin-left: 4px; border-radius: 50%; background: var(--green); vertical-align: middle; }
+.broker-live.flash { box-shadow: inset 0 0 0 1px var(--accent); transition: box-shadow 0.2s; }
+.broker-live td.dim { color: var(--text-faint); font-size: 10px; }

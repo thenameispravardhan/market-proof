@@ -17,7 +17,6 @@ Caddy exempts only the exact path /api/fyers/postback from basic auth.
 """
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -25,10 +24,31 @@ from sqlalchemy.orm import Session
 
 from app.api import market
 from app.db.models import Trade
+from app.db import session as db_session
 from app.db.session import get_db
-from app.execution.order_reconcile import UNMATCHED_RETRY_S, _unwrap_fyers, reconcile_order_update
+from app.execution.order_reconcile import _unwrap_fyers, reconcile_order_update, spawn, wait_for_trade
+from app.services.event_bus import event_bus
 
 router = APIRouter(prefix="/api/fyers", tags=["fyers"])
+
+
+async def _sync_from_fyers(order_id: str) -> dict[str, Any]:
+    """Reconcile one of OUR orders from what Fyers reports (not the payload)."""
+    backend = market._fyers_backend()  # noqa: SLF001
+    if backend is None or not hasattr(backend, "get_order_status"):
+        return {"ok": False, "reason": "Fyers not connected", "order_id": order_id}
+    # ponytail: one REST read per update of our own orders; add a per-id cooldown if Fyers ever floods
+    st = await backend.get_order_status(order_id)
+    truth = st.raw if isinstance(st.raw, dict) and str(st.raw.get("id") or "") == order_id else None
+    if truth is None:
+        return {"ok": False, "reason": st.error or "order not found at Fyers", "order_id": order_id}
+    with db_session.SessionLocal() as db:
+        return await reconcile_order_update(db, truth, source="fyers_postback")
+
+
+async def _sync_when_row_lands(order_id: str) -> None:
+    if await wait_for_trade(order_id):
+        await _sync_from_fyers(order_id)
 
 
 @router.post("/postback")
@@ -42,21 +62,11 @@ async def fyers_postback(request: Request, db: Session = Depends(get_db)) -> dic
     order_id = str(_unwrap_fyers(payload).get("id") or "").strip()
     if not order_id:
         return {"ok": False, "reason": "no order id"}
-    # Only our own orders cost a Fyers call; manual / unknown ids stop here.
-    # Fyers can call before the placing request has committed our row, so
-    # an unknown id gets one more look after a short wait.
-    mine = lambda: db.query(Trade.id).filter(Trade.broker_order_id == order_id).first() is not None  # noqa: E731
-    if not mine():
-        await asyncio.sleep(UNMATCHED_RETRY_S)
-        db.rollback()  # end the read snapshot so the re-check sees a just-committed row
-        if not mine():
-            return {"ok": True, "matched": False, "order_id": order_id}
-    backend = market._fyers_backend()  # noqa: SLF001
-    if backend is None or not hasattr(backend, "get_order_status"):
-        return {"ok": False, "reason": "Fyers not connected", "order_id": order_id}
-    # ponytail: one REST read per update of our own orders; add a per-id cooldown if Fyers ever floods
-    st = await backend.get_order_status(order_id)
-    truth = st.raw if isinstance(st.raw, dict) and str(st.raw.get("id") or "") == order_id else None
-    if truth is None:
-        return {"ok": False, "reason": st.error or "order not found at Fyers", "order_id": order_id}
-    return await reconcile_order_update(db, truth, source="fyers_postback")
+    await event_bus.publish("broker", {"order_id": order_id, "source": "fyers_postback"})
+    if db.query(Trade.id).filter(Trade.broker_order_id == order_id).first() is not None:
+        return await _sync_from_fyers(order_id)
+    # Not ours (Fyers app / web order) or Fyers beat our own commit: answer
+    # Fyers NOW — it re-sends a webhook that takes ~2s — and look again in
+    # the background. Unknown ids still never cost a Fyers call.
+    spawn(_sync_when_row_lands(order_id))
+    return {"ok": True, "matched": False, "order_id": order_id}

@@ -395,7 +395,7 @@ export function SymbolDetails({ hit }: { hit: InstrumentHit | null }) {
 // Account manager
 // ---------------------------------------------------------------------------
 
-export type BottomTab = "positions" | "orders" | "trades" | "account" | "basket" | "log";
+export type BottomTab = "positions" | "orders" | "trades" | "account" | "basket" | "broker" | "log";
 
 interface TradeRow {
   id: number;
@@ -726,6 +726,7 @@ export function AccountManager({
           </section>
         )}
         {tab === "basket" && <Basket selected={selected} orderFor={orderFor} />}
+        {tab === "broker" && <BrokerLive privacy={privacy} />}
         {tab === "log" && (
           <section className="trade-card">
             {log.length === 0 ? (
@@ -812,6 +813,115 @@ function Basket({ selected, orderFor }: { selected: InstrumentHit | null; orderF
                 <td>{l.type === "LIMIT" ? <input type="number" step="0.05" value={l.price ?? ""} onChange={(e) => put(l.id, { price: e.target.value === "" ? null : Number(e.target.value) })} style={{ width: 90 }} aria-label="Limit price" /> : "—"}</td>
                 <td className="hint">{l.result ?? ""}</td>
                 <td><button type="button" className="chart-menu-x" onClick={() => setLegs((x) => x.filter((y) => y.id !== l.id))} title="Remove leg">✕</button></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Fyers live — the whole broker account, including orders placed from the
+// Fyers app / web. Reloads on every `broker` event (order WebSocket or
+// postback, dispatched by App as "broker:order"); P&L ticks with live quotes.
+// ---------------------------------------------------------------------------
+
+interface BrokerOrder { id: string; symbol: string; side: string; type: string; product: string | null; qty: number; filled: number; remaining: number; limit_price: number | null; stop_price: number | null; traded_price: number | null; status: string; message: string; time: string | null; source: string | null; ours: boolean }
+interface BrokerPosition { symbol: string; product: string | null; net_qty: number; avg_price: number | null; buy_qty: number; buy_avg: number | null; sell_qty: number; sell_avg: number | null; ltp: number | null; realized: number | null; unrealized: number | null; pl: number | null }
+interface BrokerBook { ok: boolean; reason?: string; orders: BrokerOrder[]; positions: BrokerPosition[]; errors?: string[] }
+
+/** Live P&L: realized + (live LTP − avg) × net qty; the Fyers figure until a tick arrives. */
+export function livePnl(p: BrokerPosition, ltp: number | null | undefined): number | null {
+  if (ltp == null || p.net_qty === 0 || p.avg_price == null) return p.pl;
+  return (p.realized ?? 0) + (ltp - p.avg_price) * p.net_qty;
+}
+
+const SOURCES: Record<string, string> = { M: "Mobile", W: "Web", A: "API", ITS: "API", R: "Admin" };
+
+function BrokerPositionRow({ p, privacy, onPnl }: { p: BrokerPosition; privacy: boolean; onPnl: (sym: string, v: number) => void }) {
+  const live = useLiveQuote(p.net_qty ? p.symbol : null)?.last_price ?? null;
+  const ltp = live ?? p.ltp;
+  const pnl = livePnl(p, ltp);
+  useEffect(() => onPnl(`${p.symbol}|${p.product}`, pnl ?? 0), [p.symbol, p.product, pnl]); // eslint-disable-line react-hooks/exhaustive-deps
+  const m = (v: number | null) => (privacy ? "•••" : fmt(v));
+  return (
+    <tr>
+      <td>{p.symbol}</td>
+      <td>{p.product ?? "—"}</td>
+      <td className={p.net_qty > 0 ? "up" : p.net_qty < 0 ? "down" : ""}>{p.net_qty}</td>
+      <td>{fmt(p.avg_price)}</td>
+      <td title={live != null ? "live tick" : "Fyers snapshot"}>{fmt(ltp)}{live != null && <span className="live-dot" />}</td>
+      <td className={(p.realized ?? 0) >= 0 ? "up" : "down"}>{m(p.realized)}</td>
+      <td className={(pnl ?? 0) >= 0 ? "up" : "down"}>{m(pnl)}</td>
+    </tr>
+  );
+}
+
+export function BrokerLive({ privacy }: { privacy: boolean }) {
+  const book = useJson<BrokerBook>("/api/broker/book", 15000); // events drive it; the poll is a fallback
+  const [pnl, setPnl] = useState<Record<string, number>>({});
+  const [flash, setFlash] = useState(false);
+  useEffect(() => {
+    let t: ReturnType<typeof setTimeout> | undefined;
+    // One order fires several events (transit → rejected, socket + postback): coalesce them.
+    const on = () => {
+      clearTimeout(t);
+      t = setTimeout(() => {
+        book.reload();
+        setFlash(true);
+        setTimeout(() => setFlash(false), 800);
+      }, 150);
+    };
+    window.addEventListener("broker:order", on);
+    return () => {
+      window.removeEventListener("broker:order", on);
+      clearTimeout(t);
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  const d = book.data;
+  if (!d) return <section className="trade-card"><div className="empty">Loading the Fyers account…</div></section>;
+  if (!d.ok) return <section className="trade-card"><div className="empty">{d.reason ?? "Fyers account unavailable."}</div></section>;
+  const working = d.orders.filter((o) => o.status === "PENDING" || o.status === "TRANSIT");
+  const total = Object.values(pnl).reduce((a, b) => a + b, 0);
+  const onPnl = (k: string, v: number) => setPnl((x) => (x[k] === v ? x : { ...x, [k]: v }));
+  return (
+    <section className={`trade-card broker-live${flash ? " flash" : ""}`} data-testid="broker-live">
+      <div className="quote-row">
+        <div className="quote-cell"><div className="k">ACCOUNT P&amp;L (LIVE)</div><div className={`v ${total >= 0 ? "up" : "down"}`}>{privacy ? "•••" : fmt(total)}</div></div>
+        <div className="quote-cell"><div className="k">OPEN POSITIONS</div><div className="v">{d.positions.filter((p) => p.net_qty !== 0).length}</div></div>
+        <div className="quote-cell"><div className="k">WORKING ORDERS</div><div className="v">{working.length}</div></div>
+        <div className="quote-cell"><div className="k">ORDERS TODAY</div><div className="v">{d.orders.length}</div></div>
+      </div>
+      {(d.errors ?? []).length > 0 && <div className="hint warn-text">{(d.errors ?? []).join(" · ")}</div>}
+      <div className="chart-menu-head">Positions — whole account (app, web and bot)</div>
+      {d.positions.length === 0 ? (
+        <div className="empty">No positions today.</div>
+      ) : (
+        <table className="pending-table">
+          <thead><tr><th>Symbol</th><th>Product</th><th>Net qty</th><th>Avg</th><th>LTP</th><th>Realized</th><th>P&amp;L</th></tr></thead>
+          <tbody>{d.positions.map((p) => <BrokerPositionRow key={`${p.symbol}-${p.product}`} p={p} privacy={privacy} onPnl={onPnl} />)}</tbody>
+        </table>
+      )}
+      <div className="chart-menu-head">Orders today</div>
+      {d.orders.length === 0 ? (
+        <div className="empty">No orders today.</div>
+      ) : (
+        <table className="pending-table">
+          <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Type</th><th>Qty</th><th>Price</th><th>Status</th><th>From</th><th>ID</th></tr></thead>
+          <tbody>
+            {d.orders.map((o) => (
+              <tr key={o.id} title={o.message}>
+                <td>{o.time?.split(" ").pop() ?? "—"}</td>
+                <td>{o.symbol}</td>
+                <td className={o.side === "BUY" ? "up" : "down"}>{o.side}</td>
+                <td>{o.type}</td>
+                <td>{o.filled ? `${o.filled}/${o.qty}` : o.qty}</td>
+                <td>{fmt(o.traded_price || o.limit_price || o.stop_price)}</td>
+                <td className={o.status === "FILLED" ? "up" : o.status === "REJECTED" || o.status === "CANCELLED" ? "down" : "warn-text"}>{o.status}</td>
+                <td>{o.ours ? "Bot" : SOURCES[o.source ?? ""] ?? o.source ?? "—"}</td>
+                <td className="dim">{o.id}</td>
               </tr>
             ))}
           </tbody>
