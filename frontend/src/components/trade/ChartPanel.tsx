@@ -700,6 +700,53 @@ function undoStore(key: string): UndoStore {
   return st;
 }
 
+/** A cell's history is capped: drop its oldest step and that step's journal entry. */
+function dropOldest(st: UndoStore): void {
+  st.past.shift();
+  for (const [key, v] of UNDO_STORES) {
+    if (v !== st) continue;
+    const k = UNDO_JOURNAL.past.indexOf(key);
+    if (k >= 0) UNDO_JOURNAL.past.splice(k, 1);
+  }
+}
+
+/** One history for the whole layout, like TradingView's: the cells keep
+ *  their own snapshots, the journal keeps the order steps happened in
+ *  across cells. Undo / redo in any chart replays the latest step,
+ *  whichever chart it was in. */
+export const UNDO_JOURNAL: { past: string[]; future: string[] } = { past: [], future: [] };
+const UNDO_HANDLERS = new Map<string, { undo: () => boolean; redo: () => boolean; label: (which: "past" | "future") => string }>();
+const journalListeners = new Set<() => void>();
+function journalChanged(): void {
+  journalListeners.forEach((f) => f());
+}
+
+/** A new step in `cell`: it goes on the journal, and every redo is gone. */
+export function journalPush(cell: string): void {
+  UNDO_JOURNAL.past.push(cell);
+  if (UNDO_JOURNAL.past.length > 300) UNDO_JOURNAL.past.shift();
+  UNDO_JOURNAL.future = [];
+  for (const st of UNDO_STORES.values()) st.future = [];
+  journalChanged();
+}
+
+/** Undo / redo the layout's latest step; false when there's none. Steps
+ *  of a chart that's gone (a smaller layout) are skipped. */
+export function journalStep(which: "undo" | "redo"): boolean {
+  const from = which === "undo" ? UNDO_JOURNAL.past : UNDO_JOURNAL.future;
+  const to = which === "undo" ? UNDO_JOURNAL.future : UNDO_JOURNAL.past;
+  while (from.length) {
+    const cell = from.pop()!;
+    if (UNDO_HANDLERS.get(cell)?.[which]()) {
+      to.push(cell);
+      journalChanged();
+      return true;
+    }
+  }
+  journalChanged();
+  return false;
+}
+
 function computeTheme(s: ChartSettings): ThemeColors {
   const b = readThemeColors();
   const up = s.upColor || b.up;
@@ -968,8 +1015,8 @@ export default function ChartPanel(props: ChartPanelProps) {
       if (st.restoring) st.restoring = false;
       else {
         st.past.push({ label: "change symbol", drawings: [], indicators: [], kind: kindRef.current, iv: ivRef.current, symbol: st.symbol, hit: st.hit });
-        if (st.past.length > 100) st.past.shift();
-        st.future = [];
+        if (st.past.length > 100) dropOldest(st);
+        journalPush(myId);
       }
       setUndoVer((v) => v + 1);
     }
@@ -1263,8 +1310,8 @@ export default function ChartPanel(props: ChartPanelProps) {
   function pushUndo(label: string, snap?: Snap): void {
     const u = undoRef.current;
     u.past.push(snap ?? snapshot(label));
-    if (u.past.length > 100) u.past.shift();
-    u.future = [];
+    if (u.past.length > 100) dropOldest(u);
+    journalPush(myId);
     setUndoVer((v) => v + 1);
   }
 
@@ -1309,22 +1356,54 @@ export default function ChartPanel(props: ChartPanelProps) {
     restoreSnap(s);
   }
 
-  function undo(): void {
+  /** Undo / redo this cell's latest step (the journal decides which cell). */
+  function undoHere(): boolean {
     const u = undoRef.current;
     const s = u.past.pop();
-    if (!s) return;
+    if (!s) return false;
     u.future.push(counterSnap(s));
     applySnap(s);
     setUndoVer((v) => v + 1);
+    return true;
   }
 
-  function redo(): void {
+  function redoHere(): boolean {
     const u = undoRef.current;
     const s = u.future.pop();
-    if (!s) return;
+    if (!s) return false;
     u.past.push(counterSnap(s));
     applySnap(s);
     setUndoVer((v) => v + 1);
+    return true;
+  }
+
+  // the layout-wide history (the journal) reaches this cell through these
+  const undoFnsRef = useRef({ undo: undoHere, redo: redoHere });
+  undoFnsRef.current = { undo: undoHere, redo: redoHere };
+  useEffect(() => {
+    const h = {
+      undo: () => undoFnsRef.current.undo(),
+      redo: () => undoFnsRef.current.redo(),
+      label: (which: "past" | "future") => {
+        const l = undoRef.current[which];
+        return l.length ? l[l.length - 1].label : "";
+      },
+    };
+    UNDO_HANDLERS.set(myId, h);
+    const onJournal = () => setUndoVer((v) => v + 1);
+    journalListeners.add(onJournal);
+    return () => {
+      if (UNDO_HANDLERS.get(myId) === h) UNDO_HANDLERS.delete(myId);
+      journalListeners.delete(onJournal);
+    };
+  }, [myId]);
+
+  function undo(): void {
+    if (!journalStep("undo")) undoHere();
+  }
+
+  function redo(): void {
+    if (!journalStep("redo")) redoHere();
   }
 
   /** Scale / view state ("reset scales" is undoable). */
@@ -5071,10 +5150,18 @@ export default function ChartPanel(props: ChartPanelProps) {
                       : `${activeTool.label}: ${pendingCount ? `point ${pendingCount + 1} of ${activeTool.points}` : `click ${activeTool.points === 1 ? "a point" : "the first point"}`}${stay ? " · stay in drawing mode" : ""} (Shift snaps 45°, Esc cancels)`
                   : null;
   void undoVer;
-  const canUndo = undoRef.current.past.length > 0;
-  const canRedo = undoRef.current.future.length > 0;
-  const undoLabel = canUndo ? undoRef.current.past[undoRef.current.past.length - 1].label : "";
-  const redoLabel = canRedo ? undoRef.current.future[undoRef.current.future.length - 1].label : "";
+  // the layout's history: the latest step in any chart (else this chart's own)
+  const jPast = UNDO_JOURNAL.past.filter((c) => UNDO_HANDLERS.has(c));
+  const jFuture = UNDO_JOURNAL.future.filter((c) => UNDO_HANDLERS.has(c));
+  const canUndo = jPast.length > 0 || undoRef.current.past.length > 0;
+  const canRedo = jFuture.length > 0 || undoRef.current.future.length > 0;
+  const stepLabel = (cell: string | undefined, which: "past" | "future") => {
+    if (!cell) return undoRef.current[which].length ? undoRef.current[which][undoRef.current[which].length - 1].label : "";
+    const l = UNDO_HANDLERS.get(cell)?.label(which) ?? "";
+    return cell === myId || !multi ? l : `${l} (another chart)`;
+  };
+  const undoLabel = canUndo ? stepLabel(jPast[jPast.length - 1], "past") : "";
+  const redoLabel = canRedo ? stepLabel(jFuture[jFuture.length - 1], "future") : "";
   const lightVars = settings.theme === "light"
     ? ({
         "--bg-panel": LIGHT.panel, "--bg-surface": LIGHT.surface, "--bg-elev": LIGHT.elev, "--bg-input": LIGHT.bg,
