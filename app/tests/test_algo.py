@@ -587,3 +587,15 @@ def test_tick_recorder_end_to_end(tmp_path):
     m1 = {"t": [t0], "o": [100.0], "h": [100.1], "l": [99.95], "c": [100.1], "v": [500]}
     b = of.build_bars(m1, "time", 1, real=flow)
     assert b["buy_v"][0] == 400 and b["real_pct"][0] == 100.0  # the candle's split IS the recorded one
+    rec.on_tick("NSE:SBIN-EQ", {"ltp": 99.0, "vol_traded_today": 9e6, "exch_feed_time": t0 - 86400 * 3})
+    assert rec.flush() == 0                                  # subscribe snapshot of an earlier session: dropped
+    y = t0 - 86400                                           # a day the bot was down at the close
+    late = ticks.TickRecorder(tmp_path)
+    for k, (ltp, vol, bid, ask) in enumerate(seq):
+        late._buf.setdefault("SBIN", []).append(late._classify("SBIN", (y + k, y + 10 * k, ltp, vol, 0.0, 0, bid, ask,
+                                                                        0.0, 0.0, 0.0, 0.0)))
+    late.flush()
+    late._minutes, late._fp, late._state = {}, {}, {}
+    ticks.TickRecorder(tmp_path).sweep()
+    assert not list((tmp_path / "raw" / "SBIN").glob("*.csv"))
+    assert ticks.TickRecorder(tmp_path).minute_flow("SBIN", y, y + 60) == {y: (400.0, 100.0)}
