@@ -624,3 +624,207 @@ export function volumeProfile(candles: OhlcvCandle[], valueArea = 0.7): {
   }
   return { poc, vah, val };
 }
+
+/** Smoothed (Wilder / RMA) moving average, seeded with the first SMA. */
+export function smma(values: number[], period: number): (number | null)[] {
+  const out: (number | null)[] = new Array(values.length).fill(null);
+  if (period <= 0 || values.length < period) return out;
+  let prev = 0;
+  for (let i = 0; i < period; i++) prev += values[i];
+  prev /= period;
+  out[period - 1] = prev;
+  for (let i = period; i < values.length; i++) {
+    prev = (prev * (period - 1) + values[i]) / period;
+    out[i] = prev;
+  }
+  return out;
+}
+
+/** Volume-weighted moving average. */
+export function vwma(values: number[], volumes: number[], period: number): (number | null)[] {
+  const out: (number | null)[] = new Array(values.length).fill(null);
+  if (period <= 0) return out;
+  let pv = 0;
+  let v = 0;
+  for (let i = 0; i < values.length; i++) {
+    pv += values[i] * (volumes[i] ?? 0);
+    v += volumes[i] ?? 0;
+    if (i >= period) {
+      pv -= values[i - period] * (volumes[i - period] ?? 0);
+      v -= volumes[i - period] ?? 0;
+    }
+    if (i >= period - 1) out[i] = v > 0 ? pv / v : sma(values.slice(i - period + 1, i + 1), period)[period - 1];
+  }
+  return out;
+}
+
+export type MaType = "SMA" | "EMA" | "SMMA" | "WMA" | "VWMA";
+
+/** Any moving average over a series that may start with warm-up nulls:
+ *  the average runs on the defined tail and keeps the leading gap. */
+export function movingAverage(
+  type: MaType,
+  values: (number | null)[],
+  period: number,
+  volumes?: number[],
+): (number | null)[] {
+  const out: (number | null)[] = new Array(values.length).fill(null);
+  let start = 0;
+  while (start < values.length && values[start] === null) start++;
+  const tail = values.slice(start).map((v) => (v === null ? 0 : v));
+  let res: (number | null)[];
+  switch (type) {
+    case "EMA": res = ema(tail, period); break;
+    case "SMMA": res = smma(tail, period); break;
+    case "WMA": res = wma(tail, period); break;
+    case "VWMA": res = vwma(tail, (volumes ?? []).slice(start), period); break;
+    default: res = sma(tail, period);
+  }
+  for (let i = 0; i < res.length; i++) out[start + i] = res[i];
+  return out;
+}
+
+export interface KeltnerResult {
+  upper: (number | null)[];
+  middle: (number | null)[];
+  lower: (number | null)[];
+}
+
+/** Keltner channels: EMA of close ± mult × ATR. */
+export function keltner(candles: OhlcvCandle[], period = 20, mult = 2, atrPeriod = 10): KeltnerResult {
+  const mid = ema(candles.map((c) => c.close), period);
+  const a = atr(candles, atrPeriod);
+  const upper = mid.map((m, i) => (m === null || a[i] === null ? null : m + mult * (a[i] as number)));
+  const lower = mid.map((m, i) => (m === null || a[i] === null ? null : m - mult * (a[i] as number)));
+  return { upper, middle: mid, lower };
+}
+
+export interface PivotResult {
+  p: (number | null)[];
+  r1: (number | null)[];
+  r2: (number | null)[];
+  r3: (number | null)[];
+  s1: (number | null)[];
+  s2: (number | null)[];
+  s3: (number | null)[];
+}
+
+/** Classic floor pivots from the PREVIOUS period's high / low / close.
+ *  `periodOf` maps a candle time to its period id (day, month, year …). */
+export function pivotPoints(candles: OhlcvCandle[], periodOf: (t: number) => number): PivotResult {
+  const n = candles.length;
+  const mk = () => new Array<number | null>(n).fill(null);
+  const res: PivotResult = { p: mk(), r1: mk(), r2: mk(), r3: mk(), s1: mk(), s2: mk(), s3: mk() };
+  let period = Number.NaN;
+  let hi = -Infinity, lo = Infinity, close = 0;
+  let prev: { h: number; l: number; c: number } | null = null;
+  for (let i = 0; i < n; i++) {
+    const c = candles[i];
+    const k = periodOf(c.time);
+    if (k !== period) {
+      if (!Number.isNaN(period)) prev = { h: hi, l: lo, c: close };
+      period = k;
+      hi = -Infinity;
+      lo = Infinity;
+    }
+    if (c.high > hi) hi = c.high;
+    if (c.low < lo) lo = c.low;
+    close = c.close;
+    if (prev) {
+      const p = (prev.h + prev.l + prev.c) / 3;
+      const r = prev.h - prev.l;
+      res.p[i] = p;
+      res.r1[i] = 2 * p - prev.l;
+      res.s1[i] = 2 * p - prev.h;
+      res.r2[i] = p + r;
+      res.s2[i] = p - r;
+      res.r3[i] = prev.h + 2 * (p - prev.l);
+      res.s3[i] = prev.l - 2 * (prev.h - p);
+    }
+  }
+  return res;
+}
+
+/** Linear regression of `values` (least squares on the index).
+ *  Returns the fitted value at the first and last index plus the
+ *  standard deviation of the residuals. */
+export function linearRegression(values: number[]): { start: number; end: number; dev: number } | null {
+  const n = values.length;
+  if (n < 2) return null;
+  let sx = 0, sy = 0, sxy = 0, sxx = 0;
+  for (let i = 0; i < n; i++) {
+    sx += i;
+    sy += values[i];
+    sxy += i * values[i];
+    sxx += i * i;
+  }
+  const den = n * sxx - sx * sx;
+  const slope = den !== 0 ? (n * sxy - sx * sy) / den : 0;
+  const icpt = (sy - slope * sx) / n;
+  let ss = 0;
+  for (let i = 0; i < n; i++) ss += (values[i] - (icpt + slope * i)) ** 2;
+  return { start: icpt, end: icpt + slope * (n - 1), dev: Math.sqrt(ss / n) };
+}
+
+export type Rating = "Strong sell" | "Sell" | "Neutral" | "Buy" | "Strong buy";
+
+/** TradingView-style technical rating: the mean of moving-average votes
+ *  (price above / below SMA & EMA 10…200) and oscillator votes (RSI,
+ *  Stochastic, CCI, Williams %R, MACD, momentum), each in −1 … +1. */
+export function technicalRating(candles: OhlcvCandle[]): {
+  score: number;
+  ma: number;
+  osc: number;
+  rating: Rating;
+  votes: { buy: number; sell: number; neutral: number };
+} | null {
+  const n = candles.length;
+  if (n < 30) return null;
+  const closes = candles.map((c) => c.close);
+  const last = closes[n - 1];
+  const votes = { buy: 0, sell: 0, neutral: 0 };
+  const tally = (v: number) => {
+    if (v > 0) votes.buy++;
+    else if (v < 0) votes.sell++;
+    else votes.neutral++;
+    return v;
+  };
+  const maVotes: number[] = [];
+  for (const len of [10, 20, 30, 50, 100, 200]) {
+    for (const f of [sma, ema]) {
+      const v = f(closes, len)[n - 1];
+      if (v !== null) maVotes.push(tally(last > v ? 1 : last < v ? -1 : 0));
+    }
+  }
+  const oscVotes: number[] = [];
+  const r = rsi(closes, 14);
+  if (r[n - 1] !== null && r[n - 2] !== null) {
+    const v = r[n - 1] as number, p = r[n - 2] as number;
+    oscVotes.push(tally(v < 30 && v > p ? 1 : v > 70 && v < p ? -1 : 0));
+  }
+  const st = stochastic(candles, 14, 3, 3);
+  const k = st.k[n - 1], d = st.d[n - 1];
+  if (k !== null && d !== null) oscVotes.push(tally(k < 20 && k > d ? 1 : k > 80 && k < d ? -1 : 0));
+  const cc = cci(candles, 20);
+  if (cc[n - 1] !== null && cc[n - 2] !== null) {
+    const v = cc[n - 1] as number, p = cc[n - 2] as number;
+    oscVotes.push(tally(v < -100 && v > p ? 1 : v > 100 && v < p ? -1 : 0));
+  }
+  const w = williamsR(candles, 14);
+  if (w[n - 1] !== null && w[n - 2] !== null) {
+    const v = w[n - 1] as number, p = w[n - 2] as number;
+    oscVotes.push(tally(v < -80 && v > p ? 1 : v > -20 && v < p ? -1 : 0));
+  }
+  const m = macd(closes, 12, 26, 9);
+  if (m.macd[n - 1] !== null && m.signal[n - 1] !== null) {
+    oscVotes.push(tally((m.macd[n - 1] as number) > (m.signal[n - 1] as number) ? 1 : -1));
+  }
+  if (n > 11) oscVotes.push(tally(closes[n - 1] > closes[n - 11] ? 1 : closes[n - 1] < closes[n - 11] ? -1 : 0));
+  const mean = (a: number[]) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0);
+  const ma = mean(maVotes);
+  const osc = mean(oscVotes);
+  const score = (ma + osc) / 2;
+  const rating: Rating =
+    score > 0.5 ? "Strong buy" : score > 0.1 ? "Buy" : score < -0.5 ? "Strong sell" : score < -0.1 ? "Sell" : "Neutral";
+  return { score, ma, osc, rating, votes };
+}

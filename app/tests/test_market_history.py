@@ -119,3 +119,44 @@ def test_history_rejects_empty_range(client: TestClient, monkeypatch) -> None:
     body = r.json()
     assert body["ok"] is False
     assert stub.calls == []
+
+
+def test_history_accepts_second_resolutions(client: TestClient, monkeypatch) -> None:
+    """The chart's 5s … 45s intervals pass straight through to Fyers."""
+    stub = _StubBackend()
+    monkeypatch.setattr(market, "_fyers_backend", lambda: stub)
+    r = client.get(
+        "/api/market/history",
+        params={"symbol": "NSE:SBIN-EQ", "resolution": "15s", "from": 1, "to": 2},
+    )
+    body = r.json()
+    assert body["ok"] is True
+    assert stub.calls[0]["resolution"] == "15S"
+
+
+def test_funds_degrades_without_fyers(client: TestClient, monkeypatch) -> None:
+    monkeypatch.setattr(market, "_fyers_backend", lambda: None)
+    body = client.get("/api/market/funds").json()
+    assert body == {"ok": False, "available": None, "reason": "connect a Fyers account for funds"}
+
+
+def test_funds_reports_the_available_balance(client: TestClient, monkeypatch) -> None:
+    class _Funds:
+        async def get_funds(self) -> float:
+            return 125000.5
+
+    monkeypatch.setattr(market, "_fyers_backend", lambda: _Funds())
+    body = client.get("/api/market/funds").json()
+    assert body["ok"] is True
+    assert body["available"] == 125000.5
+
+
+def test_funds_broker_failure(client: TestClient, monkeypatch) -> None:
+    class _Broken:
+        async def get_funds(self) -> float:
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(market, "_fyers_backend", lambda: _Broken())
+    body = client.get("/api/market/funds").json()
+    assert body["ok"] is False
+    assert body["available"] is None
