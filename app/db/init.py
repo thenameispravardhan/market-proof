@@ -50,7 +50,8 @@ def init_db() -> None:
 # add these by hand. Idempotent and SQLite-friendly.
 _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
     "positions": [("stop_loss", "FLOAT"), ("target", "FLOAT"), ("product", "VARCHAR(16) NOT NULL DEFAULT 'INTRADAY'")],
-    "trades": [("slippage_pct", "FLOAT"), ("r_multiple", "FLOAT"), ("product", "VARCHAR(16) NOT NULL DEFAULT 'INTRADAY'")],
+    "trades": [("slippage_pct", "FLOAT"), ("r_multiple", "FLOAT"), ("product", "VARCHAR(16) NOT NULL DEFAULT 'INTRADAY'"),
+               ("filled_qty", "INTEGER NOT NULL DEFAULT 0")],
     # DeepSeek v4 inference controls — added to the prompt tables after
     # they shipped. DEFAULT clauses backfill existing rows so reads never
     # see NULL (medium reasoning, thinking + streaming off).
