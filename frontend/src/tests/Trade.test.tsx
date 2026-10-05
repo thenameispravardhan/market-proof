@@ -2,7 +2,7 @@
 // and verify the place-order flow against a stubbed backend.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import Trade from "../pages/Trade";
@@ -686,6 +686,57 @@ describe("Trade page", () => {
     fireEvent.dragOver(cell, { dataTransfer });
     fireEvent.drop(cell, { dataTransfer });
     await waitFor(() => expect(JSON.parse(localStorage.getItem("trade:last") ?? "null")?.symbol).toBe(leg.symbol));
+  });
+
+  it("chain: dropping on another chart cell never moves the chain to that cell's stock", async () => {
+    const leg = { symbol: "NSE:RELIANCE26OCT2500CE", ltp: 42, bid: 41.9, ask: 42.1, oi: 1000, volume: 10, ltpch: 0, lot_size: 500, tick_size: 0.05 };
+    const chain = { ok: true, underlying: "RELIANCE", symbol: "", spot: 2450, expiries: [], selected_expiry: null, source: "fyers",
+      strikes: [{ strike: 2500, ce: leg, pe: null }] };
+    const tcs = { symbol: "NSE:TCS-EQ", short_name: "TCS", exchange: "NSE", segment: "EQ", instrument_type: "EQ", lot_size: 1, tick_size: 0.05, expiry: null, strike: null, underlying: null, display: "TCS" };
+    localStorage.setItem("trade:layout", JSON.stringify("2"));
+    localStorage.setItem("trade:cells", JSON.stringify([null, tcs]));
+    const stubs = defaultStubs();
+    globalThis.fetch = makeFetchStub((url, init) => (url.includes("/api/options/chain") ? makeJsonResponse(chain) : stubs(url, init)));
+    const user = userEvent.setup();
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await user.type(await screen.findByTestId("trade-search"), "RELI");
+    await user.click(await screen.findByTestId("search-row-NSE:RELIANCE-EQ"));
+    if (!screen.queryByTestId("dock-chain")) await user.click(screen.getByTestId("rail-chain"));
+    const price = await screen.findByTestId("chain-ce-2500");
+    const store: Record<string, string> = {};
+    const dataTransfer = { setData: (k: string, v: string) => { store[k] = v; }, getData: (k: string) => store[k] ?? "", get types() { return Object.keys(store); }, effectAllowed: "", dropEffect: "" };
+    fireEvent.dragStart(price, { dataTransfer });
+    const cell = await screen.findByTestId("tv-cell-1");
+    fireEvent.dragOver(cell, { dataTransfer });
+    fireEvent.drop(cell, { dataTransfer });
+    await waitFor(() => expect(JSON.parse(localStorage.getItem("trade:last") ?? "null")?.symbol).toBe(leg.symbol));
+    expect(JSON.parse(localStorage.getItem("trade:chainBase") ?? "null")?.symbol).toBe("NSE:RELIANCE-EQ");
+    // the option ticket asks for lots, not quantity
+    const lots = await screen.findByTestId("ticket-lots");
+    fireEvent.change(lots, { target: { value: "3" } });
+    expect(screen.getByTestId("ticket-qty").textContent).toContain("1500 qty");
+  });
+
+  it("ticket: F&O asks for lots; SL / target as price, points or %", async () => {
+    const posts: Record<string, unknown>[] = [];
+    const stubs = defaultStubs();
+    globalThis.fetch = makeFetchStub((url, init) => {
+      if (/\/api\/orders$/.test(url) && init?.method === "POST") posts.push(JSON.parse(String(init.body)));
+      return stubs(url, init);
+    });
+    const user = userEvent.setup();
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await user.type(await screen.findByTestId("trade-search"), "RELI");
+    await user.click(await screen.findByTestId("search-row-NSE:RELIANCE-EQ"));
+    await waitFor(() => expect(screen.getByTestId("ticket-submit")).not.toBeDisabled());
+    // ask = 2450.5 for a BUY: SL 1% below, target 20 points above
+    await user.click(within(screen.getByTestId("ticket-sl-mode")).getByText("%"));
+    await user.type(screen.getByTestId("ticket-sl"), "1");
+    await user.click(within(screen.getByTestId("ticket-tp-mode")).getByText("pts"));
+    await user.type(screen.getByTestId("ticket-tp"), "20");
+    await user.click(screen.getByTestId("ticket-submit"));
+    await waitFor(() => expect(posts).toHaveLength(1));
+    expect(posts[0]).toMatchObject({ stop_loss: 2426, target: 2470.5 });
   });
 
   it("does not render the option chain for a non-index symbol", async () => {

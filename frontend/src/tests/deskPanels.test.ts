@@ -81,3 +81,18 @@ describe("extra indicators", () => {
     }
   });
 });
+
+import { levelPrice } from "../pages/Trade";
+
+describe("ticket level input", () => {
+  it("turns price / points / % into an absolute level on the right side", () => {
+    expect(levelPrice(95, "price", 100, "BUY", "sl")).toBe(95);
+    expect(levelPrice(2, "pct", 100, "BUY", "sl")).toBe(98);
+    expect(levelPrice(2, "pct", 100, "BUY", "target")).toBe(102);
+    expect(levelPrice(5, "pts", 100, "SELL", "sl")).toBe(105);
+    expect(levelPrice(5, "pts", 100, "SELL", "target")).toBe(95);
+    expect(levelPrice(1, "pct", 333.33, "BUY", "sl", 0.05)).toBe(330);
+    expect(levelPrice(0, "pct", 100, "BUY", "sl")).toBeNull();
+    expect(levelPrice(1, "pct", null, "BUY", "sl")).toBeNull();
+  });
+});
