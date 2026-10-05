@@ -102,6 +102,44 @@ async def update_levels(
     return {"ok": True, "managed": result}
 
 
+class ConvertBody(BaseModel):
+    to: str
+
+
+@router.post("/{symbol}/convert")
+async def convert_position(symbol: str, body: ConvertBody) -> dict[str, Any]:
+    """Convert an open position's product at the broker (INTRADAY <-> DELIVERY
+    for cash, INTRADAY <-> MARGIN for F&O) and record it, so the EOD
+    square-off flattens it or carries it accordingly."""
+    from app.api import market
+    from app.api.orders import MANUAL_PRODUCTS, _PRODUCT_ALIASES
+    from app.db import session as db_session
+    from app.db.models import Position as PositionRow
+
+    to = _PRODUCT_ALIASES.get(body.to.upper(), body.to.upper())
+    if to not in MANUAL_PRODUCTS:
+        raise HTTPException(status_code=422, detail=f"convert to one of {sorted(MANUAL_PRODUCTS)}")
+    with db_session.SessionLocal() as db:
+        pos = db.query(PositionRow).filter_by(symbol=symbol).one_or_none()
+        if pos is None or not pos.quantity:
+            raise HTTPException(status_code=404, detail=f"no open position for {symbol!r}")
+        frm, qty = pos.product or "INTRADAY", pos.quantity
+    if frm == to:
+        return {"ok": True, "symbol": symbol, "product": to, "unchanged": True}
+    backend = market._fyers_backend()  # noqa: SLF001
+    if backend is None or not hasattr(backend, "convert_position"):
+        raise HTTPException(status_code=503, detail="connect a Fyers account to convert positions")
+    try:
+        await backend.convert_position(symbol, qty, abs(qty), frm, to)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Fyers rejected the conversion: {e}")
+    with db_session.SessionLocal() as db:
+        db.query(PositionRow).filter_by(symbol=symbol).update({"product": to})
+        db.commit()
+    _audit("positions.convert", symbol, {"from": frm, "to": to, "qty": qty})
+    return {"ok": True, "symbol": symbol, "product": to, "from": frm}
+
+
 @router.post("/close-all")
 async def close_all(request: Request) -> dict[str, Any]:
     """Square off every managed position."""

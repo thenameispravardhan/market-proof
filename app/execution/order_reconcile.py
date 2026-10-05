@@ -256,6 +256,7 @@ def _apply_fill_to_position(db: Session, trade: TradeRow) -> None:
                 average_price=float(trade.price or 0.0),
                 last_price=float(trade.price or 0.0),
                 unrealized_pnl=0.0,
+                product=trade.product or "INTRADAY",
             )
         )
     else:

@@ -130,6 +130,7 @@ def _ser_position(p: Position) -> dict[str, Any]:
         "last_price": p.last_price,
         "unrealized_pnl": p.unrealized_pnl,
         "strategy_id": p.strategy_id,
+        "product": p.product or "INTRADAY",
         "opened_at": _iso_utc(p.opened_at),
         "updated_at": _iso_utc(p.updated_at),
     }

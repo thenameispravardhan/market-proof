@@ -279,6 +279,9 @@ class Trade(Base):
     order_type: Mapped[str] = mapped_column(String(16), default="market", nullable=False)
     status: Mapped[str] = mapped_column(String(16), default="placed", nullable=False)
     broker_order_id: Mapped[Optional[str]] = mapped_column(String(128), index=True)
+    # Broker product: INTRADAY (MIS, the bot's only product) or, for manual
+    # Trade-page orders, DELIVERY (CNC) / MARGIN (F&O carry-forward).
+    product: Mapped[str] = mapped_column(String(16), default="INTRADAY", server_default="INTRADAY", nullable=False)
     pnl: Mapped[Optional[float]] = mapped_column(Float)
     # Realised-trade analytics (RISK.md §7): % the fill slipped from the
     # intended entry, and the exit's reward-to-risk multiple. Populated
@@ -312,6 +315,9 @@ class Position(Base):
     # then). Nullable — a position may have no managed exits.
     stop_loss: Mapped[Optional[float]] = mapped_column(Float)
     target: Mapped[Optional[float]] = mapped_column(Float)
+    # INTRADAY rows are flattened by the EOD square-off; DELIVERY / MARGIN
+    # (manual carry-forward) rows are left alone.
+    product: Mapped[str] = mapped_column(String(16), default="INTRADAY", server_default="INTRADAY", nullable=False)
     strategy_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("strategies.id", ondelete="SET NULL")
     )

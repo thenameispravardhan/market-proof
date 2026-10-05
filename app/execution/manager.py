@@ -1613,6 +1613,7 @@ class Manager:
                     status=local_status,
                     broker_order_id=result.broker_order_id or None,
                     executed_at=datetime.now(timezone.utc) if result.state == OrderState.FILLED else None,
+                    product=product_type.value,
                 )
             )
             # Mirror a confirmed fill into the positions table so the
@@ -1636,6 +1637,7 @@ class Manager:
                                 average_price=fill_price,
                                 last_price=fill_price,
                                 unrealized_pnl=0.0,
+                                product=product_type.value,
                             )
                         )
                 else:

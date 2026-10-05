@@ -481,7 +481,12 @@ function LocalPnl({ p, privacy }: { p: Position; privacy: boolean }) {
   return <span className={(v ?? 0) >= 0 ? "up" : "down"}>{privacy ? "•••" : fmt(v)}</span>;
 }
 
-const CONVERT_HINT = "This terminal is intraday-only — positions square off before the close, so converting to delivery / carry-forward (CNC / NRML) is turned off.";
+/** Intraday ⇄ carry: DELIVERY (CNC) for cash, MARGIN (NRML) for F&O. */
+const isFnoSymbol = (sym: string) => !/-(EQ|BE|INDEX)$/i.test(sym);
+export const convertTarget = (p: { symbol: string; product?: string }) =>
+  (p.product ?? "INTRADAY") !== "INTRADAY" ? "INTRADAY" : isFnoSymbol(p.symbol) ? "MARGIN" : "DELIVERY";
+const convertTitle = (p: { symbol: string; product?: string }) =>
+  convertTarget(p) === "INTRADAY" ? "Convert back to intraday — it will be squared off before the close" : "Convert to carry-forward — the EOD square-off will leave it open";
 
 export function AccountManager({
   tab,
@@ -681,7 +686,17 @@ export function AccountManager({
                       void run(`Reverse ${p.symbol}`, () => orderFor(p.symbol, p.symbol, q)({ side: p.quantity > 0 ? "SELL" : "BUY", type: "MARKET", price: null }));
                     }
                   }}>⇅</button>
-                  <span title={CONVERT_HINT}><button type="button" className="btn-sm" disabled>Convert</button></span>
+                  <button type="button" className="btn-sm" title={convertTitle(p)} data-testid={`convert-${p.symbol}`} onClick={() => {
+                    const to = convertTarget(p);
+                    if (window.confirm(`Convert ${p.symbol} (${p.quantity}) from ${p.product ?? "INTRADAY"} to ${to}?`)) {
+                      void run(`Convert ${p.symbol} → ${to}`, async () => {
+                        const r = await fetch(`/api/positions/${encodeURIComponent(p.symbol)}/convert`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ to }) });
+                        const j = await r.json().catch(() => ({}));
+                        if (!r.ok) throw new Error(j.detail ?? `HTTP ${r.status}`);
+                        return `${p.symbol} is now ${j.product}`;
+                      });
+                    }
+                  }}>{(p.product ?? "INTRADAY") === "INTRADAY" ? "→ Carry" : "→ Intraday"}</button>
                   <button type="button" className="btn-sm danger" title="Exit — full or partial, market or limit" onClick={() => setExit({ pos: { symbol: p.symbol, name: p.symbol, qty: p.quantity, avg: p.average_price, ltp: p.last_price, lot: lotOf(p.symbol) }, local: true })} data-testid={`exit-${p.symbol}`}>Exit</button>
                 </>
               )}

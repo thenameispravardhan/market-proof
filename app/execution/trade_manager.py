@@ -1033,6 +1033,11 @@ class TradeManager:
             None, _open_position_symbols, self._session_factory
         )
         symbols.update(db_syms)
+        if reason == "EOD_SQUAREOFF":
+            # Manual DELIVERY / MARGIN positions are carried forward on purpose.
+            symbols -= set(await asyncio.get_running_loop().run_in_executor(
+                None, _carry_position_symbols, self._session_factory
+            ))
         out: list[dict[str, Any]] = []
         for symbol in symbols:
             res = await self.close_position(symbol, reason=reason)
@@ -1220,6 +1225,8 @@ class TradeManager:
             )
             limit_price = float(base) * (1.0 + buffer)
 
+        exit_product = _position_product(self._session_factory, mp.symbol)
+
         async def _place(order_type: OrderType, lp: Optional[float]) -> Optional[OrderResult]:
             """One place_order call, wrapped in the broker timeout.
             Returns None on timeout (T-24: the order MAY be live — the
@@ -1234,7 +1241,7 @@ class TradeManager:
                         order_type=order_type,
                         limit_price=lp,
                         stop_price=None,
-                        product_type=ProductType.INTRADAY,
+                        product_type=exit_product,
                         validity="IOC" if order_type == OrderType.LIMIT else "DAY",
                     ),
                     timeout=broker_timeout,
@@ -1355,7 +1362,7 @@ class TradeManager:
                     order_type=OrderType.MARKET,
                     limit_price=None,
                     stop_price=None,
-                    product_type=ProductType.INTRADAY,
+                    product_type=_position_product(self._session_factory, mp.symbol),
                     validity="DAY",
                 ),
                 timeout=broker_timeout,
@@ -1616,6 +1623,28 @@ class TradeManager:
 
 
 # -- DB helpers (sync, run in executor) ----------------------------------
+
+
+def _carry_position_symbols(session_factory: Callable[[], Any]) -> list[str]:
+    """Open positions with a carry-forward product (manual DELIVERY / MARGIN)."""
+    from app.db.models import Position as PositionRow
+
+    with session_factory() as session:
+        rows = session.query(PositionRow).filter(PositionRow.quantity != 0, PositionRow.product != "INTRADAY").all()
+        return [r.symbol for r in rows]
+
+
+def _position_product(session_factory: Callable[[], Any], symbol: str) -> ProductType:
+    """Product to close a position with — its own, so a CNC exit sells the
+    holding instead of opening an MIS short."""
+    from app.db.models import Position as PositionRow
+
+    try:
+        with session_factory() as session:
+            row = session.query(PositionRow).filter_by(symbol=symbol).one_or_none()
+            return ProductType(row.product) if row is not None and row.product else ProductType.INTRADAY
+    except Exception:  # noqa: BLE001
+        return ProductType.INTRADAY
 
 
 def _open_position_symbols(session_factory: Callable[[], Any]) -> list[str]:

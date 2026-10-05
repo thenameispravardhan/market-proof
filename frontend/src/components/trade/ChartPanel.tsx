@@ -4405,7 +4405,8 @@ export default function ChartPanel(props: ChartPanelProps) {
     // The chart area (toolbars, drawing strip, charts, date-range bar) goes
     // fullscreen — not the side panels or the account manager. Esc exits.
     if (document.fullscreenElement) void document.exitFullscreen();
-    else void (wrapRef.current?.closest(".tv-layout") ?? wrapRef.current?.closest(".chart-card"))?.requestFullscreen?.();
+    // The whole Trade page (chart + right dock + rail) so the panels keep working in fullscreen.
+    else void (wrapRef.current?.closest(".trade-page") ?? wrapRef.current?.closest(".tv-layout") ?? wrapRef.current?.closest(".chart-card"))?.requestFullscreen?.();
   }
 
   /** PNG of the chart: a title strip (symbol, interval, last OHLC, change),

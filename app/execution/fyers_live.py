@@ -472,6 +472,10 @@ class FyersClient:
         order (the SDK's `cancel_gtt_order`)."""
         return await self._request("DELETE", "/gtt/orders/sync", json_body={"id": gtt_id})
 
+    async def convert_position(self, body: dict[str, Any]) -> dict[str, Any]:
+        """PUT /positions — convert an open position's product (e.g. INTRADAY -> CNC)."""
+        return await self._request("PUT", "/positions", json_body=body)
+
     async def get_orderbook(self) -> dict[str, Any]:
         """GET /orders — today's full order book (app, web and API orders)."""
         return await self._request("GET", "/orders")
@@ -1157,6 +1161,14 @@ class FyersLiveBackend:
             except Exception:  # noqa: BLE001
                 log.exception("fyers.positions.parse_error")
         return out
+
+    async def convert_position(self, symbol: str, side: int, qty: int, from_product: str, to_product: str) -> None:
+        """Convert an open position between products. Raises FyersAPIError on rejection."""
+        fy = {"INTRADAY": "INTRADAY", "DELIVERY": "CNC", "MARGIN": "MARGIN"}
+        await self._client.convert_position({
+            "symbol": symbol, "positionSide": 1 if side > 0 else -1, "convertQty": int(qty),
+            "convertFrom": fy[from_product], "convertTo": fy[to_product], "overnight": 0,
+        })
 
     async def broker_book(self) -> dict[str, Any]:
         """Raw orderBook + netPositions straight from Fyers — every order and
