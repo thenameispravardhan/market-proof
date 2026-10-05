@@ -45,12 +45,14 @@ FYERS_STATUS_HINTS: dict[str, str] = {
     "7": "EXPIRED",
 }
 
-# Fyers can confirm / reject within milliseconds — before the placing
-# request has committed its trades row. An update that beats its row is
-# re-matched after these waits (seconds, ~2s total); the row usually lands
-# in tens of ms, so the first short wait catches it.
-RETRY_DELAYS = (0.1, 0.3, 0.6, 1.0)
-_tasks: set = set()  # strong refs so background retries aren't GC'd
+# Trading DB work runs on its own two threads — never on the event loop (an
+# fsync / busy SQLite would freeze ticks and orders) and never queued behind
+# Algo Lab backtests or PDF extraction on the default executor.
+from concurrent.futures import ThreadPoolExecutor
+
+TRADING_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="trading-db")
+
+_tasks: set = set()  # strong refs so background tasks aren't GC'd
 
 
 def spawn(coro: Any) -> None:
@@ -59,16 +61,65 @@ def spawn(coro: Any) -> None:
     t.add_done_callback(_tasks.discard)
 
 
+# Fyers often confirms / rejects BEFORE the placing request has committed its
+# trades row. Such an update is parked here and applied the moment the row
+# is saved (apply_parked, called by the order path) — no polling ladder.
+# A slow backstop retry covers rows written by other paths.
+PARKED: dict[str, list[tuple[dict[str, Any], str]]] = {}
+BACKSTOP_DELAYS = (0.5, 1.5, 3.0, 5.0)
+
+# Ticket SL / target to arm once THIS order fills: order_id -> (symbol, sl, tp).
+LEVELS_ON_FILL: dict[str, tuple[str, Any, Any]] = {}
+
+# Exit orders waiting for their fill on the order WebSocket: order_id -> future
+# resolved with the terminal status text (FILLED / REJECTED / CANCELLED ...).
+ORDER_WAITERS: dict[str, "asyncio.Future[dict[str, Any]]"] = {}
+
+
+# Terminal updates nobody was waiting for yet (the fill can beat the waiter).
+RECENT_TERMINAL: dict[str, dict[str, Any]] = {}
+
+
+def wait_for_order(order_id: str) -> "asyncio.Future[dict[str, Any]]":
+    fut = ORDER_WAITERS.get(order_id)
+    if fut is None or fut.done():
+        fut = asyncio.get_running_loop().create_future()
+        ORDER_WAITERS[order_id] = fut
+        if order_id in RECENT_TERMINAL:
+            fut.set_result(RECENT_TERMINAL.pop(order_id))
+            ORDER_WAITERS.pop(order_id, None)
+    return fut
+
+
 async def wait_for_trade(order_id: str) -> bool:
     """True once a trades row with this broker_order_id is committed."""
     from app.db.session import SessionLocal
 
-    for d in RETRY_DELAYS:
-        await asyncio.sleep(d)
+    def _has() -> bool:
         with SessionLocal() as db:
-            if db.query(TradeRow.id).filter(TradeRow.broker_order_id == order_id).first() is not None:
-                return True
+            return db.query(TradeRow.id).filter(TradeRow.broker_order_id == order_id).first() is not None
+
+    loop = asyncio.get_running_loop()
+    for d in BACKSTOP_DELAYS:
+        await asyncio.sleep(d)
+        if await loop.run_in_executor(TRADING_POOL, _has):
+            return True
     return False
+
+
+async def apply_parked(order_id: str) -> None:
+    """Apply updates that arrived before this order's row existed."""
+    from app.db.session import SessionLocal
+
+    for payload, source in PARKED.pop(order_id, []):
+        with SessionLocal() as db:
+            await reconcile_order_update(db, payload, source=source, retry=False)
+
+
+async def _backstop(order_id: str) -> None:
+    if order_id in PARKED and await wait_for_trade(order_id):
+        await apply_parked(order_id)
+    PARKED.pop(order_id, None)  # never matched: an order placed outside the bot
 
 
 def _split_symbol(raw: str) -> tuple[str, str]:
@@ -124,126 +175,127 @@ _STATUS_MAP = {
 _TERMINAL = {"filled", "rejected", "cancelled"}
 
 
-async def _retry_unmatched(order_id: str, payload: dict[str, Any], source: str) -> None:
-    if await wait_for_trade(order_id):
-        from app.db.session import SessionLocal
-
-        with SessionLocal() as db:
-            await reconcile_order_update(db, payload, source=source, retry=False)
-
-
 async def reconcile_order_update(
     db: Session, payload: Mapping[str, Any], *, source: str = "fyers", retry: bool = True
 ) -> dict[str, Any]:
     """Reconcile a single Fyers order update against the trades table.
 
-    `payload` is the raw Fyers order object (or a wrapper around it).
-    `source` tags where the update came from (e.g. ``fyers_order_ws``)
-    for the audit trail and the published event. Historical rows may
-    carry ``fyers_postback`` from the since-removed webhook receiver.
-    Commits `db` on a match. Returns a result dict describing the outcome.
+    Matches by broker_order_id, never creates a signal, deduped (WebSocket +
+    postback + polls converge). The DB work runs on TRADING_POOL; events,
+    exit waiters and SL/TP arming happen back on the loop, AFTER the commit.
     """
     order = _unwrap_fyers(payload)
     order_id = str(order.get("id") or order.get("order_id") or "").strip()
     status_text = _status_text(order.get("status"))
     _exch, sym = _split_symbol(str(order.get("symbol") or ""))
-    traded_price = order.get("tradedPrice") or order.get("limitPrice")
-
     if not order_id:
         log.warning("fyers.reconcile.no_order_id", source=source, status=status_text, symbol=sym)
         return {"ok": False, "reason": "no order id in payload"}
 
-    new_status = _STATUS_MAP.get(status_text, "placed")
-    # Nudge the UI's live broker view on EVERY update — including orders
-    # placed outside the bot (Fyers app / web), which never get a trades row.
-    if retry:
-        await event_bus.publish("broker", {"order_id": order_id, "status": status_text, "symbol": sym, "source": source})
+    res = await asyncio.get_running_loop().run_in_executor(TRADING_POOL, _reconcile_sync, db, order, order_id, status_text, source)
 
-    trade = (
-        db.query(TradeRow).filter(TradeRow.broker_order_id == order_id).one_or_none()
-    )
-    if trade is None:
-        # An order we didn't originate (manual order in the Fyers app, or
-        # a stale id). Acknowledge without creating anything — a broker
-        # update must NEVER spin up a new signal.
-        log.info(
-            "fyers.reconcile.unmatched_order",
-            source=source, order_id=order_id, status=status_text, retry=retry,
-        )
+    if status_text in ("FILLED", "REJECTED", "CANCELLED", "EXPIRED"):
+        fut = ORDER_WAITERS.pop(order_id, None)
+        if fut is not None and not fut.done():
+            fut.set_result(dict(order))
+        else:
+            RECENT_TERMINAL[order_id] = dict(order)
+            while len(RECENT_TERMINAL) > 500:
+                RECENT_TERMINAL.pop(next(iter(RECENT_TERMINAL)))
+
+    if not res.get("matched"):
         if retry:
-            spawn(_retry_unmatched(order_id, dict(payload), source))
+            PARKED.setdefault(order_id, []).append((dict(payload), source))
+            if len(PARKED[order_id]) == 1:
+                spawn(_backstop(order_id))
+        await event_bus.publish("broker", {"order_id": order_id, "status": status_text, "symbol": sym, "source": source})
+        return res
+
+    if res.get("changed"):
+        await event_bus.publish(
+            "trades.filled" if res["status"] == "filled" else "trade.executed",
+            {"trade_id": res["trade_id"], "symbol": res["symbol"], "status": res["status"],
+             "broker_order_id": order_id, "price": res.get("price"), "source": source},
+        )
+        if res.get("filled_now") and order_id in LEVELS_ON_FILL:
+            symbol, sl, tp = LEVELS_ON_FILL.pop(order_id)
+            spawn(_arm_levels(order_id, symbol, sl, tp))
+        if res["status"] in ("rejected", "cancelled") and not res.get("filled_now"):
+            LEVELS_ON_FILL.pop(order_id, None)
+    await event_bus.publish("broker", {"order_id": order_id, "status": status_text, "symbol": sym, "source": source})
+    return {k: v for k, v in res.items() if k not in ("changed", "filled_now", "symbol", "price")}
+
+
+async def _arm_levels(order_id: str, symbol: str, sl: Any, tp: Any) -> None:
+    from app.main import app
+
+    tm = getattr(app.state, "trade_manager", None)
+    if tm is None:
+        return
+    try:
+        await tm.update_levels(symbol, stop_loss=sl, target=tp)
+        log.info("manual_order.levels_armed", order_id=order_id, symbol=symbol, stop_loss=sl, target=tp)
+    except Exception:  # noqa: BLE001
+        log.exception("manual_order.levels_arm_failed", order_id=order_id)
+
+
+def _reconcile_sync(db: Session, order: dict[str, Any], order_id: str, status_text: str, source: str) -> dict[str, Any]:
+    new_status = _STATUS_MAP.get(status_text, "placed")
+    trade = db.query(TradeRow).filter(TradeRow.broker_order_id == order_id).one_or_none()
+    if trade is None:
+        log.info("fyers.reconcile.unmatched_order", source=source, order_id=order_id, status=status_text)
         return {"ok": True, "matched": False, "order_id": order_id, "status": new_status}
 
-    # Dual-confirmation dedup: the same fill can arrive via the order
-    # WebSocket, the postback webhook AND the entry state machine's REST
-    # poll. The FIRST confirmation wins; a repeat of the same status is
-    # acknowledged without re-applying (re-applying a fill would double
-    # the position), and a terminal `filled` row is never downgraded by
-    # a late cancel/pending echo (an IOC partial's final broker status
-    # is "cancelled" even though shares traded).
-    if trade.status == new_status:
-        log.info(
-            "fyers.reconcile.deduped",
-            source=source, order_id=order_id, status=new_status,
-        )
-        return {
-            "ok": True, "matched": True, "deduped": True,
-            "trade_id": trade.id, "status": new_status,
-        }
-    # A terminal row never goes back: no fill downgraded, and a late
-    # "transit"/"pending" echo (retries can land out of order) can't
-    # resurrect a rejected or cancelled order.
-    if (trade.status == "filled" and new_status != "filled") or (trade.status in _TERMINAL and new_status == "placed"):
-        log.info(
-            "fyers.reconcile.kept_fill",
-            source=source, order_id=order_id, ignored_status=new_status,
-        )
-        return {
-            "ok": True, "matched": True, "deduped": True,
-            "trade_id": trade.id, "status": trade.status,
-        }
+    # Partial fills (manual orders only — the auto pipeline mirrors its own
+    # fills): apply each new filledQty slice to the position as it arrives.
+    filled_now = False
+    manual = trade.signal_id is None
+    reported = order.get("filledQty")
+    try:
+        reported = int(reported) if reported is not None else None
+    except (TypeError, ValueError):
+        reported = None
+    already = int(trade.filled_qty or 0)
+    target_filled = reported if reported is not None else (int(trade.quantity or 0) if new_status == "filled" else already)
+    delta = target_filled - already if manual else 0
+    price = order.get("tradedPrice") or order.get("limitPrice")
 
-    trade.status = new_status
+    if trade.status == new_status and delta <= 0:
+        log.info("fyers.reconcile.deduped", source=source, order_id=order_id, status=new_status)
+        return {"ok": True, "matched": True, "deduped": True, "trade_id": trade.id, "status": new_status}
+    # A terminal row never goes back (no fill downgraded; a late transit /
+    # pending echo can't resurrect a rejected or cancelled order).
+    if (trade.status == "filled" and new_status != "filled") or (trade.status in _TERMINAL and new_status == "placed" and delta <= 0):
+        log.info("fyers.reconcile.kept_fill", source=source, order_id=order_id, ignored_status=new_status)
+        return {"ok": True, "matched": True, "deduped": True, "trade_id": trade.id, "status": trade.status}
+
+    try:
+        if price is not None and (delta > 0 or new_status == "filled"):
+            trade.price = float(price)
+    except (TypeError, ValueError):
+        pass
+    if manual and delta > 0:
+        _apply_fill_to_position(db, trade, delta)
+        trade.filled_qty = already + delta
+        filled_now = True
+    elif not manual and new_status == "filled" and trade.status != "filled":
+        _apply_fill_to_position(db, trade, int(trade.quantity or 0))
+        filled_now = True
+    if trade.status != "filled":
+        trade.status = new_status
     if new_status == "filled":
-        try:
-            if traded_price is not None:
-                trade.price = float(traded_price)
-        except (TypeError, ValueError):
-            pass
         trade.executed_at = datetime.now(timezone.utc)
-        _apply_fill_to_position(db, trade)
-
-    db.add(
-        AuditLog(
-            actor="system",
-            action=f"{source}.{new_status}",
-            target=f"trade:{trade.id}",
-            after={"order_id": order_id, "status": new_status, "price": trade.price},
-        )
-    )
+    db.add(AuditLog(actor="system", action=f"{source}.{new_status}", target=f"trade:{trade.id}",
+                    after={"order_id": order_id, "status": new_status, "price": trade.price, "filled": trade.filled_qty}))
     db.commit()
-
-    await event_bus.publish(
-        "trades.filled" if new_status == "filled" else "trade.executed",
-        {
-            "trade_id": trade.id,
-            "symbol": trade.symbol,
-            "status": new_status,
-            "broker_order_id": order_id,
-            "price": trade.price,
-            "source": source,
-        },
-    )
-    log.info(
-        "fyers.reconcile.reconciled",
-        source=source, order_id=order_id, trade_id=trade.id, status=new_status,
-    )
-    return {"ok": True, "matched": True, "trade_id": trade.id, "status": new_status}
+    log.info("fyers.reconcile.reconciled", source=source, order_id=order_id, trade_id=trade.id, status=trade.status)
+    return {"ok": True, "matched": True, "trade_id": trade.id, "status": trade.status, "changed": True,
+            "filled_now": filled_now, "symbol": trade.symbol, "price": trade.price}
 
 
-def _apply_fill_to_position(db: Session, trade: TradeRow) -> None:
-    """Mirror a confirmed Fyers fill into the positions table."""
-    qty = int(trade.quantity or 0)
+def _apply_fill_to_position(db: Session, trade: TradeRow, qty: int | None = None) -> None:
+    """Mirror a confirmed Fyers fill (or one partial slice of it) into positions."""
+    qty = int(trade.quantity or 0) if qty is None else int(qty)
     if qty <= 0:
         return
     signed = qty if (trade.side or "").upper() == "BUY" else -qty

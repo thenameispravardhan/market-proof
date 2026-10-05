@@ -53,7 +53,7 @@ def _eventually(fn, timeout: float = 2.0) -> bool:
 
 
 def test_postback_trusts_fyers_not_the_payload(client: TestClient, monkeypatch) -> None:
-    monkeypatch.setattr(order_reconcile, "RETRY_DELAYS", (0.01,))
+    monkeypatch.setattr(order_reconcile, "BACKSTOP_DELAYS", (0.01,))
     _trade("OID-1")
     be = _Backend(code=2, price=801.5)
     monkeypatch.setattr(market, "_fyers_backend", lambda: be)
@@ -68,7 +68,7 @@ def test_postback_trusts_fyers_not_the_payload(client: TestClient, monkeypatch) 
 def test_postback_answers_fast_and_catches_the_row_later(client: TestClient, monkeypatch) -> None:
     """Fyers rejected within ms, before the placing request committed the row:
     reply at once (Fyers re-sends slow webhooks), reconcile in the background."""
-    monkeypatch.setattr(order_reconcile, "RETRY_DELAYS", (0.05, 0.1, 0.2))
+    monkeypatch.setattr(order_reconcile, "BACKSTOP_DELAYS", (0.05, 0.1, 0.2))
     monkeypatch.setattr(market, "_fyers_backend", lambda: _Backend(code=5))
     t0 = time.time()
     r = client.post("/api/fyers/postback", json={"orders": {"id": "OID-RACE", "status": 5}})
@@ -78,7 +78,7 @@ def test_postback_answers_fast_and_catches_the_row_later(client: TestClient, mon
 
 
 def test_ws_update_before_row_is_retried_and_no_resurrection(client: TestClient, monkeypatch) -> None:
-    monkeypatch.setattr(order_reconcile, "RETRY_DELAYS", (0.05, 0.05, 0.05))
+    monkeypatch.setattr(order_reconcile, "BACKSTOP_DELAYS", (0.05, 0.05, 0.05))
 
     async def scenario() -> None:
         with db_session.SessionLocal() as db:

@@ -549,7 +549,7 @@ export function AccountManager({
   const fundsFull = useApiJson<FundsResp>(tab === "funds" ? "/api/broker/funds" : null, 30000);
   const holdings = useApiJson<HoldingsResp>(tab === "holdings" || tab === "account" ? "/api/broker/holdings" : null, 60000);
   const gtt = useApiJson<GttResp>(tab === "gtt" ? "/api/broker/gtt" : null, 30000);
-  const profile = useApiJson<ProfileResp>(connected ? "/api/broker/profile" : null);
+  const profile = useApiJson<ProfileResp>(connected ? "/api/broker/profile" : null, 0, false);   // static identity: not on every order
   const log = useSyncExternalStore(subscribeLog, getLog);
   const open = (positions ?? []).filter((p) => p.quantity !== 0);
   const totalPnl = open.reduce((a, p) => a + (p.unrealized_pnl ?? 0), 0);
@@ -964,6 +964,9 @@ export function useLayouts() {
   // Dirty check + autosave every few seconds.
   useEffect(() => {
     const id = setInterval(() => {
+      // Several tabs open: only the one you're looking at autosaves, so a
+      // background tab never overwrites the layout you're editing.
+      if (document.hidden) return;
       const list = readLayouts();
       const c = list.find((l) => l.id === localStorage.getItem(CURRENT_KEY));
       if (!c) {

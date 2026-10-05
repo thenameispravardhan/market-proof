@@ -54,7 +54,7 @@ import {
 } from "lightweight-charts";
 import { api } from "../../api/client";
 import { getTheme, THEME_EVENT, toggleTheme } from "../../lib/theme";
-import { useLiveQuote } from "../../hooks/useQuotes";
+import { onQuote, useLiveQuote, type QuoteTick } from "../../hooks/useQuotes";
 import { heikinAshi, heikinAshiBar, type OhlcvCandle } from "../../lib/indicators";
 import type { HistoryResponse, InstrumentHit, SearchResponse } from "../../types";
 import {
@@ -760,6 +760,18 @@ function computeTheme(s: ChartSettings): ThemeColors {
     volDown: withAlpha(down, 0.35, b.volDown),
     ...(light ? { text: LIGHT.dim, grid: LIGHT.grid, border: LIGHT.border, crosshair: LIGHT.faint, bg: LIGHT.bg, draw: "#2962FF" } : {}),
   };
+}
+
+/** One live price in the legend (sell = bid, buy = ask, spread): the only
+ *  part of the chart that re-renders per tick. */
+function LivePx({ symbol, kind, fallback, fmt }: { symbol: string; kind: "sell" | "buy" | "spread"; fallback: number | null; fmt: (v: number) => string }) {
+  const q = useLiveQuote(symbol);
+  const bid = q?.bid ?? null;
+  const ask = q?.ask ?? null;
+  const ltp = q?.last_price ?? fallback;
+  if (kind === "spread") return <>{bid != null && ask != null ? fmt(ask - bid) : "—"}</>;
+  const v = (kind === "sell" ? bid : ask) ?? ltp;
+  return <>{v != null ? fmt(v) : "—"}</>;
 }
 
 export default function ChartPanel(props: ChartPanelProps) {
@@ -2178,7 +2190,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     indRefreshTimer.current = window.setTimeout(() => {
       indRefreshTimer.current = undefined;
       refreshIndicatorData();
-    }, 1000);
+    }, 250);   // indicators follow price within a quarter second
   }
 
   /** Push the full candle set into every series. */
@@ -3939,9 +3951,15 @@ export default function ChartPanel(props: ChartPanelProps) {
   }, [compareQuery, symbol]);
 
   // 9) Live last bar from the `/ws` quote stream + alert triggers.
-  const live = useLiveQuote(symbol);
-  liveQuoteRef.current = live;
-  useEffect(() => {
+  // Ticks are applied straight to the series through a store callback: no
+  // React re-render of this (very large) component per tick. Only the small
+  // LivePx prices in the legend re-render.
+  const onLiveRef = useRef<(live: QuoteTick) => void>(() => undefined);
+  useEffect(() => onQuote(symbol, (q) => {
+    liveQuoteRef.current = q;
+    onLiveRef.current(q);
+  }), [symbol]);
+  onLiveRef.current = (live: QuoteTick) => {
     if (!live || live.last_price == null) return;
     const lp = live.last_price;
     liveRef.current = { bid: live.bid ?? null, ask: live.ask ?? null };
@@ -3987,7 +4005,7 @@ export default function ChartPanel(props: ChartPanelProps) {
         brickTimer.current = window.setTimeout(() => {
           brickTimer.current = undefined;
           applyData();
-        }, 1000);
+        }, 250);
       }
     } else {
       const bar = candles[candles.length - 1];
@@ -3998,8 +4016,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     }
     legendLastBar();
     updateExtraLines();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [live]);
+  };
 
   // 10) Bar-close countdown under the last-price label (intraday, market hours).
   useEffect(() => {
@@ -5206,9 +5223,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     return p === undefined || p === 0 || !knownPanes.has(p);
   });
   const qtyStep = instrument?.lot_size && instrument.lot_size > 1 ? instrument.lot_size : 1;
-  const bid = live?.bid ?? null;
-  const ask = live?.ask ?? null;
-  const ltpNow = live?.last_price ?? lastClose();
+  const ltpFallback = lastClose();
   const quickTrade = settings.buySellButtons && !!onChartOrder && !hide.positions;
 
   /** Open the legend's More menu next to the clicked button. */
@@ -6000,9 +6015,9 @@ export default function ChartPanel(props: ChartPanelProps) {
             {quickTrade && (
               <div className="lg-row lg-trade" data-testid="chart-quick-row">
                 <button type="button" className="qt sell" onClick={() => quickOrder("SELL")} title={instant ? "Sell at market — one click" : "Sell — opens the order window"} data-testid="chart-quick-sell">
-                  <span>SELL</span><b>{bid != null ? fmtPrice(bid) : ltpNow != null ? fmtPrice(ltpNow) : "—"}</b>
+                  <span>SELL</span><b><LivePx symbol={symbol} kind="sell" fallback={ltpFallback} fmt={fmtPrice} /></b>
                 </button>
-                <span className="qt-spread" title="Spread">{bid != null && ask != null ? fmtNum(ask - bid, 2) : "—"}</span>
+                <span className="qt-spread" title="Spread"><LivePx symbol={symbol} kind="spread" fallback={null} fmt={(v) => fmtNum(v, 2)} /></span>
                 <input
                   className="qt-qty"
                   type="number"
@@ -6018,7 +6033,7 @@ export default function ChartPanel(props: ChartPanelProps) {
                   }}
                 />
                 <button type="button" className="qt buy" onClick={() => quickOrder("BUY")} title={instant ? "Buy at market — one click" : "Buy — opens the order window"} data-testid="chart-quick-buy">
-                  <span>BUY</span><b>{ask != null ? fmtPrice(ask) : ltpNow != null ? fmtPrice(ltpNow) : "—"}</b>
+                  <span>BUY</span><b><LivePx symbol={symbol} kind="buy" fallback={ltpFallback} fmt={fmtPrice} /></b>
                 </button>
               </div>
             )}
@@ -6099,7 +6114,7 @@ export default function ChartPanel(props: ChartPanelProps) {
                     title="Reverse the position at market"
                     onClick={() => {
                       const q = Math.abs(showPos.qty) * 2;
-                      if (window.confirm(`Reverse: ${showPos.qty > 0 ? "SELL" : "BUY"} ${q} ${shortName} at market?`)) {
+                      if (instant || window.confirm(`Reverse: ${showPos.qty > 0 ? "SELL" : "BUY"} ${q} ${shortName} at market?`)) {
                         submitOrder({ side: showPos.qty > 0 ? "SELL" : "BUY", type: "MARKET", price: null });
                       }
                     }}
@@ -6113,7 +6128,7 @@ export default function ChartPanel(props: ChartPanelProps) {
                     className="x"
                     title="Close the position at market"
                     onClick={() => {
-                      if (window.confirm(`Close ${showPos.qty > 0 ? "LONG" : "SHORT"} ${Math.abs(showPos.qty)} ${shortName} at market?`)) {
+                      if (instant || window.confirm(`Close ${showPos.qty > 0 ? "LONG" : "SHORT"} ${Math.abs(showPos.qty)} ${shortName} at market?`)) {
                         onClosePosition().catch((err) => addToast(`Close failed: ${err instanceof Error ? err.message : String(err)}`));
                       }
                     }}

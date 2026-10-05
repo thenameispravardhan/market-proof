@@ -100,6 +100,8 @@ log = get_logger(__name__)
 
 # Channels the manager publishes on.
 CHANNEL_TRADE_EXECUTED = "trade.executed"
+
+from app.execution.order_reconcile import TRADING_POOL  # noqa: E402  (trading DB writes' own threads)
 CHANNEL_TRADE_CLOSED = "trade.closed"
 CHANNEL_RISK_BLOCKED = "risk.blocked"
 # A drift-blocked signal entering the passive retracement watch (not a
@@ -1450,35 +1452,25 @@ class Manager:
         # Settings-page risk rules govern the BOT, not the operator: a manual
         # Trade-page order is never blocked by them. The verdict is still
         # computed and returned as an advisory `risk_warning` (and logged).
+        # Advisory only, so it runs AFTER the order is sent (it can make Fyers
+        # REST calls — funds, ADV history — that must never delay the order).
         risk_codes: list[str] = []
         risk_message = ""
-        risk_approved = True
-        try:
-            decision = await self._risk.evaluate(
-                signal=manual_signal,
-                account=account,
-                entry=entry,
-                stop_loss=stop_loss,
-                target=target,
-                manual_qty=int(quantity),
-            )
-            risk_approved = bool(decision.approved)
-            if not decision.approved:
-                risk_codes = list(decision.codes)
-                risk_message = (
-                    "; ".join(v.get("code", "?") for v in decision.violations)
-                    if decision.violations
-                    else "risk limit exceeded"
+
+        async def _advise() -> None:
+            try:
+                decision = await self._risk.evaluate(
+                    signal=manual_signal, account=account, entry=entry,
+                    stop_loss=stop_loss, target=target, manual_qty=int(quantity),
                 )
-                log.warning(
-                    "manual_order.risk_advisory",
-                    account_id=account.id, symbol=symbol, side=side,
-                    quantity=quantity, codes=risk_codes,
-                )
-        except Exception as e:  # noqa: BLE001
-            # Engine fault → advisory only; never block on an engine error.
-            log.warning("manual_order.risk_engine_failed", error=str(e))
-            risk_message = f"risk check unavailable: {e}"
+                if not decision.approved:
+                    log.warning(
+                        "manual_order.risk_advisory",
+                        account_id=account.id, symbol=symbol, side=side,
+                        quantity=quantity, codes=list(decision.codes),
+                    )
+            except Exception as e:  # noqa: BLE001
+                log.warning("manual_order.risk_engine_failed", error=str(e))
 
         backend = self._manual_backend_for(account)
         if backend is None:
@@ -1503,9 +1495,9 @@ class Manager:
         # flips it to filled/rejected and updates the position. We do NOT
         # poll get_order_status here — the operator wants order data to come
         # exclusively from the Fyers webhook.
-        # Persist + audit
+        # Persist + audit (own small pool: never queued behind backtests / PDF jobs)
         await asyncio.get_running_loop().run_in_executor(
-            None,
+            TRADING_POOL,
             self._persist_manual_trade_executed,
             account.id,
             manual_signal,
@@ -1520,6 +1512,14 @@ class Manager:
             risk_codes,
             risk_message,
         )
+        # A Fyers update that beat this commit was parked — apply it now.
+        if result.broker_order_id:
+            from app.execution.order_reconcile import apply_parked
+
+            await apply_parked(str(result.broker_order_id))
+        from app.execution.order_reconcile import spawn as _spawn
+
+        _spawn(_advise())
         # `result.state` is one of PENDING / FILLED / REJECTED / etc.
         # The local `trades.status` column uses the same lowercase
         # vocab as the auto-pipeline ("placed" for new rows, "filled"
@@ -1614,6 +1614,7 @@ class Manager:
                     broker_order_id=result.broker_order_id or None,
                     executed_at=datetime.now(timezone.utc) if result.state == OrderState.FILLED else None,
                     product=product_type.value,
+                    filled_qty=int(quantity) if result.state == OrderState.FILLED and fill_price > 0 else 0,
                 )
             )
             # Mirror a confirmed fill into the positions table so the

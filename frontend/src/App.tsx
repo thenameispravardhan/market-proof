@@ -1,8 +1,10 @@
 import { lazy, Suspense, useEffect, useState } from "react";
+import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useRouter } from "./router";
 import type { TabKey } from "./router";
 import { useWebSocket } from "./hooks/useWebSocket";
 import { ingestQuote, useLiveQuote } from "./hooks/useQuotes";
+import { ingestDepth } from "./hooks/useDepth";
 import { usePanelSizes } from "./hooks/usePanelSizes";
 import {
   useFyersAuthorizeUrl,
@@ -228,16 +230,26 @@ function StatusBar({ wsStatus }: { wsStatus: string }) {
   );
 }
 
+function refreshTrading(qc: QueryClient): void {
+  for (const k of ["positions", "managed-positions", "pending-orders", "trades"]) void qc.invalidateQueries({ queryKey: [k] });
+  window.dispatchEvent(new Event("broker:order"));
+}
+
 export default function App() {
   const [tab, navigate] = useRouter();
+  const qc = useQueryClient();
   const { status } = useWebSocket({
-    channels: ["signals", "trades", "positions", "quotes", "broker"],
+    channels: ["signals", "quotes", "depth", "broker", "trades.filled", "trade.executed", "trade.closed", "algo.entry", "algo.exit", "algo.update"],
     onEvent: (msg) => {
-      if (msg.channel === "quotes") ingestQuote(msg.payload);
-      // Any order update on the Fyers account (bot, app or web) -> the Trade page's live broker view reloads.
-      if (msg.channel === "broker") window.dispatchEvent(new Event("broker:order"));
+      if (msg.channel === "quotes") { ingestQuote(msg.payload); return; }
+      if (msg.channel === "depth") { ingestDepth(msg.payload); return; }
+      // Fills / closes / order updates (bot, app or web) refresh every view at once — no 3-5 s poll wait.
+      if (msg.channel === "broker" || msg.channel.startsWith("trade")) refreshTrading(qc);
+      if (msg.channel.startsWith("algo.")) window.dispatchEvent(new CustomEvent("algo:event", { detail: msg.payload }));
     },
   });
+  // After a (re)connect, pull what may have been missed while the socket was down.
+  useEffect(() => { if (status === "open") refreshTrading(qc); }, [status, qc]);
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(readSidebarOpen);
   const [skin, setSkin] = useState<AppTheme>(getTheme);
   useEffect(() => {

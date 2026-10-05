@@ -9,6 +9,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { InstrumentHit, OptionChainResponse } from "../../types";
 import { useLiveQuote } from "../../hooks/useQuotes";
+import { useDepth } from "../../hooks/useDepth";
 
 const fmt = (v: number | null | undefined, d = 2) => (v == null || !Number.isFinite(v) ? "—" : v.toLocaleString("en-IN", { minimumFractionDigits: d, maximumFractionDigits: d }));
 const fmtQty = (v: number) => (v >= 1e7 ? `${(v / 1e7).toFixed(2)}Cr` : v >= 1e5 ? `${(v / 1e5).toFixed(2)}L` : v >= 1e3 ? `${(v / 1e3).toFixed(1)}K` : String(Math.round(v)));
@@ -38,26 +39,10 @@ export function DepthPanel({ symbol, tick, onPrice, onMarket }: {
   onPrice: (price: number, side: "BUY" | "SELL") => void;
   onMarket: (side: "BUY" | "SELL") => void;
 }) {
-  const [d, setD] = useState<Depth | null>(null);
+  const d = useDepth(symbol);   // pushed book, shared with the DOM panel
   const [view, setView] = useState<"ladder" | "depth">("ladder");
   const live = useLiveQuote(symbol);
-  useEffect(() => {
-    if (!symbol) return;
-    let stop = false;
-    const load = () => {
-      if (document.hidden) return;
-      void fetch(`/api/market/depth?symbol=${encodeURIComponent(symbol)}`)
-        .then((r) => r.json())
-        .then((j: Depth) => !stop && setD(j))
-        .catch(() => !stop && setD({ ok: false, reason: "depth request failed" }));
-    };
-    load();
-    const id = setInterval(load, 2000); // ponytail: 2s REST poll (Fyers caps data calls ~200/min); move to the depth socket if the ladder must tick faster
-    return () => {
-      stop = true;
-      clearInterval(id);
-    };
-  }, [symbol]);
+
 
   if (!symbol) return <div className="hint">Open a symbol to see its book.</div>;
   if (!d) return <div className="hint">Loading depth…</div>;

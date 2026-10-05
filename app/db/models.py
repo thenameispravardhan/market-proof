@@ -282,6 +282,8 @@ class Trade(Base):
     # Broker product: INTRADAY (MIS, the bot's only product) or, for manual
     # Trade-page orders, DELIVERY (CNC) / MARGIN (F&O carry-forward).
     product: Mapped[str] = mapped_column(String(16), default="INTRADAY", server_default="INTRADAY", nullable=False)
+    # Quantity already mirrored into positions (partial fills apply in slices).
+    filled_qty: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     pnl: Mapped[Optional[float]] = mapped_column(Float)
     # Realised-trade analytics (RISK.md §7): % the fill slipped from the
     # intended entry, and the exit's reward-to-risk multiple. Populated

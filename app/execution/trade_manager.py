@@ -1038,10 +1038,13 @@ class TradeManager:
             symbols -= set(await asyncio.get_running_loop().run_in_executor(
                 None, _carry_position_symbols, self._session_factory
             ))
+        # All at once: the last position must not wait N exits for its turn.
+        results = await asyncio.gather(*(self.close_position(s, reason=reason) for s in symbols), return_exceptions=True)
         out: list[dict[str, Any]] = []
-        for symbol in symbols:
-            res = await self.close_position(symbol, reason=reason)
-            if res is not None:
+        for symbol, res in zip(symbols, results):
+            if isinstance(res, BaseException):
+                log.error("trade_manager.close_failed", symbol=symbol, error=str(res))
+            elif res is not None:
                 out.append(res)
         return out
 
@@ -1099,7 +1102,8 @@ class TradeManager:
                 # at the broker. Put it back under management, apply a
                 # retry cooldown, and escalate once past the budget.
                 mp.exit_failures += 1
-                backoff = min(60.0, 5.0 * (2 ** max(0, mp.exit_failures - 1)))
+                # A stop must retry fast: 1 s for the first two failures, then back off.
+                backoff = 1.0 if mp.exit_failures <= 2 else min(30.0, 5.0 * (2 ** (mp.exit_failures - 3)))
                 mp.next_exit_retry_at = datetime.now(timezone.utc) + timedelta(
                     seconds=backoff
                 )
@@ -1296,7 +1300,11 @@ class TradeManager:
         if result.state == OrderState.PENDING and order_id:
             deadline = asyncio.get_running_loop().time() + fill_timeout
             while asyncio.get_running_loop().time() < deadline:
-                await asyncio.sleep(0.2)
+                ws = await _ws_fill(order_id, 0.6)
+                if ws is not None:
+                    if ws[0] == "FILLED":
+                        return (int(ws[1] or qty), ws[2] if ws[2] is not None else avg, order_id)
+                    break
                 try:
                     status = await backend.get_order_status(order_id)
                 except Exception:  # noqa: BLE001
@@ -1385,7 +1393,11 @@ class TradeManager:
             # Brief poll; then trust the market order to fill.
             deadline = asyncio.get_running_loop().time() + 1.0
             while asyncio.get_running_loop().time() < deadline:
-                await asyncio.sleep(0.2)
+                ws = await _ws_fill(order_id, 0.5)
+                if ws is not None:
+                    if ws[0] == "FILLED":
+                        return (int(ws[1] or qty), ws[2] if ws[2] is not None else avg, order_id)
+                    break
                 try:
                     status = await backend.get_order_status(order_id)
                 except Exception:  # noqa: BLE001
@@ -1623,6 +1635,22 @@ class TradeManager:
 
 
 # -- DB helpers (sync, run in executor) ----------------------------------
+
+
+async def _ws_fill(order_id: str, timeout: float) -> Optional[tuple[str, Any, Optional[float]]]:
+    """The exit order's terminal update from the order WebSocket, if it lands
+    within `timeout`: (status, filled_qty, avg_price). None = keep polling."""
+    from app.execution.order_reconcile import _status_text, wait_for_order
+
+    try:
+        o = await asyncio.wait_for(asyncio.shield(wait_for_order(order_id)), timeout)
+    except asyncio.TimeoutError:
+        return None
+    try:
+        px = float(o.get("tradedPrice")) if o.get("tradedPrice") else None
+    except (TypeError, ValueError):
+        px = None
+    return (_status_text(o.get("status")), o.get("filledQty"), px)
 
 
 def _carry_position_symbols(session_factory: Callable[[], Any]) -> list[str]:

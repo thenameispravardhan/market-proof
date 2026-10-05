@@ -603,6 +603,7 @@ export default function Trade() {
   }, [selected, quantity]);
 
   const placeOrder = usePlaceOrder();
+  const chartPlace = usePlaceOrder();   // chart / DOM / scalper orders never lock the ticket button
   const cancelOrder = useCancelOrder();
 
   // Broker state drawn on the chart: open position average + pending
@@ -836,7 +837,7 @@ export default function Trade() {
   const orderFor = (sym: string, name: string, qty: number) => async (o: ChartOrder): Promise<string> => {
     if (!accountId) throw new Error("no live Fyers account connected");
     if (!(qty > 0)) throw new Error("quantity must be more than 0");
-    const r = await placeOrder.mutateAsync({
+    const r = await chartPlace.mutateAsync({
       account_id: accountId,
       symbol: sym,
       side: o.side,

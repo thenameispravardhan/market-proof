@@ -736,9 +736,7 @@ def test_settings_risk_rules_never_block_a_manual_order(
         )
         assert placed["ok"] is True
         assert placed["broker_order_id"] == "X9"
-        assert placed.get("blocked") is not True
-        assert "RISK_MAX_SINGLE_POSITION_PCT" in placed["risk_codes"]
-        assert placed["risk_warning"]
+        assert placed.get("blocked") is not True   # advisory runs after the order, in the background
     finally:
         mgr._risk = original_risk
 
@@ -861,12 +859,12 @@ def test_delete_trades_rejects_empty_id_list(client: TestClient, isolated_db):
 def test_ticket_sl_target_armed_only_after_fill(
     client: TestClient, db_session, isolated_db, real_account, monkeypatch
 ):
-    """Optional SL / target ride with the order and are handed to the trade
-    manager once THAT order fills — a resting limit isn't armed early."""
+    """Optional SL / target ride with the order and are armed by the
+    reconciler the moment THAT order's fill lands — never before."""
+    import asyncio
     import time
-    from app.api import orders as orders_api
     from app.db import session as dbs
-    from app.db.models import Trade
+    from app.execution import order_reconcile
     from app.main import app
 
     calls: list = []
@@ -876,22 +874,50 @@ def test_ticket_sl_target_armed_only_after_fill(
             calls.append((symbol, stop_loss, target))
             return {}
 
-    monkeypatch.setattr(orders_api, "ARM_POLL_S", 0.02)
     monkeypatch.setattr(app.state, "trade_manager", TM(), raising=False)
     _install_stub_backend(client, real_account.id, ok=True)
     r = client.post("/api/orders", json={"account_id": real_account.id, "symbol": "NSE:INFY-EQ", "side": "BUY",
                                          "quantity": 1, "order_type": "LIMIT", "limit_price": 100,
                                          "product_type": "INTRADAY", "stop_loss": 95, "target": ""})
     assert r.json()["levels_pending"] == {"stop_loss": 95.0, "target": None}
-    time.sleep(0.1)
-    assert calls == []                        # still resting: nothing armed
-    with dbs.SessionLocal() as db:
-        db.query(Trade).filter_by(broker_order_id="STUB-1").update({"status": "filled"})
-        db.commit()
-    end = time.time() + 2
-    while not calls and time.time() < end:
-        time.sleep(0.02)
+    assert calls == [] and "STUB-1" in order_reconcile.LEVELS_ON_FILL   # resting: nothing armed
+
+    async def fill() -> None:
+        with dbs.SessionLocal() as db:
+            await order_reconcile.reconcile_order_update(
+                db, {"id": "STUB-1", "status": 2, "filledQty": 1, "tradedPrice": 100, "symbol": "NSE:INFY-EQ"}, source="test")
+        await asyncio.sleep(0.05)
+
+    asyncio.run(fill())
     assert calls == [("NSE:INFY-EQ", 95.0, None)]
+
+
+def test_parked_update_applies_on_commit_and_partials_mirror(client: TestClient, db_session, isolated_db):
+    """An update that beats its row is parked and applied by apply_parked;
+    manual partial fills mirror into positions slice by slice."""
+    import asyncio
+    from app.db import session as dbs
+    from app.db.models import Position, Trade
+    from app.execution import order_reconcile
+
+    async def go() -> None:
+        with dbs.SessionLocal() as db:
+            r = await order_reconcile.reconcile_order_update(db, {"id": "P-1", "status": 6, "filledQty": 4, "tradedPrice": 50}, source="test")
+        assert r["matched"] is False and "P-1" in order_reconcile.PARKED
+        with dbs.SessionLocal() as db:
+            db.add(Trade(symbol="NSE:X-EQ", side="BUY", quantity=10, price=50.0, status="placed", broker_order_id="P-1"))
+            db.commit()
+        await order_reconcile.apply_parked("P-1")
+        with dbs.SessionLocal() as db:
+            assert db.query(Position).filter_by(symbol="NSE:X-EQ").one().quantity == 4
+        with dbs.SessionLocal() as db:
+            await order_reconcile.reconcile_order_update(db, {"id": "P-1", "status": 2, "filledQty": 10, "tradedPrice": 51}, source="test")
+        with dbs.SessionLocal() as db:
+            assert db.query(Position).filter_by(symbol="NSE:X-EQ").one().quantity == 10
+            t = db.query(Trade).filter_by(broker_order_id="P-1").one()
+            assert (t.status, t.filled_qty) == ("filled", 10)
+
+    asyncio.run(go())
 
 
 def test_db_rebuilt_position_keeps_its_broker_account(client: TestClient, db_session, isolated_db, real_account):

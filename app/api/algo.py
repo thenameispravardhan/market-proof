@@ -537,13 +537,38 @@ def list_trades(strategy_id: Optional[int] = None, limit: int = Query(300, ge=1,
     return {"trades": rows}
 
 
+async def _live_prices(symbols: list[str]) -> dict[str, float]:
+    """Open-leg prices from the tick stream (and keep those symbols streaming
+    so the page can show P&L per tick); REST only for symbols with no fresh tick."""
+    from app.algo.runner import _ltp
+    from app.api.orders import _bus_quote_is_fresh, _fyers_stream, _is_simulated, _manager
+
+    syms = sorted({x.upper() for x in symbols if x})
+    stream = _fyers_stream()
+    out: dict[str, float] = {}
+    md = _manager().market_data
+    for sym in syms:
+        if stream is not None:
+            try:
+                stream.touch_interest(sym)
+            except Exception:  # noqa: BLE001
+                pass
+        q = await md.get_quote(sym)
+        if q is not None and q.last_price and _bus_quote_is_fresh(q) and not _is_simulated(q):
+            out[sym] = float(q.last_price)
+    missing = [x for x in syms if x not in out]
+    if missing:
+        out.update(await _ltp(missing))
+    return out
+
+
 @router.get("/status")
 async def status(request: Request, db: Session = Depends(get_db)) -> dict[str, Any]:
     from app.algo.runner import _ltp, _mtm, _row
 
     r = _runner(request)
     open_rows = [_row(t) for t in db.execute(select(AlgoTrade).where(AlgoTrade.status == "open")).scalars()]
-    prices = await _ltp([lg["symbol"] for t in open_rows for lg in t["legs"]] + [t["symbol"] for t in open_rows])         if open_rows else {}
+    prices = await _live_prices([lg["symbol"] for t in open_rows for lg in t["legs"]] + [t["symbol"] for t in open_rows]) if open_rows else {}
     for t in open_rows:
         t["ltp"] = prices.get((t["symbol"] if t["ref"] == "u" else t["legs"][0]["symbol"]).upper())
         m = _mtm(t["legs"], prices)

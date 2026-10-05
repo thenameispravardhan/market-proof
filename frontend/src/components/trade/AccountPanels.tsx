@@ -42,7 +42,19 @@ function savePref(k: string, v: unknown): void {
 
 /** GET a JSON endpoint, every `every` ms and on each `broker:order` event
  *  (order socket / postback, dispatched by App). `null` url = idle. */
-export function useApiJson<T>(url: string | null, every = 0): { data: T | null; reload: () => void } {
+// Panels that read the same URL at the same moment share ONE request (every
+// fetch here can cost a Fyers REST call, which competes with orders).
+const inflight = new Map<string, Promise<unknown>>();
+function sharedGet(url: string): Promise<unknown> {
+  let p = inflight.get(url);
+  if (!p) {
+    p = fetch(url).then((r) => (r.ok ? r.json() : null)).finally(() => setTimeout(() => inflight.delete(url), 250));
+    inflight.set(url, p);
+  }
+  return p;
+}
+
+export function useApiJson<T>(url: string | null, every = 0, onOrders = true): { data: T | null; reload: () => void } {
   const [data, setData] = useState<T | null>(null);
   const [nonce, setNonce] = useState(0);
   useEffect(() => {
@@ -50,8 +62,7 @@ export function useApiJson<T>(url: string | null, every = 0): { data: T | null; 
     let stop = false;
     let t: ReturnType<typeof setTimeout> | undefined;
     const load = () =>
-      fetch(url)
-        .then((r) => (r.ok ? r.json() : null))
+      sharedGet(url)
         .then((j) => !stop && setData(j as T))
         .catch(() => undefined);
     void load();
@@ -61,14 +72,14 @@ export function useApiJson<T>(url: string | null, every = 0): { data: T | null; 
       clearTimeout(t);
       t = setTimeout(() => void load(), 200);
     };
-    window.addEventListener("broker:order", on);
+    if (onOrders) window.addEventListener("broker:order", on);
     return () => {
       stop = true;
       if (id) clearInterval(id);
       clearTimeout(t);
       window.removeEventListener("broker:order", on);
     };
-  }, [url, every, nonce]);
+  }, [url, every, nonce, onOrders]);
   return { data, reload: () => setNonce((n) => n + 1) };
 }
 

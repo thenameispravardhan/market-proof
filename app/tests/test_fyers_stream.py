@@ -1095,3 +1095,56 @@ async def test_reconcile_does_not_crash_when_close_clears_subs_mid_iteration():
     # The subscribe list grew: initial reconcile, then reconcile after the
     # simulated close→connect. Both emit SBIN.
     assert (("NSE:SBIN-EQ",), "SymbolUpdate") in holder["data"].subscribed
+
+
+@pytest.mark.asyncio
+async def test_tick_reaches_both_bare_and_full_keys_and_unsubscribe_keeps_the_other():
+    """The bot holds "SBIN", the Trade page views "NSE:SBIN-EQ": one
+    instrument, two bus keys. Both get every tick, and dropping one key
+    must not unsubscribe the instrument the other still needs."""
+    md = MarketDataBus()
+    holder, df, of = _factories()
+    mgr = FyersStreamManager(
+        market_data=md,
+        quote_feed=_FakeQuoteFeed(["SBIN"]),
+        backend_provider=lambda: _FakeBackend(),
+        data_socket_factory=df,
+        order_socket_factory=of,
+        resolve_fn=lambda s: "NSE:SBIN-EQ" if s == "SBIN" else None,
+    )
+    mgr._loop = asyncio.get_running_loop()
+    await mgr._ensure_connected()
+    await mgr._reconcile_subscriptions()
+    mgr._subscribe_ondemand("NSE:SBIN-EQ", "NSE:SBIN-EQ")
+    seen: list[str] = []
+    mgr._publish_threadsafe = lambda key, ltp, **kw: seen.append(key)  # type: ignore[method-assign]
+    mgr._on_data_message({"symbol": "NSE:SBIN-EQ", "ltp": 812.5})
+    assert sorted(seen) == ["NSE:SBIN-EQ", "SBIN"]
+    # the on-demand key lapses: the bare key still owns the instrument
+    mgr._ondemand["NSE:SBIN-EQ"] = 0.0
+    before = list(holder["data"].unsubscribed) if hasattr(holder["data"], "unsubscribed") else []
+    await mgr._reconcile_subscriptions()
+    after = list(holder["data"].unsubscribed) if hasattr(holder["data"], "unsubscribed") else []
+    assert after == before
+    seen.clear()
+    mgr._on_data_message({"symbol": "NSE:SBIN-EQ", "ltp": 813.0})
+    assert seen == ["SBIN"]
+
+
+@pytest.mark.asyncio
+async def test_depth_frame_is_pushed_on_the_depth_channel():
+    from app.services.event_bus import event_bus
+
+    md = MarketDataBus()
+    holder, df, of = _factories()
+    mgr = FyersStreamManager(market_data=md, quote_feed=_FakeQuoteFeed([]), backend_provider=lambda: _FakeBackend(),
+                             data_socket_factory=df, order_socket_factory=of, resolve_fn=lambda s: None)
+    mgr._loop = asyncio.get_running_loop()
+    q = event_bus.subscribe("depth")
+    try:
+        mgr._on_data_message({"type": "dp", "symbol": "NSE:SBIN-EQ", "bid_price1": 100.0, "bid_size1": 5, "bid_order1": 2,
+                              "ask_price1": 100.5, "ask_size1": 7, "ask_order1": 3})
+        evt = await asyncio.wait_for(q.get(), 1.0)
+        assert evt.payload["bids"] == [[100.0, 5.0, 2.0]] and evt.payload["asks"] == [[100.5, 7.0, 3.0]]
+    finally:
+        event_bus.unsubscribe("depth", q)

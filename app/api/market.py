@@ -432,6 +432,16 @@ async def market_depth(symbol: str) -> dict[str, Any]:
     backend = _fyers_backend()
     if backend is None or not hasattr(backend, "get_depth"):
         return {"ok": False, "reason": "connect a Fyers account for market depth"}
+    # Keep the book streaming (DepthUpdate → `depth` ws channel); this REST
+    # read is only the first snapshot and a slow keep-alive.
+    from app.api.orders import _fyers_stream
+
+    stream = _fyers_stream()
+    if stream is not None and hasattr(stream, "touch_depth"):
+        try:
+            stream.touch_depth(symbol)
+        except Exception:  # noqa: BLE001
+            pass
     try:
         book = await backend.get_depth(symbol.strip().upper())
     except Exception as e:  # noqa: BLE001

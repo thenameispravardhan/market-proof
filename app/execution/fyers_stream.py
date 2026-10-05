@@ -43,6 +43,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
+from app.services.event_bus import event_bus
 from app.execution.base import safe_float
 from app.execution.market_data import MarketDataBus
 from app.execution.order_reconcile import reconcile_order_update
@@ -200,6 +201,7 @@ class FyersStreamManager:
         self._token: Optional[str] = None
         self._subscribed: dict[str, str] = {}    # short -> full
         self._full_to_short: dict[str, str] = {}  # full  -> short
+        self._depth: dict[str, float] = {}  # full -> last touch (DepthUpdate subscriptions)
         self._ondemand: dict[str, float] = {}     # short -> monotonic ts
         self._stop_event = asyncio.Event()
         self._task: Optional[asyncio.Task[None]] = None
@@ -380,14 +382,34 @@ class FyersStreamManager:
         )
         # connect() spawns the SDK's ws/ping threads but does a synchronous
         # time.sleep(2), so run it off the event loop.
-        await self._loop.run_in_executor(None, self._data_socket.connect)
-        await self._loop.run_in_executor(None, self._order_socket.connect)
+        # Both at once (each blocks ~2 s inside the SDK): half the blind window.
+        await asyncio.gather(
+            self._loop.run_in_executor(None, self._data_socket.connect),
+            self._loop.run_in_executor(None, self._order_socket.connect),
+        )
         self._data_connected = True
+        # Updates sent while the order socket was down are gone — replay today's
+        # order book once so no fill / reject is lost across a reconnect.
+        asyncio.ensure_future(self._resync_orders())
         # Order socket subscribes itself in `_on_order_connect` — that
         # covers both the initial connect AND any SDK auto-reconnect
         # (which wipes the order subscription the same way it wipes
         # data subscriptions). No explicit subscribe needed here.
         log.info("fyers_stream.connected")
+
+    async def _resync_orders(self) -> None:
+        backend = self._backend_provider()
+        if backend is None or not hasattr(backend, "broker_book"):
+            return
+        try:
+            book = await backend.broker_book()
+        except Exception as e:  # noqa: BLE001
+            log.warning("fyers_stream.order_resync_failed", error=str(e))
+            return
+        for order in book.get("orders") or []:
+            if isinstance(order, dict) and order.get("id"):
+                await self._reconcile_order(order)
+        log.info("fyers_stream.order_resync", orders=len(book.get("orders") or []))
 
     async def _close_sockets(self) -> None:
         for sock in (self._data_socket, self._order_socket):
@@ -406,10 +428,15 @@ class FyersStreamManager:
         self._subscribed.clear()
         self._full_to_short.clear()
         self._ondemand.clear()
+        self._depth.clear()
 
     # -- subscription reconcile -----------------------------------------
 
     async def _reconcile_subscriptions(self) -> None:
+        self._expire_depth()
+        await self._reconcile_quotes()
+
+    async def _reconcile_quotes(self) -> None:
         """Diff the quote feed's watch set against current subscriptions and
         subscribe / unsubscribe the delta on the data socket."""
         if self._data_socket is None or not self._data_connected:
@@ -462,16 +489,22 @@ class FyersStreamManager:
             except Exception:  # noqa: BLE001
                 log.exception("fyers_stream.subscribe_failed")
         if remove:
+            # Only drop an instrument from the socket when no remaining key still uses it.
+            still = {f for k, f in subscribed_snapshot.items() if k not in remove}
+            gone = [f for f in set(remove.values()) if f not in still]
             try:
-                self._data_socket.unsubscribe(
-                    symbols=list(remove.values()), data_type="SymbolUpdate"
-                )
+                if gone:
+                    self._data_socket.unsubscribe(symbols=gone, data_type="SymbolUpdate")
             except Exception:  # noqa: BLE001
                 log.exception("fyers_stream.unsubscribe_failed")
             for s, f in remove.items():
                 self._subscribed.pop(s, None)
-                self._full_to_short.pop(f, None)
                 self._ondemand.pop(s, None)
+                others = [k for k, ff in self._subscribed.items() if ff == f]
+                if others:
+                    self._full_to_short[f] = others[0]
+                else:
+                    self._full_to_short.pop(f, None)
 
     # -- WS-first one-shot price (signal / manual pricing) ---------------
 
@@ -517,6 +550,57 @@ class FyersStreamManager:
             if price is not None:
                 return price
         return None  # timed out → REST fallback
+
+    # -- market depth push (DOM / Market depth panels) --------------------
+
+    DEPTH_TTL_S = 20.0
+
+    def touch_depth(self, symbol: str) -> None:
+        """Keep `symbol`'s 5-level book streaming (DepthUpdate) while a panel
+        shows it; each depth frame is pushed to the browser on the `depth`
+        channel. Lapses DEPTH_TTL_S after the last touch."""
+        full = (self._resolve(symbol) or symbol).strip().upper()
+        if ":" not in full or self._data_socket is None or not self._data_connected:
+            return
+        fresh = full not in self._depth
+        self._depth[full] = time.monotonic()
+        if fresh:
+            try:
+                self._data_socket.subscribe(symbols=[full], data_type="DepthUpdate")
+            except Exception:  # noqa: BLE001
+                log.exception("fyers_stream.depth_subscribe_failed")
+                self._depth.pop(full, None)
+
+    def _expire_depth(self) -> None:
+        now = time.monotonic()
+        stale = [f for f, t in self._depth.items() if now - t > self.DEPTH_TTL_S]
+        for f in stale:
+            self._depth.pop(f, None)
+        if stale and self._data_socket is not None and self._data_connected:
+            try:
+                self._data_socket.unsubscribe(symbols=stale, data_type="DepthUpdate")
+            except Exception:  # noqa: BLE001
+                log.debug("fyers_stream.depth_unsubscribe_failed")
+
+    def _on_depth_message(self, message: dict[str, Any]) -> None:
+        sym = str(message.get("symbol") or "").upper()
+        if not sym:
+            return
+
+        def side(name: str) -> list[list[float]]:
+            rows = []
+            for i in range(1, 6):
+                px = safe_float(message.get(f"{name}_price{i}"))
+                if px > 0:
+                    rows.append([px, safe_float(message.get(f"{name}_size{i}")), safe_float(message.get(f"{name}_order{i}"))])
+            return rows
+
+        book = {"ok": True, "symbol": sym, "bids": side("bid"), "asks": side("ask"),
+                "total_buy": safe_float(message.get("tot_buy_qty")) or None,
+                "total_sell": safe_float(message.get("tot_sell_qty")) or None}
+        loop = self._loop
+        if loop is not None:
+            asyncio.run_coroutine_threadsafe(event_bus.publish("depth", book), loop)
 
     def touch_interest(self, symbol: str) -> None:
         """Mark `symbol` as actively viewed (e.g. the Trade page quote box)
@@ -585,6 +669,7 @@ class FyersStreamManager:
         # subs unsubscribe the instant after reconnect.
         self._subscribed.clear()
         self._full_to_short.clear()
+        self._depth.clear()
         log.info("fyers_stream.data_closed")
 
     def _on_data_error(self, *args: Any) -> None:
@@ -602,6 +687,9 @@ class FyersStreamManager:
                     keys=sorted(message.keys()) if isinstance(message, dict) else None,
                     sample=str(message)[:400],
                 )
+            if isinstance(message, dict) and (message.get("type") == "dp" or "bid_price1" in message):
+                self._on_depth_message(message)
+                return
             if not isinstance(message, dict):
                 self._drop_count += 1
                 if self._drop_count <= self._UNMAPPED_LOG_CAP:
@@ -650,16 +738,21 @@ class FyersStreamManager:
             ch = message.get("ch")
             chp = message.get("chp")
             pc = message.get("prev_close_price")
-            self._publish_threadsafe(
-                short,
-                ltp,
-                bid=bid,
-                ask=ask,
-                volume=volume,
-                change=safe_float(ch) if ch is not None else None,
-                change_pct=safe_float(chp) if chp is not None else None,
-                prev_close=(safe_float(pc) or None) if pc is not None else None,
-            )
+            # Every key that holds this instrument (the bot's bare "SBIN" and
+            # the Trade page's "NSE:SBIN-EQ") gets the tick — one never steals it.
+            full_id = self._subscribed.get(short, short)
+            keys = [k for k, f in list(self._subscribed.items()) if f == full_id] or [short]
+            for key in keys:
+                self._publish_threadsafe(
+                    key,
+                    ltp,
+                    bid=bid,
+                    ask=ask,
+                    volume=volume,
+                    change=safe_float(ch) if ch is not None else None,
+                    change_pct=safe_float(chp) if chp is not None else None,
+                    prev_close=(safe_float(pc) or None) if pc is not None else None,
+                )
             self._pub_count += 1
         except Exception:  # noqa: BLE001
             log.exception("fyers_stream.data_message_failed")

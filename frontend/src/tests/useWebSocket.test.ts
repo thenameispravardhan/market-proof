@@ -81,8 +81,9 @@ describe("useWebSocket", () => {
     expect(ws.sent).toEqual([{ type: "subscribe", channels: ["signals"] }]);
   });
 
-  it("parses incoming 'event' frames and surfaces them as lastMessage", async () => {
-    const { result } = renderHook(() => useWebSocket());
+  it("parses incoming 'event' frames and hands them to onEvent (no re-render state)", async () => {
+    const got: unknown[] = [];
+    renderHook(() => useWebSocket({ onEvent: (m) => got.push(m) }));
     const ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1]!;
     await act(async () => {
       ws.fakeOpen();
@@ -94,7 +95,7 @@ describe("useWebSocket", () => {
         ts: "2026-06-12T00:00:00Z",
       });
     });
-    expect(result.current.lastMessage).toEqual({
+    expect(got[0]).toEqual({
       channel: "signals",
       payload: { symbol: "RELIANCE", action: "BUY" },
       event_id: "e-1",
