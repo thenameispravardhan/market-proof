@@ -2944,3 +2944,7 @@ a.chart-menu-item { text-decoration: none; color: var(--text); }
 .chain-search-hits button { display: flex; gap: 8px; align-items: baseline; padding: 6px 10px; background: transparent; border: 0; color: var(--text); text-align: left; cursor: pointer; font-size: 11.5px; }
 .chain-search-hits button:hover { background: var(--bg-surface); }
 .chain-ltp[draggable="true"] { cursor: grab; }
+
+/* ticket: SL / target input mode (₹ price · pts · %) */
+.level-mode { flex-shrink: 0; }
+.level-mode button { padding: 3px 6px; min-width: 26px; }

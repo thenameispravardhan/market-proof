@@ -105,6 +105,35 @@ function cleanError(raw: unknown, fallback: string): string {
 }
 
 const DRAG_MIME = "application/x-tradebot-instrument";
+
+export type LevelInputMode = "price" | "pts" | "pct";
+const LEVEL_MODE_LABEL: Record<LevelInputMode, string> = { price: "₹", pts: "pts", pct: "%" };
+
+/** A stop / target typed as a price, points away, or % away from the entry
+ *  reference — always returned as an absolute price on the right side of the
+ *  entry for the trade direction, rounded to the tick. null = not set. */
+export function levelPrice(v: number, mode: LevelInputMode, ref: number | null | undefined, side: "BUY" | "SELL",
+  kind: "sl" | "target", tick = 0.05): number | null {
+  if (!(v > 0)) return null;
+  if (mode === "price") return v;
+  if (ref == null || !(ref > 0)) return null;
+  const dist = mode === "pts" ? v : (ref * v) / 100;
+  const up = (side === "BUY") === (kind === "target");   // BUY target / SELL stop sit above the entry
+  const raw = up ? ref + dist : ref - dist;
+  const t = tick > 0 ? tick : 0.05;
+  return raw > 0 ? Math.round(Math.round(raw / t) * t * 100) / 100 : null;
+}
+
+function LevelMode({ mode, onMode, testid }: { mode: LevelInputMode; onMode: (m: LevelInputMode) => void; testid: string }) {
+  return (
+    <span className="seg level-mode" data-testid={testid}>
+      {(["price", "pts", "pct"] as LevelInputMode[]).map((m) => (
+        <button key={m} type="button" className={mode === m ? "on" : ""} onClick={() => onMode(m)}
+          title={m === "price" ? "an absolute price" : m === "pts" ? "points away from the entry" : "% away from the entry"}>{LEVEL_MODE_LABEL[m]}</button>
+      ))}
+    </span>
+  );
+}
 const PRODUCT_LABEL: Record<ProductType, string> = { INTRADAY: "Intraday", DELIVERY: "Delivery", MARGIN: "Carry (NRML)" };
 
 // Right-dock panels, opened / closed from the icon bar. Several can be open;
@@ -667,12 +696,12 @@ export default function Trade() {
     return true;
   }, [selected, accountId, quantity, requiresLimit, limitPrice, requiresStop, stopPrice]);
 
-  const onSelect = (h: InstrumentHit, fromChain = false) => {
+  const onSelect = (h: InstrumentHit, fromChain = false, keepChain = false) => {
     setSelected(h);
     setShowResults(false);
     setQuery(""); // the watchlist row + chart header show the pick; the box is for the next search
     setLastResult(null);
-    if (isUnderlying(h)) {
+    if (isUnderlying(h) && !keepChain) {
       setChainBase(h);
       try { localStorage.setItem("trade:chainBase", JSON.stringify(h)); } catch { /* best-effort */ }
       setSelectedExpiry(null); // load the nearest expiry for the new underlying
@@ -784,8 +813,11 @@ export default function Trade() {
     e.preventDefault();
     try {
       const h = JSON.parse(raw) as InstrumentHit;
-      activate(i);
-      onSelect(h, true);
+      // Switch the target cell straight to the dropped option. Going through
+      // activate(i) would first select that cell's OLD stock — which moved
+      // the option chain to it. A drop never changes the chain.
+      setActiveCell(i);
+      onSelect(h, true, true);
     } catch { /* not ours */ }
   };
   // The chain's own search: changes only the chain, never a chart.
@@ -835,6 +867,12 @@ export default function Trade() {
   const [slPrice, setSlPrice] = useState("");
   const [tpPrice, setTpPrice] = useState("");
   const estPrice = (requiresLimit && Number(limitPrice) > 0 ? Number(limitPrice) : null) ?? (side === "BUY" ? ask : bid) ?? ltp;
+  const [slMode, setSlMode] = useState<LevelInputMode>(() => stored<LevelInputMode>("trade:slMode", "price"));
+  const [tpMode, setTpMode] = useState<LevelInputMode>(() => stored<LevelInputMode>("trade:tpMode", "price"));
+  useEffect(() => { try { localStorage.setItem("trade:slMode", JSON.stringify(slMode)); localStorage.setItem("trade:tpMode", JSON.stringify(tpMode)); } catch { /* best-effort */ } }, [slMode, tpMode]);
+  const tick = selected?.tick_size ?? 0.05;
+  const slAbs = levelPrice(Number(slPrice), slMode, estPrice, side, "sl", tick);
+  const tpAbs = levelPrice(Number(tpPrice), tpMode, estPrice, side, "target", tick);
   const { data: funds } = useQuery<{ ok: boolean; available: number | null }>({
     queryKey: ["market-funds"],
     queryFn: () => fetch("/api/market/funds").then((r) => r.json()),
@@ -852,8 +890,8 @@ export default function Trade() {
       limit_price: requiresLimit && limitPrice ? Number(limitPrice) : null,
       stop_price: requiresStop && stopPrice ? Number(stopPrice) : null,
       product_type: product,
-      stop_loss: Number(slPrice) > 0 ? Number(slPrice) : null,
-      target: Number(tpPrice) > 0 ? Number(tpPrice) : null,
+      stop_loss: slAbs,
+      target: tpAbs,
       bypass_risk: opts?.bypassRisk ?? false,
       operator: "ui_trade_page",
     };
@@ -1289,22 +1327,33 @@ export default function Trade() {
                     </button>
                   </div>
   
-                  <label className="ticket-row">
-                    <span>Quantity</span>
-                    <input
-                      type="number"
-                      min={1}
-                      step={selected?.lot_size ?? 1}
-                      value={quantity}
-                      onChange={(e) => setQuantity(Math.max(1, Number(e.target.value || 1)))}
-                      data-testid="ticket-qty"
-                    />
-                    {selected && selected.lot_size > 1 && (
-                      <span className="hint">
-                        {Math.floor(quantity / selected.lot_size)} lot(s)
-                      </span>
-                    )}
-                  </label>
+                  {selected && selected.lot_size > 1 ? (
+                    /* F&O trades in whole lots: enter lots, the quantity follows. */
+                    <label className="ticket-row">
+                      <span>Lots</span>
+                      <input
+                        type="number"
+                        min={1}
+                        step={1}
+                        value={Math.max(1, Math.round(quantity / selected.lot_size))}
+                        onChange={(e) => setQuantity(Math.max(1, Math.floor(Number(e.target.value || 1))) * selected.lot_size)}
+                        data-testid="ticket-lots"
+                      />
+                      <span className="hint" data-testid="ticket-qty">= {quantity} qty ({selected.lot_size}/lot)</span>
+                    </label>
+                  ) : (
+                    <label className="ticket-row">
+                      <span>Quantity</span>
+                      <input
+                        type="number"
+                        min={1}
+                        step={1}
+                        value={quantity}
+                        onChange={(e) => setQuantity(Math.max(1, Number(e.target.value || 1)))}
+                        data-testid="ticket-qty"
+                      />
+                    </label>
+                  )}
   
                   <label className="ticket-row">
                     <span>Order type</span>
@@ -1413,10 +1462,14 @@ export default function Trade() {
                   <label className="ticket-row">
                     <span>Stop loss</span>
                     <input type="number" step="0.05" min={0} placeholder="optional" value={slPrice} onChange={(e) => setSlPrice(e.target.value)} data-testid="ticket-sl" />
+                    <LevelMode mode={slMode} onMode={setSlMode} testid="ticket-sl-mode" />
+                    {slMode !== "price" && slAbs != null && <span className="hint" data-testid="ticket-sl-abs">→ {fmtMoney(slAbs)}</span>}
                   </label>
                   <label className="ticket-row">
                     <span>Target</span>
                     <input type="number" step="0.05" min={0} placeholder="optional" value={tpPrice} onChange={(e) => setTpPrice(e.target.value)} data-testid="ticket-tp" />
+                    <LevelMode mode={tpMode} onMode={setTpMode} testid="ticket-tp-mode" />
+                    {tpMode !== "price" && tpAbs != null && <span className="hint" data-testid="ticket-tp-abs">→ {fmtMoney(tpAbs)}</span>}
                   </label>
                   <div className="ticket-row ticket-est" data-testid="ticket-est">
                     <span>Est. amount</span>
