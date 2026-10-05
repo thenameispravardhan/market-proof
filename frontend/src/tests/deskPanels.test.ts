@@ -98,17 +98,26 @@ describe("ticket level input", () => {
 });
 
 import { tabLocal } from "../router";
+import { initWorkspace, wsId } from "../workspace";
 
-describe("per-tab trade state", () => {
-  it("a refresh keeps THIS tab's view even after another tab wrote its own", () => {
+describe("per-tab trade state (TradingView-style workspace id in the URL)", () => {
+  it("each tab keeps its own view across refresh; a new tab starts from the last used", async () => {
     localStorage.clear();
     sessionStorage.clear();
-    tabLocal.setItem("trade:scalper", "false");          // this tab: chart
-    localStorage.setItem("trade:scalper", "true");       // another tab switched to the scalper
+    window.location.hash = "#/trade?ws=tabtwo1";
+    await initWorkspace();
+    expect(wsId()).toBe("tabtwo1");
+    tabLocal.setItem("trade:scalper", "false");            // tab 2: BANKNIFTY chart
+    localStorage.setItem("trade:scalper@tabthree", "true"); // tab 3: SENSEX scalper (its own key)
+    localStorage.setItem("trade:scalper", "true");          // ...and it was the last one used
+    await initWorkspace();                                  // tab 2 refreshes: same URL id
     expect(tabLocal.getItem("trade:scalper")).toBe("false");
-    sessionStorage.clear();                               // a brand-new tab starts from the last used
-    expect(tabLocal.getItem("trade:scalper")).toBe("true");
-    localStorage.setItem("trade:watchlists", "x");       // shared keys pass straight through
+    window.location.hash = "#/trade";                       // a brand-new tab: no id yet
+    await initWorkspace();
+    expect(wsId()).not.toBe("tabtwo1");
+    expect(window.location.hash).toContain(`ws=${wsId()}`);
+    expect(tabLocal.getItem("trade:scalper")).toBe("true"); // seeded from the last used
+    localStorage.setItem("trade:watchlists", "x");          // shared keys pass straight through
     expect(tabLocal.getItem("trade:watchlists")).toBe("x");
   });
 });

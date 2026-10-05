@@ -7,6 +7,7 @@
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import type { InstrumentHit, PendingOrder, Position } from "../../types";
 import { useLiveQuote } from "../../hooks/useQuotes";
+import { wsId } from "../../workspace";
 import { technicalRating, type OhlcvCandle } from "../../lib/indicators";
 import { capTier } from "../../lib/marketCap";
 import { clearLog, getLog, subscribeLog } from "./chartSync";
@@ -1012,7 +1013,10 @@ export function useLayouts() {
     } catch {
       /* best-effort */
     }
-    try { Object.keys(sessionStorage).filter((k) => k.startsWith("trade:") || k.startsWith("chart:")).forEach((k) => sessionStorage.removeItem(k)); } catch { /* storage off */ }
+    try {
+      Object.keys(sessionStorage).filter((k) => k.startsWith("trade:") || k.startsWith("chart:")).forEach((k) => sessionStorage.removeItem(k));
+      Object.keys(localStorage).filter((k) => k.endsWith(`@${wsId()}`)).forEach((k) => localStorage.removeItem(k));   // the loaded layout wins in this tab
+    } catch { /* storage off */ }
     window.location.reload();
   };
   const rename = (id: string, name: string) => persist(layouts.map((l) => (l.id === id ? { ...l, name } : l)), current);
@@ -1039,7 +1043,10 @@ export function useLayouts() {
       drop.forEach((k) => localStorage.removeItem(k));
       localStorage.removeItem(CURRENT_KEY);
     } catch { /* best-effort */ }
-    try { Object.keys(sessionStorage).filter((k) => k.startsWith("trade:") || k.startsWith("chart:")).forEach((k) => sessionStorage.removeItem(k)); } catch { /* storage off */ }
+    try {
+      Object.keys(sessionStorage).filter((k) => k.startsWith("trade:") || k.startsWith("chart:")).forEach((k) => sessionStorage.removeItem(k));
+      Object.keys(localStorage).filter((k) => k.endsWith(`@${wsId()}`)).forEach((k) => localStorage.removeItem(k));   // the loaded layout wins in this tab
+    } catch { /* storage off */ }
     window.location.reload();
   };
   return { layouts, current: cur, autosave, dirty, save, saveAs, load, rename, copy, remove, star, setAutosave, newLayout };
