@@ -164,10 +164,30 @@ def _strategy_account(strategy_id: int) -> Optional[int]:
 # ---- broker helpers ------------------------------------------------------------
 
 async def _ltp(symbols: list[str]) -> dict[str, float]:
+    """Live prices from the Fyers tick stream (keeping those symbols streaming);
+    REST quotes only for symbols with no fresh tick — so the 1 s exit loop
+    doesn't spend the Fyers rate budget orders need."""
     from app.api.market import fyers_quotes
+    from app.api.orders import _bus_quote_is_fresh, _fyers_stream, _is_simulated, _manager
 
-    qs = await fyers_quotes(sorted(set(symbols)))
-    return {k: float(q.last_price) for k, q in qs.items() if q.last_price}
+    syms = sorted({x.upper() for x in symbols if x})
+    out: dict[str, float] = {}
+    stream = _fyers_stream()
+    md = _manager().market_data
+    for sym in syms:
+        if stream is not None:
+            try:
+                stream.touch_interest(sym)
+            except Exception:  # noqa: BLE001
+                pass
+        q = await md.get_quote(sym)
+        if q is not None and q.last_price and _bus_quote_is_fresh(q) and not _is_simulated(q):
+            out[sym] = float(q.last_price)
+    missing = [x for x in syms if x not in out]
+    if missing:
+        qs = await fyers_quotes(missing)
+        out.update({k: float(q.last_price) for k, q in qs.items() if q.last_price})
+    return out
 
 
 async def _broker_net(account: BrokerAccount, symbol: str) -> Optional[int]:
@@ -313,7 +333,7 @@ def _notify_exit(payload: dict[str, Any]) -> None:
 
 
 class AlgoRunner:
-    TICK_S = 5.0
+    TICK_S = 1.0   # exits / stops checked on live LTP every second
 
     def __init__(self) -> None:
         self.events: deque[dict[str, Any]] = deque(maxlen=300)

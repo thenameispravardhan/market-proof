@@ -1012,6 +1012,7 @@ export function useLayouts() {
     } catch {
       /* best-effort */
     }
+    try { Object.keys(sessionStorage).filter((k) => k.startsWith("trade:") || k.startsWith("chart:")).forEach((k) => sessionStorage.removeItem(k)); } catch { /* storage off */ }
     window.location.reload();
   };
   const rename = (id: string, name: string) => persist(layouts.map((l) => (l.id === id ? { ...l, name } : l)), current);
@@ -1038,6 +1039,7 @@ export function useLayouts() {
       drop.forEach((k) => localStorage.removeItem(k));
       localStorage.removeItem(CURRENT_KEY);
     } catch { /* best-effort */ }
+    try { Object.keys(sessionStorage).filter((k) => k.startsWith("trade:") || k.startsWith("chart:")).forEach((k) => sessionStorage.removeItem(k)); } catch { /* storage off */ }
     window.location.reload();
   };
   return { layouts, current: cur, autosave, dirty, save, saveAs, load, rename, copy, remove, star, setAutosave, newLayout };
