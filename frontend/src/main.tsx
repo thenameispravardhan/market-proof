@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import App from "./App";
 import "./App.css";
 import { applyTheme } from "./lib/theme";
+import { initWorkspace } from "./workspace";
 
 applyTheme(); // before the first paint, so a light skin doesn't flash dark
 
@@ -23,10 +24,11 @@ if (!root) {
   throw new Error("#root not found in index.html");
 }
 
-ReactDOM.createRoot(root).render(
+// This tab's workspace id (URL ?ws=) must be settled before any state loads.
+void initWorkspace().then(() => ReactDOM.createRoot(root).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
       <App />
     </QueryClientProvider>
   </React.StrictMode>
-);
+));

@@ -3,6 +3,7 @@
 // Default tab: "dashboard".
 
 import { useState, useEffect } from "react";
+import { withWs, wsId } from "./workspace";
 
 export type TabKey =
   | "dashboard"
@@ -55,13 +56,13 @@ export function useRouter(): [TabKey, (tab: TabKey) => void] {
 
   useEffect(() => {
     const handler = () => setTab(parseHash());
-    if (!window.location.hash) window.history.replaceState(null, "", `#/${parseHash()}`);
+    if (!window.location.hash.split("?")[0].replace(/^#\/?/, "")) window.history.replaceState(null, "", withWs(`#/${parseHash()}`));
     window.addEventListener("hashchange", handler);
     return () => window.removeEventListener("hashchange", handler);
   }, []);
 
   const navigate = (t: TabKey) => {
-    window.location.hash = `/${t}`;
+    window.location.hash = withWs(`#/${t}`).slice(1);   // keep this tab's workspace id in the URL
   };
 
   useEffect(() => {
@@ -95,11 +96,15 @@ export function useSessionState<T>(key: string, init: T): [T, (v: T) => void] {
 // tab starts from where you left off). Write: both. Other keys pass through.
 const PER_TAB = /^(trade:(last|scalper|layout|cells|chainBase|dock|dockSizes|bottomTab|bottomOpen|sync|splits)|chart:prefs)$/;
 
+// Stored under the tab's workspace id from the URL (#/trade?ws=<id>, see
+// workspace.ts); the plain key is the "last used" seed for a brand-new tab.
+const nsKey = (k: string) => `${k}@${wsId()}`;
+
 export const tabLocal = {
   getItem(k: string): string | null {
     try {
-      if (PER_TAB.test(k)) {
-        const v = sessionStorage.getItem(k);
+      if (PER_TAB.test(k) && wsId()) {
+        const v = localStorage.getItem(nsKey(k)) ?? sessionStorage.getItem(k);   // sessionStorage: pre-workspace tabs
         if (v != null) return v;
       }
       return localStorage.getItem(k);
@@ -109,10 +114,10 @@ export const tabLocal = {
   },
   setItem(k: string, v: string): void {
     localStorage.setItem(k, v);
-    if (PER_TAB.test(k)) try { sessionStorage.setItem(k, v); } catch { /* storage off */ }
+    if (PER_TAB.test(k) && wsId()) localStorage.setItem(nsKey(k), v);
   },
   removeItem(k: string): void {
     localStorage.removeItem(k);
-    try { sessionStorage.removeItem(k); } catch { /* storage off */ }
+    if (wsId()) localStorage.removeItem(nsKey(k));
   },
 };
