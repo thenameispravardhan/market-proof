@@ -1756,6 +1756,19 @@ def _open_position_as_managed(
         # trailed, so this can understate R — trailing then resumes from
         # the current stop, which is safe).
         initial_risk = abs(entry - stop_loss) if stop_loss is not None else 0.0
+        # The account the position lives on: the latest filled trade for the
+        # symbol. Without it an exit has no broker route and only settles the
+        # DB row — the real position would stay open at Fyers.
+        from app.db.models import Trade as TradeRow
+
+        account_id = (
+            session.query(TradeRow.broker_account_id)
+            .filter(TradeRow.symbol == symbol, TradeRow.status == "filled",
+                    TradeRow.broker_account_id.is_not(None))
+            .order_by(TradeRow.id.desc())
+            .limit(1)
+            .scalar()
+        )
         mp = ManagedPosition(
             symbol=row.symbol,
             quantity=int(row.quantity),
@@ -1764,7 +1777,7 @@ def _open_position_as_managed(
             target=float(row.target) if row.target is not None else None,
             signal_id=None,
             strategy_id=row.strategy_id,
-            broker_account_id=None,
+            broker_account_id=account_id,
             opened_at=opened_at,
             max_hold_seconds=max_hold_seconds,
             initial_risk=initial_risk,
