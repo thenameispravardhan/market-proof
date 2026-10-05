@@ -259,7 +259,11 @@ class FyersClient:
                 # eyeballs) tries IPv6 FIRST and ignores /etc/gai.conf, so
                 # without this live orders were rejected with -50 naming the
                 # server's IPv6 address.
-                transport=self._transport or httpx.AsyncHTTPTransport(local_address="0.0.0.0"),
+                transport=self._transport or httpx.AsyncHTTPTransport(
+                    local_address="0.0.0.0",
+                    # keep connections warm so an order after a quiet spell skips TCP+TLS
+                    limits=httpx.Limits(max_keepalive_connections=10, keepalive_expiry=120),
+                ),
                 timeout=self._timeout_s,
                 headers={
                     "User-Agent": (
@@ -802,12 +806,21 @@ class FyersLiveBackend:
         self.name = f"fyers:{account_name}"
         self.broker_account_id = broker_account_id
         self._client = client or FyersClient(app_id=app_id, access_token=access_token)
+        # Orders get their OWN connection pool and slots: never queued behind
+        # depth / quotes / chain / history polls, short timeout, and no retry —
+        # a re-POSTed order could duplicate; the caller decides what to do.
+        self._orders = client or FyersClient(
+            app_id=app_id, access_token=access_token, timeout_s=5.0, max_retries=0, concurrency=4,
+        )
 
     async def aclose(self) -> None:
         await self._client.aclose()
+        if self._orders is not self._client:
+            await self._orders.aclose()
 
     def set_access_token(self, access_token: str) -> None:
         self._client.set_access_token(access_token)
+        self._orders.set_access_token(access_token)
 
     @property
     def app_id(self) -> str:
@@ -904,7 +917,7 @@ class FyersLiveBackend:
             "offlineOrder": False,
         }
         try:
-            data = await self._client.place_order(payload)
+            data = await self._orders.place_order(payload)
         except FyersAuthError as e:
             log.error("fyers.place_order.auth_error", symbol=symbol, error=str(e))
             return OrderResult(
@@ -1058,7 +1071,7 @@ class FyersLiveBackend:
         if not broker_order_id:
             return False
         try:
-            await self._client.cancel_order(broker_order_id)
+            await self._orders.cancel_order(broker_order_id)
             return True
         except FyersAPIError as e:
             log.warning("fyers.cancel.failed",
@@ -1115,7 +1128,7 @@ class FyersLiveBackend:
         if len(payload) == 1:
             return False, "nothing to modify"
         try:
-            data = await self._client.modify_order(payload)
+            data = await self._orders.modify_order(payload)
         except FyersBlockedError as e:
             log.error(
                 "fyers.modify.blocked",
@@ -1289,7 +1302,7 @@ class FyersLiveBackend:
                 error="empty broker_order_id",
             )
         try:
-            data = await self._client.get_order_status(broker_order_id)
+            data = await self._orders.get_order_status(broker_order_id)
         except FyersAuthError as e:
             return OrderStatus(
                 broker_order_id=broker_order_id,

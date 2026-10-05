@@ -61,6 +61,38 @@ function subscribe(cb: () => void): () => void {
   };
 }
 
+let version = 0;
+listeners.add(() => { version += 1; });
+
+/** Re-render on every tick flush (one per frame) — for small components that
+ *  read several symbols at once via peekQuote (e.g. a multi-leg live P&L). */
+export function useQuoteTick(): number {
+  return useSyncExternalStore(subscribe, () => version);
+}
+
+export function peekQuote(symbol: string): QuoteTick | undefined {
+  return store.get(symbol.toUpperCase());
+}
+
+/** Imperative per-symbol tick callback (no React re-render) — for the chart,
+ *  which applies ticks straight to its series. Returns the unsubscribe. */
+export function onQuote(symbol: string, cb: (q: QuoteTick) => void): () => void {
+  const key = symbol.toUpperCase();
+  let last = store.get(key);
+  if (last) cb(last);
+  const l = () => {
+    const q = store.get(key);
+    if (q && q !== last) {
+      last = q;
+      cb(q);
+    }
+  };
+  listeners.add(l);
+  return () => {
+    listeners.delete(l);
+  };
+}
+
 /**
  * Subscribe to the latest live quote for one symbol. Returns undefined
  * until the first tick for that symbol arrives. The store hands back the

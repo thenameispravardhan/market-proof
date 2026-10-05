@@ -40,10 +40,10 @@ const WS_OPEN = WebSocket.OPEN;
 const WS_CONNECTING = WebSocket.CONNECTING;
 
 export function useWebSocket(options: UseWebSocketOptions = {}): UseWebSocketResult {
-  const { channels = [], backoffMinMs = 1000, backoffMaxMs = 30_000, onEvent } = options;
+  const { channels = [], backoffMinMs = 500, backoffMaxMs = 3_000, onEvent } = options;   // live trading: reconnect within seconds, never 30 s
 
   const [status, setStatus] = useState<WsStatus>("connecting");
-  const [lastMessage, setLastMessage] = useState<WsMessage | null>(null);
+  const lastMessage: WsMessage | null = null;
 
   // Keep refs for the WS instance and mutable config so callbacks don't
   // close over stale values.
@@ -82,11 +82,9 @@ export function useWebSocket(options: UseWebSocketOptions = {}): UseWebSocketRes
             event_id: frame.event_id ?? "",
             ts: frame.ts ?? "",
           };
+          // Events go to onEvent only; holding them in state re-rendered the
+          // whole app per order update for a value nothing read.
           onEventRef.current?.(msg);
-          // Quotes are high-frequency and consumed via the external store
-          // through onEvent — don't re-render every lastMessage subscriber
-          // on each tick.
-          if (msg.channel !== "quotes") setLastMessage(msg);
         }
       } catch {
         // ignore malformed frames

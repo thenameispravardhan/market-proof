@@ -313,11 +313,29 @@ async def place_order(
     # order fills (a resting limit may fill much later), never before.
     sl, tp = _opt_price(body.get("stop_loss")), _opt_price(body.get("target"))
     if (sl is not None or tp is not None) and result.get("broker_order_id"):
-        from app.execution.order_reconcile import spawn
+        from app.execution.order_reconcile import LEVELS_ON_FILL
 
-        spawn(_arm_levels_on_fill(str(result["broker_order_id"]), symbol.upper(), sl, tp))
+        # Armed by the reconciler the moment THIS order's fill lands — or now,
+        # if the fill was already applied (instant fill / parked update).
+        oid = str(result["broker_order_id"])
+        LEVELS_ON_FILL[oid] = (symbol.upper(), sl, tp)
+        row = db.query(Trade.status).filter(Trade.broker_order_id == oid).first()
+        if row is not None and row[0] == "filled":
+            from app.execution.order_reconcile import _arm_levels, spawn
+
+            spawn(_arm_levels(oid, *LEVELS_ON_FILL.pop(oid)))
         result["levels_pending"] = {"stop_loss": sl, "target": tp}
     return result
+
+
+async def _commit_off_loop(db: Session) -> None:
+    """The commit (fsync + SQLite write lock, up to its busy timeout) runs on
+    the trading pool so it can't freeze ticks and orders on the event loop."""
+    import asyncio
+
+    from app.execution.order_reconcile import TRADING_POOL
+
+    await asyncio.get_running_loop().run_in_executor(TRADING_POOL, db.commit)
 
 
 def _opt_price(v: Any) -> Optional[float]:
@@ -328,36 +346,6 @@ def _opt_price(v: Any) -> Optional[float]:
     return f if f > 0 else None
 
 
-ARM_POLL_S = 2.0
-ARM_MAX_S = 8 * 3600  # a resting limit can fill any time in the session
-
-
-async def _arm_levels_on_fill(order_id: str, symbol: str, sl: Optional[float], tp: Optional[float]) -> None:
-    """Wait for the order's trades row to turn filled, then hand the levels to
-    the trade manager (which exits on them). Stops on cancel / reject."""
-    import asyncio
-
-    from app.db import session as db_session
-    from app.main import app
-
-    waited = 0.0
-    while waited < ARM_MAX_S:
-        with db_session.SessionLocal() as db:
-            row = db.query(Trade.status).filter(Trade.broker_order_id == order_id).first()
-        st = row[0] if row else None
-        if st in ("cancelled", "rejected", "expired"):
-            return
-        if st == "filled":
-            tm = getattr(app.state, "trade_manager", None)
-            if tm is not None:
-                try:
-                    await tm.update_levels(symbol, stop_loss=sl, target=tp)
-                    log.info("manual_order.levels_armed", order_id=order_id, symbol=symbol, stop_loss=sl, target=tp)
-                except Exception:  # noqa: BLE001
-                    log.exception("manual_order.levels_arm_failed", order_id=order_id)
-            return
-        await asyncio.sleep(ARM_POLL_S)
-        waited += ARM_POLL_S
 
 
 @router.post("/cancel")
@@ -458,7 +446,7 @@ async def cancel_order(
             },
         ))
     if trades:
-        db.commit()
+        await _commit_off_loop(db)
     response: dict[str, Any] = {
         "ok": bool(ok),
         "broker_order_id": broker_order_id,
@@ -726,7 +714,7 @@ async def modify_order(
                     "broker_message": message,
                 },
             ))
-        db.commit()
+        await _commit_off_loop(db)
         rows_updated = len(trades)
     return {
         "ok": bool(ok),

@@ -26,6 +26,8 @@ import {
   type UTCTimestamp,
 } from "lightweight-charts";
 import { api } from "../api/client";
+import { useSessionState } from "../router";
+import { peekQuote, useQuoteTick } from "../hooks/useQuotes";
 import { Toggle } from "../components/common/Toggle";
 
 // ---------------------------------------------------------------------------
@@ -129,7 +131,7 @@ type LiveTrade = {
   id: number; strategy_id: number; symbol: string; instrument: string | null; side: string; quantity: number; mode: string; status: string;
   entry_at: string; entry_price: number | null; stop_loss: number | null; target: number | null; trail_stop: number | null;
   exit_at: string | null; exit_price: number | null; exit_reason: string | null; net_pnl: number | null; charges: number | null;
-  note: string | null; ltp?: number | null; unrealized?: number | null; legs: LiveLeg[] | null; be_on?: boolean | null;
+  note: string | null; ltp?: number | null; unrealized?: number | null; legs: LiveLeg[] | null; be_on?: boolean | null; ref?: string;
 };
 type RunnerStatus = { running: boolean; last_tick: number | null; last_sync: { t: number; symbols: number; ok: number; failed: string[] } | null; events: { t: number; level: string; msg: string }[]; open: LiveTrade[] };
 type Account = { id: number; name: string; broker: string; paper_mode: boolean; enabled: boolean };
@@ -1148,14 +1150,41 @@ function Optimizer({ spec, cat, range, onApply }: { spec: Spec; cat: Catalog; ra
   );
 }
 
+/** Live MTM of one open algo trade from the tick store: Σ act × (ltp − entry) × qty
+ *  over legs (closed legs at their exit). Falls back to the server's figure. */
+function liveMtm(t: LiveTrade): number | null {
+  const legs = t.legs ?? [];
+  if (!legs.length) return t.unrealized ?? null;
+  let total = 0;
+  for (const lg of legs) {
+    const px = lg.exit ?? peekQuote(lg.symbol)?.last_price ?? lg.ltp;
+    if (px == null) return t.unrealized ?? null;
+    total += lg.act * (px - lg.entry) * lg.qty;
+  }
+  return total;
+}
+
+function AlgoLiveMtm({ t }: { t: LiveTrade }) {
+  useQuoteTick();
+  const v = liveMtm(t);
+  return <td className={`mono ${pnlCls(v)}`} data-testid={`algo-mtm-${t.id}`}>{inr(v)}</td>;
+}
+
+function AlgoLiveLtp({ t }: { t: LiveTrade }) {
+  useQuoteTick();
+  const ref = t.ref === "u" ? t.symbol : t.legs?.[0]?.symbol ?? t.symbol;
+  return <>{num(peekQuote(ref)?.last_price ?? t.ltp)}</>;
+}
+
 function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
   const qc = useQueryClient();
   const strategies = useQuery({ queryKey: ["algo", "strategies"], queryFn: () => api.get<{ strategies: Saved[] }>("/api/algo/strategies"), refetchInterval: 10000 });
-  const status = useQuery({ queryKey: ["algo", "status"], queryFn: () => api.get<RunnerStatus>("/api/algo/status"), refetchInterval: 5000 });
+  // 1 s: the endpoint reads the tick stream (no Fyers REST per call); the MTM cells tick per frame on top of it.
+  const status = useQuery({ queryKey: ["algo", "status"], queryFn: () => api.get<RunnerStatus>("/api/algo/status"), refetchInterval: 1000 });
   const accounts = useQuery({ queryKey: ["algo", "accounts"], queryFn: () => api.get<{ accounts: Account[] }>("/api/broker-accounts") });
   const [sel, setSel] = useState<number | null>(null);
   const trades = useQuery({
-    queryKey: ["algo", "trades", sel], refetchInterval: 10000,
+    queryKey: ["algo", "trades", sel], refetchInterval: 3000,
     queryFn: () => api.get<{ trades: LiveTrade[] }>(`/api/algo/trades?limit=300${sel ? `&strategy_id=${sel}` : ""}`),
   });
   const [err, setErr] = useState<string | null>(null);
@@ -1169,6 +1198,15 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
   const st = status.data;
   const ago = st?.last_tick ? Math.round(Date.now() / 1000 - st.last_tick) : null;
   const nameOf = (id: number) => strategies.data?.strategies.find((s) => s.id === id)?.name ?? String(id);
+  const openShown = (st?.open ?? []).filter((t) => !sel || t.strategy_id === sel);
+  useQuoteTick();   // re-render the header total per tick
+  const liveTotal = openShown.reduce((a, t) => a + (liveMtm(t) ?? 0), 0);
+  const closed = (trades.data?.trades ?? []).filter((t) => t.status === "closed");
+  const summary = {
+    n: closed.length,
+    wins: closed.filter((t) => (t.net_pnl ?? 0) > 0).length,
+    net: closed.reduce((a, t) => a + (t.net_pnl ?? 0), 0),
+  };
   const instLabel = (s: Saved) => {
     const i = s.spec.instrument;
     if (!i || i.type === "equity") return "equity";
@@ -1193,7 +1231,8 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
               <tbody>{strategies.data!.strategies.map((s) => (
                 <tr key={s.id} style={sel === s.id ? { background: "var(--bg-row)" } : undefined}>
                   <td><Toggle on={s.enabled} size="sm" onChange={(on: boolean) => put(s.id, { enabled: on })} /></td>
-                  <td><a href="#/algo" onClick={(e) => { e.preventDefault(); setSel(sel === s.id ? null : s.id); }}>{s.name}</a></td>
+                  <td><a href="#/algo" onClick={(e) => { e.preventDefault(); setSel(sel === s.id ? null : s.id); }}>{s.name}</a>{" "}
+                    <button type="button" className="btn-sm" onClick={() => setSel(s.id)} title="this automation's trades and open positions" data-testid={`algo-trades-${s.id}`}>Trades</button></td>
                   <td>
                     <select value={s.version} title="the version that runs — switch back and forth any time" onChange={async (e) => {
                       setErr(null);
@@ -1244,18 +1283,18 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
         )}
       </div>
       <div className="widget widget-wide" style={{ marginBottom: 12 }}>
-        <h3>Open positions</h3>
-        {!st?.open.length ? <div className="empty">flat</div> : (
+        <h3>Open positions {sel ? <span className="meta">— {nameOf(sel)}</span> : null} <span className="meta">· live MTM {inr(liveTotal)}</span></h3>
+        {!openShown.length ? <div className="empty">flat</div> : (
           <div style={{ overflowX: "auto" }}>
             <table>
               <thead><tr><th>Strategy</th><th>Instrument</th><th>Signal</th><th>Qty</th><th>Mode</th><th>Ref entry</th><th>Ref LTP</th><th>Stop</th><th>Trail</th><th>Target</th><th>MTM</th><th>Since</th></tr></thead>
-              <tbody>{st.open.map((t) => (
+              <tbody>{openShown.map((t) => (
                 <tr key={t.id} title={(t.legs ?? []).map((l) => `${l.act > 0 ? "BUY" : "SELL"} ${l.qty} ${l.label ?? l.symbol}: ${num(l.entry)} → ${num(l.ltp)}`).join("\n")}>
                   <td>{nameOf(t.strategy_id)}</td><td>{(t.instrument ?? t.symbol).replace(/NSE:/g, "")}</td>
                   <td><span className={`badge ${t.side === "BUY" ? "buy" : "sell"}`}>{t.side === "BUY" ? "LONG" : "SHORT"}</span></td><td className="mono">{t.quantity}</td><td>{t.mode}</td>
-                  <td className="mono">{num(t.entry_price)}</td><td className="mono">{num(t.ltp)}</td><td className="mono">{t.be_on ? `BE ${num(t.entry_price)}` : num(t.stop_loss)}</td>
+                  <td className="mono">{num(t.entry_price)}</td><td className="mono"><AlgoLiveLtp t={t} /></td><td className="mono">{t.be_on ? `BE ${num(t.entry_price)}` : num(t.stop_loss)}</td>
                   <td className="mono">{num(t.trail_stop)}</td><td className="mono">{num(t.target)}</td>
-                  <td className={`mono ${pnlCls(t.unrealized)}`}>{inr(t.unrealized)}</td><td className="mono">{isoIst(t.entry_at)}</td></tr>))}
+                  <AlgoLiveMtm t={t} /><td className="mono">{isoIst(t.entry_at)}</td></tr>))}
               </tbody>
             </table>
           </div>
@@ -1263,7 +1302,8 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(380px, 1fr))", gap: 12 }}>
         <div className="widget">
-          <h3>Trades {sel ? <span className="meta">— {nameOf(sel)} (click the name again for all)</span> : <span className="meta">— all strategies</span>}</h3>
+          <h3>Trades {sel ? <span className="meta">— {nameOf(sel)} <button type="button" className="btn-sm" onClick={() => setSel(null)}>show all</button></span> : <span className="meta">— all strategies</span>}</h3>
+          <div className="meta" data-testid="algo-trade-summary">{summary.n} closed · {summary.n ? Math.round((summary.wins / summary.n) * 100) : 0}% winners · net <span className={pnlCls(summary.net)}>{inr(summary.net)}</span> · open MTM <span className={pnlCls(liveTotal)}>{inr(liveTotal)}</span></div>
           <div style={{ maxHeight: 420, overflow: "auto" }}>
             {!trades.data?.trades.length ? <div className="empty">none yet</div> : (
               <table>
@@ -1477,7 +1517,7 @@ type Tab = "builder" | "optimize" | "compare" | "automations" | "data";
 export default function Algo() {
   const cat = useQuery({ queryKey: ["algo", "catalog"], queryFn: () => api.get<Catalog>("/api/algo/indicators"), staleTime: Infinity });
   const qc = useQueryClient();
-  const [tab, setTab] = useState<Tab>("builder");
+  const [tab, setTab] = useSessionState<Tab>("algo:tab", "builder");
   const [spec, setSpec] = useState<Spec | null>(null);
   const [name, setName] = useState("My strategy");
   const [editing, setEditing] = useState<number | null>(null);

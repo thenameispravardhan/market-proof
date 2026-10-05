@@ -8,6 +8,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { InstrumentHit } from "../../types";
 import { useLiveQuote } from "../../hooks/useQuotes";
+import { useDepth } from "../../hooks/useDepth";
 import { useOutside } from "./chartUi";
 import type { ChartOrder } from "./ChartPanel";
 import { fmt, type OrderRow } from "./AccountPanels";
@@ -96,7 +97,7 @@ export function DomPanel({
   const sym = symbol?.symbol ?? null;
   const tick = symbol?.tick_size && symbol.tick_size > 0 ? symbol.tick_size : 0.05;
   const lot = symbol?.lot_size && symbol.lot_size > 1 ? symbol.lot_size : 1;
-  const [d, setD] = useState<Depth | null>(null);
+  const d = useDepth(sym);   // pushed book (DepthUpdate), REST only as snapshot / keep-alive
   const [s, setS] = useState<DomSettings>(loadDom);
   const [menu, setMenu] = useState(false);
   const [pinned, setPinned] = useState<number | null>(null);
@@ -115,24 +116,8 @@ export function DomPanel({
   const key = (p: number) => Math.round(p / tick);
 
   useEffect(() => {
-    setD(null);
     setPinned(null);
     setVap(new Map());
-    if (!sym) return;
-    let stop = false;
-    const load = () => {
-      if (document.hidden) return;
-      void fetch(`/api/market/depth?symbol=${encodeURIComponent(sym)}`)
-        .then((r) => r.json())
-        .then((j: Depth) => !stop && setD(j))
-        .catch(() => !stop && setD({ ok: false, reason: "depth request failed" }));
-    };
-    load();
-    const id = setInterval(load, 2000); // Fyers caps data calls (~200/min): a 2s poll
-    return () => {
-      stop = true;
-      clearInterval(id);
-    };
   }, [sym]);
 
   // volume at price: each tick's volume increase, booked at its last price
@@ -237,7 +222,7 @@ export function DomPanel({
       </div>
       <div className="dom-btns">
         <button type="button" className="btn-sm" disabled={!pos} onClick={() => pos && confirmGo(`Flatten ${symbol.short_name} at market`) && onFlatten().then(() => onMsg(`Flattened ${symbol.short_name}`), (e) => onMsg(`Flatten failed: ${e instanceof Error ? e.message : String(e)}`))} data-testid="dom-flatten">Flatten</button>
-        <button type="button" className="btn-sm" disabled={!orders.length} onClick={() => { if (window.confirm(`Cancel all ${orders.length} working order(s) on ${symbol.short_name}?`)) orders.forEach((o) => o.id && onCancel(o.id)); }} data-testid="dom-cxl-all">CXL All</button>
+        <button type="button" className="btn-sm" disabled={!orders.length} onClick={() => { if (confirmGo(`Cancel all ${orders.length} working order(s) on ${symbol.short_name}`)) orders.forEach((o) => o.id && onCancel(o.id)); }} data-testid="dom-cxl-all">CXL All</button>
         <button type="button" className="btn-sm" disabled={!pos} onClick={() => pos && send({ side: pos.qty > 0 ? "SELL" : "BUY", type: "MARKET", price: null }, `Reverse ${symbol.short_name}: ${pos.qty > 0 ? "SELL" : "BUY"} ${Math.abs(pos.qty) * 2} at market`)} data-testid="dom-reverse" title="Opposite side, twice the position, at market">Reverse</button>
       </div>
       {!d ? (
@@ -273,7 +258,7 @@ export function DomPanel({
                     title={`${o.side} ${o.remaining ?? o.qty} ${o.type === "STOP_LOSS" ? "stop-limit" : o.type.toLowerCase()} — drag to another price to modify`}
                   >
                     {o.remaining ?? o.qty}{o.type !== "LIMIT" && <i>stp</i>}
-                    <button type="button" onClick={(e) => { e.stopPropagation(); if (o.id && window.confirm(`Cancel ${o.side} ${o.remaining ?? o.qty} @ ${fmt(p)}?`)) onCancel(o.id); }} title="Cancel">✕</button>
+                    <button type="button" onClick={(e) => { e.stopPropagation(); if (o.id && confirmGo(`Cancel ${o.side} ${o.remaining ?? o.qty} @ ${fmt(p)}`)) onCancel(o.id); }} title="Cancel">✕</button>
                   </span>
                 );
                 return (

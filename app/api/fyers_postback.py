@@ -63,7 +63,11 @@ async def fyers_postback(request: Request, db: Session = Depends(get_db)) -> dic
     if not order_id:
         return {"ok": False, "reason": "no order id"}
     await event_bus.publish("broker", {"order_id": order_id, "source": "fyers_postback"})
-    if db.query(Trade.id).filter(Trade.broker_order_id == order_id).first() is not None:
+    row = db.query(Trade.status).filter(Trade.broker_order_id == order_id).first()
+    if row is not None:
+        if row[0] in ("filled", "rejected", "cancelled"):
+            # The order WebSocket already settled it: no extra Fyers call.
+            return {"ok": True, "matched": True, "deduped": True, "order_id": order_id, "status": row[0]}
         return await _sync_from_fyers(order_id)
     # Not ours (Fyers app / web order) or Fyers beat our own commit: answer
     # Fyers NOW — it re-sends a webhook that takes ~2s — and look again in

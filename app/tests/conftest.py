@@ -97,3 +97,14 @@ def client() -> TestClient:
 
     with TestClient(app) as c:
         yield c
+
+
+@pytest.fixture(autouse=True)
+def _reset_order_reconcile_state():
+    """Order ids repeat across tests (real Fyers ids don't): clear the
+    reconciler's parked / waiter / levels / recent-terminal maps."""
+    from app.execution import order_reconcile as orc
+
+    for m in (orc.PARKED, orc.LEVELS_ON_FILL, orc.ORDER_WAITERS, orc.RECENT_TERMINAL):
+        m.clear()
+    yield
