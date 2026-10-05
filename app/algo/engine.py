@@ -78,7 +78,8 @@ DEFAULT_SPEC: dict[str, Any] = {
     "cooldown_bars": 0,
     "max_bars": None,
     "sizing": {"mode": "qty", "value": 1},
-    "portfolio": {"capital": 100000, "leverage": 1.0, "max_positions": 10, "compounding": True},
+    "portfolio": {"capital": 100000, "leverage": 1.0, "max_positions": 10, "compounding": True,
+                  "max_position_pct": None},                       # cap one position's margin at X% of equity
     "costs": {"slippage_pct": 0.02, "charges": True},
 }
 
@@ -251,6 +252,7 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
     pf["leverage"] = _num(pf.get("leverage", 1), "leverage", 0.1)
     pf["max_positions"] = _num(pf.get("max_positions", 10), "max positions", 1, integer=True)
     pf["compounding"] = bool(pf.get("compounding", True))
+    pf["max_position_pct"] = _num(pf.get("max_position_pct"), "max % per position", 1e-9, allow_none=True)
     s["max_trades_per_day"] = _num(s["max_trades_per_day"], "max trades per day", 1, integer=True)
     s["cooldown_bars"] = _num(s.get("cooldown_bars") or 0, "cooldown bars", 0, integer=True)
     s["max_bars"] = _num(s.get("max_bars"), "max bars in trade", 1, integer=True, allow_none=True)
@@ -538,12 +540,17 @@ def units(spec: dict, equity: float, per_set_margin: float, per_set_risk: Option
     v = float(sz["value"])
     mode = sz["mode"]
     if mode in ("qty", "lots"):
-        return int(v)
-    if mode in ("amount", "pct_equity"):
+        n = int(v)
+    elif mode in ("amount", "pct_equity"):
         budget = v if mode == "amount" else equity * v / 100
-        return int(budget // per_set_margin) if per_set_margin > 0 else 0
-    risk = v if mode == "risk" else equity * v / 100
-    return int(risk // per_set_risk) if per_set_risk else 0
+        n = int(budget // per_set_margin) if per_set_margin > 0 else 0
+    else:
+        risk = v if mode == "risk" else equity * v / 100
+        n = int(risk // per_set_risk) if per_set_risk else 0
+    cap = spec["portfolio"].get("max_position_pct")
+    if cap and per_set_margin > 0:                   # no single position may block more than cap% of equity
+        n = min(n, int(equity * cap / 100 // per_set_margin))
+    return n
 
 
 # ---- per-symbol context ----------------------------------------------------

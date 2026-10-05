@@ -612,3 +612,14 @@ def test_adv_from_daily_candles_unblocks_known_liquid_symbols():
     assert adv_from_candles([]) is None
     _ADV_CACHE[("NSE:SBIN-EQ", int((_t.time() + 19800) // 86400))] = 160.0
     assert cached_adv("nse:sbin-eq") == 160.0
+
+
+def test_units_caps_one_position_at_max_position_pct() -> None:
+    s = _cross_spec(sizing={"mode": "pct_equity", "value": 50},
+                    portfolio={"capital": 100000, "max_position_pct": 20})
+    # 50% of 1L = 500 shares at ₹100, but one position may only block 20% → 200.
+    assert engine.units(s, 100000, 100.0, None) == 200
+    s["portfolio"]["max_position_pct"] = None
+    assert engine.units(s, 100000, 100.0, None) == 500
+    with pytest.raises(ValueError):
+        _cross_spec(portfolio={"max_position_pct": -5})
