@@ -1220,7 +1220,7 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
       <div className="widget widget-wide" style={{ marginBottom: 12 }}>
         <h3>Automations <span className="meta">
           runner {st?.running ? (ago !== null && ago < 30 ? `alive · tick ${ago}s ago` : "idle") : "not running"} ·
-          evaluates on each completed candle, exits on live LTP every 5s, squares off at the session's square-off time
+          evaluates on each completed candle, exits on live LTP every 1s · every setting lives in Builder & backtest
         </span></h3>
         {(strategies.data?.strategies ?? []).length === 0 ? (
           <div className="empty">No saved strategies yet — build one in the Builder tab and press “Save as new”.</div>

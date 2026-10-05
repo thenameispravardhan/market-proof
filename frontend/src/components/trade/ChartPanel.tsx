@@ -55,6 +55,7 @@ import {
 import { api } from "../../api/client";
 import { getTheme, THEME_EVENT, toggleTheme } from "../../lib/theme";
 import { onQuote, useLiveQuote, type QuoteTick } from "../../hooks/useQuotes";
+import { tabLocal } from "../../router";
 import { heikinAshi, heikinAshiBar, type OhlcvCandle } from "../../lib/indicators";
 import type { HistoryResponse, InstrumentHit, SearchResponse } from "../../types";
 import {
@@ -404,7 +405,7 @@ function fmtVol(v: number): string {
 
 function loadJson<T>(key: string, fallback: T): T {
   try {
-    const raw = localStorage.getItem(key);
+    const raw = tabLocal.getItem(key);
     if (!raw) return fallback;
     return JSON.parse(raw) as T;
   } catch {
@@ -414,7 +415,7 @@ function loadJson<T>(key: string, fallback: T): T {
 
 function saveJson(key: string, value: unknown): void {
   try {
-    localStorage.setItem(key, JSON.stringify(value));
+    tabLocal.setItem(key, JSON.stringify(value));
   } catch {
     /* storage full / disabled — persistence is best-effort */
   }

@@ -39,6 +39,7 @@ import {
   useServerInfo,
 } from "../hooks/useApi";
 import { useLiveQuote } from "../hooks/useQuotes";
+import { tabLocal } from "../router";
 import ChartPanel, { type BrokerLine, type ChartOrder, type ChartPosition, type HostAction } from "../components/trade/ChartPanel";
 import Scalper, { splitDrag } from "../components/trade/Scalper";
 import { AccountManager, BOTTOM_TABS, LayoutMenu, SymbolDetails, WatchlistTable, useLayouts, type BottomTab, type WatchState } from "../components/trade/TradePanels";
@@ -235,7 +236,7 @@ const isUnderlying = (h: InstrumentHit | null): h is InstrumentHit =>
 
 function stored<T>(key: string, fallback: T): T {
   try {
-    const v = localStorage.getItem(key);
+    const v = tabLocal.getItem(key);
     return v == null ? fallback : (JSON.parse(v) as T);
   } catch {
     return fallback;
@@ -257,7 +258,7 @@ function drag(e: React.PointerEvent, axis: "x" | "y", start: number, set: (v: nu
   const up = () => {
     window.removeEventListener("pointermove", move);
     window.removeEventListener("pointerup", up);
-    if (key) try { localStorage.setItem(key, String(Math.round(v))); } catch { /* best-effort */ }
+    if (key) try { tabLocal.setItem(key, String(Math.round(v))); } catch { /* best-effort */ }
   };
   window.addEventListener("pointermove", move);
   window.addEventListener("pointerup", up);
@@ -271,7 +272,7 @@ const WATCH_KEY = "trade:watchlists";
 
 function loadRecent(): InstrumentHit[] {
   try {
-    const raw = localStorage.getItem(RECENT_KEY);
+    const raw = tabLocal.getItem(RECENT_KEY);
     const list = raw ? (JSON.parse(raw) as InstrumentHit[]) : [];
     return Array.isArray(list) ? list.filter((h) => h && h.symbol) : [];
   } catch {
@@ -281,7 +282,7 @@ function loadRecent(): InstrumentHit[] {
 
 function loadWatchState(): WatchState {
   try {
-    const v = JSON.parse(localStorage.getItem(WATCH_KEY) ?? "null") as WatchState | null;
+    const v = JSON.parse(tabLocal.getItem(WATCH_KEY) ?? "null") as WatchState | null;
     if (v && Array.isArray(v.lists) && v.lists.length) return { active: Math.max(0, Math.min(v.active ?? 0, v.lists.length - 1)), lists: v.lists };
   } catch {
     /* fall through */
@@ -369,13 +370,13 @@ export default function Trade() {
     if (tab) setBottomTab(tab);
     setBottomOpen(tab != null);
     try {
-      localStorage.setItem("trade:bottomOpen", JSON.stringify(tab != null));
-      if (tab) localStorage.setItem("trade:bottomTab", JSON.stringify(tab));
+      tabLocal.setItem("trade:bottomOpen", JSON.stringify(tab != null));
+      if (tab) tabLocal.setItem("trade:bottomTab", JSON.stringify(tab));
     } catch { /* best-effort */ }
   };
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<InstrumentHit | null>(() => {
-    try { return JSON.parse(localStorage.getItem(LAST_KEY) ?? "null"); } catch { return null; }
+    try { return JSON.parse(tabLocal.getItem(LAST_KEY) ?? "null"); } catch { return null; }
   });
   // The chain stays on the last UNDERLYING picked, so clicking one of its
   // options (which opens that option's chart + ticket) keeps the chain up.
@@ -394,26 +395,26 @@ export default function Trade() {
     if (k === "instant" && v && !window.confirm("Turn on instant orders?\nEvery order from the chart, the '+' menu and the scalper (and its hotkeys) goes to the broker immediately — no confirm.")) return;
     const n = { ...tset, [k]: v };
     setTset(n);
-    try { localStorage.setItem("trade:settings", JSON.stringify(n)); } catch { /* best-effort */ }
+    try { tabLocal.setItem("trade:settings", JSON.stringify(n)); } catch { /* best-effort */ }
   };
   const settingsEl = <TradeSettings s={tset} onChange={changeSetting} />;
   // Layout split positions (fractions), draggable, per layout.
   const [splits, setSplits] = useState<Record<string, { x: number; y: number }>>(() => stored("trade:splits", {}));
-  useEffect(() => { try { localStorage.setItem("trade:splits", JSON.stringify(splits)); } catch { /* best-effort */ } }, [splits]);
+  useEffect(() => { try { tabLocal.setItem("trade:splits", JSON.stringify(splits)); } catch { /* best-effort */ } }, [splits]);
   // One top toolbar + one drawing strip for the whole layout: the active
   // chart renders its own controls into these (TradingView-style).
   const [topSlot, setTopSlot] = useState<HTMLDivElement | null>(null);
   const [leftSlot, setLeftSlot] = useState<HTMLDivElement | null>(null);
   const [scalper, setScalper] = useState(() => stored("trade:scalper", false));
-  useEffect(() => { try { localStorage.setItem("trade:scalper", JSON.stringify(scalper)); } catch { /* best-effort */ } }, [scalper]);
+  useEffect(() => { try { tabLocal.setItem("trade:scalper", JSON.stringify(scalper)); } catch { /* best-effort */ } }, [scalper]);
   const dockWidth = dock.includes("chain") ? Math.max(dockW, 400) : dockW;   // the chain's 5 columns need room
   // Panel heights the operator dragged (px); unset = sized by content. The
   // last panel always takes whatever room is left.
   const [sizes, setSizes] = useState<Partial<Record<DockId, number>>>(() => stored("trade:dockSizes", {}));
-  useEffect(() => { try { localStorage.setItem("trade:dockSizes", JSON.stringify(sizes)); } catch { /* best-effort */ } }, [sizes]);
+  useEffect(() => { try { tabLocal.setItem("trade:dockSizes", JSON.stringify(sizes)); } catch { /* best-effort */ } }, [sizes]);
   const saveDock = (next: DockId[]) => {
     setDock(next);
-    try { localStorage.setItem("trade:dock", JSON.stringify(next)); } catch { /* best-effort */ }
+    try { tabLocal.setItem("trade:dock", JSON.stringify(next)); } catch { /* best-effort */ }
   };
   const toggleDock = (id: DockId) => saveDock(dock.includes(id) ? dock.filter((x) => x !== id) : [...dock, id]);
   const moveDock = (id: DockId, by: -1 | 1) => {
@@ -461,7 +462,7 @@ export default function Trade() {
   const setSync = (k: keyof LayoutSync, v: boolean) => {
     const n = { ...sync, [k]: v };
     setSyncState(n);
-    try { localStorage.setItem("trade:sync", JSON.stringify(n)); } catch { /* best-effort */ }
+    try { tabLocal.setItem("trade:sync", JSON.stringify(n)); } catch { /* best-effort */ }
   };
   const nCells = LAYOUTS.find((l) => l.id === layout)?.n ?? 1;
   useEffect(() => {
@@ -469,13 +470,13 @@ export default function Trade() {
       if (sync.symbol && selected) {
         if (Array.from({ length: nCells }, (_, i) => c[i]?.symbol).every((x) => x === selected.symbol)) return c;
         const n = Array.from({ length: Math.max(nCells, c.length) }, () => selected);
-        try { localStorage.setItem("trade:cells", JSON.stringify(n)); } catch { /* best-effort */ }
+        try { tabLocal.setItem("trade:cells", JSON.stringify(n)); } catch { /* best-effort */ }
         return n;
       }
       if (c[activeCell]?.symbol === selected?.symbol) return c;
       const n = [...c];
       n[activeCell] = selected;
-      try { localStorage.setItem("trade:cells", JSON.stringify(n)); } catch { /* best-effort */ }
+      try { tabLocal.setItem("trade:cells", JSON.stringify(n)); } catch { /* best-effort */ }
       return n;
     });
   }, [selected, activeCell, sync.symbol, nCells]);
@@ -487,8 +488,8 @@ export default function Trade() {
     setWlState((w) => {
       const next = fn(w);
       try {
-        localStorage.setItem(WATCH_KEY, JSON.stringify(next));
-        localStorage.setItem(RECENT_KEY, JSON.stringify(next.lists[next.active]?.items ?? []));
+        tabLocal.setItem(WATCH_KEY, JSON.stringify(next));
+        tabLocal.setItem(RECENT_KEY, JSON.stringify(next.lists[next.active]?.items ?? []));
       } catch { /* best-effort */ }
       return next;
     });
@@ -704,13 +705,13 @@ export default function Trade() {
     setLastResult(null);
     if (isUnderlying(h) && !keepChain) {
       setChainBase(h);
-      try { localStorage.setItem("trade:chainBase", JSON.stringify(h)); } catch { /* best-effort */ }
+      try { tabLocal.setItem("trade:chainBase", JSON.stringify(h)); } catch { /* best-effort */ }
       setSelectedExpiry(null); // load the nearest expiry for the new underlying
     }
     // An option picked off the chain opens its chart + ticket without
     // flooding the watchlist; a searched symbol joins it.
     if (!fromChain) addToWatch(h);
-    try { localStorage.setItem(LAST_KEY, JSON.stringify(h)); } catch { /* best-effort */ }
+    try { tabLocal.setItem(LAST_KEY, JSON.stringify(h)); } catch { /* best-effort */ }
     // Intraday-only bot — F&O included. Every ticket is MIS/INTRADAY; the
     // backend rejects anything else, so there is nothing per-instrument to set.
     setOrderType("MARKET");
@@ -743,8 +744,8 @@ export default function Trade() {
     setLayoutOpen(false);
     setMaxCell(null);
     try {
-      localStorage.setItem("trade:layout", JSON.stringify(id));
-      localStorage.setItem("trade:cells", JSON.stringify(out));
+      tabLocal.setItem("trade:layout", JSON.stringify(id));
+      tabLocal.setItem("trade:cells", JSON.stringify(out));
     } catch { /* best-effort */ }
   };
   const activate = (i: number) => {
@@ -828,7 +829,7 @@ export default function Trade() {
     setChainBase(h);
     setChainQuery("");
     setSelectedExpiry(null);
-    try { localStorage.setItem("trade:chainBase", JSON.stringify(h)); } catch { /* best-effort */ }
+    try { tabLocal.setItem("trade:chainBase", JSON.stringify(h)); } catch { /* best-effort */ }
   };
 
   // An order from a chart (right-click menu, scalper buttons) on the ticket's
@@ -863,14 +864,14 @@ export default function Trade() {
   const product: ProductType = productPick === "INTRADAY" ? "INTRADAY" : carryProduct;
   const saveDefaultProduct = (p: ProductType) => {
     setDefaultProduct(p);
-    try { localStorage.setItem("trade:defaultProduct", JSON.stringify(p)); } catch { /* best-effort */ }
+    try { tabLocal.setItem("trade:defaultProduct", JSON.stringify(p)); } catch { /* best-effort */ }
   };
   const [slPrice, setSlPrice] = useState("");
   const [tpPrice, setTpPrice] = useState("");
   const estPrice = (requiresLimit && Number(limitPrice) > 0 ? Number(limitPrice) : null) ?? (side === "BUY" ? ask : bid) ?? ltp;
   const [slMode, setSlMode] = useState<LevelInputMode>(() => stored<LevelInputMode>("trade:slMode", "price"));
   const [tpMode, setTpMode] = useState<LevelInputMode>(() => stored<LevelInputMode>("trade:tpMode", "price"));
-  useEffect(() => { try { localStorage.setItem("trade:slMode", JSON.stringify(slMode)); localStorage.setItem("trade:tpMode", JSON.stringify(tpMode)); } catch { /* best-effort */ } }, [slMode, tpMode]);
+  useEffect(() => { try { tabLocal.setItem("trade:slMode", JSON.stringify(slMode)); tabLocal.setItem("trade:tpMode", JSON.stringify(tpMode)); } catch { /* best-effort */ } }, [slMode, tpMode]);
   const tick = selected?.tick_size ?? 0.05;
   const slAbs = levelPrice(Number(slPrice), slMode, estPrice, side, "sl", tick);
   const tpAbs = levelPrice(Number(tpPrice), tpMode, estPrice, side, "target", tick);
@@ -1002,7 +1003,7 @@ export default function Trade() {
       case "privacy": {
         const v = !privacy;
         setPrivacy(v);
-        try { localStorage.setItem("trade:privacy", JSON.stringify(v)); } catch { /* best-effort */ }
+        try { tabLocal.setItem("trade:privacy", JSON.stringify(v)); } catch { /* best-effort */ }
         return;
       }
     }
@@ -1808,7 +1809,7 @@ export default function Trade() {
             privacy,
             onPrivacy: (v) => {
               setPrivacy(v);
-              try { localStorage.setItem("trade:privacy", JSON.stringify(v)); } catch { /* best-effort */ }
+              try { tabLocal.setItem("trade:privacy", JSON.stringify(v)); } catch { /* best-effort */ }
             },
             autosave: L.autosave,
             onAutosave: L.setAutosave,

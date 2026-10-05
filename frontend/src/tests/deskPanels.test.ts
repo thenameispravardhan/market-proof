@@ -96,3 +96,19 @@ describe("ticket level input", () => {
     expect(levelPrice(1, "pct", null, "BUY", "sl")).toBeNull();
   });
 });
+
+import { tabLocal } from "../router";
+
+describe("per-tab trade state", () => {
+  it("a refresh keeps THIS tab's view even after another tab wrote its own", () => {
+    localStorage.clear();
+    sessionStorage.clear();
+    tabLocal.setItem("trade:scalper", "false");          // this tab: chart
+    localStorage.setItem("trade:scalper", "true");       // another tab switched to the scalper
+    expect(tabLocal.getItem("trade:scalper")).toBe("false");
+    sessionStorage.clear();                               // a brand-new tab starts from the last used
+    expect(tabLocal.getItem("trade:scalper")).toBe("true");
+    localStorage.setItem("trade:watchlists", "x");       // shared keys pass straight through
+    expect(tabLocal.getItem("trade:watchlists")).toBe("x");
+  });
+});

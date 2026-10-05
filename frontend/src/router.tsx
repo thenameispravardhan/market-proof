@@ -88,3 +88,31 @@ export function useSessionState<T>(key: string, init: T): [T, (v: T) => void] {
   };
   return [v, set];
 }
+
+// Trade-page state that must stay with ITS browser tab across a refresh (tab 1
+// NIFTY chart, tab 2 BANKNIFTY chart, tab 3 SENSEX scalper never take each
+// other's view). Read: this tab's copy first, else the last-used one (a new
+// tab starts from where you left off). Write: both. Other keys pass through.
+const PER_TAB = /^(trade:(last|scalper|layout|cells|chainBase|dock|dockSizes|bottomTab|bottomOpen|sync|splits)|chart:prefs)$/;
+
+export const tabLocal = {
+  getItem(k: string): string | null {
+    try {
+      if (PER_TAB.test(k)) {
+        const v = sessionStorage.getItem(k);
+        if (v != null) return v;
+      }
+      return localStorage.getItem(k);
+    } catch {
+      return null;
+    }
+  },
+  setItem(k: string, v: string): void {
+    localStorage.setItem(k, v);
+    if (PER_TAB.test(k)) try { sessionStorage.setItem(k, v); } catch { /* storage off */ }
+  },
+  removeItem(k: string): void {
+    localStorage.removeItem(k);
+    try { sessionStorage.removeItem(k); } catch { /* storage off */ }
+  },
+};
