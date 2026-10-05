@@ -892,3 +892,20 @@ def test_ticket_sl_target_armed_only_after_fill(
     while not calls and time.time() < end:
         time.sleep(0.02)
     assert calls == [("NSE:INFY-EQ", 95.0, None)]
+
+
+def test_db_rebuilt_position_keeps_its_broker_account(client: TestClient, db_session, isolated_db, real_account):
+    """A position rebuilt from the DB (Trade-page fills, every position after a
+    restart) must carry its broker account — without it SL / target / Close /
+    EOD exits only settle the DB row and never send an order to Fyers."""
+    from app.db import session as dbs
+    from app.db.models import Position, Trade
+    from app.execution.trade_manager import _open_position_as_managed
+
+    with dbs.SessionLocal() as db:
+        db.add(Trade(symbol="NSE:INFY-EQ", side="BUY", quantity=1, price=1000.0, status="filled",
+                     broker_order_id="OID-ACC", broker_account_id=real_account.id))
+        db.add(Position(symbol="NSE:INFY-EQ", quantity=1, average_price=1000.0, stop_loss=990.0))
+        db.commit()
+    mp, _ = _open_position_as_managed(dbs.SessionLocal, "NSE:INFY-EQ")
+    assert mp.broker_account_id == real_account.id
