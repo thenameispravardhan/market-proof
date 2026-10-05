@@ -142,6 +142,10 @@ def _manager():
     return mgr
 
 
+MANUAL_PRODUCTS = {"INTRADAY", "DELIVERY", "MARGIN"}
+_PRODUCT_ALIASES = {"MIS": "INTRADAY", "CNC": "DELIVERY", "NRML": "MARGIN"}
+
+
 def _fyers_stream():
     """The realtime Fyers stream manager from the lifespan, or None when
     it isn't running (tests / streaming disabled)."""
@@ -235,16 +239,14 @@ async def place_order(
     bypass_risk = bool(body.get("bypass_risk", False))
     operator = str(body.get("operator", "ui_trade_page"))
 
-    # INTRADAY-ONLY bot: no delivery / carry-forward, ever. Every trade
-    # must be flattenable by the EOD square-off, so any other product
-    # type is rejected outright (not silently coerced).
-    if product_type != "INTRADAY":
+    # The BOT trades INTRADAY only. A manual Trade-page order may also be
+    # DELIVERY (CNC) or MARGIN (F&O carry-forward); those rows carry their
+    # product so the EOD square-off leaves them alone. CO/BO are not supported.
+    product_type = _PRODUCT_ALIASES.get(product_type, product_type)
+    if product_type not in MANUAL_PRODUCTS:
         raise HTTPException(
             status_code=422,
-            detail=(
-                f"product_type {product_type!r} not allowed — this bot is "
-                f"intraday-only (no carry-forward); use INTRADAY."
-            ),
+            detail=f"product_type {product_type!r} not allowed — use one of {sorted(MANUAL_PRODUCTS)}",
         )
 
     if not symbol:
@@ -307,7 +309,55 @@ async def place_order(
         return result
     if result.get("status") in ("REJECTED",):
         return result
+    # Optional SL / target from the ticket: armed on the position once THIS
+    # order fills (a resting limit may fill much later), never before.
+    sl, tp = _opt_price(body.get("stop_loss")), _opt_price(body.get("target"))
+    if (sl is not None or tp is not None) and result.get("broker_order_id"):
+        from app.execution.order_reconcile import spawn
+
+        spawn(_arm_levels_on_fill(str(result["broker_order_id"]), symbol.upper(), sl, tp))
+        result["levels_pending"] = {"stop_loss": sl, "target": tp}
     return result
+
+
+def _opt_price(v: Any) -> Optional[float]:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0 else None
+
+
+ARM_POLL_S = 2.0
+ARM_MAX_S = 8 * 3600  # a resting limit can fill any time in the session
+
+
+async def _arm_levels_on_fill(order_id: str, symbol: str, sl: Optional[float], tp: Optional[float]) -> None:
+    """Wait for the order's trades row to turn filled, then hand the levels to
+    the trade manager (which exits on them). Stops on cancel / reject."""
+    import asyncio
+
+    from app.db import session as db_session
+    from app.main import app
+
+    waited = 0.0
+    while waited < ARM_MAX_S:
+        with db_session.SessionLocal() as db:
+            row = db.query(Trade.status).filter(Trade.broker_order_id == order_id).first()
+        st = row[0] if row else None
+        if st in ("cancelled", "rejected", "expired"):
+            return
+        if st == "filled":
+            tm = getattr(app.state, "trade_manager", None)
+            if tm is not None:
+                try:
+                    await tm.update_levels(symbol, stop_loss=sl, target=tp)
+                    log.info("manual_order.levels_armed", order_id=order_id, symbol=symbol, stop_loss=sl, target=tp)
+                except Exception:  # noqa: BLE001
+                    log.exception("manual_order.levels_arm_failed", order_id=order_id)
+            return
+        await asyncio.sleep(ARM_POLL_S)
+        waited += ARM_POLL_S
 
 
 @router.post("/cancel")

@@ -56,6 +56,7 @@ export interface Position {
   last_price: number | null;
   unrealized_pnl: number | null;
   strategy_id: number | null;
+  product?: ProductType;
   opened_at: string;
   updated_at: string;
 }
@@ -346,7 +347,8 @@ export interface ManagedPosition {
 
 export type OrderType = "MARKET" | "LIMIT" | "STOP_LOSS" | "SL-M";
 // Intraday-only bot — the backend 422s anything else, so there is one value.
-export type ProductType = "INTRADAY";
+// INTRADAY (MIS) is what the bot trades; a manual order may also be DELIVERY (CNC) or MARGIN (F&O carry-forward).
+export type ProductType = "INTRADAY" | "DELIVERY" | "MARGIN";
 
 export interface InstrumentHit {
   symbol: string;          // "NSE:SBIN-EQ" or "NSE:NIFTY2561424500CE"
@@ -414,6 +416,9 @@ export interface PlaceOrderRequest {
   limit_price?: number | null;
   stop_price?: number | null;
   product_type: ProductType;
+  /** Optional protective levels — armed on the position once the order fills. */
+  stop_loss?: number | null;
+  target?: number | null;
   bypass_risk?: boolean;
   operator?: string;
 }

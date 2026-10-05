@@ -330,26 +330,28 @@ def test_place_order_persists_trade_and_audit(
     assert trade.broker_order_id == "STUB-1"
 
 
-def test_non_intraday_product_rejected(
+def test_manual_products_delivery_allowed_and_carried(
     client: TestClient, db_session, isolated_db, real_account
 ):
-    """Intraday-only bot: DELIVERY / NORMAL / MARGIN manual orders are
-    rejected outright — nothing may survive the EOD square-off."""
+    """Manual orders may be DELIVERY (CNC) or MARGIN as well as INTRADAY;
+    CO / BO / NORMAL are rejected. The product is recorded so the EOD
+    square-off can leave carry-forward positions alone."""
+    from app.db import session as dbs
+    from app.db.models import Position, Trade
+    from app.execution.trade_manager import _carry_position_symbols
+
     _install_stub_backend(client, real_account.id, ok=True)
-    for product in ("DELIVERY", "NORMAL", "MARGIN"):
-        r = client.post(
-            "/api/orders",
-            json={
-                "account_id": real_account.id,
-                "symbol": "NSE:INFY-EQ",
-                "side": "BUY",
-                "quantity": 1,
-                "order_type": "MARKET",
-                "product_type": product,
-            },
-        )
-        assert r.status_code == 422, f"{product}: {r.text}"
-        assert "intraday-only" in r.json()["detail"]
+    body = {"account_id": real_account.id, "symbol": "NSE:INFY-EQ", "side": "BUY", "quantity": 1, "order_type": "MARKET"}
+    for bad in ("NORMAL", "CO", "BO"):
+        assert client.post("/api/orders", json={**body, "product_type": bad}).status_code == 422, bad
+    r = client.post("/api/orders", json={**body, "product_type": "CNC"})
+    assert r.status_code == 200 and r.json()["ok"] is True, r.text
+    with dbs.SessionLocal() as db:
+        assert db.query(Trade).filter_by(broker_order_id="STUB-1").one().product == "DELIVERY"
+        db.add_all([Position(symbol="NSE:TCS-EQ", quantity=5, average_price=1.0, product="DELIVERY"),
+                    Position(symbol="NSE:SBIN-EQ", quantity=5, average_price=1.0)])
+        db.commit()
+    assert _carry_position_symbols(dbs.SessionLocal) == ["NSE:TCS-EQ"]
 
 
 # ---------------------------------------------------------------------------
@@ -854,3 +856,39 @@ def test_delete_trades_unknown_id_404s_and_deletes_nothing(
 
 def test_delete_trades_rejects_empty_id_list(client: TestClient, isolated_db):
     assert client.post("/api/trades/delete", json={"ids": []}).status_code == 422
+
+
+def test_ticket_sl_target_armed_only_after_fill(
+    client: TestClient, db_session, isolated_db, real_account, monkeypatch
+):
+    """Optional SL / target ride with the order and are handed to the trade
+    manager once THAT order fills — a resting limit isn't armed early."""
+    import time
+    from app.api import orders as orders_api
+    from app.db import session as dbs
+    from app.db.models import Trade
+    from app.main import app
+
+    calls: list = []
+
+    class TM:
+        async def update_levels(self, symbol, *, stop_loss, target):
+            calls.append((symbol, stop_loss, target))
+            return {}
+
+    monkeypatch.setattr(orders_api, "ARM_POLL_S", 0.02)
+    monkeypatch.setattr(app.state, "trade_manager", TM(), raising=False)
+    _install_stub_backend(client, real_account.id, ok=True)
+    r = client.post("/api/orders", json={"account_id": real_account.id, "symbol": "NSE:INFY-EQ", "side": "BUY",
+                                         "quantity": 1, "order_type": "LIMIT", "limit_price": 100,
+                                         "product_type": "INTRADAY", "stop_loss": 95, "target": ""})
+    assert r.json()["levels_pending"] == {"stop_loss": 95.0, "target": None}
+    time.sleep(0.1)
+    assert calls == []                        # still resting: nothing armed
+    with dbs.SessionLocal() as db:
+        db.query(Trade).filter_by(broker_order_id="STUB-1").update({"status": "filled"})
+        db.commit()
+    end = time.time() + 2
+    while not calls and time.time() < end:
+        time.sleep(0.02)
+    assert calls == [("NSE:INFY-EQ", 95.0, None)]

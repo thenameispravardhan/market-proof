@@ -311,6 +311,30 @@ describe("Trade page", () => {
     expect(success.textContent).toMatch(/NSE:RELIANCE-EQ/);
   });
 
+  it("ticket: product choice + default, optional SL / target ride with the order", async () => {
+    const posts: Record<string, unknown>[] = [];
+    const stubs = defaultStubs();
+    globalThis.fetch = makeFetchStub((url, init) => {
+      if (/\/api\/orders$/.test(url) && init?.method === "POST") posts.push(JSON.parse(String(init.body)));
+      return stubs(url, init);
+    });
+    const user = userEvent.setup();
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await user.type(await screen.findByTestId("trade-search"), "RELI");
+    await user.click(await screen.findByTestId("search-row-NSE:RELIANCE-EQ"));
+    await waitFor(() => expect(screen.getByTestId("ticket-submit")).not.toBeDisabled());
+    expect(screen.getByTestId("ticket-sl")).toBeTruthy();   // always shown, optional
+    expect(screen.getByTestId("ticket-tp")).toBeTruthy();
+    expect(screen.getByTestId("ticket-est")).toBeTruthy();
+    await user.click(screen.getByTestId("ticket-product-DELIVERY"));
+    await user.click(screen.getByTestId("ticket-product-default"));
+    expect(localStorage.getItem("trade:defaultProduct")).toBe(JSON.stringify("DELIVERY"));
+    await user.type(screen.getByTestId("ticket-sl"), "95");
+    await user.click(screen.getByTestId("ticket-submit"));
+    await waitFor(() => expect(posts).toHaveLength(1));
+    expect(posts[0]).toMatchObject({ product_type: "DELIVERY", stop_loss: 95, target: null });
+  });
+
   it("places a LIMIT buy from the chart's right-click menu only after the confirm", async () => {
     const posts: Record<string, unknown>[] = [];
     const stubs = defaultStubs();
@@ -641,6 +665,27 @@ describe("Trade page", () => {
     expect(err.textContent).toMatch(/Insufficient margin/);
     // No IP-whitelist hint for non-whitelist errors.
     expect(screen.queryByTestId("ticket-ip-whitelist")).not.toBeInTheDocument();
+  });
+
+  it("chain: drag a price onto a chart cell opens that option there", async () => {
+    const leg = { symbol: "NSE:RELIANCE26OCT2500CE", ltp: 42, bid: 41.9, ask: 42.1, oi: 1000, volume: 10, ltpch: 0, lot_size: 500, tick_size: 0.05 };
+    const chain = { ok: true, underlying: "RELIANCE", symbol: "", spot: 2450, expiries: [], selected_expiry: null, source: "fyers",
+      strikes: [{ strike: 2500, ce: leg, pe: null }] };
+    const stubs = defaultStubs();
+    globalThis.fetch = makeFetchStub((url, init) => (url.includes("/api/options/chain") ? makeJsonResponse(chain) : stubs(url, init)));
+    const user = userEvent.setup();
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await user.type(await screen.findByTestId("trade-search"), "RELI");
+    await user.click(await screen.findByTestId("search-row-NSE:RELIANCE-EQ"));
+    if (!screen.queryByTestId("dock-chain")) await user.click(screen.getByTestId("rail-chain"));
+    const price = await screen.findByTestId("chain-ce-2500");
+    const store: Record<string, string> = {};
+    const dataTransfer = { setData: (k: string, v: string) => { store[k] = v; }, getData: (k: string) => store[k] ?? "", get types() { return Object.keys(store); }, effectAllowed: "", dropEffect: "" };
+    fireEvent.dragStart(price, { dataTransfer });
+    const cell = screen.getByTestId("tv-cell-0");
+    fireEvent.dragOver(cell, { dataTransfer });
+    fireEvent.drop(cell, { dataTransfer });
+    await waitFor(() => expect(JSON.parse(localStorage.getItem("trade:last") ?? "null")?.symbol).toBe(leg.symbol));
   });
 
   it("does not render the option chain for a non-index symbol", async () => {

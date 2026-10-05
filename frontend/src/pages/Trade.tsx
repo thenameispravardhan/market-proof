@@ -51,6 +51,7 @@ import type {
   OptionLeg,
   OrderType,
   PlaceOrderRequest,
+  ProductType,
 } from "../types";
 
 function fmtMoney(v: number | null | undefined): string {
@@ -102,6 +103,9 @@ function cleanError(raw: unknown, fallback: string): string {
   if (s.length > 320) s = s.slice(0, 320) + "…";
   return s;
 }
+
+const DRAG_MIME = "application/x-tradebot-instrument";
+const PRODUCT_LABEL: Record<ProductType, string> = { INTRADAY: "Intraday", DELIVERY: "Delivery", MARGIN: "Carry (NRML)" };
 
 // Right-dock panels, opened / closed from the icon bar. Several can be open;
 // they stack in this order.
@@ -741,17 +745,13 @@ export default function Trade() {
   }, [chainOn, chainBase?.symbol, chain?.selected_expiry, chain != null]);  // eslint-disable-line react-hooks/exhaustive-deps
 
   // Click a CE/PE cell in the chain → load that option into the ticket.
-  const onSelectOption = (
-    row: { strike: number; ce: OptionLeg | null; pe: OptionLeg | null },
-    type: "CE" | "PE",
-  ) => {
+  const optionHit = (row: { strike: number; ce: OptionLeg | null; pe: OptionLeg | null }, type: "CE" | "PE"): InstrumentHit | null => {
     const leg = type === "CE" ? row.ce : row.pe;
-    if (!leg || !chainBase) return;
-    const exch = leg.symbol.includes(":") ? leg.symbol.split(":")[0] : chainBase.exchange;
-    onSelect({
+    if (!leg || !chainBase) return null;
+    return {
       symbol: leg.symbol,
       short_name: `${chainBase.short_name} ${row.strike} ${type}`,
-      exchange: exch,
+      exchange: leg.symbol.includes(":") ? leg.symbol.split(":")[0] : chainBase.exchange,
       segment: "FO",
       instrument_type: type,
       lot_size: leg.lot_size,
@@ -760,8 +760,42 @@ export default function Trade() {
       strike: row.strike,
       underlying: chainBase.short_name,
       display: `${chainBase.short_name} ${row.strike} ${type}`,
-    }, true);
+    };
+  };
+  const onSelectOption = (
+    row: { strike: number; ce: OptionLeg | null; pe: OptionLeg | null },
+    type: "CE" | "PE",
+  ) => {
+    const h = optionHit(row, type);
+    if (!h) return;
+    onSelect(h, true);
     if (!dock.includes("trade")) toggleDock("trade");   // the ticket is where the click is going
+  };
+  // Drag an option off the chain onto any chart cell to open it there.
+  const dragOption = (row: { strike: number; ce: OptionLeg | null; pe: OptionLeg | null }, type: "CE" | "PE") => (e: React.DragEvent) => {
+    const h = optionHit(row, type);
+    if (!h) return;
+    e.dataTransfer.setData(DRAG_MIME, JSON.stringify(h));
+    e.dataTransfer.effectAllowed = "copy";
+  };
+  const dropOnCell = (i: number) => (e: React.DragEvent) => {
+    const raw = e.dataTransfer.getData(DRAG_MIME);
+    if (!raw) return;
+    e.preventDefault();
+    try {
+      const h = JSON.parse(raw) as InstrumentHit;
+      activate(i);
+      onSelect(h, true);
+    } catch { /* not ours */ }
+  };
+  // The chain's own search: changes only the chain, never a chart.
+  const [chainQuery, setChainQuery] = useState("");
+  const { data: chainHits } = useSearchSymbols(chainQuery);
+  const pickChainBase = (h: InstrumentHit) => {
+    setChainBase(h);
+    setChainQuery("");
+    setSelectedExpiry(null);
+    try { localStorage.setItem("trade:chainBase", JSON.stringify(h)); } catch { /* best-effort */ }
   };
 
   // An order from a chart (right-click menu, scalper buttons) on the ticket's
@@ -788,6 +822,25 @@ export default function Trade() {
     return `${o.side} ${qty} ${name} ${o.type === "STOP_LOSS" ? "STOP-LIMIT" : o.type}${o.price != null ? ` @ ${o.price}` : ""}${o.type === "STOP_LOSS" && o.limit != null ? ` lmt ${o.limit}` : ""} → ${r.status}`;
   };
 
+  const isFnoSel = selected != null && selected.segment !== "EQ" && selected.instrument_type !== "EQ";
+  const carryProduct: ProductType = isFnoSel ? "MARGIN" : "DELIVERY";
+  const [defaultProduct, setDefaultProduct] = useState<ProductType>(() => stored<ProductType>("trade:defaultProduct", "INTRADAY"));
+  const [productPick, setProduct] = useState<ProductType>(defaultProduct);
+  // DELIVERY and MARGIN are the same choice ("carry") on cash vs F&O.
+  const product: ProductType = productPick === "INTRADAY" ? "INTRADAY" : carryProduct;
+  const saveDefaultProduct = (p: ProductType) => {
+    setDefaultProduct(p);
+    try { localStorage.setItem("trade:defaultProduct", JSON.stringify(p)); } catch { /* best-effort */ }
+  };
+  const [slPrice, setSlPrice] = useState("");
+  const [tpPrice, setTpPrice] = useState("");
+  const estPrice = (requiresLimit && Number(limitPrice) > 0 ? Number(limitPrice) : null) ?? (side === "BUY" ? ask : bid) ?? ltp;
+  const { data: funds } = useQuery<{ ok: boolean; available: number | null }>({
+    queryKey: ["market-funds"],
+    queryFn: () => fetch("/api/market/funds").then((r) => r.json()),
+    refetchInterval: 30000,
+  });
+
   const onSubmit = async (opts?: { bypassRisk?: boolean }) => {
     if (!selected || !accountId) return;
     const body: PlaceOrderRequest = {
@@ -798,7 +851,9 @@ export default function Trade() {
       order_type: orderType,
       limit_price: requiresLimit && limitPrice ? Number(limitPrice) : null,
       stop_price: requiresStop && stopPrice ? Number(stopPrice) : null,
-      product_type: "INTRADAY",
+      product_type: product,
+      stop_loss: Number(slPrice) > 0 ? Number(slPrice) : null,
+      target: Number(tpPrice) > 0 ? Number(tpPrice) : null,
       bypass_risk: opts?.bypassRisk ?? false,
       operator: "ui_trade_page",
     };
@@ -948,7 +1003,9 @@ export default function Trade() {
                 const h = i === activeCell ? selected : cells[i] ?? null;
                 const active = i === activeCell;
                 return (
-                  <div key={i} className={`tv-cell${active && nCells > 1 ? " active" : ""}`} onMouseDownCapture={() => activate(i)}>
+                  <div key={i} className={`tv-cell${active && nCells > 1 ? " active" : ""}`} onMouseDownCapture={() => activate(i)}
+                    onDragOver={(e) => { if (e.dataTransfer.types.includes(DRAG_MIME)) { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; } }}
+                    onDrop={dropOnCell(i)} data-testid={`tv-cell-${i}`}>
                     {/* key={symbol} remounts the panel per symbol so its candle
                         store, drawings and pagination reset cleanly. */}
                     {h && (
@@ -1337,16 +1394,34 @@ export default function Trade() {
                     </label>
                   )}
   
-                  {/* Intraday-only bot: no delivery / carry-forward, ever. One value,
-                      so it reads as a fact rather than a choice you cannot make. */}
+                  {/* Product: the bot itself is intraday-only; a manual order may carry
+                      forward. The star saves the choice as the ticket default. */}
                   <div className="ticket-row">
                     <span>Product</span>
-                    <span
-                      data-testid="ticket-product"
-                      title="Intraday-only bot — every position is squared off the same day"
-                    >
-                      INTRADAY (MIS)
+                    <span className="seg" data-testid="ticket-product">
+                      {(["INTRADAY", carryProduct] as ProductType[]).map((p) => (
+                        <button key={p} type="button" className={product === p ? "on" : ""} onClick={() => setProduct(p)} data-testid={`ticket-product-${p}`}
+                          title={p === "INTRADAY" ? "MIS — squared off before the close" : p === "DELIVERY" ? "CNC — delivery, kept overnight" : "NRML — F&O carry-forward"}>
+                          {PRODUCT_LABEL[p]}
+                        </button>
+                      ))}
                     </span>
+                    <button type="button" className="px-quick-btn" onClick={() => saveDefaultProduct(product)} title="make this the ticket default"
+                      data-testid="ticket-product-default">{defaultProduct === product ? "★ default" : "☆ set default"}</button>
+                  </div>
+
+                  <label className="ticket-row">
+                    <span>Stop loss</span>
+                    <input type="number" step="0.05" min={0} placeholder="optional" value={slPrice} onChange={(e) => setSlPrice(e.target.value)} data-testid="ticket-sl" />
+                  </label>
+                  <label className="ticket-row">
+                    <span>Target</span>
+                    <input type="number" step="0.05" min={0} placeholder="optional" value={tpPrice} onChange={(e) => setTpPrice(e.target.value)} data-testid="ticket-tp" />
+                  </label>
+                  <div className="ticket-row ticket-est" data-testid="ticket-est">
+                    <span>Est. amount</span>
+                    <span>{estPrice != null ? fmtMoney(estPrice * quantity) : "—"}</span>
+                    <span className="hint">funds {funds?.ok && funds.available != null ? fmtMoney(funds.available) : "—"}</span>
                   </div>
   
                   {/* Submit */}
@@ -1480,6 +1555,20 @@ export default function Trade() {
               {dockGrip("chain")}
               {dockHead("chain", chainBase?.short_name)}
               <div className="dock-body">
+                <div className="chain-search">
+                  <input type="search" placeholder="Search underlying — NIFTY, RELIANCE… (chart stays as is)" value={chainQuery}
+                    onChange={(e) => setChainQuery(e.target.value)} data-testid="chain-search" />
+                  {chainQuery.trim() && (
+                    <div className="chain-search-hits">
+                      {(chainHits?.hits ?? []).filter((h) => h.instrument_type === "IND" || h.instrument_type === "EQ").slice(0, 8).map((h) => (
+                        <button type="button" key={h.symbol} onClick={() => pickChainBase(h)} data-testid={`chain-search-${h.short_name}`}>
+                          <b>{h.short_name}</b> <span className="hint">{h.exchange} · {h.instrument_type === "IND" ? "index" : "stock"}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  <span className="hint">drag a price onto a chart to open it there</span>
+                </div>
                 {/* ---- option chain (index underlyings + F&O stocks) ----
                      Indices always show the panel; a cash stock shows it only when
                      it actually has options (F&O stock), so non-F&O names stay clean. */}
@@ -1553,6 +1642,8 @@ export default function Trade() {
                                     <button
                                       className={`chain-ltp ce${selected?.symbol === s.ce.symbol ? " on" : ""}`}
                                       onClick={() => onSelectOption(s, "CE")}
+                                      draggable
+                                      onDragStart={dragOption(s, "CE")}
                                       data-testid={`chain-ce-${s.strike}`}
                                       title={s.ce.symbol}
                                     >
@@ -1571,6 +1662,8 @@ export default function Trade() {
                                     <button
                                       className={`chain-ltp pe${selected?.symbol === s.pe.symbol ? " on" : ""}`}
                                       onClick={() => onSelectOption(s, "PE")}
+                                      draggable
+                                      onDragStart={dragOption(s, "PE")}
                                       data-testid={`chain-pe-${s.strike}`}
                                       title={s.pe.symbol}
                                     >
