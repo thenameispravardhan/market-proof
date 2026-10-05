@@ -77,7 +77,7 @@ type Spec = {
   cooldown_bars: number;
   max_bars: number | null;
   sizing: { mode: string; value: number };
-  portfolio: { capital: number; leverage: number; max_positions: number; compounding: boolean };
+  portfolio: { capital: number; leverage: number; max_positions: number; compounding: boolean; max_position_pct?: number | null };
   costs: { slippage_pct: number; charges: boolean };
 };
 type IndicatorDef = { name: string; params: Record<string, number | string>; outputs: string[]; group: string };
@@ -159,6 +159,36 @@ const isoIst = (iso: string | null) => (iso ? ist(Date.parse(iso.endsWith("Z") |
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const daysAgo = (n: number) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
 const shortSym = (s: string) => s.replace(/^NSE:/, "").replace(/-EQ$/, "").replace(/-INDEX$/, "");
+type SizingPreset = { name: string; hint: string; riskPct: number; equityPct: number; maxPositions: number; capPct: number; dailyLossPct: number; compound: boolean };
+export const SIZING_PRESETS: SizingPreset[] = [
+  { name: "Conservative", hint: "0.5% risk per trade (or 10% of equity without a stop), 3 open, ≤ 25% per position, stop the day at −1.5%", riskPct: 0.5, equityPct: 10, maxPositions: 3, capPct: 25, dailyLossPct: 1.5, compound: false },
+  { name: "Balanced", hint: "1% risk per trade (or 20% of equity), 5 open, ≤ 40% per position, stop the day at −3%", riskPct: 1, equityPct: 20, maxPositions: 5, capPct: 40, dailyLossPct: 3, compound: true },
+  { name: "Aggressive", hint: "2% risk per trade (or 35% of equity), 10 open, ≤ 60% per position, stop the day at −5%", riskPct: 2, equityPct: 35, maxPositions: 10, capPct: 60, dailyLossPct: 5, compound: true },
+];
+const SIZE_SHORT: Record<string, string> = { qty: "fixed shares", lots: "fixed lots", amount: "₹ amount", pct_equity: "% of equity", risk: "₹ risk", risk_pct: "% risk" };
+const SIZE_UNIT: Record<string, string> = { qty: "shares", lots: "lots", amount: "₹ per trade", pct_equity: "% of equity per trade", risk: "₹ lost if the stop hits", risk_pct: "% of equity lost if the stop hits" };
+
+/** The whole sizing block in one plain sentence. */
+export function sizingSummary(spec: Pick<Spec, "sizing" | "portfolio" | "daily">, lot: number | null): string {
+  const { mode, value: v } = spec.sizing;
+  const pf = spec.portfolio;
+  const each =
+    mode === "qty" ? `${v} shares` :
+    mode === "lots" ? `${v} lot${v === 1 ? "" : "s"}${lot ? ` (${v * lot} qty)` : ""}` :
+    mode === "amount" ? `${inr(v)} of margin` :
+    mode === "pct_equity" ? `${v}% of equity (${inr((pf.capital * v) / 100)} to start)` :
+    mode === "risk" ? `sized so the stop loses ${inr(v)}` :
+    `sized so the stop loses ${v}% of equity (${inr((pf.capital * v) / 100)} to start)`;
+  const parts = [
+    `Each trade: ${each}.`,
+    `Up to ${pf.max_positions} open at once from ${inr(pf.capital)}${pf.leverage !== 1 ? ` at ${pf.leverage}× leverage` : ""}.`,
+    pf.max_position_pct ? `No position uses more than ${pf.max_position_pct}% (${inr((pf.capital * pf.max_position_pct) / 100)}).` : "",
+    spec.daily.max_loss ? `Trading stops for the day at −${inr(spec.daily.max_loss)}.` : "",
+    pf.compounding ? "Profits grow later trade sizes." : "Sizes stay on the starting capital.",
+  ];
+  return parts.filter(Boolean).join(" ");
+}
+
 const tfLabel = (t: number) => (t === 1440 ? "daily" : t >= 60 ? `${t / 60}h` : `${t}m`);
 const SECTIONS = ["instrument", "session", "sizing", "portfolio", "mtm", "daily", "costs", "entry_order", "bars"] as const;
 const barLabel = (sp: Spec) => (!sp.bars || sp.bars.type === "time" ? tfLabel(sp.timeframe) : `${sp.bars.type} ~${sp.bars.per_day}/day`);
@@ -1525,6 +1555,14 @@ export default function Algo() {
     qty: "fixed shares", lots: "fixed lots", amount: "₹ capital per trade", pct_equity: "% of equity per trade",
     risk: "₹ risk per trade (needs stop)", risk_pct: "% of equity at risk (needs stop)",
   };
+  const applyPreset = (pr: SizingPreset) => {
+    const risky = !!spec.stop_loss;
+    upd({
+      sizing: { mode: risky ? "risk_pct" : "pct_equity", value: risky ? pr.riskPct : pr.equityPct },
+      portfolio: { ...spec.portfolio, max_positions: pr.maxPositions, max_position_pct: pr.capPct, compounding: pr.compound },
+      daily: { ...spec.daily, max_loss: Math.round((spec.portfolio.capital * pr.dailyLossPct) / 100) },
+    });
+  };
   const exitBlock = (key: "exit_long" | "exit_short", label: string) => {
     const g = spec[key];
     return (
@@ -1794,23 +1832,37 @@ export default function Algo() {
 
           <div className="widget widget-wide" style={{ marginBottom: 12 }}>
             <h3>Sizing & portfolio <span className="meta">one capital pool shared by every symbol in the strategy</span></h3>
-            <div className="algo-operand" style={{ gap: 14 }}>
-              <label className="meta">size
-                <select value={spec.sizing.mode} onChange={(e) => upd({ sizing: { ...spec.sizing, mode: e.target.value } })}>
-                  {sizingModes.map((m) => <option key={m} value={m}>{SIZE_LABEL[m]}</option>)}
-                </select>
-                <NumInput width={80} value={spec.sizing.value} onChange={(n) => upd({ sizing: { ...spec.sizing, value: n ?? 1 } })} />
-                {fno && info.data?.lot ? <span>× {info.data.lot} per lot</span> : null}
-              </label>
+            <div className="algo-operand" style={{ gap: 6 }}>
+              <span className="meta">quick setup</span>
+              {SIZING_PRESETS.map((pr) => (
+                <button type="button" key={pr.name} className="btn-sm" title={pr.hint} onClick={() => applyPreset(pr)}>{pr.name}</button>
+              ))}
+            </div>
+            <div className="algo-operand" style={{ gap: 6, marginTop: 10 }}>
+              <span className="meta">each trade is</span>
+              <div className="seg">
+                {sizingModes.map((m) => (
+                  <button type="button" key={m} className={spec.sizing.mode === m ? "on" : ""}
+                    disabled={(m === "risk" || m === "risk_pct") && !spec.stop_loss}
+                    title={(m === "risk" || m === "risk_pct") && !spec.stop_loss ? "add a stop loss first — risk sizing divides by the stop distance" : SIZE_LABEL[m]}
+                    onClick={() => upd({ sizing: { ...spec.sizing, mode: m } })}>{SIZE_SHORT[m]}</button>
+                ))}
+              </div>
+              <label className="meta"><NumInput width={80} value={spec.sizing.value} onChange={(n) => upd({ sizing: { ...spec.sizing, value: n ?? 1 } })} /> {SIZE_UNIT[spec.sizing.mode]}</label>
+              {fno && info.data?.lot ? <span className="meta">× {info.data.lot} per lot</span> : null}
+            </div>
+            <div className="algo-operand" style={{ gap: 14, marginTop: 10 }}>
               <label className="meta">capital ₹ <NumInput width={100} value={spec.portfolio.capital} onChange={(n) => upd({ portfolio: { ...spec.portfolio, capital: n ?? 100000 } })} /></label>
-              <label className="meta" title="intraday margin multiplier: equity MIS ≈ 5, futures / written options ≈ 6–9. Bought options always need the full premium.">leverage × <NumInput width={44} value={spec.portfolio.leverage} onChange={(n) => upd({ portfolio: { ...spec.portfolio, leverage: n ?? 1 } })} /></label>
-              <label className="meta">max open positions <NumInput width={44} value={spec.portfolio.max_positions} onChange={(n) => upd({ portfolio: { ...spec.portfolio, max_positions: Math.max(1, Math.floor(n ?? 1)) } })} /></label>
-              <label className="meta"><input type="checkbox" checked={spec.portfolio.compounding} onChange={(e) => upd({ portfolio: { ...spec.portfolio, compounding: e.target.checked } })} /> compound (size from current equity)</label>
+              <label className="meta">max open <NumInput width={40} value={spec.portfolio.max_positions} onChange={(n) => upd({ portfolio: { ...spec.portfolio, max_positions: Math.max(1, Math.floor(n ?? 1)) } })} /> positions</label>
+              <label className="meta" title="no single position may block more than this share of equity (empty = no cap)">max <NumInput width={40} allowEmpty placeholder="off" value={spec.portfolio.max_position_pct ?? null} onChange={(n) => upd({ portfolio: { ...spec.portfolio, max_position_pct: n } })} />% per position</label>
+              <label className="meta" title="intraday margin multiplier: equity MIS ≈ 5, futures / written options ≈ 6–9. Bought options always need the full premium.">leverage × <NumInput width={40} value={spec.portfolio.leverage} onChange={(n) => upd({ portfolio: { ...spec.portfolio, leverage: n ?? 1 } })} /></label>
+              <label className="meta"><input type="checkbox" checked={spec.portfolio.compounding} onChange={(e) => upd({ portfolio: { ...spec.portfolio, compounding: e.target.checked } })} /> compound profits</label>
             </div>
             <div className="algo-operand" style={{ gap: 14, marginTop: 8 }}>
               <label className="meta">slippage % <NumInput width={52} value={spec.costs.slippage_pct} onChange={(n) => upd({ costs: { ...spec.costs, slippage_pct: n ?? 0 } })} /></label>
-              <label className="meta"><input type="checkbox" checked={spec.costs.charges} onChange={(e) => upd({ costs: { ...spec.costs, charges: e.target.checked } })} /> Indian charges by segment (brokerage, STT, exchange, GST, stamp)</label>
+              <label className="meta"><input type="checkbox" checked={spec.costs.charges} onChange={(e) => upd({ costs: { ...spec.costs, charges: e.target.checked } })} /> Indian charges (brokerage, STT, exchange, GST, stamp)</label>
             </div>
+            <div className="hint" style={{ marginTop: 8 }} data-testid="sizing-summary">{sizingSummary(spec, fno ? info.data?.lot ?? null : null)}</div>
           </div>
 
           <div className="widget widget-wide" style={{ marginBottom: 12 }}>
