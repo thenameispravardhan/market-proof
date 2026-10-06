@@ -632,7 +632,9 @@ def test_estimate_counts_minute_data_once_not_per_symbol() -> None:
 
     s = _cross_spec(symbols=[f"NSE:S{i}-EQ" for i in range(46)], timeframe=15,
                     entry_long={"logic": "AND", "conditions": [
-                        {"left": {"ind": "RVOL"}, "op": ">", "right": {"value": 2}}]})
-    assert engine.needs_minutes(s)   # RVOL is order flow: built from 1-minute data
+                        {"left": {"ind": "DELTA", "field": "delta_pct"}, "op": ">", "right": {"value": 20}}]})
+    assert engine.needs_minutes(s)   # DELTA is order flow: built from 1-minute data
+    rv = _cross_spec(entry_long={"logic": "AND", "conditions": [{"left": {"ind": "RVOL"}, "op": ">", "right": {"value": 2}}]})
+    assert not engine.needs_minutes(rv)   # RVOL only needs candle volume
     est = _estimate_bars(s, 0, 30 * 86400)
     assert est < MAX_BARS and est < 100_000

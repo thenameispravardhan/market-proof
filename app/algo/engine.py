@@ -308,7 +308,9 @@ def _walk_operands(spec: dict[str, Any]):
         yield from walk(spec.get(k))
 
 
-ORDER_FLOW = {"DELTA", "CVD", "CVD_DIVERGENCE", "VPROFILE", "RVOL", "BAR_FLOW"}
+# Indicators that need buy / sell flow (recorded ticks, else per-minute BVC
+# estimates). RVOL is NOT one: it only compares candle volume by time of day.
+ORDER_FLOW = {"DELTA", "CVD", "CVD_DIVERGENCE", "VPROFILE", "BAR_FLOW"}
 
 
 def bar_minutes(spec: dict[str, Any]) -> float:
