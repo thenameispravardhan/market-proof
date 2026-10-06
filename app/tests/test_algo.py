@@ -623,3 +623,16 @@ def test_units_caps_one_position_at_max_position_pct() -> None:
     assert engine.units(s, 100000, 100.0, None) == 500
     with pytest.raises(ValueError):
         _cross_spec(portfolio={"max_position_pct": -5})
+
+
+def test_estimate_counts_minute_data_once_not_per_symbol() -> None:
+    """46 symbols x 30 days at 15m with an order-flow indicator: minutes are
+    folded per symbol and freed, so this is ~60k candles held, not ~900k."""
+    from app.api.algo import MAX_BARS, _estimate_bars
+
+    s = _cross_spec(symbols=[f"NSE:S{i}-EQ" for i in range(46)], timeframe=15,
+                    entry_long={"logic": "AND", "conditions": [
+                        {"left": {"ind": "RVOL"}, "op": ">", "right": {"value": 2}}]})
+    assert engine.needs_minutes(s)   # RVOL is order flow: built from 1-minute data
+    est = _estimate_bars(s, 0, 30 * 86400)
+    assert est < MAX_BARS and est < 100_000
