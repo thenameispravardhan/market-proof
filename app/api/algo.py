@@ -78,10 +78,17 @@ _heavy = asyncio.Semaphore(1)
 
 
 def _estimate_bars(spec: dict[str, Any], start: int, end: int) -> int:
+    """Candles held in memory at the PEAK of one run. Every symbol's base and
+    higher-timeframe candles stay for the whole run; 1-minute data (order flow,
+    volume / turnover candles) is loaded ONE symbol at a time, folded into base
+    candles and freed (data.assemble), so it counts once, not per symbol."""
     days = (end - start) / 86400 * 5 / 7 + 30
-    per_day = 375 if engine.needs_minutes(spec) else 375 / spec["timeframe"]   # built from 1-minute data
-    htf = sum(1 if tf == 1440 else 375 / tf for tf in engine.cond_timeframes(spec)) / per_day
-    return int(len(spec["symbols"]) * days * per_day * (1 + htf))
+    btype = spec["bars"]["type"]
+    base = spec["bars"]["per_day"] if btype != "time" else 375 / spec["timeframe"]
+    htf = sum(1 if tf == 1440 else 375 / tf for tf in engine.cond_timeframes(spec))
+    held = len(spec["symbols"]) * days * (base + htf)
+    transient = days * 375 if engine.needs_minutes(spec) else 0
+    return int(held + transient)
 
 
 def _guard(spec: dict[str, Any], start: int, end: int, combos: int = 1) -> int:
