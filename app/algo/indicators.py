@@ -726,7 +726,7 @@ REGISTRY: dict[str, tuple[Callable[..., Any], dict[str, Any], list[str], str]] =
     "CVD_DIVERGENCE": (lambda d, period=20: cvd_divergence(d, period), {"period": 20}, ["bull", "bear"], "Order flow"),
     "VPROFILE":   (lambda d, value_area=70: volume_profile(d, value_area), {"value_area": 70},
                    ["poc", "vah", "val", "prev_poc", "prev_vah", "prev_val"], "Order flow"),
-    "RVOL":       (lambda d, days=10: rvol(d, days), {"days": 10}, ["value"], "Order flow"),
+    "RVOL":       (lambda d, days=10: rvol(d, days), {"days": 10}, ["value"], "Volume"),
     "BAR_FLOW":   (lambda d: {"poc": d["poc"] if d.get("flow") else source(d, "hlc3"),
                               "vwap": d["bvwap"] if d.get("flow") else source(d, "hlc3")},
                    {}, ["poc", "vwap"], "Order flow"),
