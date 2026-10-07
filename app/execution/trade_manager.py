@@ -1797,6 +1797,18 @@ def _open_position_as_managed(
             .limit(1)
             .scalar()
         )
+        # The hold window is the news bot's rule. A manual ticket position or
+        # a carry-forward product (DELIVERY / MARGIN) never TIME_EXITs —
+        # rebuilt the next morning it would already be "expired" at the open.
+        signal_id = (
+            session.query(TradeRow.signal_id)
+            .filter(TradeRow.symbol == symbol, TradeRow.status == "filled")
+            .order_by(TradeRow.id.desc())
+            .limit(1)
+            .scalar()
+        )
+        if signal_id is None or (row.product or "INTRADAY") != "INTRADAY":
+            max_hold_seconds = 0
         mp = ManagedPosition(
             symbol=row.symbol,
             quantity=int(row.quantity),

@@ -935,3 +935,26 @@ def test_db_rebuilt_position_keeps_its_broker_account(client: TestClient, db_ses
         db.commit()
     mp, _ = _open_position_as_managed(dbs.SessionLocal, "NSE:INFY-EQ")
     assert mp.broker_account_id == real_account.id
+
+
+def test_rebuilt_manual_or_carry_position_never_time_exits(client: TestClient, db_session, isolated_db):
+    """The news bot's hold window (MAX_HOLD_SECONDS) must not reach a manual
+    ticket position or a DELIVERY / MARGIN carry: rebuilt the next morning it
+    was already 'expired' and got TIME_EXITed at the open."""
+    from datetime import datetime, timedelta, timezone
+    from app.db import session as dbs
+    from app.db.models import Position, Trade
+    from app.execution.trade_manager import _open_position_as_managed
+
+    old = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=1)
+    with dbs.SessionLocal() as db:
+        db.add_all([
+            Trade(symbol="NSE:MAN-EQ", side="BUY", quantity=1, price=10.0, status="filled"),
+            Position(symbol="NSE:MAN-EQ", quantity=1, average_price=10.0, opened_at=old),
+            Trade(symbol="NSE:CF-EQ", side="BUY", quantity=1, price=10.0, status="filled", product="DELIVERY"),
+            Position(symbol="NSE:CF-EQ", quantity=1, average_price=10.0, opened_at=old, product="DELIVERY"),
+        ])
+        db.commit()
+    for sym in ("NSE:MAN-EQ", "NSE:CF-EQ"):
+        mp, _ = _open_position_as_managed(dbs.SessionLocal, sym)
+        assert mp.max_hold_seconds == 0 and not mp.time_exit_expired()
