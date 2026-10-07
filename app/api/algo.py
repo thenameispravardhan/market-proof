@@ -425,8 +425,8 @@ def update_strategy(sid: int, body: dict[str, Any] = Body(...), db: Session = De
         if acc is None or acc.paper_mode or acc.broker != "fyers":
             raise HTTPException(422, detail="live mode needs a real Fyers account selected")
         spec = engine.normalize(s.spec)
-        if not spec["session"]["square_off"] or \
-                engine.session_window(spec)[2] > engine._hhmm(LIVE_SQUARE_OFF_LATEST):
+        # Off = carry forward (NRML / CNC orders); a set time must beat Fyers' MIS square-off.
+        if engine._hhmm(LIVE_SQUARE_OFF_LATEST) < engine.session_window(spec)[2] < engine.CARRY:
             raise HTTPException(422, detail=f"live square-off must be at or before {LIVE_SQUARE_OFF_LATEST} "
                                             "(Fyers auto-squares intraday positions at ~15:20)")
     _audit(db, "algo.update", s, changes)
@@ -477,8 +477,7 @@ def activate_version(sid: int, version: int, db: Session = Depends(get_db)) -> d
     s.spec, s.version = v.spec, v.version
     if s.mode == "live":
         spec = engine.normalize(s.spec)
-        if not spec["session"]["square_off"] or \
-                engine.session_window(spec)[2] > engine._hhmm(LIVE_SQUARE_OFF_LATEST):
+        if engine._hhmm(LIVE_SQUARE_OFF_LATEST) < engine.session_window(spec)[2] < engine.CARRY:
             raise HTTPException(422, detail=f"v{version} squares off after {LIVE_SQUARE_OFF_LATEST} — "
                                             "switch the strategy to paper first")
     _audit(db, "algo.activate_version", s, {"version": version})

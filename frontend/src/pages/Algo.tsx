@@ -1843,7 +1843,7 @@ export default function Algo() {
             <div className="algo-operand" style={{ gap: 14, marginTop: 8 }}>
               {(["start", "end", "square_off"] as const).map((k) => {
                 const on = spec.session[k] !== null && spec.session[k] !== undefined;
-                const off = { start: "from the 09:15 open", end: "until square-off", square_off: "at 15:29" }[k];
+                const off = { start: "from the 09:15 open", end: "until square-off", square_off: "carry forward overnight" }[k];
                 return (
                   <label key={k} className="meta" title={on ? "" : `off — ${off}`}>
                     <input type="checkbox" checked={on} onChange={(e) => upd({ session: { ...spec.session, [k]: e.target.checked ? SESSION_DEFAULT[k] : null } })} />

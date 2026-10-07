@@ -19,7 +19,8 @@ Execution model, shared with the live runner:
   * MTM (rupee) stop / target / trail work on the whole position — the way
     to manage a multi-leg option position;
   * daily max loss / max profit flatten the strategy and stop it for the day;
-  * intraday only — everything is flat by `square_off`.
+  * everything is flat by `square_off`; with square-off switched off the
+    position carries forward (overnight) until an exit rule closes it.
 
 The portfolio is one cash ledger across all symbols: positions compete for
 capital (leverage applies to equity/futures/option writing, never to option
@@ -84,14 +85,17 @@ DEFAULT_SPEC: dict[str, Any] = {
 }
 
 
+CARRY = 24 * 60   # square-off minute meaning "never" (no clock minute reaches it)
+
+
 def session_window(spec: dict[str, Any]) -> tuple[int, int, int]:
     """(entries from, entries until, square off) in IST minutes. A switched-off
-    time falls back to the session edge: entries from the open, until the
-    square-off, and square-off at the last minute (15:29) — still intraday."""
+    entry time falls back to the session edge (09:15 / 15:29); a switched-off
+    square-off is CARRY: positions are never time-squared and carry overnight."""
     sess = spec["session"]
-    sq = _hhmm(sess["square_off"]) if sess.get("square_off") else 15 * 60 + 29
+    sq = _hhmm(sess["square_off"]) if sess.get("square_off") else CARRY
     start = _hhmm(sess["start"]) if sess.get("start") else 9 * 60 + 15
-    end = _hhmm(sess["end"]) if sess.get("end") else sq
+    end = _hhmm(sess["end"]) if sess.get("end") else min(sq, 15 * 60 + 29)
     return start, end, sq
 
 
@@ -163,7 +167,7 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
         if s["session"].get(k) in ("", None):
             s["session"][k] = None
     start, end, sq = session_window(s)
-    if not 9 * 60 + 15 <= start <= end <= sq <= 15 * 60 + 29:
+    if not 9 * 60 + 15 <= start <= end <= min(sq, 15 * 60 + 29):
         raise ValueError("session must satisfy 09:15 <= start <= end <= square_off <= 15:29")
     eo = s["entry_order"]
     if eo.get("type") not in ("market", "pullback", "breakout"):
@@ -835,7 +839,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         day, mod = (t + IST) // 86400, ((t + IST) % 86400) // 60
         if day != day_key:
             day_key, day_realized = day, 0.0
-        if s_["pos"] and day != s_["pos"]["day"]:
+        if s_["pos"] and day != s_["pos"]["day"] and sq < CARRY:
             close(sym, d["c"][i - 1], ind.close_time(d, i - 1), "EOD", i - 1)
         if s_["pos"] and (s_["pos"]["exit_pending"] or mod >= sq):
             close(sym, d["o"][i], t, s_["pos"]["exit_pending"] or "SQUARE_OFF", i)
