@@ -23,6 +23,9 @@ them once the candles exist. Nothing about ingestion waits for prices.
 """
 from __future__ import annotations
 
+import subprocess
+import sys
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any, Optional
@@ -218,18 +221,44 @@ def load_live() -> int:
     dataset's 91, with prices left pending and the AI fields taken from the
     analyses row when the filing was analysed.
     """
+    with tempfile.TemporaryDirectory() as tmp:
+        _export_live(Path(tmp))
+        return _fold_live(Path(tmp))
+
+
+# DuckDB's sqlite extension bundles its OWN copy of SQLite. Attaching the live
+# trading.db inside this process puts two SQLite libraries on one file: POSIX
+# locks are per-process, so on DETACH DuckDB's copy believes it is the last
+# connection and DELETES trading.db-wal/-shm under the app's open connections.
+# Writes then land in a deleted WAL and any newly opened connection fails with
+# "disk I/O error" (prod, 2026-10-06). A child process is a real second
+# process, which SQLite's locking handles correctly.
+_EXPORT = """
+import duckdb, sys
+c = duckdb.connect()
+c.execute("INSTALL sqlite; LOAD sqlite;")
+c.execute(f"ATTACH '{sys.argv[1]}' AS live (TYPE sqlite, READ_ONLY)")
+c.execute(f"COPY (SELECT id, exchange, symbol, headline, event_type, filed_at, received_at, pdf_url, content_hash FROM live.announcements) TO '{sys.argv[2]}/a.parquet'")
+c.execute(f"COPY (SELECT id, announcement_id, sentiment, sentiment_score, confidence, recommendation, rationale, model FROM live.analyses) TO '{sys.argv[2]}/an.parquet'")
+"""
+
+
+def _export_live(dest: Path) -> None:
+    subprocess.run([sys.executable, "-c", _EXPORT, LIVE_DB.as_posix(), dest.as_posix()],
+                   check=True, timeout=600)
+
+
+def _fold_live(src: Path) -> int:
     con = connect()
-    con.execute("INSTALL sqlite; LOAD sqlite;")
-    con.execute(f"ATTACH '{LIVE_DB.as_posix()}' AS live (TYPE sqlite, READ_ONLY)")
+    a_src, an_src = f"read_parquet('{(src / 'a.parquet').as_posix()}')", f"read_parquet('{(src / 'an.parquet').as_posix()}')"
     # Every live timestamp is converted to IST before it is used, both for the
     # uid and for the stored value, so the two sources land on one clock.
     ist_filed = f"(CAST(a.filed_at AS TIMESTAMP) + {IST_SHIFT})"
     ist_recv = f"(CAST(a.received_at AS TIMESTAMP) + {IST_SHIFT})"
     base = UID_BASE.format(ex="a.exchange", sym="a.symbol",
                           ts=ist_filed, hl="a.headline")
-    try:
-        with _lock:
-            n = con.execute(f"""
+    with _lock:
+        n = con.execute(f"""
                 INSERT INTO {TABLE} (
                     uid, event_id, exchange, symbol, headline, category,
                     announced_at, disseminated_at, attachment_url, content_hash,
@@ -247,13 +276,11 @@ def load_live() -> int:
                            an.recommendation, an.rationale, an.model,
                            CASE WHEN an.id IS NULL THEN NULL ELSE 'live' END,
                            'live', 'pending'
-                    FROM live.announcements a
-                    LEFT JOIN live.analyses an ON an.announcement_id = a.id
+                    FROM {a_src} a
+                    LEFT JOIN {an_src} an ON an.announcement_id = a.id
                 ) m
                 WHERE m.uid NOT IN (SELECT uid FROM {TABLE})
             """).fetchone()
-    finally:
-        con.execute("DETACH live")
     log.info("warehouse_store.live_loaded", rows=n[0] if n else 0)
     return n[0] if n else 0
 
