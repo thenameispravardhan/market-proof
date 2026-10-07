@@ -26,8 +26,9 @@ Modes, chosen per strategy on the Algo page:
           checked against the broker's net position before an order is sent.
 
 Invariants kept: Fyers-only prices; no live price -> no entry and no booked
-exit (never a synthetic fill); intraday only — everything is flat by the
-square-off time and anything left at 15:30 is closed.
+exit (never a synthetic fill); everything is flat by the square-off time and
+anything left at 15:30 is closed — unless the strategy's square-off is switched
+off: then it carries forward (live orders go out as NRML / CNC, not MIS).
 """
 from __future__ import annotations
 
@@ -60,6 +61,11 @@ def _utc(ts: float) -> datetime:
 
 def _naive(ts: float) -> datetime:
     return _utc(ts).replace(tzinfo=None)
+
+
+def _carries(s: Optional[dict]) -> bool:
+    """Square-off switched off: the position is meant to stay open overnight."""
+    return s is not None and engine.session_window(s["spec"])[2] >= engine.CARRY
 
 
 def _epoch(dt: datetime) -> float:
@@ -209,15 +215,23 @@ async def _broker_net(account: BrokerAccount, symbol: str) -> Optional[int]:
                if str(r.get("symbol") or "").upper() == symbol.upper())
 
 
+def _product(spec: dict, lg: dict) -> str:
+    """MIS for an intraday strategy; a carry-forward one (square-off off) needs
+    CNC / NRML, or Fyers auto-squares the MIS position at ~15:20 anyway."""
+    if engine.session_window(spec)[2] < engine.CARRY:
+        return "INTRADAY"
+    return "DELIVERY" if lg["kind"] == "EQ" else "MARGIN"
+
+
 async def _order(account: BrokerAccount, symbol: str, side: str, qty: int, *, exit_: bool,
-                 strategy_id: int) -> tuple[bool, Optional[str], str]:
-    """(ok, broker order id, message) — one MARKET INTRADAY order."""
+                 strategy_id: int, product: str = "INTRADAY") -> tuple[bool, Optional[str], str]:
+    """(ok, broker order id, message) — one MARKET order."""
     from app.api.orders import _manager
 
     try:
         r = await _manager().place_manual_order(
             account=account, symbol=symbol, side=side, quantity=int(qty), order_type="MARKET",
-            product_type="INTRADAY", bypass_risk=exit_, operator=f"algo:{strategy_id}")
+            product_type=product, bypass_risk=exit_, operator=f"algo:{strategy_id}")
     except Exception as e:  # noqa: BLE001 — a broker fault is reported, never raised into the loop
         return False, None, str(e)[:300]
     if r.get("ok"):
@@ -386,7 +400,8 @@ class AlgoRunner:
                 await fno.ensure_master()
             except Exception as e:  # noqa: BLE001
                 self.event("error", f"F&O master refresh failed: {e}"[:200])
-        stale = [t for t in open_trades if _naive(day_start) > t["entry_at"].replace(tzinfo=None)]
+        stale = [t for t in open_trades if _naive(day_start) > t["entry_at"].replace(tzinfo=None)
+                 and not _carries(by_id.get(t["strategy_id"]))]
         if stale:
             await self._close_stale(stale)
             open_trades = [t for t in open_trades if t not in stale]
@@ -399,7 +414,7 @@ class AlgoRunner:
                     await self._on_bar(s, now, day_start)
         elif mins >= CLOSE_MIN:
             if open_trades:
-                await self._manage(open_trades, by_id, now, 24 * 60, day_start)   # past every square-off
+                await self._manage(open_trades, by_id, now, CLOSE_MIN, day_start)   # past every square-off
             if mins >= SYNC_AFTER_MIN and self._sync_day != day and strategies:
                 self._sync_day = day
                 await self.sync(strategies, days=5)
@@ -535,7 +550,8 @@ class AlgoRunner:
                     continue
                 ok, oid, msg = (False, None, why or "positions unavailable") if acc is None or net is None \
                     else await _order(acc, lg["symbol"], "SELL" if lg["act"] > 0 else "BUY",
-                                      min(lg["qty"], abs(held)), exit_=True, strategy_id=t["strategy_id"])
+                                      min(lg["qty"], abs(held)), exit_=True, strategy_id=t["strategy_id"],
+                                      product=lg.get("product", "INTRADAY"))
                 if not ok:
                     self._retry_at[t["id"]] = now + 30
                     await asyncio.to_thread(_update, t["id"], legs=legs, note=f"exit failed: {msg}"[:500])
@@ -736,8 +752,9 @@ class AlgoRunner:
             failure = why
             if acc is not None:
                 for lg in sorted(legs, key=lambda x: -x["act"]):       # bought legs first
+                    lg["product"] = _product(spec, lg)
                     ok, oid, msg = await _order(acc, lg["symbol"], "BUY" if lg["act"] > 0 else "SELL",
-                                                lg["qty"], exit_=False, strategy_id=s["id"])
+                                                lg["qty"], exit_=False, strategy_id=s["id"], product=lg["product"])
                     if not ok:
                         failure = f"{lg['symbol']}: {msg}"
                         break
@@ -747,7 +764,7 @@ class AlgoRunner:
             if failure:
                 for lg in placed:                                   # roll back what did fill
                     await _order(acc, lg["symbol"], "SELL" if lg["act"] > 0 else "BUY", lg["qty"],
-                                 exit_=True, strategy_id=s["id"])
+                                 exit_=True, strategy_id=s["id"], product=lg["product"])
                 await asyncio.to_thread(
                     _insert, strategy_id=s["id"], symbol=sym, side=side, quantity=legs[0]["qty"], mode="live",
                     status="rejected", entry_at=_utc(now), entry_price=round(u, 2), legs=_clean(legs),
@@ -796,5 +813,5 @@ class AlgoRunner:
 
 
 def _clean(legs: list[dict]) -> list[dict]:
-    keep = ("symbol", "kind", "act", "qty", "entry", "label", "K", "exp", "order_id")
+    keep = ("symbol", "kind", "act", "qty", "entry", "label", "K", "exp", "order_id", "product")
     return [{k: lg[k] for k in keep if k in lg} for lg in legs]

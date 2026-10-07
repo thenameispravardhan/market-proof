@@ -299,7 +299,34 @@ def test_session_times_can_be_switched_off():
     closes = [100] * 5 + [106] + [107] * 80
     spec = _cross_spec(exit_long=None, session={"start": None, "end": None, "square_off": None})
     t = engine.run(spec, {"X": bars(closes, spread=0)})["trades"][0]
-    assert t["reason"] == "SQUARE_OFF" and (t["exit_t"] + 19800) % 86400 >= 15 * 3600 + 29 * 60   # not 15:15
+    assert t["reason"] == "END"          # square-off off = carry forward: never time-squared
+
+
+def test_runner_carries_when_square_off_is_off(isolated_db):
+    """Square-off switched off: no SQUARE_OFF after 15:30, no STALE_SESSION
+    close the next morning — and live orders go out as NRML / CNC, not MIS."""
+    import asyncio
+
+    from app.algo import runner as rn
+    from app.db import session as dbs
+    from app.db.models import AlgoStrategy, AlgoTrade
+
+    spec = _cross_spec(exit_long=None, session={"start": None, "end": None, "square_off": None})
+    with dbs.SessionLocal() as db:
+        s = AlgoStrategy(name="c", spec=spec, enabled=False, mode="paper")
+        db.add(s)
+        db.flush()
+        db.add(AlgoTrade(strategy_id=s.id, symbol="NSE:TEST-EQ", side="BUY", quantity=1, mode="paper",
+                         status="open", entry_price=100.0, entry_at=rn._utc(DAY0 + 3600).replace(tzinfo=None)))
+        db.commit()
+    r = rn.AlgoRunner()
+    asyncio.run(r.tick(DAY0 + 6 * 3600 + 20 * 60))          # 15:35 IST, same day
+    asyncio.run(r.tick(DAY0 + 86400 + 60))                  # next day 09:16
+    with dbs.SessionLocal() as db:
+        assert db.query(AlgoTrade).one().status == "open"
+    norm = engine.normalize(spec)
+    assert rn._product(norm, {"kind": "EQ"}) == "DELIVERY" and rn._product(norm, {"kind": "CE"}) == "MARGIN"
+    assert rn._product(engine.normalize(_cross_spec()), {"kind": "CE"}) == "INTRADAY"
 
 
 def test_pullback_and_breakout_entries():
