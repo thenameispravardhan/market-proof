@@ -133,3 +133,28 @@ def test_sql_console_rejects_writes():
                 "copy announcements to '/tmp/x.csv'",
                 "select * from read_parquet('/etc/hosts')"):
         assert _FORBIDDEN.search(bad), f"not blocked: {bad}"
+
+
+def test_load_live_folds_rows_and_leaves_the_live_wal_alone(store, tmp_path, monkeypatch):
+    """load_live must never open trading.db with DuckDB's own SQLite inside
+    this process: on detach it deleted the live -wal/-shm (prod 2026-10-06)."""
+    import sqlite3
+    db = tmp_path / "live.db"
+    live = sqlite3.connect(db)
+    live.execute("pragma journal_mode=wal")
+    live.executescript("""
+        create table announcements(id integer primary key, exchange text, symbol text, headline text,
+            event_type text, filed_at datetime, received_at datetime, pdf_url text, content_hash text);
+        create table analyses(id integer primary key, announcement_id int, sentiment text,
+            sentiment_score real, confidence real, recommendation text, rationale text, model text);
+        insert into announcements values (1,'NSE','TCS','Q2 results','results',
+            '2026-10-06 04:00:00','2026-10-06 04:00:01','u','h');
+        insert into analyses values (1,1,'positive',0.8,0.9,'BUY','beat','m');
+    """)
+    live.commit()
+    monkeypatch.setattr(W, "LIVE_DB", db)
+    assert W.load_live() == 1
+    assert (tmp_path / "live.db-wal").exists()
+    live.execute("insert into announcements(id) values (2)")   # still writable
+    live.commit()
+    assert store.execute(f"select ai_sentiment from {W.TABLE} where event_id = 1").fetchone() == ("positive",)
