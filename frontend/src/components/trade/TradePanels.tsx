@@ -7,6 +7,7 @@
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import type { InstrumentHit, PendingOrder, Position } from "../../types";
 import { useLiveQuote } from "../../hooks/useQuotes";
+import { announceOrderChange } from "../../hooks/useApi";
 import { wsId } from "../../workspace";
 import { technicalRating, type OhlcvCandle } from "../../lib/indicators";
 import { capTier } from "../../lib/marketCap";
@@ -589,7 +590,7 @@ export function AccountManager({
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(typeof j.detail === "string" ? j.detail : `HTTP ${r.status}`);
     if (j.ok === false) throw new Error(j.message || "the broker refused the change");
-    book.reload();
+    announceOrderChange();
     return `Moved ${o.side} ${o.remaining ?? o.qty} ${o.symbol} to ${fmt(price)}`;
   };
   const prof = profile.data?.ok ? profile.data : null;
@@ -761,7 +762,7 @@ export function AccountManager({
           </section>
         )}
       </div>
-      {modify && <ModifyOrderDialog order={modify} accountId={accountId} onClose={() => setModify(null)} onDone={(m) => { setMsg(m); book.reload(); }} />}
+      {modify && <ModifyOrderDialog order={modify} accountId={accountId} onClose={() => setModify(null)} onDone={(m) => { setMsg(m); announceOrderChange(); }} />}
       {exit && (
         <ExitPositionDialog
           pos={exit.pos}
