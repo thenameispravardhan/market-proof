@@ -705,6 +705,27 @@ describe("Trade page", () => {
     expect(screen.getByTestId("ticket-submit")).toBeDisabled();
   });
 
+  it("watchlist: a saved option's lot size is refreshed from the server when NSE revises it", async () => {
+    const opt = { symbol: "NSE:NIFTY25DEC25000CE", short_name: "NIFTY 25000 CE", exchange: "NSE", segment: "FO", instrument_type: "CE",
+      lot_size: 75, tick_size: 0.05, expiry: null, strike: 25000, underlying: "NIFTY", display: "NIFTY 25000 CE" };
+    localStorage.setItem("trade:watchlists", JSON.stringify({ active: 0, lists: [{ name: "Watchlist", items: [opt] }] }));
+    localStorage.setItem("trade:last", JSON.stringify(opt));
+    const lotCalls: string[] = [];
+    const stubs = defaultStubs();
+    globalThis.fetch = makeFetchStub((url, init) => {
+      if (url.includes("/api/options/lots")) {
+        lotCalls.push(url);
+        return makeJsonResponse({ ok: true, lots: { "NSE:NIFTY25DEC25000CE": 65 } });
+      }
+      return stubs(url, init);
+    });
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await waitFor(() => expect(screen.getByTestId("ticket-qty").textContent).toMatch(/\(65\/lot\)/));
+    expect(decodeURIComponent(lotCalls[0])).toContain("NSE:NIFTY25DEC25000CE");
+    const saved = JSON.parse(localStorage.getItem("trade:watchlists") ?? "null");
+    expect(saved.lists[0].items[0].lot_size).toBe(65);
+  });
+
   it("chain: dropping on another chart cell never moves the chain to that cell's stock", async () => {
     const leg = { symbol: "NSE:RELIANCE26OCT2500CE", ltp: 42, bid: 41.9, ask: 42.1, oi: 1000, volume: 10, ltpch: 0, lot_size: 500, tick_size: 0.05 };
     const chain = { ok: true, underlying: "RELIANCE", symbol: "", spot: 2450, expiries: [], selected_expiry: null, source: "fyers",

@@ -191,3 +191,6 @@ def test_lot_endpoint(client, fo_master):
     assert client.get("/api/options/lot", params={"symbol": "NSE:SBIN-EQ"}).json()["lot_size"] == 1
     j = client.get("/api/options/lot", params={"symbol": "nse:nifty25dec25000ce"}).json()
     assert j["lot_size"] == 65 and j["underlying"] == "NIFTY" and j["derivative"] is True
+    j = client.get("/api/options/lots",
+                   params={"symbols": "NSE:SBIN-EQ, NSE:NIFTY25OCT25000CE,NSE:NEWCO25OCT100CE"}).json()
+    assert j["lots"] == {"NSE:SBIN-EQ": 1, "NSE:NIFTY25OCT25000CE": 75, "NSE:NEWCO25OCT100CE": None}

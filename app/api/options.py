@@ -129,27 +129,42 @@ def _master_chain(underlying: str, expiry: Optional[str], reason: str) -> dict[s
     }
 
 
-@router.get("/lot")
-async def lot_size(
-    symbol: str = Query(..., min_length=1, description="Fyers symbol, e.g. NSE:SBIN25OCTFUT"),
-) -> dict[str, Any]:
-    """Lot size for one symbol: 1 for cash, the contract's lot for NSE/BSE
-    F&O (from the Fyers F&O scrip master), or `lot_size: null` when it isn't
-    known — the order endpoint refuses such an order rather than guess."""
+async def _lots_for(symbols: list[str]) -> dict[str, Optional[int]]:
+    """Lot per symbol: 1 for cash, the contract's lot for NSE/BSE F&O (Fyers
+    F&O scrip master), None when it isn't known — the order endpoint refuses
+    such an order rather than guess. Fetches the master once if it's missing."""
     from app.algo import fno
 
-    sym = symbol.strip().upper()
-    if not fno.is_derivative(sym):
-        return {"ok": True, "symbol": sym, "lot_size": 1, "derivative": False}
-    lot = fno.contract_lot(sym)
-    if lot is None and not fno.master_loaded():
+    if any(fno.is_derivative(s) for s in symbols) and not fno.master_loaded():
         try:
             await fno.ensure_master()
         except Exception as e:  # noqa: BLE001
             log.warning("options.lot_master_refresh_failed", error=str(e)[:200])
-        lot = fno.contract_lot(sym)
-    return {"ok": True, "symbol": sym, "lot_size": lot, "derivative": True,
+    return {s: (fno.contract_lot(s) if fno.is_derivative(s) else 1) for s in symbols}
+
+
+@router.get("/lot")
+async def lot_size(
+    symbol: str = Query(..., min_length=1, description="Fyers symbol, e.g. NSE:SBIN25OCTFUT"),
+) -> dict[str, Any]:
+    """Lot size for one symbol (`lot_size: null` when it isn't known)."""
+    from app.algo import fno
+
+    sym = symbol.strip().upper()
+    lot = (await _lots_for([sym]))[sym]
+    return {"ok": True, "symbol": sym, "lot_size": lot, "derivative": fno.is_derivative(sym),
             "underlying": fno.underlying_of(sym)}
+
+
+@router.get("/lots")
+async def lot_sizes(
+    symbols: str = Query(..., min_length=1, description="Comma-separated Fyers symbols (max 200)"),
+) -> dict[str, Any]:
+    """Current lot sizes for many symbols at once — the Trade page refreshes
+    saved watchlist entries with it, since a lot stored when an option was
+    added goes stale when NSE revises lots."""
+    syms = list(dict.fromkeys(s.strip().upper() for s in symbols.split(",") if s.strip()))[:200]
+    return {"ok": True, "lots": await _lots_for(syms)}
 
 
 @router.get("/chain")
