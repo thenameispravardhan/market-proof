@@ -356,7 +356,7 @@ export interface InstrumentHit {
   exchange: string;
   segment: string;         // "EQ" / "FO" / "COM" / "CD" / "INDEX"
   instrument_type: string; // "EQ" / "FUT" / "CE" / "PE" / "IND"
-  lot_size: number;
+  lot_size: number;        // 0 = an F&O contract whose lot isn't known (orders blocked)
   tick_size: number;
   expiry: string | null;   // YYYY-MM-DD
   strike: number | null;
@@ -381,7 +381,8 @@ export interface OptionLeg {
   oi: number | null;
   volume: number | null;
   ltpch: number | null;
-  lot_size: number;
+  /** null when the backend doesn't know this contract's lot (F&O master not loaded). */
+  lot_size: number | null;
   tick_size: number;
 }
 

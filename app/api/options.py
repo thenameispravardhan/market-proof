@@ -129,6 +129,29 @@ def _master_chain(underlying: str, expiry: Optional[str], reason: str) -> dict[s
     }
 
 
+@router.get("/lot")
+async def lot_size(
+    symbol: str = Query(..., min_length=1, description="Fyers symbol, e.g. NSE:SBIN25OCTFUT"),
+) -> dict[str, Any]:
+    """Lot size for one symbol: 1 for cash, the contract's lot for NSE/BSE
+    F&O (from the Fyers F&O scrip master), or `lot_size: null` when it isn't
+    known — the order endpoint refuses such an order rather than guess."""
+    from app.algo import fno
+
+    sym = symbol.strip().upper()
+    if not fno.is_derivative(sym):
+        return {"ok": True, "symbol": sym, "lot_size": 1, "derivative": False}
+    lot = fno.contract_lot(sym)
+    if lot is None and not fno.master_loaded():
+        try:
+            await fno.ensure_master()
+        except Exception as e:  # noqa: BLE001
+            log.warning("options.lot_master_refresh_failed", error=str(e)[:200])
+        lot = fno.contract_lot(sym)
+    return {"ok": True, "symbol": sym, "lot_size": lot, "derivative": True,
+            "underlying": fno.underlying_of(sym)}
+
+
 @router.get("/chain")
 async def options_chain(
     underlying: str = Query("", description="Index short name, e.g. NIFTY / BANKNIFTY"),
