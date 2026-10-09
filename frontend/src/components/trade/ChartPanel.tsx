@@ -151,6 +151,7 @@ import { DrawingFloatBar, FavoritesBar, LeftToolbar, type CursorMode, type Magne
 import { AlertsPanel, DataWindow, ObjectTree, type DataRow, type GroupAction, type TreeDrop, type TreeItem } from "./ChartWidgets";
 import { AboutIndicatorDialog, InsightsDialog, ManagePanesDialog, WhatsNewDialog } from "./ChartInfoDialogs";
 import { CHART_SETTINGS_EVENT } from "./UserSettings";
+import { LEVEL_DRAG_SLOP, levelProblem, snapToTick } from "./levelDrag";
 
 const IST = IST_OFFSET;
 
@@ -1076,6 +1077,9 @@ export default function ChartPanel(props: ChartPanelProps) {
     orig: Drawing;
     snap: Snap;
     moved: boolean;
+    /** Ctrl / ⌘ held at press: the first move drags a copy instead. */
+    clone?: boolean;
+    cloned?: boolean;
   } | null>(null);
   const freehandRef = useRef<{ type: string; points: DrawingPoint[]; last: { x: number; y: number } } | null>(null);
   const hoverCursorElRef = useRef<HTMLElement | null>(null);
@@ -2772,7 +2776,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     const dims = paneDims();
     const list = drawingsRef.current;
     for (let i = list.length - 1; i >= 0; i--) {
-      let d = list[i];
+      const d = list[i];
       if (!visibleNow(d, deps) || hideRef.current.drawings) continue;
       // Handles are only visible (and grabbable) on the selected drawing.
       const handle = selectedIdRef.current === d.id ? hitHandle(d, pt.x, pt.y, deps, dims.width, dims.height) : null;
@@ -2780,10 +2784,6 @@ export default function ChartPanel(props: ChartPanelProps) {
       selectDrawing(d.id);
       if (d.locked || lockAllRef.current) return; // selectable, not movable
       const snap = snapshot("move drawing");
-      if (e.ctrlKey || e.metaKey) {
-        const copy = cloneDrawing(d.id, false);
-        if (copy) d = copy;
-      }
       dragRef.current = {
         id: d.id,
         mode: handle !== null ? handle : "move",
@@ -2792,6 +2792,9 @@ export default function ChartPanel(props: ChartPanelProps) {
         orig: d,
         snap,
         moved: false,
+        // Ctrl / ⌘ + drag copies — but only once the pointer travels, so a
+        // ctrl-click doesn't leave an invisible duplicate on top.
+        clone: (e.ctrlKey || e.metaKey) && handle === null,
       };
       e.preventDefault();
       e.stopPropagation();
@@ -2846,9 +2849,20 @@ export default function ChartPanel(props: ChartPanelProps) {
     }
     const pt = paneCoords(e, true);
     if (!pt) return;
+    // A few pixels of jitter on a click is not a move (no undo step, no save).
+    if (!drag.moved && Math.hypot(pt.x - drag.startPx.x, pt.y - drag.startPx.y) < 3) return;
     const time = xToTime(pt.x);
     const price = yToPrice(pt.y);
     if (time === null || price == null) return;
+    if (drag.clone && !drag.moved) {
+      const copy = cloneDrawing(drag.id, false);
+      if (copy) {
+        drag.id = copy.id;
+        drag.orig = copy;
+        drag.cloned = true;
+        selectDrawing(copy.id);
+      }
+    }
     const d = drag.orig;
     const tool = TOOL_BY_ID.get(d.type);
     const dims = paneDims();
@@ -3122,9 +3136,15 @@ export default function ChartPanel(props: ChartPanelProps) {
       }
       const drag = dragRef.current;
       if (drag) {
-        // abort the drag — put the drawing back
-        drawingsRef.current = drawingsRef.current.map((d) => (d.id === drag.id ? drag.orig : d));
+        // abort the drag — put the drawing back (or drop the copy a ctrl-drag made)
+        drawingsRef.current = drag.cloned
+          ? drawingsRef.current.filter((d) => d.id !== drag.id)
+          : drawingsRef.current.map((d) => (d.id === drag.id ? drag.orig : d));
         dragRef.current = null;
+        if (drag.cloned) {
+          persistDrawings();
+          bumpDrawings();
+        }
         repaintDrawings();
         return;
       }
@@ -4384,28 +4404,47 @@ export default function ChartPanel(props: ChartPanelProps) {
     const host = containerRef.current;
     if (!host || !mainRef.current) return;
     const pos = showPos;
+    const startY = e.clientY;
+    // A press without travel is a click: it must never move (or pull out) a live exit.
+    let moved = false;
     levelDragRef.current = { which, price: pos[which] ?? pos.avg };
     setLevelDrag(which);
     const move = (ev: PointerEvent) => {
+      if (!moved && Math.abs(ev.clientY - startY) < LEVEL_DRAG_SLOP) return;
+      moved = true;
       const pr = yToPrice(ev.clientY - host.getBoundingClientRect().top);
-      if (pr != null && levelDragRef.current) levelDragRef.current.price = Math.round(pr * 100) / 100;
+      if (pr != null && levelDragRef.current) levelDragRef.current.price = snapToTick(pr, tickRef.current);
     };
-    const up = async () => {
+    const detach = () => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", cancel);
+      window.removeEventListener("keydown", esc, true);
+    };
+    const done = () => {
+      levelDragRef.current = null;
+      setLevelDrag(null);
+    };
+    const cancel = () => {
+      detach();
+      done();
+    };
+    // Escape puts the line back without saving.
+    const esc = (ev: KeyboardEvent) => {
+      if (ev.key !== "Escape") return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      cancel();
+    };
+    const up = async () => {
+      detach();
       const d = levelDragRef.current;
       if (!d) return;
-      const done = () => {
-        levelDragRef.current = null;
-        setLevelDrag(null);
-      };
-      if (d.price === pos[which]) return done();
+      if (!moved || d.price === pos[which]) return done();
       const ltp = prevLtpRef.current ?? lastClose();
-      const long = pos.qty > 0;
-      // A level on the wrong side of the market would exit on the next tick.
-      const below = which === "sl" ? long : !long;
-      if (ltp != null && (below ? d.price >= ltp : d.price <= ltp)) {
-        addToast(`${which === "sl" ? "Stop-loss" : "Target"} must be ${below ? "below" : "above"} the LTP ${fmtPrice(ltp)} for a ${long ? "long" : "short"} — not changed`);
+      const problem = levelProblem(which, d.price, ltp, pos.qty > 0, fmtPrice);
+      if (problem) {
+        addToast(problem);
         return done();
       }
       try {
@@ -4418,6 +4457,8 @@ export default function ChartPanel(props: ChartPanelProps) {
     };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", cancel);
+    window.addEventListener("keydown", esc, true);
   }
 
   async function removeLevel(which: "sl" | "tp"): Promise<void> {
