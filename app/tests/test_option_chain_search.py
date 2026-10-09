@@ -73,9 +73,34 @@ def test_master_fallback_keeps_a_live_epoch_expiry(tmp_path, monkeypatch) -> Non
     (tmp_path / "fo.csv").write_text(rows)
     m = InstrumentMaster(data_dir=tmp_path)
     monkeypatch.setattr(options_api, "get_master", lambda: m)
+    monkeypatch.setattr(options_api, "_ist_today", lambda: "2026-10-09")
     out = options_api._master_chain("NIFTY", _epoch(2026, 10, 27), "test")
     assert out["selected_expiry"] == "2026-10-27"
     assert out["strikes"][0]["ce"]["symbol"] == "NSE:NIFTY26O2725000CE"
+
+
+def test_master_fallback_skips_lapsed_expiries_and_never_guesses_lot_1(tmp_path, monkeypatch) -> None:
+    rows = "".join(
+        f"NSE:NIFTY{c}25000CE,NIFTY,NSE,FO,CE,{lot},0.05,{d},25000,NIFTY\n"
+        for c, d, lot in (("26O06", "06-Oct-2026", 65), ("26O13", "13-Oct-2026", 1))
+    )
+    (tmp_path / "fo.csv").write_text(rows)
+    m = InstrumentMaster(data_dir=tmp_path)
+    monkeypatch.setattr(options_api, "get_master", lambda: m)
+    monkeypatch.setattr(options_api, "_ist_today", lambda: "2026-10-09")
+    out = options_api._master_chain("NIFTY", None, "test")
+    # The 6 Oct expiry has lapsed: the nearest live one is picked, not it.
+    assert [e["ts"] for e in out["expiries"]] == ["2026-10-13"]
+    assert out["selected_expiry"] == "2026-10-13"
+    leg = out["strikes"][0]["ce"]
+    assert leg["symbol"] == "NSE:NIFTY26O1325000CE"
+    # A static lot of 1 is not a real F&O lot: unknown, so the ticket blocks it.
+    assert leg["lot_size"] in (None, 65) and leg["lot_size"] != 1
+
+    # Every expiry lapsed: an empty ladder rather than dead contracts.
+    monkeypatch.setattr(options_api, "_ist_today", lambda: "2026-11-01")
+    out = options_api._master_chain("NIFTY", None, "test")
+    assert out["expiries"] == [] and out["strikes"] == []
 
 
 class _StubBackend:
