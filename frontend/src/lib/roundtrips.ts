@@ -95,7 +95,28 @@ export function buildRoundTrips(
         qty -= matched;
         if (lot.qty === 0) openLots.shift();
       }
-      if (qty > 0) openLots.push({ side: t.side, qty, price: t.price ?? 0, t });
+      if (qty > 0 && t.pnl != null) {
+        // An exit leg (it carries realised P&L) with no entry left to close:
+        // the entry was deleted or fell outside the fetched window. It is
+        // still a closed trade, not a phantom open position in the other
+        // direction, and its P&L must still count.
+        const { isPaper, accountName } = acctMeta(t, byId);
+        out.push({
+          key: `x-${t.id}-${seq++}`,
+          symbol: t.symbol,
+          isPaper,
+          accountName,
+          side: t.side === "SELL" ? "BUY" : "SELL",
+          quantity: qty,
+          entryPrice: null,
+          exitPrice: t.price ?? null,
+          entryTime: null,
+          exitTime: t.executed_at ?? t.created_at ?? null,
+          pnl: (t.pnl * qty) / exitQtyTotal,
+          open: false,
+          tradeIds: [t.id],
+        });
+      } else if (qty > 0) openLots.push({ side: t.side, qty, price: t.price ?? 0, t });
     }
     for (const lot of openLots) {
       const { isPaper, accountName } = acctMeta(lot.t, byId);

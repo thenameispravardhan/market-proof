@@ -56,12 +56,18 @@ function Section({
   onDelete: (r: RoundTrip) => void;
 }) {
   const realised = rows.reduce((acc, r) => acc + (r.pnl ?? 0), 0);
+  const closed = rows.filter((r) => !r.open);
+  const openCount = rows.length - closed.length;
+  const winRate = closed.length > 0
+    ? (closed.filter((r) => (r.pnl ?? 0) > 0).length / closed.length) * 100
+    : null;
   return (
     <div className="widget widget-wide" data-testid={`trades-${title.toLowerCase().includes("fyers") ? "fyers" : "paper"}`}>
       <h3>
         {title}
         <span className="mono" style={{ fontWeight: 400 }}>
-          {rows.length} trade{rows.length === 1 ? "" : "s"} · P&amp;L{" "}
+          {closed.length} closed{openCount > 0 ? ` · ${openCount} open` : ""}
+          {winRate !== null ? ` · ${winRate.toFixed(0)}% won` : ""} · Realised{" "}
           <span className={pnlClass(realised)}>₹{fmtMoney(realised)}</span>
         </span>
       </h3>
@@ -223,10 +229,12 @@ export default function TradeHistory() {
     }
   }
 
-  const realised = roundtrips.reduce((a, r) => a + (r.pnl ?? 0), 0);
-  const closed = roundtrips.filter((r) => !r.open && r.pnl !== null);
-  const wins = closed.filter((r) => (r.pnl ?? 0) > 0).length;
-  const winRate = closed.length > 0 ? (wins / closed.length) * 100 : null;
+  // Real money and paper money are never added together: a paper win
+  // must not mask a live loss.
+  const sum = (rs: RoundTrip[]) => rs.reduce((a, r) => a + (r.pnl ?? 0), 0);
+  const liveRealised = sum(fyers);
+  const paperRealised = sum(paper);
+  const openCount = roundtrips.filter((r) => r.open).length;
 
   if (isLoading) {
     return (
@@ -251,18 +259,16 @@ export default function TradeHistory() {
 
       <div className="stat-row">
         <div className="stat">
-          <div className="stat-label">Round-trips</div>
-          <div className="stat-value">{roundtrips.length}</div>
+          <div className="stat-label">Fyers realised P&amp;L</div>
+          <div className={`stat-value ${pnlClass(liveRealised)}`}>₹{fmtMoney(liveRealised)}</div>
         </div>
         <div className="stat">
-          <div className="stat-label">Realised P&amp;L</div>
-          <div className={`stat-value ${pnlClass(realised)}`}>₹{fmtMoney(realised)}</div>
+          <div className="stat-label">Paper realised P&amp;L</div>
+          <div className={`stat-value ${pnlClass(paperRealised)}`}>₹{fmtMoney(paperRealised)}</div>
         </div>
         <div className="stat">
-          <div className="stat-label">Win rate</div>
-          <div className="stat-value">
-            {winRate === null ? "—" : `${winRate.toFixed(0)}%`}
-          </div>
+          <div className="stat-label">Open positions</div>
+          <div className="stat-value">{openCount}</div>
         </div>
       </div>
 

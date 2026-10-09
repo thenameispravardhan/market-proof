@@ -511,6 +511,17 @@ export function tradedQty(t: TradeRow): number {
   return orderBucket(t.status) === "filled" || t.executed_at ? t.quantity : 0;
 }
 
+/** The bot's executed trades: the filled-only feed (so a burst of rejected
+ *  HOLD signals can't crowd real fills out of the newest-N window) plus any
+ *  partly filled order from the all-status feed (cancelled after some fills,
+ *  so it isn't "filled"). De-duplicated by id, newest first. */
+export function tradedRows(all: TradeRow[], filled: TradeRow[]): TradeRow[] {
+  const byId = new Map<number, TradeRow>();
+  for (const t of [...filled, ...all]) if (!byId.has(t.id) && tradedQty(t) > 0) byId.set(t.id, t);
+  const when = (t: TradeRow) => t.executed_at ?? t.created_at ?? "";
+  return [...byId.values()].sort((a, b) => when(b).localeCompare(when(a)));
+}
+
 export function TradesTable({ rows, privacy }: { rows: TradeRow[]; privacy: boolean }) {
   const done = rows.filter((t) => tradedQty(t) > 0);
   const when = (t: TradeRow) => t.executed_at ?? t.created_at;
