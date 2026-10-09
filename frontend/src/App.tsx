@@ -249,7 +249,12 @@ export default function App() {
     },
   });
   // After a (re)connect, pull what may have been missed while the socket was down.
-  useEffect(() => { if (status === "open") refreshTrading(qc); }, [status, qc]);
+  // Charts listen for "ws:open" to backfill the bars the quote stream missed.
+  useEffect(() => {
+    if (status !== "open") return;
+    refreshTrading(qc);
+    window.dispatchEvent(new Event("ws:open"));
+  }, [status, qc]);
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(readSidebarOpen);
   const [skin, setSkin] = useState<AppTheme>(getTheme);
   useEffect(() => {

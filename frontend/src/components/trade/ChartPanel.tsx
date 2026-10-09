@@ -64,6 +64,7 @@ import {
   fetchPlan,
   formatClock,
   formatDate,
+  inSession,
   intervalCount,
   intervalGroup,
   intervalLabel,
@@ -75,12 +76,15 @@ import {
   lineBreak,
   liveBucket,
   mergeOlder,
+  minuteOfDay,
   monthName,
   normalizeInterval,
   parseInterval,
   pointFigure,
   rangeBars,
   renko,
+  sameInstrument,
+  sessionFor,
   TIMEZONES,
   wallClock,
   zoneOffsetLabel,
@@ -306,6 +310,8 @@ const COMPARE_COLORS = ["#42A5F5", "#AB47BC", "#26C6DA", "#FFCA28"];
 // Hard ceiling on how many candles we keep — beyond this the scroll-back
 // pagination stops asking for more.
 const MAX_CANDLES = 20000;
+/** Fewer bars than this on the first page pages further back right away. */
+const MIN_INITIAL_BARS = 60;
 
 const PREFS_KEY = "chart:prefs";
 
@@ -990,6 +996,17 @@ export default function ChartPanel(props: ChartPanelProps) {
   const fetchSeqRef = useRef(0);
   const loadingOlderRef = useRef<Promise<void> | null>(null);
   const haveMoreRef = useRef(true);
+  /** Epoch end (exclusive) of the next older page to fetch; null = before the oldest bar. */
+  const olderCursorRef = useRef<number | null>(null);
+  /** Consecutive older pages that came back empty (weekends, holidays). */
+  const emptyOlderRef = useRef(0);
+  /** No older-page retry before this time (ms) after a failed request. */
+  const olderRetryAtRef = useRef(0);
+  /** Consecutive failed older-page requests (a range the broker refuses). */
+  const olderFailsRef = useRef(0);
+  const tailLoadingRef = useRef(false);
+  const tailAtRef = useRef(0);
+  const lastTickAtRef = useRef(0);
   const drawModeRef = useRef<DrawMode>(null);
   const ivRef = useRef(iv);
   const kindRef = useRef(chartKind);
@@ -2218,26 +2235,43 @@ export default function ChartPanel(props: ChartPanelProps) {
     });
   }
 
-  /** Page in older history (one chunk); concurrent callers share it. */
+  /** Page in older history (one chunk); concurrent callers share it.
+   *  An empty page (a weekend or a holiday) moves on to the one before it;
+   *  only a long run of empty pages means the broker has nothing older.
+   *  A failed request is retried later instead of ending the scroll-back. */
   function maybeLoadOlder(): Promise<void> {
     if (loadingOlderRef.current) return loadingOlderRef.current;
     const candles = candlesRef.current;
-    if (!haveMoreRef.current || candles.length === 0 || candles.length >= MAX_CANDLES) return Promise.resolve();
+    if (!haveMoreRef.current || candles.length >= MAX_CANDLES || Date.now() < olderRetryAtRef.current) return Promise.resolve();
+    if (candles.length === 0 && olderCursorRef.current === null) return Promise.resolve();
     const run = (async () => {
       const seq = fetchSeqRef.current;
       const key = ivRef.current;
       const pl = fetchPlan(key);
-      const to = candles[0].time - IST - 1;
+      const edge = candles.length ? candles[0].time - IST : Infinity;
+      const to = Math.min(edge, olderCursorRef.current ?? Infinity) - 1;
       const from = dayStart(to - (pl.chunkDays - 1) * 86400);
       const r = await fetchHistory(symbol, pl.res, from, to);
       if (seq !== fetchSeqRef.current) return;
+      if (r.reason) {
+        olderFailsRef.current += 1;
+        if (olderFailsRef.current >= 3) haveMoreRef.current = false;
+        else olderRetryAtRef.current = Date.now() + 5000;
+        return;
+      }
+      olderFailsRef.current = 0;
+      olderCursorRef.current = from;
       const cur = candlesRef.current;
       const firstTime = cur[0]?.time ?? Infinity;
       let older = r.candles.filter((c) => c.time < firstTime);
       if (older.length === 0) {
-        haveMoreRef.current = false;
+        emptyOlderRef.current += 1;
+        // Intraday pages are short (2 days for seconds): keep stepping back
+        // across weekends and long holidays, give up after ~3 weeks of nothing.
+        if (emptyOlderRef.current * pl.chunkDays >= 21) haveMoreRef.current = false;
         return;
       }
+      emptyOlderRef.current = 0;
       if (pl.aggregate) older = aggregate(older, key) as Candle[];
       const merged = (pl.aggregate ? mergeOlder(older, cur, key) : [...older, ...cur]) as Candle[];
       const added = merged.length - cur.length;
@@ -2250,6 +2284,36 @@ export default function ChartPanel(props: ChartPanelProps) {
     });
     loadingOlderRef.current = run;
     return run;
+  }
+
+  /** Re-fetch the newest bars and splice them in: fills what the live
+   *  stream missed while the socket was down or the tab was asleep. */
+  function refreshTail(): void {
+    const candles = candlesRef.current;
+    if (tailLoadingRef.current || statusRef.current !== "ready" || candles.length === 0 || replayRef.current.on) return;
+    const nowMs = Date.now();
+    if (nowMs - tailAtRef.current < 20000) return;
+    tailAtRef.current = nowMs;
+    tailLoadingRef.current = true;
+    const seq = fetchSeqRef.current;
+    const key = ivRef.current;
+    const pl = fetchPlan(key);
+    const last = candles[candles.length - 1];
+    // Intraday aggregates anchor to the day's first bar: take the whole day.
+    const fromChart = pl.aggregate && isIntraday(key) ? Math.floor(last.time / 86400) * 86400 : last.time;
+    void fetchHistory(symbol, pl.res, fromChart - IST, Math.floor(nowMs / 1000) + 60).then((r) => {
+      tailLoadingRef.current = false;
+      if (seq !== fetchSeqRef.current || key !== ivRef.current || r.reason || r.candles.length === 0) return;
+      const fresh = (pl.aggregate ? aggregate(r.candles, key) : r.candles) as Candle[];
+      const cur = candlesRef.current;
+      const cut = fresh[0].time;
+      const end = fresh[fresh.length - 1].time;
+      let i = cur.length;
+      while (i > 0 && cur[i - 1].time >= cut) i--;
+      // bars the stream opened after the request went out stay
+      candlesRef.current = [...cur.slice(0, i), ...fresh, ...cur.filter((c) => c.time > end)];
+      applyData();
+    });
   }
 
   /** Page back until the chart holds bars at or before chart time `t`. */
@@ -3438,19 +3502,35 @@ export default function ChartPanel(props: ChartPanelProps) {
     otherDataRef.current = new Map(); // other symbols' bars follow the interval
     haveMoreRef.current = true;
     loadingOlderRef.current = null;
+    emptyOlderRef.current = 0;
+    olderRetryAtRef.current = 0;
+    olderFailsRef.current = 0;
+    tailLoadingRef.current = false;
     setDrawMode(null);
     setStatus({ kind: "loading" });
     if (replayRef.current.on) setReplay({ on: false, selecting: false, playing: false, speed: replayRef.current.speed, idx: 0 });
     const pl = fetchPlan(iv);
     const now = Math.floor(Date.now() / 1000);
     void (async () => {
-      const r = await fetchHistory(symbol, pl.res, dayStart(now - (pl.initialDays - 1) * 86400), now);
+      const from = dayStart(now - (pl.initialDays - 1) * 86400);
+      olderCursorRef.current = from;
+      const r = await fetchHistory(symbol, pl.res, from, now);
       if (seq !== fetchSeqRef.current) return;
       candlesRef.current = pl.aggregate ? (aggregate(r.candles, iv) as Candle[]) : r.candles;
+      if (!r.reason) {
+        // A short first page (seconds bars on a Monday morning or a weekend,
+        // weekly / monthly bars from one year of days) pages further back
+        // before the chart calls itself empty.
+        for (let k = 0; k < 4 && candlesRef.current.length < MIN_INITIAL_BARS && haveMoreRef.current; k++) {
+          await maybeLoadOlder();
+          if (seq !== fetchSeqRef.current) return;
+        }
+      }
+      const have = candlesRef.current.length;
       if (r.reason) setStatus({ kind: "error", message: r.reason });
-      else if (r.candles.length === 0) setStatus({ kind: "empty" });
+      else if (have === 0) setStatus({ kind: "empty" });
       else setStatus({ kind: "ready" });
-      statusRef.current = r.reason ? "error" : r.candles.length ? "ready" : "empty";
+      statusRef.current = r.reason ? "error" : have ? "ready" : "empty";
       applyData();
       // Position the newest bar at the right edge. setVisibleLogicalRange
       // is deterministic even with a market-closed gap (scrollToRealTime
@@ -3466,7 +3546,7 @@ export default function ChartPanel(props: ChartPanelProps) {
       // One silent retry per symbol|interval — the first fetch right after
       // a backend restart can fail transiently while the Fyers client warms up.
       const key = `${symbol}|${iv}`;
-      if ((r.reason || r.candles.length === 0) && autoRetriedKeyRef.current !== key) {
+      if ((r.reason || have === 0) && autoRetriedKeyRef.current !== key) {
         autoRetriedKeyRef.current = key;
         setTimeout(() => {
           if (seq === fetchSeqRef.current) setReloadNonce((x) => x + 1);
@@ -3584,13 +3664,15 @@ export default function ChartPanel(props: ChartPanelProps) {
       return;
     }
     let stop = false;
-    void fetch("/api/trades?limit=200")
+    // Fills only: rejected / HOLD rows used to crowd a symbol's fills out
+    // of the newest-200 window and its markers silently disappeared.
+    void fetch("/api/trades?status=filled&limit=1000")
       .then((r) => (r.ok ? r.json() : []))
       .then((rows: unknown) => {
         if (stop || !Array.isArray(rows)) return;
         const out: { time: number; side: "BUY" | "SELL"; qty: number; price: number }[] = [];
         for (const t of rows as { symbol?: string; side?: string; quantity?: number; price?: number; status?: string; executed_at?: string | null }[]) {
-          if ((t.symbol ?? "").toUpperCase() !== symbol.toUpperCase() || !t.executed_at || (t.status ?? "").toLowerCase() !== "filled") continue;
+          if (!sameInstrument(t.symbol ?? "", symbol) || !t.executed_at || (t.status ?? "").toLowerCase() !== "filled") continue;
           const ts = Date.parse(t.executed_at);
           if (!Number.isFinite(ts) || t.price == null) continue;
           out.push({ time: Math.floor(ts / 1000) + IST, side: t.side === "SELL" ? "SELL" : "BUY", qty: Number(t.quantity ?? 0), price: Number(t.price) });
@@ -3977,17 +4059,20 @@ export default function ChartPanel(props: ChartPanelProps) {
     const last = candles[candles.length - 1];
     const parsed = Date.parse(live.ts);
     const t = Math.floor(Number.isFinite(parsed) ? parsed / 1000 : Date.now() / 1000) + IST;
-    const b = liveBucket(last, t, ivRef.current);
+    const session = sessionFor(symbol);
+    // A silent stretch mid-session (socket reconnect, sleeping tab, backend
+    // restart) left bars the stream never saw: re-fetch them from history.
+    const nowMs = Date.now();
+    const quiet = lastTickAtRef.current > 0 && nowMs - lastTickAtRef.current > 60000;
+    lastTickAtRef.current = nowMs;
+    if (quiet && inSession(t, session)) refreshTail();
+    const b = liveBucket(last, t, ivRef.current, session.open);
     if (b.kind === "stale") return;
-    if (b.kind === "new") {
-      // Only open a NEW bar during plausible NSE hours (Mon–Fri,
-      // 09:00–15:40 IST) — quotes echo the last close on weekends and
-      // overnight, which would otherwise mint phantom bars.
-      const d = new Date(t * 1000); // t is IST-shifted, so read as UTC
-      const dow = d.getUTCDay();
-      const mins = d.getUTCHours() * 60 + d.getUTCMinutes();
-      if (dow === 0 || dow === 6 || mins < 540 || mins > 940) return;
-    }
+    // Only open a NEW bar inside the session (Mon–Fri, 09:15–15:30 on NSE).
+    // Quotes echo the last price in the pre-open, after the close, overnight
+    // and on weekends: those minted flat phantom bars (09:00–09:14,
+    // 15:30–15:40 …) that history doesn't have and a reload made vanish.
+    if (b.kind === "new" && !inSession(isIntraday(ivRef.current) ? b.time : t, session)) return;
     const dv = dayVol != null && pv != null && dayVol >= pv ? dayVol - pv : 0;
     let rolled = false;
     if (b.kind === "same") {
@@ -4019,6 +4104,22 @@ export default function ChartPanel(props: ChartPanelProps) {
     updateExtraLines();
   };
 
+  // 9b) Backfill the newest bars when the quote socket reconnects or the
+  //     tab wakes up: the stream doesn't replay what it missed meanwhile.
+  useEffect(() => {
+    const onOpen = () => refreshTail();
+    const onVis = () => {
+      if (document.visibilityState === "visible" && inSession(Math.floor(Date.now() / 1000) + IST, sessionFor(symbol))) refreshTail();
+    };
+    window.addEventListener("ws:open", onOpen);
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      window.removeEventListener("ws:open", onOpen);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // 10) Bar-close countdown under the last-price label (intraday, market hours).
   useEffect(() => {
     const id = setInterval(() => {
@@ -4037,7 +4138,8 @@ export default function ChartPanel(props: ChartPanelProps) {
       const mins = d.getUTCHours() * 60 + d.getUTCMinutes();
       const last = candles[candles.length - 1];
       const remaining = last.time + interval - nowIst;
-      if (dow === 0 || dow === 6 || mins < 555 || mins > 930 || remaining <= 0 || remaining > interval) {
+      const session = sessionFor(symbol);
+      if (dow === 0 || dow === 6 || mins < session.open || mins >= session.close || remaining <= 0 || remaining > interval) {
         el.style.display = "none";
         return;
       }
@@ -5139,12 +5241,12 @@ export default function ChartPanel(props: ChartPanelProps) {
   const drawCount = drawingsList.filter((d) => !TOOL_BY_ID.get(d.type)?.temp).length;
   const marketStatus = (() => {
     const now = Math.floor(Date.now() / 1000) + IST;
-    const d = new Date(now * 1000);
-    const dow = d.getUTCDay();
-    const m = d.getUTCHours() * 60 + d.getUTCMinutes();
+    const dow = new Date(now * 1000).getUTCDay();
+    const m = minuteOfDay(now);
+    const session = sessionFor(symbol);
     if (dow === 0 || dow === 6) return { k: "closed", t: "Market closed" };
-    if (m >= 540 && m < 555) return { k: "pre", t: "Pre-market" };
-    if (m >= 555 && m < 930) return { k: "open", t: "Market open" };
+    if (inSession(now, session)) return { k: "open", t: "Market open" };
+    if (m >= 540 && m < session.open) return { k: "pre", t: "Pre-market" };
     return { k: "closed", t: "Market closed" };
   })();
   const activeTool = drawMode ? TOOL_BY_ID.get(drawMode) : undefined;
