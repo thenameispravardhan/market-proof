@@ -199,16 +199,19 @@ function trueRange(candles: OhlcvCandle[]): number[] {
   return out;
 }
 
-/** Average true range with Wilder's smoothing. */
+/** Average true range with Wilder's smoothing — TradingView's ta.atr: the
+ *  first bar's true range is its high − low, and the RMA is seeded with the
+ *  SMA of the first `period` ranges, so the first value lands on bar
+ *  period − 1 (same as the backtester's app/algo/indicators.atr). */
 export function atr(candles: OhlcvCandle[], period = 14): (number | null)[] {
   const out: (number | null)[] = new Array(candles.length).fill(null);
-  if (candles.length <= period) return out;
+  if (period < 1 || candles.length < period) return out;
   const tr = trueRange(candles);
   let acc = 0;
-  for (let i = 1; i <= period; i++) acc += tr[i];
+  for (let i = 0; i < period; i++) acc += tr[i];
   let prev = acc / period;
-  out[period] = prev;
-  for (let i = period + 1; i < candles.length; i++) {
+  out[period - 1] = prev;
+  for (let i = period; i < candles.length; i++) {
     prev = (prev * (period - 1) + tr[i]) / period;
     out[i] = prev;
   }
