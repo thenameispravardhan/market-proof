@@ -535,7 +535,8 @@ export function AccountManager({
   managed: { symbol: string; stop_loss: number | null; target: number | null }[] | undefined;
   /** The bot's working orders (`/api/orders/pending`). */
   pendingOrders: PendingOrder[];
-  onCancel: (brokerOrderId: string) => void;
+  /** `label` names the order for the result banner ("BUY 10 NSE:SBIN-EQ"). */
+  onCancel: (brokerOrderId: string, label?: string) => void;
   cancelBusyId: string | null;
   cancelBanner?: ReactNode;
   accountId: number | null;
