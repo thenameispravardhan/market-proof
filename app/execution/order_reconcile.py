@@ -28,6 +28,7 @@ from typing import Any, Mapping
 from sqlalchemy.orm import Session
 
 from app.db.models import AuditLog, Position as PositionRow, Trade as TradeRow
+from app.execution.base import apply_fill
 from app.logging_config import get_logger
 from app.services.event_bus import event_bus
 
@@ -241,7 +242,18 @@ async def _arm_levels(order_id: str, symbol: str, sl: Any, tp: Any) -> None:
 
 def _reconcile_sync(db: Session, order: dict[str, Any], order_id: str, status_text: str, source: str) -> dict[str, Any]:
     new_status = _STATUS_MAP.get(status_text, "placed")
-    trade = db.query(TradeRow).filter(TradeRow.broker_order_id == order_id).one_or_none()
+    # broker_order_id isn't unique on `trades` (see orders.cancel_order), and
+    # `one_or_none()` raised MultipleResultsFound on a duplicate — the update
+    # was lost and the order sat "placed" forever. The oldest row carries the
+    # fill; the rest are kept in step with its status below.
+    rows = (
+        db.query(TradeRow)
+        .filter(TradeRow.broker_order_id == order_id)
+        .order_by(TradeRow.id.asc())
+        .all()
+    )
+    trade = rows[0] if rows else None
+    duplicates = rows[1:]
     if trade is None:
         log.info("fyers.reconcile.unmatched_order", source=source, order_id=order_id, status=status_text)
         return {"ok": True, "matched": False, "order_id": order_id, "status": new_status}
@@ -285,6 +297,9 @@ def _reconcile_sync(db: Session, order: dict[str, Any], order_id: str, status_te
         trade.status = new_status
     if new_status == "filled":
         trade.executed_at = datetime.now(timezone.utc)
+    for dup in duplicates:
+        if dup.status != "filled":
+            dup.status = trade.status
     db.add(AuditLog(actor="system", action=f"{source}.{new_status}", target=f"trade:{trade.id}",
                     after={"order_id": order_id, "status": new_status, "price": trade.price, "filled": trade.filled_qty}))
     db.commit()
@@ -312,11 +327,5 @@ def _apply_fill_to_position(db: Session, trade: TradeRow, qty: int | None = None
             )
         )
     else:
-        new_qty = pos.quantity + signed
-        if signed > 0 and new_qty != 0:
-            pos.average_price = (
-                (pos.average_price * pos.quantity + float(trade.price or 0.0) * signed)
-                / new_qty
-            )
-        pos.quantity = new_qty
+        pos.quantity, pos.average_price = apply_fill(pos.quantity, pos.average_price, signed, trade.price)
         pos.last_price = float(trade.price or 0.0)

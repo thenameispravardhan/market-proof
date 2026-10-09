@@ -38,6 +38,8 @@ from app.execution.fyers_auth import (
     FyersAuthError,
     consume_state,
     exchange_code_for_token,
+    token_expires_at,
+    token_is_expired,
 )
 from app.logging_config import get_logger
 
@@ -96,9 +98,15 @@ async def fyers_callback(
     # Find the matching broker_accounts row.
     app_id = settings.FYERS_APP_ID
     redirect_uri = settings.FYERS_REDIRECT_URI
+    # Several rows can carry the same app_id (a stale paper copy, a
+    # re-created row): `scalar_one_or_none()` raised MultipleResultsFound
+    # AFTER the one-shot state was consumed, so the operator got a 500 and
+    # had to start over. Prefer the real (non-paper) Fyers row.
     account: Optional[BrokerAccount] = db.execute(
-        select(BrokerAccount).where(BrokerAccount.app_id == app_id)
-    ).scalar_one_or_none()
+        select(BrokerAccount)
+        .where(BrokerAccount.app_id == app_id)
+        .order_by(BrokerAccount.paper_mode.asc(), BrokerAccount.id.asc())
+    ).scalars().first()
     if account is None:
         # Fall back: prefer a REAL Fyers account (paper_mode=False)
         # whose app_id is set but mismatched (the common case is
@@ -395,7 +403,11 @@ def fyers_status(db: Session = Depends(get_db)) -> dict[str, Any]:
         ).scalars().first()
 
     account_present = account is not None
-    has_token = bool(account_present and account.access_token)  # type: ignore[union-attr]
+    token = account.access_token if account_present else None  # type: ignore[union-attr]
+    expires_at = token_expires_at(token)
+    token_expired = bool(token) and token_is_expired(token)
+    # An expired token is as good as none: Fyers answers 401 to everything.
+    has_token = bool(token) and not token_expired
     enabled = bool(account_present and account.enabled)  # type: ignore[union-attr]
 
     reason: Optional[str] = None
@@ -406,6 +418,11 @@ def fyers_status(db: Session = Depends(get_db)) -> dict[str, Any]:
         )
     elif not account_present:
         reason = "Click 'Connect Fyers' to run the OAuth flow."
+    elif token_expired:
+        reason = (
+            "Fyers session expired (Fyers tokens last one trading day). "
+            "Click 'Connect Fyers' to log in again."
+        )
     elif not has_token:
         reason = (
             "Fyers account is configured but the access token is missing. "
@@ -429,6 +446,8 @@ def fyers_status(db: Session = Depends(get_db)) -> dict[str, Any]:
         # counts as success.
         "authorized": credentials_set and account_present and has_token,
         "has_token": has_token,
+        "token_expired": token_expired,
+        "token_expires_at": expires_at,
         "enabled": enabled,
         "credentials_set": credentials_set,
         "account_present": account_present,

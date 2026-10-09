@@ -698,20 +698,36 @@ def _state_from_str(status: str) -> OrderState:
 _INDEX_LOT_SIZES: dict[str, int] = {
     "NIFTYNXT50": 25,
     "MIDCPNIFTY": 120,
-    "FINNIFTY": 65,
+    "FINNIFTY": 60,
     "BANKNIFTY": 30,
-    "NIFTY50": 75,
-    "NIFTY": 75,
+    "NIFTYBANK": 30,
+    "NIFTY50": 65,
+    "NIFTY": 65,
     "SENSEX": 20,
     "BANKEX": 30,
 }
 
 
 def _guess_lot_size(underlying_symbol: str) -> int:
+    """Lot size for an underlying's options: the scrip master's when it's
+    downloaded, else the current NSE/BSE index lots (`fno.INDEX_LOTS`).
+
+    The old substring match against a stale table broke the common case:
+    BANKNIFTY's Fyers symbol is `NSE:NIFTYBANK-INDEX`, which matched
+    "NIFTY" (75) instead of BANKNIFTY (30), so every BANKNIFTY option
+    ticket sent a quantity that wasn't a lot multiple. Stock options got 1."""
+    from app.algo import fno
+
+    try:
+        lot = fno.lot_size(fno.fno_name(underlying_symbol or ""))
+    except Exception:  # noqa: BLE001 — a lot guess must never break the chain
+        lot = 0
+    if lot and lot > 1:
+        return int(lot)
     s = (underlying_symbol or "").upper()
-    for key, lot in _INDEX_LOT_SIZES.items():
+    for key, fallback in _INDEX_LOT_SIZES.items():
         if key in s:
-            return lot
+            return fallback
     return 1
 
 
@@ -869,7 +885,8 @@ class FyersLiveBackend:
         fyers_product = {
             ProductType.INTRADAY: "INTRADAY",
             ProductType.DELIVERY: "CNC",
-            ProductType.NORMAL: "NRML",
+            # Fyers v3 has no "NRML" — F&O carry-forward is "MARGIN".
+            ProductType.NORMAL: "MARGIN",
             ProductType.MARGIN: "MARGIN",
             ProductType.CO: "CO",
             ProductType.BO: "BO",
@@ -927,8 +944,12 @@ class FyersLiveBackend:
                 side=side,
                 quantity=int(quantity),
                 order_type=order_type,
-                error=str(e),
-                raw={"status_code": e.status_code},
+                error=(
+                    "Fyers session expired or was revoked — the order was NOT "
+                    "placed. Reconnect Fyers from Accounts (tokens last one "
+                    "trading day), then place it again."
+                ),
+                raw={"status_code": e.status_code, "reason": "token_expired"},
             )
         except FyersBlockedError as e:
             # CDN-level block (Cloudflare, Akamai, etc.). Not
@@ -1042,6 +1063,13 @@ class FyersLiveBackend:
                 raw={"status_code": e.status_code},
             )
         order_id = str(data.get("id") or data.get("orderNumber") or "")
+        if not order_id and str(data.get("s") or "").lower() == "error":
+            # A 2xx carrying `s: error` and no order id is a refusal, not
+            # an order in flight — PENDING here left a ghost "placed" row
+            # and told the operator it went through.
+            message = str(data.get("message") or data.get("code") or "order refused")
+            log.error("fyers.place_order.refused", symbol=symbol, error=message)
+            return _reject(f"Fyers refused the order: {message}")
         if not order_id:
             # Fyers returned 2xx but no order id. Treat as PENDING —
             # the manager's poll loop will resolve it.
@@ -1157,10 +1185,17 @@ class FyersLiveBackend:
                 sym = str(entry.get("symbol") or "")
                 if not sym:
                     continue
-                qty = int(entry.get("netQty") or entry.get("qty") or 0)
+                # `netQty` is signed; `qty` is its absolute value, so only
+                # fall back to it when `netQty` is missing (never for 0).
+                net = entry.get("netQty")
+                qty = int(safe_float(net if net is not None else entry.get("qty")))
                 avg = safe_float(entry.get("avgPrice") or entry.get("buyAvg") or 0.0)
                 last = safe_float(entry.get("ltp") or entry.get("lastPrice"))
-                unrealized = safe_float(entry.get("unrealizedProfit"))
+                # Fyers spells it `unrealized_profit` (as market.py reads it);
+                # the camelCase key never existed, so live P&L was always None.
+                unrealized = safe_float(
+                    entry.get("unrealized_profit", entry.get("unrealizedProfit"))
+                )
                 out.append(
                     Position(
                         symbol=sym,
@@ -1178,10 +1213,12 @@ class FyersLiveBackend:
     async def convert_position(self, symbol: str, side: int, qty: int, from_product: str, to_product: str) -> None:
         """Convert an open position between products. Raises FyersAPIError on rejection."""
         fy = {"INTRADAY": "INTRADAY", "DELIVERY": "CNC", "MARGIN": "MARGIN"}
-        await self._client.convert_position({
+        # A 200 with `s: error` is a refusal too; without the check the API
+        # recorded a conversion Fyers never made.
+        _ensure_ok(await self._client.convert_position({
             "symbol": symbol, "positionSide": 1 if side > 0 else -1, "convertQty": int(qty),
             "convertFrom": fy[from_product], "convertTo": fy[to_product], "overnight": 0,
-        })
+        }), "convert position")
 
     async def broker_book(self) -> dict[str, Any]:
         """Raw orderBook + netPositions straight from Fyers — every order and
@@ -1335,7 +1372,12 @@ class FyersLiveBackend:
                 raw=data,
             )
         status = str(match.get("status") or "PENDING")
-        filled_qty = int(match.get("tradedQty") or 0)
+        # The v3 order book reports fills as `filledQty` (the REST book, the
+        # order socket and the reconciler all read that key). `tradedQty`
+        # doesn't exist there, so this always read 0 and a partly filled
+        # IOC that then cancelled looked like "nothing filled" — leaving a
+        # real position the bot never tracked.
+        filled_qty = int(safe_float(match.get("filledQty", match.get("tradedQty"))))
         avg_price = safe_float(match.get("tradedPrice"))
         return OrderStatus(
             broker_order_id=broker_order_id,

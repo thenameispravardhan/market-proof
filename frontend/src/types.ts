@@ -431,6 +431,8 @@ export interface PlaceOrderResponse {
   risk_message: string;
   risk_warning?: string | null;
   broker_order_id: string | null;
+  /** PENDING / FILLED / REJECTED …, or UNCONFIRMED when Fyers never
+   *  acknowledged the order (timeout) — it may still have been placed. */
   status: string;
   error: string | null;
   // Diagnostic marker from the Fyers backend (e.g. "ip_whitelist"
@@ -454,6 +456,8 @@ export interface PendingOrder {
   quantity: number;
   price: number;
   order_type: string;
+  /** INTRADAY / DELIVERY / MARGIN — absent from older backends. */
+  product?: string;
   status: string;
   created_at: string | null;
 }
