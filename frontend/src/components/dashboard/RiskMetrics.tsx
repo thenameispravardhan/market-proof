@@ -35,9 +35,9 @@ function Metric({
         flex: 1,
         minWidth: 120,
         padding: 10,
-        background: "var(--bg)",
+        background: "var(--bg-surface)",
         border: "1px solid var(--border)",
-        borderRadius: 6,
+        borderRadius: 0,
       }}
     >
       <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 0.4, color: "var(--text-dim)" }}>

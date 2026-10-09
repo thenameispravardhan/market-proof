@@ -56,9 +56,9 @@ export function PromptPreview({ eventType }: { eventType: string | null }) {
               style={{
                 whiteSpace: "pre-wrap",
                 wordBreak: "break-word",
-                background: "var(--bg)",
+                background: "var(--bg-input)",
                 border: "1px solid var(--border)",
-                borderRadius: 6,
+                borderRadius: 0,
                 padding: 8,
                 maxHeight: 240,
                 overflow: "auto",
