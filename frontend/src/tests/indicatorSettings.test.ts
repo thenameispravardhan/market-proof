@@ -4,6 +4,7 @@ import {
   INDICATOR_BY_TYPE,
   cloneInstances,
   defaultInputs,
+  instanceDefaults,
   newInstance,
   sanitizeInputs,
   sanitizeInstance,
@@ -86,6 +87,23 @@ describe("indicator settings: applying", () => {
     const inst = { ...newInstance("ema")!, vis: { minutes: { on: true, min: 30, max: 5 } } } as IndicatorInstance;
     expect(visibleOnInterval(inst, "15")).toBe(true);
     expect(visibleOnInterval(inst, "1")).toBe(false);
+  });
+
+  it("a visibility range that runs to the group's end includes longer minute charts", () => {
+    const inst = { ...newInstance("ema")!, vis: { minutes: { on: true, min: 15, max: 59 } } } as IndicatorInstance;
+    expect(visibleOnInterval(inst, "90")).toBe(true);
+    expect(visibleOnInterval(inst, "5")).toBe(false);
+    const capped = { ...inst, vis: { minutes: { on: true, min: 1, max: 30 } } } as IndicatorInstance;
+    expect(visibleOnInterval(capped, "45")).toBe(false);
+  });
+
+  it("save as default from a hidden, pinned copy keeps neither flag", () => {
+    const inst = { ...newInstance("ema")!, visible: false, scale: "left" as const, pane: "own" };
+    const d = instanceDefaults(inst) as Record<string, unknown>;
+    expect(d.visible).toBeUndefined();
+    expect(d.scale).toBeUndefined();
+    expect(d.pane).toBeUndefined();
+    expect(d.inputs).toEqual(inst.inputs);
   });
 
   it("templates keep merged panes attached after uids are renewed", () => {
