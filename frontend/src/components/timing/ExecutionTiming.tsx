@@ -94,7 +94,7 @@ export function ExecutionTiming() {
     ? [
         { label: "PDF fetch", v: pl.latency.pdf_fetch_ms.p50, color: "#6e7681" },
         { label: "PDF extract", v: pl.latency.pdf_extract_ms.p50, color: "#388bfd" },
-        { label: "LLM (DeepSeek)", v: pl.latency.llm_ms.p50, color: "#58a6ff" },
+        { label: "AI call", v: pl.latency.llm_ms.p50, color: "#58a6ff" },
       ]
     : [];
   const subMax = Math.max(1, ...sub.map((x) => x.v ?? 0));
@@ -105,14 +105,16 @@ export function ExecutionTiming() {
       <div className="widget" data-testid="execution-timing">
         <h3>
           Time per layer{" "}
-          <span className="mono" style={{ color: "var(--muted)" }}>
-            median end-to-end {ms(totalP50)}
-          </span>
+          {hasTrades && (
+            <span className="mono" style={{ color: "var(--muted)" }}>
+              median end-to-end {ms(totalP50)}
+            </span>
+          )}
         </h3>
         {!hasTrades ? (
           <p className="empty">
-            No filled trades yet — this fills in once orders execute (paper
-            trades count too, so Monday&apos;s paper session will populate it).
+            No filled trades yet. This fills in once orders execute (paper and
+            live trades both count).
           </p>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 8 }}>
@@ -167,14 +169,14 @@ export function ExecutionTiming() {
           </span>
         </h3>
         {data &&
-        Object.keys(data.detection_by_source ?? data.detection_by_exchange).length > 0 ? (
+        Object.keys(data.detection_by_source ?? data.detection_by_exchange ?? {}).length > 0 ? (
           (() => {
             // Prefer the per-source split (NSE-API vs NSE-RSS vs BSE-API);
             // fall back to per-exchange for pre-upgrade data.
             const entries = Object.entries(
               Object.keys(data.detection_by_source ?? {}).length > 0
                 ? data.detection_by_source
-                : data.detection_by_exchange,
+                : data.detection_by_exchange ?? {},
             );
             const raceMax = Math.max(1, ...entries.map(([, st]) => st.p50 ?? 0));
             const colors: Record<string, string> = {
@@ -213,7 +215,7 @@ export function ExecutionTiming() {
                   effectively detected at the FASTER exchange&apos;s speed — the
                   monitors race, first one in wins.
                 </p>
-                {Object.keys(data.monitor_ticks).length > 0 && (
+                {Object.keys(data.monitor_ticks ?? {}).length > 0 && (
                   <p className="field-hint" style={{ marginTop: 0 }}>
                     Bot&apos;s own share:{" "}
                     {Object.entries(data.monitor_ticks)
@@ -262,9 +264,9 @@ export function ExecutionTiming() {
               </div>
             ))}
             <p className="field-hint" style={{ marginTop: 0 }}>
-              The LLM call is almost always the dominant slice — if it creeps
-              up, DeepSeek is congested. The Deterministic Fast Track (Settings)
-              skips it for unambiguous headlines.
+              The AI call is almost always the biggest slice. If it creeps up,
+              the AI provider is congested. Settings → AI analysis → Fast track
+              skips the AI for unambiguous headlines.
             </p>
           </div>
         ) : (

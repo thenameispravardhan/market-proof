@@ -161,3 +161,37 @@ async def test_trade_entry_and_exit_both_notify(db_session, isolated_db):
 
     # The operator's filter says "trade"; both halves must still match.
     assert {k for k, _ in sent} == {"trade_entry", "trade_exit"}
+
+
+def test_editing_a_channel_keeps_its_masked_secret(client):
+    """GET masks the bot token as '***'. Sending the form back (rename,
+    toggle) must not save the mask over the real token."""
+    r = client.post("/api/notifications/channels", json={
+        "name": "tg-keep-secret", "kind": "telegram",
+        "config": {"bot_token": "real-token-123", "chat_id": "42"},
+    })
+    assert r.status_code == 201, r.text
+    cid = r.json()["id"]
+    assert r.json()["config"]["bot_token"] == "***"
+
+    for sent in ("***", ""):
+        r = client.put(f"/api/notifications/channels/{cid}", json={
+            "name": "tg-keep-secret", "enabled": False,
+            "config": {"bot_token": sent, "chat_id": "43"},
+        })
+        assert r.status_code == 200, r.text
+
+    from app.db.models import NotificationChannel
+    from app.db.session import SessionLocal
+    with SessionLocal() as db:
+        cfg = db.get(NotificationChannel, cid).config
+    assert cfg["bot_token"] == "real-token-123"
+    assert cfg["chat_id"] == "43"
+
+    # A genuinely new token still replaces it.
+    client.put(f"/api/notifications/channels/{cid}", json={
+        "config": {"bot_token": "new-token", "chat_id": "43"},
+    })
+    with SessionLocal() as db:
+        assert db.get(NotificationChannel, cid).config["bot_token"] == "new-token"
+    client.delete(f"/api/notifications/channels/{cid}")

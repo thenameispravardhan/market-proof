@@ -433,7 +433,11 @@ def export_settings(db: Session = Depends(get_db)) -> dict[str, Any]:
     return {
         "version": get_settings().APP_VERSION,
         "exported_at": datetime.now(timezone.utc).isoformat(),
-        "overrides": _read_overrides(db),
+        # TRADING_MODE has its own guarded control and never travels in a file.
+        "overrides": {
+            k: v for k, v in _read_overrides(db).items()
+            if not _REGISTRY[k]["read_only"]
+        },
     }
 
 
@@ -457,13 +461,22 @@ async def import_settings(
     this build understands. Every accepted value goes through the same
     validation as a normal PUT.
     """
-    known = {k: v for k, v in body.overrides.items() if k in _GLOBAL_KEYS}
+    # Keys with their own guarded control (TRADING_MODE) never travel in a
+    # file: importing an old export must not flip the bot into LIVE (or out
+    # of it) behind the typed confirmation on /api/settings/trading-mode.
+    known = {
+        k: v for k, v in body.overrides.items()
+        if k in _GLOBAL_KEYS and not _REGISTRY[k]["read_only"]
+    }
     ignored = sorted(set(body.overrides) - set(known))
 
     before = _read_overrides(db)
     cleared: list[str] = []
     if body.replace:
-        cleared = _clear_overrides(db, [k for k in before if k not in known])
+        cleared = _clear_overrides(db, [
+            k for k in before
+            if k not in known and not _REGISTRY[k]["read_only"]
+        ])
     after = _write_overrides(db, known)
 
     _audit(db, actor="ui", action="settings.import", target="global",
