@@ -8,6 +8,7 @@ import ChartPanel, { type ChartOrder, type ChartPosition } from "./ChartPanel";
 import { useQuote } from "../../hooks/useApi";
 import { useLiveQuote } from "../../hooks/useQuotes";
 import type { InstrumentHit, OptionChainResponse, OptionLeg, Position } from "../../types";
+import { isOptionOf, optionRoot } from "../../lib/options";
 
 type Helpers = {
   positionFor: (sym: string) => ChartPosition | null;
@@ -111,7 +112,7 @@ export default function Scalper({
   const peRow = atmIdx >= 0 ? at(atmIdx - peOff) : undefined;
   const ce = ceRow?.ce ?? null;
   const pe = peRow?.pe ?? null;
-  const name = base?.short_name ?? "";
+  const name = base ? optionRoot(base) : "";
   const legName = (row: typeof ceRow, t: "CE" | "PE") => (row ? `${name} ${row.strike} ${t}` : t);
 
   const trade = async (leg: OptionLeg | null, label: string, side: "BUY" | "SELL") => {
@@ -126,10 +127,12 @@ export default function Scalper({
     }
   };
 
-  // This underlying's open option positions (e.g. NSE:NIFTY…22400CE).
-  const prefix = base ? `${base.exchange}:${base.short_name}` : null;
+  // This underlying's open option positions (e.g. NSE:NIFTY…22400CE). Keyed
+  // on the option root: the index's own name (NIFTY50, NIFTYBANK) never
+  // prefixes its options, so "exit all" found nothing to close.
+  const root = base ? optionRoot(base) : null;
   const open = (positions ?? []).filter(
-    (p) => prefix && p.quantity !== 0 && p.symbol.startsWith(prefix) && /^\d/.test(p.symbol.slice(prefix.length)) && /\d(CE|PE)$/.test(p.symbol),
+    (p) => base && root && p.quantity !== 0 && isOptionOf(p.symbol, base.exchange, root),
   );
   const exitAll = async () => {
     if (open.length === 0) return setMsg("No open positions on this underlying.");
