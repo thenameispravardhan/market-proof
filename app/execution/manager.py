@@ -1496,28 +1496,43 @@ class Manager:
         # flips it to filled/rejected and updates the position. We do NOT
         # poll get_order_status here — the operator wants order data to come
         # exclusively from the Fyers webhook.
-        # Persist + audit (own small pool: never queued behind backtests / PDF jobs)
-        await asyncio.get_running_loop().run_in_executor(
-            TRADING_POOL,
-            self._persist_manual_trade_executed,
-            account.id,
-            manual_signal,
-            side_enum,
-            int(quantity),
-            float(limit_price or stop_price or 0.0),
-            type_enum,
-            product_enum,
-            result,
-            operator,
-            bypass_risk,
-            risk_codes,
-            risk_message,
-        )
-        # A Fyers update that beat this commit was parked — apply it now.
-        if result.broker_order_id:
-            from app.execution.order_reconcile import apply_parked
+        # Persist + audit (own small pool: never queued behind backtests / PDF jobs).
+        # The order is already at the broker by now: a local DB failure (e.g.
+        # SQLite busy) must not turn into a 500, or the operator retries and
+        # places the same real-money order a second time.
+        record_warning: Optional[str] = None
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                TRADING_POOL,
+                self._persist_manual_trade_executed,
+                account.id,
+                manual_signal,
+                side_enum,
+                int(quantity),
+                float(limit_price or stop_price or 0.0),
+                type_enum,
+                product_enum,
+                result,
+                operator,
+                bypass_risk,
+                risk_codes,
+                risk_message,
+            )
+            # A Fyers update that beat this commit was parked — apply it now.
+            if result.broker_order_id:
+                from app.execution.order_reconcile import apply_parked
 
-            await apply_parked(str(result.broker_order_id))
+                await apply_parked(str(result.broker_order_id))
+        except Exception:  # noqa: BLE001
+            log.exception(
+                "manual_order.persist_failed",
+                account_id=account.id, symbol=symbol,
+                broker_order_id=result.broker_order_id, state=result.state.value,
+            )
+            record_warning = (
+                "The order was sent to the broker, but saving it locally failed. "
+                "Check the Fyers order book; do not place it again."
+            )
         from app.execution.order_reconcile import spawn as _spawn
 
         _spawn(_advise())
@@ -1580,6 +1595,7 @@ class Manager:
             "stop_loss_used": stop_loss,
             "target_used": target,
             "entry_is_synthetic": entry_is_synthetic,
+            "warning": record_warning,
         }
 
     def _persist_manual_trade_executed(

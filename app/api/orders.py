@@ -53,6 +53,10 @@ router = APIRouter(prefix="/api/orders", tags=["orders"])
 # session — freezing the ticket price at a single (soon wrong) value.
 _BUS_QUOTE_MAX_AGE_S = 6.0
 
+# Manual orders currently being sent, keyed on every field that defines the
+# order (see `place_order`). Process-local: the app runs a single worker.
+_IN_FLIGHT: set[tuple[Any, ...]] = set()
+
 
 async def _fyers_quote(db: Session, sym: str) -> Optional[dict[str, Any]]:
     """Live quote via the connected real Fyers account — the sole price
@@ -230,9 +234,14 @@ async def place_order(
         account_id = int(body["account_id"])
         symbol = str(body["symbol"]).strip().upper()
         side = str(body["side"]).strip().upper()
-        quantity = int(body["quantity"])
     except (KeyError, TypeError, ValueError) as e:
         raise HTTPException(status_code=422, detail=f"missing or bad field: {e}")
+    # `int(10.5)` silently became 10 — a different order than the one asked for.
+    quantity = _opt_int_field(body, "quantity")
+    if quantity is None:
+        raise HTTPException(status_code=422, detail="missing or bad field: 'quantity'")
+    if side not in ("BUY", "SELL"):
+        raise HTTPException(status_code=422, detail=f"side must be BUY or SELL, got {side!r}")
 
     order_type = str(body.get("order_type") or "MARKET").strip().upper()
     # The docstring (and the Fyers / Zerodha vocabulary) says SL / SL-L for a
@@ -240,9 +249,13 @@ async def place_order(
     # "unknown order_type" after skipping the price checks below.
     order_type = _ORDER_TYPE_ALIASES.get(order_type, order_type)
     product_type = str(body.get("product_type", "INTRADAY")).upper()
-    limit_price = body.get("limit_price")
-    stop_price = body.get("stop_price")
-    bypass_risk = bool(body.get("bypass_risk", False))
+    # Prices are checked here (a string, 0 or a negative used to reach the
+    # broker call), and a price that doesn't apply to the order type is
+    # dropped rather than carried into the trade row.
+    limit_price = _opt_price_field(body, "limit_price") if order_type in ("LIMIT", "STOP_LOSS") else None
+    stop_price = _opt_price_field(body, "stop_price") if order_type in ("STOP_LOSS", "SL-M") else None
+    # `bool("false")` is True: only a real true counts as the override.
+    bypass_risk = body.get("bypass_risk") is True
     operator = str(body.get("operator", "ui_trade_page"))
 
     # The BOT trades INTRADAY only. A manual Trade-page order may also be
@@ -274,6 +287,17 @@ async def place_order(
 
     acc = _require_real_account(db, account_id)
 
+    # A double click (or a retry while the first request is still waiting on
+    # Fyers) sent the same real-money order twice. While an identical order
+    # is in flight, the second one is refused; once it returns, the operator
+    # can deliberately place the same order again.
+    key = (account_id, symbol, side, quantity, order_type, product_type, limit_price, stop_price)
+    if key in _IN_FLIGHT:
+        raise HTTPException(
+            status_code=409,
+            detail="An identical order is already being sent. Wait for its result before placing it again.",
+        )
+    _IN_FLIGHT.add(key)
     try:
         result = await _manager().place_manual_order(
             account=acc,
@@ -311,6 +335,8 @@ async def place_order(
         # No backend available — the operator hasn't done OAuth yet
         # or the account row is mis-configured.
         raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        _IN_FLIGHT.discard(key)
 
     # 200 with ok=false when risk blocks; the UI shows the reason
     # and the confirm-phrase field. 200 with ok=true on a clean
