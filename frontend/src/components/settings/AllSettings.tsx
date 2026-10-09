@@ -285,7 +285,7 @@ export function AllSettings() {
       <h3>All Settings</h3>
       <p className="empty">
         Every operator control in one place — {total} in total, grouped by what
-        they affect. The cards above are friendlier editors for the same values.
+        they affect.
       </p>
 
       {isLoading ? (

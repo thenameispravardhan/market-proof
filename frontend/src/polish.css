@@ -1,0 +1,112 @@
+/* =========================================================================
+   App-wide polish (everything outside the Trade page).
+   Loaded after App.css so these rules win ties without !important. Kept in
+   its own file so Trade-page work in App.css never conflicts with it.
+   ========================================================================= */
+
+/* Tokens components already reference but App.css never defined. Unset,
+   they fell back to hard-coded dark hex values (wrong in the light theme)
+   or to nothing at all (`.warn` text had no colour). */
+:root {
+  --bg: var(--bg-app);
+  --bg-hover: var(--bg-row);
+  --row-hover: var(--bg-row);
+  --surface-2: var(--bg-elev);
+  --muted: var(--text-faint);
+  --yellow: var(--amber);
+  --danger: var(--red);
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+/* ---- Panels ------------------------------------------------------------
+   Most panels put an <h3> straight inside .widget (no .widget-header), and
+   .widget has no padding, so titles and text sat on the border and a lone
+   <h3> stretched to fill the panel (Pipeline Latency's title floated in
+   the middle). Give those panels the same inset and header band that the
+   .widget-header panels (Rules, Strategies) already have. */
+.widget > h3 { flex: none; }
+.widget:not(:has(> .widget-header)) { padding: 0 12px 12px; }
+.widget:not(:has(> .widget-header)):not(:has(> h3:first-child)) { padding-top: 12px; }
+.widget:not(:has(> .widget-header)) > h3:first-child {
+  margin: 0 -12px 12px;
+  padding: 0 12px;
+  min-height: 34px;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+/* A collapsed panel is just its header: no empty strip under it. */
+.widget:has(> h3:only-child) { min-height: 0; padding-bottom: 0; }
+.widget > h3:only-child { margin-bottom: 0; border-bottom: none; }
+/* Algo Lab panels already space children with a flex gap. */
+.algo .widget > h3:first-child { margin-bottom: 0; }
+.widget > h3 .badge { margin-left: auto; }
+.widget > h3 select { width: auto; }
+/* An empty-state line under a header needs less top room than a bare one. */
+.widget > h3 + .empty { padding-top: 12px; }
+/* Lists inside a padded panel run edge to edge, like the header. */
+.widget:not(:has(> .widget-header)) > .list { margin: 0 -12px; }
+/* The browser's reset strips list indents; numbered steps lost their numbers. */
+.widget ol, .widget ul:not(.nav-list) { padding-left: 20px; }
+
+/* The resize grip was a solid grey square on every panel. Draw it as the
+   usual two diagonal hairlines instead. */
+.widget::-webkit-resizer {
+  background:
+    linear-gradient(135deg,
+      transparent 0 52%, var(--border-hi) 52% 60%,
+      transparent 60% 72%, var(--border-hi) 72% 80%, transparent 80%);
+}
+
+/* ---- Page header -------------------------------------------------------
+   Pages with buttons beside the title (Dashboard, Algo Lab, Dataset, Model,
+   Outcomes) drew the title's underline only under the title, so the
+   buttons hung off a broken line. The rule now spans the whole header. */
+.dashboard-head {
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding-bottom: 10px;
+  margin-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+}
+.dashboard-head .page-title { border-bottom: none; padding-bottom: 0; margin: 0; }
+
+/* Page intro paragraphs (Accounts, Prompts) read as body copy. */
+.page-title + p.text-dim { line-height: 1.6; }
+
+/* ---- Dashboard grid ----------------------------------------------------
+   auto-fill made three columns on a laptop screen, so Pipeline Latency and
+   Resources filled two of them and left an empty hole on the right. */
+.dashboard-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+@media (max-width: 1000px) { .dashboard-grid { grid-template-columns: 1fr; } }
+
+/* ---- Status bar --------------------------------------------------------
+   The Trade page's segmented-control `.seg` rule leaks into the status bar
+   (same class name) and painted each segment as a rounded grey pill. */
+.statusbar .seg { background: transparent; border-radius: 0; }
+.statusbar .ws-status { display: inline-flex; align-items: center; gap: 6px; }
+
+/* Workflow chips: square, like every other control in the terminal look. */
+.wf-chip { border-radius: 0; }
+
+/* ---- Two-column pages --------------------------------------------------
+   Pages whose columns hold several stacked panels (Settings) cannot use
+   .layout-2, whose 1px border-coloured gap turns into a grey slab behind
+   anything that is not a single panel. */
+.page-cols {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+.page-col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+@media (max-width: 900px) { .page-cols { grid-template-columns: 1fr; } }
+
+/* Settings: group toggles in All Settings. */
+button.settings-group-title { color: var(--text-dim); }
+button.settings-group-title:hover { color: var(--accent); background: none; }
+
+/* Notifications: the "enabled" checkbox sat on its own line from the label. */
+.field label:has(> input[type="checkbox"]) {
+  display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+}
