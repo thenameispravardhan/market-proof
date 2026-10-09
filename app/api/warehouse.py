@@ -77,12 +77,15 @@ def _con():
     than from the connection, which is why that screen rejects anything that is
     not a bare SELECT/WITH.
     """
-    from app.services.warehouse_store import connect as store_connect
+    from app.services import warehouse_store as store
 
-    if not STORE.exists():
+    # Read the path off the module, not the name imported at the top: a
+    # rebound STORE (the tests' throwaway warehouse) was invisible here, so
+    # every announcement endpoint answered 503 "not built".
+    if not store.STORE.exists():
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
                             "warehouse not built — POST /api/warehouse/rebuild")
-    return store_connect().cursor()
+    return store.connect().cursor()
 
 
 @router.get("/stats")
@@ -492,7 +495,9 @@ def announcement_export_path(fmt: str, columns: Optional[list[str]] = None,
                              event_type: Optional[str] = None,
                              since: Optional[str] = None,
                              until: Optional[str] = None,
-                             enriched_only: bool = False) -> Path:
+                             enriched_only: bool = False,
+                             split: Optional[str] = None,
+                             split_ratio: float = 0.8) -> Path:
     """Write the WHOLE dataset to a temp file and return its path.
 
     303,505 rows x 97 columns is roughly 150 MB of CSV. Building that as a
@@ -520,6 +525,21 @@ def announcement_export_path(fmt: str, columns: Optional[list[str]] = None,
         params.append(until)
     if enriched_only:
         where.append("price_status = 'filled'")
+    if split in ("train", "val"):
+        # Chronological, like the signal export: the oldest `split_ratio`
+        # trains, the newest remainder validates. The Train/Val buttons used to
+        # pass `split` here and have it ignored, so both downloaded the SAME
+        # full dataset. A quantile cut keeps the COPY unsorted (sorting 300k
+        # rows is what blew the memory cap below).
+        pre = f"WHERE {' AND '.join(where)}" if where else ""
+        cutoff = con.execute(
+            f"SELECT quantile_disc(announced_at, ?) FROM {TABLE} {pre}",
+            [split_ratio] + params).fetchone()[0]
+        if cutoff is None:
+            where.append("FALSE")
+        else:
+            where.append("announced_at < ?" if split == "train" else "announced_at >= ?")
+            params.append(cutoff)
     clause = f"WHERE {' AND '.join(where)}" if where else ""
 
     # Sweep exports older than an hour before writing a new one. The streaming
@@ -555,6 +575,57 @@ def announcement_export_path(fmt: str, columns: Optional[list[str]] = None,
         f"COPY (SELECT {', '.join(sel)} FROM {TABLE} {clause}) "
         f"TO '{tmp.as_posix()}' ({opts})", params)
     return tmp
+
+
+_NUMERIC_TYPES = ("TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT",
+                  "FLOAT", "DOUBLE", "REAL", "DECIMAL")
+
+
+def announcement_health(target: str) -> dict[str, Any]:
+    """Column health for the announcement grain, in the shape the page renders.
+
+    The page used to send this panel to the SIGNAL dataset, so it listed
+    columns that are not in the table above it and offered targets the
+    announcement data does not have. Aggregates run inside DuckDB in one pass,
+    so this covers every row rather than a sample.
+    """
+    con = _con()
+    specs = announcement_column_specs()
+    numeric = {c["key"] for c in specs
+               if str(c["type"]).upper().startswith(_NUMERIC_TYPES)}
+    if target not in numeric:
+        target = "adj_30m" if "adj_30m" in numeric else next(iter(sorted(numeric)), "")
+    parts = ["count(*)"]
+    for c in specs:
+        k = f'"{c["key"]}"'
+        parts.append(f"count({k})")
+        if c["key"] in numeric:
+            parts += [f"avg({k})", f"stddev_pop({k})",
+                      f'corr({k}, "{target}")' if target else "NULL",
+                      f'count(CASE WHEN "{target}" IS NOT NULL THEN {k} END)' if target else "0"]
+    vals = list(con.execute(f"SELECT {', '.join(parts)} FROM {TABLE}").fetchone())
+    n = vals.pop(0)
+    r4 = lambda v: round(float(v), 4) if v is not None else None  # noqa: E731
+    report = []
+    for c in specs:
+        non_null = vals.pop(0)
+        entry: dict[str, Any] = {
+            "key": c["key"], "role": c["role"], "category": c["category"],
+            "null_rate": round(1.0 - non_null / n, 4) if n else None,
+            "numeric": c["key"] in numeric,
+        }
+        if c["key"] in numeric:
+            mean, std, corr, corr_n = (vals.pop(0) for _ in range(4))
+            if c["key"] == target:
+                corr = 1.0
+            entry.update(mean=r4(mean), std=r4(std), corr_target=r4(corr), corr_n=corr_n)
+            entry["leak_warning"] = bool(
+                c["role"] == "feature" and c["key"] != target and corr is not None
+                and abs(corr) >= 0.9 and corr_n >= 30)
+        report.append(entry)
+    return {"target": target, "rows_sampled": n, "columns": report,
+            "targets": sorted(k for k in numeric
+                              if next(s for s in specs if s["key"] == k)["role"] == "target")}
 
 
 def announcement_stats() -> dict[str, Any]:
