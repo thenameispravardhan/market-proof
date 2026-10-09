@@ -5,7 +5,7 @@
 // named-layout manager (save / load / autosave).
 
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
-import type { InstrumentHit, PendingOrder, Position, ProductType } from "../../types";
+import type { InstrumentHit, ManagedPosition, PendingOrder, Position, ProductType } from "../../types";
 import { useQueryClient } from "@tanstack/react-query";
 import { peekQuote, useLiveQuote, useQuoteTick } from "../../hooks/useQuotes";
 import { announceOrderChange } from "../../hooks/useApi";
@@ -537,7 +537,7 @@ export function AccountManager({
   tab: BottomTab;
   onTab: (t: BottomTab | null) => void;
   positions: Position[] | undefined;
-  managed: { symbol: string; stop_loss: number | null; target: number | null }[] | undefined;
+  managed: Pick<ManagedPosition, "symbol" | "stop_loss" | "target" | "trail_active" | "breakeven_armed" | "exit_failures">[] | undefined;
   /** The bot's working orders (`/api/orders/pending`). */
   pendingOrders: PendingOrder[];
   onCancel: (brokerOrderId: string) => void;
@@ -640,7 +640,20 @@ export function AccountManager({
     { id: "realized", label: "Realized P&L", get: (p) => realizedBy(p.symbol), render: (p) => { const v = realizedBy(p.symbol); return <span className={v == null ? "" : v >= 0 ? "up" : "down"}>{money(v)}</span>; }, num: true },
     {
       id: "sl", label: "SL", get: (p) => managed?.find((x) => x.symbol === p.symbol)?.stop_loss ?? null,
-      render: (p) => { if (!p.quantity) return "—"; const m = managed?.find((x) => x.symbol === p.symbol); return <button type="button" className="am-link" onClick={() => askLevel(p.symbol, "SL", m?.stop_loss ?? null, m?.target ?? null)}>{m?.stop_loss != null ? fmt(m.stop_loss) : "+ SL"}</button>; },
+      render: (p) => {
+        if (!p.quantity) return "—";
+        const m = managed?.find((x) => x.symbol === p.symbol);
+        // Say when the bot (not the operator) moved the stop, and when its
+        // exit is failing at the broker, instead of changing it silently.
+        const tag = m?.trail_active ? "trailing" : m?.breakeven_armed ? "breakeven" : null;
+        return (
+          <>
+            <button type="button" className="am-link" onClick={() => askLevel(p.symbol, "SL", m?.stop_loss ?? null, m?.target ?? null)}>{m?.stop_loss != null ? fmt(m.stop_loss) : "+ SL"}</button>
+            {tag && <span className="text-dim" title={tag === "trailing" ? "The bot is trailing this stop behind the best price" : "The bot moved this stop to lock in profit"} data-testid={`sl-tag-${p.symbol}`}> · {tag}</span>}
+            {m?.exit_failures ? <span className="down" title="The broker refused or timed out the bot's exit order; it keeps retrying. Exit manually if this persists." data-testid={`exit-failing-${p.symbol}`}> · exit failing</span> : null}
+          </>
+        );
+      },
     },
     {
       id: "tp", label: "TP", get: (p) => managed?.find((x) => x.symbol === p.symbol)?.target ?? null,
