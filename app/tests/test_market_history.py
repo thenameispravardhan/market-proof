@@ -199,3 +199,27 @@ def test_funds_broker_failure(client: TestClient, monkeypatch) -> None:
     body = client.get("/api/market/funds").json()
     assert body["ok"] is False
     assert body["available"] is None
+
+
+def test_backend_treats_a_fyers_error_payload_as_a_failed_call() -> None:
+    """Fyers can answer 200 `{"s": "error"}` (rate limit, bad range). That
+    must come back as None (retry), not [] — an empty page reads as "no
+    older history" and ends the chart's scroll-back."""
+    import asyncio
+
+    from app.execution.fyers_live import FyersLiveBackend
+
+    class _Client:
+        def __init__(self, payload: dict) -> None:
+            self.payload = payload
+
+        async def get_history(self, symbol: str, **kw):  # noqa: ANN003
+            return self.payload
+
+    be = FyersLiveBackend.__new__(FyersLiveBackend)
+    be._client = _Client({"s": "error", "code": 429, "message": "request limit reached"})  # noqa: SLF001
+    assert asyncio.run(be.get_history_range("NSE:SBIN-EQ", resolution="5", from_ts=1, to_ts=2)) is None
+    be._client = _Client({"s": "no_data", "candles": []})  # noqa: SLF001
+    assert asyncio.run(be.get_history_range("NSE:SBIN-EQ", resolution="5", from_ts=1, to_ts=2)) == []
+    be._client = _Client({"s": "ok", "candles": CANDLES})  # noqa: SLF001
+    assert asyncio.run(be.get_history_range("NSE:SBIN-EQ", resolution="5", from_ts=1, to_ts=2)) == CANDLES

@@ -1503,6 +1503,11 @@ class FyersLiveBackend:
         except FyersAPIError as e:
             log.warning("fyers.history_range.failed", symbol=symbol, error=str(e))
             return None
+        # A 200 `{"s": "error"}` (rate limit, bad range) is a failed call,
+        # not an empty range: an empty page ends the chart's scroll-back.
+        if isinstance(data, dict) and str(data.get("s") or "").lower() == "error":
+            log.warning("fyers.history_range.failed", symbol=symbol, error=str(data.get("message") or data.get("code")))
+            return None
         candles = data.get("candles") or data.get("data") or []
         return candles if isinstance(candles, list) else []
 

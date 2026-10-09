@@ -197,31 +197,35 @@ function combine(into: Bar, b: Bar): void {
   if (b.oi !== undefined) into.oi = b.oi; // a level, not a flow: the bucket's last
 }
 
+/** Start of the intraday bucket holding chart time `t`: buckets of `len`
+ *  seconds counted from the session open (`sessionOpen`, IST minutes), or
+ *  from midnight for anything before the open. History aggregation and
+ *  live ticks both use it, so a bar keeps its time across a reload. */
+export function intradayBucket(t: number, len: number, sessionOpen: number = NSE_SESSION.open): number {
+  const day0 = Math.floor(t / DAY) * DAY;
+  const open = day0 + sessionOpen * 60;
+  const anchor = t >= open ? open : day0;
+  return anchor + Math.floor((t - anchor) / len) * len;
+}
+
 /**
- * Aggregate base candles into `key`. Intraday buckets anchor to each
- * day's first bar (the session open), day-and-longer ones to the
- * calendar. Each output bar takes the time of its first input bar.
+ * Aggregate base candles into `key`. Intraday buckets anchor to the
+ * session open (`sessionOpen`, IST minutes; NSE's 09:15 by default),
+ * day-and-longer ones to the calendar. Calendar bars take the time of
+ * their first input bar.
  */
-export function aggregate(bars: Bar[], key: string): Bar[] {
+export function aggregate(bars: Bar[], key: string, sessionOpen: number = NSE_SESSION.open): Bar[] {
   const iv = parseInterval(key);
   if (!iv || bars.length === 0) return bars.slice();
   const out: Bar[] = [];
   if (iv.unit === "S" || iv.unit === "m") {
     const len = iv.unit === "S" ? iv.n : iv.n * 60;
-    let day = -1;
-    let anchor = 0;
-    let bucket = -1;
+    let bucket = Number.NaN;
     for (const b of bars) {
-      const d = Math.floor(b.time / DAY);
-      if (d !== day) {
-        day = d;
-        anchor = b.time;
-        bucket = -1;
-      }
-      const k = Math.floor((b.time - anchor) / len);
+      const k = intradayBucket(b.time, len, sessionOpen);
       if (k !== bucket || out.length === 0) {
         bucket = k;
-        out.push({ time: anchor + k * len, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume, ...(b.oi !== undefined ? { oi: b.oi } : {}) });
+        out.push({ time: k, open: b.open, high: b.high, low: b.low, close: b.close, volume: b.volume, ...(b.oi !== undefined ? { oi: b.oi } : {}) });
       } else {
         combine(out[out.length - 1], b);
       }
@@ -324,16 +328,9 @@ export function liveBucket(
   const iv = parseInterval(key);
   if (!iv) return { kind: "same" };
   if (iv.unit === "S" || iv.unit === "m") {
-    const len = iv.unit === "S" ? iv.n : iv.n * 60;
-    if (Math.floor(t / DAY) !== Math.floor(last.time / DAY)) {
-      // A new session: anchor to the session open (09:15 on NSE) when past it.
-      const day0 = Math.floor(t / DAY) * DAY;
-      const open = day0 + sessionOpen * 60;
-      const anchor = t >= open ? open : day0;
-      return { kind: "new", time: anchor + Math.floor((t - anchor) / len) * len };
-    }
-    const n = Math.floor((t - last.time) / len);
-    return n === 0 ? { kind: "same" } : { kind: "new", time: last.time + n * len };
+    // Same grid as aggregate(): a bar opened live keeps its time on reload.
+    const time = intradayBucket(t, iv.unit === "S" ? iv.n : iv.n * 60, sessionOpen);
+    return time > last.time ? { kind: "new", time } : { kind: "same" };
   }
   if (iv.unit === "D" && iv.n === 1) {
     const n = Math.floor((t - last.time) / DAY);
