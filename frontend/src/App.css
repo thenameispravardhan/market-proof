@@ -2531,6 +2531,8 @@ kbd {
 .cmodal-tabs button:hover { background: var(--bg-elev); color: var(--text); }
 .cmodal-tabs button.on { background: var(--bg-elev); color: var(--text); box-shadow: inset 3px 0 var(--accent); }
 .cmodal-body { flex: 1; min-height: 0; overflow-y: auto; padding: 10px 14px; display: flex; flex-direction: column; gap: 4px; }
+/* rows keep their height and the body scrolls (they used to squash and overlap on short screens) */
+.cmodal-body > * { flex-shrink: 0; }
 .cmodal-foot { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--border); }
 .cbtn { padding: 5px 14px; background: var(--bg-elev); border: 1px solid var(--border-hi); border-radius: 4px; color: var(--text); font-size: 11.5px; font-weight: 600; cursor: pointer; }
 .cbtn:hover { border-color: var(--accent); }
@@ -2564,18 +2566,25 @@ kbd {
 .cpick-cell.on { outline: 2px solid var(--accent); outline-offset: 1px; }
 .cpick-custom { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
 .cpick-custom input[type="color"] { width: 32px; height: 22px; padding: 0; border: 0; background: none; }
-.cpick-reset { background: none; border: 0; color: var(--text-dim); font-size: 11px; cursor: pointer; text-decoration: underline; }
+.cpick-reset { padding: 0; background: none; border: 0; color: var(--text-dim); font-size: 11px; text-transform: none; letter-spacing: normal; cursor: pointer; text-decoration: underline; }
+.cpick-reset:hover { background: none; color: var(--text); }
 .cpick-op { display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: 11px; color: var(--text-dim); }
 .cpick-op input { width: 110px; }
 
 /* indicator picker */
-.ind-search { margin-bottom: 6px; }
+.ind-search { margin: 0; }
+/* the search box stays put while the list scrolls under it */
+.ind-search-bar { position: sticky; top: -10px; z-index: 2; margin: -10px -14px 0; padding: 10px 14px 6px; background: var(--bg-panel); }
 .ind-added { font-size: 11px; color: var(--green); padding: 2px 4px; }
 .ind-list { display: flex; flex-direction: column; gap: 1px; }
 .ind-row { display: flex; align-items: center; gap: 4px; padding: 2px 4px; border-radius: 4px; background: none; border: 0; text-align: left; color: var(--text); cursor: pointer; }
 div.ind-row { cursor: default; }
 .ind-row:hover { background: var(--bg-elev); }
 .ind-row.off { opacity: 0.5; }
+.ind-row.off .ind-name:disabled { opacity: 1; }
+.ind-star { flex-shrink: 0; width: 26px; height: 26px; padding: 0; background: none; border: 0; border-radius: 4px; color: var(--text-faint); font-size: 15px; line-height: 1; cursor: pointer; }
+.ind-star:hover { background: var(--bg-surface); color: #f5c518; }
+.ind-star.on { color: #f5c518; }
 .ind-name { flex: 1; background: none; border: 0; padding: 5px 4px; text-align: left; color: var(--text); font-size: 12px; cursor: pointer; }
 .ind-name:disabled { cursor: default; }
 .ind-new { margin-left: 6px; padding: 0 4px; border-radius: 3px; background: #2962ff; color: #fff; font-size: 9px; font-weight: 700; letter-spacing: 0.04em; vertical-align: 1px; }
@@ -2737,7 +2746,13 @@ div.ind-row { cursor: default; }
 /* legend rows are content-sized and interactive (hover shows their actions);
    the gaps between them still pass through to the chart */
 .chart-legend .lg-row { pointer-events: auto; }
-.cmodal[data-testid="ind-settings"] .cform-check { width: 150px; }
+.cmodal.ind-settings .cmodal-tabs { width: 130px; }
+.cmodal.ind-settings .cform-check { width: 180px; }
+.cmodal.ind-settings .cform-label { width: 180px; }
+.cmodal.ind-settings .cform-ctl { flex-wrap: nowrap; }
+.cmodal.ind-settings .cform-row.off .cform-ctl { opacity: 0.45; }
+.cmodal.ind-settings .cform-num:disabled { opacity: 0.6; }
+.ind-vis-hint { margin-bottom: 4px; }
 .chart-scale-modes { position: absolute; right: 26px; bottom: 2px; z-index: 7; display: flex; gap: 2px; opacity: 0; transition: opacity 0.12s; }
 .chart-container:hover .chart-scale-modes, .chart-scale-modes.sm-always { opacity: 1; }
 .chart-scale-modes button { width: 20px; height: 20px; padding: 0; border: 1px solid var(--border); border-radius: 3px; background: var(--bg-elev); color: var(--text-dim); font-size: 10px; font-weight: 700; cursor: pointer; }
