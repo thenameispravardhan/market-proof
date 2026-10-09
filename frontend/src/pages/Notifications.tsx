@@ -9,6 +9,11 @@ export default function Notifications() {
   return (
     <div>
       <h1 className="page-title">Notifications</h1>
+      <p className="text-dim" style={{ marginBottom: 16, maxWidth: 720 }}>
+        Get pinged on Telegram, Discord, email or a webhook when the bot finds a
+        signal, trades, or pauses itself. Add a channel, pick what it should
+        send, then press Test.
+      </p>
       <div className="layout-2">
         <ChannelList
           selectedId={selectedId}
@@ -17,7 +22,7 @@ export default function Notifications() {
         />
         <ChannelForm
           channelId={selectedId}
-          onSaved={() => setSelectedId(null)}
+          onSaved={(id) => setSelectedId(id)}
         />
       </div>
     </div>

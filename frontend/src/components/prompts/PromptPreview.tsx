@@ -24,12 +24,16 @@ export function PromptPreview({ eventType }: { eventType: string | null }) {
   return (
     <div className="widget" data-testid="prompt-preview">
       <h3>Preview</h3>
+      <p className="field-hint" style={{ marginBottom: 8 }}>
+        Shows the <strong>saved</strong> prompt with a filing URL filled in.
+        Nothing is sent to the AI. Save your edits first to preview them.
+      </p>
       {!eventType ? (
         <p className="empty">Select a prompt to preview.</p>
       ) : (
         <>
           <div className="field">
-            <label htmlFor="prev-url">PDF URL (fake)</label>
+            <label htmlFor="prev-url">Example filing URL</label>
             <input
               id="prev-url"
               type="text"

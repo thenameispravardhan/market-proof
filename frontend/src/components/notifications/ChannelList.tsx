@@ -4,6 +4,7 @@ import {
   useDeleteNotificationChannel,
   useTestNotificationChannel,
 } from "../../hooks/useApi";
+import { useState } from "react";
 import type { NotificationChannel } from "../../types";
 
 interface Props {
@@ -23,19 +24,28 @@ export function ChannelList({ selectedId, onSelect, onNew }: Props) {
   const { data: channels, isLoading } = useNotificationChannels();
   const deleteChannel = useDeleteNotificationChannel();
   const testChannel = useTestNotificationChannel();
+  // Result of the last Test / Delete, shown under that channel instead of a
+  // blocking alert().
+  const [result, setResult] = useState<{ id: number; ok: boolean; text: string } | null>(null);
 
   const handleDelete = async (c: NotificationChannel) => {
     if (!confirm(`Delete channel "${c.name}"?`)) return;
-    await deleteChannel.mutateAsync(c.id);
+    try {
+      await deleteChannel.mutateAsync(c.id);
+      if (selectedId === c.id) onNew();
+    } catch (err) {
+      setResult({ id: c.id, ok: false, text: `Delete failed: ${(err as Error).message}` });
+    }
   };
 
   const handleTest = async (e: React.MouseEvent, id: number) => {
     e.stopPropagation();
+    setResult(null);
     try {
       const r = await testChannel.mutateAsync(id);
-      alert(r.ok ? "✓ Test message sent!" : `✗ ${r.error}`);
+      setResult({ id, ok: r.ok, text: r.ok ? "Test message sent." : `Test failed: ${r.error}` });
     } catch (err) {
-      alert(`✗ ${(err as Error).message}`);
+      setResult({ id, ok: false, text: `Test failed: ${(err as Error).message}` });
     }
   };
 
@@ -63,15 +73,19 @@ export function ChannelList({ selectedId, onSelect, onNew }: Props) {
                 {!c.enabled && <span className="badge warn" style={{ marginLeft: 4 }}>disabled</span>}
               </div>
               <div className="body reason">
-                Events: {c.events_filter ?? "*"}
+                Sends: {!c.events_filter || c.events_filter.trim() === "*" ? "everything" : c.events_filter.split(",").join(", ")}
               </div>
+              {result?.id === c.id && (
+                <div className={`body reason ${result.ok ? "pnl-pos" : "pnl-neg"}`}>{result.text}</div>
+              )}
               <div className="body reason" style={{ display: "flex", gap: 8, marginTop: 6 }}>
                 <button
                   className="btn-sm"
                   onClick={(e) => handleTest(e, c.id)}
                   disabled={testChannel.isPending}
+                  title="Send a test message now"
                 >
-                  Test
+                  {testChannel.isPending && testChannel.variables === c.id ? "Sending…" : "Test"}
                 </button>
                 <button
                   className="btn-sm danger"

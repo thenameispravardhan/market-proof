@@ -79,6 +79,7 @@ function FieldRow({
       {field.widget === "toggle" ? (
         <Toggle
           on={Boolean(value)}
+          disabled={disabled}
           data-testid={`${id}-toggle`}
           onChange={(next) => !disabled && onChange(field.key, next)}
         />
@@ -162,6 +163,7 @@ export function AllSettings() {
   const handleChange = (key: string, value: unknown) => {
     setValues((prev) => ({ ...prev, [key]: value }));
     setSaved(false);
+    setNote(null);
   };
 
   // Only send what the operator actually changed. A blanket save would rewrite
@@ -181,6 +183,28 @@ export function AllSettings() {
   }, [schema, values]);
 
   const dirtyCount = Object.keys(dirty).length;
+
+  // Unsaved edits are easy to lose on a page this long: warn before the tab
+  // closes or reloads while any are pending.
+  useEffect(() => {
+    if (dirtyCount === 0) return;
+    const warn = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [dirtyCount]);
+
+  const discardChanges = () => {
+    if (!schema) return;
+    const next: Values = {};
+    for (const group of schema.groups) {
+      for (const f of group.fields) next[f.key] = f.value;
+    }
+    setValues(next);
+    setError(null);
+  };
 
   const groups = useMemo(() => {
     if (!schema) return [];
@@ -443,6 +467,17 @@ export function AllSettings() {
                 ? "No changes"
                 : `Save ${dirtyCount} change${dirtyCount === 1 ? "" : "s"}`}
           </button>
+          {dirtyCount > 0 && (
+            <button
+              type="button"
+              onClick={discardChanges}
+              disabled={update.isPending}
+              data-testid="discard-settings"
+              style={{ marginLeft: 8 }}
+            >
+              Discard
+            </button>
+          )}
         </>
       )}
     </div>
