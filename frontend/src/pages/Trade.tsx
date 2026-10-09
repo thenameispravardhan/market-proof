@@ -471,8 +471,16 @@ export default function Trade() {
   const [dockW, setDockW] = useState(() => Number(stored("trade:dockW", 340)) || 340);
   const [layout, setLayout] = useState<Layout>(() => stored<Layout>("trade:layout", "1"));
   const [cells, setCells] = useState<(InstrumentHit | null)[]>(() => stored("trade:cells", []));
-  const [activeCell, setActiveCell] = useState(0);
+  // The active cell is persisted with the cells: the last-open symbol belongs
+  // to it, so restoring it into cell 0 overwrote that cell's chart on reload.
+  const [activeCell, setActiveCellState] = useState(() => Math.max(0, Number(stored("trade:activeCell", 0)) || 0));
+  const setActiveCell = (i: number) => {
+    setActiveCellState(i);
+    try { tabLocal.setItem("trade:activeCell", JSON.stringify(i)); } catch { /* best-effort */ }
+  };
   const [layoutOpen, setLayoutOpen] = useState(false);
+  const layoutPopRef = useRef<HTMLDivElement | null>(null);
+  useOutside(layoutPopRef, layoutOpen, () => setLayoutOpen(false));
   const [tset, setTset] = useState<TradeSet>(() => ({ ...TRADE_SET_DEFAULT, ...stored<Partial<TradeSet>>("trade:settings", {}) }));
   const changeSetting = (k: keyof TradeSet, v: boolean) => {
     if (k === "instant" && v && !window.confirm("Turn on instant orders?\nEvery order from the chart, the '+' menu and the scalper (and its hotkeys) goes to the broker immediately — no confirm.")) return;
@@ -490,7 +498,16 @@ export default function Trade() {
   const [leftSlot, setLeftSlot] = useState<HTMLDivElement | null>(null);
   const [scalper, setScalper] = useState(() => stored("trade:scalper", false));
   useEffect(() => { try { tabLocal.setItem("trade:scalper", JSON.stringify(scalper)); } catch { /* best-effort */ } }, [scalper]);
-  const dockWidth = dock.includes("chain") ? Math.max(dockW, 400) : dockW;   // the chain's 5 columns need room
+  // Sizes dragged on a bigger monitor must not squeeze the chart away on a
+  // smaller one: the dock and bottom bar are capped to the current window.
+  const [win, setWin] = useState(() => ({ w: window.innerWidth, h: window.innerHeight }));
+  useEffect(() => {
+    const on = () => setWin({ w: window.innerWidth, h: window.innerHeight });
+    window.addEventListener("resize", on);
+    return () => window.removeEventListener("resize", on);
+  }, []);
+  const dockCap = Math.max(280, win.w - 660);   // leaves the chart + rail at least ~600px
+  const dockWidth = Math.min(dockCap, dock.includes("chain") ? Math.max(dockW, 400) : dockW);   // the chain's 5 columns need room
   // Panel heights the operator dragged (px); unset = sized by content. The
   // last panel always takes whatever room is left.
   const [sizes, setSizes] = useState<Partial<Record<DockId, number>>>(() => stored("trade:dockSizes", {}));
@@ -548,6 +565,7 @@ export default function Trade() {
     try { tabLocal.setItem("trade:sync", JSON.stringify(n)); } catch { /* best-effort */ }
   };
   const nCells = LAYOUTS.find((l) => l.id === layout)?.n ?? 1;
+  useEffect(() => { if (activeCell >= nCells) setActiveCell(0); }, [activeCell, nCells]);  // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     setCells((c) => {
       if (sync.symbol && selected) {
@@ -1277,8 +1295,8 @@ export default function Trade() {
         </div>
 
         {/* ---- bottom bar: click a tab to open it, click it again (or ▾) to close; drag the top edge to resize ---- */}
-        <div className={`tv-bottom${bottomOpen ? "" : " closed"}`} style={bottomOpen ? { height: bottomMax ? "70vh" : bottomH } : undefined}>
-          {bottomOpen && <div className="tv-resize" onPointerDown={(e) => { setBottomMax(false); drag(e, "y", bottomH, setBottomH, 120, window.innerHeight * 0.75, "trade:bottomH"); }} title="Drag to resize" />}
+        <div className={`tv-bottom${bottomOpen ? "" : " closed"}`} style={bottomOpen ? { height: bottomMax ? "70vh" : Math.min(bottomH, Math.max(120, win.h * 0.6)) } : undefined}>
+          {bottomOpen && <div className="tv-resize" onPointerDown={(e) => { setBottomMax(false); drag(e, "y", Math.min(bottomH, Math.max(120, win.h * 0.6)), setBottomH, 120, window.innerHeight * 0.6, "trade:bottomH"); }} title="Drag to resize" />}
           {!bottomOpen && (
             <div className="tabs trade-tabs" role="tablist">
               <button type="button" role="tab" aria-selected={false} className="tab am-trade-tab" onClick={() => openBottom("trade")} title="DOM — trade from the price ladder">Trade</button>
@@ -1326,7 +1344,7 @@ export default function Trade() {
       {/* ---- right dock: the panels opened from the icon bar, stacked; each scrolls inside itself ---- */}
       {dock.length > 0 && (
         <div className="tv-dock" style={{ width: dockWidth }}>
-          <div className="tv-dock-resize" onPointerDown={(e) => drag(e, "x", dockWidth, setDockW, 280, 760, "trade:dockW")} title="Drag to resize" />
+          <div className="tv-dock-resize" onPointerDown={(e) => drag(e, "x", dockWidth, setDockW, 280, Math.min(760, dockCap), "trade:dockW")} title="Drag to resize" />
           {dock.includes("watch") && (
             <section className="dock-panel" data-testid="dock-watch" style={panelStyle("watch")}>
               {dockGrip("watch")}
@@ -1997,7 +2015,7 @@ export default function Trade() {
           </button>
         ))}
         <div className="tv-rail-sep" />
-        <div className="tv-rail-pop-wrap">
+        <div className="tv-rail-pop-wrap" ref={layoutPopRef}>
           <button
             type="button"
             className={`tv-rail-btn${layoutOpen || (!scalper && layout !== "1") ? " on" : ""}`}
