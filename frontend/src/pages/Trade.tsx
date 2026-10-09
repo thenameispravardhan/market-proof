@@ -122,13 +122,88 @@ const LEVEL_MODE_LABEL: Record<LevelInputMode, string> = { price: "₹", pts: "p
 export function levelPrice(v: number, mode: LevelInputMode, ref: number | null | undefined, side: "BUY" | "SELL",
   kind: "sl" | "target", tick = 0.05): number | null {
   if (!(v > 0)) return null;
-  if (mode === "price") return v;
+  // A typed price goes to Fyers too (the SL / target orders), so it sits on
+  // the same tick grid as the entry.
+  if (mode === "price") return roundToTick(v, tick);
   if (ref == null || !(ref > 0)) return null;
   const dist = mode === "pts" ? v : (ref * v) / 100;
   const up = (side === "BUY") === (kind === "target");   // BUY target / SELL stop sit above the entry
   const raw = up ? ref + dist : ref - dist;
   const t = tick > 0 ? tick : 0.05;
   return raw > 0 ? Math.round(Math.round(raw / t) * t * 100) / 100 : null;
+}
+
+export interface TicketCheck {
+  side: "BUY" | "SELL";
+  orderType: OrderType;
+  quantity: number;
+  lotSize: number;
+  limit: number | null;     // tick-rounded, null when not set / not needed
+  stop: number | null;
+  ltp: number | null;
+  entry: number | null;     // the price the stop / target are measured from
+  sl: number | null;
+  tp: number | null;
+}
+
+/** Why the ticket can't be sent as it stands (null = it can). Each of these
+ *  is an order Fyers would reject, or one that would hit its own stop the
+ *  moment it filled. */
+export function ticketProblem(t: TicketCheck): string | null {
+  const needLimit = t.orderType === "LIMIT" || t.orderType === "STOP_LOSS";
+  const needStop = t.orderType === "STOP_LOSS" || t.orderType === "SL-M";
+  if (!(t.quantity > 0) || !Number.isInteger(t.quantity)) return "Enter a quantity of at least 1.";
+  if (t.lotSize > 1 && t.quantity % t.lotSize !== 0) return `Quantity must be a multiple of the lot size (${t.lotSize}).`;
+  if (needLimit && t.limit == null) return "Enter a limit price.";
+  if (needStop && t.stop == null) return "Enter a trigger (stop) price.";
+  // Stop-limit: a BUY triggers at the stop and buys up to the limit, so the
+  // limit can't be below the trigger (and the reverse for a SELL).
+  if (t.orderType === "STOP_LOSS" && t.limit != null && t.stop != null) {
+    if (t.side === "BUY" && t.limit < t.stop) return "For a stop-limit BUY the limit price must be at or above the trigger.";
+    if (t.side === "SELL" && t.limit > t.stop) return "For a stop-limit SELL the limit price must be at or below the trigger.";
+  }
+  if (t.entry != null && t.entry > 0) {
+    const long = t.side === "BUY";
+    if (t.sl != null && (long ? t.sl >= t.entry : t.sl <= t.entry))
+      return `Stop loss ${t.sl} is on the wrong side of the entry (${t.entry}) — for a ${t.side} it must be ${long ? "below" : "above"} it.`;
+    if (t.tp != null && (long ? t.tp <= t.entry : t.tp >= t.entry))
+      return `Target ${t.tp} is on the wrong side of the entry (${t.entry}) — for a ${t.side} it must be ${long ? "above" : "below"} it.`;
+  }
+  return null;
+}
+
+/** Non-blocking: a stop order whose trigger is already through the market
+ *  (Fyers refuses those, but the LTP here can lag, so it's a warning). */
+export function ticketWarning(t: TicketCheck): string | null {
+  if ((t.orderType === "STOP_LOSS" || t.orderType === "SL-M") && t.stop != null && t.ltp != null && t.ltp > 0) {
+    if (t.side === "BUY" && t.stop <= t.ltp) return `A BUY stop triggers above the market — ${t.stop} is at or below the LTP ${t.ltp}, so the broker will likely reject it.`;
+    if (t.side === "SELL" && t.stop >= t.ltp) return `A SELL stop triggers below the market — ${t.stop} is at or above the LTP ${t.ltp}, so the broker will likely reject it.`;
+  }
+  return null;
+}
+
+/** A whole-number input that can be cleared and retyped. Committing on every
+ *  keystroke snapped an empty box straight back to 1, so backspacing "1" and
+ *  typing "5" gave 15. Commits valid values as they're typed; an empty or bad
+ *  entry falls back to the last good value on blur. */
+function IntField({ value, onCommit, testid }: { value: number; onCommit: (n: number) => void; testid: string }) {
+  const [text, setText] = useState(String(value));
+  useEffect(() => { setText((t) => (Number(t) === value ? t : String(value))); }, [value]);
+  return (
+    <input
+      type="number"
+      min={1}
+      step={1}
+      value={text}
+      onChange={(e) => {
+        setText(e.target.value);
+        const n = Number(e.target.value);
+        if (e.target.value !== "" && Number.isInteger(n) && n >= 1) onCommit(n);
+      }}
+      onBlur={() => setText(String(value))}
+      data-testid={testid}
+    />
+  );
 }
 
 function LevelMode({ mode, onMode, testid }: { mode: LevelInputMode; onMode: (m: LevelInputMode) => void; testid: string }) {
@@ -695,7 +770,7 @@ export default function Trade() {
   const onPickPrice = (price: number) => {
     if (!dock.includes("trade")) toggleDock("trade");
     setOrderType("LIMIT");
-    setLimitPrice(price.toFixed(2));
+    setLimitPrice(String(roundToTick(price, selected?.tick_size ?? 0.05)));
   };
 
   const isOption =
@@ -707,14 +782,6 @@ export default function Trade() {
   // trigger price. MARKET needs neither.
   const requiresLimit = orderType === "LIMIT" || orderType === "STOP_LOSS";
   const requiresStop = orderType === "STOP_LOSS" || orderType === "SL-M";
-  const canSubmit = useMemo(() => {
-    if (!selected || !accountId) return false;
-    if (!(quantity > 0) || !Number.isInteger(quantity)) return false;
-    if (selected.lot_size > 1 && quantity % selected.lot_size !== 0) return false;
-    if (requiresLimit && !(Number(limitPrice) > 0)) return false;
-    if (requiresStop && !(Number(stopPrice) > 0)) return false;
-    return true;
-  }, [selected, accountId, quantity, requiresLimit, limitPrice, requiresStop, stopPrice]);
 
   const onSelect = (h: InstrumentHit, fromChain = false, keepChain = false) => {
     if (h.symbol !== selected?.symbol) {
@@ -742,7 +809,7 @@ export default function Trade() {
     try { tabLocal.setItem(LAST_KEY, JSON.stringify(h)); } catch { /* best-effort */ }
     // Intraday-only bot — F&O included. Every ticket is MIS/INTRADAY; the
     // backend rejects anything else, so there is nothing per-instrument to set.
-    setOrderType("MARKET");
+    setOrderType(loadUserPrefs().defaultOrderType);
   };
 
   const sp = splits[layout] ?? { x: layout === "3" ? 0.6 : 0.5, y: 0.5 };
@@ -896,30 +963,44 @@ export default function Trade() {
   };
   const [slPrice, setSlPrice] = useState("");
   const [tpPrice, setTpPrice] = useState("");
-  const estPrice = (requiresLimit && Number(limitPrice) > 0 ? Number(limitPrice) : null) ?? (side === "BUY" ? ask : bid) ?? ltp;
+  const tick = selected?.tick_size ?? 0.05;
+  const limitNum = requiresLimit && Number(limitPrice) > 0 ? roundToTick(Number(limitPrice), tick) : null;
+  const stopNum = requiresStop && Number(stopPrice) > 0 ? roundToTick(Number(stopPrice), tick) : null;
+  // The price the order should fill near: its limit, an SL-M's trigger, else
+  // the touch on the side being hit.
+  const estPrice = limitNum ?? stopNum ?? (side === "BUY" ? ask : bid) ?? ltp;
   const [slMode, setSlMode] = useState<LevelInputMode>(() => stored<LevelInputMode>("trade:slMode", "price"));
   const [tpMode, setTpMode] = useState<LevelInputMode>(() => stored<LevelInputMode>("trade:tpMode", "price"));
   useEffect(() => { try { tabLocal.setItem("trade:slMode", JSON.stringify(slMode)); tabLocal.setItem("trade:tpMode", JSON.stringify(tpMode)); } catch { /* best-effort */ } }, [slMode, tpMode]);
-  const tick = selected?.tick_size ?? 0.05;
   const slAbs = levelPrice(Number(slPrice), slMode, estPrice, side, "sl", tick);
   const tpAbs = levelPrice(Number(tpPrice), tpMode, estPrice, side, "target", tick);
+  const check: TicketCheck = {
+    side, orderType, quantity,
+    lotSize: selected && selected.lot_size > 1 ? selected.lot_size : 1,
+    limit: limitNum, stop: stopNum, ltp: ltp ?? null, entry: estPrice ?? null, sl: slAbs, tp: tpAbs,
+  };
+  const problem = !selected ? "Pick a symbol." : !accountId ? "Connect a live Fyers account to place orders." : ticketProblem(check);
+  const canSubmit = problem == null;
+  const ticketWarn = canSubmit ? ticketWarning(check) : null;
   const { data: funds } = useQuery<{ ok: boolean; available: number | null }>({
     queryKey: ["market-funds"],
     queryFn: () => fetch("/api/market/funds").then((r) => r.json()),
     refetchInterval: 30000,
   });
 
-  const onSubmit = async (opts?: { bypassRisk?: boolean }) => {
-    if (!selected || !accountId) return;
-    const body: PlaceOrderRequest = {
-      account_id: accountId,
-      symbol: selected.symbol,
+  const onSubmit = async (opts?: { bypassRisk?: boolean; resend?: PlaceOrderRequest }) => {
+    if (!opts?.resend && (!selected || !accountId || !canSubmit)) return;
+    // The risk override re-sends the order that was blocked, not whatever the
+    // ticket holds now (the side / qty / symbol may have been changed since).
+    const body: PlaceOrderRequest = opts?.resend ? { ...opts.resend, bypass_risk: true } : {
+      account_id: accountId!,
+      symbol: selected!.symbol,
       side,
       quantity: Number(quantity),
       order_type: orderType,
       // Fyers rejects a price off the instrument's tick grid.
-      limit_price: requiresLimit && limitPrice ? roundToTick(Number(limitPrice), tick) : null,
-      stop_price: requiresStop && stopPrice ? roundToTick(Number(stopPrice), tick) : null,
+      limit_price: limitNum,
+      stop_price: stopNum,
       product_type: product,
       stop_loss: slAbs,
       target: tpAbs,
@@ -941,7 +1022,8 @@ export default function Trade() {
       } else {
         setLastResult({
           type: "success",
-          message: `${r.status}  ${selected.symbol}  ${side} ${quantity}  @ ${r.broker_order_id ?? "—"}`,
+          // The order id is not a price — "@ 2406..." read as a fill price.
+          message: `${r.status}  ${body.symbol}  ${body.side} ${body.quantity}${r.broker_order_id ? `  · order ${r.broker_order_id}` : ""}`,
           // Risk is advisory for manual orders — surface it without blocking.
           warning: r.risk_warning ?? (r.risk_message ? r.risk_message : null),
           detail: body,
@@ -1363,27 +1445,17 @@ export default function Trade() {
                     /* F&O trades in whole lots: enter lots, the quantity follows. */
                     <label className="ticket-row">
                       <span>Lots</span>
-                      <input
-                        type="number"
-                        min={1}
-                        step={1}
+                      <IntField
                         value={Math.max(1, Math.round(quantity / selected.lot_size))}
-                        onChange={(e) => setQuantity(Math.max(1, Math.floor(Number(e.target.value || 1)) || 1) * selected.lot_size)}
-                        data-testid="ticket-lots"
+                        onCommit={(n) => setQuantity(n * selected.lot_size)}
+                        testid="ticket-lots"
                       />
                       <span className="hint" data-testid="ticket-qty">= {quantity} qty ({selected.lot_size}/lot)</span>
                     </label>
                   ) : (
                     <label className="ticket-row">
                       <span>Quantity</span>
-                      <input
-                        type="number"
-                        min={1}
-                        step={1}
-                        value={quantity}
-                        onChange={(e) => setQuantity(Math.max(1, Math.floor(Number(e.target.value || 1)) || 1))}
-                        data-testid="ticket-qty"
-                      />
+                      <IntField value={quantity} onCommit={setQuantity} testid="ticket-qty" />
                     </label>
                   )}
   
@@ -1416,7 +1488,7 @@ export default function Trade() {
                           <button
                             type="button"
                             className="px-quick-btn"
-                            onClick={() => setLimitPrice(bid.toFixed(2))}
+                            onClick={() => setLimitPrice(String(roundToTick(bid, tick)))}
                             title={`bid ${fmtMoney(bid)}`}
                             data-testid="limit-fill-bid"
                           >
@@ -1427,7 +1499,7 @@ export default function Trade() {
                           <button
                             type="button"
                             className="px-quick-btn"
-                            onClick={() => setLimitPrice(ltp.toFixed(2))}
+                            onClick={() => setLimitPrice(String(roundToTick(ltp, tick)))}
                             title={`LTP ${fmtMoney(ltp)}`}
                             data-testid="limit-fill-ltp"
                           >
@@ -1438,7 +1510,7 @@ export default function Trade() {
                           <button
                             type="button"
                             className="px-quick-btn"
-                            onClick={() => setLimitPrice(ask.toFixed(2))}
+                            onClick={() => setLimitPrice(String(roundToTick(ask, tick)))}
                             title={`ask ${fmtMoney(ask)}`}
                             data-testid="limit-fill-ask"
                           >
@@ -1464,7 +1536,7 @@ export default function Trade() {
                           <button
                             type="button"
                             className="px-quick-btn"
-                            onClick={() => setStopPrice(ltp.toFixed(2))}
+                            onClick={() => setStopPrice(String(roundToTick(ltp, tick)))}
                             title={`LTP ${fmtMoney(ltp)}`}
                             data-testid="stop-fill-ltp"
                           >
@@ -1493,13 +1565,13 @@ export default function Trade() {
 
                   <label className="ticket-row">
                     <span>Stop loss</span>
-                    <input type="number" step="0.05" min={0} placeholder="optional" value={slPrice} onChange={(e) => setSlPrice(e.target.value)} data-testid="ticket-sl" />
+                    <input type="number" step={tick} min={0} placeholder="optional" value={slPrice} onChange={(e) => setSlPrice(e.target.value)} data-testid="ticket-sl" />
                     <LevelMode mode={slMode} onMode={setSlMode} testid="ticket-sl-mode" />
                     {slMode !== "price" && slAbs != null && <span className="hint" data-testid="ticket-sl-abs">→ {fmtMoney(slAbs)}</span>}
                   </label>
                   <label className="ticket-row">
                     <span>Target</span>
-                    <input type="number" step="0.05" min={0} placeholder="optional" value={tpPrice} onChange={(e) => setTpPrice(e.target.value)} data-testid="ticket-tp" />
+                    <input type="number" step={tick} min={0} placeholder="optional" value={tpPrice} onChange={(e) => setTpPrice(e.target.value)} data-testid="ticket-tp" />
                     <LevelMode mode={tpMode} onMode={setTpMode} testid="ticket-tp-mode" />
                     {tpMode !== "price" && tpAbs != null && <span className="hint" data-testid="ticket-tp-abs">→ {fmtMoney(tpAbs)}</span>}
                   </label>
@@ -1520,6 +1592,9 @@ export default function Trade() {
                       {placeOrder.isPending ? "placing…" : `PLACE ${side}`}
                     </button>
                   </div>
+                  {/* Say why PLACE is greyed out instead of leaving a dead button. */}
+                  {problem && selected && <div className="hint ticket-problem" data-testid="ticket-problem">{problem}</div>}
+                  {ticketWarn && <div className="result-warning" data-testid="ticket-warning">⚠ {ticketWarn}</div>}
   
                   {lastResult && lastResult.type === "success" && (
                     <div className="result success" data-testid="ticket-result-success">
@@ -1554,7 +1629,7 @@ export default function Trade() {
                           </div>
                           <button
                             className="btn-sm sell"
-                            onClick={() => onSubmit({ bypassRisk: true })}
+                            onClick={() => lastResult.detail && onSubmit({ resend: lastResult.detail })}
                             disabled={placeOrder.isPending}
                             data-testid="ticket-risk-override-btn"
                           >
