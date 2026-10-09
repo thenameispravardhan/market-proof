@@ -459,6 +459,9 @@ export interface PlaceOrderResponse {
   stop_loss_used?: number;
   target_used?: number;
   entry_is_synthetic?: boolean;
+  /** Set when the broker took the order but saving it locally failed: the
+   *  order is live, so the operator must not place it again. */
+  warning?: string | null;
 }
 
 export interface PendingOrder {

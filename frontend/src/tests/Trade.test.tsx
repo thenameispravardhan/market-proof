@@ -350,7 +350,9 @@ describe("Trade page", () => {
     // Success result should appear.
     const success = await screen.findByTestId("ticket-result-success");
     expect(success.textContent).toMatch(/PENDING/);
-    expect(success.textContent).toMatch(/NSE:RELIANCE-EQ/);
+    // Readable: side, size, name and type, not the raw broker symbol.
+    expect(success.textContent).toMatch(/BUY 1 RELIANCE · Market/);
+    expect(success.textContent).not.toMatch(/NSE:RELIANCE-EQ/);
   });
 
   it("ticket: product choice + default, optional SL / target ride with the order", async () => {
@@ -375,6 +377,24 @@ describe("Trade page", () => {
     await user.click(screen.getByTestId("ticket-submit"));
     await waitFor(() => expect(posts).toHaveLength(1));
     expect(posts[0]).toMatchObject({ product_type: "DELIVERY", stop_loss: 95, target: null });
+    // The result says the stop loss is set on fill, and the box empties so
+    // the next order (an exit, say) doesn't silently carry it.
+    expect((await screen.findByTestId("ticket-result-success")).textContent).toMatch(/SL 95 set once it fills/);
+    expect((screen.getByTestId("ticket-sl") as HTMLInputElement).value).toBe("");
+  });
+
+  it("ticket: the PLACE button says what it will send, and the order types read as words", async () => {
+    globalThis.fetch = makeFetchStub(defaultStubs());
+    const user = userEvent.setup();
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await user.type(await screen.findByTestId("trade-search"), "RELI");
+    await user.click(await screen.findByTestId("search-row-NSE:RELIANCE-EQ"));
+    await waitFor(() => expect(screen.getByTestId("ticket-submit")).not.toBeDisabled());
+    expect(screen.getByTestId("ticket-submit").textContent).toBe("BUY 1 RELIANCE");
+    await user.click(screen.getByTestId("ticket-side-sell"));
+    expect(screen.getByTestId("ticket-submit").textContent).toBe("SELL 1 RELIANCE");
+    const labels = Array.from((screen.getByTestId("ticket-type") as HTMLSelectElement).options).map((o) => o.text);
+    expect(labels).toEqual(["Market", "Limit", "Stop-limit (SL)", "Stop-market (SL-M)"]);
   });
 
   it("places a LIMIT buy from the chart's right-click menu only after the confirm", async () => {
@@ -1372,6 +1392,23 @@ describe("Trade page", () => {
     const err = await screen.findByTestId("ticket-result-error");
     expect(err.textContent).toMatch(/before placing it again/);
     expect(screen.queryByTestId("ticket-result-success")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["saved-locally failure", 200, { ok: true, blocked: false, risk_codes: [], risk_message: "", broker_order_id: "FY-9", status: "PENDING", error: null,
+      warning: "The order was sent to the broker, but saving it locally failed. Check the Fyers order book; do not place it again." }, "ticket-record-warning", /do not place it again/],
+    ["duplicate in flight", 409, { detail: "An identical order is already being sent. Wait for its result before placing it again." }, "ticket-result-error", /already being sent/],
+    ["rate limit", 200, { ok: false, blocked: false, risk_codes: [], risk_message: "", broker_order_id: null, status: "REJECTED",
+      error: "Fyers rate-limited the request and did not place the order. Wait a few seconds and place it again." }, "ticket-result-error", /did not place the order/],
+  ])("ticket: shows the %s outcome plainly", async (_n, placeStatus, placeResponse, testid, text) => {
+    globalThis.fetch = makeFetchStub(defaultStubs({ placeResponse, placeStatus }));
+    const user = userEvent.setup();
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await user.type(await screen.findByTestId("trade-search"), "RELI");
+    await user.click(await screen.findByTestId("search-row-NSE:RELIANCE-EQ"));
+    await waitFor(() => expect(screen.getByTestId("ticket-submit")).not.toBeDisabled());
+    await user.click(screen.getByTestId("ticket-submit"));
+    expect((await screen.findByTestId(testid)).textContent).toMatch(text);
   });
 
   it("ticket: the quantity box can be cleared and retyped", async () => {
