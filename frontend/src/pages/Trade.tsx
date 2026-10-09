@@ -46,6 +46,8 @@ import { AccountManager, BOTTOM_TABS, LayoutMenu, SymbolDetails, WatchlistTable,
 import { BookPanel, FnoPanel, type DeskTab } from "../components/trade/ProPanels";
 import { loadUserPrefs, UserSettingsDialog, type UserPrefs } from "../components/trade/UserSettings";
 import type { SyncFlags } from "../components/trade/chartSync";
+import { useOutside } from "../components/trade/chartUi";
+import { expiryIso, optionRoot } from "../lib/options";
 import type {
   BrokerAccount,
   InstrumentHit,
@@ -562,6 +564,9 @@ export default function Trade() {
     });
   }, [selected, activeCell, sync.symbol, nCells]);
   const [showResults, setShowResults] = useState(false);
+  // Clicking anywhere outside the search box closes its results.
+  const searchRef = useRef<HTMLDivElement | null>(null);
+  useOutside(searchRef, showResults, () => setShowResults(false));
   // Keyboard cursor into the search results (-1 = nothing highlighted).
   const [highlightIdx, setHighlightIdx] = useState(-1);
   const [wl, setWlState] = useState<WatchState>(loadWatchState);
@@ -671,6 +676,14 @@ export default function Trade() {
     selectedExpiry,
     userPrefs.chainStrikes,
   );
+  // An expiry the chain no longer lists (it lapsed, or the chain switched
+  // between live epochs and static dates) drops back to the nearest one,
+  // instead of a select showing one expiry while every poll asks for another.
+  useEffect(() => {
+    if (selectedExpiry && chain && chain.expiries.length > 0 && !chain.expiries.some((e) => e.ts === selectedExpiry)) {
+      setSelectedExpiry(null);
+    }
+  }, [chain, selectedExpiry]);
   const { data: pending } = usePendingOrders(accountId);
   const { data: positions } = usePositions();
 
@@ -907,18 +920,23 @@ export default function Trade() {
   const optionHit = (row: { strike: number; ce: OptionLeg | null; pe: OptionLeg | null }, type: "CE" | "PE"): InstrumentHit | null => {
     const leg = type === "CE" ? row.ce : row.pe;
     if (!leg || !chainBase) return null;
+    // Name the option by its F&O root (NIFTY, not the index's NIFTY50) and
+    // carry the chain's expiry, so two expiries of one strike tell apart.
+    const root = optionRoot(chainBase);
+    const exp = chain?.expiries.find((e) => e.ts === chain.selected_expiry)?.label ?? null;
+    const name = `${root} ${row.strike} ${type}`;
     return {
       symbol: leg.symbol,
-      short_name: `${chainBase.short_name} ${row.strike} ${type}`,
+      short_name: name,
       exchange: leg.symbol.includes(":") ? leg.symbol.split(":")[0] : chainBase.exchange,
       segment: "FO",
       instrument_type: type,
       lot_size: leg.lot_size ?? 0,
       tick_size: leg.tick_size,
-      expiry: null,
+      expiry: expiryIso(exp),
       strike: row.strike,
-      underlying: chainBase.short_name,
-      display: `${chainBase.short_name} ${row.strike} ${type}`,
+      underlying: root,
+      display: exp ? `${name}  ·  ${exp}` : name,
     };
   };
   const onSelectOption = (
@@ -1314,7 +1332,7 @@ export default function Trade() {
               {dockGrip("watch")}
               {dockHead("watch")}
               <div className="dock-body">
-                <div className="trade-search">
+                <div className="trade-search" ref={searchRef}>
                 <div className="trade-search-bar">
                   <input
                     type="text"
