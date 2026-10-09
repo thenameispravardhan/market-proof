@@ -10,6 +10,7 @@ the UI which path produced it.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Query
@@ -85,7 +86,25 @@ def _resolve_symbol(underlying: str, symbol: Optional[str]) -> Optional[str]:
         return _UNDERLYING_TO_SYMBOL[u]
     if u.endswith("-INDEX") or ":" in u:
         return u
+    # A stock (or an index the master knows) by its short name: Fyers'
+    # chain takes the cash symbol, e.g. RELIANCE -> NSE:RELIANCE-EQ.
+    for inst in get_master().search(u, limit=10):
+        if inst.short_name == u and inst.instrument_type in ("EQ", "IND"):
+            return inst.symbol
     return None
+
+
+def _is_epoch(expiry: Optional[str]) -> bool:
+    return bool(expiry) and expiry.strip().isdigit()  # type: ignore[union-attr]
+
+
+def _master_expiry(expiry: Optional[str]) -> Optional[str]:
+    """The master keys expiries by `YYYY-MM-DD`; the live chain by epoch.
+    Translate a live epoch so a fallback keeps the expiry the user picked."""
+    if not _is_epoch(expiry):
+        return expiry
+    ist = timezone(timedelta(hours=5, minutes=30))
+    return datetime.fromtimestamp(int(expiry), ist).strftime("%Y-%m-%d")  # type: ignore[arg-type]
 
 
 def _leg_from_master(leg: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -107,7 +126,7 @@ def _leg_from_master(leg: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
 def _master_chain(underlying: str, expiry: Optional[str], reason: str) -> dict[str, Any]:
     """Static fallback from the instrument master — no live prices. Shaped
     identically to the live response so the UI doesn't branch."""
-    chain = get_master().option_chain(underlying, expiry=expiry)
+    chain = get_master().option_chain(underlying, expiry=_master_expiry(expiry))
     strikes = [
         {
             "strike": s["strike"],
@@ -159,8 +178,11 @@ async def options_chain(
         return _master_chain(underlying, expiry, "Fyers backend unavailable.")
 
     try:
+        # Only an epoch is a Fyers expiry. A `YYYY-MM-DD` left over from a
+        # master fallback made Fyers reject every poll, so the chain stayed
+        # static after the account reconnected.
         chain = await backend.get_option_chain(
-            idx_symbol, strikecount=strikecount, timestamp=expiry or ""
+            idx_symbol, strikecount=strikecount, timestamp=expiry if _is_epoch(expiry) else ""
         )
     except FyersAuthError as e:
         # Daily token expiry is the common case — give an actionable hint.
@@ -179,7 +201,8 @@ async def options_chain(
         return _master_chain(underlying, expiry, "Option chain fetch failed; showing static list.")
 
     expiries = chain.get("expiries", [])
-    selected = expiry or (expiries[0]["ts"] if expiries else None)
+    listed = [e["ts"] for e in expiries]
+    selected = expiry if expiry in listed else (listed[0] if listed else None)
     chain.update(
         {
             "ok": True,

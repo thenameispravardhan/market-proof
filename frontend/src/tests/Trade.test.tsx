@@ -1224,4 +1224,48 @@ describe("Trade page", () => {
     expect(err.textContent).toMatch(/before placing it again/);
     expect(screen.queryByTestId("ticket-result-success")).not.toBeInTheDocument();
   });
+
+  it("search: clicking outside the search box closes its results", async () => {
+    globalThis.fetch = makeFetchStub(defaultStubs());
+    const user = userEvent.setup();
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await user.type(await screen.findByTestId("trade-search"), "RELI");
+    await screen.findByTestId("search-row-NSE:RELIANCE-EQ");
+    fireEvent.mouseDown(document.body);
+    await waitFor(() => expect(screen.queryByTestId("trade-search-results")).not.toBeInTheDocument());
+  });
+
+  it("chain: an option picked off the chain carries its expiry; a lapsed expiry falls back to the nearest", async () => {
+    const leg = { symbol: "NSE:RELIANCE26OCT2500CE", ltp: 42, bid: 41.9, ask: 42.1, oi: 1000, volume: 10, ltpch: 0, lot_size: 500, tick_size: 0.05 };
+    const expiries = [{ label: "27-10-2026", ts: "1793097000" }, { label: "24-11-2026", ts: "1795516200" }];
+    const asked: string[] = [];
+    const stubs = defaultStubs();
+    globalThis.fetch = makeFetchStub((url, init) => {
+      if (!url.includes("/api/options/chain")) return stubs(url, init);
+      const exp = new URL(url, "http://x").searchParams.get("expiry");
+      asked.push(exp ?? "");
+      // The second expiry lapses: the chain stops listing it and has no strikes for it.
+      const lapsed = exp === "1795516200";
+      const listed = lapsed ? expiries.slice(0, 1) : expiries;
+      return makeJsonResponse({ ok: true, underlying: "RELIANCE", symbol: "NSE:RELIANCE-EQ", spot: 2450, expiries: listed,
+        selected_expiry: listed[0].ts, source: "fyers", reason: null, strikes: lapsed ? [] : [{ strike: 2500, ce: leg, pe: null }] });
+    });
+    const user = userEvent.setup();
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await user.type(await screen.findByTestId("trade-search"), "RELI");
+    await user.click(await screen.findByTestId("search-row-NSE:RELIANCE-EQ"));
+    if (!screen.queryByTestId("dock-chain")) await user.click(screen.getByTestId("rail-chain"));
+    await user.click(await screen.findByTestId("chain-ce-2500"));
+    await waitFor(() => expect(JSON.parse(localStorage.getItem("trade:last") ?? "null")?.symbol).toBe(leg.symbol));
+    const picked = JSON.parse(localStorage.getItem("trade:last") ?? "null");
+    expect(picked.expiry).toBe("2026-10-27");
+    expect(picked.underlying).toBe("RELIANCE");
+    expect(picked.display).toContain("27-10-2026");
+
+    await user.selectOptions(screen.getByTestId("chain-expiry"), "1795516200");
+    await waitFor(() => expect(asked).toContain("1795516200"));
+    // Back on the nearest expiry's ladder rather than stuck on the lapsed one.
+    expect(await screen.findByTestId("chain-ce-2500")).toBeInTheDocument();
+    expect((screen.getByTestId("chain-expiry") as HTMLSelectElement).value).toBe("1793097000");
+  });
 });

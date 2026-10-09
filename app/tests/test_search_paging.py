@@ -38,7 +38,10 @@ _ROWS = [
 
 NFO = {"NSE:NIFTY26OCTFUT", "NSE:NIFTY26OCT25000CE", "NSE:NIFTY26OCT25000PE"}
 ETFS = {"NSE:NIFTYBEES-EQ", "NSE:SETFNIF50-EQ"}
-INDICES = {"NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX", "BSE:SENSEX-INDEX", "NSE:FINNIFTY-INDEX"}
+INDICES = {
+    "NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX", "BSE:SENSEX-INDEX", "NSE:FINNIFTY-INDEX",
+    "NSE:MIDCPNIFTY-INDEX", "NSE:NIFTYNXT50-INDEX", "BSE:BANKEX-INDEX",
+}
 
 
 @pytest.fixture()
@@ -103,10 +106,11 @@ def test_query_paging_matches_one_big_call_across_rank_tiers(api: TestClient) ->
     """"NIFTY" spans the exact, prefix and substring tiers; one-hit pages
     must reassemble into exactly the single-call ranking."""
     whole = [h["symbol"] for h in _page(api, q="NIFTY", limit=100)["hits"]]
-    # exact: NIFTY index + FUT/CE/PE; prefix: NIFTYBANK, NIFTYBEES; substring: FINNIFTY
+    # exact: NIFTY index + FUT/CE/PE; prefix: NIFTYBANK, NIFTYNXT50,
+    # NIFTYBEES; substring: FINNIFTY, MIDCPNIFTY
     assert whole[0] == "NSE:NIFTY50-INDEX" and set(whole[1:4]) == NFO
-    assert set(whole[4:6]) == {"NSE:NIFTYBANK-INDEX", "NSE:NIFTYBEES-EQ"}
-    assert whole[6:] == ["NSE:FINNIFTY-INDEX"]
+    assert set(whole[4:7]) == {"NSE:NIFTYBANK-INDEX", "NSE:NIFTYNXT50-INDEX", "NSE:NIFTYBEES-EQ"}
+    assert set(whole[7:]) == {"NSE:FINNIFTY-INDEX", "NSE:MIDCPNIFTY-INDEX"}
     paged: list[str] = []
     for offset in range(len(whole)):
         body = _page(api, q="NIFTY", limit=1, offset=offset)
@@ -131,7 +135,7 @@ def test_offset_must_not_be_negative(api: TestClient) -> None:
         ("CDS", {"NSE:USDINR26OCTFUT"}),
         ("BCD", {"BSE:USDINR26OCTFUT"}),
         ("MCX", {"MCX:CRUDEOIL26OCTFUT"}),
-        ("BSE", {"BSE:RELIANCE-A", "BSE:SENSEX-INDEX"}),  # cash + index, no F&O / currency
+        ("BSE", {"BSE:RELIANCE-A", "BSE:SENSEX-INDEX", "BSE:BANKEX-INDEX"}),  # cash + index, no F&O / currency
         ("NFO,MCX", NFO | {"MCX:CRUDEOIL26OCTFUT"}),  # sources OR together
     ],
 )

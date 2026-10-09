@@ -1528,4 +1528,8 @@ class FyersLiveBackend:
         data = await self._client.get_option_chain(
             symbol, strikecount=strikecount, timestamp=timestamp
         )
-        return normalize_option_chain(data, underlying_symbol=symbol)
+        # A 200 with `s: error` (bad symbol, stale expiry) would otherwise
+        # normalise to an empty "live" chain instead of the master fallback.
+        return normalize_option_chain(
+            _ensure_ok(data, "option chain"), underlying_symbol=symbol
+        )

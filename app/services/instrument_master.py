@@ -358,7 +358,11 @@ def _seed_instruments() -> list[Instrument]:
     for sym, name in [
         ("NSE:NIFTY50-INDEX", "NIFTY"),
         ("NSE:NIFTYBANK-INDEX", "BANKNIFTY"),
+        ("NSE:FINNIFTY-INDEX", "FINNIFTY"),
+        ("NSE:MIDCPNIFTY-INDEX", "MIDCPNIFTY"),
+        ("NSE:NIFTYNXT50-INDEX", "NIFTYNXT50"),
         ("BSE:SENSEX-INDEX", "SENSEX"),
+        ("BSE:BANKEX-INDEX", "BANKEX"),
     ]:
         out.append(Instrument(
             symbol=sym, short_name=name,
@@ -418,13 +422,40 @@ class InstrumentMaster:
         return len(self._by_symbol)
 
     def _add(self, inst: Instrument) -> None:
+        # A symbol seen again (the CSV re-listing a seed scrip) takes the old
+        # entry's place in every index, keeping its rank. Appending it left
+        # the seed object first in the name index, so search kept returning
+        # the seed's tick size instead of the scrip master's.
+        old = self._by_symbol.get(inst.symbol)
         self._by_symbol[inst.symbol] = inst
-        for key in {inst.short_name, inst.symbol.split(":", 1)[-1].rsplit("-", 1)[0].upper()}:
-            if not key:
-                continue
-            self._by_short.setdefault(key, []).append(inst)
+        indexes = {"short": self._by_short, "underlying": self._by_underlying}
+        new_keys = self._index_keys(inst)
+        if old is not None:
+            for spot in self._index_keys(old):
+                index, key = indexes[spot[0]], spot[1]
+                keep = spot in new_keys
+                if keep:
+                    new_keys.remove(spot)
+                    lst = [inst if i is old else i for i in index.get(key, [])]
+                else:
+                    lst = [i for i in index.get(key, []) if i is not old]
+                if lst:
+                    index[key] = lst
+                else:
+                    index.pop(key, None)
+        for name, key in new_keys:
+            indexes[name].setdefault(key, []).append(inst)
+
+    @classmethod
+    def _index_keys(cls, inst: Instrument) -> list[tuple[str, str]]:
+        keys = [("short", k) for k in cls._name_keys(inst) if k]
         if inst.underlying:
-            self._by_underlying.setdefault(inst.underlying.upper(), []).append(inst)
+            keys.append(("underlying", inst.underlying.upper()))
+        return keys
+
+    @staticmethod
+    def _name_keys(inst: Instrument) -> set[str]:
+        return {inst.short_name, inst.symbol.split(":", 1)[-1].rsplit("-", 1)[0].upper()}
 
     def count(self) -> int:
         return len(self._by_symbol)
