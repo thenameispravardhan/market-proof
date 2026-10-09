@@ -911,6 +911,12 @@ export default function Trade() {
     return best;
   }, [chain]);
 
+  // Largest OI on the ladder: the OI bars' 100%. Once per chain, not per row.
+  const chainMaxOi = useMemo(
+    () => Math.max(1, ...(chain?.strikes ?? []).map((x) => Math.max(x.ce?.oi ?? 0, x.pe?.oi ?? 0))),
+    [chain],
+  );
+
   const atmRef = useRef<HTMLTableRowElement | null>(null);
   useEffect(() => {
     atmRef.current?.scrollIntoView?.({ block: "center" });
@@ -1850,9 +1856,8 @@ export default function Trade() {
                         <tbody>
                           {chain.strikes.map((s) => {
                             const atm = s.strike === atmStrike;
-                            const maxOi = Math.max(1, ...chain.strikes.map((x) => Math.max(x.ce?.oi ?? 0, x.pe?.oi ?? 0)));
                             const oiBar = (v: number | null | undefined, side: "ce" | "pe") =>
-                              userPrefs.chainOiBars && v ? { background: `linear-gradient(to ${side === "ce" ? "left" : "right"}, ${side === "ce" ? "rgba(239,83,80,0.22)" : "rgba(38,166,154,0.22)"} ${(v / maxOi) * 100}%, transparent 0)` } : undefined;
+                              userPrefs.chainOiBars && v ? { background: `linear-gradient(to ${side === "ce" ? "left" : "right"}, ${side === "ce" ? "rgba(239,83,80,0.22)" : "rgba(38,166,154,0.22)"} ${(v / chainMaxOi) * 100}%, transparent 0)` } : undefined;
                             return (
                               <tr key={s.strike} className={atm ? "atm" : ""} ref={atm ? atmRef : undefined}>
                                 <td className="oi" style={oiBar(s.ce?.oi, "ce")}>{fmtOi(s.ce?.oi)}</td>
@@ -1902,7 +1907,7 @@ export default function Trade() {
                   </section>
                 )}
                       {!(chainBase && (chainBase.instrument_type === "IND" || (chainBase.instrument_type === "EQ" && (chain?.strikes?.length ?? 0) > 0))) && (
-                        <section className="trade-card"><div className="empty">{chainBase ? "No options listed for this symbol." : "Open an index or F&O stock to see its option chain."}</div></section>
+                        <section className="trade-card"><div className="empty">{!chainBase ? "Open an index or F&O stock to see its option chain." : !chain ? "Loading chain…" : "No options listed for this symbol."}</div></section>
                       )}
               </div>
             </section>

@@ -19,7 +19,13 @@ from sqlalchemy.orm import Session
 
 from app.db.models import BrokerAccount
 from app.db.session import get_db
-from app.execution.fyers_live import FyersAPIError, FyersAuthError, FyersBlockedError
+from app.execution.fyers_live import (
+    FyersAPIError,
+    FyersAuthError,
+    FyersBlockedError,
+    _guess_lot_size,
+    _leg_lot,
+)
 from app.logging_config import get_logger
 from app.services.instrument_master import get_master
 
@@ -107,7 +113,27 @@ def _master_expiry(expiry: Optional[str]) -> Optional[str]:
     return datetime.fromtimestamp(int(expiry), ist).strftime("%Y-%m-%d")  # type: ignore[arg-type]
 
 
-def _leg_from_master(leg: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+def _ist_today() -> str:
+    return datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%Y-%m-%d")
+
+
+def _master_lot(symbol: str, underlying_lot: Optional[int], static_lot: Any) -> Optional[int]:
+    """A static-ladder leg's lot, looked up the way the live chain does (the
+    F&O scrip master's contract lot, else the underlying's), then the
+    instrument master's when it's a real lot. Never a default of 1: the
+    ticket and the scalper would send a 1-unit F&O order, which the exchange
+    rejects; None makes them say the lot is unknown instead."""
+    lot = _leg_lot(symbol, underlying_lot)
+    if lot:
+        return int(lot)
+    try:
+        static = int(static_lot or 0)
+    except (TypeError, ValueError):
+        static = 0
+    return static if static > 1 else None
+
+
+def _leg_from_master(leg: Optional[dict[str, Any]], underlying_lot: Optional[int]) -> Optional[dict[str, Any]]:
     if not leg:
         return None
     return {
@@ -118,20 +144,32 @@ def _leg_from_master(leg: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
         "oi": None,
         "volume": None,
         "ltpch": None,
-        "lot_size": leg.get("lot_size", 1),
-        "tick_size": leg.get("tick_size", 0.05),
+        "lot_size": _master_lot(leg.get("symbol", ""), underlying_lot, leg.get("lot_size")),
+        "tick_size": leg.get("tick_size") or 0.05,
     }
 
 
 def _master_chain(underlying: str, expiry: Optional[str], reason: str) -> dict[str, Any]:
     """Static fallback from the instrument master — no live prices. Shaped
     identically to the live response so the UI doesn't branch."""
-    chain = get_master().option_chain(underlying, expiry=_master_expiry(expiry))
+    master = get_master()
+    chain = master.option_chain(underlying, expiry=_master_expiry(expiry))
+    # A master file a few days old still lists expiries that have lapsed, and
+    # picked the oldest as "nearest": a ladder of dead contracts. Drop them
+    # and land on the first live expiry.
+    today = _ist_today()
+    live = [e for e in chain.get("expiries", []) if e >= today]
+    if live and chain.get("selected_expiry") not in live:
+        chain = master.option_chain(underlying, expiry=live[0])
+    elif not live:
+        chain = {**chain, "selected_expiry": None, "strikes": []}
+    chain["expiries"] = live
+    underlying_lot = _guess_lot_size(underlying)
     strikes = [
         {
             "strike": s["strike"],
-            "ce": _leg_from_master(s.get("ce")),
-            "pe": _leg_from_master(s.get("pe")),
+            "ce": _leg_from_master(s.get("ce"), underlying_lot),
+            "pe": _leg_from_master(s.get("pe"), underlying_lot),
         }
         for s in chain.get("strikes", [])
     ]

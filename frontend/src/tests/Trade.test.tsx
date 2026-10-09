@@ -419,6 +419,77 @@ describe("Trade page", () => {
     });
   });
 
+  it("scalper: a traded leg stays on its strike when the ATM moves, so SELL closes it", async () => {
+    localStorage.setItem("trade:scalper", "true");
+    const leg = (strike: number, t: "CE" | "PE") => ({
+      symbol: `NSE:RELIANCE26OCT${strike}${t}`, ltp: 20, bid: null, ask: null, oi: 1, volume: 1, ltpch: 0, lot_size: 250, tick_size: 0.05,
+    });
+    let spot = 2452;
+    const posts: Record<string, unknown>[] = [];
+    const stubs = defaultStubs();
+    globalThis.fetch = makeFetchStub((url, init) => {
+      if (url.includes("/api/options/chain")) {
+        return makeJsonResponse({
+          ok: true, underlying: "RELIANCE", symbol: "NSE:RELIANCE-EQ", spot, source: "fyers", reason: null,
+          expiries: [{ label: "28-10-2026", ts: "1793000000" }], selected_expiry: "1793000000",
+          strikes: [2400, 2450, 2500].map((k) => ({ strike: k, ce: leg(k, "CE"), pe: leg(k, "PE") })),
+        });
+      }
+      if (/\/api\/orders$/.test(url) && init?.method === "POST") posts.push(JSON.parse(String(init.body)));
+      return stubs(url, init);
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const user = userEvent.setup();
+    const qc = makeQc();
+    render(<Trade />, { wrapper: wrapper(qc) });
+    await user.type(await screen.findByTestId("trade-search"), "RELI");
+    await user.click(await screen.findByTestId("search-row-NSE:RELIANCE-EQ"));
+    await waitFor(() => expect(screen.getByTestId("ticket-submit")).not.toBeDisabled());
+    expect(screen.getByTestId("scalp-qty").textContent).toMatch(/250/);
+
+    await user.click(await screen.findByTestId("scalp-buy-CE"));
+    await waitFor(() => expect(posts).toHaveLength(1));
+    expect(posts[0]).toMatchObject({ symbol: "NSE:RELIANCE26OCT2450CE", side: "BUY" });
+    expect(await screen.findByTestId("scalp-pin-CE")).toHaveTextContent("2450");
+
+    // The spot moves up a strike: the CE leg would follow the ATM to 2500.
+    spot = 2499;
+    await qc.refetchQueries({ queryKey: ["option-chain"] });
+    await user.click(screen.getByTestId("scalp-sell-CE"));
+    await waitFor(() => expect(posts).toHaveLength(2));
+    expect(posts[1]).toMatchObject({ symbol: "NSE:RELIANCE26OCT2450CE", side: "SELL" });
+
+    // Unpinning follows the ATM again.
+    await user.click(screen.getByTestId("scalp-pin-CE"));
+    await user.click(screen.getByTestId("scalp-buy-CE"));
+    await waitFor(() => expect(posts).toHaveLength(3));
+    expect(posts[2]).toMatchObject({ symbol: "NSE:RELIANCE26OCT2500CE", side: "BUY" });
+  });
+
+  it("scalper: a ladder with no spot says why instead of showing dead legs", async () => {
+    localStorage.setItem("trade:scalper", "true");
+    const stubs = defaultStubs();
+    globalThis.fetch = makeFetchStub((url, init) => {
+      if (url.includes("/api/options/chain")) {
+        return makeJsonResponse({
+          ok: true, underlying: "RELIANCE", symbol: "", spot: null, source: "master",
+          reason: "Connect a Fyers account for the live option chain.",
+          expiries: [{ label: "2026-10-28", ts: "2026-10-28" }], selected_expiry: "2026-10-28",
+          strikes: [{ strike: 2450, ce: { symbol: "NSE:RELIANCE26OCT2450CE", ltp: null, bid: null, ask: null, oi: null, volume: null, ltpch: null, lot_size: null, tick_size: 0.05 }, pe: null }],
+        });
+      }
+      return stubs(url, init);
+    });
+    const user = userEvent.setup();
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await user.type(await screen.findByTestId("trade-search"), "RELI");
+    await user.click(await screen.findByTestId("search-row-NSE:RELIANCE-EQ"));
+    const empty = await screen.findByTestId("scalp-empty");
+    expect(empty.textContent).toMatch(/ATM/);
+    expect(empty.textContent).toMatch(/Connect a Fyers account/);
+    expect(screen.getByTestId("scalp-qty").textContent).toMatch(/lot unknown/);
+  });
+
   it("surfaces a risk warning on a placed order (override / engine-fault)", async () => {
     // When the backend places an order that still carries a risk note
     // (an operator override, or a risk-engine fault that didn't block),
@@ -1348,8 +1419,10 @@ describe("Trade page", () => {
       // The second expiry lapses: the chain stops listing it and has no strikes for it.
       const lapsed = exp === "1795516200";
       const listed = lapsed ? expiries.slice(0, 1) : expiries;
-      return makeJsonResponse({ ok: true, underlying: "RELIANCE", symbol: "NSE:RELIANCE-EQ", spot: 2450, expiries: listed,
+      const res = makeJsonResponse({ ok: true, underlying: "RELIANCE", symbol: "NSE:RELIANCE-EQ", spot: 2450, expiries: listed,
         selected_expiry: listed[0].ts, source: "fyers", reason: null, strikes: lapsed ? [] : [{ strike: 2500, ce: leg, pe: null }] });
+      // The new expiry answers slowly, so the test sees the panel while it loads.
+      return lapsed ? new Promise<Response>((r) => setTimeout(() => r(res), 150)) : res;
     });
     const user = userEvent.setup();
     render(<Trade />, { wrapper: wrapper(makeQc()) });
@@ -1365,9 +1438,11 @@ describe("Trade page", () => {
 
     await user.selectOptions(screen.getByTestId("chain-expiry"), "1795516200");
     await waitFor(() => expect(asked).toContain("1795516200"));
+    // The ladder stays up while the new expiry loads (it used to vanish).
+    expect(screen.getByTestId("trade-chain")).toBeInTheDocument();
     // Back on the nearest expiry's ladder rather than stuck on the lapsed one.
+    await waitFor(() => expect((screen.getByTestId("chain-expiry") as HTMLSelectElement).value).toBe("1793097000"));
     expect(await screen.findByTestId("chain-ce-2500")).toBeInTheDocument();
-    expect((screen.getByTestId("chain-expiry") as HTMLSelectElement).value).toBe("1793097000");
   });
 });
 

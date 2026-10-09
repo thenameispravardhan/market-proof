@@ -1,9 +1,11 @@
 // Option scalper (Fyers-style): the underlying's chart flanked by the chosen
 // CE and PE charts, each leg with BUY / SELL at market for N lots. Strikes are
-// picked as ATM ± steps and follow the ATM as the spot moves. Every order is
+// picked as ATM ± steps and follow the ATM as the spot moves, except that a
+// leg you have traded stays on its strike until you pick another one or the
+// position is flat, so SELL closes what BUY opened. Every order is
 // a real intraday order: a confirm per click unless "1-click" is switched on
 // for the session — only then do the hotkeys work too.
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import ChartPanel, { type ChartOrder, type ChartPosition } from "./ChartPanel";
 import { useQuote } from "../../hooks/useApi";
 import { useLiveQuote } from "../../hooks/useQuotes";
@@ -105,11 +107,19 @@ export default function Scalper({
     } catch { /* best-effort */ }
   }, [ceOff, peOff, lots]);
 
+  // A traded leg's symbol, held while its position is open: following the
+  // ATM after a fill moved BUY / SELL onto a new strike, so SELL opened a
+  // short on it instead of closing the long.
+  const [pin, setPin] = useState<{ CE: string | null; PE: string | null }>({ CE: null, PE: null });
   const strikes = chain?.strikes ?? [];
   const atmIdx = strikes.findIndex((s) => s.strike === atmStrike);
   const at = (i: number) => strikes[Math.max(0, Math.min(strikes.length - 1, i))];
-  const ceRow = atmIdx >= 0 ? at(atmIdx + ceOff) : undefined;
-  const peRow = atmIdx >= 0 ? at(atmIdx - peOff) : undefined;
+  const pinnedRow = (t: "CE" | "PE") => {
+    const sym = pin[t];
+    return sym ? strikes.find((s) => (t === "CE" ? s.ce : s.pe)?.symbol === sym) : undefined;
+  };
+  const ceRow = pinnedRow("CE") ?? (atmIdx >= 0 ? at(atmIdx + ceOff) : undefined);
+  const peRow = pinnedRow("PE") ?? (atmIdx >= 0 ? at(atmIdx - peOff) : undefined);
   const ce = ceRow?.ce ?? null;
   const pe = peRow?.pe ?? null;
   const name = base ? optionRoot(base) : "";
@@ -117,12 +127,14 @@ export default function Scalper({
 
   const trade = async (leg: OptionLeg | null, label: string, side: "BUY" | "SELL") => {
     if (!leg) return;
+    const t: "CE" | "PE" = leg.symbol.toUpperCase().endsWith("PE") ? "PE" : "CE";
     if (!leg.lot_size) return setMsg(`✕ lot size unknown for ${label} — F&O scrip master not loaded`);
     const qty = lots * leg.lot_size;
     if (!oneClick && !window.confirm(`${side} ${qty} ${label} at market?\nReal order · intraday`)) return;
     setMsg(`${side} ${qty} ${label}…`);
     try {
       setMsg(await helpers.orderFor(leg.symbol, label, qty)({ side, type: "MARKET", price: null }));
+      setPin((p) => ({ ...p, [t]: leg.symbol }));
     } catch (e) {
       setMsg(`✕ ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -135,6 +147,24 @@ export default function Scalper({
   const open = (positions ?? []).filter(
     (p) => base && root && p.quantity !== 0 && isOptionOf(p.symbol, base.exchange, root),
   );
+  // Release a pin once its position has been open and is flat again (closed
+  // from here, the chart, or the Positions panel). A pin set by a fill that
+  // hasn't reached the positions list yet is kept.
+  const seenOpen = useRef<Record<string, boolean>>({});
+  useEffect(() => {
+    for (const t of ["CE", "PE"] as const) {
+      const sym = pin[t];
+      if (!sym) continue;
+      const isOpen = (positions ?? []).some((p) => p.symbol === sym && p.quantity !== 0);
+      if (isOpen) seenOpen.current[sym] = true;
+      else if (seenOpen.current[sym]) {
+        delete seenOpen.current[sym];
+        setPin((p) => ({ ...p, [t]: null }));
+      }
+    }
+  }, [positions, pin]);
+  const unpin = (t: "CE" | "PE") => setPin((p) => ({ ...p, [t]: null }));
+
   const exitAll = async () => {
     if (open.length === 0) return setMsg("No open positions on this underlying.");
     if (!oneClick && !window.confirm(`Exit ${open.length} position(s) on ${name} at market?`)) return;
@@ -165,7 +195,13 @@ export default function Scalper({
   const stepLabel = (o: number) => (o === 0 ? "ATM" : o > 0 ? `OTM ${o}` : `ITM ${-o}`);
   const leg = (row: typeof ceRow, l: OptionLeg | null, t: "CE" | "PE", off: number, setOff: (n: number) => void) => (
     <div className={`scalp-leg ${t.toLowerCase()}`}>
-      <select value={off} onChange={(e) => setOff(Number(e.target.value))} aria-label={`${t} strike`} title={`${t} strike, relative to ATM`}>
+      {pinnedRow(t) && row && (
+        <button type="button" className="px-quick-btn" onClick={() => unpin(t)} data-testid={`scalp-pin-${t}`}
+          title="Held on the strike you traded so SELL closes it. Click to follow the ATM again.">
+          📌 {row.strike} ×
+        </button>
+      )}
+      <select value={off} onChange={(e) => { unpin(t); setOff(Number(e.target.value)); }} aria-label={`${t} strike`} title={`${t} strike, relative to ATM`}>
         {STEPS.map((o) => {
           const r = atmIdx >= 0 ? at(atmIdx + (t === "CE" ? o : -o)) : undefined;
           return <option key={o} value={o}>{stepLabel(o)}{r ? ` · ${r.strike}` : ""}</option>;
@@ -194,7 +230,8 @@ export default function Scalper({
       orderQty={qty}
     />
   );
-  const lotSize = ce?.lot_size ?? pe?.lot_size ?? 1;
+  // null = the contract's lot isn't known; never show it as 1.
+  const lotSize = ce?.lot_size || pe?.lot_size || null;
 
   return (
     <div className="scalp" data-testid="scalper">
@@ -214,7 +251,7 @@ export default function Scalper({
           <button type="button" onClick={() => setLots((n) => Math.max(1, n - 1))} aria-label="Fewer lots">−</button>
           <input type="number" min={1} value={lots} onChange={(e) => setLots(Math.max(1, Math.floor(Number(e.target.value) || 1)))} />
           <button type="button" onClick={() => setLots((n) => n + 1)} aria-label="More lots">+</button>
-          <span>× {lotSize} = <b>{lots * lotSize}</b></span>
+          <span data-testid="scalp-qty">{lotSize ? <>× {lotSize} = <b>{lots * lotSize}</b></> : "× lot unknown"}</span>
         </label>
         <label className={`scalp-oneclick${oneClick ? " on" : ""}`} title="Place orders without the confirm; enables Shift+↑ buy CE · Shift+↓ buy PE · Shift+X exit all">
           <input
@@ -229,8 +266,13 @@ export default function Scalper({
         </button>
         {msg && <span className="scalp-msg" title={msg}>{msg}</span>}
       </div>
-      {strikes.length === 0 ? (
-        <section className="trade-card tv-empty"><div className="empty">{chain?.reason ?? (chain ? "No options listed for this underlying." : "Loading the option chain…")}</div></section>
+      {strikes.length === 0 || atmIdx < 0 ? (
+        <section className="trade-card tv-empty"><div className="empty" data-testid="scalp-empty">{
+          strikes.length > 0
+            // The static ladder carries no spot, so there is no ATM to pick strikes from.
+            ? `No live spot price, so the scalper can't find the ATM strike.${chain?.reason ? ` ${chain.reason}` : ""}`
+            : chain?.reason ?? (chain ? "No options listed for this underlying." : "Loading the option chain…")
+        }</div></section>
       ) : (
         <div className="tv-layout">
           <div className="tv-topbar"><div className="tv-topslot" ref={setTop} />{settings}</div>
