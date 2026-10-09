@@ -44,14 +44,21 @@ function savePref(k: string, v: unknown): void {
  *  (order socket / postback, dispatched by App). `null` url = idle. */
 // Panels that read the same URL at the same moment share ONE request (every
 // fetch here can cost a Fyers REST call, which competes with orders).
-const inflight = new Map<string, Promise<unknown>>();
-function sharedGet(url: string): Promise<unknown> {
-  let p = inflight.get(url);
-  if (!p) {
-    p = fetch(url).then((r) => (r.ok ? r.json() : null)).finally(() => setTimeout(() => inflight.delete(url), 250));
-    inflight.set(url, p);
-  }
-  return p;
+// A finished request stays shareable for 250ms so panels mounting together
+// reuse it; a `fresh` read (after a broker event) only joins one still in flight.
+const inflight = new Map<string, { p: Promise<unknown>; done: boolean }>();
+function sharedGet(url: string, fresh = false): Promise<unknown> {
+  const hit = inflight.get(url);
+  if (hit && !(fresh && hit.done)) return hit.p;
+  const entry = { p: Promise.resolve<unknown>(null), done: false };
+  entry.p = fetch(url)
+    .then((r) => (r.ok ? r.json() : null))
+    .finally(() => {
+      entry.done = true;
+      setTimeout(() => inflight.get(url) === entry && inflight.delete(url), 250);
+    });
+  inflight.set(url, entry);
+  return entry.p;
 }
 
 export function useApiJson<T>(url: string | null, every = 0, onOrders = true): { data: T | null; reload: () => void } {
@@ -61,16 +68,16 @@ export function useApiJson<T>(url: string | null, every = 0, onOrders = true): {
     if (!url) return;
     let stop = false;
     let t: ReturnType<typeof setTimeout> | undefined;
-    const load = () =>
-      sharedGet(url)
+    const load = (fresh = false) =>
+      sharedGet(url, fresh)
         .then((j) => !stop && setData(j as T))
         .catch(() => undefined);
     void load();
-    const id = every ? setInterval(load, every) : undefined;
+    const id = every ? setInterval(() => void load(), every) : undefined;
     // one order fires several events (transit → filled, socket + postback): coalesce
     const on = () => {
       clearTimeout(t);
-      t = setTimeout(() => void load(), 200);
+      t = setTimeout(() => void load(true), 200);
     };
     if (onOrders) window.addEventListener("broker:order", on);
     return () => {
@@ -206,7 +213,7 @@ export function orderRows(book: BrokerBook | null, pending: PendingOrder[], hist
       symbol: p.symbol,
       side: p.side,
       type: p.order_type,
-      product: "INTRADAY",
+      product: p.product ?? "INTRADAY",
       qty: p.quantity,
       filled: null,
       remaining: p.quantity,
