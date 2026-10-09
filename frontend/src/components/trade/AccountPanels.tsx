@@ -227,7 +227,8 @@ export function orderRows(book: BrokerBook | null, pending: PendingOrder[], hist
       limit: p.order_type === "LIMIT" || p.order_type === "STOP_LOSS" ? p.price || null : null,
       stop: p.order_type === "SL-M" ? p.price || null : null,
       avg: null,
-      status: "WORKING",
+      // the label Fyers' own book uses for a working order, so the two sources read alike
+      status: "PENDING",
       ts,
       time: clock(ts),
       source: "Bot",
@@ -418,6 +419,9 @@ const ORDER_FILTERS: [OrderFilter, string, string][] = [
   ["rejected", "Rejected", "Rejected by the broker or exchange"],
 ];
 
+/** "BUY 10 NSE:SBIN-EQ" — how a person names an order in a banner. */
+export const orderLabel = (r: OrderRow) => `${r.side} ${r.qty} ${r.symbol}`;
+
 export function filterOrders(rows: OrderRow[], f: OrderFilter): OrderRow[] {
   if (f === "all") return rows;
   if (f === "inactive") return rows.filter((r) => r.bucket !== "working");
@@ -435,7 +439,7 @@ export function OrdersTable({
 }: {
   rows: OrderRow[];
   privacy: boolean;
-  onCancel: (id: string) => void;
+  onCancel: (id: string, label?: string) => void;
   cancelBusyId: string | null;
   onModify: (r: OrderRow) => void;
   banner?: ReactNode;
@@ -485,14 +489,17 @@ export function OrdersTable({
           </div>
         }
         actions={(r) =>
-          r.bucket === "working" && r.id ? (
+          r.bucket !== "working" ? null : r.id ? (
             <>
               <button type="button" className="btn-sm" onClick={() => onModify(r)} data-testid={`modify-${r.id}`}>Modify</button>
-              <button type="button" className="btn small" onClick={() => onCancel(r.id!)} disabled={cancelBusyId === r.id} data-testid={`cancel-${r.id}`}>
+              <button type="button" className="btn small" onClick={() => onCancel(r.id!, orderLabel(r))} disabled={cancelBusyId === r.id} data-testid={`cancel-${r.id}`}>
                 {cancelBusyId === r.id ? "cancelling…" : "Cancel"}
               </button>
             </>
-          ) : null
+          ) : (
+            // sent, but the broker hasn't answered with an order id yet — nothing to cancel by
+            <span className="hint" title="Waiting for the broker to confirm this order; Modify and Cancel appear once it has an order ID">confirming…</span>
+          )
         }
       />
     </section>
@@ -807,7 +814,7 @@ export function groupOrders(rows: OrderRow[]): OrderGroup[] {
   }).sort((a, b) => (b.last ?? 0) - (a.last ?? 0));
 }
 
-export function SmartOrderbook({ rows, privacy, onCancel, onModify }: { rows: OrderRow[]; privacy: boolean; onCancel: (id: string) => void; onModify: (r: OrderRow) => void }) {
+export function SmartOrderbook({ rows, privacy, onCancel, onModify }: { rows: OrderRow[]; privacy: boolean; onCancel: (id: string, label?: string) => void; onModify: (r: OrderRow) => void }) {
   const [open, setOpen] = useState<string[]>([]);
   const [q, setQ] = useState("");
   const groups = groupOrders(rows.filter((r) => !q.trim() || r.symbol.toLowerCase().includes(q.trim().toLowerCase())));
@@ -818,7 +825,7 @@ export function SmartOrderbook({ rows, privacy, onCancel, onModify }: { rows: Or
   const m = (v: number | null) => (privacy ? "•••" : fmt(v));
   const cancelAll = (g: OrderGroup) => {
     const w = g.orders.filter((o) => o.bucket === "working" && o.id);
-    if (w.length && window.confirm(`Cancel ${w.length} working order(s) on ${g.symbol}?`)) w.forEach((o) => onCancel(o.id!));
+    if (w.length && window.confirm(`Cancel ${w.length} working order(s) on ${g.symbol}?`)) w.forEach((o) => onCancel(o.id!, orderLabel(o)));
   };
   return (
     <section className="trade-card smart-ob" data-testid="am-smart">
@@ -875,7 +882,7 @@ export function SmartOrderbook({ rows, privacy, onCancel, onModify }: { rows: Or
                           {o.bucket === "working" && o.id && (
                             <>
                               <button type="button" className="btn-sm" onClick={() => onModify(o)}>Modify</button>
-                              <button type="button" className="btn-sm danger" onClick={() => onCancel(o.id!)}>Cancel</button>
+                              <button type="button" className="btn-sm danger" onClick={() => onCancel(o.id!, orderLabel(o))}>Cancel</button>
                             </>
                           )}
                         </td>
@@ -906,13 +913,20 @@ export function ModifyOrderDialog({ order, accountId, onClose, onDone }: { order
   const needLimit = type === "LIMIT" || type === "STOP_LOSS";
   const needStop = type === "STOP_LOSS" || type === "SL-M";
   const q = Number(qty);
-  const bad = !(q > 0) ? "Quantity must be more than 0"
+  const origType = order.type === "SL-L" ? "STOP_LOSS" : order.type;
+  // an unchanged order would still be a broker round trip that does nothing
+  const unchanged = q === order.qty && type === origType
+    && (!needLimit || Number(limit) === order.limit)
+    && (!needStop || Number(stop) === order.stop);
+  const bad = !accountId ? "Connect a live Fyers account to modify orders"
+    : !(q > 0) ? "Quantity must be more than 0"
     : !Number.isInteger(q) ? "Quantity must be a whole number"
     : q > order.qty ? `At most ${order.qty} — add size with a new order so the risk checks see it`
       : order.filled && q < order.filled ? `At least ${order.filled} — already filled`
       : needLimit && !(Number(limit) > 0) ? "Enter a limit price"
         : needStop && !(Number(stop) > 0) ? "Enter a stop (trigger) price"
-          : null;
+          : unchanged ? "Change the quantity, type or price to modify"
+            : null;
   const submit = async () => {
     if (bad || !accountId || !order.id) return;
     setBusy(true);
@@ -926,7 +940,7 @@ export function ModifyOrderDialog({ order, accountId, onClose, onDone }: { order
       const j = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(typeof j.detail === "string" ? j.detail : `HTTP ${r.status}`);
       if (j.ok === false) throw new Error(j.message || "the broker refused the change");
-      onDone(`Modified ${order.id}${j.message ? ` — ${j.message}` : ""}`);
+      onDone(`Modified ${orderLabel(order)} (${order.id})${j.message ? ` — ${j.message}` : ""}`);
       onClose();
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
@@ -940,7 +954,7 @@ export function ModifyOrderDialog({ order, accountId, onClose, onDone }: { order
       onClose={onClose}
       width={400}
       testid="modify-order"
-      footer={<><span className="grow" /><button type="button" className="cbtn" onClick={onClose}>Cancel</button><button type="button" className="cbtn primary" disabled={!!bad || busy || !accountId} onClick={() => void submit()} data-testid="modify-order-ok">{busy ? "Sending…" : "Modify"}</button></>}
+      footer={<><span className="grow" /><button type="button" className="cbtn" onClick={onClose}>Cancel</button><button type="button" className="cbtn primary" disabled={!!bad || busy} onClick={() => void submit()} data-testid="modify-order-ok">{busy ? "Sending…" : "Modify"}</button></>}
     >
       <Row label="Order"><span className="dim">{order.id} · {order.qty} {order.type === "STOP_LOSS" ? "STOP-LIMIT" : order.type}{order.filled ? ` · ${order.filled} filled` : ""}</span></Row>
       <Row label="Quantity (total)"><input className="cform-input" type="number" min={Math.max(1, order.filled ?? 0)} max={order.qty} value={qty} onChange={(e) => setQty(e.target.value)} aria-label="Quantity" data-testid="modify-qty" /></Row>
