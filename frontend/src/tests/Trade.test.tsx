@@ -1336,6 +1336,58 @@ describe("Trade page", () => {
     await waitFor(() => expect(screen.queryByTestId("trade-search-results")).not.toBeInTheDocument());
   });
 
+  it("search: a failed search says so instead of 'no results'", async () => {
+    const stubs = defaultStubs();
+    globalThis.fetch = makeFetchStub((url, init) => (url.includes("/api/search/symbols") ? makeJsonResponse({ detail: "boom" }, 500) : stubs(url, init)));
+    const user = userEvent.setup();
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await user.type(await screen.findByTestId("trade-search"), "RELI");
+    const box = await screen.findByTestId("trade-search-results");
+    await waitFor(() => expect(box.textContent).toMatch(/Search failed/));
+    expect(box.textContent).not.toMatch(/no results/);
+  });
+
+  describe("watchlist", () => {
+    const hit = (s: string) => ({ symbol: `NSE:${s}-EQ`, short_name: s, exchange: "NSE", segment: "EQ", instrument_type: "EQ",
+      lot_size: 1, tick_size: 0.05, expiry: null, strike: null, underlying: null, display: s });
+    const quotesStub = (quotes: Record<string, unknown>) => {
+      const stubs = defaultStubs();
+      return makeFetchStub((url, init) => (url.includes("/api/market/quotes") ? makeJsonResponse({ quotes }) : stubs(url, init)));
+    };
+
+    it("drops duplicate and broken rows saved by an older build", async () => {
+      localStorage.setItem("trade:watchlists", JSON.stringify({ active: 0, lists: [{ name: "Watchlist", items: [hit("TCS"), hit("TCS"), { short_name: "x" }, { symbol: "NSE:INFY-EQ" }] }] }));
+      globalThis.fetch = quotesStub({});
+      render(<Trade />, { wrapper: wrapper(makeQc()) });
+      expect(await screen.findAllByTestId("recent-chip-NSE:TCS-EQ")).toHaveLength(1);
+      expect(screen.getByTestId("recent-chip-NSE:INFY-EQ").textContent).toContain("INFY");
+    });
+
+    it("removing a row drops its flag, so re-adding starts clean", async () => {
+      localStorage.setItem("trade:watchlists", JSON.stringify({ active: 0, lists: [{ name: "Watchlist", items: [hit("TCS")], flags: { "NSE:TCS-EQ": "#F23645" } }] }));
+      globalThis.fetch = quotesStub({});
+      render(<Trade />, { wrapper: wrapper(makeQc()) });
+      const row = await screen.findByTestId("recent-chip-NSE:TCS-EQ");
+      fireEvent.click(within(row).getByRole("button", { name: /Remove TCS/ }));
+      await waitFor(() => expect(screen.queryByTestId("recent-chip-NSE:TCS-EQ")).not.toBeInTheDocument());
+      const saved = JSON.parse(localStorage.getItem("trade:watchlists") ?? "null");
+      expect(saved.lists[0].flags).toEqual({});
+    });
+
+    it("sorting by price keeps symbols without a quote at the bottom", async () => {
+      localStorage.setItem("trade:watchlists", JSON.stringify({ active: 0, lists: [{ name: "Watchlist", items: [hit("AAA"), hit("BBB"), hit("CCC"), hit("DDD")] }] }));
+      globalThis.fetch = quotesStub({ "NSE:BBB-EQ": { ltp: 10, change: 1, change_pct: 1 }, "NSE:DDD-EQ": { ltp: 20, change: 1, change_pct: 1 } });
+      render(<Trade />, { wrapper: wrapper(makeQc()) });
+      const order = () => screen.getAllByTestId(/^recent-chip-/).map((r) => r.getAttribute("data-testid")!.replace("recent-chip-NSE:", "").replace("-EQ", ""));
+      await waitFor(() => expect(screen.getByTestId("recent-chip-NSE:DDD-EQ").textContent).toContain("20.00"));
+      const sortBtn = screen.getByRole("button", { name: /^Last/ });
+      fireEvent.click(sortBtn);
+      expect(order()).toEqual(["BBB", "DDD", "AAA", "CCC"]);
+      fireEvent.click(sortBtn);
+      expect(order()).toEqual(["DDD", "BBB", "AAA", "CCC"]);
+    });
+  });
+
   it("chain: an option picked off the chain carries its expiry; a lapsed expiry falls back to the nearest", async () => {
     const leg = { symbol: "NSE:RELIANCE26OCT2500CE", ltp: 42, bid: 41.9, ask: 42.1, oi: 1000, volume: 10, ltpch: 0, lot_size: 500, tick_size: 0.05 };
     const expiries = [{ label: "27-10-2026", ts: "1793097000" }, { label: "24-11-2026", ts: "1795516200" }];
