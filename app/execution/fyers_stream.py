@@ -45,6 +45,7 @@ from typing import Any, Callable, Optional
 
 from app.services.event_bus import event_bus
 from app.execution.base import safe_float
+from app.execution.fyers_auth import token_is_expired
 from app.execution.market_data import MarketDataBus
 from app.execution.order_reconcile import reconcile_order_update
 from app.execution.symbols import resolve_fyers_symbol
@@ -129,6 +130,17 @@ def _extract_order(message: Any) -> dict[str, Any]:
     return {}
 
 
+# Data-socket acks: connect, mode switch, subscribe, unsubscribe.
+_CONTROL_FRAMES = {"cn", "ful", "lit", "sub", "unsub"}
+
+
+def _bare_token(token: Any) -> Optional[str]:
+    """The JWT part of a socket token (``APPID:jwt`` or just ``jwt``)."""
+    if not isinstance(token, str):
+        return None
+    return token.split(":", 1)[1] if ":" in token else token
+
+
 class FyersStreamManager:
     """Owns the Fyers data + order WebSockets and bridges them to asyncio."""
 
@@ -203,6 +215,12 @@ class FyersStreamManager:
         self._full_to_short: dict[str, str] = {}  # full  -> short
         self._depth: dict[str, float] = {}  # full -> last touch (DepthUpdate subscriptions)
         self._ondemand: dict[str, float] = {}     # short -> monotonic ts
+        # Full ids Fyers rejected as invalid on this connection. Never
+        # re-subscribed (or unsubscribed) until the next connect, so one bad
+        # symbol can't re-raise "Please provide a valid symbol" every sweep.
+        self._rejected: set[str] = set()
+        # Why the feed is down, for the status endpoint (None while healthy).
+        self._down_reason: Optional[str] = None
         self._stop_event = asyncio.Event()
         self._task: Optional[asyncio.Task[None]] = None
         # Diagnostics: how many ticks we received vs published vs dropped,
@@ -347,11 +365,23 @@ class FyersStreamManager:
             if self._data_socket is not None:
                 log.info("fyers_stream.account_gone_disconnecting")
                 await self._close_sockets()
+            self._down_reason = "no_account"
             return
         try:
             token = backend.ws_access_token
         except Exception as e:  # noqa: BLE001
             log.debug("fyers_stream.no_token", error=str(e))
+            self._down_reason = "no_token"
+            return
+        # An expired token can't authenticate the socket; holding it open just
+        # loops the SDK's reconnect. Wait for a fresh login instead.
+        if token_is_expired(_bare_token(token)):
+            if self._down_reason != "token_expired":
+                log.warning("fyers_stream.token_expired_waiting_for_login")
+            if self._data_socket is not None:
+                await self._close_sockets()
+            self._token = None
+            self._down_reason = "token_expired"
             return
         if self._data_socket is not None and token == self._token:
             return  # already connected with the current token
@@ -360,11 +390,13 @@ class FyersStreamManager:
             await self._close_sockets()
         self._token = token
         await self._connect_sockets()
+        self._down_reason = None
 
     async def _connect_sockets(self) -> None:
         self._subscribed.clear()
         self._full_to_short.clear()
         self._ondemand.clear()
+        self._rejected.clear()
         self._data_connected = False
         self._data_socket = self._data_factory(
             self._token,
@@ -459,6 +491,7 @@ class FyersStreamManager:
             full = self._resolve(short) or (short if ":" in short else None)
             if full:
                 desired[short] = full.upper()
+        desired = {s: f for s, f in desired.items() if f not in self._rejected}
 
         add = {s: f for s, f in desired.items() if s not in self._subscribed}
         # Don't yank a symbol that was just subscribed on demand to serve a
@@ -492,9 +525,10 @@ class FyersStreamManager:
             # Only drop an instrument from the socket when no remaining key still uses it.
             still = {f for k, f in subscribed_snapshot.items() if k not in remove}
             gone = [f for f in set(remove.values()) if f not in still]
+            gone = [f for f in gone if f not in self._rejected]
             try:
                 if gone:
-                    self._data_socket.unsubscribe(symbols=gone, data_type="SymbolUpdate")
+                    self._unsubscribe(gone, "SymbolUpdate")
             except Exception:  # noqa: BLE001
                 log.exception("fyers_stream.unsubscribe_failed")
             for s, f in remove.items():
@@ -505,6 +539,39 @@ class FyersStreamManager:
                     self._full_to_short[f] = others[0]
                 else:
                     self._full_to_short.pop(f, None)
+
+    def _unsubscribe(self, fulls: list[str], data_type: str) -> None:
+        """Unsubscribe `fulls`, working around an SDK bug.
+
+        `FyersDataSocket.unsubscribe` only accepts symbols from the MOST
+        RECENT `subscribe()` call (it overwrites `scrips_count` on every
+        subscribe). Anything subscribed earlier was silently kept streaming
+        and the SDK reported "Please provide a valid symbol" instead, which
+        is the recurring production warning. Point the filter at every token
+        the socket currently holds so the unsubscribe actually goes out.
+        """
+        sock = self._data_socket
+        if sock is None:
+            return
+        try:
+            held = getattr(sock, "symbol_token", None)
+            counts = getattr(sock, "scrips_count", None)
+            if isinstance(held, dict) and isinstance(counts, dict):
+                counts[11] = list(held.keys())  # 11 = the SDK's default channel
+        except Exception:  # noqa: BLE001 — best effort; the SDK may change
+            log.debug("fyers_stream.scrips_count_patch_failed")
+        sock.unsubscribe(symbols=fulls, data_type=data_type)
+
+    def status(self) -> dict[str, Any]:
+        """A small, human-readable snapshot of the live price feed."""
+        age = None if self._last_rx_ts is None else round(time.monotonic() - self._last_rx_ts, 1)
+        return {
+            "connected": bool(self._data_socket is not None and self._data_connected),
+            "reason": self._down_reason,
+            "subscribed": len(self._subscribed),
+            "last_tick_age_s": age,
+            "rejected_symbols": sorted(self._rejected),
+        }
 
     # -- WS-first one-shot price (signal / manual pricing) ---------------
 
@@ -560,7 +627,7 @@ class FyersStreamManager:
         shows it; each depth frame is pushed to the browser on the `depth`
         channel. Lapses DEPTH_TTL_S after the last touch."""
         full = (self._resolve(symbol) or symbol).strip().upper()
-        if ":" not in full or self._data_socket is None or not self._data_connected:
+        if ":" not in full or full in self._rejected or self._data_socket is None or not self._data_connected:
             return
         fresh = full not in self._depth
         self._depth[full] = time.monotonic()
@@ -578,7 +645,7 @@ class FyersStreamManager:
             self._depth.pop(f, None)
         if stale and self._data_socket is not None and self._data_connected:
             try:
-                self._data_socket.unsubscribe(symbols=stale, data_type="DepthUpdate")
+                self._unsubscribe(stale, "DepthUpdate")
             except Exception:  # noqa: BLE001
                 log.debug("fyers_stream.depth_unsubscribe_failed")
 
@@ -618,7 +685,7 @@ class FyersStreamManager:
     def _subscribe_ondemand(self, bus_key: str, full: str) -> bool:
         """Subscribe `full` on the data socket (idempotent) and refresh its
         keep-alive timestamp. Returns False if the socket isn't connected."""
-        if self._data_socket is None or not self._data_connected:
+        if self._data_socket is None or not self._data_connected or full in self._rejected:
             return False
         self._ondemand[bus_key] = time.monotonic()
         if bus_key not in self._subscribed:
@@ -673,7 +740,23 @@ class FyersStreamManager:
         log.info("fyers_stream.data_closed")
 
     def _on_data_error(self, *args: Any) -> None:
-        log.warning("fyers_stream.data_error", detail=str(args[0]) if args else "")
+        detail = args[0] if args else ""
+        bad = detail.get("invalid_symbols") if isinstance(detail, dict) else None
+        if bad:
+            # Fyers rejected some subscribed ids (a delisted / renamed scrip, or
+            # a symbol that doesn't exist on that exchange). Forget them so the
+            # bus falls back to REST for them and they aren't retried.
+            bad_set = {str(b).upper() for b in bad}
+            self._rejected |= bad_set
+            for k, f in list(self._subscribed.items()):
+                if f in bad_set:
+                    self._subscribed.pop(k, None)
+                    self._ondemand.pop(k, None)
+            for f in bad_set:
+                self._full_to_short.pop(f, None)
+            log.warning("fyers_stream.symbols_rejected", symbols=sorted(bad_set))
+            return
+        log.warning("fyers_stream.data_error", detail=str(detail))
 
     def _on_data_message(self, message: Any) -> None:
         try:
@@ -690,6 +773,8 @@ class FyersStreamManager:
             if isinstance(message, dict) and (message.get("type") == "dp" or "bid_price1" in message):
                 self._on_depth_message(message)
                 return
+            if isinstance(message, dict) and "symbol" not in message and message.get("type") in _CONTROL_FRAMES:
+                return  # connect / subscribe / unsubscribe acks carry no price
             if not isinstance(message, dict):
                 self._drop_count += 1
                 if self._drop_count <= self._UNMAPPED_LOG_CAP:
