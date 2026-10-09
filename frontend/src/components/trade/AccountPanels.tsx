@@ -971,7 +971,7 @@ export function ExitPositionDialog({
         <input className="cform-input" type="number" min={pos.lot} step={pos.lot} max={abs} value={qty} onChange={(e) => setQty(e.target.value)} aria-label="Exit quantity" data-testid="exit-qty" />
         <span className="am-qty-btns">
           {[0.25, 0.5, 1].map((f) => (
-            <button key={f} type="button" className="btn-sm" onClick={() => setQty(String(Math.max(pos.lot, Math.round((abs * f) / pos.lot) * pos.lot)))}>{f === 1 ? "All" : `${f * 100}%`}</button>
+            <button key={f} type="button" className="btn-sm" onClick={() => setQty(String(f === 1 ? abs : Math.min(abs, Math.max(pos.lot, Math.round((abs * f) / pos.lot) * pos.lot))))}>{f === 1 ? "All" : `${f * 100}%`}</button>
           ))}
         </span>
       </Row>

@@ -292,6 +292,11 @@ class ManagedPosition:
         return (exit_price - self.entry) * self.quantity
 
 
+# Exits the operator (or the EOD square-off) asked for: they flatten whatever
+# is open, even a position reversed by hand since it was booked.
+_OPERATOR_EXITS = ("MANUAL", "SQUARE_OFF", "EOD_SQUAREOFF")
+
+
 def _default_session_factory() -> Callable[[], Any]:
     from app.db.session import SessionLocal
     return SessionLocal
@@ -575,6 +580,54 @@ class TradeManager:
             self._ensure_tick_listener(symbol)
         log.info("trade_manager.hydrated", managed=len(self._book))
 
+    async def _follow_row(
+        self, symbol: str, mp: ManagedPosition, *, in_book: bool = True
+    ) -> Optional[ManagedPosition]:
+        """Bring a managed position in line with its position row.
+
+        Manual orders (a partial exit, an add, a reverse from the Trade
+        page) update the row but not this book. Left alone, the next stop
+        would exit the OLD quantity: on a live account that oversells into a
+        naked position. Returns the position to keep managing, or None when
+        the row is flat (closed by hand; nothing left to exit). A row that is
+        missing leaves the book as it is.
+        """
+        state = await asyncio.get_running_loop().run_in_executor(
+            None, _position_row_state, self._session_factory, symbol
+        )
+        if state is None:
+            return mp
+        qty, avg = state
+        if qty == mp.quantity:
+            return mp
+        if qty == 0:
+            async with self._lock:
+                if in_book and self._book.get(symbol) is mp:
+                    self._book.pop(symbol, None)
+            log.info("trade_manager.closed_manually", symbol=symbol, local_qty=mp.quantity)
+            return None
+        if (qty > 0) != (mp.quantity > 0):
+            # Reversed: a new position on the other side, with no levels yet.
+            fresh = ManagedPosition(
+                symbol=symbol, quantity=qty, entry=avg, stop_loss=None, target=None,
+                strategy_id=mp.strategy_id, broker_account_id=mp.broker_account_id,
+                scale_out_enabled=mp.scale_out_enabled, scale_out_r=mp.scale_out_r,
+                trail_activate_r=mp.trail_activate_r, trail_distance_r=mp.trail_distance_r,
+            )
+            async with self._lock:
+                if in_book and self._book.get(symbol) is mp:
+                    self._book[symbol] = fresh
+            await asyncio.get_running_loop().run_in_executor(
+                None, _persist_position_levels, self._session_factory, symbol, None, None,
+            )
+            log.warning("trade_manager.reversed_manually", symbol=symbol, local_qty=mp.quantity, qty=qty)
+            return fresh
+        log.info("trade_manager.resized_manually", symbol=symbol, local_qty=mp.quantity, qty=qty)
+        mp.quantity = qty
+        if avg > 0:
+            mp.entry = avg
+        return mp
+
     def managed_positions(self) -> list[ManagedPosition]:
         return list(self._book.values())
 
@@ -762,6 +815,11 @@ class TradeManager:
                 None, _mark_to_market, self._session_factory, symbol, last
             )
             mp = book.get(symbol)
+            if mp is not None:
+                # Under the check lock: an exit / scale-out in flight writes
+                # the row before it updates the book.
+                async with self._check_lock(symbol):
+                    mp = await self._follow_row(symbol, mp)
             if mp is not None:
                 # Backstop: the tick listener normally evaluates every
                 # tick in realtime; the sweep re-runs the same check so
@@ -1082,6 +1140,20 @@ class TradeManager:
         mp = mp or booked
         if mp is None:
             return None
+        if route and booked is not None and reason != "CLOSED_EXTERNAL":
+            # A manual order may have resized / closed / reversed this
+            # position since the book last looked: exit what is really open.
+            # (A position just rebuilt from its row is already current.)
+            synced = await self._follow_row(symbol, mp, in_book=False)
+            if synced is None:
+                return None
+            if synced is not mp and reason not in _OPERATOR_EXITS:
+                # Reversed by hand: the old stop / target were for the other
+                # side. Keep managing the new position; don't fire on them.
+                async with self._lock:
+                    self._book.setdefault(symbol, synced)
+                return None
+            mp = synced
         settle_price = float(exit_price)
         broker_order_id: Optional[str] = None
         # LIVE positions flatten at the BROKER first — the local settle
@@ -1724,6 +1796,19 @@ def _row_exit_fallback(
         return None
 
 
+def _position_row_state(
+    session_factory: Callable[[], Any], symbol: str
+) -> Optional[tuple[int, float]]:
+    """(quantity, average_price) of the symbol's position row, or None."""
+    from app.db.models import Position as PositionRow
+
+    with session_factory() as session:
+        pos = session.query(PositionRow).filter_by(symbol=symbol).one_or_none()
+        if pos is None:
+            return None
+        return int(pos.quantity or 0), float(pos.average_price or 0.0)
+
+
 def _mark_to_market(
     session_factory: Callable[[], Any], symbol: str, last_price: float
 ) -> None:
@@ -1737,10 +1822,16 @@ def _mark_to_market(
         pos = session.query(PositionRow).filter_by(symbol=symbol).one_or_none()
         if pos is None or pos.quantity == 0 or last_price <= 0:
             return
-        if pos.last_price is not None and abs(float(pos.last_price) - float(last_price)) < 0.01:
+        pnl = (float(last_price) - float(pos.average_price)) * pos.quantity
+        if (
+            pos.last_price is not None
+            and abs(float(pos.last_price) - float(last_price)) < 0.01
+            and pos.unrealized_pnl is not None
+            and abs(float(pos.unrealized_pnl) - pnl) < 0.01
+        ):
             return  # unchanged — skip the write
         pos.last_price = float(last_price)
-        pos.unrealized_pnl = (float(last_price) - float(pos.average_price)) * pos.quantity
+        pos.unrealized_pnl = pnl
         session.commit()
 
 
@@ -1916,6 +2007,8 @@ def _persist_position_quantity(
         if pos is None:
             return
         pos.quantity = int(quantity)
+        if pos.last_price is not None and pos.average_price is not None:
+            pos.unrealized_pnl = (float(pos.last_price) - float(pos.average_price)) * pos.quantity
         session.commit()
 
 
@@ -1998,5 +2091,6 @@ def _partial_settle(
         if pos is not None:
             pos.quantity = int(pos.quantity) - int(closed_signed)
             pos.last_price = float(exit_price)
+            pos.unrealized_pnl = (float(exit_price) - float(pos.average_price)) * pos.quantity
             pos.stop_loss = mp.entry  # breakeven on the remainder
         session.commit()
