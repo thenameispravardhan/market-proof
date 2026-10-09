@@ -755,6 +755,34 @@ describe("Trade page", () => {
     expect(screen.getByTestId("ticket-qty").textContent).toContain("1500 qty");
   });
 
+  it("layout: a reload keeps each cell's chart (the last symbol goes back to its own cell)", async () => {
+    const eq = (sym: string, name: string) => ({ symbol: sym, short_name: name, exchange: "NSE", segment: "EQ", instrument_type: "EQ", lot_size: 1, tick_size: 0.05, expiry: null, strike: null, underlying: null, display: name });
+    const tcs = eq("NSE:TCS-EQ", "TCS"), infy = eq("NSE:INFY-EQ", "INFY");
+    localStorage.setItem("trade:layout", JSON.stringify("2"));
+    localStorage.setItem("trade:cells", JSON.stringify([tcs, infy]));
+    localStorage.setItem("trade:activeCell", JSON.stringify(1));
+    localStorage.setItem("trade:last", JSON.stringify(infy));
+    globalThis.fetch = makeFetchStub(defaultStubs());
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await screen.findByTestId("tv-cell-1");
+    const cells = JSON.parse(localStorage.getItem("trade:cells") ?? "[]");
+    expect(cells.map((c: { symbol: string } | null) => c?.symbol)).toEqual(["NSE:TCS-EQ", "NSE:INFY-EQ"]);
+  });
+
+  it("layout menu closes on Escape and on a click outside it", async () => {
+    globalThis.fetch = makeFetchStub(defaultStubs());
+    const user = userEvent.setup();
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await user.click(await screen.findByTestId("rail-layout"));
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    await user.click(screen.getByTestId("rail-layout"));
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    await user.click(screen.getByTestId("trade-search"));
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+  });
+
   it("ticket: F&O asks for lots; SL / target as price, points or %", async () => {
     const posts: Record<string, unknown>[] = [];
     const stubs = defaultStubs();
