@@ -11,7 +11,7 @@ const pos = (o: Partial<Position>): Position => ({
   strategy_id: null, product: "INTRADAY", lot_size: 1, opened_at: now, updated_at: now, ...o,
 });
 
-function renderManager(positions: Position[]) {
+function renderManager(positions: Position[], extra: Partial<Parameters<typeof AccountManager>[0]> = {}) {
   vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify([]))));
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const noop = () => {};
@@ -22,6 +22,7 @@ function renderManager(positions: Position[]) {
         onCancel={noop} cancelBusyId={null} accountId={null} privacy={false} connected={false}
         accountLabel="Paper" selected={null} closeFor={() => async () => {}} levelsFor={() => async () => {}}
         orderFor={() => async () => "ok"} qty={1} onQty={noop} onMaximize={noop} maximized={false} onCollapse={noop}
+        {...extra}
       />
     </QueryClientProvider>,
   );
@@ -60,5 +61,28 @@ describe("Positions panel", () => {
     expect(screen.getByText(/multiple of the lot size \(30\)/)).toBeTruthy();
     fireEvent.change(screen.getByTestId("exit-qty"), { target: { value: "30" } });
     expect(screen.queryByText(/multiple of the lot size/)).toBeNull();
+  });
+
+  it("a partial exit of a carry position is sent with that position's product", async () => {
+    const orderFor = vi.fn((..._a: unknown[]) => async () => "ok");
+    renderManager([pos({ product: "DELIVERY" })], { orderFor });
+    fireEvent.click(screen.getByTestId("exit-NSE:SBIN-EQ"));
+    fireEvent.change(screen.getByTestId("exit-qty"), { target: { value: "4" } });
+    fireEvent.click(screen.getByTestId("exit-position-ok"));
+    await waitFor(() => expect(orderFor).toHaveBeenCalledWith("NSE:SBIN-EQ", "NSE:SBIN-EQ", 4, "DELIVERY"));
+  });
+
+  it("an SL that is not a price is refused, and one already through the market asks first", async () => {
+    const levelsFor = vi.fn(() => async () => {});
+    renderManager([pos({})], { levelsFor });
+    vi.stubGlobal("prompt", vi.fn(() => "0"));
+    fireEvent.click(screen.getByText("+ SL"));
+    expect(screen.getByText(/not a price/)).toBeTruthy();
+    vi.stubGlobal("prompt", vi.fn(() => "130"));
+    const confirm = vi.fn((_m: string) => false);
+    vi.stubGlobal("confirm", confirm);
+    fireEvent.click(screen.getByText("+ SL"));
+    expect(confirm.mock.calls[0][0]).toMatch(/above the last price/);
+    expect(levelsFor).not.toHaveBeenCalled();
   });
 });

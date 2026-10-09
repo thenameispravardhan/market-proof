@@ -5,7 +5,7 @@
 // named-layout manager (save / load / autosave).
 
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
-import type { InstrumentHit, PendingOrder, Position } from "../../types";
+import type { InstrumentHit, PendingOrder, Position, ProductType } from "../../types";
 import { useQueryClient } from "@tanstack/react-query";
 import { peekQuote, useLiveQuote, useQuoteTick } from "../../hooks/useQuotes";
 import { announceOrderChange } from "../../hooks/useApi";
@@ -501,6 +501,11 @@ function LiveTotalPnl({ open, privacy, testid }: { open: Position[]; privacy: bo
 const isFnoSymbol = (sym: string) => !/-(EQ|BE|INDEX)$/i.test(sym);
 export const convertTarget = (p: { symbol: string; product?: string }) =>
   (p.product ?? "INTRADAY") !== "INTRADAY" ? "INTRADAY" : isFnoSymbol(p.symbol) ? "MARGIN" : "DELIVERY";
+/** A Fyers product (CNC / NRML / MIS or ours) as the order API's product. */
+export const orderProduct = (product: string | null | undefined): ProductType => {
+  const p = (product ?? "").toUpperCase();
+  return p === "DELIVERY" || p === "CNC" ? "DELIVERY" : p === "MARGIN" || p === "NRML" ? "MARGIN" : "INTRADAY";
+};
 const convertTitle = (p: { symbol: string; product?: string }) =>
   convertTarget(p) === "INTRADAY" ? "Convert back to intraday — it will be squared off before the close" : "Convert to carry-forward — the EOD square-off will leave it open";
 
@@ -545,7 +550,7 @@ export function AccountManager({
   selected: InstrumentHit | null;
   closeFor: (sym: string) => () => Promise<void>;
   levelsFor: (sym: string) => (sl: number | null, tp: number | null) => Promise<void>;
-  orderFor: (sym: string, name: string, qty: number) => (o: ChartOrder) => Promise<string>;
+  orderFor: (sym: string, name: string, qty: number, product?: ProductType) => (o: ChartOrder) => Promise<string>;
   instant?: boolean;
   /** The ticket quantity (shared with the DOM). */
   qty: number;
@@ -647,7 +652,18 @@ export function AccountManager({
     const v = window.prompt(`${which} for ${sym} (blank clears)`, cur != null ? String(cur) : "");
     if (v === null) return;
     const n = v.trim() === "" ? null : Number(v);
-    if (n !== null && !Number.isFinite(n)) return;
+    if (n !== null && !(Number.isFinite(n) && n > 0)) {
+      setMsg(`${which} for ${sym} not changed: "${v}" is not a price`);
+      return;
+    }
+    // A level already through the market fires the exit on the next tick.
+    const pos = open.find((p) => p.symbol === sym);
+    const ltp = peekQuote(sym)?.last_price ?? pos?.last_price ?? null;
+    if (n !== null && pos && ltp != null) {
+      const long = pos.quantity > 0;
+      const through = which === "SL" ? (long ? n >= ltp : n <= ltp) : long ? n <= ltp : n >= ltp;
+      if (through && !window.confirm(`${which} ${fmt(n)} is already ${long === (which === "SL") ? "above" : "below"} the last price ${fmt(ltp)} — the position will exit at once. Set it anyway?`)) return;
+    }
     void run(`Exits ${sym}`, () => levelsFor(sym)(which === "SL" ? n : sl, which === "TP" ? n : tp));
   }
   const domPos = selected ? open.find((p) => p.symbol === selected.symbol) : undefined;
@@ -664,7 +680,7 @@ export function AccountManager({
         <span className="am-status">
           <span className={`lg-dot ${connected ? "open" : "closed"}`} /> <span data-testid="am-account-line">{acctText}</span>
           {funds.data?.available != null && <> · Funds <b>{money(funds.data.available)}</b></>}
-          {open.length > 0 && <> · P&L <LiveTotalPnl open={open} privacy={privacy} testid="am-total-pnl" /></>}
+          {open.length > 0 && <> · Open P&L <LiveTotalPnl open={open} privacy={privacy} testid="am-total-pnl" /></>}
         </span>
         <AccountMenu connected={connected} onLogout={onLogout} onTab={(t) => onTab(t)} onRefresh={() => { book.reload(); trades.reload(); funds.reload(); fundsFull.reload(); holdings.reload(); gtt.reload(); profile.reload(); setMsg("Account data refreshed"); }} />
         <button type="button" className="tab tv-collapse" onClick={onMaximize} title={maximized ? "Restore panel" : "Maximize panel"}>{maximized ? "❐" : "⬚"}</button>
@@ -716,10 +732,10 @@ export function AccountManager({
               }
               actions={(p) => !p.quantity ? null : (
                 <>
-                  <button type="button" className="btn-sm" title="Reverse at market" onClick={() => {
+                  <button type="button" className="btn-sm" title="Reverse at market" aria-label={`Reverse ${p.symbol}`} onClick={() => {
                     const q = Math.abs(p.quantity) * 2;
-                    if (window.confirm(`Reverse ${p.symbol}: ${p.quantity > 0 ? "SELL" : "BUY"} ${q} at market?`)) {
-                      void run(`Reverse ${p.symbol}`, () => orderFor(p.symbol, p.symbol, q)({ side: p.quantity > 0 ? "SELL" : "BUY", type: "MARKET", price: null }));
+                    if (window.confirm(`Reverse ${p.symbol}: ${p.quantity > 0 ? "SELL" : "BUY"} ${q} at market? You will end up ${p.quantity > 0 ? "SHORT" : "LONG"} ${Math.abs(p.quantity)}.`)) {
+                      void run(`Reverse ${p.symbol}`, () => orderFor(p.symbol, p.symbol, q, orderProduct(productOf(p)))({ side: p.quantity > 0 ? "SELL" : "BUY", type: "MARKET", price: null }));
                     }
                   }}>⇅</button>
                   <button type="button" className="btn-sm" title={convertTitle(p)} data-testid={`convert-${p.symbol}`} onClick={() => {
@@ -735,14 +751,14 @@ export function AccountManager({
                       });
                     }
                   }}>{(p.product ?? "INTRADAY") === "INTRADAY" ? "→ Carry" : "→ Intraday"}</button>
-                  <button type="button" className="btn-sm danger" title="Exit — full or partial, market or limit" onClick={() => setExit({ pos: { symbol: p.symbol, name: p.symbol, qty: p.quantity, avg: p.average_price, ltp: p.last_price, lot: lotOf(p.symbol) }, local: true })} data-testid={`exit-${p.symbol}`}>Exit</button>
+                  <button type="button" className="btn-sm danger" title="Exit — full or partial, market or limit" onClick={() => setExit({ pos: { symbol: p.symbol, name: p.symbol, qty: p.quantity, avg: p.average_price, ltp: p.last_price, lot: lotOf(p.symbol), product: productOf(p) }, local: true })} data-testid={`exit-${p.symbol}`}>Exit</button>
                 </>
               )}
             />
           </section>
         )}
         {tab === "allpositions" && (
-          <AllPositionsPanel book={book.data} privacy={privacy} onExit={(p) => setExit({ pos: { symbol: p.symbol, name: p.symbol, qty: p.net_qty, avg: p.avg_price, ltp: p.ltp, lot: lotOf(p.symbol) }, local: false })} />
+          <AllPositionsPanel book={book.data} privacy={privacy} onExit={(p) => setExit({ pos: { symbol: p.symbol, name: p.symbol, qty: p.net_qty, avg: p.avg_price, ltp: p.ltp, lot: lotOf(p.symbol), product: p.product }, local: false })} />
         )}
         {tab === "orders" && (
           <OrdersTable rows={rows} privacy={privacy} onCancel={onCancel} cancelBusyId={cancelBusyId} onModify={setModify} banner={cancelBanner} live={!!book.data?.ok} />
@@ -804,7 +820,7 @@ export function AccountManager({
           pos={exit.pos}
           onClose={() => setExit(null)}
           onExit={async (q, o, full) => {
-            const r = full && exit.local ? await closeFor(exit.pos.symbol)().then(() => `Closed ${exit.pos.symbol} at market`) : await orderFor(exit.pos.symbol, exit.pos.name, q)(o);
+            const r = full && exit.local ? await closeFor(exit.pos.symbol)().then(() => `Closed ${exit.pos.symbol} at market`) : await orderFor(exit.pos.symbol, exit.pos.name, q, orderProduct(exit.pos.product))(o);
             setMsg(`Exit ${exit.pos.symbol}: ${r}`);
             book.reload();
             return r;
