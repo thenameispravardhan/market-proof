@@ -9,10 +9,13 @@ import {
   parseBasketCsv,
   symbolParts,
   tradedQty,
+  tradedRows,
   type BrokerBook,
   type TradeRow,
 } from "../components/trade/AccountPanels";
 import { ladderKeys } from "../components/trade/DomPanel";
+import { buildRoundTrips } from "../lib/roundtrips";
+import type { Trade } from "../types";
 import type { PendingOrder } from "../types";
 
 const pending = (p: Partial<PendingOrder>): PendingOrder => ({
@@ -161,5 +164,27 @@ describe("DOM ladder rows", () => {
   });
   it("can drop prices nothing traded at", () => {
     expect(ladderKeys(100, 3, { between: true, zeroVol: false }, info)).toEqual([110, 101, 96]);
+  });
+});
+
+describe("trade history", () => {
+  it("keeps fills crowded out of the all-status feed and partly filled orders", () => {
+    const fill = trade({ id: 1 });
+    const partly = trade({ id: 2, status: "cancelled", filled_qty: 3, executed_at: "2026-10-04T04:10:00Z" });
+    const rejected = trade({ id: 3, status: "rejected", executed_at: null });
+    // the all-status window holds only rejects + the partial; the fill is in the filled feed
+    const rows = tradedRows([partly, rejected], [fill]);
+    expect(rows.map((t) => t.id)).toEqual([2, 1]);
+    expect(tradedRows([fill], [fill])).toHaveLength(1);
+  });
+
+  it("counts an exit leg whose entry is missing as closed, not as an open short", () => {
+    const exit = { ...trade({ id: 5, side: "SELL", quantity: 10, price: 610, pnl: 100 }), broker_account_id: null } as unknown as Trade;
+    const [r, ...rest] = buildRoundTrips([exit], new Map());
+    expect(rest).toHaveLength(0);
+    expect(r.open).toBe(false);
+    expect(r.side).toBe("BUY");
+    expect(r.pnl).toBe(100);
+    expect(r.entryPrice).toBeNull();
   });
 });
