@@ -89,19 +89,33 @@ export function ActivePositions() {
   const closeOne = useClosePosition();
   const closeAll = useCloseAllPositions();
   const [busy, setBusy] = useState<string | null>(null);
+  const [closeError, setCloseError] = useState<string | null>(null);
 
   const open = (data ?? []).filter((p) => p.quantity !== 0);
   const managedBy = new Map((managed ?? []).map((m) => [m.symbol, m]));
 
+  // Both buttons send market orders (real ones in live mode), so each asks
+  // first, and a failure is shown instead of silently leaving the row open.
   const onClose = async (symbol: string) => {
+    if (!window.confirm(`Close your ${symbol} position at market price?`)) return;
     setBusy(symbol);
+    setCloseError(null);
     try {
       await closeOne.mutateAsync(symbol);
-    } catch {
-      /* surfaced via react-query; ignore here */
+    } catch (e) {
+      setCloseError(`Could not close ${symbol}: ${(e as Error).message}`);
     } finally {
       setBusy(null);
     }
+  };
+
+  const onCloseAll = () => {
+    const n = open.length;
+    if (!window.confirm(`Close all ${n} open position${n === 1 ? "" : "s"} at market price?`)) return;
+    setCloseError(null);
+    closeAll.mutate(undefined, {
+      onError: (e) => setCloseError(`Could not square off: ${(e as Error).message}`),
+    });
   };
 
   return (
@@ -111,7 +125,7 @@ export function ActivePositions() {
         {open.length > 0 && (
           <button
             className="btn-sm danger"
-            onClick={() => closeAll.mutate()}
+            onClick={onCloseAll}
             disabled={closeAll.isPending}
             title="Square off every open position at market"
           >
@@ -119,6 +133,11 @@ export function ActivePositions() {
           </button>
         )}
       </h3>
+      {closeError && (
+        <p className="empty pnl-neg" role="alert">
+          {closeError}
+        </p>
+      )}
       {isLoading ? (
         <SkeletonList rows={3} />
       ) : error ? (

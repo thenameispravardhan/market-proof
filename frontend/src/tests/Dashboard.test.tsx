@@ -41,7 +41,7 @@ describe("Dashboard", () => {
     vi.restoreAllMocks();
   });
 
-  it("renders all 4 widgets and shows announcement data when the API responds", async () => {
+  it("renders the dashboard widgets (no Risk Metrics) and shows announcement data when the API responds and shows announcement data when the API responds", async () => {
     globalThis.fetch = makeFetchStub((url) => {
       if (url.includes("/api/announcements/recent")) {
         return makeJsonResponse([
@@ -72,10 +72,10 @@ describe("Dashboard", () => {
     });
     render(<Dashboard />, { wrapper: wrapper(qc) });
 
-    // All four widgets render with their testids.
+    // The widgets render with their testids; Risk Metrics was removed.
     expect(screen.getByTestId("news-pipeline")).toBeInTheDocument();
     expect(screen.getByTestId("active-positions")).toBeInTheDocument();
-    expect(screen.getByTestId("risk-metrics")).toBeInTheDocument();
+    expect(screen.queryByTestId("risk-metrics")).not.toBeInTheDocument();
     expect(screen.getByTestId("pnl-chart")).toBeInTheDocument();
 
     // The pipeline widget shows the symbol from the mock.
@@ -99,37 +99,16 @@ describe("Dashboard", () => {
     });
   });
 
-  it("surfaces today's realised P&L in the RiskMetrics widget when trades are present", async () => {
-    const today = new Date();
-    const todayIso = today.toISOString();
-
+  it("shows today's P&L in rupees in the stat row from the summary endpoint", async () => {
     globalThis.fetch = makeFetchStub((url) => {
-      if (url.includes("/api/trades")) {
-        return makeJsonResponse([
-          {
-            id: 1,
-            signal_id: 1,
-            broker_account_id: 1,
-            symbol: "TCS",
-            side: "BUY",
-            quantity: 10,
-            price: 100,
-            order_type: "market",
-            status: "filled",
-            broker_order_id: "x",
-            pnl: 42.5,
-            executed_at: todayIso,
-            created_at: todayIso,
-          },
-        ]);
+      if (url.includes("/api/dashboard/summary")) {
+        return makeJsonResponse({
+          open_positions: 2,
+          todays_realized_pnl: 1234.5,
+          todays_unrealized_pnl: -42.25,
+          pnl_series: [],
+        });
       }
-      if (url.includes("/api/positions")) return makeJsonResponse([
-        {
-          id: 1, symbol: "TCS", quantity: 10, average_price: 100, last_price: 104.25,
-          unrealized_pnl: 42.5, strategy_id: null, opened_at: todayIso, updated_at: todayIso,
-        },
-      ]);
-      if (url.includes("/api/dashboard/summary")) return makeJsonResponse({}, 404);
       return makeJsonResponse([], 404);
     });
 
@@ -138,14 +117,42 @@ describe("Dashboard", () => {
     });
     render(<Dashboard />, { wrapper: wrapper(qc) });
 
-    // Wait for the RiskMetrics widget to finish loading (its "Hard
-    // rules" metric is the last thing to render). The dashboard also
-    // shows a summary stat row, so some labels appear more than once.
-    await waitFor(() => {
-      expect(screen.getByText("Hard rules")).toBeInTheDocument();
+    expect(await screen.findByText("+₹1,234.50")).toBeInTheDocument();
+    expect(screen.getByText("−₹42.25")).toBeInTheDocument();
+    expect(screen.getByText("2")).toBeInTheDocument();
+  });
+
+  it("asks before squaring off and does nothing when cancelled", async () => {
+    const posts: string[] = [];
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (init?.method === "POST") {
+        posts.push(url);
+        return makeJsonResponse({ ok: true });
+      }
+      if (url.includes("/api/positions/managed")) return makeJsonResponse([]);
+      if (url.includes("/api/positions")) {
+        return makeJsonResponse([
+          {
+            id: 1, symbol: "TCS", quantity: 10, average_price: 100, last_price: 104,
+            unrealized_pnl: 40, strategy_id: null, opened_at: null, updated_at: null,
+          },
+        ]);
+      }
+      return makeJsonResponse([], 404);
+    }) as unknown as typeof fetch;
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false, refetchInterval: false } },
     });
-    expect(screen.getAllByText("Open positions").length).toBeGreaterThan(0);
-    expect(screen.getAllByText(/Realised P&L \(today\)/).length).toBeGreaterThan(0);
+    render(<Dashboard />, { wrapper: wrapper(qc) });
+
+    (await screen.findByText("Square off all")).click();
+    expect(confirmSpy).toHaveBeenCalledWith("Close all 1 open position at market price?");
+    screen.getByText("Close").click();
+    expect(confirmSpy).toHaveBeenCalledWith("Close your TCS position at market price?");
+    expect(posts).toEqual([]);
   });
 
   it("renders the AI Analysis toggle and PUTs AI_ANALYSIS_ENABLED=false on click", async () => {
