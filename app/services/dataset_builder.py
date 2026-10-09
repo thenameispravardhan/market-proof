@@ -704,6 +704,11 @@ class DatasetBuilder:
             progress["running"] = False
             progress["finished_at"] = _utcnow_naive().isoformat()
             self._include_stale = False  # rebuild is a one-shot
+            # A status poll that landed before remaining_start was set cached
+            # the PRE-run pending count. Left alone, the page kept saying
+            # "N rows await enrichment" for up to 30s after the run had
+            # drained them all.
+            self._pending_cache = None
             log.info("dataset_builder.full_backfill_done", **{
                 k: v for k, v in progress.items() if isinstance(v, int)
             })

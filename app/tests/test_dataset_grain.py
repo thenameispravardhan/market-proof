@@ -105,3 +105,37 @@ def test_signal_only_filters_are_rejected_not_ignored(client, store, bad):
 
     r_export = client.get(f"/api/dataset/export?source=announcements&{bad}")
     assert r_export.status_code == 422, f"export accepted and ignored {bad}"
+
+
+def test_train_and_val_exports_are_a_chronological_split(client, store):
+    """The Train/Val buttons sent split=train|val and the announcement branch
+    ignored it, so both downloaded the same full file."""
+    for i in range(10):
+        W.ingest_live(symbol=f"S{i}", headline=f"filing {i}",
+                      announced_at=f"2026-07-{10 + i} 10:00:00", exchange="NSE")
+
+    def symbols(split):
+        r = client.get("/api/dataset/export?source=announcements&format=csv"
+                       f"&columns=symbol,announced_at&split={split}&split_ratio=0.8")
+        assert r.status_code == 200, r.text
+        assert f"_{split}.csv" in r.headers["content-disposition"]
+        return {line.split(",")[0] for line in r.text.strip().splitlines()[1:]}
+
+    train, val = symbols("train"), symbols("val")
+    assert train and val
+    assert not train & val, "a row landed in both train and val"
+    assert train | val == {f"S{i}" for i in range(10)}
+    assert "S9" in val and "S0" in train, "split is not chronological"
+
+
+def test_health_reports_the_announcement_columns(client, store):
+    """The health panel used to describe the SIGNAL dataset on a page that
+    shows announcements."""
+    W.ingest_live(symbol="ACME", headline="x", announced_at="2026-07-29 10:00:00",
+                  exchange="NSE")
+    body = client.get("/api/dataset/health?source=announcements&target=nope").json()
+    keys = {c["key"] for c in body["columns"]}
+    catalog = client.get("/api/dataset/columns?source=announcements").json()
+    assert keys == {c["key"] for c in catalog["columns"]}
+    assert body["target"] in body["targets"]
+    assert body["rows_sampled"] == 1
