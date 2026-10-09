@@ -876,7 +876,7 @@ def dataset_export(
         path = announcement_export_path(
             kind, columns=_split_columns(columns), symbol=symbol,
             event_type=event_type, since=since, until=until,
-            enriched_only=enriched_only)
+            enriched_only=enriched_only, split=split, split_ratio=split_ratio)
         stamp = datetime.utcnow().strftime("%Y%m%d")
         ext = {"csv": "csv", "jsonl": "jsonl", "parquet": "parquet"}[format]
 
@@ -898,7 +898,9 @@ def dataset_export(
                         "jsonl": "application/x-ndjson",
                         "parquet": "application/vnd.apache.parquet"}[format],
             headers={
-                "Content-Disposition": f"attachment; filename=announcements_{stamp}.{ext}",
+                "Content-Disposition": (
+                    f"attachment; filename=announcements_{stamp}"
+                    f"{'_' + split if split else ''}.{ext}"),
                 "Content-Length": str(path.stat().st_size),
             },
         )
@@ -980,13 +982,16 @@ def _as_number(v: Any) -> Optional[float]:
 def dataset_health(
     target: str = Query("ret_15m_pct"),
     limit: int = Query(5000, ge=10, le=20000),
-    source: str = Query("all", pattern="^(all|signal|shadow)$"),
+    source: str = Query("all", pattern="^(all|signal|shadow|announcements)$"),
     enriched_only: bool = Query(False),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """Per-column health over the (sampled) dataset: null rate, basic
     stats, and correlation with the chosen target. A FEATURE correlating
     ~1.0 with the target is look-ahead leakage, not alpha — flagged."""
+    if source == "announcements":
+        from app.api.warehouse import announcement_health
+        return announcement_health(target)
     if target not in _VALID_KEYS:
         target = "ret_15m_pct"
     result = _dataset_rows(

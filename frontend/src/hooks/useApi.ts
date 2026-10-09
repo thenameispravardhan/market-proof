@@ -1260,13 +1260,21 @@ export interface DatasetHealth {
   target: string;
   rows_sampled: number;
   columns: DatasetHealthColumn[];
+  /** Numeric label columns this grain offers as a target (announcements only). */
+  targets?: string[];
 }
 
-export function useDatasetHealth(target: string, enabled: boolean) {
+export function useDatasetHealth(
+  target: string,
+  enabled: boolean,
+  source: DatasetSource | "all" = "all",
+) {
   return useQuery<DatasetHealth>({
-    queryKey: ["dataset-health", target],
+    queryKey: ["dataset-health", source, target],
     queryFn: () =>
-      api.get(`/api/dataset/health?target=${encodeURIComponent(target)}`),
+      api.get(
+        `/api/dataset/health?source=${source}&target=${encodeURIComponent(target)}`,
+      ),
     enabled,
     refetchInterval: 60000,
   });
