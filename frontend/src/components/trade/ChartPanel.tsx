@@ -94,11 +94,13 @@ import {
 import {
   INDICATOR_BY_TYPE,
   argsLabel,
+  cloneInstances,
   instanceDefaults,
   instanceTitle,
   migrateActive,
   newInstance,
   newUid,
+  sanitizeInputs,
   sanitizeInstance,
   visibleOnInterval,
   type IndicatorInstance,
@@ -2110,7 +2112,9 @@ export default function ChartPanel(props: ChartPanelProps) {
       for (const sym of symbolInputs(def, inst.inputs)) ensureOther(sym);
       let res;
       try {
-        res = def.compute(view, inst.inputs, ctxC);
+        // inputs are validated on load / edit; re-check so a value typed
+        // mid-edit can never hand compute() a length of 0 or a stray string
+        res = def.compute(view, sanitizeInputs(def, inst.inputs), ctxC);
       } catch {
         continue;
       }
@@ -4916,7 +4920,7 @@ export default function ChartPanel(props: ChartPanelProps) {
 
   function applyIndTemplate(t: IndicatorTemplate): void {
     setMenuOpen(null);
-    const items = t.items.map((i) => sanitizeInstance({ ...i, uid: newUid() })).filter(Boolean) as IndicatorInstance[];
+    const items = cloneInstances(t.items);
     setIndicators(items, "apply template");
     const iv2 = t.interval && parseInterval(t.interval) ? t.interval : null;
     if (iv2 && iv2 !== ivRef.current) changeInterval(iv2);

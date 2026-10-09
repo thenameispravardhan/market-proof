@@ -46,7 +46,8 @@ def _zip(fn: Callable[..., float], *cols: S) -> S:
 
 
 def shift(x: S, n: int) -> S:
-    return ([None] * n + x[:-n]) if n > 0 else list(x)
+    """x delayed by n bars (same length; n > len(x) is all None)."""
+    return ([None] * n + list(x))[:len(x)] if n > 0 else list(x)
 
 
 # ---- moving averages -------------------------------------------------------
@@ -243,9 +244,11 @@ def supertrend(d: dict, n: int, mult: float) -> dict[str, S]:
         if up is not None:
             bu = max(bu, up) if c[i - 1] > up else bu
             bd = min(bd, dn) if c[i - 1] < dn else bd
-            if trend == -1 and c[i] > dn:
+            # the flip compares the close with THIS bar's bands (TradingView),
+            # not the previous bar's — those lag a bar behind the chart
+            if trend == -1 and c[i] > bd:
                 trend = 1
-            elif trend == 1 and c[i] < up:
+            elif trend == 1 and c[i] < bu:
                 trend = -1
         up, dn = bu, bd
         val[i] = up if trend == 1 else dn
@@ -741,22 +744,52 @@ REGISTRY: dict[str, tuple[Callable[..., Any], dict[str, Any], list[str], str]] =
 SOURCES = ("close", "open", "high", "low", "hl2", "hlc3", "ohlc4", "volume", "range")
 
 
-def compute(d: dict, name: str, params: dict[str, Any]) -> dict[str, S]:
-    """One indicator over one symbol's bars -> {field: series}."""
+# Upper bounds for the few params that are not bar counts.
+_PARAM_MAX = {"value_area": 100, "maximum": 1.0, "start": 1.0, "increment": 1.0}
+MAX_PERIOD = 5000
+
+
+def normalize_params(name: str, params: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Defaults merged with `params`, each coerced to its type and range-checked.
+    Raises ValueError naming the bad param, so a strategy is rejected when it is
+    saved rather than failing (or silently computing nonsense) when it runs."""
     if name not in REGISTRY:
         raise ValueError(f"unknown indicator {name!r}")
-    fn, defaults, outputs, _ = REGISTRY[name]
+    defaults = REGISTRY[name][1]
+    if params is not None and not isinstance(params, dict):
+        raise ValueError(f"{name}: params must be an object")
+    # keys the indicator doesn't take are ignored (older saved specs carry some)
     p = {**defaults, **{k: v for k, v in (params or {}).items() if k in defaults}}
     for k, v in p.items():
         if k == "source":
             if v not in SOURCES:
                 raise ValueError(f"{name}: unknown source {v!r}")
-        elif isinstance(defaults[k], int):
-            p[k] = int(v)
-            if p[k] < 1:
-                raise ValueError(f"{name}: {k} must be >= 1")
+            continue
+        if isinstance(v, bool) or v is None or v == "":
+            raise ValueError(f"{name}: {k} must be a number")
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            raise ValueError(f"{name}: {k} must be a number, got {v!r}") from None
+        if not math.isfinite(f):
+            raise ValueError(f"{name}: {k} must be a finite number")
+        if isinstance(defaults[k], int):
+            p[k] = int(round(f))         # an optimiser grid may step by 2.5
+            hi = _PARAM_MAX.get(k, MAX_PERIOD)
+            if not 1 <= p[k] <= hi:
+                raise ValueError(f"{name}: {k} must be between 1 and {hi}")
         else:
-            p[k] = float(v)
+            p[k] = f
+            hi = _PARAM_MAX.get(k)
+            if f <= 0 or (hi is not None and f > hi):
+                raise ValueError(f"{name}: {k} must be > 0" + (f" and <= {hi}" if hi is not None else ""))
+    return p
+
+
+def compute(d: dict, name: str, params: dict[str, Any]) -> dict[str, S]:
+    """One indicator over one symbol's bars -> {field: series}."""
+    fn, _, outputs, _ = REGISTRY[name] if name in REGISTRY else (None, None, None, None)
+    p = normalize_params(name, params)
     res = fn(d, **p)
     return res if isinstance(res, dict) else {outputs[0]: res}
 
