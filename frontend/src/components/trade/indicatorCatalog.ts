@@ -383,7 +383,9 @@ export const INDICATORS: IndicatorDef[] = [
       const kijun = midRange(c, num(inp.base, 26));
       const spanA = tenkan.map((t, i) => (t === null || kijun[i] === null ? null : (t + (kijun[i] as number)) / 2));
       const spanB = midRange(c, num(inp.spanB, 52));
-      const disp = num(inp.disp, 26);
+      // TradingView plots the cloud displacement − 1 bars ahead and the
+      // lagging span displacement − 1 bars back (26 → 25), as the backtester does
+      const disp = Math.max(0, num(inp.disp, 26) - 1);
       return { plots: [tenkan, kijun, c.map((k) => k.close), spanA, spanB], shifts: [0, 0, -disp, disp, disp] };
     },
   },
@@ -766,13 +768,74 @@ export function defaultFills(def: IndicatorDef): FillStyle[] {
   return (def.fills ?? []).map((f) => ({ color: f.color, visible: true }));
 }
 
+/** One input value made valid for its definition, or the default when it
+ *  can't be: numbers clamped to min / max (ints rounded), numeric strings
+ *  from older saves parsed, selects / sources limited to their options. */
+export function sanitizeInput(i: InputDef, v: unknown): InputValue {
+  switch (i.type) {
+    case "int":
+    case "float": {
+      const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : Number.NaN;
+      if (!Number.isFinite(n)) return i.def;
+      const r = i.type === "int" ? Math.round(n) : n;
+      return Math.min(i.max ?? Infinity, Math.max(i.min ?? -Infinity, r));
+    }
+    case "bool":
+      return typeof v === "boolean" ? v : v === "true" ? true : v === "false" ? false : i.def;
+    case "source":
+      return typeof v === "string" && (SOURCES as string[]).includes(v) ? v : i.def;
+    case "select":
+      return typeof v === "string" && (i.options ?? []).includes(v) ? v : i.def;
+    case "symbol":
+      return typeof v === "string" ? v.trim().toUpperCase() : i.def;
+    default:
+      return i.def;
+  }
+}
+
+/** Every input of `def`, valid (unknown keys dropped, missing ones defaulted). */
+export function sanitizeInputs(def: IndicatorDef, raw: unknown): Record<string, InputValue> {
+  const r = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  return Object.fromEntries(def.inputs.map((i) => [i.key, i.key in r ? sanitizeInput(i, r[i.key]) : i.def]));
+}
+
+const PLOT_KIND_SET = new Set<string>(PLOT_KINDS.map((k) => k.v));
+
+function sanitizePlot(base: PlotStyle, raw: unknown): PlotStyle {
+  if (!raw || typeof raw !== "object") return base;
+  const r = raw as Partial<PlotStyle>;
+  const out: PlotStyle = {
+    color: typeof r.color === "string" && r.color.trim() ? r.color : base.color,
+    width: typeof r.width === "number" && Number.isFinite(r.width) ? Math.min(4, Math.max(1, Math.round(r.width))) : base.width,
+    dash: r.dash === 0 || r.dash === 1 || r.dash === 2 ? r.dash : base.dash,
+    visible: typeof r.visible === "boolean" ? r.visible : base.visible,
+  };
+  if (typeof r.kind === "string" && PLOT_KIND_SET.has(r.kind)) out.kind = r.kind;
+  return out;
+}
+
+function sanitizeVis(raw: unknown): IndicatorInstance["vis"] {
+  if (!raw || typeof raw !== "object") return undefined;
+  const r = raw as Record<string, Partial<VisRange> | undefined>;
+  const out: Partial<Record<IntervalGroup, VisRange>> = {};
+  for (const g of VIS_GROUPS) {
+    const v = r[g.id];
+    if (!v || typeof v !== "object") continue;
+    const clamp = (x: unknown, d: number) => (typeof x === "number" && Number.isFinite(x) ? Math.min(g.max, Math.max(1, Math.round(x))) : d);
+    const a = clamp(v.min, 1);
+    const b = clamp(v.max, g.max);
+    out[g.id] = { on: v.on !== false, min: Math.min(a, b), max: Math.max(a, b) };
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
 export function newInstance(type: string, inputs?: Record<string, InputValue>): IndicatorInstance | null {
   const def = INDICATOR_BY_TYPE.get(type);
   if (!def) return null;
   return {
     uid: newUid(),
     type,
-    inputs: { ...defaultInputs(def), ...(inputs ?? {}) },
+    inputs: sanitizeInputs(def, inputs ?? {}),
     plots: defaultPlots(def),
     fills: defaultFills(def),
     visible: true,
@@ -788,22 +851,42 @@ export function sanitizeInstance(raw: unknown): IndicatorInstance | null {
   const r = raw as Partial<IndicatorInstance>;
   const def = r.type ? INDICATOR_BY_TYPE.get(r.type) : undefined;
   if (!def) return null;
-  const plots = defaultPlots(def).map((p, i) => ({ ...p, ...(Array.isArray(r.plots) ? r.plots[i] ?? {} : {}) }));
-  const fills = defaultFills(def).map((f, i) => ({ ...f, ...(Array.isArray(r.fills) ? r.fills[i] ?? {} : {}) }));
+  const plots = defaultPlots(def).map((p, i) => sanitizePlot(p, Array.isArray(r.plots) ? r.plots[i] : undefined));
+  const fills = defaultFills(def).map((f, i) => {
+    const x = Array.isArray(r.fills) ? (r.fills[i] as Partial<FillStyle> | null | undefined) : undefined;
+    return {
+      color: x && typeof x.color === "string" && x.color.trim() ? x.color : f.color,
+      visible: x && typeof x.visible === "boolean" ? x.visible : f.visible,
+    };
+  });
+  const vis = sanitizeVis(r.vis);
   return {
-    uid: typeof r.uid === "string" ? r.uid : newUid(),
+    uid: typeof r.uid === "string" && r.uid ? r.uid : newUid(),
     type: def.type,
-    inputs: { ...defaultInputs(def), ...(r.inputs ?? {}) },
+    inputs: sanitizeInputs(def, r.inputs),
     plots,
     fills,
     visible: r.visible !== false,
-    precision: typeof r.precision === "number" ? r.precision : null,
+    precision: typeof r.precision === "number" && Number.isInteger(r.precision) && r.precision >= 0 && r.precision <= 8 ? r.precision : null,
     labelsOnScale: r.labelsOnScale !== false,
     valuesInStatus: r.valuesInStatus !== false,
-    vis: r.vis,
-    ...(r.pane !== undefined ? { pane: r.pane } : {}),
-    ...(r.scale !== undefined ? { scale: r.scale } : {}),
+    ...(vis ? { vis } : {}),
+    ...(typeof r.pane === "string" && r.pane ? { pane: r.pane } : {}),
+    ...(r.scale === "left" || r.scale === "right" || r.scale === "new" ? { scale: r.scale } : {}),
   };
+}
+
+/** Copies of `items` with fresh uids, keeping indicators that were merged
+ *  into another one's pane attached to that indicator's new uid (a template
+ *  or a layout applied twice must not lose its pane grouping). */
+export function cloneInstances(items: unknown[]): IndicatorInstance[] {
+  const fresh = items.map((raw) => sanitizeInstance(raw)).filter((x): x is IndicatorInstance => x !== null);
+  const ids = new Map(fresh.map((x) => [x.uid, newUid()]));
+  return fresh.map((x) => {
+    const pane = x.pane && x.pane !== "own" && x.pane !== "main" ? ids.get(x.pane) : x.pane;
+    const { pane: _p, ...rest } = x;
+    return { ...rest, uid: ids.get(x.uid) as string, ...(pane ? { pane } : {}) };
+  });
 }
 
 /** Everything "Save as default" keeps (no identity, no placement). */
@@ -833,7 +916,8 @@ export function visibleOnInterval(inst: IndicatorInstance, interval: string): bo
   if (!v) return true;
   if (!v.on) return false;
   const n = intervalCount(interval);
-  return n >= v.min && n <= v.max;
+  // a range typed backwards (from 30 to 5) still means 5–30
+  return n >= Math.min(v.min, v.max) && n <= Math.max(v.min, v.max);
 }
 
 /** Old charts stored booleans per built-in; turn them into instances

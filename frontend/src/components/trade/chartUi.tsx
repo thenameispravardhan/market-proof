@@ -198,7 +198,21 @@ export function Num({ value, onChange, min, max, step = 1, width = 70, ariaLabel
       onChange={(e) => {
         setTxt(e.target.value);
         const v = Number(e.target.value);
-        if (e.target.value !== "" && Number.isFinite(v)) onChange(Math.max(min ?? -Infinity, Math.min(max ?? Infinity, v)));
+        // Commit only in-range values while typing: clamping here would turn
+        // the "1" of a "14" into the min (2) and the field would read "24".
+        if (e.target.value !== "" && Number.isFinite(v) && v >= (min ?? -Infinity) && v <= (max ?? Infinity)) onChange(v);
+      }}
+      onBlur={() => {
+        // leaving the field settles it: clamp an out-of-range entry, or put
+        // back the last good value when it was cleared / not a number
+        const v = Number(txt);
+        if (txt.trim() === "" || !Number.isFinite(v)) {
+          setTxt(String(value));
+          return;
+        }
+        const c = Math.max(min ?? -Infinity, Math.min(max ?? Infinity, v));
+        if (c !== value) onChange(c);
+        setTxt(String(c));
       }}
     />
   );

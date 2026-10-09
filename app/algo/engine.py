@@ -297,6 +297,12 @@ def _check_group(g: dict[str, Any], base_tf: int, depth: int = 0) -> None:
                 for k in ("mult", "add"):
                     if o.get(k) not in (None, ""):
                         o[k] = _num(o[k], k, -1e12)
+                # params are checked (and stored normalized) here, so a bad
+                # length fails on save instead of at the first live bar
+                o["params"] = {k: v for k, v in ind.normalize_params(o["ind"], o.get("params")).items()
+                               if k in (o.get("params") or {})}
+                if o.get("offset") not in (None, ""):
+                    o["offset"] = _num(o["offset"], f"{o['ind']} offset (bars ago)", 0, integer=True)
 
 
 def _walk_operands(spec: dict[str, Any]):
