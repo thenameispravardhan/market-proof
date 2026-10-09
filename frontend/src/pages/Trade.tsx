@@ -527,6 +527,36 @@ export default function Trade() {
     refetchInterval: 5000,
   });
 
+  // Lot sizes of saved F&O entries (watchlist, the open ticket) are refreshed
+  // from the server's F&O scrip master: a lot stored when an option was added
+  // goes stale when NSE revises lot sizes, and the ticket would send it.
+  const isFno = (h: InstrumentHit | null | undefined) =>
+    !!h && (h.segment === "FO" || ["CE", "PE", "FUT"].includes(h.instrument_type));
+  const fnoSyms = [...new Set([...wl.lists.flatMap((l) => l.items), selected].filter(isFno).map((h) => h!.symbol))]
+    .sort().slice(0, 200).join(",");
+  const { data: freshLots } = useQuery<{ lots: Record<string, number | null> }>({
+    queryKey: ["fno-lots", fnoSyms],
+    queryFn: async () => {
+      const r = await fetch(`/api/options/lots?symbols=${encodeURIComponent(fnoSyms)}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    },
+    enabled: fnoSyms.length > 0,
+    staleTime: 5 * 60_000,
+  });
+  useEffect(() => {
+    const lots = freshLots?.lots;
+    if (!lots) return;
+    const fix = (h: InstrumentHit): InstrumentHit => {
+      if (!(h.symbol in lots)) return h;
+      const lot = lots[h.symbol] ?? 0;   // 0 = unknown: the ticket blocks it
+      return h.lot_size === lot ? h : { ...h, lot_size: lot };
+    };
+    if (wl.lists.some((l) => l.items.some((h) => fix(h) !== h)))
+      updateWl((w) => ({ ...w, lists: w.lists.map((l) => ({ ...l, items: l.items.map(fix) })) }));
+    setSelected((cur) => (cur && fix(cur) !== cur ? fix(cur) : cur));
+  }, [freshLots]);  // eslint-disable-line react-hooks/exhaustive-deps
+
   const { data: accounts } = useBrokerAccounts();
   // Trade page is REAL-MONEY ONLY. Filter out paper-mode rows.
   // We silently pick the first real account — there's no UI switcher.
