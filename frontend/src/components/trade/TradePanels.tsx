@@ -29,6 +29,7 @@ import {
   OrdersTable,
   SmartOrderbook,
   TradesTable,
+  tradedRows,
   fmt,
   livePnl,
   orderRows,
@@ -563,6 +564,8 @@ export function AccountManager({
   const bookTabs: BottomTab[] = ["orders", "smart", "allpositions", "positions", "trade", "account"];
   const book = useApiJson<BrokerBook>(connected && bookTabs.includes(tab) ? "/api/broker/book" : null, 15000);
   const trades = useApiJson<TradeRow[]>(["orders", "trades", "account", "smart", "positions"].includes(tab) ? "/api/trades?limit=200" : null, 10000);
+  // Same URL as the chart's trade marks, so the two share one request.
+  const filledTrades = useApiJson<TradeRow[]>(["trades", "account", "positions"].includes(tab) ? "/api/trades?status=filled&limit=1000" : null, 10000);
   const funds = useApiJson<{ ok: boolean; available: number | null; reason?: string | null }>(tab === "account" || tab === "positions" ? "/api/market/funds" : null, 30000);
   const fundsFull = useApiJson<FundsResp>(tab === "funds" ? "/api/broker/funds" : null, 30000);
   const holdings = useApiJson<HoldingsResp>(tab === "holdings" || tab === "account" ? "/api/broker/holdings" : null, 60000);
@@ -572,11 +575,12 @@ export function AccountManager({
   const open = (positions ?? []).filter((p) => p.quantity !== 0);
   const money = (v: number | null | undefined) => (privacy ? "•••" : fmt(v));
   const tradeRows = Array.isArray(trades.data) ? trades.data : [];
+  const executed = tradedRows(tradeRows, Array.isArray(filledTrades.data) ? filledTrades.data : []);
   const today = new Date().toDateString();
   const realizedBy = (sym: string) => {
     const bp = book.data?.ok ? book.data.positions.filter((x) => x.symbol === sym) : [];
     if (bp.length) return bp.reduce((a, x) => a + (x.realized ?? 0), 0);
-    const ts = tradeRows.filter((t) => t.symbol === sym && t.pnl != null && t.executed_at && new Date(t.executed_at).toDateString() === today);
+    const ts = executed.filter((t) => t.symbol === sym && t.pnl != null && t.executed_at && new Date(t.executed_at).toDateString() === today);
     return ts.length ? ts.reduce((a, t) => a + (t.pnl ?? 0), 0) : null;
   };
   // Fyers' product for a live position; the bot's own row otherwise (paper, or the book not loaded).
@@ -587,7 +591,7 @@ export function AccountManager({
   // Live: Fyers' realized figure for the whole account; paper: the bot's closing trades.
   const realized = book.data?.ok
     ? book.data.positions.reduce((a, x) => a + (x.realized ?? 0), 0)
-    : tradeRows.filter((t) => t.pnl != null && t.executed_at && new Date(t.executed_at).toDateString() === today).reduce((a, t) => a + (t.pnl ?? 0), 0);
+    : executed.filter((t) => t.pnl != null && t.executed_at && new Date(t.executed_at).toDateString() === today).reduce((a, t) => a + (t.pnl ?? 0), 0);
   const rows = orderRows(book.data, pendingOrders, tradeRows);
   const workingCount = rows.filter((r) => r.bucket === "working").length;
   const run = async (label: string, f: () => Promise<unknown>) => {
@@ -666,7 +670,7 @@ export function AccountManager({
           {funds.data?.available != null && <> · Funds <b>{money(funds.data.available)}</b></>}
           {open.length > 0 && <> · P&L <LiveTotalPnl open={open} privacy={privacy} testid="am-total-pnl" /></>}
         </span>
-        <AccountMenu connected={connected} onLogout={onLogout} onTab={(t) => onTab(t)} onRefresh={() => { book.reload(); trades.reload(); funds.reload(); fundsFull.reload(); holdings.reload(); gtt.reload(); profile.reload(); setMsg("Account data refreshed"); }} />
+        <AccountMenu connected={connected} onLogout={onLogout} onTab={(t) => onTab(t)} onRefresh={() => { book.reload(); trades.reload(); filledTrades.reload(); funds.reload(); fundsFull.reload(); holdings.reload(); gtt.reload(); profile.reload(); setMsg("Account data refreshed"); }} />
         <button type="button" className="tab tv-collapse" onClick={onMaximize} title={maximized ? "Restore panel" : "Maximize panel"}>{maximized ? "❐" : "⬚"}</button>
         <button type="button" className="tab" onClick={onCollapse} title="Close panel">▾</button>
       </div>
@@ -748,7 +752,7 @@ export function AccountManager({
           <OrdersTable rows={rows} privacy={privacy} onCancel={onCancel} cancelBusyId={cancelBusyId} onModify={setModify} banner={cancelBanner} live={!!book.data?.ok} />
         )}
         {tab === "smart" && <SmartOrderbook rows={rows} privacy={privacy} onCancel={onCancel} onModify={setModify} />}
-        {tab === "trades" && <TradesTable rows={tradeRows} privacy={privacy} />}
+        {tab === "trades" && <TradesTable rows={executed} privacy={privacy} />}
         {tab === "holdings" && <HoldingsPanel data={holdings.data} privacy={privacy} />}
         {tab === "funds" && <FundsPanel data={fundsFull.data} privacy={privacy} />}
         {tab === "gtt" && <GttPanel data={gtt.data} accountId={accountId} privacy={privacy} onDone={(m) => { setMsg(m); gtt.reload(); }} />}
