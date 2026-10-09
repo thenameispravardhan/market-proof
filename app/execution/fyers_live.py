@@ -964,8 +964,18 @@ class FyersLiveBackend:
                 raw={"status_code": e.status_code, "reason": e.reason},
             )
         except FyersAPIError as e:
-            # Retryable failures stay PENDING (manager will time out
-            # the row). Non-retryable 4xx are REJECTED.
+            # A 429 is Fyers refusing the request outright: the order was
+            # never accepted, so it is REJECTED (safe to place again), not
+            # an "unconfirmed" order that may be live.
+            if e.status_code == 429:
+                log.warning("fyers.place_order.rate_limited", symbol=symbol)
+                return _reject(
+                    "Fyers rate-limited the request and did not place the order. "
+                    "Wait a few seconds and place it again."
+                )
+            # Other retryable failures (timeout / 5xx) may have reached
+            # Fyers: PENDING with no order id, reported as UNCONFIRMED.
+            # Non-retryable 4xx are REJECTED.
             if e.retryable:
                 log.warning("fyers.place_order.retryable", symbol=symbol, error=str(e))
                 return OrderResult(
