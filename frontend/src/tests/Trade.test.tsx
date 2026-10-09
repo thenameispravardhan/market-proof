@@ -1282,6 +1282,23 @@ describe("Trade page", () => {
     expect(screen.queryByTestId("ticket-result-success")).not.toBeInTheDocument();
   });
 
+  it.each([
+    ["saved-locally failure", 200, { ok: true, blocked: false, risk_codes: [], risk_message: "", broker_order_id: "FY-9", status: "PENDING", error: null,
+      warning: "The order was sent to the broker, but saving it locally failed. Check the Fyers order book; do not place it again." }, "ticket-record-warning", /do not place it again/],
+    ["duplicate in flight", 409, { detail: "An identical order is already being sent. Wait for its result before placing it again." }, "ticket-result-error", /already being sent/],
+    ["rate limit", 200, { ok: false, blocked: false, risk_codes: [], risk_message: "", broker_order_id: null, status: "REJECTED",
+      error: "Fyers rate-limited the request and did not place the order. Wait a few seconds and place it again." }, "ticket-result-error", /did not place the order/],
+  ])("ticket: shows the %s outcome plainly", async (_n, placeStatus, placeResponse, testid, text) => {
+    globalThis.fetch = makeFetchStub(defaultStubs({ placeResponse, placeStatus }));
+    const user = userEvent.setup();
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await user.type(await screen.findByTestId("trade-search"), "RELI");
+    await user.click(await screen.findByTestId("search-row-NSE:RELIANCE-EQ"));
+    await waitFor(() => expect(screen.getByTestId("ticket-submit")).not.toBeDisabled());
+    await user.click(screen.getByTestId("ticket-submit"));
+    expect((await screen.findByTestId(testid)).textContent).toMatch(text);
+  });
+
   it("ticket: the quantity box can be cleared and retyped", async () => {
     const posts = searchStubs();
     const user = userEvent.setup();
