@@ -112,6 +112,29 @@ def _serialize(c: NotificationChannel) -> dict[str, Any]:
     }
 
 
+# What a client sends back for a secret it was only ever shown masked.
+_SECRET_PLACEHOLDERS = {"", "***", "●●●●"}
+
+
+def _keep_stored_secrets(
+    kind: str, stored: dict[str, Any], incoming: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge an edit onto the stored config without clobbering secrets.
+
+    GET masks every secret as '***', so a form that renames a channel or
+    flips `enabled` would otherwise PUT the mask back and save it as the
+    real bot token / SMTP password, silently breaking the channel. A secret
+    left blank or still masked keeps its stored value; keys the form does
+    not know about (e.g. a webhook `secret`) are kept too.
+    """
+    merged = {**stored, **incoming}
+    for k in _MASKED_KEYS.get(kind, frozenset()) | {"password", "secret", "token", "bot_token"}:
+        v = incoming.get(k)
+        if k in stored and (v is None or (isinstance(v, str) and v.strip() in _SECRET_PLACEHOLDERS)):
+            merged[k] = stored[k]
+    return merged
+
+
 def _validate_config_for_kind(kind: str, config: dict[str, Any]) -> None:
     """Per-kind required fields. Empty / missing → 422."""
     if kind == "telegram":
@@ -181,8 +204,9 @@ def update_channel(
     if body.name is not None:
         c.name = body.name
     if body.config is not None:
-        _validate_config_for_kind(c.kind, body.config)
-        c.config = body.config
+        config = _keep_stored_secrets(c.kind, c.config or {}, body.config)
+        _validate_config_for_kind(c.kind, config)
+        c.config = config
     if body.events_filter is not None:
         c.events_filter = body.events_filter
     if body.enabled is not None:

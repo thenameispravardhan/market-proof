@@ -1,6 +1,6 @@
 // ChannelForm — create or update a notification channel.
 // Shows kind-specific fields.
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   useNotificationChannels,
   useCreateNotificationChannel,
@@ -9,9 +9,23 @@ import {
 
 type Kind = "telegram" | "discord" | "email" | "webhook";
 
+// The events a channel can subscribe to (app/notifications/manager.py).
+// "trade" covers both entries and exits.
+const EVENT_TYPES: { value: string; label: string }[] = [
+  { value: "signal", label: "New AI signals" },
+  { value: "trade", label: "Trades opened and closed" },
+  { value: "risk_halt", label: "Risk halts (trading paused)" },
+  { value: "error", label: "System errors" },
+  { value: "report", label: "Daily health report" },
+];
+
+// GET masks secrets as "***". Never put the mask in an input: it would be
+// sent back on save. The field starts blank, and blank means "keep it".
+const isMasked = (v: unknown) => v === "***";
+
 interface Props {
   channelId: number | null;
-  onSaved?: () => void;
+  onSaved?: (id: number) => void;
 }
 
 export function ChannelForm({ channelId, onSaved }: Props) {
@@ -36,6 +50,9 @@ export function ChannelForm({ channelId, onSaved }: Props) {
   const [toAddrs, setToAddrs] = useState("");
   const [webhookOutUrl, setWebhookOutUrl] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [savedMsg, setSavedMsg] = useState<string | null>(null);
+  const hasStoredSecret = (key: string) =>
+    !!channel && isMasked((channel.config as Record<string, unknown>)[key]);
 
   useEffect(() => {
     if (channel) {
@@ -44,13 +61,13 @@ export function ChannelForm({ channelId, onSaved }: Props) {
       setEventsFilter(channel.events_filter ?? "*");
       setEnabled(channel.enabled);
       const cfg = channel.config as Record<string, string>;
-      setBotToken(cfg.bot_token ?? "");
+      setBotToken(isMasked(cfg.bot_token) ? "" : cfg.bot_token ?? "");
       setChatId(cfg.chat_id ?? "");
       setWebhookUrl(cfg.webhook_url ?? "");
       setSmtpHost(cfg.smtp_host ?? "");
       setSmtpPort(String(cfg.smtp_port ?? 587));
       setSmtpUser(cfg.username ?? "");
-      setSmtpPass(cfg.password ? "●●●●" : "");
+      setSmtpPass(isMasked(cfg.password) ? "" : cfg.password ?? "");
       setFromAddr(cfg.from_addr ?? "");
       setToAddrs(Array.isArray(cfg.to_addrs) ? cfg.to_addrs.join(", ") : "");
       setWebhookOutUrl(cfg.url ?? "");
@@ -62,6 +79,26 @@ export function ChannelForm({ channelId, onSaved }: Props) {
     }
     setError(null);
   }, [channel]);
+
+  // Keep the "Saved" line through the refetch that follows a save; clear it
+  // only when the operator moves to a different channel.
+  const savedFor = useRef<number | null>(null);
+  useEffect(() => {
+    if (savedFor.current !== channelId) setSavedMsg(null);
+  }, [channelId]);
+
+  // Events filter as checkboxes. "*" = everything; anything not in the list
+  // (hand-typed in an older build) is kept as-is.
+  const selectedEvents = eventsFilter.trim() === "*" || eventsFilter.trim() === ""
+    ? null
+    : eventsFilter.split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
+  const toggleEvent = (value: string) => {
+    const current = selectedEvents ?? [];
+    const next = current.includes(value)
+      ? current.filter((e) => e !== value)
+      : [...current, value];
+    setEventsFilter(next.length ? next.join(",") : "*");
+  };
 
   const buildConfig = (): Record<string, unknown> => {
     switch (kind) {
@@ -85,12 +122,12 @@ export function ChannelForm({ channelId, onSaved }: Props) {
     const config = buildConfig();
     const body = { name, kind, config, events_filter: eventsFilter, enabled };
     try {
-      if (channel) {
-        await update.mutateAsync(body as never);
-      } else {
-        await create.mutateAsync(body as never);
-      }
-      onSaved?.();
+      const saved = channel
+        ? await update.mutateAsync(body as never)
+        : await create.mutateAsync(body as never);
+      savedFor.current = saved.id;
+      setSavedMsg(channel ? `Saved "${name}".` : `Created "${name}". Use Test to check it.`);
+      onSaved?.(saved.id);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -117,7 +154,7 @@ export function ChannelForm({ channelId, onSaved }: Props) {
         <>
           <div className="field">
             <label htmlFor="tg-token">Bot token</label>
-            <input id="tg-token" type="password" value={botToken} onChange={(e) => setBotToken(e.target.value)} autoComplete="new-password" />
+            <input id="tg-token" type="password" value={botToken} onChange={(e) => setBotToken(e.target.value)} autoComplete="new-password" placeholder={hasStoredSecret("bot_token") ? "Saved. Leave blank to keep it" : "From @BotFather"} />
           </div>
           <div className="field">
             <label htmlFor="tg-chat">Chat ID</label>
@@ -149,7 +186,7 @@ export function ChannelForm({ channelId, onSaved }: Props) {
           </div>
           <div className="field">
             <label htmlFor="em-pass">Password</label>
-            <input id="em-pass" type="password" value={smtpPass} onChange={(e) => setSmtpPass(e.target.value)} autoComplete="new-password" />
+            <input id="em-pass" type="password" value={smtpPass} onChange={(e) => setSmtpPass(e.target.value)} autoComplete="new-password" placeholder={hasStoredSecret("password") ? "Saved. Leave blank to keep it" : ""} />
           </div>
           <div className="field">
             <label htmlFor="em-from">From address</label>
@@ -168,9 +205,25 @@ export function ChannelForm({ channelId, onSaved }: Props) {
         </div>
       )}
 
-      <div className="field">
-        <label htmlFor="ch-events">Events filter (comma-separated or *)</label>
-        <input id="ch-events" value={eventsFilter} onChange={(e) => setEventsFilter(e.target.value)} placeholder="signal,trade,risk_halt,error" />
+      <div className="field" data-testid="channel-events">
+        <label>Send me</label>
+        <label style={{ fontWeight: "normal" }}>
+          <input
+            type="checkbox"
+            checked={selectedEvents === null}
+            onChange={() => setEventsFilter(selectedEvents === null ? "signal,trade,risk_halt,error" : "*")}
+          />{" "}Everything
+        </label>
+        {EVENT_TYPES.map((ev) => (
+          <label key={ev.value} style={{ fontWeight: "normal" }}>
+            <input
+              type="checkbox"
+              checked={selectedEvents === null || selectedEvents.includes(ev.value)}
+              disabled={selectedEvents === null}
+              onChange={() => toggleEvent(ev.value)}
+            />{" "}{ev.label}
+          </label>
+        ))}
       </div>
       <div className="field">
         <label>
@@ -179,6 +232,7 @@ export function ChannelForm({ channelId, onSaved }: Props) {
         </label>
       </div>
       {error && <p className="pnl-neg">{error}</p>}
+      {savedMsg && !error && <p className="pnl-pos">{savedMsg}</p>}
       <button
         className="primary"
         onClick={handleSave}

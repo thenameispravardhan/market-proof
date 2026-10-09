@@ -311,6 +311,9 @@ export interface GlobalSettings {
   // Cap on AI completion tokens — shorter output generates faster; a full
   // signal JSON measured ~165 tokens, so keep at least ~2× headroom.
   LLM_MAX_TOKENS: number;
+  // Which model reads filings: DeepSeek (uses the Prompts page) or the
+  // project's own fine-tuned SLM (uses its own built-in prompt).
+  LLM_PROVIDER?: "deepseek" | "slm";
   // Staleness gate: filings older than this (seconds) skip the AI entirely.
   MAX_NEWS_AGE_SECONDS: number;
   // WHICH clock the staleness gate measures. OFF (default) = time since the
