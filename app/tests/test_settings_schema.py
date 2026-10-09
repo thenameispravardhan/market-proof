@@ -171,3 +171,18 @@ def test_schema_reports_which_keys_are_overridden(client):
     assert body["overridden_count"] == sum(
         1 for f in fields.values() if f["overridden"]
     )
+
+
+def test_import_never_changes_trading_mode(client):
+    """An old export carrying TRADING_MODE must not switch the mode: that
+    only happens behind the typed confirmation on its own endpoint."""
+    before = client.get("/api/settings").json()["global"]["TRADING_MODE"]
+    other = "live" if before == "paper" else "paper"
+    r = client.post(
+        "/api/settings/import",
+        json={"overrides": {"TRADING_MODE": other, "MAX_HOLD_SECONDS": 600}},
+    )
+    assert r.status_code == 200, r.text
+    assert "TRADING_MODE" in r.json()["ignored"]
+    assert r.json()["global"]["TRADING_MODE"] == before
+    assert r.json()["global"]["MAX_HOLD_SECONDS"] == 600

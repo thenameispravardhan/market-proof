@@ -16,7 +16,7 @@ const DEEPSEEK_MODELS: { value: string; label: string }[] = [
   { value: "deepseek-v4-pro", label: "deepseek-v4-pro — v4, most capable" },
 ];
 
-// Reasoning depth (v4). Only applied when thinking is enabled.
+// Reasoning depth (v4). Sent with every call, thinking on or off.
 const REASONING_EFFORTS: { value: ReasoningEffort; label: string }[] = [
   { value: "low", label: "low — fastest" },
   { value: "medium", label: "medium — balanced" },
@@ -25,10 +25,14 @@ const REASONING_EFFORTS: { value: ReasoningEffort; label: string }[] = [
 
 export function PromptEditor({
   eventType,
+  tokenCap,
   onSaved,
   onError,
 }: {
   eventType: string | null;
+  // Settings → AI analysis → LLM max tokens. The analyzer uses the smaller
+  // of this and the template's own max_tokens, so say so next to the field.
+  tokenCap?: number;
   onSaved?: () => void;
   onError?: (msg: string) => void;
 }) {
@@ -151,7 +155,7 @@ export function PromptEditor({
   return (
     <div className="widget" data-testid="prompt-editor">
       <h3>
-        Editor — {current.event_type}{" "}
+        Prompt{" "}
         <span className="meta mono" style={{ color: "var(--text-dim)" }}>v{current.version}</span>
       </h3>
       <div className="field">
@@ -215,6 +219,11 @@ export function PromptEditor({
             value={maxTokens}
             onChange={(e) => setMaxTokens(parseInt(e.target.value, 10) || 64)}
           />
+          {tokenCap !== undefined && maxTokens > tokenCap && (
+            <div className="field-hint" data-testid="prompt-token-cap">
+              Capped at {tokenCap} by Settings → AI analysis → AI max output tokens.
+            </div>
+          )}
         </div>
       </div>
       <div className="field-row">
@@ -257,9 +266,8 @@ export function PromptEditor({
         </div>
       </div>
       <div className="meta" style={{ color: "var(--text-dim)", fontSize: 11, marginTop: -4, marginBottom: 8 }}>
-        Thinking off sends <code className="mono">{`extra_body={"thinking": {"type": "disabled"}}`}</code>.
-        These flow straight into the DeepSeek call that turns each news item
-        into a signal.
+        Thinking and higher reasoning effort make answers slower, and an answer
+        slower than the AI call timeout in Settings is thrown away.
       </div>
       <div className="field">
         <label htmlFor="note">Change note (optional)</label>
@@ -278,7 +286,7 @@ export function PromptEditor({
           disabled={!dirty || update.isPending}
           data-testid="save-prompt"
         >
-          {update.isPending ? "Saving…" : "Save (bumps version)"}
+          {update.isPending ? "Saving…" : dirty ? "Save as new version" : "No changes"}
         </button>
         <button
           type="button"
