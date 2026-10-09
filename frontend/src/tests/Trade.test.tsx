@@ -264,6 +264,33 @@ describe("Trade page", () => {
     expect(body.account_id).toBe(7);
   });
 
+  it("says plainly when the Fyers session has expired, with a way to log in", async () => {
+    const base = defaultStubs();
+    globalThis.fetch = makeFetchStub((url: string, init?: RequestInit) =>
+      url.includes("/api/fyers/status")
+        ? makeJsonResponse({ connected: false, has_token: false, token_expired: true, account_present: true,
+            credentials_set: true, app_id: null, redirect_uri: null, live_mode: true, reason: null,
+            stream: { connected: false, reason: "token_expired", subscribed: 0, last_tick_age_s: null, rejected_symbols: [] } })
+        : base(url, init));
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    const banner = await screen.findByTestId("trade-feed-banner");
+    expect(banner).toHaveTextContent(/session has expired/i);
+    expect(banner).toHaveTextContent("Log in to Fyers");
+  });
+
+  it("shows no feed banner while the Fyers session and price feed are healthy", async () => {
+    const base = defaultStubs();
+    globalThis.fetch = makeFetchStub((url: string, init?: RequestInit) =>
+      url.includes("/api/fyers/status")
+        ? makeJsonResponse({ connected: true, has_token: true, token_expired: false, account_present: true,
+            credentials_set: true, app_id: null, redirect_uri: null, live_mode: true, reason: null,
+            stream: { connected: true, reason: null, subscribed: 3, last_tick_age_s: 0.4, rejected_symbols: [] } })
+        : base(url, init));
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await screen.findByTestId("ticket-submit");
+    expect(screen.queryByTestId("trade-feed-banner")).not.toBeInTheDocument();
+  });
+
   it("disables the ticket when there are no live accounts", async () => {
     globalThis.fetch = makeFetchStub((url) => {
       if (url.includes("/api/broker-accounts")) return makeJsonResponse({ accounts: [PAPER_ACCOUNT] });

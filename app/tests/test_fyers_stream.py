@@ -1148,3 +1148,116 @@ async def test_depth_frame_is_pushed_on_the_depth_channel():
         assert evt.payload["bids"] == [[100.0, 5.0, 2.0]] and evt.payload["asks"] == [[100.5, 7.0, 3.0]]
     finally:
         event_bus.unsubscribe("depth", q)
+
+
+# ---- "Please provide a valid symbol" + connection status ----------------
+
+
+class _SdkLikeDataSocket(_FakeDataSocket):
+    """Mimics the real SDK's unsubscribe filter: only tokens in
+    `scrips_count[11]` (overwritten by every subscribe) can be unsubscribed;
+    anything else is reported as an invalid symbol."""
+
+    def __init__(self, **cb):
+        super().__init__(**cb)
+        self.symbol_token: dict = {}
+        self.scrips_count: dict = {}
+        self.errors: list = []
+
+    def subscribe(self, symbols, data_type="SymbolUpdate"):
+        super().subscribe(symbols, data_type)
+        conv = {f"tok|{s}": s for s in symbols}
+        self.symbol_token.update(conv)
+        self.scrips_count[11] = list(conv)
+
+    def unsubscribe(self, symbols, data_type="SymbolUpdate"):
+        ok = [s for s in symbols if f"tok|{s}" in self.scrips_count.get(11, [])]
+        if not ok:
+            self.errors.append("Please provide a valid symbol")
+            return
+        super().unsubscribe(ok, data_type)
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_reaches_symbols_from_earlier_subscribe_calls():
+    md = MarketDataBus()
+    holder: dict = {}
+
+    def df(token, **cb):
+        holder["data"] = _SdkLikeDataSocket(**cb)
+        return holder["data"]
+
+    feed = _FakeQuoteFeed(["SBIN"])
+    mgr = FyersStreamManager(
+        market_data=md, quote_feed=feed, backend_provider=lambda: _FakeBackend(),
+        data_socket_factory=df, order_socket_factory=_factories()[2],
+        resolve_fn=lambda s: f"NSE:{s}-EQ", ondemand_ttl_s=0.0,
+    )
+    mgr._loop = asyncio.get_running_loop()
+    await mgr._ensure_connected()
+    await mgr._reconcile_subscriptions()
+    feed._symbols = ["SBIN", "TCS"]  # a later subscribe overwrites the SDK filter
+    await mgr._reconcile_subscriptions()
+    feed._symbols = ["TCS"]
+    await mgr._reconcile_subscriptions()
+
+    sock = holder["data"]
+    assert sock.errors == []
+    assert sock.unsubscribed == [(("NSE:SBIN-EQ",), "SymbolUpdate")]
+
+
+@pytest.mark.asyncio
+async def test_rejected_symbols_are_dropped_and_not_retried():
+    md = MarketDataBus()
+    holder, df, of = _factories()
+    feed = _FakeQuoteFeed(["SBIN", "BADCO"])
+    mgr = FyersStreamManager(
+        market_data=md, quote_feed=feed, backend_provider=lambda: _FakeBackend(),
+        data_socket_factory=df, order_socket_factory=of,
+        resolve_fn=lambda s: f"NSE:{s}-EQ",
+    )
+    mgr._loop = asyncio.get_running_loop()
+    await mgr._ensure_connected()
+    await mgr._reconcile_subscriptions()
+    mgr._on_data_error({"code": -300, "message": "Please provide a valid symbol",
+                        "s": "error", "type": "sub", "invalid_symbols": ["NSE:BADCO-EQ"]})
+    await mgr._reconcile_subscriptions()
+    mgr.touch_interest("BADCO")
+
+    sock = holder["data"]
+    assert len(sock.subscribed) == 1
+    assert set(sock.subscribed[0][0]) == {"NSE:SBIN-EQ", "NSE:BADCO-EQ"}
+    assert sock.unsubscribed == []
+    st = mgr.status()
+    assert st["connected"] is True and st["subscribed"] == 1
+    assert st["rejected_symbols"] == ["NSE:BADCO-EQ"]
+
+
+@pytest.mark.asyncio
+async def test_control_frames_are_not_counted_as_dropped_ticks():
+    mgr = FyersStreamManager(market_data=MarketDataBus(), backend_provider=lambda: None)
+    for t in ("cn", "ful", "sub", "unsub"):
+        mgr._on_data_message({"type": t, "code": 200, "message": "ok", "s": "ok"})
+    assert mgr._drop_count == 0
+
+
+@pytest.mark.asyncio
+async def test_expired_token_does_not_open_the_socket():
+    import base64
+    import json
+
+    exp = base64.urlsafe_b64encode(json.dumps({"exp": 1}).encode()).decode().rstrip("=")
+
+    class _Expired:
+        ws_access_token = f"APP-100:h.{exp}.s"
+
+    holder, df, of = _factories()
+    mgr = FyersStreamManager(
+        market_data=MarketDataBus(), backend_provider=lambda: _Expired(),
+        data_socket_factory=df, order_socket_factory=of,
+    )
+    mgr._loop = asyncio.get_running_loop()
+    await mgr._ensure_connected()
+    assert "data" not in holder
+    assert mgr.status() == {"connected": False, "reason": "token_expired", "subscribed": 0,
+                            "last_tick_age_s": None, "rejected_symbols": []}

@@ -29,6 +29,7 @@ import {
   useBrokerAccounts,
   useCancelOrder,
   useFyersDisconnect,
+  useFyersStatus,
   useOptionChain,
   usePendingOrders,
   usePlaceOrder,
@@ -39,7 +40,7 @@ import {
   useServerInfo,
 } from "../hooks/useApi";
 import { useLiveQuote } from "../hooks/useQuotes";
-import { tabLocal } from "../router";
+import { tabLocal, useRouter } from "../router";
 import ChartPanel, { type BrokerLine, type ChartOrder, type ChartPosition, type HostAction } from "../components/trade/ChartPanel";
 import Scalper, { splitDrag } from "../components/trade/Scalper";
 import { AccountManager, BOTTOM_TABS, LayoutMenu, SymbolDetails, WatchlistTable, useLayouts, type BottomTab, type WatchState } from "../components/trade/TradePanels";
@@ -645,6 +646,21 @@ export default function Trade() {
     [accounts],
   );
   const accountId: number | null = realAccounts.length > 0 ? realAccounts[0].id : null;
+  // The account row existing isn't enough: Fyers tokens expire every
+  // trading day, after which every order and quote is refused. Say so
+  // plainly instead of showing a green "connected" dot.
+  const { data: fyers } = useFyersStatus();
+  const [, navigate] = useRouter();
+  const loggedIn = fyers?.has_token ?? true;   // unknown yet → don't cry wolf
+  const feedIssue: string | null = !fyers || !fyers.account_present
+    ? null
+    : fyers.token_expired
+      ? "Your Fyers session has expired (Fyers logs everyone out daily). Orders will be rejected and prices update slowly until you log in again."
+      : !fyers.has_token
+        ? "You're not logged in to Fyers. Orders will be rejected and prices update slowly until you log in."
+        : fyers.stream && !fyers.stream.connected
+          ? "The live price feed is reconnecting. Prices update every few seconds until it's back."
+          : null;
   // Server identity (public IP). Surfaced in the place-order
   // error banner when Fyers rejects with the IP-whitelist
   // error so the operator can copy the IP into the Fyers app
@@ -1180,6 +1196,14 @@ export default function Trade() {
   return (
     <div className="trade-page tv">
       <div className="tv-center">
+        {feedIssue && (
+          <div className="trade-feed-banner" role="alert" data-testid="trade-feed-banner">
+            <span>{feedIssue}</span>
+            {!loggedIn && (
+              <button type="button" className="btn-sm" onClick={() => navigate("accounts")}>Log in to Fyers</button>
+            )}
+          </div>
+        )}
         <div className="tv-chart">
           {scalper ? (
             <Scalper
@@ -1305,7 +1329,7 @@ export default function Trade() {
               )}
               accountId={accountId}
               privacy={privacy}
-              connected={accountId != null}
+              connected={accountId != null && loggedIn}
               accountLabel={realAccounts[0] ? `${realAccounts[0].name} · INR` : ""}
               selected={selected}
               closeFor={closeFor}
