@@ -102,7 +102,11 @@ export interface TradeRow {
   quantity: number;
   price: number | null;
   order_type: string;
+  /** INTRADAY / DELIVERY / MARGIN — absent from older backends. */
+  product?: string;
   status: string;
+  /** Quantity filled so far (manual orders) — 0 / absent when unknown. */
+  filled_qty?: number;
   broker_order_id: string | null;
   pnl: number | null;
   executed_at: string | null;
@@ -129,7 +133,7 @@ export function orderBucket(status: string): OrderBucket {
   const s = status.toLowerCase();
   if (/pending|open|transit|trigger|working|placed|amo/.test(s)) return "working";
   if (/fill|complete|traded|executed/.test(s)) return "filled";
-  if (/cancel/.test(s)) return "cancelled";
+  if (/cancel|expire/.test(s)) return "cancelled";
   if (/reject/.test(s)) return "rejected";
   return "other";
 }
@@ -206,7 +210,7 @@ export function orderRows(book: BrokerBook | null, pending: PendingOrder[], hist
     if (p.broker_order_id && seen.has(p.broker_order_id)) continue;
     if (p.broker_order_id) seen.add(p.broker_order_id);
     const ts = p.created_at ? Date.parse(p.created_at) : null;
-    const stopType = p.order_type === "SL-M" || p.order_type === "STOP_LOSS";
+    const filled = p.filled_qty ?? 0;
     out.push({
       key: `p-${p.id}`,
       id: p.broker_order_id,
@@ -215,10 +219,13 @@ export function orderRows(book: BrokerBook | null, pending: PendingOrder[], hist
       type: p.order_type,
       product: p.product ?? "INTRADAY",
       qty: p.quantity,
-      filled: null,
-      remaining: p.quantity,
-      limit: !stopType || p.order_type === "STOP_LOSS" ? p.price || null : null,
-      stop: stopType ? p.price || null : null,
+      filled: p.filled_qty == null ? null : filled,
+      remaining: Math.max(0, p.quantity - filled),
+      // `price` is the limit (LIMIT / stop-limit) or the SL-M trigger; a
+      // stop-limit's trigger isn't stored locally, so it stays unknown
+      // rather than showing the limit as the stop.
+      limit: p.order_type === "LIMIT" || p.order_type === "STOP_LOSS" ? p.price || null : null,
+      stop: p.order_type === "SL-M" ? p.price || null : null,
       avg: null,
       status: "WORKING",
       ts,
@@ -233,25 +240,30 @@ export function orderRows(book: BrokerBook | null, pending: PendingOrder[], hist
       if (t.broker_order_id && seen.has(t.broker_order_id)) continue;
       if (orderBucket(t.status) === "working") continue; // the pending list has it
       const ts = t.created_at ? Date.parse(t.created_at) : null;
+      const b = orderBucket(t.status);
+      // filled_qty is only tracked for manual orders; a filled bot order
+      // reports 0 there, so a fill with no slice count is the whole order.
+      const filled = t.filled_qty ? t.filled_qty : b === "filled" ? t.quantity : 0;
       out.push({
         key: `h-${t.id}`,
         id: t.broker_order_id,
         symbol: t.symbol,
         side: t.side,
         type: t.order_type,
-        product: "INTRADAY",
+        product: t.product ?? "INTRADAY",
         qty: t.quantity,
-        filled: orderBucket(t.status) === "filled" ? t.quantity : 0,
+        filled,
         remaining: 0,
-        limit: t.order_type === "LIMIT" ? t.price : null,
+        // a fill overwrites `price` with the traded price
+        limit: t.order_type === "LIMIT" && !filled ? t.price : null,
         stop: null,
-        avg: orderBucket(t.status) === "filled" ? t.price : null,
+        avg: filled ? t.price : null,
         status: t.status.toUpperCase(),
         ts,
         time: clock(ts),
         source: "Bot",
         message: "",
-        bucket: orderBucket(t.status),
+        bucket: b,
       });
     }
   }
@@ -402,7 +414,7 @@ const ORDER_FILTERS: [OrderFilter, string, string][] = [
   ["working", "Working", "Pending at the exchange"],
   ["inactive", "Inactive", "No longer working — filled, cancelled, rejected or expired"],
   ["filled", "Filled", "Executed"],
-  ["cancelled", "Cancelled", "Cancelled"],
+  ["cancelled", "Cancelled", "Cancelled or expired"],
   ["rejected", "Rejected", "Rejected by the broker or exchange"],
 ];
 
@@ -491,18 +503,27 @@ export function OrdersTable({
 // Trades
 // ---------------------------------------------------------------------------
 
+/** Shares actually traded on a trade row: the filled slices of a manual
+ *  order (a partly filled order that was then cancelled traded only those),
+ *  else the whole order once it's filled. */
+export function tradedQty(t: TradeRow): number {
+  if (t.filled_qty) return t.filled_qty;
+  return orderBucket(t.status) === "filled" || t.executed_at ? t.quantity : 0;
+}
+
 export function TradesTable({ rows, privacy }: { rows: TradeRow[]; privacy: boolean }) {
-  const done = rows.filter((t) => t.executed_at);
+  const done = rows.filter((t) => tradedQty(t) > 0);
+  const when = (t: TradeRow) => t.executed_at ?? t.created_at;
   const cols: Col<TradeRow>[] = [
-    { id: "time", label: "Time", get: (t) => (t.executed_at ? Date.parse(t.executed_at) : null), render: (t) => new Date(t.executed_at!).toLocaleString("en-IN") },
+    { id: "time", label: "Time", get: (t) => (when(t) ? Date.parse(when(t)!) : null), render: (t) => (when(t) ? new Date(when(t)!).toLocaleString("en-IN") : "—") },
     { id: "symbol", label: "Symbol", get: (t) => t.symbol, fixed: true, cls: () => "sym" },
     { id: "exchange", label: "Exchange", get: (t) => symbolParts(t.symbol).exchange },
     { id: "segment", label: "Segment", get: (t) => symbolParts(t.symbol).segment },
-    { id: "product", label: "Product Type", get: () => "INTRADAY" },
+    { id: "product", label: "Product Type", get: (t) => t.product ?? "INTRADAY" },
     { id: "side", label: "Side", get: (t) => t.side, cls: (t) => sideCls(t.side) },
-    { id: "qty", label: "Qty", get: (t) => t.quantity, render: (t) => t.quantity, num: true },
+    { id: "qty", label: "Qty", get: (t) => tradedQty(t), render: (t) => tradedQty(t), num: true },
     { id: "price", label: "Traded price", get: (t) => t.price, num: true },
-    { id: "value", label: "Trade value", get: (t) => (t.price != null ? t.price * t.quantity : null), render: (t) => (privacy ? "•••" : fmt(t.price != null ? t.price * t.quantity : null)), num: true, optional: true },
+    { id: "value", label: "Trade value", get: (t) => (t.price != null ? t.price * tradedQty(t) : null), render: (t) => (privacy ? "•••" : fmt(t.price != null ? t.price * tradedQty(t) : null)), num: true, optional: true },
     { id: "pnl", label: "P&L", get: (t) => t.pnl, render: (t) => (t.pnl == null ? "—" : privacy ? "•••" : fmt(t.pnl)), cls: (t) => pnlCls(t.pnl), num: true },
     { id: "id", label: "Order ID", get: (t) => t.broker_order_id, cls: () => "broker-id", optional: true },
   ];
@@ -873,8 +894,9 @@ export function ModifyOrderDialog({ order, accountId, onClose, onDone }: { order
   const [err, setErr] = useState<string | null>(null);
   const needLimit = type === "LIMIT" || type === "STOP_LOSS";
   const needStop = type === "STOP_LOSS" || type === "SL-M";
-  const q = Math.floor(Number(qty));
+  const q = Number(qty);
   const bad = !(q > 0) ? "Quantity must be more than 0"
+    : !Number.isInteger(q) ? "Quantity must be a whole number"
     : q > order.qty ? `At most ${order.qty} — add size with a new order so the risk checks see it`
       : order.filled && q < order.filled ? `At least ${order.filled} — already filled`
       : needLimit && !(Number(limit) > 0) ? "Enter a limit price"
