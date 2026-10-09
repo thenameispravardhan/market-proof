@@ -64,16 +64,21 @@ export function FyersSetupCard() {
   const { data: status } = useFyersStatus();
   const { data: serverInfo } = useServerInfo();
 
+  // Once Fyers is authorised this one-time checklist is just noise, so it
+  // starts collapsed; the operator can still open it to copy a value.
+  const authorized = !!(status?.authorized || status?.connected);
   const appId = status?.app_id ?? null;
   const redirect = status?.redirect_uri ?? null;
   const ip = serverInfo?.public_ip ?? null;
 
   return (
-    <div className="widget" data-testid="fyers-setup">
-      <h3>
-        Fyers App Activation
-        <span className="badge neutral">One-time</span>
-      </h3>
+    <details className="widget" data-testid="fyers-setup" open={!!status && !authorized}>
+      <summary style={{ cursor: "pointer", listStyle: "revert" }}>
+        <h3 style={{ display: "inline-flex" }}>
+          Fyers App Activation
+          <span className="badge neutral">{authorized ? "Done" : "One-time"}</span>
+        </h3>
+      </summary>
 
       <p className="text-dim" style={{ fontSize: 12, marginBottom: 14 }}>
         SEBI's 2026 algo rules require <strong>one</strong> app, created and{" "}
@@ -109,7 +114,7 @@ export function FyersSetupCard() {
         </li>
         <li>
           Click <strong>Activate</strong> on Fyers, then{" "}
-          <strong>Connect Fyers</strong> below.
+          <strong>Connect Fyers</strong> at the top of this page.
         </li>
       </ol>
 
@@ -136,6 +141,6 @@ export function FyersSetupCard() {
         placement only works from the one whose ID matches here. Static IPs are
         editable once per week on Fyers.
       </p>
-    </div>
+    </details>
   );
 }
