@@ -65,6 +65,7 @@ from app.execution.base import (
     OrderType,
     Position,
     ProductType,
+    apply_fill,
     safe_float,
 )
 from app.execution.market_data import MarketDataBus, Quote
@@ -501,49 +502,38 @@ class PaperBackend:
         stid = strategy_id if strategy_id is not None else (o.strategy_id if o else None)
         if qty <= 0:
             return
-        # Update position.
+        # Update position. The DB row is the book of record: after a
+        # restart the in-memory book is empty, and a SELL against a long the
+        # row still holds must close it, not open a phantom short.
+        row_pos = await asyncio.get_running_loop().run_in_executor(
+            None, _load_position, self._session_factory, sym,
+        )
+        if row_pos is not None:
+            row_pos.broker_account_id = self.broker_account_id
+            self._positions[sym] = row_pos
         pos = self._positions.get(sym)
-        if sd == OrderSide.BUY:
-            if pos is None or pos.quantity == 0:
-                self._positions[sym] = Position(
-                    symbol=sym,
-                    quantity=qty,
-                    average_price=float(fill_price),
-                    strategy_id=stid,
-                    broker_account_id=self.broker_account_id,
-                )
-            else:
-                new_qty = pos.quantity + qty
-                new_avg = (pos.average_price * pos.quantity + fill_price * qty) / new_qty
-                pos.quantity = new_qty
-                pos.average_price = new_avg
-                pos.updated_at = datetime.now(timezone.utc)
-        else:  # SELL — close / reduce
-            if pos is None or pos.quantity == 0:
-                # Sell with no position: open a short. v1 keeps it
-                # simple — record a short with negative qty.
-                self._positions[sym] = Position(
-                    symbol=sym,
-                    quantity=-qty,
-                    average_price=float(fill_price),
-                    strategy_id=stid,
-                    broker_account_id=self.broker_account_id,
-                )
-            else:
-                pos.quantity = pos.quantity - qty
-                pos.updated_at = datetime.now(timezone.utc)
-        # Re-fetch the (possibly newly created) position so the
-        # mirror step below has a valid reference.
-        pos = self._positions.get(sym)
-        if pos is None:
-            # Defensive — should never happen.
-            return
-        # Compute realised PnL on the closing side.
+        signed = qty if sd == OrderSide.BUY else -qty
+        old_qty = pos.quantity if pos is not None else 0
+        old_avg = pos.average_price if pos is not None else 0.0
+        new_qty, new_avg = apply_fill(old_qty, old_avg, signed, fill_price)
+        if pos is None or old_qty == 0:
+            pos = Position(
+                symbol=sym,
+                quantity=new_qty,
+                average_price=float(fill_price),
+                strategy_id=stid,
+                broker_account_id=self.broker_account_id,
+            )
+            self._positions[sym] = pos
+        else:
+            pos.quantity, pos.average_price = new_qty, new_avg
+        pos.mark_to_market(float(fill_price))
+        # Realised P&L on the slice this fill closed (a reduce, a full
+        # close, or the closing half of a flip), long or short.
         realised_pnl: Optional[float] = None
-        if pos is not None and sd == OrderSide.SELL and pos.quantity <= 0:
-            # Simplified: realised = (fill - avg) * qty when closing a long.
-            if pos.average_price is not None and pos.quantity + qty > 0:
-                realised_pnl = (fill_price - pos.average_price) * qty
+        if old_qty != 0 and (old_qty > 0) != (signed > 0):
+            closed = min(abs(old_qty), qty)
+            realised_pnl = (float(fill_price) - old_avg) * closed * (1 if old_qty > 0 else -1)
         # Persist the fill on the trade row.
         await asyncio.get_running_loop().run_in_executor(
             None, _update_trade_filled,
@@ -649,6 +639,22 @@ def _update_trade_status(
         session.commit()
 
 
+def _load_position(session_factory: SessionFactory, symbol: str) -> Optional[Position]:
+    """The DB position row for `symbol` as a paper Position (None when there is none)."""
+    with session_factory() as session:
+        row = session.query(PositionRow).filter_by(symbol=symbol).one_or_none()
+        if row is None:
+            return None
+        return Position(
+            symbol=row.symbol,
+            quantity=int(row.quantity or 0),
+            average_price=float(row.average_price or 0.0),
+            last_price=row.last_price,
+            unrealized_pnl=row.unrealized_pnl,
+            strategy_id=row.strategy_id,
+        )
+
+
 def _mirror_position(
     session_factory: SessionFactory,
     symbol: str,
@@ -676,5 +682,6 @@ def _mirror_position(
             row.average_price = float(average_price)
             row.last_price = last_price
             row.unrealized_pnl = unrealized_pnl
-            row.strategy_id = strategy_id
+            if strategy_id is not None:
+                row.strategy_id = strategy_id
         session.commit()

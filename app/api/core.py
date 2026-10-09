@@ -121,6 +121,26 @@ def _ser_signal(s: Signal) -> dict[str, Any]:
     }
 
 
+def _lot_size(symbol: str) -> int:
+    """Contract lot for an F&O symbol (1 for cash), so a partial exit from
+    the positions panel can be checked against whole lots."""
+    try:
+        from app.algo import fno
+
+        # The per-contract F&O master lot (`contract_lot`, where available)
+        # is the same source order placement checks quantities against.
+        contract_lot = getattr(fno, "contract_lot", None)
+        lot = contract_lot(symbol) if contract_lot is not None else None
+        if not lot:
+            from app.services.instrument_master import get_master
+
+            inst = get_master().get(symbol)
+            lot = inst.lot_size if inst is not None else None
+        return int(lot) if lot and lot > 1 else 1
+    except Exception:  # noqa: BLE001 — a missing master never breaks the book
+        return 1
+
+
 def _ser_position(p: Position) -> dict[str, Any]:
     return {
         "id": p.id,
@@ -131,6 +151,7 @@ def _ser_position(p: Position) -> dict[str, Any]:
         "unrealized_pnl": p.unrealized_pnl,
         "strategy_id": p.strategy_id,
         "product": p.product or "INTRADAY",
+        "lot_size": _lot_size(p.symbol),
         "opened_at": _iso_utc(p.opened_at),
         "updated_at": _iso_utc(p.updated_at),
     }

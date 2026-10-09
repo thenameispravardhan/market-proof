@@ -160,3 +160,72 @@ async def test_square_off_not_due_midsession(db_session, isolated_db):
     closed = await tm.square_off_if_due(now=now, force=True)
     assert closed == []
     assert len(tm.managed_positions()) == 1
+
+
+# -- Manual orders on a managed position ---------------------------------
+
+
+async def _managed(db_session, tm, qty=10):
+    await tm.register(symbol="SBIN", quantity=qty, entry=100.0, stop_loss=95.0, target=120.0)
+    db_session.add(PositionRow(symbol="SBIN", quantity=qty, average_price=100.0, last_price=100.0))
+    db_session.commit()
+
+
+def _set_row(db_session, qty, avg=100.0):
+    row = db_session.query(PositionRow).filter_by(symbol="SBIN").one()
+    row.quantity, row.average_price = qty, avg
+    db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_stop_after_manual_partial_exit_closes_only_the_rest(db_session, isolated_db):
+    md = MarketDataBus()
+    tm = TradeManager(market_data=md)
+    await _managed(db_session, tm)
+    _set_row(db_session, 4)                 # sold 6 from the Trade page
+    md.set_quote_sync("SBIN", 94.0)         # stop
+    await tm._sweep()
+    exit_row = db_session.query(TradeRow).filter_by(symbol="SBIN").one()
+    assert exit_row.quantity == 4           # not the 10 it was booked with
+    assert exit_row.pnl == pytest.approx(-24.0)
+
+
+@pytest.mark.asyncio
+async def test_manual_close_drops_the_managed_position(db_session, isolated_db):
+    md = MarketDataBus()
+    tm = TradeManager(market_data=md)
+    await _managed(db_session, tm)
+    _set_row(db_session, 0)
+    md.set_quote_sync("SBIN", 94.0)
+    await tm._sweep()
+    assert tm.managed_positions() == []
+    assert db_session.query(TradeRow).filter_by(symbol="SBIN").count() == 0   # no second exit
+
+
+@pytest.mark.asyncio
+async def test_manual_reverse_clears_the_old_levels(db_session, isolated_db):
+    md = MarketDataBus()
+    tm = TradeManager(market_data=md)
+    await _managed(db_session, tm)
+    _set_row(db_session, -10, 101.0)        # reversed at 101
+    md.set_quote_sync("SBIN", 101.0)        # past the long's 95 stop for a short
+    await tm._sweep()
+    [mp] = tm.managed_positions()
+    assert mp.quantity == -10 and mp.entry == pytest.approx(101.0)
+    assert mp.stop_loss is None and mp.target is None
+    assert db_session.query(TradeRow).filter_by(symbol="SBIN").count() == 0
+    db_session.expire_all()
+    row = db_session.query(PositionRow).filter_by(symbol="SBIN").one()
+    assert row.stop_loss is None and row.target is None
+
+
+def test_mark_to_market_follows_a_quantity_change(db_session, isolated_db):
+    from app.execution.trade_manager import _mark_to_market
+    from app.db.session import SessionLocal
+
+    db_session.add(PositionRow(symbol="SBIN", quantity=10, average_price=100.0, last_price=110.0, unrealized_pnl=100.0))
+    db_session.commit()
+    _set_row(db_session, 4)                 # same price, smaller position
+    _mark_to_market(SessionLocal, "SBIN", 110.0)
+    db_session.expire_all()
+    assert db_session.query(PositionRow).filter_by(symbol="SBIN").one().unrealized_pnl == pytest.approx(40.0)
