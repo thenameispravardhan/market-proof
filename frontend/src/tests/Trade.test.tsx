@@ -1325,43 +1325,6 @@ describe("Trade page", () => {
     expect(ok.textContent).toMatch(/order FY-1/);
     expect(ok.textContent).not.toMatch(/@ FY-1/);
   });
-});
-
-describe("ticket checks", () => {
-  const base: TicketCheck = { side: "BUY", orderType: "MARKET", quantity: 1, lotSize: 1, limit: null, stop: null, ltp: 100, entry: 100, sl: null, tp: null };
-
-  it("passes a plain market order", () => {
-    expect(ticketProblem(base)).toBeNull();
-  });
-  it("wants a whole lot for F&O", () => {
-    expect(ticketProblem({ ...base, quantity: 40, lotSize: 30 })).toMatch(/multiple of the lot size \(30\)/);
-    expect(ticketProblem({ ...base, quantity: 60, lotSize: 30 })).toBeNull();
-  });
-  it("needs the prices its order type uses", () => {
-    expect(ticketProblem({ ...base, orderType: "LIMIT" })).toMatch(/limit price/);
-    expect(ticketProblem({ ...base, orderType: "SL-M" })).toMatch(/trigger/);
-    expect(ticketProblem({ ...base, orderType: "STOP_LOSS", limit: 101 })).toMatch(/trigger/);
-  });
-  it("refuses a stop-limit whose limit is on the wrong side of its trigger", () => {
-    expect(ticketProblem({ ...base, orderType: "STOP_LOSS", stop: 105, limit: 104 })).toMatch(/at or above the trigger/);
-    expect(ticketProblem({ ...base, orderType: "STOP_LOSS", stop: 105, limit: 106, entry: 106 })).toBeNull();
-    expect(ticketProblem({ ...base, side: "SELL", orderType: "STOP_LOSS", stop: 95, limit: 96 })).toMatch(/at or below the trigger/);
-  });
-  it("keeps the stop loss and target on the right side of the entry", () => {
-    expect(ticketProblem({ ...base, sl: 101 })).toMatch(/Stop loss .* below/);
-    expect(ticketProblem({ ...base, tp: 99 })).toMatch(/Target .* above/);
-    expect(ticketProblem({ ...base, side: "SELL", sl: 99 })).toMatch(/Stop loss .* above/);
-    expect(ticketProblem({ ...base, side: "SELL", sl: 102, tp: 95 })).toBeNull();
-  });
-  it("warns when a stop's trigger is already through the market", () => {
-    expect(ticketWarning({ ...base, orderType: "SL-M", stop: 99 })).toMatch(/BUY stop triggers above/);
-    expect(ticketWarning({ ...base, orderType: "SL-M", stop: 101 })).toBeNull();
-    expect(ticketWarning({ ...base, side: "SELL", orderType: "SL-M", stop: 101 })).toMatch(/SELL stop/);
-  });
-  it("puts a typed stop / target price on the tick grid", () => {
-    expect(levelPrice(2400.02, "price", 2450, "BUY", "sl", 0.05)).toBe(2400);
-    expect(levelPrice(101.13, "price", null, "BUY", "target", 0.1)).toBe(101.1);
-  });
 
   it("search: clicking outside the search box closes its results", async () => {
     globalThis.fetch = makeFetchStub(defaultStubs());
@@ -1405,5 +1368,42 @@ describe("ticket checks", () => {
     // Back on the nearest expiry's ladder rather than stuck on the lapsed one.
     expect(await screen.findByTestId("chain-ce-2500")).toBeInTheDocument();
     expect((screen.getByTestId("chain-expiry") as HTMLSelectElement).value).toBe("1793097000");
+  });
+});
+
+describe("ticket checks", () => {
+  const base: TicketCheck = { side: "BUY", orderType: "MARKET", quantity: 1, lotSize: 1, limit: null, stop: null, ltp: 100, entry: 100, sl: null, tp: null };
+
+  it("passes a plain market order", () => {
+    expect(ticketProblem(base)).toBeNull();
+  });
+  it("wants a whole lot for F&O", () => {
+    expect(ticketProblem({ ...base, quantity: 40, lotSize: 30 })).toMatch(/multiple of the lot size \(30\)/);
+    expect(ticketProblem({ ...base, quantity: 60, lotSize: 30 })).toBeNull();
+  });
+  it("needs the prices its order type uses", () => {
+    expect(ticketProblem({ ...base, orderType: "LIMIT" })).toMatch(/limit price/);
+    expect(ticketProblem({ ...base, orderType: "SL-M" })).toMatch(/trigger/);
+    expect(ticketProblem({ ...base, orderType: "STOP_LOSS", limit: 101 })).toMatch(/trigger/);
+  });
+  it("refuses a stop-limit whose limit is on the wrong side of its trigger", () => {
+    expect(ticketProblem({ ...base, orderType: "STOP_LOSS", stop: 105, limit: 104 })).toMatch(/at or above the trigger/);
+    expect(ticketProblem({ ...base, orderType: "STOP_LOSS", stop: 105, limit: 106, entry: 106 })).toBeNull();
+    expect(ticketProblem({ ...base, side: "SELL", orderType: "STOP_LOSS", stop: 95, limit: 96 })).toMatch(/at or below the trigger/);
+  });
+  it("keeps the stop loss and target on the right side of the entry", () => {
+    expect(ticketProblem({ ...base, sl: 101 })).toMatch(/Stop loss .* below/);
+    expect(ticketProblem({ ...base, tp: 99 })).toMatch(/Target .* above/);
+    expect(ticketProblem({ ...base, side: "SELL", sl: 99 })).toMatch(/Stop loss .* above/);
+    expect(ticketProblem({ ...base, side: "SELL", sl: 102, tp: 95 })).toBeNull();
+  });
+  it("warns when a stop's trigger is already through the market", () => {
+    expect(ticketWarning({ ...base, orderType: "SL-M", stop: 99 })).toMatch(/BUY stop triggers above/);
+    expect(ticketWarning({ ...base, orderType: "SL-M", stop: 101 })).toBeNull();
+    expect(ticketWarning({ ...base, side: "SELL", orderType: "SL-M", stop: 101 })).toMatch(/SELL stop/);
+  });
+  it("puts a typed stop / target price on the tick grid", () => {
+    expect(levelPrice(2400.02, "price", 2450, "BUY", "sl", 0.05)).toBe(2400);
+    expect(levelPrice(101.13, "price", null, "BUY", "target", 0.1)).toBe(101.1);
   });
 });
