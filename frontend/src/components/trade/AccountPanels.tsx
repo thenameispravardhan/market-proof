@@ -944,7 +944,7 @@ export function ModifyOrderDialog({ order, accountId, onClose, onDone }: { order
 }
 
 /** The position an exit acts on (the bot's, or the Fyers account's). */
-export interface ExitTarget { symbol: string; name: string; qty: number; avg: number | null; ltp: number | null; lot: number }
+export interface ExitTarget { symbol: string; name: string; qty: number; avg: number | null; ltp: number | null; lot: number; product?: string | null }
 
 export function ExitPositionDialog({
   pos,
@@ -988,7 +988,7 @@ export function ExitPositionDialog({
       testid="exit-position"
       footer={<><span className="grow" /><button type="button" className="cbtn" onClick={onClose}>Cancel</button><button type="button" className="cbtn danger" disabled={!!bad || busy} onClick={() => void submit()} data-testid="exit-position-ok">{busy ? "Sending…" : `${side} ${q > 0 ? q : ""} to exit`}</button></>}
     >
-      <Row label="Position"><span className={pos.qty > 0 ? "up" : "down"}>{pos.qty > 0 ? "LONG" : "SHORT"} {abs} @ {fmt(pos.avg)}</span><span className="dim"> · LTP {fmt(live)}</span></Row>
+      <Row label="Position"><span className={pos.qty > 0 ? "up" : "down"}>{pos.qty > 0 ? "LONG" : "SHORT"} {abs} @ {fmt(pos.avg)}</span><span className="dim"> · LTP {fmt(live)}{pos.product ? ` · ${pos.product}` : ""}</span></Row>
       <Row label="Quantity">
         <input className="cform-input" type="number" min={pos.lot} step={pos.lot} max={abs} value={qty} onChange={(e) => setQty(e.target.value)} aria-label="Exit quantity" data-testid="exit-qty" />
         <span className="am-qty-btns">
