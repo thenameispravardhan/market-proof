@@ -1,7 +1,8 @@
 // Accounts page — intentionally minimal. The bot runs on exactly two
 // accounts:
 //   1. Paper Trading — built in, always available, simulated fills.
-//   2. Fyers — connect in one click via OAuth (keys live in .env).
+//   2. Fyers — connect in one click via OAuth. Keys are entered on this
+//      page (API Credentials), saved to .env and applied live.
 // No broker-account CRUD; there is nothing for the operator to manage
 // beyond connecting Fyers.
 
@@ -12,7 +13,10 @@ import { useGlobalSettings } from "../hooks/useApi";
 
 function PaperAccountCard() {
   const { data } = useGlobalSettings();
-  const isPaper = (data?.global?.TRADING_MODE ?? "paper") === "paper";
+  // No badge until the mode is known: defaulting to "paper" flashed
+  // "Active" on a bot that is actually trading live.
+  const mode = data?.global?.TRADING_MODE;
+  const isPaper = mode === "paper";
   return (
     <div
       className="widget"
@@ -28,9 +32,14 @@ function PaperAccountCard() {
             Always available.
           </div>
         </div>
-        <span className={`badge ${isPaper ? "green" : "neutral"}`}>
-          {isPaper ? "Active" : "Standby"}
-        </span>
+        {mode && (
+          <span
+            className={`badge ${isPaper ? "green" : "neutral"}`}
+            title={isPaper ? "Trading mode is Paper" : "Trading mode is Live; paper is not used"}
+          >
+            {isPaper ? "Active" : "Standby"}
+          </span>
+        )}
       </div>
     </div>
   );
@@ -43,8 +52,9 @@ export default function Accounts() {
       <p className="text-dim" style={{ marginBottom: 18, maxWidth: 640 }}>
         The bot trades through two accounts: a built-in <strong>paper</strong>{" "}
         account for simulation, and your <strong>Fyers</strong> account for live
-        orders. Connect Fyers in one click — the API keys are read from{" "}
-        <code className="mono">.env</code>.
+        orders. First time: enter your keys under API Credentials, activate the
+        app on Fyers, then click Connect Fyers. Fyers sessions end daily, so
+        after that you only need Connect Fyers.
       </p>
       <div className="layout-2">
         <PaperAccountCard />
@@ -55,8 +65,6 @@ export default function Accounts() {
       </div>
       <div style={{ marginTop: 16 }}>
         <FyersSetupCard />
-      </div>
-      <div style={{ marginTop: 16 }}>
       </div>
     </div>
   );
