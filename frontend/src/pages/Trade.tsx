@@ -220,6 +220,7 @@ function LevelMode({ mode, onMode, testid }: { mode: LevelInputMode; onMode: (m:
   );
 }
 const PRODUCT_LABEL: Record<ProductType, string> = { INTRADAY: "Intraday", DELIVERY: "Delivery", MARGIN: "Carry (NRML)" };
+const ORDER_TYPE_LABEL: Record<OrderType, string> = { MARKET: "Market", LIMIT: "Limit", STOP_LOSS: "Stop-limit", "SL-M": "Stop-market" };
 
 // Right-dock panels, opened / closed from the icon bar. Several can be open;
 // they stack in this order.
@@ -730,6 +731,8 @@ export default function Trade() {
     type: "success" | "error";
     message: string;
     warning?: string | null;
+    /** The order is at the broker but wasn't saved here — never re-place it. */
+    recordWarning?: string | null;
     detail?: PlaceOrderRequest;
     // Diagnostic reason from the Fyers backend. Set when the
     // place-order rejection has a known cause the UI can
@@ -1112,14 +1115,27 @@ export default function Trade() {
           reason: r.reason ?? null,
         });
       } else {
+        // What was sent, in the words a trader reads it: side, size, name,
+        // type and price, then the broker's status and order id.
+        const name = selected?.symbol === body.symbol ? selected.short_name || body.symbol : body.symbol;
+        const px = body.order_type === "LIMIT" ? ` @ ${body.limit_price}`
+          : body.order_type === "SL-M" ? ` trigger ${body.stop_price}`
+          : body.order_type === "STOP_LOSS" ? ` trigger ${body.stop_price} limit ${body.limit_price}` : "";
+        const levels = [body.stop_loss != null ? `SL ${body.stop_loss}` : "", body.target != null ? `target ${body.target}` : ""].filter(Boolean).join(", ");
         setLastResult({
           type: "success",
           // The order id is not a price — "@ 2406..." read as a fill price.
-          message: `${r.status}  ${body.symbol}  ${body.side} ${body.quantity}${r.broker_order_id ? `  · order ${r.broker_order_id}` : ""}`,
+          message: `${r.status} · ${body.side} ${body.quantity} ${name} · ${ORDER_TYPE_LABEL[body.order_type]}${px}`
+            + `${levels ? ` · ${levels} set once it fills` : ""}${r.broker_order_id ? ` · order ${r.broker_order_id}` : ""}`,
           // Risk is advisory for manual orders — surface it without blocking.
           warning: r.risk_warning ?? (r.risk_message ? r.risk_message : null),
+          recordWarning: r.warning ?? null,
           detail: body,
         });
+        // The stop loss / target belonged to this order. Left in the boxes
+        // they'd ride along on the next one, an exit included.
+        setSlPrice("");
+        setTpPrice("");
       }
     } catch (e) {
       setLastResult({
@@ -1578,10 +1594,10 @@ export default function Trade() {
                       onChange={(e) => setOrderType(e.target.value as OrderType)}
                       data-testid="ticket-type"
                     >
-                      <option value="MARKET">MARKET</option>
-                      <option value="LIMIT">LIMIT</option>
-                      <option value="STOP_LOSS">STOP_LOSS (SL-L)</option>
-                      <option value="SL-M">SL-M</option>
+                      <option value="MARKET">Market</option>
+                      <option value="LIMIT">Limit</option>
+                      <option value="STOP_LOSS">Stop-limit (SL)</option>
+                      <option value="SL-M">Stop-market (SL-M)</option>
                     </select>
                   </label>
   
@@ -1635,7 +1651,7 @@ export default function Trade() {
   
                   {requiresStop && (
                     <label className="ticket-row">
-                      <span>Stop price</span>
+                      <span>Trigger price</span>
                       <input
                         type="number"
                         step={tick}
@@ -1702,16 +1718,21 @@ export default function Trade() {
                       data-testid="ticket-submit"
                       title={account ? `Sends a real ${side} order to Fyers (${account.name})` : undefined}
                     >
-                      {placeOrder.isPending ? "placing…" : `PLACE ${side}`}
+                      {placeOrder.isPending ? "placing…" : selected ? `${side} ${quantity} ${selected.short_name || selected.symbol}` : `PLACE ${side}`}
                     </button>
                   </div>
                   {/* Say why PLACE is greyed out instead of leaving a dead button. */}
-                  {problem && selected && <div className="hint ticket-problem" data-testid="ticket-problem">{problem}</div>}
+                  {problem && <div className="hint ticket-problem" data-testid="ticket-problem">{problem}</div>}
                   {ticketWarn && <div className="result-warning" data-testid="ticket-warning">⚠ {ticketWarn}</div>}
   
                   {lastResult && lastResult.type === "success" && (
                     <div className="result success" data-testid="ticket-result-success">
                       {lastResult.message}
+                      {lastResult.recordWarning && (
+                        <div className="result-warning" data-testid="ticket-record-warning">
+                          ⚠ {lastResult.recordWarning}
+                        </div>
+                      )}
                       {lastResult.warning && (
                         <div className="result-warning" data-testid="ticket-risk-advisory">
                           ⚠ risk advisory: {lastResult.warning}
@@ -1777,7 +1798,7 @@ export default function Trade() {
                             >
                               myapi.fyers.in/dashboard
                             </a>
-                            , then click PLACE BUY again.
+                            , then place the order again.
                           </div>
                           <div
                             style={{
