@@ -71,7 +71,7 @@ async def test_scale_out_takes_half_and_trails(db_session, isolated_db):
     db_session.add(PositionRow(symbol="RELIANCE", quantity=10,
                                average_price=100.0, last_price=100.0))
     db_session.commit()
-    await md.publish("RELIANCE", 111.0)  # +2.2R
+    md.set_quote_sync("RELIANCE", 111.0)  # +2.2R
     await tm._sweep()
     # Half (5) closed at a profit; 5 still managed with a breakeven-ish
     # (trailed) stop.
@@ -100,7 +100,7 @@ async def test_hard_target_suppresses_scale_out(db_session, isolated_db):
     db_session.add(PositionRow(symbol="RELIANCE", quantity=10,
                                average_price=100.0, last_price=100.0))
     db_session.commit()
-    await md.publish("RELIANCE", 111.0)  # past the 108 target
+    md.set_quote_sync("RELIANCE", 111.0)  # past the 108 target
     await tm._sweep()
     # Full exit — the position is gone, not partially scaled out.
     assert tm.managed_positions() == []
@@ -121,7 +121,7 @@ async def test_exit_records_r_multiple(db_session, isolated_db, monkeypatch):
         # R=5; exit at target 110 => +2R.
         await tm.register(symbol="TCS", quantity=10, entry=100.0,
                           stop_loss=95.0, target=110.0)
-        await md.publish("TCS", 110.0)
+        md.set_quote_sync("TCS", 110.0)
         await tm._sweep()
         trade = db_session.query(TradeRow).filter_by(symbol="TCS").one()
         assert trade.r_multiple == pytest.approx(2.0)
@@ -141,7 +141,7 @@ async def test_square_off_if_due_flattens(db_session, isolated_db):
     db_session.add(PositionRow(symbol="INFY", quantity=10,
                                average_price=1000.0, last_price=1000.0))
     db_session.commit()
-    await md.publish("INFY", 1010.0)
+    md.set_quote_sync("INFY", 1010.0)
     # 15:20 IST on a Friday is past the 15:10 square-off.
     now = datetime(2026, 6, 19, 15, 20, tzinfo=IST).astimezone(timezone.utc)
     closed = await tm.square_off_if_due(now=now, force=True)
@@ -155,7 +155,7 @@ async def test_square_off_not_due_midsession(db_session, isolated_db):
     tm = TradeManager(market_data=md)
     await tm.register(symbol="INFY", quantity=10, entry=1000.0,
                       stop_loss=950.0, target=None)
-    await md.publish("INFY", 1010.0)
+    md.set_quote_sync("INFY", 1010.0)
     now = datetime(2026, 6, 19, 11, 0, tzinfo=IST).astimezone(timezone.utc)
     closed = await tm.square_off_if_due(now=now, force=True)
     assert closed == []
