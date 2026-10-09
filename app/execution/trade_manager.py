@@ -291,6 +291,34 @@ class ManagedPosition:
         # Long: (exit-entry)*qty ; Short: (entry-exit)*|qty|.
         return (exit_price - self.entry) * self.quantity
 
+    def view(self) -> dict[str, Any]:
+        """What the dashboard shows for this position: its levels plus the
+        exit state the manager is acting on, so a stop the bot moved
+        (trailing / breakeven), a pending time exit or a failing broker
+        exit is visible instead of changing silently."""
+        time_exit_at: Optional[str] = None
+        if self.max_hold_seconds and self.max_hold_seconds > 0:
+            opened = self.opened_at
+            if opened.tzinfo is None:
+                opened = opened.replace(tzinfo=timezone.utc)
+            time_exit_at = (opened + timedelta(seconds=self.max_hold_seconds)).isoformat()
+        return {
+            "symbol": self.symbol,
+            "quantity": self.quantity,
+            "entry": self.entry,
+            "stop_loss": self.stop_loss,
+            "target": self.target,
+            "signal_id": self.signal_id,
+            "strategy_id": self.strategy_id,
+            "opened_at": self.opened_at.isoformat(),
+            "trail_active": self.trail_active,
+            "breakeven_armed": self.breakeven_armed,
+            "scaled_out": self.scaled_out,
+            "time_exit_at": time_exit_at,
+            "exit_failures": self.exit_failures,
+            "exit_escalated": self.escalated,
+        }
+
 
 # Exits the operator (or the EOD square-off) asked for: they flatten whatever
 # is open, even a position reversed by hand since it was booked.
@@ -542,16 +570,59 @@ class TradeManager:
             "trade_manager.levels_updated",
             symbol=symbol, stop_loss=new_sl, target=new_target,
         )
-        return {
-            "symbol": mp.symbol,
-            "quantity": mp.quantity,
-            "entry": mp.entry,
-            "stop_loss": mp.stop_loss,
-            "target": mp.target,
-            "signal_id": mp.signal_id,
-            "strategy_id": mp.strategy_id,
-            "opened_at": mp.opened_at.isoformat(),
-        }
+        return mp.view()
+
+    async def check_levels(
+        self,
+        symbol: str,
+        *,
+        stop_loss: Optional[float],
+        target: Optional[float],
+    ) -> Optional[str]:
+        """Why an operator's SL / target edit would misfire, or None.
+
+        A stop typed on the wrong side of the market (or a target typed
+        into the SL box) used to be accepted and the next tick flattened
+        the position at market. Rejects non-positive levels, a stop at or
+        beyond the target, and, when a real price is known, a level the
+        price has already crossed. Unknown symbols return None so the
+        caller still answers 404.
+        """
+        symbol = symbol.upper().strip()
+        for name, v in (("Stop-loss", stop_loss), ("Target", target)):
+            if v is not None and not float(v) > 0:
+                return f"{name} must be a positive price"
+        async with self._lock:
+            mp = self._book.get(symbol)
+        if mp is not None:
+            qty = mp.quantity
+            last = mp.price_history[-1][1] if mp.price_history else None
+        else:
+            loaded = await asyncio.get_running_loop().run_in_executor(
+                None, _open_position_as_managed, self._session_factory, symbol
+            )
+            if loaded is None:
+                return None
+            qty, last = loaded[0].quantity, None
+        if last is None:
+            quote = await self._md.get_quote(symbol)
+            if quote is not None and self._is_real_quote(quote):
+                last = float(quote.last_price)
+        long = qty > 0
+        if stop_loss is not None and target is not None:
+            if (long and stop_loss >= target) or (not long and stop_loss <= target):
+                side = "below" if long else "above"
+                return f"Stop-loss must be {side} the target for a {'long' if long else 'short'} position"
+        if last is not None:
+            if stop_loss is not None and ((long and stop_loss >= last) or (not long and stop_loss <= last)):
+                side = "below" if long else "above"
+                return (f"Stop-loss {stop_loss:g} is already hit (price {last:g}); "
+                        f"set it {side} the price, or use Exit to close now")
+            if target is not None and ((long and target <= last) or (not long and target >= last)):
+                side = "above" if long else "below"
+                return (f"Target {target:g} is already hit (price {last:g}); "
+                        f"set it {side} the price, or use Exit to close now")
+        return None
 
     async def _hydrate_book(self) -> None:
         """Rebuild the managed book from open position rows so stop-loss /
