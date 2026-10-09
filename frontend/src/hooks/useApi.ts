@@ -424,8 +424,12 @@ export interface FyersStatus {
   // trade on/off switch. The banner keys on this (not `connected`) so a
   // switched-OFF account isn't mislabelled "Token Expired".
   authorized?: boolean;
-  // True if the account row holds a non-empty access_token.
+  // True if the account row holds an access_token that hasn't expired.
   has_token?: boolean;
+  // True when the held token's own expiry (JWT `exp`) has passed.
+  token_expired?: boolean;
+  // Epoch seconds the token expires at, when readable.
+  token_expires_at?: number | null;
   // True if the Fyers account's trade switch is ON (`enabled`).
   enabled?: boolean;
   // True if creds are in .env but no OAuth has run yet (or token expired).
@@ -879,6 +883,8 @@ export function usePlaceOrder() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["pending-orders"] });
       qc.invalidateQueries({ queryKey: ["trades"] });
+      // A market order can fill before the response lands.
+      qc.invalidateQueries({ queryKey: ["positions"] });
     },
   });
 }
@@ -886,9 +892,13 @@ export function usePlaceOrder() {
 export interface CancelOrderResponse {
   ok: boolean;
   broker_order_id: string;
-  /** Optional human-readable reason for the cancel outcome
-   *  (e.g. "cancelled", "broker_rejected_already_gone"). */
-  reason?: string;
+  /** The cancel outcome: "cancelled", or on ok:false what the broker says
+   *  the order is — "already_gone" (cancelled / rejected / expired),
+   *  "already_filled", or "broker_refused" (may still be working). */
+  reason?: "cancelled" | "already_gone" | "already_filled" | "broker_refused" | string;
+  /** Operator-facing explanation when ok is false. */
+  message?: string;
+  rows_updated?: number;
 }
 
 export function useCancelOrder() {

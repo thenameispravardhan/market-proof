@@ -875,12 +875,14 @@ describe("Trade page", () => {
       if (url.includes("/api/orders/cancel") && method === "POST") {
         const body = init?.body ? JSON.parse(String(init.body)) : null;
         cancelCalls.push({ url, method, body });
-        // Backend says: broker said "no", but the local row is gone.
+        // Broker said "no"; the backend checked and the order was
+        // already cancelled there, so the local row is gone.
         pending = { ok: true, count: 0, orders: [] };
         return makeJsonResponse({
           ok: false,
           broker_order_id: body?.broker_order_id,
-          reason: "broker_rejected_already_gone",
+          reason: "already_gone",
+          message: "the order was already cancelled at the broker",
         });
       }
       return makeJsonResponse({}, 404);
@@ -895,7 +897,7 @@ describe("Trade page", () => {
 
     await waitFor(() => expect(cancelCalls.length).toBe(1));
     const banner = await screen.findByTestId("cancel-result");
-    expect(banner.textContent).toMatch(/already gone/i);
+    expect(banner.textContent).toMatch(/already cancelled/i);
     // The local pending list refreshes and the row is gone.
     await waitFor(() =>
       expect(screen.queryByTestId("cancel-FX-99999")).not.toBeInTheDocument(),
@@ -1098,5 +1100,128 @@ describe("Trade page", () => {
     await waitFor(() => expect(panel.textContent).toMatch(/NSE:RELIANCE-EQ/));
     expect(screen.getByText("Exit all")).toBeInTheDocument();
     expect(screen.getByTitle("Reverse at market")).toBeInTheDocument();
+  });
+
+  it("cancel the broker refused: says the order may still be working and keeps the row", async () => {
+    const pending = {
+      ok: true, count: 1,
+      orders: [{
+        id: 43, broker_order_id: "FX-77777", broker_account_id: 7, symbol: "NSE:RELIANCE-EQ",
+        side: "BUY", quantity: 1, price: 2400, order_type: "LIMIT", status: "placed",
+        created_at: "2026-06-13T10:00:00Z",
+      }],
+    };
+    const stubs = defaultStubs({ pending });
+    globalThis.fetch = makeFetchStub((url, init) => {
+      if (url.includes("/api/orders/cancel") && init?.method === "POST") {
+        return makeJsonResponse({
+          ok: false, broker_order_id: "FX-77777", reason: "broker_refused", rows_updated: 0,
+          message: "the broker didn't cancel the order and it may still be working — check the Orders tab and try again",
+        });
+      }
+      return stubs(url, init);
+    });
+    const user = userEvent.setup();
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await user.click(await screen.findByTestId("cancel-FX-77777"));
+    const banner = await screen.findByTestId("cancel-result");
+    expect(banner.textContent).toMatch(/Not cancelled/);
+    expect(banner.textContent).toMatch(/may still be working/);
+    expect(banner.className).toMatch(/error/);
+    expect(screen.getByTestId("cancel-FX-77777")).toBeInTheDocument();
+  });
+
+  const OPT = (symbol: string, name: string, lot: number) => ({
+    symbol, short_name: name, exchange: "NSE", segment: "FO", instrument_type: "CE",
+    lot_size: lot, tick_size: 0.05, expiry: null, strike: 50000, underlying: name.split(" ")[0], display: name,
+  });
+  const NIFTY_CE = OPT("NSE:NIFTY26JUN24000CE", "NIFTY 24000 CE", 65);
+  const BANK_CE = OPT("NSE:BANKNIFTY26JUN51000CE", "BANKNIFTY 51000 CE", 30);
+
+  function searchStubs() {
+    const stubs = defaultStubs();
+    const posts: Record<string, unknown>[] = [];
+    globalThis.fetch = makeFetchStub((url, init) => {
+      if (url.includes("/api/search/symbols")) {
+        const q = new URL(url, "http://x").searchParams.get("q") ?? "";
+        const hits = /^BANK/i.test(q) ? [BANK_CE] : /^NIF/i.test(q) ? [NIFTY_CE] : SEARCH_RELIANCE.hits;
+        return makeJsonResponse({ ok: true, count: hits.length, hits });
+      }
+      if (/\/api\/orders$/.test(url) && init?.method === "POST") posts.push(JSON.parse(String(init.body)));
+      return stubs(url, init);
+    });
+    return posts;
+  }
+
+  async function pick(user: ReturnType<typeof userEvent.setup>, q: string, symbol: string) {
+    const box = await screen.findByTestId("trade-search");
+    await user.clear(box);
+    await user.type(box, q);
+    await user.click(await screen.findByTestId(`search-row-${symbol}`));
+  }
+
+  it("ticket: quantity snaps to the new lot when switching options, and back to shares for cash", async () => {
+    searchStubs();
+    const user = userEvent.setup();
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+
+    await pick(user, "NIF", NIFTY_CE.symbol);
+    await waitFor(() => expect(screen.getByTestId("ticket-qty").textContent).toMatch(/= 65 qty/));
+    // NIFTY's 65 is not a BANKNIFTY lot (30): it must become one lot, not stay 65.
+    await pick(user, "BANK", BANK_CE.symbol);
+    await waitFor(() => expect(screen.getByTestId("ticket-qty").textContent).toMatch(/= 30 qty \(30\/lot\)/));
+    // Back to a cash stock: the default quantity, not 30 shares.
+    await pick(user, "RELI", "NSE:RELIANCE-EQ");
+    await waitFor(() => expect((screen.getByTestId("ticket-qty") as HTMLInputElement).value).toBe("1"));
+  });
+
+  it("ticket: a limit price typed for one symbol is cleared when another is picked", async () => {
+    searchStubs();
+    const user = userEvent.setup();
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+
+    await pick(user, "RELI", "NSE:RELIANCE-EQ");
+    await user.selectOptions(screen.getByTestId("ticket-type"), "LIMIT");
+    await user.type(screen.getByTestId("ticket-limit"), "2450");
+    await user.type(screen.getByTestId("ticket-sl"), "2400");
+
+    await pick(user, "BANK", BANK_CE.symbol);
+    await user.selectOptions(screen.getByTestId("ticket-type"), "LIMIT");
+    expect((screen.getByTestId("ticket-limit") as HTMLInputElement).value).toBe("");
+    expect((screen.getByTestId("ticket-sl") as HTMLInputElement).value).toBe("");
+    expect(screen.getByTestId("ticket-submit")).toBeDisabled();
+  });
+
+  it("ticket: limit price is sent on the instrument's tick grid", async () => {
+    const posts = searchStubs();
+    const user = userEvent.setup();
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+
+    await pick(user, "RELI", "NSE:RELIANCE-EQ");
+    await user.selectOptions(screen.getByTestId("ticket-type"), "LIMIT");
+    await user.type(screen.getByTestId("ticket-limit"), "2450.03");
+    await waitFor(() => expect(screen.getByTestId("ticket-submit")).not.toBeDisabled());
+    await user.click(screen.getByTestId("ticket-submit"));
+    await waitFor(() => expect(posts).toHaveLength(1));
+    expect(posts[0].limit_price).toBe(2450.05);
+  });
+
+  it("an order Fyers never confirmed is shown as an error with a check-before-retry warning", async () => {
+    globalThis.fetch = makeFetchStub(defaultStubs({
+      placeResponse: {
+        ok: false, blocked: false, risk_codes: [], risk_message: "", broker_order_id: "",
+        status: "UNCONFIRMED",
+        error: "Fyers didn't confirm this order (transport error). It may still have been placed — check the Orders tab or the Fyers order book before placing it again.",
+      },
+    }));
+    const user = userEvent.setup();
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await user.type(await screen.findByTestId("trade-search"), "RELI");
+    await user.click(await screen.findByTestId("search-row-NSE:RELIANCE-EQ"));
+    await waitFor(() => expect(screen.getByTestId("ticket-submit")).not.toBeDisabled());
+    await user.click(screen.getByTestId("ticket-submit"));
+    const err = await screen.findByTestId("ticket-result-error");
+    expect(err.textContent).toMatch(/before placing it again/);
+    expect(screen.queryByTestId("ticket-result-success")).not.toBeInTheDocument();
   });
 });

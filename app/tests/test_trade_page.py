@@ -451,53 +451,6 @@ def test_cancel_unknown_order_id_404s(
     assert r.status_code == 200
 
 
-def test_cancel_marks_local_row_when_broker_rejects(
-    client: TestClient, db_session, isolated_db, real_account
-):
-    """When the broker says 'no' to a cancel (order already filled,
-    already cancelled, or just not on the broker anymore), the local
-    `trades` row must still be flipped to `cancelled` so the Trade
-    page's pending list doesn't loop forever showing the same row
-    with no UI feedback. Regression test for the "cancel does
-    nothing" complaint.
-    """
-    _install_stub_backend(client, real_account.id, ok=True)
-    # Place an order so we have a row to cancel.
-    r = client.post(
-        "/api/orders",
-        json={
-            "account_id": real_account.id,
-            "symbol": "NSE:SBIN-EQ",
-            "side": "BUY",
-            "quantity": 1,
-            "order_type": "MARKET",
-        },
-    )
-    assert r.status_code == 200
-
-    # Re-install the stub with ok=False so the broker "rejects" the
-    # cancel — the order is already gone from the broker side
-    # (filled / cancelled / unknown id).
-    _install_stub_backend(client, real_account.id, ok=False)
-
-    r = client.post(
-        "/api/orders/cancel",
-        json={"account_id": real_account.id, "broker_order_id": "STUB-1"},
-    )
-    assert r.status_code == 200
-    body = r.json()
-    assert body["ok"] is False
-    assert body["broker_order_id"] == "STUB-1"
-    assert body["reason"] == "broker_rejected_already_gone"
-
-    # The local row is still flipped to cancelled so the operator's
-    # pending list drops it. Without this, the Trade page kept
-    # showing the same row even after a successful broker reject.
-    db_session.expire_all()
-    trade = db_session.query(Trade).filter_by(broker_order_id="STUB-1").one()
-    assert trade.status == "cancelled"
-
-
 def test_cancel_handles_duplicate_broker_order_id_rows(
     client: TestClient, db_session, isolated_db, real_account
 ):

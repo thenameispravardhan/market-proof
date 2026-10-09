@@ -80,6 +80,7 @@ from app.execution.base import (
     OrderType,
     ProductType,
     TradingBackend,
+    apply_fill,
 )
 from app.execution import entry_manager as entry_sm
 from app.execution.entry_manager import (
@@ -1544,8 +1545,22 @@ class Manager:
             )
         except Exception:  # noqa: BLE001
             log.exception("manual_order.publish_failed")
+        # PENDING with no order id = the request timed out / hit a 5xx after
+        # it may have reached Fyers. Reporting that as a placed order (and
+        # parking an id-less "placed" row nobody could cancel) invited a
+        # second click and a duplicate real-money order. Say it's unknown.
+        unconfirmed = result.state == OrderState.PENDING and not result.broker_order_id
+        status_text = "UNCONFIRMED" if unconfirmed else result.state.value
+        error = result.error
+        if unconfirmed:
+            error = (
+                "Fyers didn't confirm this order"
+                + (f" ({result.error})" if result.error else "")
+                + ". It may still have been placed — check the Orders tab or the "
+                "Fyers order book before placing it again."
+            )
         return {
-            "ok": result.state in (OrderState.PENDING, OrderState.FILLED),
+            "ok": result.state in (OrderState.PENDING, OrderState.FILLED) and not unconfirmed,
             "blocked": False,
             # Risk codes are surfaced as a warning; the order proceeded
             # either because it passed risk or the operator overrode it.
@@ -1554,8 +1569,8 @@ class Manager:
             "risk_warning": risk_message or None,
             "bypassed_risk": bool(bypass_risk and risk_codes),
             "broker_order_id": result.broker_order_id,
-            "status": result.state.value,
-            "error": result.error,
+            "status": status_text,
+            "error": error,
             # Surface the OrderResult's `raw` field as `reason` so
             # the UI can branch on diagnostic markers from the
             # Fyers backend (e.g. "ip_whitelist" → render a
@@ -1592,6 +1607,10 @@ class Manager:
             OrderState.EXPIRED: "expired",
         }
         local_status = state_to_status.get(result.state, "placed")
+        if result.state == OrderState.PENDING and not result.broker_order_id:
+            # No order id: nothing can reconcile or cancel it, so it must not
+            # sit in the pending list as "placed" forever.
+            local_status = "unconfirmed"
         # On a confirmed fill, the authoritative price is the broker's
         # average fill price (a MARKET order's `price` arg is 0).
         fill_price = float(
@@ -1642,12 +1661,9 @@ class Manager:
                             )
                         )
                 else:
-                    new_qty = pos.quantity + signed
-                    if signed > 0 and new_qty != 0:
-                        pos.average_price = (
-                            pos.average_price * pos.quantity + fill_price * signed
-                        ) / new_qty
-                    pos.quantity = new_qty
+                    pos.quantity, pos.average_price = apply_fill(
+                        pos.quantity, pos.average_price, signed, fill_price
+                    )
                     pos.last_price = fill_price
             session.add(
                 AuditLog(
@@ -2091,20 +2107,10 @@ def _persist_trade(
                 )
                 session.add(pos)
             else:
-                # Simple weighted average update; the paper backend
-                # already maintains the in-memory mirror, but we
-                # keep the DB row consistent.
-                if result.side == OrderSide.BUY:
-                    new_qty = pos.quantity + int(result.filled_quantity)
-                    pos.average_price = (
-                        (pos.average_price * pos.quantity + result.average_price * result.filled_quantity)
-                        / new_qty
-                        if new_qty
-                        else pos.average_price
-                    )
-                    pos.quantity = new_qty
-                else:
-                    pos.quantity = pos.quantity - int(result.filled_quantity)
+                signed = int(result.filled_quantity) * (1 if result.side == OrderSide.BUY else -1)
+                pos.quantity, pos.average_price = apply_fill(
+                    pos.quantity, pos.average_price, signed, result.average_price
+                )
                 pos.last_price = result.average_price
         if result.state in (OrderState.FILLED, OrderState.REJECTED, OrderState.CANCELLED, OrderState.EXPIRED):
             s.status = "filled" if result.state == OrderState.FILLED else "blocked"

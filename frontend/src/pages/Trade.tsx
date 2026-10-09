@@ -107,6 +107,12 @@ function cleanError(raw: unknown, fallback: string): string {
 
 const DRAG_MIME = "application/x-tradebot-instrument";
 
+/** A price snapped to the instrument's tick (Fyers rejects off-grid prices). */
+export function roundToTick(v: number, tick = 0.05): number {
+  const t = tick > 0 ? tick : 0.05;
+  return Math.round(Math.round(v / t) * t * 100) / 100;
+}
+
 export type LevelInputMode = "price" | "pts" | "pct";
 const LEVEL_MODE_LABEL: Record<LevelInputMode, string> = { price: "₹", pts: "pts", pct: "%" };
 
@@ -596,12 +602,23 @@ export default function Trade() {
     text: string;
   } | null>(null);
 
-  // Lot-size aware default qty
+  // Lot-size aware quantity. F&O trades in whole lots, so when the
+  // instrument changes a quantity that isn't a multiple of the new lot snaps
+  // to one lot (NIFTY's 65 carried over to a BANKNIFTY option, lot 30, and
+  // Fyers rejected it; a default qty other than 1 was never snapped at all).
+  // Leaving F&O for a cash symbol drops back to the default quantity rather
+  // than carrying a lot-sized share count into an equity ticket.
+  const prevLot = useRef(1);
   useEffect(() => {
-    if (selected && selected.lot_size > 1 && quantity === 1) {
-      setQuantity(selected.lot_size);
+    const lot = selected && selected.lot_size > 1 ? selected.lot_size : 1;
+    const was = prevLot.current;
+    prevLot.current = lot;
+    if (lot > 1) {
+      if (quantity % lot !== 0) setQuantity(lot);
+    } else if (was > 1) {
+      setQuantity(loadUserPrefs().defaultQty);
     }
-  }, [selected, quantity]);
+  }, [selected?.symbol, selected?.lot_size]);  // eslint-disable-line react-hooks/exhaustive-deps
 
   const placeOrder = usePlaceOrder();
   const chartPlace = usePlaceOrder();   // chart / DOM / scalper orders never lock the ticket button
@@ -692,13 +709,24 @@ export default function Trade() {
   const requiresStop = orderType === "STOP_LOSS" || orderType === "SL-M";
   const canSubmit = useMemo(() => {
     if (!selected || !accountId) return false;
-    if (quantity <= 0) return false;
-    if (requiresLimit && !limitPrice) return false;
-    if (requiresStop && !stopPrice) return false;
+    if (!(quantity > 0) || !Number.isInteger(quantity)) return false;
+    if (selected.lot_size > 1 && quantity % selected.lot_size !== 0) return false;
+    if (requiresLimit && !(Number(limitPrice) > 0)) return false;
+    if (requiresStop && !(Number(stopPrice) > 0)) return false;
     return true;
   }, [selected, accountId, quantity, requiresLimit, limitPrice, requiresStop, stopPrice]);
 
   const onSelect = (h: InstrumentHit, fromChain = false, keepChain = false) => {
+    if (h.symbol !== selected?.symbol) {
+      // Prices belong to the instrument they were typed for. Carrying a
+      // RELIANCE limit / SL into an option ticket sent a wildly marketable
+      // limit, or armed a stop at another instrument's price on fill.
+      // Points / % levels are relative to the entry, so those stay.
+      setLimitPrice("");
+      setStopPrice("");
+      if (slMode === "price") setSlPrice("");
+      if (tpMode === "price") setTpPrice("");
+    }
     setSelected(h);
     setShowResults(false);
     setQuery(""); // the watchlist row + chart header show the pick; the box is for the next search
@@ -889,8 +917,9 @@ export default function Trade() {
       side,
       quantity: Number(quantity),
       order_type: orderType,
-      limit_price: requiresLimit && limitPrice ? Number(limitPrice) : null,
-      stop_price: requiresStop && stopPrice ? Number(stopPrice) : null,
+      // Fyers rejects a price off the instrument's tick grid.
+      limit_price: requiresLimit && limitPrice ? roundToTick(Number(limitPrice), tick) : null,
+      stop_price: requiresStop && stopPrice ? roundToTick(Number(stopPrice), tick) : null,
       product_type: product,
       stop_loss: slAbs,
       target: tpAbs,
@@ -938,20 +967,21 @@ export default function Trade() {
         account_id: accountId,
         broker_order_id: brokerOrderId,
       });
-      // Broker can return ok:false when the order is already gone
-      // (filled, rejected, cancelled, or simply not on the broker
-      // anymore). The backend still drops it from our local pending
-      // list, so surface the broker's "no" to the operator so the
-      // click doesn't look silently broken.
+      // ok:false means the broker didn't cancel it. The backend then
+      // checks what the order really is: already cancelled / rejected
+      // (dropped from the list), already filled (now a position), or
+      // still working — the one case the operator must act on.
       if (r.ok) {
+        setCancelMessage({ type: "success", text: `Cancelled ${brokerOrderId}` });
+      } else if (r.reason === "already_gone" || r.reason === "already_filled") {
         setCancelMessage({
-          type: "success",
-          text: `Cancelled ${brokerOrderId}`,
+          type: "info",
+          text: `${brokerOrderId}: ${r.message ?? "the order was no longer working at the broker"}.`,
         });
       } else {
         setCancelMessage({
-          type: "info",
-          text: `Broker rejected cancel for ${brokerOrderId} — order was already gone. Removed from pending list.`,
+          type: "error",
+          text: `Not cancelled — ${brokerOrderId}: ${r.message ?? "the broker refused the cancel; the order may still be working"}.`,
         });
       }
     } catch (e) {
@@ -1338,7 +1368,7 @@ export default function Trade() {
                         min={1}
                         step={1}
                         value={Math.max(1, Math.round(quantity / selected.lot_size))}
-                        onChange={(e) => setQuantity(Math.max(1, Math.floor(Number(e.target.value || 1))) * selected.lot_size)}
+                        onChange={(e) => setQuantity(Math.max(1, Math.floor(Number(e.target.value || 1)) || 1) * selected.lot_size)}
                         data-testid="ticket-lots"
                       />
                       <span className="hint" data-testid="ticket-qty">= {quantity} qty ({selected.lot_size}/lot)</span>
@@ -1351,7 +1381,7 @@ export default function Trade() {
                         min={1}
                         step={1}
                         value={quantity}
-                        onChange={(e) => setQuantity(Math.max(1, Number(e.target.value || 1)))}
+                        onChange={(e) => setQuantity(Math.max(1, Math.floor(Number(e.target.value || 1)) || 1))}
                         data-testid="ticket-qty"
                       />
                     </label>
@@ -1376,7 +1406,7 @@ export default function Trade() {
                       <span>Limit price</span>
                       <input
                         type="number"
-                        step="0.05"
+                        step={tick}
                         value={limitPrice}
                         onChange={(e) => setLimitPrice(e.target.value)}
                         data-testid="ticket-limit"
@@ -1424,7 +1454,7 @@ export default function Trade() {
                       <span>Stop price</span>
                       <input
                         type="number"
-                        step="0.05"
+                        step={tick}
                         value={stopPrice}
                         onChange={(e) => setStopPrice(e.target.value)}
                         data-testid="ticket-stop"
