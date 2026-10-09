@@ -24,7 +24,7 @@
 // "I ACCEPT THE RISK" into before re-submitting.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   useBrokerAccounts,
   useCancelOrder,
@@ -43,7 +43,7 @@ import { useLiveQuote } from "../hooks/useQuotes";
 import { tabLocal } from "../router";
 import ChartPanel, { type BrokerLine, type ChartOrder, type ChartPosition, type HostAction } from "../components/trade/ChartPanel";
 import Scalper, { splitDrag } from "../components/trade/Scalper";
-import { AccountManager, BOTTOM_TABS, LayoutMenu, SymbolDetails, WatchlistTable, useLayouts, type BottomTab, type WatchState } from "../components/trade/TradePanels";
+import { AccountManager, BOTTOM_TABS, LayoutMenu, SymbolDetails, WatchlistTable, cleanWatchItems, useLayouts, type BottomTab, type WatchState } from "../components/trade/TradePanels";
 import { BookPanel, FnoPanel, type DeskTab } from "../components/trade/ProPanels";
 import { loadUserPrefs, UserSettingsDialog, type UserPrefs } from "../components/trade/UserSettings";
 import type { SyncFlags } from "../components/trade/chartSync";
@@ -398,8 +398,7 @@ const WATCH_KEY = "trade:watchlists";
 function loadRecent(): InstrumentHit[] {
   try {
     const raw = tabLocal.getItem(RECENT_KEY);
-    const list = raw ? (JSON.parse(raw) as InstrumentHit[]) : [];
-    return Array.isArray(list) ? list.filter((h) => h && h.symbol) : [];
+    return cleanWatchItems(raw ? JSON.parse(raw) : []);
   } catch {
     return [];
   }
@@ -408,7 +407,12 @@ function loadRecent(): InstrumentHit[] {
 function loadWatchState(): WatchState {
   try {
     const v = JSON.parse(tabLocal.getItem(WATCH_KEY) ?? "null") as WatchState | null;
-    if (v && Array.isArray(v.lists) && v.lists.length) return { active: Math.max(0, Math.min(v.active ?? 0, v.lists.length - 1)), lists: v.lists };
+    if (v && Array.isArray(v.lists) && v.lists.length) {
+      // Saved by an older build or edited by hand: drop broken rows and
+      // duplicates (two rows with one symbol shared a React key).
+      const lists = v.lists.filter((l) => l && typeof l === "object").map((l) => ({ ...l, name: String(l.name || "Watchlist"), items: cleanWatchItems(l.items) }));
+      if (lists.length) return { active: Math.max(0, Math.min(Number(v.active) || 0, lists.length - 1)), lists };
+    }
   } catch {
     /* fall through */
   }
@@ -664,7 +668,10 @@ export default function Trade() {
   const [dataSlot, setDataSlot] = useState<HTMLDivElement | null>(null);
   const [treeSlot, setTreeSlot] = useState<HTMLDivElement | null>(null);
   const [alertsSlot, setAlertsSlot] = useState<HTMLDivElement | null>(null);
-  const watchSyms = [...new Set(wl.lists.flatMap((l) => l.items.map((h) => h.symbol)))].slice(0, 50).join(",");
+  // The server quotes 50 symbols per call: the list on screen goes first, so
+  // a long list in another tab can't push its rows out of the window.
+  const watchSyms = [...new Set([wl.lists[wl.active], ...wl.lists].flatMap((l) => l?.items.map((h) => h.symbol.toUpperCase()) ?? []))]
+    .slice(0, 50).join(",");
   const { data: watchQuotes } = useQuery<{ quotes: Record<string, { ltp: number; change: number | null; change_pct: number | null }> }>({
     queryKey: ["watch-quotes", watchSyms],
     queryFn: async () => {
@@ -674,6 +681,9 @@ export default function Trade() {
     },
     enabled: watchSyms.length > 0,
     refetchInterval: 5000,
+    // Adding or removing a symbol changes the key: keep the last prices on
+    // screen until the new set arrives instead of blanking every row.
+    placeholderData: keepPreviousData,
   });
 
   // Lot sizes of saved F&O entries (watchlist, the open ticket) are refreshed
@@ -733,7 +743,7 @@ export default function Trade() {
   // dashboard's whitelist.
   const { data: serverInfo } = useServerInfo();
 
-  const { data: searchData, isFetching: searching } = useSearchSymbols(query);
+  const { data: searchData, isFetching: searching, isError: searchFailed } = useSearchSymbols(query);
   const refreshInstruments = useRefreshInstruments();
 
   const { data: quote } = useQuote(selected?.symbol ?? "");
@@ -1511,11 +1521,14 @@ export default function Trade() {
                       : "↻ NSE/BSE"}
                   </button>
                 </div>
-                {showResults && query && (
+                {showResults && query.trim() && (
                   <div className="trade-search-results" data-testid="trade-search-results">
                     {searching && <div className="hint">Searching…</div>}
-                    {!searching && (searchData?.count ?? 0) === 0 && (
-                      <div className="hint">No symbols match "{query}". Try ↻ NSE/BSE to download the full list.</div>
+                    {!searching && searchFailed && (
+                      <div className="hint warn-text">Search failed. Check the server and try again.</div>
+                    )}
+                    {!searching && !searchFailed && (searchData?.count ?? 0) === 0 && (
+                      <div className="hint">No symbols match "{query.trim()}". Try ↻ NSE/BSE to download the full list.</div>
                     )}
                     {(searchData?.hits ?? []).map((h, i) => (
                       <button
@@ -1524,6 +1537,8 @@ export default function Trade() {
                         className={`trade-search-row${i === highlightIdx ? " hl" : ""}`}
                         onClick={() => onSelect(h)}
                         onMouseEnter={() => setHighlightIdx(i)}
+                        // Arrow keys past the visible rows scroll the pick into view.
+                        ref={i === highlightIdx ? (el) => el?.scrollIntoView?.({ block: "nearest" }) : undefined}
                         data-testid={`search-row-${h.symbol}`}
                       >
                         <span className="sym">{h.short_name}</span>
