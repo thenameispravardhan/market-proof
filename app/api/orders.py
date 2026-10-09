@@ -143,6 +143,8 @@ def _manager():
 
 
 MANUAL_PRODUCTS = {"INTRADAY", "DELIVERY", "MARGIN"}
+_ORDER_TYPE_ALIASES = {"SL": "STOP_LOSS", "SL-L": "STOP_LOSS", "SLL": "STOP_LOSS",
+                       "SLM": "SL-M", "SL_M": "SL-M", "STOP_LOSS_MARKET": "SL-M"}
 _PRODUCT_ALIASES = {"MIS": "INTRADAY", "CNC": "DELIVERY", "NRML": "MARGIN"}
 
 
@@ -204,7 +206,7 @@ async def place_order(
         "symbol":         "NSE:SBIN-EQ",    # Fyers-style
         "side":           "BUY",            # BUY | SELL
         "quantity":       10,
-        "order_type":     "MARKET",         # MARKET | LIMIT | SL | SL-M
+        "order_type":     "MARKET",         # MARKET | LIMIT | STOP_LOSS (alias SL / SL-L) | SL-M
         "limit_price":    612.5,            # required for LIMIT
         "stop_price":     605.0,            # required for SL / SL-M
         "product_type":   "INTRADAY",       # INTRADAY | DELIVERY(CNC) | NORMAL(NRML) | MARGIN
@@ -232,7 +234,11 @@ async def place_order(
     except (KeyError, TypeError, ValueError) as e:
         raise HTTPException(status_code=422, detail=f"missing or bad field: {e}")
 
-    order_type = str(body.get("order_type", "MARKET")).upper()
+    order_type = str(body.get("order_type") or "MARKET").strip().upper()
+    # The docstring (and the Fyers / Zerodha vocabulary) says SL / SL-L for a
+    # stop-limit, but only "STOP_LOSS" was accepted — "SL" died as a 422
+    # "unknown order_type" after skipping the price checks below.
+    order_type = _ORDER_TYPE_ALIASES.get(order_type, order_type)
     product_type = str(body.get("product_type", "INTRADAY")).upper()
     limit_price = body.get("limit_price")
     stop_price = body.get("stop_price")
@@ -393,26 +399,33 @@ async def cancel_order(
     except Exception as e:  # noqa: BLE001
         log.warning("manual_order.cancel_failed", broker_order_id=broker_order_id, error=str(e))
         raise HTTPException(status_code=502, detail=f"broker cancel failed: {e}")
-    # Update the local trade row to CANCELLED. We do this whenever
-    # the broker confirms the order is no longer active — either it
-    # accepted the cancel (ok=True) or it told us the order is gone
-    # / already filled / already cancelled (ok=False but reachable).
-    # Leaving the row as "placed" in those cases made the Trade page's
-    # pending list loop forever: the UI clicked Cancel, the broker
-    # said "already gone", and the row stayed visible with no
-    # feedback. See `tests/test_trade_page.py::test_cancel_marks_local
-    # _row_when_broker_rejects` for the contract.
+    # Update the local trade rows. A broker "no" is NOT proof the order is
+    # gone: `cancel_order` also answers False on a timeout / 5xx / 429
+    # (the order is still working) and on an order that already FILLED.
+    # Marking those "cancelled" hid a live order from the pending list and
+    # turned a real fill into a cancel (the postback then skipped it as
+    # settled). So on False we ask the broker what the order actually is:
+    #   - cancelled / rejected / expired -> mark the rows to match;
+    #   - filled -> reconcile the fill (status + position) instead;
+    #   - still working / unknown        -> leave the rows alone.
+    # Only rows still "placed" are touched — a settled row never flips.
     #
-    # IMPORTANT: `broker_order_id` is NOT unique on `trades` — the
-    # persist path can produce duplicate rows (one from the manual
-    # place, one from a webhook re-write, etc.). We must NOT use
-    # `scalar_one_or_none()` here; doing so raises
-    # `MultipleResultsFound` on any duplicate and turns into a 500
-    # with a plain-text body, which the frontend chokes on with
-    # "body stream already read" when it tries to parse the error.
-    # Iterate the matching rows and update all of them. See
-    # `tests/test_trade_page.py::test_cancel_handles_duplicate_broker
-    # _order_id_rows` for the regression.
+    # `broker_order_id` is NOT unique on `trades` (the persist path can
+    # produce duplicates), so every matching row is read, never
+    # `scalar_one_or_none()` (MultipleResultsFound -> a plain-text 500).
+    # See tests/test_trade_page.py for both contracts.
+    reason: str = "cancelled"
+    new_status: Optional[str] = "cancelled"
+    message: Optional[str] = None
+    if not ok:
+        reason, new_status, message, fill = await _status_after_refused_cancel(backend, broker_order_id)
+        if fill is not None:
+            from app.execution.order_reconcile import reconcile_order_update
+
+            try:
+                await reconcile_order_update(db, fill, source="manual_cancel")
+            except Exception:  # noqa: BLE001
+                log.exception("manual_order.cancel_fill_reconcile_failed", broker_order_id=broker_order_id)
     trades = (
         db.execute(
             select(Trade).where(Trade.broker_order_id == broker_order_id)
@@ -420,19 +433,12 @@ async def cancel_order(
         .scalars()
         .all()
     )
-    reason: Optional[str] = None
-    if ok:
-        reason = "cancelled"
-    else:
-        # Broker rejects normally mean the order is no longer
-        # cancellable: filled, rejected, already cancelled, or
-        # simply not found. In all of those the order is gone
-        # from the active set, so it should drop off the pending
-        # list. We keep the local status as "cancelled" and note
-        # the reason for the audit log.
-        reason = "broker_rejected_already_gone"
+    updated = 0
     for trade in trades:
-        trade.status = "cancelled"
+        if new_status is None or trade.status != "placed":
+            continue
+        trade.status = new_status
+        updated += 1
         db.add(AuditLog(
             actor="ui_trade_page",
             action="order.manual_cancelled",
@@ -445,16 +451,53 @@ async def cancel_order(
                 "reason": reason,
             },
         ))
-    if trades:
+    if updated:
         await _commit_off_loop(db)
     response: dict[str, Any] = {
         "ok": bool(ok),
         "broker_order_id": broker_order_id,
+        "reason": reason,
+        "rows_updated": updated,
     }
-    if trades:
-        response["reason"] = reason
-        response["rows_updated"] = len(trades)
+    if message:
+        response["message"] = message
     return response
+
+
+async def _status_after_refused_cancel(
+    backend: Any, broker_order_id: str
+) -> tuple[str, Optional[str], str, Optional[dict[str, Any]]]:
+    """After the broker refused a cancel, what is the order really?
+
+    Returns `(reason, new_local_status, message, fill)`: `new_local_status`
+    None leaves the rows alone; `fill` is the broker's order payload when
+    the order had (partly) filled, for the caller to reconcile."""
+    if not hasattr(backend, "get_order_status"):
+        return ("broker_refused", None, "the broker refused the cancel; the order may still be working", None)
+    try:
+        st = await backend.get_order_status(broker_order_id)
+    except Exception as e:  # noqa: BLE001
+        log.warning("manual_order.cancel_status_failed", broker_order_id=broker_order_id, error=str(e))
+        st = None
+    state = getattr(st, "state", None)
+    raw = getattr(st, "raw", None)
+    # Only a status that names THIS order counts; an error or empty book is "unknown".
+    if isinstance(raw, dict) and str(raw.get("id") or "") == broker_order_id:
+        if state == OrderState.FILLED:
+            return ("already_filled", None, "the order had already filled — it is in your positions", raw)
+        if state in (OrderState.CANCELLED, OrderState.REJECTED, OrderState.EXPIRED):
+            local = "rejected" if state == OrderState.REJECTED else "cancelled"
+            # A cancelled order can carry a partial fill — reconcile it so
+            # those shares reach the positions table.
+            fill = raw if int(getattr(st, "filled_quantity", 0) or 0) > 0 else None
+            return ("already_gone", local, f"the order was already {state.value.lower()} at the broker", fill)
+    return (
+        "broker_refused",
+        None,
+        "the broker didn't cancel the order and it may still be working — "
+        "check the Orders tab and try again",
+        None,
+    )
 
 
 def _opt_int_field(body: dict[str, Any], key: str) -> Optional[int]:
@@ -570,7 +613,8 @@ async def modify_order(
     order_type: Optional[OrderType] = None
     if body.get("order_type") is not None:
         try:
-            order_type = OrderType(str(body["order_type"]).strip().upper())
+            raw_type = str(body["order_type"]).strip().upper()
+            order_type = OrderType(_ORDER_TYPE_ALIASES.get(raw_type, raw_type))
         except ValueError:
             raise HTTPException(
                 status_code=422,
@@ -752,6 +796,7 @@ def list_pending_orders(
                 "quantity": r.quantity,
                 "price": r.price,
                 "order_type": r.order_type,
+                "product": r.product or "INTRADAY",
                 "status": r.status,
                 "created_at": r.created_at.isoformat() if r.created_at else None,
             }

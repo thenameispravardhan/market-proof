@@ -230,6 +230,36 @@ async def exchange_code_for_token(
     return TokenResponse(access_token=access_token, raw=data)
 
 
+def token_expires_at(access_token: Optional[str]) -> Optional[float]:
+    """Epoch seconds the Fyers access token expires at, or None when it
+    can't be read.
+
+    Fyers v3 access tokens are JWTs whose payload carries `exp`. The token
+    lives until early next morning, but the DB only knows a token *exists*,
+    so the UI kept saying "connected" on a dead token while every order and
+    quote failed with 401. The signature isn't checked (we don't hold the
+    key and only need the claim); a token that isn't a JWT returns None and
+    is treated as unknown, never as expired."""
+    if not access_token or access_token.count(".") != 2:
+        return None
+    import base64
+    import json
+
+    payload = access_token.split(".")[1]
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        exp = float(claims.get("exp"))
+    except Exception:  # noqa: BLE001 — unreadable means unknown
+        return None
+    return exp if exp > 0 else None
+
+
+def token_is_expired(access_token: Optional[str], *, now: Optional[float] = None) -> bool:
+    """True only when the token's own `exp` claim is in the past."""
+    exp = token_expires_at(access_token)
+    return exp is not None and exp <= (time.time() if now is None else now)
+
+
 def _safe_body(resp: httpx.Response) -> str:
     """Truncate response body for error messages. The access_token
     is never echoed back (it's the most sensitive field in the

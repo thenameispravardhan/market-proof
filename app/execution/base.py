@@ -217,3 +217,26 @@ def safe_float(x: Any, default: float = 0.0) -> float:
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def apply_fill(qty: int, avg: float, signed_fill: int, price: Optional[float]) -> tuple[int, float]:
+    """Net position after a signed fill: `(new_qty, new_avg_price)`.
+
+    Adding in the position's direction (or opening) moves the average to the
+    weighted mean; reducing keeps the average (the closed slice realises P&L
+    at the old cost); flipping through zero restarts at the fill price. The
+    old update only re-averaged BUYs, so covering a short moved its cost and
+    adding to a short or flipping a long never did. A missing / bad price
+    keeps the old average instead of averaging in a zero.
+    """
+    qty, signed_fill = int(qty or 0), int(signed_fill or 0)
+    avg = safe_float(avg)
+    px = safe_float(price)
+    new_qty = qty + signed_fill
+    if signed_fill == 0 or px <= 0:
+        return new_qty, avg
+    if qty == 0 or (qty > 0) == (signed_fill > 0):
+        return new_qty, (avg * abs(qty) + px * abs(signed_fill)) / abs(new_qty)
+    if new_qty == 0 or (new_qty > 0) == (qty > 0):
+        return new_qty, avg
+    return new_qty, px

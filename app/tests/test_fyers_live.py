@@ -51,7 +51,7 @@ def _ok_order_book(order_id: str, status: str = "2", filled_qty: int = 10, avg_p
                 "id": order_id,
                 "symbol": "NSE:RELIANCE-EQ",
                 "qty": 10,
-                "tradedQty": filled_qty,
+                "filledQty": filled_qty,
                 "tradedPrice": avg_price,
                 "status": status,
                 "type": 1,
@@ -71,7 +71,7 @@ def _ok_positions() -> dict[str, Any]:
                 "netQty": 10,
                 "avgPrice": 2500.0,
                 "ltp": 2600.0,
-                "unrealizedProfit": 1000.0,
+                "unrealized_profit": 1000.0,
             },
             {
                 "symbol": "NSE:TCS-EQ",
@@ -224,8 +224,8 @@ def test_normalize_option_chain_parses_fyers_v3_response() -> None:
     assert by[23500.0]["ce"]["ltp"] == 242.45
     assert by[23500.0]["ce"]["oi"] == 4755530
     assert by[23500.0]["pe"]["ltp"] == 67.8
-    # NIFTY lot size guessed from the underlying symbol.
-    assert by[23500.0]["ce"]["lot_size"] == 75
+    # NIFTY lot size from the underlying (the current 65; no scrip master here).
+    assert by[23500.0]["ce"]["lot_size"] == 65
     # Strikes returned in ascending order.
     assert [s["strike"] for s in out["strikes"]] == [23500.0, 23600.0]
 
@@ -822,5 +822,154 @@ async def test_set_access_token_rotates() -> None:
             side=OrderSide.BUY, quantity=1,
         )
         assert result.broker_order_id == "FX-NEW"
+    finally:
+        await client.aclose()
+
+
+# -- Fyers field names / lot sizes / refusals (trade-page deep dive) -------
+
+
+@pytest.mark.asyncio
+async def test_order_status_reads_filled_qty_of_a_partly_filled_cancelled_ioc() -> None:
+    """Fyers reports fills as `filledQty`. The parser read `tradedQty` (not
+    a v3 key), so an IOC that filled 4 of 10 and then cancelled came back
+    as 0 filled — the entry manager then treated a real 4-share position
+    as "nothing filled" and never put a stop on it."""
+    book = _ok_order_book("FX9", status="1", filled_qty=4, avg_price=101.5)
+    assert "tradedQty" not in book["orderBook"][0]
+
+    client = _make_client(lambda req: httpx.Response(200, json=book))
+    backend = FyersLiveBackend(
+        app_id="APP123", access_token="TOK", broker_account_id=1, client=client,
+    )
+    try:
+        status = await backend.get_order_status("FX9")
+        assert status.state == OrderState.CANCELLED
+        assert status.filled_quantity == 4
+        assert status.average_price == 101.5
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_positions_read_fyers_snake_case_unrealized_profit_and_signed_qty() -> None:
+    payload = {
+        "s": "ok",
+        "netPositions": [
+            {"symbol": "NSE:SBIN-EQ", "netQty": -5, "qty": 5, "avgPrice": 800.0,
+             "ltp": 790.0, "unrealized_profit": 50.0},
+            # netQty 0 must stay 0 even though `qty` (abs value) is set.
+            {"symbol": "NSE:TCS-EQ", "netQty": 0, "qty": 3, "avgPrice": 0.0, "ltp": 3500.0},
+        ],
+    }
+    client = _make_client(lambda req: httpx.Response(200, json=payload))
+    backend = FyersLiveBackend(
+        app_id="APP123", access_token="TOK", broker_account_id=1, client=client,
+    )
+    try:
+        by = {p.symbol: p for p in await backend.get_positions()}
+        assert by["NSE:SBIN-EQ"].quantity == -5
+        assert by["NSE:SBIN-EQ"].unrealized_pnl == 50.0
+        assert by["NSE:TCS-EQ"].quantity == 0
+    finally:
+        await client.aclose()
+
+
+def test_banknifty_chain_uses_banknifty_lot_not_niftys() -> None:
+    """BANKNIFTY's Fyers symbol is NSE:NIFTYBANK-INDEX. The substring match
+    hit "NIFTY" first, so every BANKNIFTY option carried NIFTY's lot (75)
+    and the ticket sent a quantity Fyers rejects as not a lot multiple."""
+    from app.execution.fyers_live import normalize_option_chain
+
+    raw = {"data": {"expiryData": [], "optionsChain": [
+        {"symbol": "NSE:NIFTYBANK-INDEX", "strike_price": -1, "option_type": "", "ltp": 51000.0},
+        {"symbol": "NSE:BANKNIFTY26JUN51000CE", "strike_price": 51000, "option_type": "CE", "ltp": 300.0},
+    ]}}
+    out = normalize_option_chain(raw, underlying_symbol="NSE:NIFTYBANK-INDEX")
+    assert out["strikes"][0]["ce"]["lot_size"] == 30
+
+
+def test_stock_option_chain_takes_lot_from_scrip_master(monkeypatch) -> None:
+    from app.algo import fno
+    from app.execution.fyers_live import normalize_option_chain
+
+    monkeypatch.setattr(fno, "master", lambda: {"lots": {"SBIN": 750}, "futures": {}, "strikes": {}})
+    raw = {"data": {"optionsChain": [
+        {"symbol": "NSE:SBIN26JUN800CE", "strike_price": 800, "option_type": "CE", "ltp": 12.0},
+    ]}}
+    out = normalize_option_chain(raw, underlying_symbol="NSE:SBIN-EQ")
+    assert out["strikes"][0]["ce"]["lot_size"] == 750
+
+
+@pytest.mark.asyncio
+async def test_place_order_200_with_error_body_is_rejected_not_pending() -> None:
+    body = {"s": "error", "code": -99, "message": "RMS: insufficient funds"}
+    client = _make_client(lambda req: httpx.Response(200, json=body))
+    backend = FyersLiveBackend(
+        app_id="APP123", access_token="TOK", broker_account_id=1, client=client,
+    )
+    try:
+        result = await backend.place_order(
+            signal=None, symbol="NSE:SBIN-EQ", side=OrderSide.BUY, quantity=1,
+        )
+        assert result.state == OrderState.REJECTED
+        assert "insufficient funds" in (result.error or "")
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_normal_product_goes_to_fyers_as_margin() -> None:
+    """Fyers v3 product types are CNC / INTRADAY / MARGIN / CO / BO / MTF —
+    there is no NRML, so NORMAL must be sent as MARGIN."""
+    from app.execution.base import ProductType
+
+    seen: dict[str, Any] = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(req.content))
+        return httpx.Response(200, json=_ok_order_response())
+
+    client = _make_client(handler)
+    backend = FyersLiveBackend(
+        app_id="APP123", access_token="TOK", broker_account_id=1, client=client,
+    )
+    try:
+        await backend.place_order(
+            signal=None, symbol="NSE:NIFTY26JUNFUT", side=OrderSide.BUY, quantity=65,
+            product_type=ProductType.NORMAL,
+        )
+        assert seen["productType"] == "MARGIN"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_place_order_401_says_reconnect() -> None:
+    client = _make_client(lambda req: httpx.Response(401, json={"s": "error", "code": -16}))
+    backend = FyersLiveBackend(
+        app_id="APP123", access_token="TOK", broker_account_id=1, client=client,
+    )
+    try:
+        result = await backend.place_order(
+            signal=None, symbol="NSE:SBIN-EQ", side=OrderSide.BUY, quantity=1,
+        )
+        assert result.state == OrderState.REJECTED
+        assert "Reconnect Fyers" in (result.error or "")
+        assert result.raw["reason"] == "token_expired"
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_convert_position_raises_on_200_error_body() -> None:
+    body = {"s": "error", "code": -99, "message": "conversion not allowed"}
+    client = _make_client(lambda req: httpx.Response(200, json=body))
+    backend = FyersLiveBackend(
+        app_id="APP123", access_token="TOK", broker_account_id=1, client=client,
+    )
+    try:
+        with pytest.raises(FyersAPIError):
+            await backend.convert_position("NSE:SBIN-EQ", 1, 5, "INTRADAY", "DELIVERY")
     finally:
         await client.aclose()

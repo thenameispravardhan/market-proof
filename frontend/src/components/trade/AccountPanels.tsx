@@ -206,7 +206,7 @@ export function orderRows(book: BrokerBook | null, pending: PendingOrder[], hist
       symbol: p.symbol,
       side: p.side,
       type: p.order_type,
-      product: "INTRADAY",
+      product: p.product ?? "INTRADAY",
       qty: p.quantity,
       filled: null,
       remaining: p.quantity,
