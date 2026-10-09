@@ -848,12 +848,18 @@ class TradeManager:
         existing = self._tick_tasks.get(symbol)
         if existing is not None and not existing.done():
             return
-        self._tick_tasks[symbol] = asyncio.create_task(
-            self._tick_loop(symbol), name=f"trade-ticks-{symbol}"
-        )
-
-    async def _tick_loop(self, symbol: str) -> None:
+        # Subscribe NOW, not when the task first runs: a tick published
+        # before the task is scheduled (e.g. straight after register())
+        # would otherwise never reach the listener. The done-callback
+        # unsubscribes even if the task is cancelled before it starts.
         q = self._md.subscribe(symbol)
+        task = asyncio.create_task(
+            self._tick_loop(symbol, q), name=f"trade-ticks-{symbol}"
+        )
+        task.add_done_callback(lambda _t: self._md.unsubscribe(symbol, q))
+        self._tick_tasks[symbol] = task
+
+    async def _tick_loop(self, symbol: str, q: asyncio.Queue[Any]) -> None:
         try:
             while not self._stop_event.is_set():
                 try:
@@ -878,7 +884,6 @@ class TradeManager:
         except asyncio.CancelledError:
             raise
         finally:
-            self._md.unsubscribe(symbol, q)
             # current_task() raises when the coroutine is finalised by GC
             # after the loop closed (test teardown) — treat as None.
             try:
