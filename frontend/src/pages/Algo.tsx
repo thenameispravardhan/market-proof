@@ -159,6 +159,9 @@ const ist = (epoch: number) =>
   new Date(epoch * 1000).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", year: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
 const isoIst = (iso: string | null) => (iso ? ist(Date.parse(iso.endsWith("Z") || iso.includes("+") ? iso : iso + "Z") / 1000) : "—");
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
+// The server takes 5–80% out-of-sample (0 = off); round a smaller number up instead of failing the run.
+const oosParam = (pct: number) => (pct > 0 ? Math.min(80, Math.max(5, pct)) : undefined);
+const draftKey = (sp: Spec, nm: string) => JSON.stringify([nm, sp]);
 const daysAgo = (n: number) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
 const shortSym = (s: string) => s.replace(/^NSE:/, "").replace(/-EQ$/, "").replace(/-INDEX$/, "");
 type SizingPreset = { name: string; hint: string; riskPct: number; equityPct: number; maxPositions: number; capPct: number; dailyLossPct: number; compound: boolean };
@@ -1086,9 +1089,11 @@ function Optimizer({ spec, cat, range, onApply }: { spec: Spec; cat: Catalog; ra
     return out;
   };
   const combos = axes.reduce((n, a) => n * values(a).length, axes.length ? 1 : 0);
+  // The builder can change under the grid (a condition removed, a stop switched off) — those axes can't run.
+  const missing = axes.filter((a) => !paths.some((p) => p.path === a.path)).length;
   const run = useMutation({
     mutationFn: () => longPost<OptResult>("/api/algo/optimize", {
-      spec: tidy(spec), ...range, metric, min_trades: minTrades, oos_pct: oos || undefined,
+      spec: tidy(spec), ...range, metric, min_trades: minTrades, oos_pct: oosParam(oos),
       grid: axes.map((a) => ({ path: a.path, values: values(a) })),
     }),
   });
@@ -1104,6 +1109,7 @@ function Optimizer({ spec, cat, range, onApply }: { spec: Spec; cat: Catalog; ra
               const p = paths.find((x) => x.path === e.target.value);
               if (p) setAxes(axes.map((x, j) => (j === i ? axisFor(p) : x)));
             }}>
+              {!paths.some((p) => p.path === a.path) && <option value={a.path}>{a.path} — no longer in the strategy</option>}
               {paths.filter((p) => p.path === a.path || !axes.some((x) => x.path === p.path)).map((p) => <option key={p.path} value={p.path}>{p.label}</option>)}
             </select>
             {(["from", "to", "step"] as const).map((k) => (
@@ -1119,11 +1125,13 @@ function Optimizer({ spec, cat, range, onApply }: { spec: Spec; cat: Catalog; ra
             if (p) setAxes([...axes, axisFor(p)]);
           }}>+ parameter</button>
           <label className="meta">rank by <select value={metric} onChange={(e) => setMetric(e.target.value)}>{cat.metrics.map((m) => <option key={m}>{m}</option>)}</select></label>
-          <label className="meta" title="the last X% of the range is held out: ranking uses only the earlier part, and each row shows how it did afterwards (walk-forward). 0 = off">hold out last <NumInput width={36} value={oos} onChange={(n) => setOos(Math.max(0, Math.min(80, Math.floor(n ?? 0))))} />% as out-of-sample</label>
+          <label className="meta" title="the last X% of the range is held out: ranking uses only the earlier part, and each row shows how it did afterwards (walk-forward). 5–80, 0 = off">hold out last <NumInput width={36} value={oos} onChange={(n) => setOos(Math.max(0, Math.min(80, Math.floor(n ?? 0))))} />% as out-of-sample</label>
           <label className="meta" title="combos with fewer trades are not ranked — a 1-trade 100% win rate means nothing">min trades <NumInput width={52} value={minTrades} onChange={(n) => setMinTrades(Math.max(1, Math.floor(n ?? 1)))} /></label>
           <span className="meta">{combos} combinations (max 400)</span>
-          <button type="button" className="primary" disabled={!combos || combos > 400 || run.isPending} onClick={() => run.mutate()}>{run.isPending ? "Optimising…" : "Run optimisation"}</button>
+          <button type="button" className="primary" disabled={!combos || combos > 400 || missing > 0 || run.isPending} onClick={() => run.mutate()}>{run.isPending ? "Optimising…" : "Run optimisation"}</button>
         </div>
+        {!axes.length && <div className="meta">Add the parameters to sweep with “+ parameter”, then run. Apply a row to send its values back to the builder.</div>}
+        {missing > 0 && <div className="meta pnl-neg">{missing} parameter{missing > 1 ? "s are" : " is"} no longer in the builder's strategy — remove {missing > 1 ? "them" : "it"} (✕) to run.</div>}
       </div>
       {run.error && <div className="pnl-neg">{errMsg(run.error)}</div>}
       {run.data && (
@@ -1223,14 +1231,18 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
           evaluates on each completed candle, exits on live LTP every 1s · every setting lives in Builder & backtest
         </span></h3>
         {(strategies.data?.strategies ?? []).length === 0 ? (
-          <div className="empty">No saved strategies yet — build one in the Builder tab and press “Save as new”.</div>
+          <div className="empty">No saved strategies yet — build one in the Builder & backtest tab and press “Save as new strategy”.</div>
         ) : (
           <div style={{ overflowX: "auto" }}>
             <table>
               <thead><tr><th>On</th><th>Strategy</th><th>Version</th><th>Symbols</th><th>Trades</th><th>TF</th><th>Mode</th><th>Open</th><th>Closed</th><th>Realised</th><th></th></tr></thead>
               <tbody>{strategies.data!.strategies.map((s) => (
                 <tr key={s.id} style={sel === s.id ? { background: "var(--bg-row)" } : undefined}>
-                  <td><Toggle on={s.enabled} size="sm" onChange={(on: boolean) => put(s.id, { enabled: on })} /></td>
+                  <td><Toggle on={s.enabled} size="sm" onChange={(on: boolean) => {
+                    // Switching on a LIVE automation starts real orders — confirm it every time, not just when the mode was picked.
+                    if (on && s.mode === "live" && !window.confirm(`REAL MONEY: switch on "${s.name}"? It will place real orders on the next signal.`)) return;
+                    put(s.id, { enabled: on });
+                  }} /></td>
                   <td><a href="#/algo" onClick={(e) => { e.preventDefault(); setSel(sel === s.id ? null : s.id); }}>{s.name}</a>{" "}
                     <button type="button" className="btn-sm" onClick={() => setSel(s.id)} title="this automation's trades and open positions" data-testid={`algo-trades-${s.id}`}>Trades</button></td>
                   <td>
@@ -1399,12 +1411,14 @@ function CompareTab({ cat, range, draft }: { cat: Catalog; range: { start: strin
   const [running, setRunning] = useState(false);
   const options = [{ key: "draft", name: "Builder draft", spec: draft },
     ...(strategies.data?.strategies ?? []).map((s) => ({ key: String(s.id), name: `${s.name} (v${s.version})`, spec: s.spec }))];
+  const chosen = options.filter((x) => pick.includes(x.key));
   const run = async () => {
     setRunning(true);
+    setRows([]);
     const out: typeof rows = [];
-    for (const o of options.filter((x) => pick.includes(x.key))) {
+    for (const o of chosen) {
       try {
-        const r = await longPost<BtResult>("/api/algo/backtest", { spec: tidy(withDefaults(cat.defaults, o.spec)), ...range, oos_pct: oos || undefined });
+        const r = await longPost<BtResult>("/api/algo/backtest", { spec: tidy(withDefaults(cat.defaults, o.spec)), ...range, oos_pct: oosParam(oos) });
         out.push({ name: o.name, stats: r.stats });
       } catch (e) { out.push({ name: o.name, stats: null, error: errMsg(e) }); }
       setRows([...out]);
@@ -1437,8 +1451,8 @@ function CompareTab({ cat, range, draft }: { cat: Catalog; range: { start: strin
         ))}
       </div>
       <div className="algo-operand" style={{ gap: 10, marginTop: 8 }}>
-        <label className="meta">out-of-sample <NumInput width={36} value={oos} onChange={(n) => setOos(Math.max(0, Math.min(80, Math.floor(n ?? 0))))} />%</label>
-        <button type="button" className="primary" disabled={running || !pick.length} onClick={run}>{running ? `Running ${rows.length + 1}/${pick.length}…` : "Run comparison"}</button>
+        <label className="meta" title="the last X% of the range as out-of-sample (5–80, 0 = off)">out-of-sample <NumInput width={36} value={oos} onChange={(n) => setOos(Math.max(0, Math.min(80, Math.floor(n ?? 0))))} />%</label>
+        <button type="button" className="primary" disabled={running || !chosen.length} onClick={run}>{running ? `Running ${rows.length + 1}/${chosen.length}…` : "Run comparison"}</button>
       </div>
       {rows.length > 0 && (
         <>
@@ -1525,27 +1539,35 @@ export default function Algo() {
   const [range, setRange] = useState({ start: daysAgo(180), end: daysAgo(0) });
   const [msg, setMsg] = useState<string | null>(null);
   const [oosPct, setOosPct] = useState(0);
+  // What the builder held when it was last loaded or saved — anything else is unsaved work.
+  const [baseline, setBaseline] = useState<string | null>(null);
+  const [btKey, setBtKey] = useState<string | null>(null);   // the inputs the shown backtest ran with
   const fileRef = useRef<HTMLInputElement>(null);
 
   // Restore the draft (or start from the server defaults + the first template).
   useEffect(() => {
     if (!cat.data || spec) return;
-    let draft: { spec: Partial<Spec>; name: string; editing: number | null; viewing?: number | null } | null = null;
+    let draft: { spec: Partial<Spec>; name: string; editing: number | null; viewing?: number | null; baseline?: string | null } | null = null;
     try { draft = JSON.parse(localStorage.getItem(DRAFT_KEY) ?? "null"); } catch { /* private mode */ }
     if (draft?.spec) {
       setSpec(withDefaults(cat.data.defaults, draft.spec));
       setName(draft.name);
       setEditing(draft.editing);
       setViewing(draft.viewing ?? null);
+      setBaseline(draft.baseline ?? null);
     } else {
-      setSpec(withDefaults(cat.data.defaults, { symbols: ["NSE:SBIN-EQ"], ...TEMPLATES[0].spec }));
+      const s = withDefaults(cat.data.defaults, { symbols: ["NSE:SBIN-EQ"], ...TEMPLATES[0].spec });
+      setSpec(s);
       setName(TEMPLATES[0].name);
+      setBaseline(draftKey(s, TEMPLATES[0].name));
     }
   }, [cat.data, spec]);
   useEffect(() => {
     if (!spec) return;
-    try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ spec, name, editing, viewing })); } catch { /* ignore */ }
-  }, [spec, name, editing, viewing]);
+    try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ spec, name, editing, viewing, baseline })); } catch { /* ignore */ }
+  }, [spec, name, editing, viewing, baseline]);
+  const strategies = useQuery({ queryKey: ["algo", "strategies"], queryFn: () => api.get<{ strategies: Saved[] }>("/api/algo/strategies") });
+  const current = editing ? strategies.data?.strategies.find((x) => x.id === editing) : undefined;
 
   const first = spec?.symbols[0];
   const info = useQuery({
@@ -1554,7 +1576,8 @@ export default function Algo() {
   });
 
   const bt = useMutation({
-    mutationFn: () => longPost<BtResult>("/api/algo/backtest", { spec: tidy(spec!), ...range, oos_pct: oosPct || undefined }),
+    onMutate: () => setBtKey(JSON.stringify({ spec, range, oosPct })),
+    mutationFn: () => longPost<BtResult>("/api/algo/backtest", { spec: tidy(spec!), ...range, oos_pct: oosParam(oosPct) }),
   });
   const versions = useQuery({
     queryKey: ["algo", "versions", editing], enabled: !!editing,
@@ -1566,13 +1589,23 @@ export default function Algo() {
       if (!asNew && editing) return api.put<Saved>(`/api/algo/strategies/${editing}`, body);
       return api.post<Saved>("/api/algo/strategies", body);
     },
-    onSuccess: (s) => {
+    onSuccess: (s, asNew) => {
+      const unchanged = !asNew && s.version === versions.data?.active;
       setEditing(s.id);
       setViewing(s.version);
-      setMsg(`Saved “${s.name}” as v${s.version} — it is the active version. Switch it on in the Automations tab.`);
+      setBaseline(draftKey(spec!, name));
+      setMsg(unchanged
+        ? `No rule changes since v${s.version} — nothing new to save.`
+        : `Saved “${s.name}” as v${s.version} — it is the active version.${s.enabled ? " It is switched on, so it trades from the next candle." : " Switch it on in the Automations tab."}`);
       qc.invalidateQueries({ queryKey: ["algo"] });
     },
-    onError: (e) => setMsg(errMsg(e)),
+    onError: (e, asNew) => {
+      // Deleted from Automations while it was open here: keep the work, save it as a new strategy instead.
+      if (!asNew && /not found/.test(errMsg(e))) {
+        setEditing(null); setViewing(null);
+        setMsg("This strategy was deleted — press “Save as new strategy” to keep the builder's copy.");
+      } else setMsg(errMsg(e));
+    },
   });
   const activate = useMutation({
     mutationFn: (v: number) => api.post<Saved>(`/api/algo/strategies/${editing}/versions/${v}/activate`, {}),
@@ -1583,6 +1616,17 @@ export default function Algo() {
   if (cat.isLoading || (!spec && !cat.error)) return <div className="empty">loading…</div>;
   if (cat.error || !cat.data || !spec) return <div className="empty">Algo API unavailable: {errMsg(cat.error)}</div>;
   const c = cat.data;
+  const dirty = baseline !== draftKey(spec, name);
+  const stale = !!bt.data && btKey !== JSON.stringify({ spec, range, oosPct });
+  const okToReplace = () => !dirty || window.confirm("The builder has unsaved changes. Replace them?");
+  // Put a strategy into the builder; `clean` = it matches what is saved (or is a fresh template).
+  const load = (next: Spec, nm: string, ed: number | null, vw: number | null, clean = true) => {
+    setSpec(next); setName(nm); setEditing(ed); setViewing(vw); setBaseline(clean ? draftKey(next, nm) : null);
+  };
+  const saveVersion = () => {
+    if (current?.enabled && !window.confirm(`“${current.name}” is switched on${current.mode === "live" ? " in LIVE (real money)" : ""}. Saving makes the new version trade from the next candle. Save?`)) return;
+    save.mutate(false);
+  };
   const upd = (patch: Partial<Spec>) => setSpec({ ...spec, ...patch });
   const inst = spec.instrument;
   const updInst = (patch: Partial<Instrument>) => upd({ instrument: { ...inst, ...patch } });
@@ -1627,9 +1671,9 @@ export default function Algo() {
       <div className="dashboard-head">
         <h1 className="page-title">Algo Lab</h1>
         <button type="button" className="primary" style={{ marginLeft: 12 }} onClick={() => {
-          if (!editing && !window.confirm("Start a new algo? The unsaved draft in the builder will be replaced.")) return;
-          setSpec(withDefaults(cat.data!.defaults, { symbols: [], entry_long: G([]), entry_short: G([]) }));
-          setName("New strategy"); setEditing(null); setViewing(null); bt.reset(); setTab("builder");
+          if (!okToReplace()) return;
+          load(withDefaults(c.defaults, { symbols: [], entry_long: G([]), entry_short: G([]) }), "New strategy", null, null);
+          bt.reset(); setTab("builder");
           setMsg("New algo — pick symbols, add entry conditions, then backtest and save.");
         }}>＋ New algo</button>
       </div>
@@ -1642,25 +1686,27 @@ export default function Algo() {
       </div>
 
       {tab === "automations" && <Automations onEdit={(s) => {
-        setName(s.name); setEditing(s.id); setViewing(s.version);
-        setSpec(withDefaults(c.defaults, s.spec)); setTab("builder");
+        if (!okToReplace()) return;
+        load(withDefaults(c.defaults, s.spec), s.name, s.id, s.version);
+        bt.reset(); setMsg(null); setTab("builder");
       }} />}
       {tab === "data" && <><RecorderPanel /><DataTab /></>}
-      {tab === "compare" && <CompareTab cat={c} range={range} draft={spec} />}
-      {tab === "optimize" && (
+      {/* Optimise and Compare stay mounted so their results survive a trip to the builder and back. */}
+      <div hidden={tab !== "compare"}><CompareTab cat={c} range={range} draft={spec} /></div>
+      <div hidden={tab !== "optimize"}>
         <Optimizer spec={spec} cat={c} range={range} onApply={(params) => {
           const s = clone(spec);
           Object.entries(params).forEach(([p, v]) => setPath(s, p, v));
           setSpec(s);
-          setMsg("Applied — run the backtest on a different date range to check it holds up.");
+          setMsg("Optimiser values applied — run the backtest on a different date range to check they hold up, then save.");
           setTab("builder");
         }} />
-      )}
+      </div>
 
       {tab === "builder" && (
         <>
           <div className="widget widget-wide" style={{ marginBottom: 12 }}>
-            <h3>Strategy {editing ? <span className="meta">saved #{editing}{viewing ? ` · v${viewing}` : ""}</span> : <span className="meta">unsaved draft</span>}
+            <h3>Strategy {editing ? <span className="meta">saved #{editing}{viewing ? ` · v${viewing}` : ""}{dirty ? " · unsaved changes" : ""}</span> : <span className="meta">not saved yet</span>}
               <span style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
                 <button type="button" className="btn-sm" onClick={() => download(`${name.replace(/[^\w-]+/g, "_")}.json`, JSON.stringify({ name, spec: tidy(spec) }, null, 2))}>⬇ export</button>
                 <button type="button" className="btn-sm" onClick={() => fileRef.current?.click()}>⬆ import</button>
@@ -1670,8 +1716,9 @@ export default function Algo() {
                   if (!f) return;
                   try {
                     const j = JSON.parse(await f.text()) as { name?: string; spec?: Partial<Spec> } & Partial<Spec>;
-                    setSpec(withDefaults(c.defaults, j.spec ?? j)); setName(j.name ?? f.name.replace(/\.json$/, "")); setEditing(null); setViewing(null);
-                    setMsg("Imported — save it to keep it.");
+                    if (!okToReplace()) return;
+                    load(withDefaults(c.defaults, j.spec ?? j), j.name ?? f.name.replace(/\.json$/, ""), null, null, false);
+                    bt.reset(); setMsg("Imported — save it to keep it.");
                   } catch (err) { setMsg(`Import failed: ${errMsg(err)}`); }
                 }} />
               </span>
@@ -1681,7 +1728,9 @@ export default function Algo() {
               <label className="algo-field"><span className="meta">template</span>
                 <select value="" onChange={(e) => {
                   const t = TEMPLATES[Number(e.target.value)];
-                  if (t) { setSpec(withDefaults(c.defaults, { symbols: t.symbols ?? (spec.symbols.length ? spec.symbols : ["NSE:SBIN-EQ"]), ...t.spec })); setName(t.name); setEditing(null); setViewing(null); }
+                  if (!t || !okToReplace()) return;
+                  load(withDefaults(c.defaults, { symbols: t.symbols ?? (spec.symbols.length ? spec.symbols : ["NSE:SBIN-EQ"]), ...t.spec }), t.name, null, null);
+                  bt.reset(); setMsg(`Loaded the “${t.name}” template — adjust it, backtest, then save.`);
                 }}>
                   <option value="">— load a template —</option>
                   {TEMPLATES.map((t, i) => <option key={t.name} value={i}>{t.name}</option>)}
@@ -1716,14 +1765,19 @@ export default function Algo() {
                 {versions.data.versions.map((v) => (
                   <button key={v.version} type="button" className={`btn-sm ${v.version === viewing ? "primary" : "ghost"}`}
                     title={`${v.note ?? ""} saved ${isoIst(v.created_at)} · ${v.closed_trades} live/paper trades · ${inr(v.realized_pnl)}${v.active ? " · ACTIVE" : ""}`}
-                    onClick={() => { setSpec(withDefaults(c.defaults, v.spec)); setViewing(v.version); setMsg(`Loaded v${v.version} into the builder${v.active ? " (active)" : " — not active yet"}.`); }}>
+                    onClick={() => {
+                      if (v.version === viewing && !dirty) return;
+                      if (!okToReplace()) return;
+                      load(withDefaults(c.defaults, v.spec), name, editing, v.version);
+                      bt.reset(); setMsg(`Loaded v${v.version} into the builder${v.active ? " (active)" : " — not active yet"}.`);
+                    }}>
                     v{v.version}{v.active ? " ✓" : ""}
                   </button>
                 ))}
                 {viewing && viewing !== versions.data.active && (
                   <button type="button" className="btn-sm" disabled={activate.isPending} onClick={() => activate.mutate(viewing)}>make v{viewing} active</button>
                 )}
-                <span className="meta">✓ = runs in Automations · saving creates the next version</span>
+                <span className="meta">✓ = the version Automations runs · saving changes creates the next version and makes it active</span>
               </div>
             )}
           </div>
@@ -1912,16 +1966,18 @@ export default function Algo() {
               {[30, 90, 180, 365, 730].map((d) => (
                 <button type="button" key={d} className="btn-sm" onClick={() => setRange({ start: daysAgo(d), end: daysAgo(0) })}>{d < 365 ? `${d}d` : `${d / 365}y`}</button>
               ))}
-              <label className="meta" title="split the result: the last X% of the range as out-of-sample (0 = off)">out-of-sample <NumInput width={36} value={oosPct} onChange={(n) => setOosPct(Math.max(0, Math.min(80, Math.floor(n ?? 0))))} />%</label>
+              <label className="meta" title="split the result: the last X% of the range as out-of-sample (5–80, 0 = off)">out-of-sample <NumInput width={36} value={oosPct} onChange={(n) => setOosPct(Math.max(0, Math.min(80, Math.floor(n ?? 0))))} />%</label>
               <button type="button" className="primary" disabled={bt.isPending} onClick={() => { setMsg(null); bt.mutate(); }}>
                 {bt.isPending ? "Backtesting… (downloads missing candles first)" : "▶ Run backtest"}
               </button>
-              {editing && <button type="button" disabled={save.isPending} onClick={() => save.mutate(false)}
-                title="keeps every earlier version — switch back any time">Save as v{(versions.data?.versions[0]?.version ?? 0) + 1}</button>}
+              {editing && <button type="button" disabled={save.isPending || !dirty} onClick={saveVersion}
+                title={dirty ? "keeps every earlier version — switch back any time" : "no changes to save"}>Save as v{(versions.data?.versions[0]?.version ?? 0) + 1}</button>}
               <button type="button" disabled={save.isPending} onClick={() => save.mutate(true)}>Save as new strategy</button>
             </div>
             {msg && <div className="meta" style={{ marginTop: 6 }}>{msg}</div>}
             {bt.error && <div className="pnl-neg" style={{ marginTop: 6 }}>{errMsg(bt.error)}</div>}
+            {stale && !bt.isPending && <div className="meta" style={{ marginTop: 6, color: "var(--amber)" }} data-testid="algo-stale">
+              The settings changed since the results below were run — press ▶ Run backtest to refresh them.</div>}
           </div>
           {bt.data && <Results r={bt.data} />}
         </>
