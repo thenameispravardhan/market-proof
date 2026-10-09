@@ -21,6 +21,19 @@ import {
 
 type Mode = "idle" | "opening" | "waiting" | "error";
 
+// `token_expires_at` is epoch seconds (from the token's JWT `exp`).
+function formatExpiry(epochS: number | null | undefined): string | null {
+  if (!epochS) return null;
+  const d = new Date(epochS * 1000);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toLocaleString(undefined, {
+    day: "numeric",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 export function ConnectFyers() {
   const { data: status, refetch } = useFyersStatus();
   const authorize = useFyersAuthorizeUrl();
@@ -36,6 +49,12 @@ export function ConnectFyers() {
   useEffect(() => {
     statusRef.current = status;
   }, [status]);
+  // Popup-close watcher; cleared on unmount so leaving the page mid-OAuth
+  // doesn't leave an interval running.
+  const watchRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  useEffect(() => () => {
+    if (watchRef.current) clearInterval(watchRef.current);
+  }, []);
 
   // While the popup is open, poll status every 2s so the banner
   // flips to "Connected" the instant the OAuth callback finishes.
@@ -83,7 +102,7 @@ export function ConnectFyers() {
         setMode("error");
         setErrorMsg(
           resp.reason ??
-            "Fyers creds not configured in .env. Add FYERS_APP_ID and FYERS_SECRET_KEY, then restart the backend."
+            "Fyers App ID / Secret Key are not set. Enter them under API Credentials below."
         );
         return;
       }
@@ -96,53 +115,29 @@ export function ConnectFyers() {
       if (!popup) {
         setMode("error");
         setErrorMsg(
-          "Popup was blocked. Allow popups for 127.0.0.1:5173 in your browser, then click Connect again."
+          `Popup was blocked. Allow popups for ${window.location.host} in your browser, then click Connect again.`
         );
         return;
       }
       setMode("waiting");
-      // Watch for the popup to close (user finished or cancelled).
-      // Fyers redirects back to /api/fyers/callback on success; if
-      // the popup closes without reaching the callback, the most
-      // likely causes are:
-      //   - The configured FYERS_APP_ID was deleted on Fyers'
-      //     dashboard (Fyers shows "deleted app" in the popup)
-      //   - The operator updated .env with new keys but DID NOT
-      //     restart the backend. The server is still using the
-      //     values it loaded at startup, so the OAuth URL is
-      //     built with the OLD (deleted) app_id.
-      //   - The redirect URI in .env / broker_accounts doesn't
-      //     match what Fyers has on file
-      //   - The user closed the popup manually
-      //   - The popup is showing a captcha / 2FA challenge that
-      //     the user never completed
-      // We surface a single message covering all five instead of
-      // silently resetting — operators were getting stuck on
-      // "Fyers Token Expired" with no way to diagnose the cause.
-      const watch = setInterval(() => {
+      // Fyers redirects the popup to /api/fyers/callback on success. If it
+      // closes without a token appearing, say so plainly with the usual
+      // causes instead of silently resetting the banner.
+      if (watchRef.current) clearInterval(watchRef.current);
+      watchRef.current = setInterval(() => {
         if (popup.closed) {
-          clearInterval(watch);
-          // Give the status poll one more tick to detect a fresh
-          // token (the callback's token write + status update can
-          // race the popup-close handler). Read from statusRef so
-          // we see the most recent value, not the one captured at
-          // click-time.
+          if (watchRef.current) clearInterval(watchRef.current);
+          watchRef.current = null;
+          // The callback's token write can race the close, so give the
+          // status poll one more tick and read the latest value via ref.
           setTimeout(() => {
             if (!isAuthorized(statusRef.current)) {
               setMode("error");
               setErrorMsg(
-                "OAuth did not complete. Most common causes: " +
-                  "(1) you updated FYERS_APP_ID / FYERS_SECRET_KEY in .env " +
-                  "but did NOT restart the backend — the running process is " +
-                  "still using the old (deleted) keys it loaded at startup. " +
-                  "Stop the uvicorn process and start it again, then retry. " +
-                  "(2) the FYERS_APP_ID in .env was deleted on the Fyers dashboard " +
-                  "(re-create it on https://myapi.fyers.in/dashboard/, update .env, " +
-                  "and restart the backend). " +
-                  "(3) FYERS_REDIRECT_URI in .env doesn't match what's registered on " +
-                  "https://myapi.fyers.in/dashboard/. " +
-                  "(4) the popup was closed before login finished. " +
-                  "(5) a captcha or 2FA challenge was shown and not completed."
+                "OAuth did not complete. Usual causes:\n" +
+                  "• The login window was closed, or a captcha / 2FA step wasn't finished.\n" +
+                  "• The FYERS_APP_ID above was deleted on the Fyers dashboard. Create a new app there and enter its keys under API Credentials.\n" +
+                  "• The Redirect URL registered on Fyers doesn't exactly match the one under Fyers App Activation."
               );
             } else {
               setMode("idle");
@@ -199,7 +194,13 @@ export function ConnectFyers() {
               {tradingOff
                 ? status?.reason ??
                   "Authorised — the Fyers account is switched OFF, so no orders route to it. Live prices keep flowing. Turn it back on with the Fyers toggle on the Dashboard."
-                : `App ID: ${status?.app_id || "—"} · Status bar will show live NIFTY / SENSEX / BANKNIFTY`}
+                : [
+                    `App ID ${status?.app_id || "—"}`,
+                    formatExpiry(status?.token_expires_at) &&
+                      `session valid until ${formatExpiry(status?.token_expires_at)}`,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
             </div>
           </div>
           <button
@@ -215,8 +216,17 @@ export function ConnectFyers() {
     );
   }
 
+  // First load: don't flash "Not Configured" before the status arrives.
+  if (!status) {
+    return (
+      <div className="widget" data-testid="connect-fyers">
+        <div style={{ fontSize: 12, color: "var(--text-dim)" }}>Checking Fyers connection…</div>
+      </div>
+    );
+  }
+
   // Not connected — show the CTA.
-  const notConfigured = !status?.credentials_set;
+  const notConfigured = !status.credentials_set;
 
   return (
     <div
@@ -230,8 +240,10 @@ export function ConnectFyers() {
           <div style={{ fontWeight: 700, color: "var(--text)" }}>
             {notConfigured
               ? "Fyers Not Configured"
+              : status?.token_expired
+              ? "Fyers Session Expired"
               : status?.account_present
-              ? "Fyers Token Expired"
+              ? "Fyers Login Needed"
               : "Connect Fyers"}
           </div>
           <div style={{ fontSize: 12, color: "var(--text-dim)", marginTop: 2 }}>
@@ -287,7 +299,7 @@ export function ConnectFyers() {
             : mode === "waiting"
             ? "Waiting for Fyers…"
             : notConfigured
-            ? "Set creds in .env first"
+            ? "Add keys first"
             : "Connect Fyers"}
         </button>
       </div>

@@ -34,22 +34,30 @@ export function FyersCredentialsCard() {
 
   const save = async () => {
     setMsg(null);
+    // Send only what actually changed. The App ID / Redirect fields are
+    // pre-filled from the server, so sending them unconditionally made a
+    // DeepSeek-only save rewrite the Fyers keys, drop the cached Fyers
+    // session and tell the operator to re-authorise for nothing.
     const body: Record<string, string> = {};
-    if (appId.trim()) body.fyers_app_id = appId.trim();
+    if (appId.trim() && appId.trim() !== (cred?.fyers_app_id ?? "")) body.fyers_app_id = appId.trim();
     if (secret.trim()) body.fyers_secret_key = secret.trim();
-    if (redirect.trim()) body.fyers_redirect_uri = redirect.trim();
+    if (redirect.trim() && redirect.trim() !== (cred?.fyers_redirect_uri ?? ""))
+      body.fyers_redirect_uri = redirect.trim();
     if (deepseek.trim()) body.deepseek_api_key = deepseek.trim();
     if (Object.keys(body).length === 0) {
-      setMsg({ kind: "err", text: "Nothing to save — fill at least one field." });
+      setMsg({ kind: "err", text: "Nothing changed — edit a field first." });
       return;
     }
+    const fyersChanged = "fyers_app_id" in body || "fyers_secret_key" in body;
     try {
       await update.mutateAsync(body);
       setSecret("");
       setDeepseek("");
       setMsg({
         kind: "ok",
-        text: "Saved to .env and applied live. If you changed the App ID or Secret, click Connect Fyers below to re-authorise.",
+        text: fyersChanged
+          ? "Saved and applied. The Fyers keys changed, so click Connect Fyers at the top to log in with them."
+          : "Saved and applied.",
       });
     } catch (e: any) {
       setMsg({ kind: "err", text: `Save failed: ${e?.message ?? "unknown error"}` });

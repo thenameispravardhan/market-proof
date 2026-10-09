@@ -279,8 +279,8 @@ async def fyers_authorize_url() -> dict[str, Any]:
             "url": "",
             "state": "",
             "reason": (
-                "FYERS_APP_ID / FYERS_SECRET_KEY are not set in .env. "
-                "Add them and restart the backend."
+                "Fyers App ID / Secret Key are not set. Enter them under "
+                "API Credentials on the Accounts page."
             ),
         }
     from app.execution.fyers_auth import build_authorize_url, register_state
@@ -339,10 +339,10 @@ async def fyers_authorize_url() -> dict[str, Any]:
                 "state": "",
                 "reason": (
                     f"Fyers rejected FYERS_APP_ID {settings.FYERS_APP_ID!r} "
-                    f"as {err!r}. The app was likely deleted on "
-                    "https://myapi.fyers.in/dashboard/. Create a new "
-                    "Fyers app, then update FYERS_APP_ID and "
-                    "FYERS_SECRET_KEY in .env and restart the backend."
+                    f"as {err!r}. The app was likely deleted on the Fyers "
+                    "API dashboard. Create a new app there, then enter its "
+                    "App ID and Secret Key under API Credentials on the "
+                    "Accounts page."
                 ),
             }
     except Exception as e:  # noqa: BLE001
@@ -413,8 +413,8 @@ def fyers_status(db: Session = Depends(get_db)) -> dict[str, Any]:
     reason: Optional[str] = None
     if not credentials_set:
         reason = (
-            "FYERS_APP_ID / FYERS_SECRET_KEY are not set in .env. "
-            "Add them and restart the backend."
+            "Fyers App ID / Secret Key are not set. Enter them under API "
+            "Credentials below."
         )
     elif not account_present:
         reason = "Click 'Connect Fyers' to run the OAuth flow."

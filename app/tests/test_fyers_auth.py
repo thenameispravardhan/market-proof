@@ -833,10 +833,11 @@ def test_authorize_url_endpoint_returns_deleted_app_reason(monkeypatch) -> None:
         reason = body["reason"]
         assert "DELETED-APP-100" in reason
         assert "deleted" in reason.lower() or "invalid" in reason.lower()
-        # It must also point the operator at the myapi dashboard
-        # and the .env keys that need updating.
-        assert "myapi.fyers.in" in reason
-        assert "FYERS_APP_ID" in reason
+        # It must point the operator at the Fyers dashboard and the
+        # API Credentials card (keys are hot-applied, no restart).
+        assert "Fyers API dashboard" in reason
+        assert "API Credentials" in reason
+        assert "restart" not in reason.lower()
     finally:
         if saved is None:
             os.environ.pop("FYERS_APP_ID", None)

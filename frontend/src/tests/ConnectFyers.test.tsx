@@ -102,17 +102,11 @@ describe("ConnectFyers", () => {
     }) as unknown as typeof fetch;
     const qc = makeQc();
     render(<ConnectFyers />, { wrapper: wrapper(qc) });
-    // Wait for the fetched status to drive the banner past the
-    // initial "Fyers Not Configured" placeholder (the query is
-    // undefined on first render) into the real "Fyers Token
-    // Expired" state. We key off the heading text, not the
-    // button, because the button is rendered in both states.
+    // Wait for the fetched status to replace the "Checking…"
+    // placeholder with the real "account exists, no token" state.
     await waitFor(() => {
-      expect(screen.getByText(/Fyers Token Expired/i)).toBeInTheDocument();
+      expect(screen.getByText(/Fyers Login Needed/i)).toBeInTheDocument();
     });
-    // Button label flips from "Set creds in .env first" (initial
-    // placeholder) to "Connect Fyers" once status.credentials_set
-    // is true.
     expect(screen.getByTestId("fyers-connect")).toBeInTheDocument();
     expect(screen.getByTestId("fyers-connect")).toHaveTextContent(
       /Connect Fyers/i,
@@ -236,12 +230,9 @@ describe("ConnectFyers", () => {
     const err = await screen.findByTestId("fyers-error");
     expect(err.textContent).toMatch(/OAuth did not complete/i);
     expect(err.textContent).toMatch(/FYERS_APP_ID/);
-    // The most common production cause is that the operator
-    // updated .env with new keys but forgot to restart the
-    // backend — the running process is still using the old
-    // (deleted) keys it loaded at startup. Make sure the
-    // message names that explicitly.
-    expect(err.textContent).toMatch(/restart the backend/i);
+    // Keys are hot-applied from API Credentials now, so the message
+    // must not send the operator off to restart the backend.
+    expect(err.textContent).not.toMatch(/restart the backend/i);
     expect(err.textContent).toMatch(/deleted on the Fyers dashboard/i);
   });
 });
