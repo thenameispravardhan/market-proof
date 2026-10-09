@@ -268,6 +268,10 @@ async def place_order(
     if order_type in ("STOP_LOSS", "SL-M") and stop_price is None:
         raise HTTPException(status_code=422, detail="stop_price required for SL-L / SL-M")
 
+    lot_problem = await _lot_problem(symbol, quantity)
+    if lot_problem:
+        raise HTTPException(status_code=422, detail=lot_problem)
+
     acc = _require_real_account(db, account_id)
 
     try:
@@ -332,6 +336,21 @@ async def place_order(
             spawn(_arm_levels(oid, *LEVELS_ON_FILL.pop(oid)))
         result["levels_pending"] = {"stop_loss": sl, "target": tp}
     return result
+
+
+async def _lot_problem(symbol: str, quantity: int) -> Optional[str]:
+    """`fno.lot_error`, downloading the F&O scrip master first when the lot is
+    unknown only because it hasn't been fetched yet (fresh install)."""
+    from app.algo import fno
+
+    problem = fno.lot_error(symbol, quantity)
+    if problem and fno.is_derivative(symbol) and fno.contract_lot(symbol) is None:
+        try:
+            await fno.ensure_master()
+        except Exception as e:  # noqa: BLE001 — the refusal below stands
+            log.warning("orders.fno_master_refresh_failed", error=str(e)[:200])
+        problem = fno.lot_error(symbol, quantity)
+    return problem
 
 
 async def _commit_off_loop(db: Session) -> None:
@@ -666,6 +685,10 @@ async def modify_order(
                     "the risk engine checks it"
                 ),
             )
+        sym = next((t.symbol for t in trades if t.symbol), None)
+        lot_problem = await _lot_problem(sym, quantity) if sym else None
+        if lot_problem:
+            raise HTTPException(status_code=422, detail=lot_problem)
         if quantity > current:
             raise HTTPException(
                 status_code=422,

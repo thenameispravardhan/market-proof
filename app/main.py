@@ -321,6 +321,7 @@ async def lifespan(app: FastAPI):
     ai_schedule_task: asyncio.Task[None] | None = None
     algo_task: asyncio.Task[None] | None = None
     tick_task: asyncio.Task[None] | None = None
+    fno_master_task: asyncio.Task[None] | None = None
     if not settings.TESTING:
         # T3: start the analyzer before the monitors so its event-bus
         # subscription is live before the first `announcements.new`
@@ -522,12 +523,30 @@ async def lifespan(app: FastAPI):
         algo_task = asyncio.create_task(app.state.algo_runner.run(), name="algo-runner")
         app.state.algo_task = algo_task
 
+        # F&O scrip master (lot sizes for every NSE/BSE future and option):
+        # fetched at startup and kept under a day old, so order lot checks
+        # and the option chain never fall back to guessing a stock's lot.
+        async def _fno_master_refresh() -> None:
+            from app.algo import fno
+
+            while True:
+                try:
+                    await fno.ensure_master()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 — retried on the next pass
+                    log.exception("fno_master.refresh_failed")
+                await asyncio.sleep(3 * 3600)
+
+        fno_master_task = asyncio.create_task(_fno_master_refresh(), name="fno-master")
+
     try:
         yield
     finally:
         if not settings.TESTING:
             # Stop the breaker monitor first.
-            for _t in (risk_monitor_task, dataset_eod_task, ai_schedule_task, algo_task, tick_task):
+            for _t in (risk_monitor_task, dataset_eod_task, ai_schedule_task, algo_task, tick_task,
+                       fno_master_task):
                 if _t is not None:
                     _t.cancel()
                     try:
