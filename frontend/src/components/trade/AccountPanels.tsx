@@ -681,7 +681,7 @@ export function GttPanel({ data, accountId, privacy, onDone }: { data: GttResp |
     try {
       const r = await fetch("/api/broker/gtt/cancel", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ account_id: accountId, id: g.id }) });
       const j = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(j.detail ?? `HTTP ${r.status}`);
+      if (!r.ok) throw new Error(typeof j.detail === "string" ? j.detail : `The server refused it (${r.status}).`);
       onDone(j.ok ? `GTT ${g.id} cancelled` : `Fyers did not cancel GTT ${g.id}`);
     } catch (e) {
       onDone(`GTT cancel failed: ${e instanceof Error ? e.message : String(e)}`);

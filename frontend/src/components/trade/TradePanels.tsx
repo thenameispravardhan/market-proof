@@ -617,7 +617,7 @@ export function AccountManager({
   /** Move a working order to `price` (the DOM's drag): the stop for stop
    *  orders (a stop-limit's limit keeps its offset), else the limit. */
   const modifyPrice = async (o: OrderRow, price: number): Promise<string> => {
-    if (!accountId || !o.id) throw new Error("no live account");
+    if (!accountId || !o.id) throw new Error("No live Fyers account is connected.");
     const stopType = o.type === "SL-M" || o.type === "STOP_LOSS";
     const body: Record<string, unknown> = { account_id: accountId, broker_order_id: o.id, order_type: o.type };
     if (stopType) body.stop_price = price;
@@ -714,7 +714,7 @@ export function AccountManager({
             qty={qty}
             onQty={onQty}
             instant={instant}
-            onOrder={(o, q) => (selected ? orderFor(selected.symbol, selected.short_name, q)(o) : Promise.reject(new Error("no symbol")))}
+            onOrder={(o, q) => (selected ? orderFor(selected.symbol, selected.short_name, q)(o) : Promise.reject(new Error("Open a symbol first.")))}
             onCancel={onCancel}
             onModify={modifyPrice}
             onFlatten={() => (selected ? closeFor(selected.symbol)() : Promise.resolve())}
@@ -762,7 +762,7 @@ export function AccountManager({
                       void run(`Convert ${p.symbol} → ${to}`, async () => {
                         const r = await fetch(`/api/positions/${encodeURIComponent(p.symbol)}/convert`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ to }) });
                         const j = await r.json().catch(() => ({}));
-                        if (!r.ok) throw new Error(j.detail ?? `HTTP ${r.status}`);
+                        if (!r.ok) throw new Error(typeof j.detail === "string" ? j.detail : `The server refused it (${r.status}).`);
                         void qc.invalidateQueries({ queryKey: ["positions"] });
                         book.reload();
                         return `${p.symbol} is now ${j.product}`;
