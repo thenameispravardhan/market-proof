@@ -107,6 +107,28 @@ function cleanError(raw: unknown, fallback: string): string {
   return s;
 }
 
+/** A failed request in plain words instead of a bare "HTTP 502". */
+function httpError(status: number): string {
+  if (status === 401 || status === 403) return "Your session has expired. Reload the page and sign in again.";
+  if (status === 404) return "Not found on the server.";
+  if (status === 503) return "The trading service isn't running right now. Try again in a moment.";
+  if (status >= 500) return `The server hit an error (${status}). Try again in a moment.`;
+  return `The request failed (${status}).`;
+}
+
+/** The server's reason for a failed request. FastAPI sends `detail` as a
+ *  string, but validation errors come as a list of objects, which used to
+ *  show up as "[object Object]". */
+function detailText(j: { detail?: unknown }, status: number): string {
+  const d = j?.detail;
+  if (typeof d === "string" && d.trim()) return d;
+  if (Array.isArray(d) && d.length) {
+    const msgs = d.map((x) => (x && typeof x === "object" && "msg" in x ? String((x as { msg: unknown }).msg) : String(x)));
+    return msgs.join("; ");
+  }
+  return httpError(status);
+}
+
 const DRAG_MIME = "application/x-tradebot-instrument";
 
 /** A price snapped to the instrument's tick (Fyers rejects off-grid prices). */
@@ -382,17 +404,18 @@ function FlowPanel({ symbol }: { symbol: string | null }) {
   const [data, setData] = useState<FlowResp | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
   const load = async () => {
     if (!symbol) return;
     const now = Math.floor(Date.now() / 1000);
     const day0 = now - ((now + 19800) % 86400);
     try {
       const r = await fetch(`/api/algo/ticks/flow?symbol=${encodeURIComponent(symbol)}&resolution=5&from=${day0 - 86400 * 4}&to=${now + 60}`);
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      if (!r.ok) throw new Error(`Couldn't load order flow. ${httpError(r.status)}`);
       setData(await r.json()); setErr(null);
     } catch (e) { setErr(e instanceof Error ? e.message : String(e)); }
   };
-  useEffect(() => { setData(null); load(); const id = setInterval(load, 15000); return () => clearInterval(id); }, [symbol]);  // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { setData(null); setNote(null); load(); const id = setInterval(load, 15000); return () => clearInterval(id); }, [symbol]);  // eslint-disable-line react-hooks/exhaustive-deps
   if (!symbol) return <section className="trade-card"><div className="empty">Pick a symbol first.</div></section>;
   const bars = data?.bars ?? [];
   const lastDay = bars.length ? Math.floor((bars[bars.length - 1][0] + 19800) / 86400) : 0;
@@ -405,18 +428,26 @@ function FlowPanel({ symbol }: { symbol: string | null }) {
     <section className="trade-card" data-testid="trade-flow">
       <h2>Real order flow — {symbol} {data?.key && <span className="hint">recorded as {data.key}</span>}</h2>
       {err && <div className="hint warn-text">{err}</div>}
+      {note && <div className="hint">{note}</div>}
       {data && !data.recorded && (
         <div className="empty">
           No ticks recorded for this symbol yet.{" "}
           <button type="button" className="btn-sm" disabled={adding} onClick={async () => {
             setAdding(true);
+            setNote(null);
             try {
-              const st = await (await fetch("/api/algo/ticks/status")).json();
-              await fetch("/api/algo/ticks/config", { method: "PUT", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ enabled: true, symbols: [...st.config_symbols, symbol] }) });
-              setErr("Added — recording starts with the next tick (market hours).");
+              const sr = await fetch("/api/algo/ticks/status");
+              if (!sr.ok) throw new Error(httpError(sr.status));
+              const st = await sr.json();
+              const r = await fetch("/api/algo/ticks/config", { method: "PUT", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ enabled: true, symbols: [...(st.config_symbols ?? []), symbol] }) });
+              if (!r.ok) throw new Error(detailText(await r.json().catch(() => ({})), r.status));
+              setErr(null);
+              setNote("Added. Recording starts with the next tick during market hours.");
+            } catch (e) {
+              setErr(`Couldn't start recording ${symbol}: ${e instanceof Error ? e.message : String(e)}`);
             } finally { setAdding(false); }
-          }}>record it</button>
+          }}>{adding ? "adding…" : "Record it"}</button>
         </div>
       )}
       {today.length > 0 && (
@@ -719,6 +750,11 @@ export default function Trade() {
     type: "success" | "info" | "error";
     text: string;
   } | null>(null);
+  useEffect(() => {
+    if (!cancelMessage || cancelMessage.type === "error") return;
+    const t = setTimeout(() => setCancelMessage(null), 8000);
+    return () => clearTimeout(t);
+  }, [cancelMessage]);
 
   // Lot-size aware quantity. F&O trades in whole lots, so when the
   // instrument changes a quantity that isn't a multiple of the new lot snaps
@@ -786,13 +822,13 @@ export default function Trade() {
       body: JSON.stringify({ stop_loss: sl, target: tp }),
     });
     const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(j.detail ?? `HTTP ${r.status}`);
+    if (!r.ok) throw new Error(detailText(j, r.status));
     qc.setQueryData<Managed[]>(["managed-positions"], (old) => [...(old ?? []).filter((x) => x.symbol !== j.managed.symbol), j.managed]);
   };
   const closeFor = (sym: string) => async () => {
     const r = await fetch(`/api/positions/${encodeURIComponent(sym)}/close`, { method: "POST" });
     const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(j.detail ?? `HTTP ${r.status}`);
+    if (!r.ok) throw new Error(detailText(j, r.status));
     void qc.invalidateQueries({ queryKey: ["positions"] });
     void qc.invalidateQueries({ queryKey: ["managed-positions"] });
   };
@@ -982,8 +1018,8 @@ export default function Trade() {
   // account. Risk-blocked or rejected orders come back as errors (the ticket
   // is where a risk override is typed).
   const orderFor = (sym: string, name: string, qty: number) => async (o: ChartOrder): Promise<string> => {
-    if (!accountId) throw new Error("no live Fyers account connected");
-    if (!(qty > 0)) throw new Error("quantity must be more than 0");
+    if (!accountId) throw new Error("No live Fyers account is connected. Connect one on the Accounts page.");
+    if (!(qty > 0)) throw new Error("Set a quantity above 0 in the order ticket first.");
     const r = await chartPlace.mutateAsync({
       account_id: accountId,
       symbol: sym,
@@ -997,9 +1033,9 @@ export default function Trade() {
       operator: "ui_chart",
     });
     if (r.status === "REJECTED" || r.status === "REJECTED_RISK" || r.ok === false) {
-      throw new Error(cleanError(r.error || r.risk_message, "broker rejected the order"));
+      throw new Error(cleanError(r.error || r.risk_message, "The broker rejected the order."));
     }
-    return `${o.side} ${qty} ${name} ${o.type === "STOP_LOSS" ? "STOP-LIMIT" : o.type}${o.price != null ? ` @ ${o.price}` : ""}${o.type === "STOP_LOSS" && o.limit != null ? ` lmt ${o.limit}` : ""} → ${r.status}`;
+    return `${o.side} ${qty} ${name} ${o.type === "STOP_LOSS" ? "STOP-LIMIT" : o.type}${o.price != null ? ` @ ${o.price}` : ""}${o.type === "STOP_LOSS" && o.limit != null ? ` limit ${o.limit}` : ""}: ${r.status}`;
   };
 
   const isFnoSel = selected != null && selected.segment !== "EQ" && selected.instrument_type !== "EQ";
@@ -1066,7 +1102,7 @@ export default function Trade() {
           type: "error",
           message: cleanError(
             r.error || r.risk_message,
-            "broker rejected the order",
+            "The broker rejected the order.",
           ),
           detail: body,
           reason: r.reason ?? null,
@@ -1075,7 +1111,7 @@ export default function Trade() {
         setLastResult({
           type: "success",
           // The order id is not a price — "@ 2406..." read as a fill price.
-          message: `${r.status}  ${body.symbol}  ${body.side} ${body.quantity}${r.broker_order_id ? `  · order ${r.broker_order_id}` : ""}`,
+          message: `${body.side} ${body.quantity} ${body.symbol} · ${r.status}${r.broker_order_id ? ` · order ${r.broker_order_id}` : ""}`,
           // Risk is advisory for manual orders — surface it without blocking.
           warning: r.risk_warning ?? (r.risk_message ? r.risk_message : null),
           detail: body,
@@ -1086,7 +1122,7 @@ export default function Trade() {
         type: "error",
         message: cleanError(
           (e as Error).message,
-          "place-order request failed",
+          "Couldn't reach the server to place the order. Check the connection and try again.",
         ),
         detail: body,
       });
@@ -1123,7 +1159,7 @@ export default function Trade() {
         type: "error",
         text: `Cancel failed for ${brokerOrderId}: ${cleanError(
           (e as Error).message,
-          "request failed",
+          "couldn't reach the server",
         )}`,
       });
     }
@@ -1382,10 +1418,14 @@ export default function Trade() {
                     onClick={() => refreshInstruments.mutate()}
                     disabled={refreshInstruments.isPending}
                     data-testid="refresh-instruments"
-                    title="Download the full NSE + BSE stock list from Fyers"
+                    title={refreshInstruments.isError
+                      ? `Couldn't download the stock list: ${cleanError(refreshInstruments.error?.message, "unknown error")}. Click to try again.`
+                      : "Download the full NSE + BSE stock list from Fyers"}
                   >
                     {refreshInstruments.isPending
                       ? "loading…"
+                      : refreshInstruments.isError
+                      ? "✕ retry"
                       : refreshInstruments.isSuccess
                       ? `✓ ${refreshInstruments.data?.instrument_count?.toLocaleString() ?? ""} symbols`
                       : "↻ NSE/BSE"}
@@ -1393,9 +1433,9 @@ export default function Trade() {
                 </div>
                 {showResults && query && (
                   <div className="trade-search-results" data-testid="trade-search-results">
-                    {searching && <div className="hint">searching…</div>}
+                    {searching && <div className="hint">Searching…</div>}
                     {!searching && (searchData?.count ?? 0) === 0 && (
-                      <div className="hint">no results for "{query}"</div>
+                      <div className="hint">No symbols match "{query}". Try ↻ NSE/BSE to download the full list.</div>
                     )}
                     {(searchData?.hits ?? []).map((h, i) => (
                       <button
@@ -1660,7 +1700,7 @@ export default function Trade() {
                       {lastResult.message}
                       {lastResult.warning && (
                         <div className="result-warning" data-testid="ticket-risk-advisory">
-                          ⚠ risk advisory: {lastResult.warning}
+                          ⚠ Risk check: {lastResult.warning}
                         </div>
                       )}
                     </div>
@@ -1723,7 +1763,7 @@ export default function Trade() {
                             >
                               myapi.fyers.in/dashboard
                             </a>
-                            , then click PLACE BUY again.
+                            , then click PLACE {lastResult.detail?.side ?? side} again.
                           </div>
                           <div
                             style={{
@@ -1800,7 +1840,7 @@ export default function Trade() {
                       <div className="chain-meta">
                         <span
                           className={`badge ${chain?.source === "fyers" ? "cash" : "neutral"}`}
-                          title={chain?.source === "fyers" ? "live Fyers prices" : "static ladder"}
+                          title={chain?.source === "fyers" ? "Live prices from Fyers" : "Static strike list. Live Fyers prices aren't available right now."}
                         >
                           {chain?.source === "fyers" ? "LIVE" : "STATIC"}
                         </span>
