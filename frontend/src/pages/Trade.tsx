@@ -1442,7 +1442,9 @@ export default function Trade() {
                         <span className="exch">{selected.exchange}:{selected.segment}</span>
                         {isOption && <span className="badge opt">OPTION</span>}
                         {isFuture && <span className="badge fut">FUTURE</span>}
-                        {!isOption && !isFuture && <span className="badge cash">CASH</span>}
+                        {!isOption && !isFuture && (selected.segment === "INDEX"
+                          ? <span className="badge idx">INDEX</span>
+                          : <span className="badge cash">CASH</span>)}
                       </div>
                       <div className="quote-fullsym">{selected.symbol}</div>
                       <div className="quote-row">
