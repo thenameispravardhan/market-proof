@@ -1167,8 +1167,14 @@ export default function Trade() {
     }
   };
 
-  const onCancel = async (brokerOrderId: string) => {
-    if (!accountId) return;
+  const onCancel = async (brokerOrderId: string, label?: string) => {
+    // "BUY 10 NSE:SBIN-EQ (2410…)": the order id alone means nothing to a person
+    const what = label ? `${label} (${brokerOrderId})` : brokerOrderId;
+    if (!accountId) {
+      // Cancels go through a live account; without one the click used to do nothing at all.
+      setCancelMessage({ type: "error", text: `Not cancelled — ${what}: connect a live Fyers account to cancel orders.` });
+      return;
+    }
     setCancelMessage(null);
     try {
       const r = await cancelOrder.mutateAsync({
@@ -1180,22 +1186,22 @@ export default function Trade() {
       // (dropped from the list), already filled (now a position), or
       // still working — the one case the operator must act on.
       if (r.ok) {
-        setCancelMessage({ type: "success", text: `Cancelled ${brokerOrderId}` });
+        setCancelMessage({ type: "success", text: `Cancelled ${what}` });
       } else if (r.reason === "already_gone" || r.reason === "already_filled") {
         setCancelMessage({
           type: "info",
-          text: `${brokerOrderId}: ${r.message ?? "the order was no longer working at the broker"}.`,
+          text: `${what}: ${r.message ?? "the order was no longer working at the broker"}.`,
         });
       } else {
         setCancelMessage({
           type: "error",
-          text: `Not cancelled — ${brokerOrderId}: ${r.message ?? "the broker refused the cancel; the order may still be working"}.`,
+          text: `Not cancelled — ${what}: ${r.message ?? "the broker refused the cancel; the order may still be working"}.`,
         });
       }
     } catch (e) {
       setCancelMessage({
         type: "error",
-        text: `Cancel failed for ${brokerOrderId}: ${cleanError(
+        text: `Cancel failed for ${what}: ${cleanError(
           (e as Error).message,
           "request failed",
         )}`,
@@ -1370,10 +1376,10 @@ export default function Trade() {
               positions={positions}
               managed={managed}
               pendingOrders={pending?.orders ?? []}
-              onCancel={(id) => void onCancel(id)}
+              onCancel={(id, label) => void onCancel(id, label)}
               cancelBusyId={cancelOrder.isPending ? cancelOrder.variables?.broker_order_id ?? null : null}
               cancelBanner={cancelMessage && (
-                <div className={`result ${cancelMessage.type}`} data-testid="cancel-result">
+                <div className={`result ${cancelMessage.type}`} data-testid="cancel-result" onClick={() => setCancelMessage(null)} title="Click to dismiss" style={{ cursor: "pointer" }}>
                   {cancelMessage.text}
                 </div>
               )}

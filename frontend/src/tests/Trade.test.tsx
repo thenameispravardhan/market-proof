@@ -1021,7 +1021,7 @@ describe("Trade page", () => {
 
     // The UI shows a success banner and the row disappears.
     const banner = await screen.findByTestId("cancel-result");
-    expect(banner.textContent).toMatch(/Cancelled FX-12345/);
+    expect(banner.textContent).toMatch(/Cancelled BUY 1 NSE:RELIANCE-EQ \(FX-12345\)/);
     await waitFor(() =>
       expect(screen.queryByTestId("cancel-FX-12345")).not.toBeInTheDocument(),
     );
