@@ -290,13 +290,21 @@ async def build_legs(spec: dict, sym: str, side: str, u: float, now: float) -> l
     name = fno.fno_name(sym)
     if inst["type"] == "equity":
         return [{"symbol": sym, "kind": "EQ", "act": sign, "per_set": 1, "label": sym, "price": u}]
-    lot = fno.lot_size(name)
+    def lot_of(contract: str, chain_lot: Any = None) -> int:
+        # The contract's own lot: never a guessed 1 (the exchange rejects it),
+        # and right for both sides of an NSE lot revision.
+        lot = (fno.contract_lot(contract, now) or (int(chain_lot) if chain_lot else None)
+               or fno.known_lot(name, now))
+        if not lot:
+            raise ValueError(f"lot size for {contract} unknown — F&O scrip master not loaded")
+        return lot
+
     if inst["type"] == "future":
         fs = fno.future_symbol(name, inst["expiry"], now)
         if not fs:
             raise ValueError(f"no {inst['expiry']} {name} future in the F&O master")
         px = (await _ltp([fs])).get(fs)
-        return [{"symbol": fs, "kind": "FUT", "act": sign, "per_set": lot, "label": fs.split(":")[-1], "price": px}]
+        return [{"symbol": fs, "kind": "FUT", "act": sign, "per_set": lot_of(fs), "label": fs.split(":")[-1], "price": px}]
     backend = data._backend()
     cfgs = inst["legs_long" if side == "BUY" else "legs_short"]
     count = min(50, max([c["steps"] for c in cfgs] + [0]) + 3 if all(c["strike"] != "PREMIUM" for c in cfgs) else 30)
@@ -329,7 +337,8 @@ async def build_legs(spec: dict, sym: str, side: str, u: float, now: float) -> l
         if not leg.get("symbol"):
             raise ValueError(f"{name} {row['strike']:g} {c['right']} not in the chain")
         legs.append({"symbol": leg["symbol"].upper(), "kind": c["right"], "act": 1 if c["action"] == "BUY" else -1,
-                     "per_set": lot * c["lots"], "label": leg["symbol"].split(":")[-1],
+                     "per_set": lot_of(leg["symbol"], leg.get("lot_size")) * c["lots"],
+                     "label": leg["symbol"].split(":")[-1],
                      "price": leg.get("ltp"), "K": row["strike"], "exp": exp})
     return legs
 

@@ -116,6 +116,7 @@ export default function Scalper({
 
   const trade = async (leg: OptionLeg | null, label: string, side: "BUY" | "SELL") => {
     if (!leg) return;
+    if (!leg.lot_size) return setMsg(`✕ lot size unknown for ${label} — F&O scrip master not loaded`);
     const qty = lots * leg.lot_size;
     if (!oneClick && !window.confirm(`${side} ${qty} ${label} at market?\nReal order · intraday`)) return;
     setMsg(`${side} ${qty} ${label}…`);
@@ -236,11 +237,11 @@ export default function Scalper({
               {[0, 1, 2].map((i) => (
                 <div key={i} className={`scalp-col${activeCol === i ? " active" : ""}`} onMouseDownCapture={() => setActiveCol(i)}>
                   {i === 0 && leg(ceRow, ce, "CE", ceOff, setCeOff)}
-                  {i === 0 && (ce ? chart(ce.symbol, legName(ceRow, "CE"), 0, lots * ce.lot_size) : <section className="trade-card tv-empty" />)}
+                  {i === 0 && (ce ? chart(ce.symbol, legName(ceRow, "CE"), 0, lots * (ce.lot_size ?? 0)) : <section className="trade-card tv-empty" />)}
                   {i === 1 && <div className="scalp-leg base"><span className="name">{name}</span><span className="scalp-ltp">{chain?.spot != null ? chain.spot.toFixed(2) : "—"}</span><span className="hint">underlying</span></div>}
                   {i === 1 && chart(base.symbol, name, 1)}
                   {i === 2 && leg(peRow, pe, "PE", peOff, setPeOff)}
-                  {i === 2 && (pe ? chart(pe.symbol, legName(peRow, "PE"), 2, lots * pe.lot_size) : <section className="trade-card tv-empty" />)}
+                  {i === 2 && (pe ? chart(pe.symbol, legName(peRow, "PE"), 2, lots * (pe.lot_size ?? 0)) : <section className="trade-card tv-empty" />)}
                 </div>
               ))}
               {[0, 1].map((k) => (

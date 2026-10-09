@@ -691,44 +691,33 @@ def _state_from_str(status: str) -> OrderState:
 # ---- Option chain normalisation -----------------------------------------
 
 
-# Known F&O lot sizes for the common index underlyings — a fallback for
-# when the scrip master (which carries the authoritative per-symbol lot
-# size) hasn't been downloaded. These change periodically; refresh from
-# data/scrip_master/*.csv when available.
-_INDEX_LOT_SIZES: dict[str, int] = {
-    "NIFTYNXT50": 25,
-    "MIDCPNIFTY": 120,
-    "FINNIFTY": 60,
-    "BANKNIFTY": 30,
-    "NIFTYBANK": 30,
-    "NIFTY50": 65,
-    "NIFTY": 65,
-    "SENSEX": 20,
-    "BANKEX": 30,
-}
+def _guess_lot_size(underlying_symbol: str) -> Optional[int]:
+    """Lot size for an underlying's options, or None when it isn't known.
 
-
-def _guess_lot_size(underlying_symbol: str) -> int:
-    """Lot size for an underlying's options: the scrip master's when it's
-    downloaded, else the current NSE/BSE index lots (`fno.INDEX_LOTS`).
-
-    The old substring match against a stale table broke the common case:
-    BANKNIFTY's Fyers symbol is `NSE:NIFTYBANK-INDEX`, which matched
-    "NIFTY" (75) instead of BANKNIFTY (30), so every BANKNIFTY option
-    ticket sent a quantity that wasn't a lot multiple. Stock options got 1."""
+    The scrip master's lot (nearest live expiry) when it's downloaded, else
+    the current NSE/BSE index lots (`fno.INDEX_LOTS`). A stock's lot is never
+    guessed: the old fallback of 1 put a 1-share quantity on every stock
+    option ticket, which the exchange rejects. BANKNIFTY's Fyers symbol is
+    `NSE:NIFTYBANK-INDEX`, resolved through `fno.fno_name` (a substring match
+    once read it as NIFTY's lot)."""
     from app.algo import fno
 
     try:
-        lot = fno.lot_size(fno.fno_name(underlying_symbol or ""))
-    except Exception:  # noqa: BLE001 — a lot guess must never break the chain
-        lot = 0
-    if lot and lot > 1:
-        return int(lot)
-    s = (underlying_symbol or "").upper()
-    for key, fallback in _INDEX_LOT_SIZES.items():
-        if key in s:
-            return fallback
-    return 1
+        return fno.known_lot(fno.fno_name(underlying_symbol or ""))
+    except Exception:  # noqa: BLE001 — a lot lookup must never break the chain
+        return None
+
+
+def _leg_lot(symbol: str, underlying_lot: Optional[int]) -> Optional[int]:
+    """The contract's own lot (differs from the underlying's while an NSE lot
+    revision rolls through the expiries), else the underlying's."""
+    from app.algo import fno
+
+    try:
+        lot = (fno.master().get("contracts") or {}).get((symbol or "").upper())
+    except Exception:  # noqa: BLE001
+        lot = None
+    return int(lot) if lot else underlying_lot
 
 
 def normalize_option_chain(
@@ -773,7 +762,7 @@ def normalize_option_chain(
             "oi": int(safe_float(row.get("oi"))) or None,
             "volume": int(safe_float(row.get("volume"))) or None,
             "ltpch": safe_float(row.get("ltpch")) or None,
-            "lot_size": lot,
+            "lot_size": _leg_lot(str(row.get("symbol") or ""), lot),
             "tick_size": 0.05,
         }
         by_strike.setdefault(strike, {})[otype] = leg

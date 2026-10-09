@@ -689,6 +689,22 @@ describe("Trade page", () => {
     await waitFor(() => expect(JSON.parse(localStorage.getItem("trade:last") ?? "null")?.symbol).toBe(leg.symbol));
   });
 
+  it("chain: an option whose lot size the backend doesn't know can't be ordered", async () => {
+    const leg = { symbol: "NSE:RELIANCE26OCT2500CE", ltp: 42, bid: 41.9, ask: 42.1, oi: 1000, volume: 10, ltpch: 0, lot_size: null, tick_size: 0.05 };
+    const chain = { ok: true, underlying: "RELIANCE", symbol: "", spot: 2450, expiries: [], selected_expiry: null, source: "fyers",
+      strikes: [{ strike: 2500, ce: leg, pe: null }] };
+    const stubs = defaultStubs();
+    globalThis.fetch = makeFetchStub((url, init) => (url.includes("/api/options/chain") ? makeJsonResponse(chain) : stubs(url, init)));
+    const user = userEvent.setup();
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await user.type(await screen.findByTestId("trade-search"), "RELI");
+    await user.click(await screen.findByTestId("search-row-NSE:RELIANCE-EQ"));
+    if (!screen.queryByTestId("dock-chain")) await user.click(screen.getByTestId("rail-chain"));
+    await user.click(await screen.findByTestId("chain-ce-2500"));
+    expect(await screen.findByTestId("ticket-lot-unknown")).toBeInTheDocument();
+    expect(screen.getByTestId("ticket-submit")).toBeDisabled();
+  });
+
   it("chain: dropping on another chart cell never moves the chain to that cell's stock", async () => {
     const leg = { symbol: "NSE:RELIANCE26OCT2500CE", ltp: 42, bid: 41.9, ask: 42.1, oi: 1000, volume: 10, ltpch: 0, lot_size: 500, tick_size: 0.05 };
     const chain = { ok: true, underlying: "RELIANCE", symbol: "", spot: 2450, expiries: [], selected_expiry: null, source: "fyers",
