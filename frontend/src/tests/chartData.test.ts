@@ -17,6 +17,9 @@ import {
   wallClock,
   formatDate,
   formatClock,
+  inSession,
+  sameInstrument,
+  sessionFor,
   type Bar,
 } from "../components/trade/chartData";
 
@@ -97,6 +100,43 @@ describe("aggregation", () => {
     // next session re-anchors to 09:15
     const next = 11 * DAY + 555 * 60 + 130;
     expect(liveBucket(last, next, "75")).toEqual({ kind: "new", time: 11 * DAY + 555 * 60 });
+  });
+});
+
+describe("trading sessions", () => {
+  // 2026-10-05 is a Monday; chart time = IST wall clock as UTC seconds.
+  const at = (d: number, h: number, m: number) => Date.UTC(2026, 9, d, h, m) / 1000;
+
+  it("NSE bars open only between 09:15 and 15:30 on weekdays", () => {
+    const nse = sessionFor("NSE:SBIN-EQ");
+    expect(inSession(at(5, 9, 15), nse)).toBe(true);
+    expect(inSession(at(5, 15, 29), nse)).toBe(true);
+    // pre-open and post-close quotes echo the last price: no bar for them
+    expect(inSession(at(5, 9, 5), nse)).toBe(false);
+    expect(inSession(at(5, 15, 30), nse)).toBe(false);
+    expect(inSession(at(5, 15, 35), nse)).toBe(false);
+    expect(inSession(at(4, 11, 0), nse)).toBe(false); // Sunday
+  });
+
+  it("MCX and currency keep their own hours", () => {
+    expect(inSession(at(5, 21, 0), sessionFor("MCX:CRUDEOIL25OCTFUT"))).toBe(true);
+    expect(inSession(at(5, 9, 5), sessionFor("MCX:GOLD25DECFUT"))).toBe(true);
+    expect(inSession(at(5, 16, 30), sessionFor("NSE:USDINR25OCTFUT"))).toBe(true);
+    expect(inSession(at(5, 16, 30), sessionFor("NSE:NIFTY25OCTFUT"))).toBe(false);
+  });
+
+  it("a new MCX day anchors its first bar to 09:00, not NSE's 09:15", () => {
+    const last = bar(at(5, 23, 25), 1, 1, 1, 1);
+    expect(liveBucket(last, at(6, 9, 2), "75", sessionFor("MCX:CRUDEOIL25OCTFUT").open)).toEqual({ kind: "new", time: at(6, 9, 0) });
+    expect(liveBucket(last, at(6, 9, 17), "5")).toEqual({ kind: "new", time: at(6, 9, 15) });
+  });
+
+  it("matches trade-book symbols to the chart symbol in either form", () => {
+    expect(sameInstrument("SBIN", "NSE:SBIN-EQ")).toBe(true);
+    expect(sameInstrument("nse:sbin-eq", "NSE:SBIN-EQ")).toBe(true);
+    expect(sameInstrument("NSE:NIFTY25O1425000CE", "NSE:NIFTY25O1425000CE")).toBe(true);
+    expect(sameInstrument("NSE:SBIN-EQ", "NSE:SBICARD-EQ")).toBe(false);
+    expect(sameInstrument("", "NSE:SBIN-EQ")).toBe(false);
   });
 });
 

@@ -267,11 +267,58 @@ export function mergeOlder(older: Bar[], current: Bar[], key: string): Bar[] {
   return [...older, ...current];
 }
 
-/** Where a live tick at chart time `t` belongs relative to the last bar. */
+// ---------------------------------------------------------------------------
+// Trading sessions
+// ---------------------------------------------------------------------------
+
+/** A trading session in IST minutes after midnight: [open, close). */
+export interface Session {
+  open: number;
+  close: number;
+}
+
+/** NSE / BSE cash and F&O: 09:15–15:30. */
+export const NSE_SESSION: Session = { open: 555, close: 930 };
+
+/** The regular session of a Fyers symbol. MCX trades into the night and
+ *  NSE / BSE currency derivatives until 17:00; everything else keeps the
+ *  equity hours. */
+export function sessionFor(symbol: string): Session {
+  const s = (symbol || "").trim().toUpperCase();
+  if (s.startsWith("MCX:")) return { open: 540, close: 1435 }; // 09:00–23:55 (23:30 in US summer)
+  if (/^(NSE|BSE):(USD|EUR|GBP|JPY)INR/.test(s)) return { open: 540, close: 1020 }; // 09:00–17:00
+  return NSE_SESSION;
+}
+
+/** Minutes after IST midnight of a chart time. */
+export function minuteOfDay(t: number): number {
+  return Math.floor((((t % DAY) + DAY) % DAY) / 60);
+}
+
+/** True when chart time `t` falls on a weekday inside the session. */
+export function inSession(t: number, session: Session = NSE_SESSION): boolean {
+  const dow = new Date(t * 1000).getUTCDay(); // chart times are IST-shifted: read as UTC
+  if (dow === 0 || dow === 6) return false;
+  const m = minuteOfDay(t);
+  return m >= session.open && m < session.close;
+}
+
+/** True for a tick symbol and a chart symbol naming the same instrument
+ *  ("SBIN", "NSE:SBIN-EQ" and "nse:sbin-eq" all match). Trade rows store
+ *  either form depending on which path placed the order. */
+export function sameInstrument(a: string, b: string): boolean {
+  const norm = (x: string) => (x || "").trim().toUpperCase().replace(/^[A-Z]+:/, "").replace(/-(EQ|BE|INDEX)$/, "");
+  const na = norm(a);
+  return na !== "" && na === norm(b);
+}
+
+/** Where a live tick at chart time `t` belongs relative to the last bar.
+ *  `sessionOpen` (IST minutes) anchors the first intraday bar of a new day. */
 export function liveBucket(
   last: Bar,
   t: number,
   key: string,
+  sessionOpen: number = NSE_SESSION.open,
 ): { kind: "same" } | { kind: "new"; time: number } | { kind: "stale" } {
   if (t < last.time) return { kind: "stale" };
   const iv = parseInterval(key);
@@ -279,9 +326,9 @@ export function liveBucket(
   if (iv.unit === "S" || iv.unit === "m") {
     const len = iv.unit === "S" ? iv.n : iv.n * 60;
     if (Math.floor(t / DAY) !== Math.floor(last.time / DAY)) {
-      // A new session: anchor to the NSE open (09:15) when past it.
+      // A new session: anchor to the session open (09:15 on NSE) when past it.
       const day0 = Math.floor(t / DAY) * DAY;
-      const open = day0 + 555 * 60;
+      const open = day0 + sessionOpen * 60;
       const anchor = t >= open ? open : day0;
       return { kind: "new", time: anchor + Math.floor((t - anchor) / len) * len };
     }
