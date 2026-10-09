@@ -460,6 +460,8 @@ export interface PendingOrder {
   /** INTRADAY / DELIVERY / MARGIN — absent from older backends. */
   product?: string;
   status: string;
+  /** Quantity already filled (partial fills) — absent from older backends. */
+  filled_qty?: number;
   created_at: string | null;
 }
 

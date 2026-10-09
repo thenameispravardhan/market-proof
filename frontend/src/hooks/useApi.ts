@@ -2,6 +2,7 @@
 // All hooks are named consistently: use<Resource>[s]() for lists,
 // use<Resource>(<id>) for single items, use<Verb><Resource>() for mutations.
 
+import { useEffect } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import type {
@@ -863,7 +864,29 @@ export function useQuote(symbol: string) {
   });
 }
 
+/** Tell every order view to reload now: the Account Manager panels and the
+ *  pending list listen for `broker:order` (also sent by App on each order
+ *  socket / postback event). Without it a cancelled or modified order kept
+ *  its old row, Cancel button included, until the next poll. */
+export function announceOrderChange(): void {
+  window.dispatchEvent(new Event("broker:order"));
+}
+
 export function usePendingOrders(accountId?: number | null) {
+  const qc = useQueryClient();
+  useEffect(() => {
+    let t: ReturnType<typeof setTimeout> | undefined;
+    // one order fires several events (transit → filled, socket + postback): coalesce
+    const on = () => {
+      clearTimeout(t);
+      t = setTimeout(() => void qc.invalidateQueries({ queryKey: ["pending-orders"] }), 200);
+    };
+    window.addEventListener("broker:order", on);
+    return () => {
+      clearTimeout(t);
+      window.removeEventListener("broker:order", on);
+    };
+  }, [qc]);
   return useQuery<PendingOrdersResponse>({
     queryKey: ["pending-orders", accountId],
     queryFn: () => {
@@ -885,6 +908,7 @@ export function usePlaceOrder() {
       qc.invalidateQueries({ queryKey: ["trades"] });
       // A market order can fill before the response lands.
       qc.invalidateQueries({ queryKey: ["positions"] });
+      announceOrderChange();
     },
   });
 }
@@ -920,6 +944,7 @@ export function useCancelOrder() {
       qc.invalidateQueries({ queryKey: ["pending-orders"] });
       qc.invalidateQueries({ queryKey: ["trades"] });
       qc.invalidateQueries({ queryKey: ["positions"] });
+      announceOrderChange();
     },
   });
 }

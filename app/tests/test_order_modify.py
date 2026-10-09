@@ -475,3 +475,45 @@ def test_modify_endpoint_end_to_end_on_the_wire(
         "id": "ORD-1", "qty": 3, "type": 1, "limitPrice": 610.0, "stopPrice": 0.0,
     }
     assert [(t.quantity, t.price) for t in _rows(db_session)] == [(3, 610.0)]
+
+
+# ---------------------------------------------------------------------------
+# Settled rows and partial fills
+# ---------------------------------------------------------------------------
+
+
+def test_modify_never_rewrites_a_settled_row(
+    client: TestClient, db_session, isolated_db, real_account
+) -> None:
+    """A duplicate row that already settled is history: a modify that the
+    broker accepted only updates the rows still working."""
+    _install(real_account.id, _ModifyStub())
+    _trade(db_session, real_account.id)
+    db_session.add(Trade(
+        broker_account_id=real_account.id, broker_order_id="ORD-1", symbol="NSE:SBIN-EQ", side="BUY",
+        quantity=10, price=600.0, order_type="LIMIT", status="filled",
+    ))
+    db_session.commit()
+
+    r = _modify(client, real_account.id, limit_price=611.0)
+    assert r.status_code == 200, r.text
+    assert r.json()["rows_updated"] == 1
+    rows = _rows(db_session)
+    assert [(t.status, t.price) for t in rows] == [("placed", 611.0), ("filled", 600.0)]
+
+
+def test_modify_refuses_a_quantity_below_the_filled_part(
+    client: TestClient, db_session, isolated_db, real_account
+) -> None:
+    stub = _ModifyStub()
+    _install(real_account.id, stub)
+    _trade(db_session, real_account.id, qty=10)
+    row = _rows(db_session)[0]
+    row.filled_qty = 6
+    db_session.commit()
+
+    r = _modify(client, real_account.id, quantity=4)
+    assert r.status_code == 422
+    assert "already filled (6)" in r.json()["detail"]
+    assert stub.calls == []
+    assert _modify(client, real_account.id, quantity=6).status_code == 200

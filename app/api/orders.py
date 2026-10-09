@@ -23,7 +23,7 @@ deliberately hidden from the broker picker.
 from __future__ import annotations
 
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
@@ -670,11 +670,21 @@ async def modify_order(
     if not hasattr(backend, "modify_order"):
         raise HTTPException(status_code=400, detail="this broker does not support modify")
 
-    # Not unique (see cancel_order) — read every row for this order.
-    trades = list(
+    # Not unique (see cancel_order) — read every row for this order. Only
+    # rows still "placed" describe a working order: a filled / cancelled /
+    # rejected row is history, and a modify must never rewrite its size or
+    # price (it also isn't a valid bound for the current size).
+    all_rows = list(
         db.execute(select(Trade).where(Trade.broker_order_id == broker_order_id)).scalars().all()
     )
+    trades = [t for t in all_rows if t.status == "placed"]
     if quantity is not None:
+        filled = max((int(t.filled_qty or 0) for t in trades), default=0)
+        if quantity < filled:
+            raise HTTPException(
+                status_code=422,
+                detail=f"quantity can't go below what already filled ({filled})",
+            )
         current = await _current_order_qty(trades, backend, broker_order_id)
         if current is None:
             raise HTTPException(
@@ -765,8 +775,9 @@ async def modify_order(
                 },
             ))
         if not trades:
-            # An order placed outside the bot (Fyers app / web): nothing
-            # local to update, but the real-money action is still audited.
+            # An order placed outside the bot (Fyers app / web), or one whose
+            # local rows are already settled: nothing local to update, but the
+            # real-money action is still audited.
             db.add(AuditLog(
                 actor="ui_trade_page",
                 action="order.manual_modified",
@@ -791,6 +802,39 @@ async def modify_order(
     }
 
 
+_IST = timezone(timedelta(hours=5, minutes=30))
+# Session close (IST) after which a DAY order can no longer be working.
+_CLOSE_IST = {"MCX": (23, 30), "CDS": (17, 0), "BCD": (17, 0)}
+_CLOSE_DEFAULT = (15, 30)  # NSE / BSE cash and F&O
+
+
+def _iso_utc(dt: Optional[datetime]) -> Optional[str]:
+    """UTC ISO string with a `Z`: SQLite hands back naive datetimes, and a
+    naive string is read as browser-local time (5h30m off in India)."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _expired_day_order(trade: Trade, now: datetime) -> bool:
+    """True when `trade` was placed before the latest session close at or
+    before `now` — a DAY order that the exchange has already expired."""
+    created = trade.created_at
+    if created is None:
+        return False
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    exch = (trade.symbol or "").split(":", 1)[0].upper() if ":" in (trade.symbol or "") else ""
+    hh, mm = _CLOSE_IST.get(exch, _CLOSE_DEFAULT)
+    local = now.astimezone(_IST)
+    close = local.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if close > local:
+        close -= timedelta(days=1)
+    return created < close
+
+
 @router.get("/pending")
 def list_pending_orders(
     account_id: Optional[int] = Query(None),
@@ -801,11 +845,36 @@ def list_pending_orders(
 
     Source: the local `trades` table where `status='placed'`. The
     Trade page's pending-orders panel polls this every few seconds.
+
+    Every order goes out as a DAY order, so one placed before the last
+    session close can't still be working; if no expiry update reached us
+    (server down at the close, socket gap) the row would sit here forever
+    with a Cancel button. Such rows are settled as "cancelled" (the same
+    status the reconciler gives a broker EXPIRED) and left out.
     """
     q = select(Trade).where(Trade.status == "placed").order_by(Trade.created_at.desc())
     if account_id is not None:
         q = q.where(Trade.broker_account_id == account_id)
-    rows = db.execute(q.limit(limit)).scalars().all()
+    now = datetime.now(timezone.utc)
+    rows = []
+    expired = 0
+    for r in db.execute(q).scalars():
+        if _expired_day_order(r, now):
+            r.status = "cancelled"
+            expired += 1
+            db.add(AuditLog(
+                actor="system",
+                action="order.expired_eod",
+                target=f"trade:{r.id}",
+                before={"status": "placed"},
+                after={"status": "cancelled", "broker_order_id": r.broker_order_id, "symbol": r.symbol},
+            ))
+            continue
+        if len(rows) < limit:
+            rows.append(r)
+    if expired:
+        db.commit()
+        log.info("manual_order.expired_stale_rows", count=expired)
     return {
         "ok": True,
         "count": len(rows),
@@ -821,7 +890,8 @@ def list_pending_orders(
                 "order_type": r.order_type,
                 "product": r.product or "INTRADAY",
                 "status": r.status,
-                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "filled_qty": int(r.filled_qty or 0),
+                "created_at": _iso_utc(r.created_at),
             }
             for r in rows
         ],

@@ -8,6 +8,7 @@ import {
   orderRows,
   parseBasketCsv,
   symbolParts,
+  tradedQty,
   type BrokerBook,
   type TradeRow,
 } from "../components/trade/AccountPanels";
@@ -51,7 +52,8 @@ describe("order list", () => {
     expect(orderBucket("FILLED")).toBe("filled");
     expect(orderBucket("cancelled")).toBe("cancelled");
     expect(orderBucket("REJECTED")).toBe("rejected");
-    expect(orderBucket("EXPIRED")).toBe("other");
+    // an exchange-expired DAY order is gone just like a cancelled one
+    expect(orderBucket("EXPIRED")).toBe("cancelled");
   });
 
   it("parses Fyers order times as IST", () => {
@@ -84,6 +86,31 @@ describe("order list", () => {
     expect(filterOrders(rows, "working")).toHaveLength(1);
     expect(filterOrders(rows, "inactive")).toHaveLength(2);
     expect(filterOrders(rows, "rejected")).toHaveLength(1);
+  });
+
+  it("a partly filled pending order shows its filled and remaining quantity", () => {
+    const [r] = orderRows(null, [pending({ quantity: 10, filled_qty: 4 })], []);
+    expect(r).toMatchObject({ qty: 10, filled: 4, remaining: 6 });
+  });
+
+  it("a stop-limit's stored price is its limit, never shown as the stop", () => {
+    const [sl] = orderRows(null, [pending({ order_type: "STOP_LOSS", price: 590 })], []);
+    expect(sl).toMatchObject({ limit: 590, stop: null });
+    const [slm] = orderRows(null, [pending({ order_type: "SL-M", price: 592 })], []);
+    expect(slm).toMatchObject({ limit: null, stop: 592 });
+  });
+
+  it("history rows carry their product and the quantity that actually traded", () => {
+    const rows = orderRows(null, [], [
+      trade({ id: 20, broker_order_id: "FX-5", status: "cancelled", quantity: 10, filled_qty: 3, price: 601, order_type: "LIMIT", product: "DELIVERY" }),
+    ]);
+    expect(rows[0]).toMatchObject({ bucket: "cancelled", product: "DELIVERY", filled: 3, avg: 601, limit: null });
+  });
+
+  it("trades tab counts partial fills, not the order size", () => {
+    expect(tradedQty(trade({ quantity: 10, filled_qty: 3, status: "cancelled", executed_at: null }))).toBe(3);
+    expect(tradedQty(trade({ quantity: 10, status: "filled" }))).toBe(10); // bot fills don't track slices
+    expect(tradedQty(trade({ quantity: 10, status: "cancelled", executed_at: null }))).toBe(0);
   });
 
   it("groups orders by symbol with fill stats (smart orderbook)", () => {
