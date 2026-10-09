@@ -134,7 +134,9 @@ describe("volume + volatility", () => {
   it("atr is positive once warmed up", () => {
     const cs = candles(Array.from({ length: 20 }, (_, i) => 100 + (i % 3)));
     const out = atr(cs, 14);
-    expect(out[13]).toBeNull();
+    // TradingView / backtester alignment: seeded on bars 0..13
+    expect(out[12]).toBeNull();
+    expect(out[13]).not.toBeNull();
     expect(out[19]! > 0).toBe(true);
   });
 
