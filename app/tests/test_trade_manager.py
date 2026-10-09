@@ -589,3 +589,49 @@ async def test_manager_with_quote_feed_fills_buy(db_session, isolated_db, monkey
         # monkeypatch reverts the env; refresh the cache so the next
         # test sees the restored values.
         reset_settings_cache()
+
+
+@pytest.mark.asyncio
+async def test_check_levels_rejects_levels_that_would_exit_instantly(db_session, isolated_db):
+    """A stop typed above the price of a long (or a target typed into the
+    SL box) used to be armed and flatten the position on the next tick."""
+    md = MarketDataBus()
+    tm = TradeManager(market_data=md)
+    await tm.register(symbol="TCS", quantity=10, entry=100.0, stop_loss=95.0, target=120.0)
+    await md.publish("TCS", 104.0)
+
+    assert "already hit" in await tm.check_levels("TCS", stop_loss=105.0, target=120.0)
+    assert "already hit" in await tm.check_levels("TCS", stop_loss=None, target=103.0)
+    assert "below the target" in await tm.check_levels("TCS", stop_loss=130.0, target=120.0)
+    assert "positive" in await tm.check_levels("TCS", stop_loss=0.0, target=None)
+    # Locking profit above entry but below the price is fine.
+    assert await tm.check_levels("TCS", stop_loss=102.0, target=None) is None
+    # Unknown symbols defer to update_levels' 404.
+    assert await tm.check_levels("NOPE", stop_loss=1.0, target=2.0) is None
+
+
+@pytest.mark.asyncio
+async def test_check_levels_short_is_mirrored(db_session, isolated_db):
+    md = MarketDataBus()
+    tm = TradeManager(market_data=md)
+    await tm.register(symbol="ITC", quantity=-5, entry=400.0, stop_loss=410.0, target=380.0)
+    await md.publish("ITC", 398.0)
+    assert "already hit" in await tm.check_levels("ITC", stop_loss=395.0, target=None)
+    assert await tm.check_levels("ITC", stop_loss=399.0, target=370.0) is None
+
+
+@pytest.mark.asyncio
+async def test_managed_view_exposes_exit_state(db_session, isolated_db):
+    """The book shows when the bot moved the stop or its exit is failing."""
+    md = MarketDataBus()
+    tm = TradeManager(market_data=md)
+    await tm.register(
+        symbol="INFY", quantity=10, entry=100.0, stop_loss=90.0, target=None,
+        max_hold_seconds=600,
+    )
+    mp = tm.managed_positions()[0]
+    mp.apply_trailing(120.0)  # +2R → trailing armed
+    v = mp.view()
+    assert v["trail_active"] is True and v["stop_loss"] == pytest.approx(115.0)
+    assert v["time_exit_at"] is not None
+    assert v["exit_failures"] == 0 and v["exit_escalated"] is False
