@@ -1,10 +1,9 @@
 // Settings page — organised by PURPOSE, not by whatever was built last.
 //
 // Left column  : the trading parameters you actually tune (one grouped form).
-// Right column : three clearly-labelled areas, in decreasing edit frequency —
-//                  Detection & Conviction  (what the bot watches / trusts)
-//                  Appearance              (theme)
-//                  History & Audit         (read-only; NOT settings)
+// Right column : in decreasing edit frequency — news sources (what the bot
+//                watches), breaker history and audit log (read-only), and
+//                panel layout.
 // The Rule Book moved to the Rules page, where a rules reference belongs.
 
 import { resetPanelSizes } from "../hooks/usePanelSizes";
@@ -13,36 +12,27 @@ import { AuditLog } from "../components/settings/AuditLog";
 import { BreakerHistory } from "../components/settings/BreakerHistory";
 import { NewsSources } from "../components/settings/NewsSources";
 
-function SectionLabel({ children }: { children: React.ReactNode }) {
-  return (
-    <div
-      style={{
-        textTransform: "uppercase",
-        letterSpacing: "0.08em",
-        fontSize: 11,
-        opacity: 0.6,
-        margin: "20px 0 8px",
-      }}
-    >
-      {children}
-    </div>
-  );
-}
-
 export default function Settings() {
   return (
     <div>
       <h1 className="page-title">Settings</h1>
-      <div className="layout-2">
-        <div>
-          <SectionLabel>Layout</SectionLabel>
-          <div className="widget" style={{ padding: "12px 14px" }}>
-            <div className="meta" style={{ marginBottom: 8 }}>
+      <div className="page-cols">
+        <div className="page-col">
+          <AllSettings />
+        </div>
+        <div className="page-col">
+          <NewsSources />
+          <BreakerHistory />
+          <AuditLog />
+          <div className="widget" data-testid="layout-settings">
+            <h3>Layout</h3>
+            <p className="text-dim" style={{ marginBottom: 10 }}>
               Drag the bottom-right corner of any panel to resize it. Sizes are
               remembered per page in this browser.
-            </div>
+            </p>
             <button
               className="btn-sm"
+              style={{ alignSelf: "flex-start" }}
               onClick={() => {
                 resetPanelSizes();
                 window.location.reload();
@@ -50,19 +40,6 @@ export default function Settings() {
             >
               Reset panel sizes
             </button>
-          </div>
-
-          <SectionLabel>All settings</SectionLabel>
-          <AllSettings />
-        </div>
-        <div>
-          <SectionLabel>Detection &amp; conviction</SectionLabel>
-          <NewsSources />
-
-          <SectionLabel>History &amp; audit (read-only)</SectionLabel>
-          <BreakerHistory />
-          <div style={{ marginTop: 16 }}>
-            <AuditLog />
           </div>
         </div>
       </div>
