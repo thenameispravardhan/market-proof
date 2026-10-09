@@ -5,7 +5,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import Trade from "../pages/Trade";
+import Trade, { ticketProblem, ticketWarning, levelPrice, type TicketCheck } from "../pages/Trade";
 
 // lightweight-charts needs a real <canvas>; jsdom has none. Stub the
 // whole engine so ChartPanel mounts and its toolbar renders, while the
@@ -1223,5 +1223,106 @@ describe("Trade page", () => {
     const err = await screen.findByTestId("ticket-result-error");
     expect(err.textContent).toMatch(/before placing it again/);
     expect(screen.queryByTestId("ticket-result-success")).not.toBeInTheDocument();
+  });
+
+  it("ticket: the quantity box can be cleared and retyped", async () => {
+    const posts = searchStubs();
+    const user = userEvent.setup();
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await pick(user, "RELI", "NSE:RELIANCE-EQ");
+    const qty = screen.getByTestId("ticket-qty") as HTMLInputElement;
+    // Backspacing the "1" used to snap straight back to 1, so this sent 15.
+    await user.clear(qty);
+    await user.type(qty, "5");
+    expect(qty.value).toBe("5");
+    await waitFor(() => expect(screen.getByTestId("ticket-submit")).not.toBeDisabled());
+    await user.click(screen.getByTestId("ticket-submit"));
+    await waitFor(() => expect(posts).toHaveLength(1));
+    expect(posts[0].quantity).toBe(5);
+  });
+
+  it("ticket: a stop loss above a BUY's entry blocks PLACE and says why", async () => {
+    const posts = searchStubs();
+    const user = userEvent.setup();
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await pick(user, "RELI", "NSE:RELIANCE-EQ");
+    await user.selectOptions(screen.getByTestId("ticket-type"), "LIMIT");
+    await user.type(screen.getByTestId("ticket-limit"), "2450");
+    await user.type(screen.getByTestId("ticket-sl"), "2500");
+    expect(screen.getByTestId("ticket-submit")).toBeDisabled();
+    expect(screen.getByTestId("ticket-problem").textContent).toMatch(/wrong side.*below/);
+    await user.clear(screen.getByTestId("ticket-sl"));
+    await user.type(screen.getByTestId("ticket-sl"), "2400.02");
+    await waitFor(() => expect(screen.getByTestId("ticket-submit")).not.toBeDisabled());
+    await user.click(screen.getByTestId("ticket-submit"));
+    await waitFor(() => expect(posts).toHaveLength(1));
+    expect(posts[0].stop_loss).toBe(2400);    // on the tick grid
+  });
+
+  it("ticket: the risk override re-sends the blocked order, not the edited ticket", async () => {
+    const posts: Record<string, unknown>[] = [];
+    const blocked = { ok: false, blocked: true, risk_codes: ["X"], risk_message: "X", broker_order_id: null, status: "REJECTED_RISK", error: "Blocked by risk limits: X.", reason: "risk_block" };
+    const placed = { ok: true, blocked: false, risk_codes: [], risk_message: "", broker_order_id: "FY-1", status: "PENDING", error: null };
+    const base = defaultStubs();
+    globalThis.fetch = makeFetchStub((url, init) => {
+      if (/\/api\/orders$/.test(url) && init?.method === "POST") {
+        const body = JSON.parse(String(init.body));
+        posts.push(body);
+        return makeJsonResponse(body.bypass_risk ? placed : blocked);
+      }
+      return base(url, init);
+    });
+    const user = userEvent.setup();
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await user.type(await screen.findByTestId("trade-search"), "RELI");
+    await user.click(await screen.findByTestId("search-row-NSE:RELIANCE-EQ"));
+    await waitFor(() => expect(screen.getByTestId("ticket-submit")).not.toBeDisabled());
+    await user.click(screen.getByTestId("ticket-submit"));
+    const overrideBtn = await screen.findByTestId("ticket-risk-override-btn");
+    await user.click(screen.getByTestId("ticket-side-sell"));   // the ticket changes after the block
+    await user.click(overrideBtn);
+    await waitFor(() => expect(posts).toHaveLength(2));
+    expect(posts[1]).toMatchObject({ side: "BUY", bypass_risk: true });
+    const ok = await screen.findByTestId("ticket-result-success");
+    expect(ok.textContent).toMatch(/BUY 1/);
+    expect(ok.textContent).toMatch(/order FY-1/);
+    expect(ok.textContent).not.toMatch(/@ FY-1/);
+  });
+});
+
+describe("ticket checks", () => {
+  const base: TicketCheck = { side: "BUY", orderType: "MARKET", quantity: 1, lotSize: 1, limit: null, stop: null, ltp: 100, entry: 100, sl: null, tp: null };
+
+  it("passes a plain market order", () => {
+    expect(ticketProblem(base)).toBeNull();
+  });
+  it("wants a whole lot for F&O", () => {
+    expect(ticketProblem({ ...base, quantity: 40, lotSize: 30 })).toMatch(/multiple of the lot size \(30\)/);
+    expect(ticketProblem({ ...base, quantity: 60, lotSize: 30 })).toBeNull();
+  });
+  it("needs the prices its order type uses", () => {
+    expect(ticketProblem({ ...base, orderType: "LIMIT" })).toMatch(/limit price/);
+    expect(ticketProblem({ ...base, orderType: "SL-M" })).toMatch(/trigger/);
+    expect(ticketProblem({ ...base, orderType: "STOP_LOSS", limit: 101 })).toMatch(/trigger/);
+  });
+  it("refuses a stop-limit whose limit is on the wrong side of its trigger", () => {
+    expect(ticketProblem({ ...base, orderType: "STOP_LOSS", stop: 105, limit: 104 })).toMatch(/at or above the trigger/);
+    expect(ticketProblem({ ...base, orderType: "STOP_LOSS", stop: 105, limit: 106, entry: 106 })).toBeNull();
+    expect(ticketProblem({ ...base, side: "SELL", orderType: "STOP_LOSS", stop: 95, limit: 96 })).toMatch(/at or below the trigger/);
+  });
+  it("keeps the stop loss and target on the right side of the entry", () => {
+    expect(ticketProblem({ ...base, sl: 101 })).toMatch(/Stop loss .* below/);
+    expect(ticketProblem({ ...base, tp: 99 })).toMatch(/Target .* above/);
+    expect(ticketProblem({ ...base, side: "SELL", sl: 99 })).toMatch(/Stop loss .* above/);
+    expect(ticketProblem({ ...base, side: "SELL", sl: 102, tp: 95 })).toBeNull();
+  });
+  it("warns when a stop's trigger is already through the market", () => {
+    expect(ticketWarning({ ...base, orderType: "SL-M", stop: 99 })).toMatch(/BUY stop triggers above/);
+    expect(ticketWarning({ ...base, orderType: "SL-M", stop: 101 })).toBeNull();
+    expect(ticketWarning({ ...base, side: "SELL", orderType: "SL-M", stop: 101 })).toMatch(/SELL stop/);
+  });
+  it("puts a typed stop / target price on the tick grid", () => {
+    expect(levelPrice(2400.02, "price", 2450, "BUY", "sl", 0.05)).toBe(2400);
+    expect(levelPrice(101.13, "price", null, "BUY", "target", 0.1)).toBe(101.1);
   });
 });
