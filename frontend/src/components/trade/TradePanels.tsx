@@ -6,7 +6,8 @@
 
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import type { InstrumentHit, PendingOrder, Position } from "../../types";
-import { useLiveQuote } from "../../hooks/useQuotes";
+import { useQueryClient } from "@tanstack/react-query";
+import { peekQuote, useLiveQuote, useQuoteTick } from "../../hooks/useQuotes";
 import { announceOrderChange } from "../../hooks/useApi";
 import { wsId } from "../../workspace";
 import { technicalRating, type OhlcvCandle } from "../../lib/indicators";
@@ -477,10 +478,23 @@ export const BOTTOM_TABS: [BottomTab, string][] = [
 
 interface ProfileResp { ok: boolean; client_id?: string | null; name?: string | null; email?: string | null; reason?: string }
 
+/** Unrealized P&L of a bot position at `ltp` (the server's mark until a tick arrives). */
+export function localPnl(p: Position, ltp: number | null | undefined): number | null {
+  if (!p.quantity) return 0;
+  return ltp != null ? (ltp - p.average_price) * p.quantity : p.unrealized_pnl;
+}
+
 function LocalPnl({ p, privacy }: { p: Position; privacy: boolean }) {
-  const live = useLiveQuote(p.symbol)?.last_price ?? null;
-  const v = live != null ? (live - p.average_price) * p.quantity : p.unrealized_pnl;
-  return <span className={(v ?? 0) >= 0 ? "up" : "down"}>{privacy ? "•••" : fmt(v)}</span>;
+  const v = localPnl(p, useLiveQuote(p.quantity ? p.symbol : null)?.last_price);
+  return <span className={v == null ? undefined : v >= 0 ? "up" : "down"}>{privacy ? "•••" : fmt(v)}</span>;
+}
+
+/** The open positions' unrealized P&L, ticking with the same live prices as
+ *  the rows (the server's mark lags them by a sweep and a poll). */
+function LiveTotalPnl({ open, privacy, testid }: { open: Position[]; privacy: boolean; testid?: string }) {
+  useQuoteTick();
+  const v = open.reduce((a, p) => a + (localPnl(p, peekQuote(p.symbol)?.last_price) ?? 0), 0);
+  return <b className={v >= 0 ? "up" : "down"} data-testid={testid}>{privacy ? "•••" : fmt(v)}</b>;
 }
 
 /** Intraday ⇄ carry: DELIVERY (CNC) for cash, MARGIN (NRML) for F&O. */
@@ -544,7 +558,9 @@ export function AccountManager({
   const [msg, setMsg] = useState<string | null>(null);
   const [modify, setModify] = useState<OrderRow | null>(null);
   const [exit, setExit] = useState<{ pos: ExitTarget; local: boolean } | null>(null);
-  const bookTabs: BottomTab[] = ["orders", "smart", "allpositions", "positions", "trade"];
+  const qc = useQueryClient();
+  const [showClosed, setShowClosed] = useState(false);
+  const bookTabs: BottomTab[] = ["orders", "smart", "allpositions", "positions", "trade", "account"];
   const book = useApiJson<BrokerBook>(connected && bookTabs.includes(tab) ? "/api/broker/book" : null, 15000);
   const trades = useApiJson<TradeRow[]>(["orders", "trades", "account", "smart", "positions"].includes(tab) ? "/api/trades?limit=200" : null, 10000);
   const funds = useApiJson<{ ok: boolean; available: number | null; reason?: string | null }>(tab === "account" || tab === "positions" ? "/api/market/funds" : null, 30000);
@@ -554,7 +570,6 @@ export function AccountManager({
   const profile = useApiJson<ProfileResp>(connected ? "/api/broker/profile" : null, 0, false);   // static identity: not on every order
   const log = useSyncExternalStore(subscribeLog, getLog);
   const open = (positions ?? []).filter((p) => p.quantity !== 0);
-  const totalPnl = open.reduce((a, p) => a + (p.unrealized_pnl ?? 0), 0);
   const money = (v: number | null | undefined) => (privacy ? "•••" : fmt(v));
   const tradeRows = Array.isArray(trades.data) ? trades.data : [];
   const today = new Date().toDateString();
@@ -564,8 +579,15 @@ export function AccountManager({
     const ts = tradeRows.filter((t) => t.symbol === sym && t.pnl != null && t.executed_at && new Date(t.executed_at).toDateString() === today);
     return ts.length ? ts.reduce((a, t) => a + (t.pnl ?? 0), 0) : null;
   };
-  const productOf = (sym: string) => (book.data?.ok ? book.data.positions.find((x) => x.symbol === sym && x.net_qty !== 0)?.product : null) ?? "INTRADAY";
-  const realized = tradeRows.filter((t) => t.pnl != null && t.executed_at && new Date(t.executed_at).toDateString() === today).reduce((a, t) => a + (t.pnl ?? 0), 0);
+  // Fyers' product for a live position; the bot's own row otherwise (paper, or the book not loaded).
+  const productOf = (p: Position) => (book.data?.ok ? book.data.positions.find((x) => x.symbol === p.symbol && x.net_qty !== 0)?.product : null) ?? p.product ?? "INTRADAY";
+  // Today's positions closed flat (the bot's book keeps them at qty 0) — shown on request.
+  const closed = (positions ?? []).filter((p) => p.quantity === 0 && new Date(p.updated_at).toDateString() === today);
+  const posRows = showClosed ? [...open, ...closed] : open;
+  // Live: Fyers' realized figure for the whole account; paper: the bot's closing trades.
+  const realized = book.data?.ok
+    ? book.data.positions.reduce((a, x) => a + (x.realized ?? 0), 0)
+    : tradeRows.filter((t) => t.pnl != null && t.executed_at && new Date(t.executed_at).toDateString() === today).reduce((a, t) => a + (t.pnl ?? 0), 0);
   const rows = orderRows(book.data, pendingOrders, tradeRows);
   const workingCount = rows.filter((r) => r.bucket === "working").length;
   const run = async (label: string, f: () => Promise<unknown>) => {
@@ -576,7 +598,12 @@ export function AccountManager({
       setMsg(`${label} failed: ${e instanceof Error ? e.message : String(e)}`);
     }
   };
-  const lotOf = (sym: string) => (selected?.symbol === sym && selected.lot_size > 1 ? selected.lot_size : 1);
+  /** Contract lot for an exit: the server's lot for the bot's position, else the charted instrument's. */
+  const lotOf = (sym: string) => {
+    const fromRow = positions?.find((p) => p.symbol === sym)?.lot_size;
+    if (fromRow && fromRow > 1) return fromRow;
+    return selected?.symbol === sym && selected.lot_size > 1 ? selected.lot_size : 1;
+  };
   /** Move a working order to `price` (the DOM's drag): the stop for stop
    *  orders (a stop-limit's limit keeps its offset), else the limit. */
   const modifyPrice = async (o: OrderRow, price: number): Promise<string> => {
@@ -599,20 +626,20 @@ export function AccountManager({
     k === "positions" && open.length ? `${l} (${open.length})` : k === "orders" && workingCount ? `${l} (${workingCount})` : k === "log" && log.length ? `${l} (${log.length})` : l;
   const posCols: Col<Position>[] = [
     { id: "symbol", label: "Symbol", get: (p) => p.symbol, fixed: true, cls: () => "sym" },
-    { id: "side", label: "Buy/Sell", get: (p) => (p.quantity > 0 ? "BUY" : "SELL"), cls: (p) => (p.quantity > 0 ? "up" : "down") },
-    { id: "product", label: "Product", get: (p) => productOf(p.symbol) },
-    { id: "qty", label: "Net qty", get: (p) => p.quantity, render: (p) => p.quantity, cls: (p) => (p.quantity > 0 ? "up" : "down"), num: true },
+    { id: "side", label: "Buy/Sell", get: (p) => (p.quantity > 0 ? "BUY" : p.quantity < 0 ? "SELL" : "CLOSED"), cls: (p) => (p.quantity > 0 ? "up" : p.quantity < 0 ? "down" : undefined) },
+    { id: "product", label: "Product", get: (p) => productOf(p) },
+    { id: "qty", label: "Net qty", get: (p) => p.quantity, render: (p) => p.quantity, cls: (p) => (p.quantity > 0 ? "up" : p.quantity < 0 ? "down" : undefined), num: true },
     { id: "avg", label: "Avg", get: (p) => p.average_price, num: true },
     { id: "ltp", label: "LTP", get: (p) => p.last_price, render: (p) => <LiveLtp symbol={p.symbol} fallback={p.last_price} />, num: true },
-    { id: "pnl", label: "Unrealized P&L", get: (p) => p.unrealized_pnl, render: (p) => <LocalPnl p={p} privacy={privacy} />, num: true },
+    { id: "pnl", label: "Unrealized P&L", get: (p) => localPnl(p, peekQuote(p.symbol)?.last_price), render: (p) => <LocalPnl p={p} privacy={privacy} />, num: true },
     { id: "realized", label: "Realized P&L", get: (p) => realizedBy(p.symbol), render: (p) => { const v = realizedBy(p.symbol); return <span className={v == null ? "" : v >= 0 ? "up" : "down"}>{money(v)}</span>; }, num: true },
     {
       id: "sl", label: "SL", get: (p) => managed?.find((x) => x.symbol === p.symbol)?.stop_loss ?? null,
-      render: (p) => { const m = managed?.find((x) => x.symbol === p.symbol); return <button type="button" className="am-link" onClick={() => askLevel(p.symbol, "SL", m?.stop_loss ?? null, m?.target ?? null)}>{m?.stop_loss != null ? fmt(m.stop_loss) : "+ SL"}</button>; },
+      render: (p) => { if (!p.quantity) return "—"; const m = managed?.find((x) => x.symbol === p.symbol); return <button type="button" className="am-link" onClick={() => askLevel(p.symbol, "SL", m?.stop_loss ?? null, m?.target ?? null)}>{m?.stop_loss != null ? fmt(m.stop_loss) : "+ SL"}</button>; },
     },
     {
       id: "tp", label: "TP", get: (p) => managed?.find((x) => x.symbol === p.symbol)?.target ?? null,
-      render: (p) => { const m = managed?.find((x) => x.symbol === p.symbol); return <button type="button" className="am-link" onClick={() => askLevel(p.symbol, "TP", m?.stop_loss ?? null, m?.target ?? null)}>{m?.target != null ? fmt(m.target) : "+ TP"}</button>; },
+      render: (p) => { if (!p.quantity) return "—"; const m = managed?.find((x) => x.symbol === p.symbol); return <button type="button" className="am-link" onClick={() => askLevel(p.symbol, "TP", m?.stop_loss ?? null, m?.target ?? null)}>{m?.target != null ? fmt(m.target) : "+ TP"}</button>; },
     },
   ];
   function askLevel(sym: string, which: "SL" | "TP", sl: number | null, tp: number | null): void {
@@ -637,7 +664,7 @@ export function AccountManager({
         <span className="am-status">
           <span className={`lg-dot ${connected ? "open" : "closed"}`} /> <span data-testid="am-account-line">{acctText}</span>
           {funds.data?.available != null && <> · Funds <b>{money(funds.data.available)}</b></>}
-          {open.length > 0 && <> · P&L <b className={totalPnl >= 0 ? "up" : "down"}>{money(totalPnl)}</b></>}
+          {open.length > 0 && <> · P&L <LiveTotalPnl open={open} privacy={privacy} testid="am-total-pnl" /></>}
         </span>
         <AccountMenu connected={connected} onLogout={onLogout} onTab={(t) => onTab(t)} onRefresh={() => { book.reload(); trades.reload(); funds.reload(); fundsFull.reload(); holdings.reload(); gtt.reload(); profile.reload(); setMsg("Account data refreshed"); }} />
         <button type="button" className="tab tv-collapse" onClick={onMaximize} title={maximized ? "Restore panel" : "Maximize panel"}>{maximized ? "❐" : "⬚"}</button>
@@ -666,21 +693,28 @@ export function AccountManager({
             <DataTable
               id="positions"
               cols={posCols}
-              rows={open}
+              rows={posRows}
               rowKey={(p) => p.symbol}
-              empty="There are no open positions in your trading account yet."
+              empty={showClosed ? "No open or closed positions today." : "There are no open positions in your trading account yet."}
               toolbar={
-                <button type="button" className="btn-sm danger" disabled={!open.length} onClick={() => {
-                  if (!window.confirm(`Exit all ${open.length} open position(s) at market?`)) return;
-                  void run("Exit all", async () => {
-                    const r = await fetch("/api/positions/close-all", { method: "POST" });
-                    const j = await r.json().catch(() => ({}));
-                    if (!r.ok) throw new Error(j.detail ?? `HTTP ${r.status}`);
-                    return "sent";
-                  });
-                }}>Exit all</button>
+                <>
+                  <button type="button" className="btn-sm danger" disabled={!open.length} onClick={() => {
+                    if (!window.confirm(`Exit all ${open.length} open position(s) at market?`)) return;
+                    void run("Exit all", async () => {
+                      const r = await fetch("/api/positions/close-all", { method: "POST" });
+                      const j = await r.json().catch(() => ({}));
+                      if (!r.ok) throw new Error(typeof j.detail === "string" ? j.detail : `HTTP ${r.status}`);
+                      void qc.invalidateQueries({ queryKey: ["positions"] });
+                      void qc.invalidateQueries({ queryKey: ["managed-positions"] });
+                      book.reload();
+                      const n = typeof j.count === "number" ? j.count : 0;
+                      return n === open.length ? `closed ${n}` : `closed ${n} of ${open.length} — check the Orders tab for the rest`;
+                    });
+                  }}>Exit all</button>
+                  <label className="am-check"><input type="checkbox" checked={showClosed} onChange={(e) => setShowClosed(e.target.checked)} data-testid="positions-show-closed" /> Closed today{closed.length ? ` (${closed.length})` : ""}</label>
+                </>
               }
-              actions={(p) => (
+              actions={(p) => !p.quantity ? null : (
                 <>
                   <button type="button" className="btn-sm" title="Reverse at market" onClick={() => {
                     const q = Math.abs(p.quantity) * 2;
@@ -695,6 +729,8 @@ export function AccountManager({
                         const r = await fetch(`/api/positions/${encodeURIComponent(p.symbol)}/convert`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ to }) });
                         const j = await r.json().catch(() => ({}));
                         if (!r.ok) throw new Error(j.detail ?? `HTTP ${r.status}`);
+                        void qc.invalidateQueries({ queryKey: ["positions"] });
+                        book.reload();
                         return `${p.symbol} is now ${j.product}`;
                       });
                     }
@@ -720,7 +756,7 @@ export function AccountManager({
           <section className="trade-card am-account">
             <div className="quote-row">
               <div className="quote-cell"><div className="k">FUNDS AVAILABLE</div><div className="v">{funds.data?.available != null ? money(funds.data.available) : "—"}</div></div>
-              <div className="quote-cell"><div className="k">POSITIONS P&amp;L</div><div className={`v ${totalPnl >= 0 ? "up" : "down"}`}>{money(totalPnl)}</div></div>
+              <div className="quote-cell"><div className="k">POSITIONS P&amp;L</div><div className="v"><LiveTotalPnl open={open} privacy={privacy} /></div></div>
               <div className="quote-cell"><div className="k">REALIZED TODAY</div><div className={`v ${realized >= 0 ? "up" : "down"}`}>{money(realized)}</div></div>
               <div className="quote-cell" title="Demat holdings: overall P&L"><div className="k">HOLDINGS P&amp;L</div><div className={`v ${(holdings.data?.overall?.pnl ?? 0) >= 0 ? "up" : "down"}`}>{holdings.data?.ok ? money(holdings.data.overall?.pnl ?? null) : "—"}</div></div>
               <div className="quote-cell"><div className="k">OPEN POSITIONS</div><div className="v">{open.length}</div></div>

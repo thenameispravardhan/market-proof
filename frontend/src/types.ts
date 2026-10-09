@@ -57,6 +57,8 @@ export interface Position {
   unrealized_pnl: number | null;
   strategy_id: number | null;
   product?: ProductType;
+  /** Contract lot (1 for cash) — exits must be whole lots. */
+  lot_size?: number;
   opened_at: string;
   updated_at: string;
 }
