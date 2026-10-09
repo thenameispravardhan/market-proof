@@ -71,6 +71,20 @@ describe("aggregation", () => {
     expect(out[1].time).toBe(open + 75 * 60);
   });
 
+  it("anchors intraday buckets to the session open even when its first bar is missing", () => {
+    // An illiquid stock with no 09:15 candle: 75m bars still start at 09:15,
+    // the same grid live ticks use, so bars don't shift on reload.
+    const open = 10 * DAY + 555 * 60;
+    const bars = [bar(open + 900, 10, 11, 9, 10.5, 1), bar(open + 75 * 60, 11, 12, 10, 11.5, 1)];
+    const out = aggregate(bars, "75");
+    expect(out.map((b) => b.time)).toEqual([open, open + 75 * 60]);
+    expect(liveBucket(out[0], open + 75 * 60 + 5, "75")).toEqual({ kind: "new", time: open + 75 * 60 });
+    expect(liveBucket(out[0], open + 74 * 60, "75")).toEqual({ kind: "same" });
+    // MCX opens at 09:00
+    const mcx = 10 * DAY + 540 * 60;
+    expect(aggregate([bar(mcx + 1800, 1, 1, 1, 1, 1)], "75", 540)[0].time).toBe(mcx);
+  });
+
   it("builds weekly bars Monday-anchored and merges a split week on paging", () => {
     // 1970-01-05 was a Monday: day 4.
     const mon = 4 * DAY;

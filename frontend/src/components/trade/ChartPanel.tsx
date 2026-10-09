@@ -2066,7 +2066,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     void fetchHistory(sym, pl.res, need - IST - 86400, Math.floor(Date.now() / 1000)).then((r) => {
       otherLoadingRef.current.delete(sym);
       if (seq !== fetchSeqRef.current || iv !== ivRef.current) return;
-      const rows = pl.aggregate ? (aggregate(r.candles, iv) as Candle[]) : r.candles;
+      const rows = pl.aggregate ? (aggregate(r.candles, iv, sessionFor(sym).open) as Candle[]) : r.candles;
       otherDataRef.current.set(sym, { from: rows.length ? Math.min(need, rows[0].time) : need, closes: new Map(rows.map((k) => [k.time as number, k.close])) });
       refreshIndicatorData();
     });
@@ -2234,7 +2234,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     const oldest = candlesRef.current.length > 0 ? candlesRef.current[0].time - IST : now - pl.initialDays * 86400;
     void fetchHistory(compareSymbol, pl.res, oldest, now).then((r) => {
       if (seq !== fetchSeqRef.current || !compareSeriesRef.current.has(compareSymbol)) return;
-      const rows = pl.aggregate ? (aggregate(r.candles, ivRef.current) as Candle[]) : r.candles;
+      const rows = pl.aggregate ? (aggregate(r.candles, ivRef.current, sessionFor(compareSymbol).open) as Candle[]) : r.candles;
       safe(() => series.setData(rows.map((k) => ({ time: k.time, value: k.close }))));
     });
   }
@@ -2248,7 +2248,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     const candles = candlesRef.current;
     if (!haveMoreRef.current || candles.length >= MAX_CANDLES || Date.now() < olderRetryAtRef.current) return Promise.resolve();
     if (candles.length === 0 && olderCursorRef.current === null) return Promise.resolve();
-    const run = (async () => {
+    const run: Promise<void> = (async () => {
       const seq = fetchSeqRef.current;
       const key = ivRef.current;
       const pl = fetchPlan(key);
@@ -2276,7 +2276,7 @@ export default function ChartPanel(props: ChartPanelProps) {
         return;
       }
       emptyOlderRef.current = 0;
-      if (pl.aggregate) older = aggregate(older, key) as Candle[];
+      if (pl.aggregate) older = aggregate(older, key, sessionFor(symbol).open) as Candle[];
       const merged = (pl.aggregate ? mergeOlder(older, cur, key) : [...older, ...cur]) as Candle[];
       const added = merged.length - cur.length;
       candlesRef.current = merged;
@@ -2284,7 +2284,8 @@ export default function ChartPanel(props: ChartPanelProps) {
       applyData();
       for (const [sym, s] of compareSeriesRef.current) loadCompareData(sym, s);
     })().finally(() => {
-      loadingOlderRef.current = null;
+      // A symbol / interval switch may have started a newer page meanwhile.
+      if (loadingOlderRef.current === run) loadingOlderRef.current = null;
     });
     loadingOlderRef.current = run;
     return run;
@@ -2308,7 +2309,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     void fetchHistory(symbol, pl.res, fromChart - IST, Math.floor(nowMs / 1000) + 60).then((r) => {
       tailLoadingRef.current = false;
       if (seq !== fetchSeqRef.current || key !== ivRef.current || r.reason || r.candles.length === 0) return;
-      const fresh = (pl.aggregate ? aggregate(r.candles, key) : r.candles) as Candle[];
+      const fresh = (pl.aggregate ? aggregate(r.candles, key, sessionFor(symbol).open) : r.candles) as Candle[];
       const cur = candlesRef.current;
       const cut = fresh[0].time;
       const end = fresh[fresh.length - 1].time;
@@ -3520,7 +3521,7 @@ export default function ChartPanel(props: ChartPanelProps) {
       olderCursorRef.current = from;
       const r = await fetchHistory(symbol, pl.res, from, now);
       if (seq !== fetchSeqRef.current) return;
-      candlesRef.current = pl.aggregate ? (aggregate(r.candles, iv) as Candle[]) : r.candles;
+      candlesRef.current = pl.aggregate ? (aggregate(r.candles, iv, sessionFor(symbol).open) as Candle[]) : r.candles;
       if (!r.reason) {
         // A short first page (seconds bars on a Monday morning or a weekend,
         // weekly / monthly bars from one year of days) pages further back
