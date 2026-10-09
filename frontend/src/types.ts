@@ -117,7 +117,6 @@ export interface PromptHistoryEntry {
 
 export interface DashboardSummary {
   open_positions: number;
-  hard_rules_count: number;
   todays_realized_pnl: number;
   todays_unrealized_pnl: number;
   pnl_series: { date: string; realized: number; cumulative: number }[];
