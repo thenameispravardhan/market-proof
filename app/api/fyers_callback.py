@@ -459,7 +459,19 @@ def fyers_status(db: Session = Depends(get_db)) -> dict[str, Any]:
         "redirect_uri": settings.FYERS_REDIRECT_URI or None,
         "live_mode": settings.is_live,
         "reason": reason,
+        # Live price socket health (None when the stream isn't running).
+        "stream": _stream_status(),
     }
+
+
+def _stream_status() -> Optional[dict[str, Any]]:
+    try:
+        from app.api.orders import _fyers_stream
+
+        stream = _fyers_stream()
+        return stream.status() if stream is not None and hasattr(stream, "status") else None
+    except Exception:  # noqa: BLE001 — status must never break the endpoint
+        return None
 
 
 @router.post("/disconnect")
