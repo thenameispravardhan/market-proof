@@ -41,8 +41,8 @@ export function ChannelList({ selectedId, onSelect, onNew }: Props) {
 
   return (
     <div className="widget" data-testid="channel-list">
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-        <h3 style={{ margin: 0 }}>Channels</h3>
+      <div className="widget-header">
+        <h3>Channels</h3>
         <button className="btn-sm primary" onClick={onNew}>+ New</button>
       </div>
       {isLoading ? (

@@ -34,7 +34,7 @@ const STAGES: {
 ];
 
 const barTrack: CSSProperties = {
-  background: "var(--surface-2, #21262d)",
+  background: "var(--surface-2)",
   borderRadius: 4,
   height: 22,
   overflow: "hidden",
@@ -105,7 +105,7 @@ export function ExecutionTiming() {
       <div className="widget" data-testid="execution-timing">
         <h3>
           Time per layer{" "}
-          <span className="mono" style={{ color: "var(--muted, #8b949e)" }}>
+          <span className="mono" style={{ color: "var(--muted)" }}>
             median end-to-end {ms(totalP50)}
           </span>
         </h3>
@@ -162,7 +162,7 @@ export function ExecutionTiming() {
       <div className="widget" style={{ marginTop: 16 }}>
         <h3>
           Detection race — which exchange publishes faster{" "}
-          <span className="mono" style={{ color: "var(--muted, #8b949e)" }}>
+          <span className="mono" style={{ color: "var(--muted)" }}>
             (last {data?.detection_samples ?? 0} filings)
           </span>
         </h3>
@@ -237,7 +237,7 @@ export function ExecutionTiming() {
       <div className="widget" style={{ marginTop: 16 }}>
         <h3>
           Inside the Analysis layer{" "}
-          <span className="mono" style={{ color: "var(--muted, #8b949e)" }}>
+          <span className="mono" style={{ color: "var(--muted)" }}>
             (last {pl?.window ?? 0} analyses)
           </span>
         </h3>
