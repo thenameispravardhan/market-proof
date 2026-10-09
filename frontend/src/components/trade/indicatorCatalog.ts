@@ -889,9 +889,11 @@ export function cloneInstances(items: unknown[]): IndicatorInstance[] {
   });
 }
 
-/** Everything "Save as default" keeps (no identity, no placement). */
-export function instanceDefaults(i: IndicatorInstance): Omit<IndicatorInstance, "uid" | "type" | "pane"> {
-  const { uid: _u, type: _t, pane: _p, ...rest } = i;
+/** Everything "Save as default" keeps: no identity, no placement (pane,
+ *  pinned scale) and not the hidden flag, so a default saved from a hidden
+ *  copy still adds visible copies. */
+export function instanceDefaults(i: IndicatorInstance): Omit<IndicatorInstance, "uid" | "type" | "pane" | "scale" | "visible"> {
+  const { uid: _u, type: _t, pane: _p, scale: _s, visible: _v, ...rest } = i;
   return JSON.parse(JSON.stringify(rest));
 }
 
@@ -916,8 +918,12 @@ export function visibleOnInterval(inst: IndicatorInstance, interval: string): bo
   if (!v) return true;
   if (!v.on) return false;
   const n = intervalCount(interval);
-  // a range typed backwards (from 30 to 5) still means 5–30
-  return n >= Math.min(v.min, v.max) && n <= Math.max(v.min, v.max);
+  const g0 = VIS_GROUPS.find((x) => x.id === g);
+  // a range typed backwards (from 30 to 5) still means 5–30; one that runs to
+  // the group's end is open-ended (a 90-minute chart is in "Minutes 1 to 59")
+  const lo = Math.min(v.min, v.max);
+  const hi = Math.max(v.min, v.max);
+  return n >= lo && (n <= hi || (g0 !== undefined && hi >= g0.max));
 }
 
 /** Old charts stored booleans per built-in; turn them into instances

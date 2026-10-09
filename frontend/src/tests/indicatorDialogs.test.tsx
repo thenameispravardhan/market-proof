@@ -2,7 +2,7 @@ import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { IndicatorPicker, IndicatorSettings } from "../components/trade/IndicatorDialogs";
+import { IndicatorPicker, IndicatorSettings, SaveTemplateDialog } from "../components/trade/IndicatorDialogs";
 import { Num } from "../components/trade/chartUi";
 import { newInstance, type IndicatorInstance } from "../components/trade/indicatorCatalog";
 
@@ -125,5 +125,25 @@ describe("indicator picker", () => {
   it("shows which indicators are favorites", () => {
     render(<IndicatorPicker {...props} favorites={["rsi"]} onAdd={() => {}} />);
     expect(screen.getByRole("button", { name: "Favorite Relative Strength Index" })).toHaveAttribute("aria-pressed", "true");
+  });
+});
+
+describe("indicator templates", () => {
+  it("can't save an empty template", () => {
+    const onSave = vi.fn();
+    render(<SaveTemplateDialog symbolLabel="RELIANCE" intervalLabel="5 minutes" existing={[]} count={0} onSave={onSave} onClose={() => {}} />);
+    fireEvent.change(screen.getByTestId("ind-template-name"), { target: { value: "Mine" } });
+    expect(screen.getByTestId("ind-template-save-ok")).toBeDisabled();
+    expect(screen.getByText(/Add some indicators/)).toBeInTheDocument();
+  });
+});
+
+describe("indicator visibility warnings", () => {
+  it("says when the chart's interval is excluded", () => {
+    const inst = { ...newInstance("ema")!, vis: { minutes: { on: false, min: 1, max: 59 } } } as IndicatorInstance;
+    render(<IndicatorSettings inst={inst} interval="5" intervalLabel="5 minutes" onChange={() => {}} onClose={() => {}} onSaveDefault={() => {}} />);
+    expect(screen.getByText(/hidden on 5 minutes/)).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Visibility"));
+    expect(screen.getByTestId("ind-vis-warn")).toHaveTextContent("Not shown on this chart's interval");
   });
 });

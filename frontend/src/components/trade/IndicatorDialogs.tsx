@@ -7,6 +7,7 @@ import {
   INDICATORS,
   INDICATOR_BY_TYPE,
   PLOT_KINDS,
+  visibleOnInterval,
   SOURCES,
   VIS_GROUPS,
   defaultFills,
@@ -43,12 +44,15 @@ export function SaveTemplateDialog({
   symbolLabel,
   intervalLabel,
   existing,
+  count,
   onSave,
   onClose,
 }: {
   symbolLabel: string;
   intervalLabel: string;
   existing: string[];
+  /** Indicators on the chart now: an empty template would only clear charts. */
+  count: number;
   onSave: (name: string, withSymbol: boolean, withInterval: boolean) => void;
   onClose: () => void;
 }) {
@@ -57,7 +61,7 @@ export function SaveTemplateDialog({
   const [withInterval, setWithInterval] = useState(false);
   const n = name.trim();
   const save = () => {
-    if (!n) return;
+    if (!n || count === 0) return;
     onSave(n, withSymbol, withInterval);
     onClose();
   };
@@ -67,13 +71,18 @@ export function SaveTemplateDialog({
       onClose={onClose}
       width={400}
       testid="ind-template-save"
-      footer={<><span className="grow" /><button type="button" className="cbtn" onClick={onClose}>Cancel</button><button type="button" className="cbtn primary" disabled={!n} onClick={save} data-testid="ind-template-save-ok">Save</button></>}
+      footer={<><span className="grow" /><button type="button" className="cbtn" onClick={onClose}>Cancel</button><button type="button" className="cbtn primary" disabled={!n || count === 0} onClick={save} data-testid="ind-template-save-ok">Save</button></>}
     >
       <Row label="Template name">
         <input className="cform-input" autoFocus value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && save()} aria-label="Template name" data-testid="ind-template-name" />
       </Row>
       <Check label={`Remember symbol (${symbolLabel})`} checked={withSymbol} onChange={setWithSymbol} testid="ind-template-symbol" />
       <Check label={`Remember interval (${intervalLabel})`} checked={withInterval} onChange={setWithInterval} testid="ind-template-interval" />
+      {count === 0 ? (
+        <div className="hint warn-text">Add some indicators to the chart first: a template saves the ones on it now.</div>
+      ) : (
+        <div className="hint">Saves the {count} indicator{count === 1 ? "" : "s"} on the chart now.</div>
+      )}
       {existing.includes(n) && <div className="hint warn-text">Replaces the existing template "{n}".</div>}
     </Modal>
   );
@@ -239,11 +248,16 @@ function TextInput({ value, onCommit, placeholder, ariaLabel }: { value: string;
 
 export function IndicatorSettings({
   inst,
+  interval,
+  intervalLabel,
   onChange,
   onClose,
   onSaveDefault,
 }: {
   inst: IndicatorInstance;
+  /** The chart's interval, to say when the Visibility tab hides it there. */
+  interval?: string;
+  intervalLabel?: string;
   onChange: (i: IndicatorInstance) => void;
   onClose: () => void;
   onSaveDefault: (i: IndicatorInstance) => void;
@@ -269,6 +283,8 @@ export function IndicatorSettings({
     onClose();
   };
   const changed = JSON.stringify(inst) !== JSON.stringify(orig);
+  const offHere = interval !== undefined && !visibleOnInterval(inst, interval);
+  const allOff = VIS_GROUPS.every((g) => inst.vis?.[g.id]?.on === false);
   const tabs = [
     ...(def.inputs.length ? [{ id: "inputs", label: "Inputs" }] : []),
     { id: "style", label: "Style" },
@@ -276,7 +292,7 @@ export function IndicatorSettings({
   ];
   return (
     <Modal
-      title={<>{def.name}{inst.visible ? null : <span className="hint"> · hidden</span>}</>}
+      title={<>{def.name}{!inst.visible ? <span className="hint"> · hidden</span> : offHere ? <span className="hint"> · hidden on {intervalLabel ?? "this interval"}</span> : null}</>}
       onClose={cancel}
       width={680}
       tabs={tabs}
@@ -398,6 +414,11 @@ export function IndicatorSettings({
       {tab === "visibility" && (
         <>
           <div className="hint ind-vis-hint">Show this indicator only on the intervals ticked below.</div>
+          {allOff ? (
+            <div className="hint warn-text" data-testid="ind-vis-warn">Every interval is unticked, so this indicator never shows.</div>
+          ) : offHere ? (
+            <div className="hint warn-text" data-testid="ind-vis-warn">Not shown on this chart's interval ({intervalLabel ?? interval}).</div>
+          ) : null}
           {VIS_GROUPS.map((g) => {
             const v = inst.vis?.[g.id] ?? { on: true, min: 1, max: g.max };
             const put = (patch: Partial<typeof v>) => {

@@ -4844,11 +4844,17 @@ export default function ChartPanel(props: ChartPanelProps) {
       addToast(`${def.name}: click the first and the last bar of the range`);
       return;
     }
+    if (def?.intradayOnly && !isIntraday(ivRef.current)) {
+      addToast(`${def.name} works on intraday charts only`);
+      return;
+    }
     const defaults = loadJson<Record<string, Partial<IndicatorInstance>>>("chart:indDefaults", {})[type];
     const base = newInstance(type, defaults?.inputs);
     if (!base) return;
-    // saved defaults cover styles, outputs and visibility too (sanitize merges them)
-    const inst = defaults ? sanitizeInstance({ ...base, ...defaults, inputs: base.inputs, uid: base.uid, type }) ?? base : base;
+    // saved defaults cover styles, outputs and visibility too (sanitize merges
+    // them); a new copy is always shown and placed fresh, whatever an older
+    // saved default carried
+    const inst = defaults ? sanitizeInstance({ ...base, ...defaults, inputs: base.inputs, uid: base.uid, type, visible: true, pane: undefined, scale: undefined }) ?? base : base;
     setIndicators([...indicatorsRef.current, inst], `add ${instanceTitle(inst)}`);
   }
 
@@ -4976,6 +4982,7 @@ export default function ChartPanel(props: ChartPanelProps) {
   }
 
   function deleteIndTemplate(name: string): void {
+    if (!window.confirm(`Delete the indicator template "${name}"?`)) return;
     const next = templates.filter((t) => t.name !== name);
     setTemplates(next);
     saveJson("chart:indTemplates", next);
@@ -6491,6 +6498,7 @@ export default function ChartPanel(props: ChartPanelProps) {
           symbolLabel={shortName}
           intervalLabel={intervalLongLabel(iv)}
           existing={templates.map((t) => t.name)}
+          count={indicators.length}
           onSave={storeIndTemplate}
           onClose={() => setDialog(null)}
         />
@@ -6511,6 +6519,8 @@ export default function ChartPanel(props: ChartPanelProps) {
       {dlg?.k === "indSettings" && dlgInd && (
         <IndicatorSettings
           inst={dlgInd}
+          interval={iv}
+          intervalLabel={intervalLongLabel(iv)}
           onChange={updateIndicator}
           onClose={() => {
             const snap = dialogSnapRef.current;
