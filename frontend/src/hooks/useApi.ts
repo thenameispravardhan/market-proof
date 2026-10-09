@@ -447,6 +447,16 @@ export interface FyersStatus {
   live_mode: boolean;
   // Reason string when not connected.
   reason: string | null;
+  // Live price socket health; null when the stream isn't running.
+  stream?: {
+    connected: boolean;
+    // "no_account" | "no_token" | "token_expired" while down, else null.
+    reason: string | null;
+    subscribed: number;
+    last_tick_age_s: number | null;
+    // Symbols Fyers refused to stream (they fall back to slower REST prices).
+    rejected_symbols: string[];
+  } | null;
 }
 
 // Risk-engine snapshot (kill switch, breaker halts, today's entry
