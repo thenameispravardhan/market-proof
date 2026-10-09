@@ -699,6 +699,8 @@ export default function Trade() {
     type: "success" | "error";
     message: string;
     warning?: string | null;
+    /** The order is at the broker but wasn't saved here — never re-place it. */
+    recordWarning?: string | null;
     detail?: PlaceOrderRequest;
     // Diagnostic reason from the Fyers backend. Set when the
     // place-order rejection has a known cause the UI can
@@ -1087,6 +1089,7 @@ export default function Trade() {
             + `${levels ? ` · ${levels} set once it fills` : ""}${r.broker_order_id ? ` · order ${r.broker_order_id}` : ""}`,
           // Risk is advisory for manual orders — surface it without blocking.
           warning: r.risk_warning ?? (r.risk_message ? r.risk_message : null),
+          recordWarning: r.warning ?? null,
           detail: body,
         });
         // The stop loss / target belonged to this order. Left in the boxes
@@ -1671,6 +1674,11 @@ export default function Trade() {
                   {lastResult && lastResult.type === "success" && (
                     <div className="result success" data-testid="ticket-result-success">
                       {lastResult.message}
+                      {lastResult.recordWarning && (
+                        <div className="result-warning" data-testid="ticket-record-warning">
+                          ⚠ {lastResult.recordWarning}
+                        </div>
+                      )}
                       {lastResult.warning && (
                         <div className="result-warning" data-testid="ticket-risk-advisory">
                           ⚠ risk advisory: {lastResult.warning}
