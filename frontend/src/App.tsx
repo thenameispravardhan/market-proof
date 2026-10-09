@@ -140,7 +140,8 @@ function StatusBar({ wsStatus }: { wsStatus: string }) {
   const { data: settings } = useGlobalSettings();
   const { data: market } = useMarketIndices();
   const authorize = useFyersAuthorizeUrl();
-  const mode = settings?.global?.TRADING_MODE ?? "paper";
+  // No default: showing PAPER before settings load would understate a live bot.
+  const mode = settings?.global?.TRADING_MODE;
   const capital = settings?.global?.PORTFOLIO_VALUE;
 
   // Local clock, ticking every second.
@@ -165,8 +166,12 @@ function StatusBar({ wsStatus }: { wsStatus: string }) {
       </div>
       <div className="seg">
         <span className="key">MODE</span>
-        <span className={`val ${mode === "live" ? "down" : "up"}`}>
-          {mode.toUpperCase()}
+        <span
+          className={`val ${mode === "live" ? "down" : mode ? "up" : ""}`}
+          data-testid="statusbar-mode"
+          title={mode === "live" ? "The bot trades real money" : mode ? "The bot simulates trades; Trade page orders are still real" : "Loading"}
+        >
+          {mode ? mode.toUpperCase() : "…"}
         </span>
       </div>
       {capital !== undefined && capital !== null && (
