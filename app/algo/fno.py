@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import csv
 import math
+import re
 import time
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
@@ -191,16 +192,25 @@ def strike_for_premium(spot: float, step: float, right: str, target: float, pric
 
 # ---- F&O master ----------------------------------------------------------------
 
-_cache: dict[str, Any] = {"mtime": None, "data": {"lots": {}, "futures": {}, "strikes": {}}}
+_EMPTY = {"lots": {}, "futures": {}, "strikes": {}, "lot_expiries": {}, "contracts": {}}
+_cache: dict[str, Any] = {"mtime": None, "data": _EMPTY}
 
 
 def master() -> dict[str, Any]:
-    """{lots: name->lot, futures: name->[(expiry_ts, symbol)], strikes: name->{expiry_ts: [strikes]}}."""
+    """{lots: name->lot, futures: name->[(expiry_ts, symbol)], strikes: name->{expiry_ts: [strikes]},
+    lot_expiries: name->[(expiry_ts, lot)], contracts: symbol->lot}.
+
+    `lots` is the lot of the nearest live expiry when the master loaded. NSE
+    revises lot sizes a few times a year and a revision only applies to new
+    expiries, so during the changeover one underlying lists contracts with two
+    lots: `lot_expiries` keeps the lot per expiry and `contracts` the exact lot
+    of every contract of such an underlying (only those, to keep it small)."""
     files = [MASTER_DIR / f"{k}.csv" for k in FO_URLS if (MASTER_DIR / f"{k}.csv").exists()]
     mtime = tuple(f.stat().st_mtime for f in files)
     if _cache["mtime"] == mtime:
         return _cache["data"]
-    lots: dict[str, int] = {}
+    by_exp: dict[str, dict[int, int]] = {}
+    sym_lot: dict[str, tuple[str, int]] = {}
     futures: dict[str, list[tuple[int, str]]] = {}
     strikes: dict[str, dict[int, set[float]]] = {}
     home: dict[str, str] = {}      # name -> its exchange; NSE_FO is read first, so SBIN stays on NSE
@@ -218,7 +228,10 @@ def master() -> dict[str, Any]:
                     exp, lot = int(float(row[8])), int(float(row[3]))
                 except ValueError:
                     continue
-                lots.setdefault(name, lot)
+                if lot <= 0:
+                    continue
+                by_exp.setdefault(name, {}).setdefault(exp, lot)
+                sym_lot[row[9].strip().upper()] = (name, lot)
                 if kind in ("CE", "PE"):
                     try:
                         strikes.setdefault(name, {}).setdefault(exp, set()).add(float(row[15]))
@@ -226,11 +239,18 @@ def master() -> dict[str, Any]:
                         pass
                 elif row[9].strip().upper().endswith("FUT"):
                     futures.setdefault(name, []).append((exp, row[9].strip().upper()))
+    now = time.time()
+    lot_expiries = {n: sorted(v.items()) for n, v in by_exp.items()}
+    lots = {n: next((lot for e, lot in v if e >= now), v[-1][1]) for n, v in lot_expiries.items()}
+    mixed = {n for n, v in lot_expiries.items() if len({lot for _, lot in v}) > 1}
+    contracts = {s: lot for s, (n, lot) in sym_lot.items() if n in mixed}
     data = {"lots": lots,
             "futures": {k: sorted(v) for k, v in futures.items()},
-            "strikes": {k: {e: sorted(s) for e, s in v.items()} for k, v in strikes.items()}}
+            "strikes": {k: {e: sorted(s) for e, s in v.items()} for k, v in strikes.items()},
+            "lot_expiries": lot_expiries,
+            "contracts": contracts}
     _cache.update(mtime=mtime, data=data)
-    log.info("fno.master_loaded", underlyings=len(lots), files=len(files))
+    log.info("fno.master_loaded", underlyings=len(lots), files=len(files), lot_changeovers=sorted(mixed))
     return data
 
 
@@ -259,8 +279,71 @@ async def ensure_master(max_age_h: float = 20.0) -> None:
     get_master().reload()
 
 
+def known_lot(name: str, now: Optional[float] = None) -> Optional[int]:
+    """The F&O lot for an underlying, or None when nothing reliable is known.
+
+    The scrip master's lot of the nearest live expiry first; the current
+    exchange index lots (`INDEX_LOTS`) when the master isn't downloaded. A
+    stock's lot is only ever taken from the master — stock lots differ per
+    stock and change with every NSE revision, so there's no safe guess."""
+    m = master()
+    exps = (m.get("lot_expiries") or {}).get(name)
+    if exps:
+        now = now or time.time()
+        return next((lot for e, lot in exps if e >= now), exps[-1][1])
+    return m["lots"].get(name) or INDEX_LOTS.get(name)
+
+
 def lot_size(name: str) -> int:
-    return master()["lots"].get(name) or INDEX_LOTS.get(name) or 1
+    """`known_lot`, or 1 when it isn't known (backtests and the builder only;
+    anything that sends an order uses `contract_lot` / `order_lot`)."""
+    return known_lot(name) or 1
+
+
+_FNO_SUFFIX = re.compile(r"\d{2}(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC|[1-9OND]\d{2})"
+                         r"(?:FUT|\d+(?:\.\d+)?(?:CE|PE))$")
+
+
+def underlying_of(symbol: str) -> Optional[str]:
+    """The F&O name inside a Fyers derivative symbol, or None for anything
+    that isn't an NSE/BSE future or option.
+
+    NSE:NIFTY25O1424500CE (weekly), NSE:BANKNIFTY25OCT56000PE (monthly) and
+    NSE:SBIN25OCTFUT all give the underlying (NIFTY, BANKNIFTY, SBIN)."""
+    s = (symbol or "").strip().upper()
+    if ":" not in s:
+        return None
+    exch, ticker = s.split(":", 1)
+    if exch not in ("NSE", "BSE"):
+        return None
+    m = _FNO_SUFFIX.search(ticker)
+    if not m or m.start() == 0:
+        return None
+    # Names that end in digits (NIFTYNXT50) can also parse with a shorter
+    # name; prefer the longest prefix the master or the index table knows.
+    known = master()["lots"]
+    for k in range(len(ticker) - 1, 0, -1):
+        head = ticker[:k]
+        if (head in known or head in INDEX_LOTS) and _FNO_SUFFIX.fullmatch(ticker[k:]):
+            return head
+    return ticker[:m.start()]
+
+
+def is_derivative(symbol: str) -> bool:
+    return underlying_of(symbol) is not None
+
+
+def contract_lot(symbol: str, now: Optional[float] = None) -> Optional[int]:
+    """Exact lot of one NSE/BSE F&O contract, or None when it isn't known.
+
+    The contract's own row in the scrip master first (matters while a lot
+    revision is rolling through the expiries), else the underlying's lot."""
+    s = (symbol or "").strip().upper()
+    lot = (master().get("contracts") or {}).get(s)
+    if lot:
+        return int(lot)
+    name = underlying_of(s)
+    return known_lot(name, now) if name else None
 
 
 def future_symbol(name: str, which: str, now: Optional[float] = None) -> Optional[str]:
@@ -273,3 +356,32 @@ def future_symbol(name: str, which: str, now: Optional[float] = None) -> Optiona
 def is_fno(name: str) -> bool:
     m = master()
     return name in m["lots"] or name in INDEX_LOTS
+
+
+def master_loaded() -> bool:
+    return bool(master()["lots"])
+
+
+def lot_error(symbol: str, quantity: int) -> Optional[str]:
+    """Why `quantity` can't be sent for `symbol`, or None when it can.
+
+    F&O quantities must be whole lots or the exchange rejects the order. An
+    NSE/BSE derivative whose lot isn't known (a stock option before the master
+    is downloaded, or a contract listed after it) is refused rather than sent
+    with a guessed lot of 1. Cash, MCX and currency symbols pass."""
+    name = underlying_of(symbol)
+    if name is None:
+        return None
+    lot = contract_lot(symbol)
+    if lot is None:
+        if len(name) == 6 and name.endswith("INR"):
+            return None                # currency F&O (USDINR…): not in the equity F&O master
+        why = ("isn't in the F&O scrip master" if master_loaded()
+               else "is unknown — the NSE/BSE F&O scrip master isn't downloaded yet")
+        return (f"lot size for {symbol} {why}, so the order wasn't sent "
+                "(a guessed lot would be rejected by the exchange). Try again in a minute.")
+    if lot > 1 and int(quantity) % lot:
+        lots = int(quantity) / lot
+        return (f"quantity {quantity} isn't a whole number of lots for {symbol} "
+                f"(lot size {lot}; that's {lots:.2f} lots) — use a multiple of {lot}")
+    return None

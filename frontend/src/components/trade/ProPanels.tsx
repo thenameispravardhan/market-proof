@@ -264,7 +264,7 @@ export function FuturesPanel({ base, onOpen }: { base: InstrumentHit | null; onO
               exchange: f.symbol.split(":")[0],
               segment: "FO",
               instrument_type: "FUT",
-              lot_size: info.lot ?? 1,
+              lot_size: info.lot ?? 0,   // 0 = unknown: the ticket blocks it
               tick_size: 0.05,
               expiry: exp.toISOString().slice(0, 10),
               strike: null,

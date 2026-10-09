@@ -602,6 +602,36 @@ export default function Trade() {
     refetchInterval: 5000,
   });
 
+  // Lot sizes of saved F&O entries (watchlist, the open ticket) are refreshed
+  // from the server's F&O scrip master: a lot stored when an option was added
+  // goes stale when NSE revises lot sizes, and the ticket would send it.
+  const isFno = (h: InstrumentHit | null | undefined) =>
+    !!h && (h.segment === "FO" || ["CE", "PE", "FUT"].includes(h.instrument_type));
+  const fnoSyms = [...new Set([...wl.lists.flatMap((l) => l.items), selected].filter(isFno).map((h) => h!.symbol))]
+    .sort().slice(0, 200).join(",");
+  const { data: freshLots } = useQuery<{ lots: Record<string, number | null> }>({
+    queryKey: ["fno-lots", fnoSyms],
+    queryFn: async () => {
+      const r = await fetch(`/api/options/lots?symbols=${encodeURIComponent(fnoSyms)}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    },
+    enabled: fnoSyms.length > 0,
+    staleTime: 5 * 60_000,
+  });
+  useEffect(() => {
+    const lots = freshLots?.lots;
+    if (!lots) return;
+    const fix = (h: InstrumentHit): InstrumentHit => {
+      if (!(h.symbol in lots)) return h;
+      const lot = lots[h.symbol] ?? 0;   // 0 = unknown: the ticket blocks it
+      return h.lot_size === lot ? h : { ...h, lot_size: lot };
+    };
+    if (wl.lists.some((l) => l.items.some((h) => fix(h) !== h)))
+      updateWl((w) => ({ ...w, lists: w.lists.map((l) => ({ ...l, items: l.items.map(fix) })) }));
+    setSelected((cur) => (cur && fix(cur) !== cur ? fix(cur) : cur));
+  }, [freshLots]);  // eslint-disable-line react-hooks/exhaustive-deps
+
   const { data: accounts } = useBrokerAccounts();
   // Trade page is REAL-MONEY ONLY. Filter out paper-mode rows.
   // We silently pick the first real account — there's no UI switcher.
@@ -776,6 +806,9 @@ export default function Trade() {
   const isOption =
     selected != null && (selected.instrument_type === "CE" || selected.instrument_type === "PE");
   const isFuture = selected != null && selected.instrument_type === "FUT";
+  // An F&O contract whose lot the backend doesn't know: never guess 1 (the
+  // exchange rejects a non-lot quantity); the backend refuses it too.
+  const lotUnknown = (isOption || isFuture) && !(selected!.lot_size > 0);
 
   // Fyers v3 price rules: LIMIT and STOP_LOSS (SL-L, stop-limit) both
   // need a limit price; STOP_LOSS (SL-L) and SL-M both need a stop /
@@ -880,7 +913,7 @@ export default function Trade() {
       exchange: leg.symbol.includes(":") ? leg.symbol.split(":")[0] : chainBase.exchange,
       segment: "FO",
       instrument_type: type,
-      lot_size: leg.lot_size,
+      lot_size: leg.lot_size ?? 0,
       tick_size: leg.tick_size,
       expiry: null,
       strike: row.strike,
@@ -979,7 +1012,8 @@ export default function Trade() {
     lotSize: selected && selected.lot_size > 1 ? selected.lot_size : 1,
     limit: limitNum, stop: stopNum, ltp: ltp ?? null, entry: estPrice ?? null, sl: slAbs, tp: tpAbs,
   };
-  const problem = !selected ? "Pick a symbol." : !accountId ? "Connect a live Fyers account to place orders." : ticketProblem(check);
+  const problem = !selected ? "Pick a symbol." : !accountId ? "Connect a live Fyers account to place orders."
+    : lotUnknown ? "Lot size unknown for this contract." : ticketProblem(check);
   const canSubmit = problem == null;
   const ticketWarn = canSubmit ? ticketWarning(check) : null;
   const { data: funds } = useQuery<{ ok: boolean; available: number | null }>({
@@ -1410,7 +1444,7 @@ export default function Trade() {
                         </div>
                         <div className="quote-cell">
                           <div className="k">LOT</div>
-                          <div className="v">{selected.lot_size}</div>
+                          <div className="v">{selected.lot_size > 0 ? selected.lot_size : "—"}</div>
                         </div>
                       </div>
                       {!quote?.ok && (
@@ -1441,6 +1475,11 @@ export default function Trade() {
                     </button>
                   </div>
   
+                  {lotUnknown && (
+                    <div className="hint warn-text" data-testid="ticket-lot-unknown">
+                      Lot size unknown for this contract (the F&amp;O scrip master hasn&apos;t loaded), so it can&apos;t be ordered yet.
+                    </div>
+                  )}
                   {selected && selected.lot_size > 1 ? (
                     /* F&O trades in whole lots: enter lots, the quantity follows. */
                     <label className="ticket-row">
