@@ -161,7 +161,7 @@ export function NewsPipeline() {
                   </td>
                   <td title={a.exchange}>{a.exchange}</td>
                   <td>
-                    <span className={`badge ${actionClass(a.event_type)}`} title={a.event_type}>
+                    <span className="badge neutral" title={a.event_type}>
                       {a.event_type}
                     </span>
                   </td>

@@ -1,13 +1,12 @@
 // Dashboard page: a trading-mode banner, a summary stat row, then the
 // live widgets in a responsive grid:
 //   - News Pipeline (unified scrape → analyze → signal table)
-//   - Active Positions (with close controls) / Risk Metrics / P&L chart
+//   - Active Positions (with close controls) / latency / resources / P&L chart
 
 import { NewsPipeline } from "../components/dashboard/NewsPipeline";
 import { ActivePositions } from "../components/dashboard/ActivePositions";
 import { PipelineLatency } from "../components/dashboard/PipelineLatency";
 import { PnLChart } from "../components/dashboard/PnLChart";
-import { RiskMetrics } from "../components/dashboard/RiskMetrics";
 import { SystemResources } from "../components/dashboard/SystemResources";
 import { AccountToggles } from "../components/dashboard/AccountToggles";
 import { AiAnalysisToggle } from "../components/dashboard/AiAnalysisToggle";
@@ -15,8 +14,8 @@ import { useDashboardSummary, useGlobalSettings } from "../hooks/useApi";
 
 function money(v: number | null | undefined): string {
   if (v === null || v === undefined) return "—";
-  const sign = v > 0 ? "+" : "";
-  return sign + v.toLocaleString(undefined, { maximumFractionDigits: 0 });
+  const sign = v > 0 ? "+" : v < 0 ? "−" : "";
+  return `${sign}₹${Math.abs(v).toLocaleString("en-IN", { maximumFractionDigits: 2, minimumFractionDigits: 2 })}`;
 }
 
 function pnlClass(v: number | null | undefined): string {
@@ -69,7 +68,6 @@ export default function Dashboard() {
       <div className="dashboard-grid">
         <NewsPipeline />
         <ActivePositions />
-        <RiskMetrics />
         <PipelineLatency />
         <SystemResources />
         <PnLChart />

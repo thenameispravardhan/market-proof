@@ -394,13 +394,18 @@ async def backfill_analyses(
 @router.get("/api/dashboard/summary")
 def dashboard_summary(db: Session = Depends(get_db)) -> dict[str, Any]:
     """Returns key metrics for the dashboard overview."""
-    today = _utcnow().date()
-    today_start = datetime(today.year, today.month, today.day)
+    # "Today" is the IST trading day, not the UTC date: between 00:00 and
+    # 05:30 IST the UTC date is still yesterday. Timestamps are stored as
+    # naive UTC, so the IST day bounds are shifted back to UTC here.
+    ist = timedelta(hours=5, minutes=30)
+    today = (_utcnow() + ist).date()
+    today_start = datetime(today.year, today.month, today.day) - ist
     today_end = today_start + timedelta(days=1)
 
-    # Open positions
+    # Open positions. Closed positions stay in the table with quantity 0,
+    # so they must not be counted (the Active Positions widget hides them).
     open_positions = db.execute(
-        select(func.count()).select_from(Position)
+        select(func.count()).select_from(Position).where(Position.quantity != 0)
     ).scalar_one_or_none() or 0
 
     # Today's realised P&L
@@ -415,7 +420,8 @@ def dashboard_summary(db: Session = Depends(get_db)) -> dict[str, Any]:
     # Today's unrealised P&L
     today_unrealised = db.execute(
         select(func.coalesce(func.sum(Position.unrealized_pnl), 0)).where(
-            Position.unrealized_pnl.isnot(None)
+            Position.unrealized_pnl.isnot(None),
+            Position.quantity != 0,
         )
     ).scalar_one_or_none() or 0.0
 
@@ -447,7 +453,6 @@ def dashboard_summary(db: Session = Depends(get_db)) -> dict[str, Any]:
 
     return {
         "open_positions": int(open_positions),
-        "hard_rules_count": 10,  # configurable limit, exposed for UI
         "todays_realized_pnl": round(float(today_pnl_row), 2),
         "todays_unrealized_pnl": round(float(today_unrealised), 2),
         "pnl_series": pnl_series,
