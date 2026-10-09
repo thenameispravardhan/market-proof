@@ -29,6 +29,7 @@ import {
   useBrokerAccounts,
   useCancelOrder,
   useFyersDisconnect,
+  useGlobalSettings,
   useOptionChain,
   usePendingOrders,
   usePlaceOrder,
@@ -303,6 +304,24 @@ function TradeSettings({ s, onChange }: { s: TradeSet; onChange: (k: keyof Trade
         </div>
       )}
     </div>
+  );
+}
+
+// Which money the ticket trades, always on screen: the Trade page only ever
+// sends real orders, so this reads LIVE whenever an order can go out and
+// OFF (with the reason under it) when it can't.
+function TicketModeBadge({ account, botMode }: { account: BrokerAccount | null; botMode?: string }) {
+  if (!account) {
+    return (
+      <span className="mode-badge off" data-testid="ticket-mode" title={botMode === "paper" ? "The bot is in paper mode; this page only trades real money" : "No logged-in Fyers account is switched on"}>
+        ORDERS OFF
+      </span>
+    );
+  }
+  return (
+    <span className="mode-badge live" data-testid="ticket-mode" title={`Orders go to Fyers (${account.name}) with real money`}>
+      LIVE · REAL MONEY · {account.name}
+    </span>
   );
 }
 
@@ -638,13 +657,26 @@ export default function Trade() {
   }, [freshLots]);  // eslint-disable-line react-hooks/exhaustive-deps
 
   const { data: accounts } = useBrokerAccounts();
+  const { data: globalSettings } = useGlobalSettings();
   // Trade page is REAL-MONEY ONLY. Filter out paper-mode rows.
-  // We silently pick the first real account — there's no UI switcher.
+  // We pick the first switched-on real account, preferring one that is
+  // logged in (the backend 400s an order on an account with no token).
   const realAccounts = useMemo<BrokerAccount[]>(
-    () => (accounts?.filter((a) => !a.paper_mode && a.enabled) ?? []),
+    () => (accounts?.filter((a) => !a.paper_mode && a.enabled) ?? [])
+      .sort((a, b) => Number(!!b.access_token) - Number(!!a.access_token)),
     [accounts],
   );
-  const accountId: number | null = realAccounts.length > 0 ? realAccounts[0].id : null;
+  const account = realAccounts[0]?.access_token ? realAccounts[0] : null;
+  const accountId: number | null = account?.id ?? null;
+  // Why this page can't place orders, in words the operator can act on.
+  // The Fyers switch on the Dashboard is the paper/live master switch:
+  // off means the bot is in paper mode and this page has no account.
+  const noAccountReason: string | null = account ? null
+    : accounts === undefined ? "Loading the broker account…"
+    : !accounts.some((a) => !a.paper_mode) ? "No Fyers account yet. Add and log in to one on the Accounts page to place orders."
+    : realAccounts.length === 0 ? "Paper mode: Fyers trading is switched off. Turn the Fyers switch on in the Dashboard to place real orders here."
+    : "Fyers is not logged in. Log in on the Accounts page to place orders.";
+  const botMode = globalSettings?.global?.TRADING_MODE;
   // Server identity (public IP). Surfaced in the place-order
   // error banner when Fyers rejects with the IP-whitelist
   // error so the operator can copy the IP into the Fyers app
@@ -990,7 +1022,7 @@ export default function Trade() {
   // `product` defaults to intraday; exits and reversals of a carry position
   // pass its own product so the order nets it off at Fyers.
   const orderFor = (sym: string, name: string, qty: number, productType: ProductType = "INTRADAY") => async (o: ChartOrder): Promise<string> => {
-    if (!accountId) throw new Error("no live Fyers account connected");
+    if (!accountId) throw new Error(noAccountReason ?? "no live Fyers account connected");
     if (!(qty > 0)) throw new Error("quantity must be more than 0");
     const r = await chartPlace.mutateAsync({
       account_id: accountId,
@@ -1038,7 +1070,7 @@ export default function Trade() {
     lotSize: selected && selected.lot_size > 1 ? selected.lot_size : 1,
     limit: limitNum, stop: stopNum, ltp: ltp ?? null, entry: estPrice ?? null, sl: slAbs, tp: tpAbs,
   };
-  const problem = !selected ? "Pick a symbol." : !accountId ? "Connect a live Fyers account to place orders."
+  const problem = !selected ? "Pick a symbol." : !accountId ? noAccountReason
     : lotUnknown ? "Lot size unknown for this contract." : ticketProblem(check);
   const canSubmit = problem == null;
   const ticketWarn = canSubmit ? ticketWarning(check) : null;
@@ -1314,7 +1346,7 @@ export default function Trade() {
               accountId={accountId}
               privacy={privacy}
               connected={accountId != null}
-              accountLabel={realAccounts[0] ? `${realAccounts[0].name} · INR` : ""}
+              accountLabel={account ? `${account.name} · INR` : ""}
               selected={selected}
               closeFor={closeFor}
               levelsFor={levelsFor}
@@ -1484,8 +1516,21 @@ export default function Trade() {
                   )}
                 </section>
                 {/* TICKET */}
-                <section className="trade-card" data-testid="trade-ticket">
-                  <h2>Ticket</h2>
+                <section className={`trade-card${account ? " ticket-live" : ""}`} data-testid="trade-ticket">
+                  <h2>
+                    Ticket{" "}
+                    <TicketModeBadge account={account} botMode={botMode} />
+                  </h2>
+                  {!account && noAccountReason && (
+                    <div className="hint warn-text" data-testid="ticket-mode-note">{noAccountReason}</div>
+                  )}
+                  {account && botMode === "paper" && (
+                    // The bot's TRADING_MODE only steers its own signals; a
+                    // manual order here always goes to the broker.
+                    <div className="hint warn-text" data-testid="ticket-mode-note">
+                      The bot is in paper mode, but orders from this page still go to Fyers with real money.
+                    </div>
+                  )}
                   <div className="ticket-side" role="group" aria-label="side">
                     <button
                       className={`ticket-side-btn buy ${side === "BUY" ? "on" : ""}`}
@@ -1655,6 +1700,7 @@ export default function Trade() {
                       disabled={!canSubmit || placeOrder.isPending}
                       onClick={() => onSubmit()}
                       data-testid="ticket-submit"
+                      title={account ? `Sends a real ${side} order to Fyers (${account.name})` : undefined}
                     >
                       {placeOrder.isPending ? "placing…" : `PLACE ${side}`}
                     </button>

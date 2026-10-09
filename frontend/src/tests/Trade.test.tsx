@@ -278,6 +278,47 @@ describe("Trade page", () => {
     expect(await screen.findByTestId("ticket-submit")).toBeDisabled();
   });
 
+  it("labels the ticket LIVE with the account it trades", async () => {
+    globalThis.fetch = makeFetchStub(defaultStubs());
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    const badge = await screen.findByTestId("ticket-mode");
+    await waitFor(() => expect(badge).toHaveTextContent("LIVE · REAL MONEY · Fyers Live"));
+    expect(screen.queryByTestId("ticket-mode-note")).toBeNull();
+  });
+
+  it("says orders are still real when the bot is in paper mode", async () => {
+    const base = defaultStubs();
+    globalThis.fetch = makeFetchStub((url, init) =>
+      url.endsWith("/api/settings") ? makeJsonResponse({ global: { TRADING_MODE: "paper" } }) : base(url, init));
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await waitFor(() => expect(screen.getByTestId("ticket-mode-note")).toHaveTextContent("still go to Fyers with real money"));
+  });
+
+  it("explains paper mode when the Fyers switch is off", async () => {
+    globalThis.fetch = makeFetchStub((url) => {
+      if (url.includes("/api/broker-accounts")) return makeJsonResponse({ accounts: [{ ...REAL_ACCOUNT, enabled: false }, PAPER_ACCOUNT] });
+      if (url.includes("/api/orders/pending")) return makeJsonResponse({ ok: true, count: 0, orders: [] });
+      if (url.includes("/api/positions")) return makeJsonResponse([]);
+      return makeJsonResponse({ ok: true, count: 0, hits: [] }, 200);
+    });
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await waitFor(() => expect(screen.getByTestId("ticket-mode-note")).toHaveTextContent("Turn the Fyers switch on in the Dashboard"));
+    expect(screen.getByTestId("ticket-mode")).toHaveTextContent("ORDERS OFF");
+    expect(screen.getByTestId("ticket-submit")).toBeDisabled();
+  });
+
+  it("blocks the ticket when the Fyers account is not logged in", async () => {
+    globalThis.fetch = makeFetchStub((url) => {
+      if (url.includes("/api/broker-accounts")) return makeJsonResponse({ accounts: [{ ...REAL_ACCOUNT, access_token: null }] });
+      if (url.includes("/api/orders/pending")) return makeJsonResponse({ ok: true, count: 0, orders: [] });
+      if (url.includes("/api/positions")) return makeJsonResponse([]);
+      return makeJsonResponse({ ok: true, count: 0, hits: [] }, 200);
+    });
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await waitFor(() => expect(screen.getByTestId("ticket-mode-note")).toHaveTextContent("Fyers is not logged in"));
+    expect(screen.getByTestId("ticket-submit")).toBeDisabled();
+  });
+
   it("disables the place button when no symbol is selected", async () => {
     globalThis.fetch = makeFetchStub(defaultStubs());
     const qc = makeQc();
