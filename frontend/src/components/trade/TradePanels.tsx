@@ -92,6 +92,46 @@ function LiveDot({ symbol }: { symbol: string }) {
   return <span className={`wl-live${live ? " on" : ""}`} title={live ? "Live — ticking" : seen ? "No tick in the last 15s" : "No live ticks yet"} />;
 }
 
+const label = (h: InstrumentHit) => h.short_name || h.symbol;
+
+/** Keep only usable rows, once each, with the fields the table reads. Used on
+ *  imported files and on lists read back from storage. */
+export function cleanWatchItems(raw: unknown): InstrumentHit[] {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<string>();
+  const out: InstrumentHit[] = [];
+  for (const h of raw as InstrumentHit[]) {
+    if (!h || typeof h.symbol !== "string" || !h.symbol.trim()) continue;
+    const key = h.symbol.toUpperCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ ...h, short_name: h.short_name || h.symbol.replace(/^[A-Z]+:/, "").replace(/-(EQ|INDEX)$/, ""), display: h.display || h.symbol });
+  }
+  return out;
+}
+
+const askName = (msg: string, cur?: string) => {
+  const v = window.prompt(msg, cur)?.trim();
+  return v ? v.slice(0, 40) : null;
+};
+
+/** One watchlist row's prices: the live push stream when it is ticking,
+ *  else the 5s REST snapshot. */
+function WatchPrices({ symbol, quote }: { symbol: string; quote: Quote | undefined }) {
+  const live = useLiveQuote(symbol);
+  const tick = live && !live.simulated && live.last_price ? live : null;
+  const ltp = tick?.last_price ?? quote?.ltp ?? null;
+  const chg = tick?.change ?? quote?.change ?? null;
+  const pct = tick?.change_pct ?? quote?.change_pct ?? null;
+  return (
+    <>
+      <span>{ltp == null ? "—" : ltp.toFixed(2)}</span>
+      <span className={chg == null ? "" : chg >= 0 ? "up" : "down"}>{chg == null ? "—" : `${chg >= 0 ? "+" : ""}${chg.toFixed(2)}`}</span>
+      <span className={pct == null ? "" : pct >= 0 ? "up" : "down"}>{pct == null ? "—" : `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`}</span>
+    </>
+  );
+}
+
 export function WatchlistTable({
   state,
   quotes,
@@ -119,22 +159,31 @@ export function WatchlistTable({
   const rows = useMemo(() => {
     const items = [...(list?.items ?? [])];
     if (!sort) return items;
-    const val = (h: InstrumentHit): number | string => {
+    const val = (h: InstrumentHit): number | null => {
       const x = quotes?.[h.symbol.toUpperCase()];
-      if (sort.key === "symbol") return h.short_name;
-      if (sort.key === "last") return x?.ltp ?? -Infinity;
-      if (sort.key === "chg") return x?.change ?? -Infinity;
-      return x?.change_pct ?? -Infinity;
+      if (sort.key === "last") return x?.ltp ?? null;
+      if (sort.key === "chg") return x?.change ?? null;
+      return x?.change_pct ?? null;
     };
+    if (sort.key === "symbol") return items.sort((a, b) => label(a).localeCompare(label(b)) * sort.dir);
+    // Rows with no quote yet stay at the bottom in both directions (the old
+    // -Infinity made two unquoted rows compare as NaN and scrambled the order).
     return items.sort((a, b) => {
       const va = val(a), vb = val(b);
-      return (typeof va === "string" ? va.localeCompare(String(vb)) : (va as number) - (vb as number)) * sort.dir;
+      if (va == null || vb == null) return va == null ? (vb == null ? 0 : 1) : -1;
+      return (va - vb) * sort.dir;
     });
   }, [list, sort, quotes]);
+  // Removing a row drops its flag too, so re-adding the symbol later starts clean.
+  const remove = (sym: string) => {
+    const flags = { ...(list?.flags ?? {}) };
+    delete flags[sym];
+    putList({ items: (list?.items ?? []).filter((i) => i.symbol !== sym), flags });
+  };
   const putList = (patch: Partial<WatchList>) => onChange({ ...state, lists: state.lists.map((l, i) => (i === state.active ? { ...l, ...patch } : l)) });
-  const head = (k: SortKey, label: string) => (
+  const head = (k: SortKey, text: string) => (
     <button type="button" className={`wl-sort${sort?.key === k ? " on" : ""}`} onClick={() => setSort((s) => (s?.key === k ? (s.dir === 1 ? { key: k, dir: -1 } : null) : { key: k, dir: 1 }))} title="Sort">
-      {label}{sort?.key === k ? (sort.dir === 1 ? " ▴" : " ▾") : ""}
+      {text}{sort?.key === k ? (sort.dir === 1 ? " ▴" : " ▾") : ""}
     </button>
   );
   if (!list) return null;
@@ -152,12 +201,12 @@ export function WatchlistTable({
               ))}
               <div className="chart-menu-sep" />
               <button type="button" className="chart-menu-item" onClick={() => {
-                const name = window.prompt("New list name");
+                const name = askName("New list name");
                 if (name) onChange({ active: state.lists.length, lists: [...state.lists, { name, items: [] }] });
                 setListMenu(false);
               }}>+ Create new list…</button>
               <button type="button" className="chart-menu-item" onClick={() => {
-                const name = window.prompt("Rename list", list.name);
+                const name = askName("Rename list", list.name);
                 if (name) putList({ name });
                 setListMenu(false);
               }}>Rename…</button>
@@ -195,9 +244,12 @@ export function WatchlistTable({
             if (!f) return;
             try {
               const raw = JSON.parse(await f.text()) as Partial<WatchList> | InstrumentHit[];
-              const items = (Array.isArray(raw) ? raw : raw.items ?? []).filter((h) => h && typeof h.symbol === "string");
-              const name = (!Array.isArray(raw) && raw.name) || f.name.replace(/\.json$/i, "");
-              onChange({ active: state.lists.length, lists: [...state.lists, { name, items, flags: Array.isArray(raw) ? {} : raw.flags }] });
+              if (!raw || typeof raw !== "object") throw new Error("not a list");
+              const items = cleanWatchItems(Array.isArray(raw) ? raw : raw.items);
+              if (!items.length) throw new Error("no symbols");
+              const name = (!Array.isArray(raw) && typeof raw.name === "string" && raw.name.trim()) || f.name.replace(/\.json$/i, "");
+              const flags = !Array.isArray(raw) && raw.flags && typeof raw.flags === "object" ? raw.flags : {};
+              onChange({ active: state.lists.length, lists: [...state.lists, { name, items, flags }] });
             } catch {
               window.alert("That file isn't an exported watchlist.");
             }
@@ -214,12 +266,8 @@ export function WatchlistTable({
             <span>{head("chgp", "Chg%")}</span>
             <span />
           </div>
-          {rows.map((h) => {
-            const x = q(h);
-            const pct = x?.change_pct ?? null;
-            const chg = x?.change ?? null;
+          {rows.map((h, idx) => {
             const flag = list.flags?.[h.symbol];
-            const idx = rows.findIndex((i) => i.symbol === h.symbol);
             return (
               <div
                 key={h.symbol}
@@ -227,10 +275,20 @@ export function WatchlistTable({
                 tabIndex={0}
                 className={`tv-watch-row wl-row${selected === h.symbol ? " on" : ""}`}
                 onClick={() => onSelect(h)}
-                onKeyDown={(e) => { if (e.key === "Enter") onSelect(h); }}
+                onKeyDown={(e) => {
+                  if (e.target !== e.currentTarget) return;
+                  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelect(h); }
+                  else if (e.key === "Delete") remove(h.symbol);
+                  else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                    e.preventDefault();
+                    const sib = e.key === "ArrowDown" ? e.currentTarget.nextElementSibling : e.currentTarget.previousElementSibling;
+                    if (sib instanceof HTMLElement && sib.tabIndex === 0) sib.focus();
+                  }
+                }}
                 onContextMenu={(e) => { e.preventDefault(); setMenu({ sym: h.symbol, x: e.clientX, y: e.clientY }); }}
                 draggable
-                onDragStart={() => { dragFrom.current = idx; }}
+                onDragStart={(e) => { dragFrom.current = idx; e.dataTransfer?.setData("text/plain", h.symbol); }}
+                onDragEnd={() => { dragFrom.current = null; }}
                 onDragOver={(e) => e.preventDefault()}
                 onDrop={() => {
                   const from = dragFrom.current;
@@ -243,15 +301,13 @@ export function WatchlistTable({
                   putList({ items });
                   setSort(null);
                 }}
-                title={`${h.symbol} — right-click for options, drag ⋮ to reorder`}
+                title={`${h.symbol} — right-click for options, drag to reorder, Delete removes`}
                 data-testid={`recent-chip-${h.symbol}`}
                 style={flag ? { boxShadow: `inset 3px 0 ${flag}` } : undefined}
               >
-                <span className="sym"><span className="wl-grip" aria-hidden="true">⋮</span><LiveDot symbol={h.symbol} />{h.short_name}</span>
-                <span>{x ? x.ltp.toFixed(2) : "—"}</span>
-                <span className={chg == null ? "" : chg >= 0 ? "up" : "down"}>{chg == null ? "—" : `${chg >= 0 ? "+" : ""}${chg.toFixed(2)}`}</span>
-                <span className={pct == null ? "" : pct >= 0 ? "up" : "down"}>{pct == null ? "—" : `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%`}</span>
-                <button type="button" className="x" title="Remove from watchlist" onClick={(e) => { e.stopPropagation(); putList({ items: list.items.filter((i) => i.symbol !== h.symbol) }); }}>×</button>
+                <span className="sym"><span className="wl-grip" aria-hidden="true">⋮</span><LiveDot symbol={h.symbol} />{label(h)}</span>
+                <WatchPrices symbol={h.symbol} quote={q(h)} />
+                <button type="button" className="x" title="Remove from watchlist" aria-label={`Remove ${label(h)}`} onClick={(e) => { e.stopPropagation(); remove(h.symbol); }}>×</button>
               </div>
             );
           })}
@@ -274,12 +330,20 @@ export function WatchlistTable({
                   <button key={i} type="button" className="chart-menu-item" data-testid={`wl-${how}-${i}`} onClick={() => {
                     const h = list.items.find((x) => x.symbol === menu.sym);
                     if (h) {
+                      // The row's flag travels with it; a move leaves no orphan flag behind.
+                      const flag = list.flags?.[h.symbol];
                       onChange({
                         ...state,
-                        lists: state.lists.map((y, j) =>
-                          j === i && !y.items.some((z) => z.symbol === h.symbol) ? { ...y, items: [...y.items, h] }
-                            : how === "move" && j === state.active ? { ...y, items: y.items.filter((z) => z.symbol !== h.symbol) }
-                              : y),
+                        lists: state.lists.map((y, j) => {
+                          if (j === i && !y.items.some((z) => z.symbol === h.symbol))
+                            return { ...y, items: [...y.items, h], flags: flag ? { ...(y.flags ?? {}), [h.symbol]: flag } : y.flags };
+                          if (how === "move" && j === state.active) {
+                            const flags = { ...(y.flags ?? {}) };
+                            delete flags[h.symbol];
+                            return { ...y, items: y.items.filter((z) => z.symbol !== h.symbol), flags };
+                          }
+                          return y;
+                        }),
                       });
                     }
                     setMenu(null);
@@ -289,7 +353,7 @@ export function WatchlistTable({
             </div>
           ))}
           <div className="chart-menu-sep" />
-          <button type="button" className="chart-menu-item ctx-sell" onClick={() => { putList({ items: list.items.filter((i) => i.symbol !== menu.sym) }); setMenu(null); }}>Remove from list</button>
+          <button type="button" className="chart-menu-item ctx-sell" onClick={() => { remove(menu.sym); setMenu(null); }}>Remove from list</button>
         </div>
       )}
     </div>
