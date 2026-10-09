@@ -981,7 +981,9 @@ export default function Trade() {
   // An order from a chart (right-click menu, scalper buttons) on the ticket's
   // account. Risk-blocked or rejected orders come back as errors (the ticket
   // is where a risk override is typed).
-  const orderFor = (sym: string, name: string, qty: number) => async (o: ChartOrder): Promise<string> => {
+  // `product` defaults to intraday; exits and reversals of a carry position
+  // pass its own product so the order nets it off at Fyers.
+  const orderFor = (sym: string, name: string, qty: number, productType: ProductType = "INTRADAY") => async (o: ChartOrder): Promise<string> => {
     if (!accountId) throw new Error("no live Fyers account connected");
     if (!(qty > 0)) throw new Error("quantity must be more than 0");
     const r = await chartPlace.mutateAsync({
@@ -992,7 +994,7 @@ export default function Trade() {
       order_type: o.type,
       limit_price: o.type === "LIMIT" ? o.price : o.type === "STOP_LOSS" ? o.limit ?? o.price : null,
       stop_price: o.type === "SL-M" || o.type === "STOP_LOSS" ? o.price : null,
-      product_type: "INTRADAY",
+      product_type: productType,
       bypass_risk: false,
       operator: "ui_chart",
     });
