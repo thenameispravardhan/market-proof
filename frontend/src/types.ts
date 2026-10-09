@@ -343,6 +343,15 @@ export interface ManagedPosition {
   signal_id: number | null;
   strategy_id: number | null;
   opened_at: string;
+  /** The bot is ratcheting the stop behind the best price. */
+  trail_active?: boolean;
+  /** The bot moved the stop to lock in a small profit. */
+  breakeven_armed?: boolean;
+  /** ISO time the bot force-closes the position (max hold), if any. */
+  time_exit_at?: string | null;
+  /** Consecutive broker exit failures, and whether they were escalated. */
+  exit_failures?: number;
+  exit_escalated?: boolean;
 }
 
 // ---- Trade page ----

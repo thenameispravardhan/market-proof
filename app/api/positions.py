@@ -50,23 +50,10 @@ def _trade_manager(request: Request) -> Any:
 @router.get("/managed")
 def list_managed(request: Request) -> list[dict[str, Any]]:
     """The live managed book: every open position with its entry,
-    stop-loss and target. This is what the TradeManager is watching."""
+    stop-loss and target, plus the exit state (trailing / breakeven /
+    time exit / failing exit) the TradeManager is acting on."""
     tm = _trade_manager(request)
-    out: list[dict[str, Any]] = []
-    for mp in tm.managed_positions():
-        out.append(
-            {
-                "symbol": mp.symbol,
-                "quantity": mp.quantity,
-                "entry": mp.entry,
-                "stop_loss": mp.stop_loss,
-                "target": mp.target,
-                "signal_id": mp.signal_id,
-                "strategy_id": mp.strategy_id,
-                "opened_at": mp.opened_at.isoformat(),
-            }
-        )
-    return out
+    return [mp.view() for mp in tm.managed_positions()]
 
 
 @router.post("/{symbol}/close")
@@ -90,6 +77,11 @@ async def update_levels(
     """Edit the stop-loss / target of an open position so the trade
     manager exits on the new levels. Pass null for a level to clear it."""
     tm = _trade_manager(request)
+    problem = await tm.check_levels(
+        symbol, stop_loss=body.stop_loss, target=body.target
+    )
+    if problem:
+        raise HTTPException(status_code=422, detail=problem)
     result = await tm.update_levels(
         symbol, stop_loss=body.stop_loss, target=body.target
     )
