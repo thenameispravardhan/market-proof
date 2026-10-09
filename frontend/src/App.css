@@ -3022,3 +3022,17 @@ a.chart-menu-item { text-decoration: none; color: var(--text); }
 /* With three or more dock panels open, the watchlist used to shrink to its
    search box with every row hidden; it now keeps room for a few rows. */
 .dock-panel[data-testid="dock-watch"] { min-height: 176px; }
+
+/* Trade ticket: which money it trades, always visible. */
+.mode-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  vertical-align: middle;
+}
+.mode-badge.live { background: var(--red); color: #fff; }
+.mode-badge.off { border: 1px solid var(--border); color: var(--text-dim); }
+.trade-card.ticket-live { box-shadow: inset 3px 0 0 var(--red); }
