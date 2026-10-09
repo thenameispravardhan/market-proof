@@ -919,3 +919,19 @@ def test_event_type_prefers_analyzer_detection_over_the_constant_column():
     assert _event_type(ann, SimpleNamespace(raw_response={"event_type": ""})) == "ANNOUNCEMENT"
     assert _event_type(ann, SimpleNamespace(raw_response=None)) == "ANNOUNCEMENT"
     assert _event_type(None, None) is None
+
+
+@pytest.mark.asyncio
+async def test_full_backfill_drops_the_cached_pending_count(db_session, isolated_db):
+    """A status poll that lands before the run snapshots its own count caches
+    the PRE-run figure; it must not outlive the run (it made the page say rows
+    were still waiting after they had all been enriched, and flaked
+    test_full_backfill_endpoint_and_status)."""
+    from app.services.dataset_builder import DatasetBuilder
+
+    builder = DatasetBuilder()
+    import time
+
+    builder._pending_cache = (time.monotonic(), {"signal": 7, "shadow": 0})
+    await builder.run_full()
+    assert builder.count_pending_cached() == {"signal": 0, "shadow": 0}

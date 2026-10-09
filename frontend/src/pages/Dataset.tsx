@@ -45,18 +45,6 @@ const CATEGORY_LABELS: Record<string, string> = {
   quality: "Data quality",
 };
 
-// Numeric label columns offered as the health panel's correlation target.
-const HEALTH_TARGETS = [
-  "ret_15m_pct",
-  "high_15m",
-  "mfe_15m_pct",
-  "mae_15m_pct",
-  "time_to_peak_min",
-  "retrace_from_peak_pct",
-  "move_30m_pct",
-  "r_multiple",
-];
-
 function agoText(iso: string | null | undefined): string {
   if (!iso) return "never";
   const t = new Date(iso.endsWith("Z") ? iso : iso + "Z").getTime();
@@ -247,10 +235,11 @@ export default function Dataset() {
   // corpus" when it is only the biggest in the newest N.
   const [sort, setSort] = useState<{ key: string; dir: 1 | -1 } | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
-  const [dedup, setDedup] = useState(true);
   const [healthOpen, setHealthOpen] = useState(false);
-  const [healthTarget, setHealthTarget] = useState("ret_15m_pct");
-  const { data: health } = useDatasetHealth(healthTarget, healthOpen);
+  // The announcement grain's market-adjusted 30-minute move; the API falls
+  // back to it for any target it does not have and lists the real choices.
+  const [healthTarget, setHealthTarget] = useState("adj_30m");
+  const { data: health } = useDatasetHealth(healthTarget, healthOpen, source);
   const [calibOpen, setCalibOpen] = useState(true);
   const [calibMove, setCalibMove] = useState(1.5);
   const [calibBig, setCalibBig] = useState(3.0);
@@ -342,8 +331,7 @@ export default function Dataset() {
     }
   };
 
-  const exportExtra: Record<string, string | number> = { limit: 20000, source };
-  if (dedup) exportExtra.dedup = "true";
+  const exportExtra: Record<string, string | number> = { source };
   const exportQs = datasetQueryString(filters, orderedSelection, exportExtra);
   const splitQs = (split: "train" | "val") =>
     datasetQueryString(filters, orderedSelection, {
@@ -368,6 +356,113 @@ export default function Dataset() {
           Dataset
         </h1>
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <button
+            className="chart-btn"
+            style={{ border: "1px solid var(--border)" }}
+            disabled={downloading !== null}
+            data-testid="dataset-export-parquet"
+            title="Every filing matching the filters below, as Parquet — typed, columnar and ~4x smaller than CSV. This is the one to train from: pandas/polars/DuckDB read it natively and load only the columns you need."
+            onClick={() => doExport(`/api/dataset/export?format=parquet&${exportQs}`, "Export Parquet")}
+          >
+            {downloading === "Export Parquet" ? "Preparing…" : "⤓ Export Parquet"}
+          </button>
+          <button
+            className="chart-btn"
+            style={{ border: "1px solid var(--border)" }}
+            disabled={downloading !== null}
+            onClick={() => doExport(`/api/dataset/export?format=csv&${exportQs}`, "Export CSV")}
+          >
+            {downloading === "Export CSV" ? "Preparing…" : "Export CSV"}
+          </button>
+          <button
+            className="chart-btn"
+            style={{ border: "1px solid var(--border)" }}
+            disabled={downloading !== null}
+            onClick={() => doExport(`/api/dataset/export?format=jsonl&${exportQs}`, "Export JSONL")}
+          >
+            {downloading === "Export JSONL" ? "Preparing…" : "Export JSONL"}
+          </button>
+          <button
+            className="chart-btn"
+            style={{ border: "1px solid var(--border)" }}
+            disabled={downloading !== null}
+            title="Oldest 80% of the filtered filings by announcement time — train on this"
+            onClick={() => doExport(`/api/dataset/export?format=csv&${splitQs("train")}`, "Train CSV")}
+          >
+            {downloading === "Train CSV" ? "Preparing…" : "Train CSV"}
+          </button>
+          <button
+            className="chart-btn"
+            style={{ border: "1px solid var(--border)" }}
+            disabled={downloading !== null}
+            title="Newest 20% of the filtered filings — validate on this (never random-split news data)"
+            onClick={() => doExport(`/api/dataset/export?format=csv&${splitQs("val")}`, "Val CSV")}
+          >
+            {downloading === "Val CSV" ? "Preparing…" : "Val CSV"}
+          </button>
+        </div>
+      </div>
+
+      {/* Coverage tiles */}
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))",
+          gap: 8,
+          marginBottom: 12,
+        }}
+      >
+        {[
+          // The announcement stats reuse the signal field names: `sources`
+          // splits history vs live-collected, `label_balance` is the
+          // market-adjusted 30-minute move at a ±1.5% bar.
+          {
+            label: "Filings (history + live)",
+            value: stats
+              ? `${stats.total_rows.toLocaleString("en-IN")} (${(
+                  stats.sources?.signal ?? 0
+                ).toLocaleString("en-IN")} + ${(
+                  stats.sources?.shadow ?? 0
+                ).toLocaleString("en-IN")})`
+              : "—",
+          },
+          {
+            label: "With prices",
+            value:
+              coveragePct !== null
+                ? `${complete.toLocaleString("en-IN")} (${coveragePct}%)`
+                : complete,
+          },
+          { label: "Awaiting prices", value: enrich["pending"] ?? 0 },
+          { label: "No price data", value: enrich["no_candles"] ?? 0 },
+          { label: "Filed after hours", value: enrich["after_hours"] ?? 0 },
+          {
+            label: "30m move up / down / flat (±1.5%)",
+            value: `${stats?.label_balance?.["UP"] ?? 0} / ${
+              stats?.label_balance?.["DOWN"] ?? 0
+            } / ${stats?.label_balance?.["FLAT"] ?? 0}`,
+          },
+          { label: "Columns", value: stats?.column_count ?? "—" },
+        ].map((t) => (
+          <div key={t.label} className="widget" style={{ padding: "10px 12px" }}>
+            <div className="meta" style={{ fontSize: 10 }}>{t.label}</div>
+            <div className="mono" style={{ fontSize: 18 }}>{t.value}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Bot-decision enrichment. These controls work on the filings the bot
+          ANALYSED (signal + shadow rows, 1-min candles) — the data the HOLD
+          calibration below reads — not on the announcement table at the
+          bottom. They used to sit in the page header, where they read as
+          "fill this table", which they never did. */}
+      <div className="widget widget-wide" style={{ marginBottom: 12, padding: "8px 14px" }}>
+        <h3 style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          Bot decision data
+          <span className="meta">
+            1-min candle features for the filings the bot analysed — feeds HOLD calibration
+          </span>
+          <span style={{ flex: 1 }} />
           <button
             className="chart-btn"
             style={{ border: "1px solid var(--border)" }}
@@ -396,187 +491,84 @@ export default function Dataset() {
             data-testid="dataset-backfill-rebuild"
             title="Re-enrich already-complete rows whose feature schema is out of date — use after a new feature set ships (e.g. the full minute-by-minute trajectory) to roll it over your existing history."
           >
-            ↻ Rebuild schema
+            ↻ Re-enrich old rows
           </button>
-          <button
-            className="chart-btn"
-            style={{ border: "1px solid var(--border)" }}
-            disabled={downloading !== null}
-            data-testid="dataset-export-parquet"
-            title="All 303k announcements as Parquet — typed, columnar and ~4x smaller than CSV. This is the one to train from: pandas/polars/DuckDB read it natively and a model can load 6 of the 97 columns without touching the rest."
-            onClick={() => doExport(`/api/dataset/export?format=parquet&${exportQs}`, "Export Parquet")}
-          >
-            {downloading === "Export Parquet" ? "Preparing…" : "⤓ Export Parquet"}
-          </button>
-          <button
-            className="chart-btn"
-            style={{ border: "1px solid var(--border)" }}
-            disabled={downloading !== null}
-            onClick={() => doExport(`/api/dataset/export?format=csv&${exportQs}`, "Export CSV")}
-          >
-            {downloading === "Export CSV" ? "Preparing…" : "Export CSV"}
-          </button>
-          <button
-            className="chart-btn"
-            style={{ border: "1px solid var(--border)" }}
-            disabled={downloading !== null}
-            onClick={() => doExport(`/api/dataset/export?format=jsonl&${exportQs}`, "Export JSONL")}
-          >
-            {downloading === "Export JSONL" ? "Preparing…" : "Export JSONL"}
-          </button>
-          <button
-            className="chart-btn"
-            style={{ border: "1px solid var(--border)" }}
-            disabled={downloading !== null}
-            title="Oldest 80% of the filtered set, chronological — train on this"
-            onClick={() => doExport(`/api/dataset/export?format=csv&${splitQs("train")}`, "Train CSV")}
-          >
-            {downloading === "Train CSV" ? "Preparing…" : "Train CSV"}
-          </button>
-          <button
-            className="chart-btn"
-            style={{ border: "1px solid var(--border)" }}
-            disabled={downloading !== null}
-            title="Newest 20% — validate on this (never random-split news data)"
-            onClick={() => doExport(`/api/dataset/export?format=csv&${splitQs("val")}`, "Val CSV")}
-          >
-            {downloading === "Val CSV" ? "Preparing…" : "Val CSV"}
-          </button>
-          <label
-            className="meta"
-            style={{ cursor: "pointer", whiteSpace: "nowrap" }}
-            title="Collapse NSE+BSE copies of the same news to one row — twins split across train/val fake your accuracy"
-          >
-            <input
-              type="checkbox"
-              checked={dedup}
-              onChange={(e) => setDedup(e.target.checked)}
-              style={{ marginRight: 4 }}
-            />
-            dedup cross-listings
-          </label>
-        </div>
-      </div>
-
-      {/* Live collector heartbeat — proof the continuous 2-min stream is on */}
-      {(() => {
-        const c = backfillStatus?.collector;
-        const on = c?.running ?? false;
-        return (
-          <div
-            className="widget widget-wide"
-            style={{
-              marginBottom: 12,
-              padding: "8px 14px",
-              display: "flex",
-              alignItems: "center",
-              gap: 12,
-              flexWrap: "wrap",
-            }}
-            data-testid="dataset-collector"
-          >
-            <span
-              className={`ws-status ${on ? "connected" : "disconnected"}`}
-              title={on ? "Auto-collector is running" : "Auto-collector is stopped"}
-              style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+        </h3>
+        {/* Live collector heartbeat — proof the continuous 2-min stream is on */}
+        {(() => {
+          const c = backfillStatus?.collector;
+          const on = c?.running ?? false;
+          return (
+            <div
+              style={{
+                marginBottom: 8,
+                display: "flex",
+                alignItems: "center",
+                gap: 12,
+                flexWrap: "wrap",
+              }}
+              data-testid="dataset-collector"
             >
-              <span className="dot" />
-              <span className="mono" style={{ fontSize: 12 }}>
-                LIVE COLLECTOR {on ? "ACTIVE" : "OFF"}
+              <span
+                className={`ws-status ${on ? "connected" : "disconnected"}`}
+                title={on ? "Auto-collector is running" : "Auto-collector is stopped"}
+                style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+              >
+                <span className="dot" />
+                <span className="mono" style={{ fontSize: 12 }}>
+                  LIVE COLLECTOR {on ? "ACTIVE" : "OFF"}
+                </span>
               </span>
-            </span>
-            <span className="meta">
-              {on
-                ? `every ${Math.round(c?.interval_s ?? 120)}s — new signals auto-fill with all fields ~16 min after firing`
-                : "not running (restart the bot to start the continuous stream)"}
-            </span>
-            {c && (
-              <span className="meta" style={{ marginLeft: "auto" }}>
-                last run {agoText(c.last_run_at)}
-                {on && c.next_run_at ? ` · next ${inText(c.next_run_at)}` : ""} ·{" "}
-                {c.runs} runs · +{c.enriched_session} enriched this session
+              <span className="meta">
+                {on
+                  ? `every ${Math.round(c?.interval_s ?? 120)}s — new signals auto-fill with all fields ~16 min after firing`
+                  : "not running (restart the bot to start the continuous stream)"}
               </span>
+              {c && (
+                <span className="meta" style={{ marginLeft: "auto" }}>
+                  last run {agoText(c.last_run_at)}
+                  {on && c.next_run_at ? ` · next ${inText(c.next_run_at)}` : ""} ·{" "}
+                  {c.runs} runs · +{c.enriched_session} enriched this session
+                </span>
+              )}
+            </div>
+          );
+        })()}
+
+        {/* Full-backfill live progress / pending line */}
+        {(fullRunning || (backfillStatus?.progress?.finished_at && (backfillStatus.progress.processed ?? 0) > 0)) && (
+          <p className="meta" style={{ marginBottom: 8 }}>
+            {fullRunning ? "⏳ Filling history: " : "History backfill done: "}
+            batch {backfillStatus?.progress?.batches ?? 0} —{" "}
+            {backfillStatus?.progress?.processed ?? 0} processed (
+            {backfillStatus?.progress?.complete ?? 0} complete,{" "}
+            {backfillStatus?.progress?.partial ?? 0} partial,{" "}
+            {backfillStatus?.progress?.after_hours ?? 0} after-hours,{" "}
+            {backfillStatus?.progress?.no_candles ?? 0} no candles)
+            {fullRunning && remainingTotal !== null && (
+              <> — ~{remainingTotal} rows remaining</>
             )}
-          </div>
-        );
-      })()}
+          </p>
+        )}
+        {!fullRunning && remainingTotal !== null && remainingTotal > 0 && (
+          <p className="meta" style={{ marginBottom: 8 }}>
+            {remainingTotal} rows await enrichment ({remaining!.signal} signal +{" "}
+            {remaining!.shadow} shadow) — "Fill entire history" processes them
+            all in the background.
+          </p>
+        )}
+        {backfill.data && !backfill.data.full && (
+          <p className="meta" style={{ marginBottom: 8 }}>
+            Enrichment batch: {backfill.data.processed} processed (
+            {backfill.data.shadow ?? 0} shadow) — {backfill.data.complete}{" "}
+            complete, {backfill.data.partial} partial,{" "}
+            {backfill.data.no_candles} without candles
+            {backfill.data.no_candles > 0 && " (is Fyers connected?)"},{" "}
+            {backfill.data.after_hours ?? 0} after-hours,{" "}
+            {backfill.data.too_old} too old, {backfill.data.errors} errors.
+          </p>
+        )}
 
-      {/* Full-backfill live progress / pending line */}
-      {(fullRunning || (backfillStatus?.progress?.finished_at && (backfillStatus.progress.processed ?? 0) > 0)) && (
-        <p className="meta" style={{ marginBottom: 8 }}>
-          {fullRunning ? "⏳ Filling history: " : "History backfill done: "}
-          batch {backfillStatus?.progress?.batches ?? 0} —{" "}
-          {backfillStatus?.progress?.processed ?? 0} processed (
-          {backfillStatus?.progress?.complete ?? 0} complete,{" "}
-          {backfillStatus?.progress?.partial ?? 0} partial,{" "}
-          {backfillStatus?.progress?.after_hours ?? 0} after-hours,{" "}
-          {backfillStatus?.progress?.no_candles ?? 0} no candles)
-          {fullRunning && remainingTotal !== null && (
-            <> — ~{remainingTotal} rows remaining</>
-          )}
-        </p>
-      )}
-      {!fullRunning && remainingTotal !== null && remainingTotal > 0 && (
-        <p className="meta" style={{ marginBottom: 8 }}>
-          {remainingTotal} rows await enrichment ({remaining!.signal} signal +{" "}
-          {remaining!.shadow} shadow) — "Fill entire history" processes them
-          all in the background.
-        </p>
-      )}
-      {backfill.data && !backfill.data.full && (
-        <p className="meta" style={{ marginBottom: 8 }}>
-          Enrichment batch: {backfill.data.processed} processed (
-          {backfill.data.shadow ?? 0} shadow) — {backfill.data.complete}{" "}
-          complete, {backfill.data.partial} partial,{" "}
-          {backfill.data.no_candles} without candles
-          {backfill.data.no_candles > 0 && " (is Fyers connected?)"},{" "}
-          {backfill.data.after_hours ?? 0} after-hours,{" "}
-          {backfill.data.too_old} too old, {backfill.data.errors} errors.
-        </p>
-      )}
-
-      {/* Coverage tiles */}
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))",
-          gap: 8,
-          marginBottom: 12,
-        }}
-      >
-        {[
-          {
-            label: "Rows (signal + shadow)",
-            value: stats
-              ? `${stats.total_rows} (${stats.sources?.signal ?? 0}+${
-                  stats.sources?.shadow ?? 0
-                })`
-              : "—",
-          },
-          {
-            label: "Enriched",
-            value:
-              coveragePct !== null ? `${complete} (${coveragePct}%)` : complete,
-          },
-          { label: "Partial", value: enrich["partial"] ?? 0 },
-          { label: "After hours", value: enrich["after_hours"] ?? 0 },
-          {
-            label: "Awaiting candles",
-            value: (enrich["pending"] ?? 0) + (enrich["no_candles"] ?? 0),
-          },
-          {
-            label: "Labels UP / DOWN / FLAT",
-            value: `${stats?.label_balance?.["UP"] ?? 0} / ${
-              stats?.label_balance?.["DOWN"] ?? 0
-            } / ${stats?.label_balance?.["FLAT"] ?? 0}`,
-          },
-          { label: "Columns", value: stats?.column_count ?? "—" },
-        ].map((t) => (
-          <div key={t.label} className="widget" style={{ padding: "10px 12px" }}>
-            <div className="meta" style={{ fontSize: 10 }}>{t.label}</div>
-            <div className="mono" style={{ fontSize: 18 }}>{t.value}</div>
-          </div>
-        ))}
       </div>
 
       {/* HOLD calibration — is the bot passing on movers? */}
@@ -919,12 +911,12 @@ export default function Dataset() {
                 onChange={(e) => setHealthTarget(e.target.value)}
                 style={{ width: "auto", padding: "2px 6px" }}
               >
-                {HEALTH_TARGETS.map((t) => (
+                {(health?.targets ?? [healthTarget]).map((t) => (
                   <option key={t} value={t}>{t}</option>
                 ))}
               </select>
               {health && (
-                <span className="meta">{health.rows_sampled} rows sampled</span>
+                <span className="meta">over {health.rows_sampled} rows</span>
               )}
             </>
           )}
@@ -1023,7 +1015,7 @@ export default function Dataset() {
           >
             <option value="">All events</option>
             {(stats?.by_event_type ?? [])
-              .filter((e) => e.event_type !== "UNKNOWN")
+              .filter((e) => e.event_type !== "UNKNOWN" && e.event_type !== "—")
               .map((e) => (
                 <option key={e.event_type} value={e.event_type}>
                   {e.event_type} ({e.samples})
@@ -1042,7 +1034,7 @@ export default function Dataset() {
               }
               style={{ marginRight: 4 }}
             />
-            enriched only
+            with prices only
           </label>
           <select
             value={limit}
@@ -1095,9 +1087,9 @@ export default function Dataset() {
           <p className="empty">Failed to load dataset: {error.message}</p>
         ) : !rowsResp || rowsResp.rows.length === 0 ? (
           <p className="empty">
-            No rows yet — every signal becomes a dataset row automatically
-            (outcome probes at +5m/+30m, then 1-min-candle enrichment ~16
-            minutes after the signal). Use “Enrich now” to backfill history.
+            {activeFilterCount > 0
+              ? "No filings match these filters."
+              : "No filings yet — every NSE/BSE announcement the bot collects lands here, and prices are filled after the market closes."}
           </p>
         ) : (
           <div className="dataset-scroll">
@@ -1148,7 +1140,7 @@ export default function Dataset() {
               </thead>
               <tbody>
                 {viewRows.map((r, i) => (
-                  <tr key={(r["outcome_id"] as number) ?? i}>
+                  <tr key={(r["uid"] as string) ?? i}>
                     {orderedSelection.map((k) => (
                       <td
                         key={k}
