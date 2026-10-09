@@ -852,6 +852,11 @@ export function useOptionChain(
     refetchInterval: (q) =>
       q.state.data && q.state.data.strikes.length > 0 ? 6000 : false,
     staleTime: 4000,
+    // A new expiry or strike count on the same underlying keeps the current
+    // ladder up until the new one lands: dropping to undefined blanked the
+    // chain (a stock's panel vanished) and remounted every scalper chart.
+    placeholderData: (prev, prevQuery) =>
+      prevQuery && prevQuery.queryKey[1] === symbol && prevQuery.queryKey[2] === underlying ? prev : undefined,
   });
 }
 
