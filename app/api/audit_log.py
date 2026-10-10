@@ -27,6 +27,7 @@ def _ser(e: AuditLog) -> dict[str, Any]:
         "before": e.before,
         "after": e.after,
         "created_at": e.created_at.isoformat() if e.created_at else None,
+        "row_hash": e.row_hash,
     }
 
 
@@ -48,3 +49,14 @@ def list_audit_log(
     stmt = stmt.limit(limit)
     rows = db.execute(stmt).scalars().all()
     return {"entries": [_ser(e) for e in rows], "count": len(rows)}
+
+
+@router.get("/verify")
+def verify_audit_chain(db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Recompute the audit hash chain. `ok: false` names the first row that
+    was edited, deleted or reordered. Compare `head_hash` with the one in
+    the daily health report to detect a wholesale rewrite."""
+    from app.services.audit_chain import seal_pending, verify_chain
+
+    seal_pending(db)
+    return verify_chain(db)

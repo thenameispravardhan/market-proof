@@ -109,7 +109,15 @@ def fill_symbol(con, symbol: str) -> int:
     if last_candle is None:
         return 0            # empty candle file: retry later, do not condemn
 
-    nif_src = candle_source(NIFTY_SYMBOL) or f"read_parquet('{NIFTY.as_posix()}')"
+    nif_src = candle_source(NIFTY_SYMBOL)
+    if nif_src is None:
+        # No index candles at all (fresh server, index export never synced).
+        # An empty relation keeps the stock's own prices filling; the
+        # market-adjusted columns already treat a missing NIFTY minute as a
+        # 0% market move. Pointing read_parquet at a file that does not exist
+        # made every fill raise and priced nothing.
+        nif_src = (f"read_parquet('{NIFTY.as_posix()}')" if NIFTY.exists() else
+                   "(SELECT NULL::TIMESTAMP AS datetime, NULL::DOUBLE AS close WHERE false)")
     con.execute(f"""
     CREATE OR REPLACE TEMP TABLE _fill AS
     WITH cand AS (

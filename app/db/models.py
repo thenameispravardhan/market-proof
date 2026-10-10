@@ -579,6 +579,12 @@ class AuditLog(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=_utcnow, nullable=False, index=True
     )
+    # Hash chain (app/services/audit_chain.py). Filled by the sealer a
+    # second or so after insert, in id order: row_hash = sha256(prev_hash +
+    # canonical row). Editing or deleting a sealed row breaks every later
+    # link, which GET /api/audit-log/verify reports.
+    prev_hash: Mapped[Optional[str]] = mapped_column(String(64))
+    row_hash: Mapped[Optional[str]] = mapped_column(String(64), index=True)
 
     __table_args__ = (Index("ix_audit_log_action_time", "action", "created_at"),)
 
