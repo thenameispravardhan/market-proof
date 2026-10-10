@@ -9,6 +9,7 @@ Run via this module:
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -64,6 +65,11 @@ from app.notifications.manager import NotificationManager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Heavy jobs (calibration, backtests, backfill) run in threads on this
+    # single worker; with the default 5ms GIL switch interval every request
+    # handoff waits behind them (measured: 3ms call -> p90 76ms, max 0.67s).
+    # 1ms hands the GIL back to the event loop 5x sooner.
+    sys.setswitchinterval(0.001)
     settings = get_settings()
     configure_logging(settings.LOG_LEVEL)
     log = get_logger("app.lifespan")
@@ -626,6 +632,10 @@ class CorrelationIdMiddleware(BaseHTTPMiddleware):
             correlation_id_var.reset(token)
         elapsed_ms = (time.perf_counter() - start) * 1000
         response.headers[self.HEADER] = cid
+        if request.url.path.startswith("/assets/") and response.status_code == 200:
+            # Vite content-hashes every asset filename, so a cached copy can
+            # never go stale; skip the per-load revalidation round-trips.
+            response.headers["cache-control"] = "private, max-age=31536000, immutable"
         log.info(
             "http.request",
             method=request.method,
@@ -705,7 +715,8 @@ if _DIST_DIR.is_dir() and (_DIST_DIR / "index.html").is_file():
         if not index.is_file():
             return {"detail": "frontend not built"}
         from fastapi.responses import FileResponse
-        return FileResponse(str(index))
+        # Always revalidate the shell so a deploy's new asset hashes load.
+        return FileResponse(str(index), headers={"cache-control": "no-cache"})
 else:
     log_path_msg = f"no static frontend at {_DIST_DIR} (run scripts/run.sh to build)"
     print(f"[startup] {log_path_msg}")
