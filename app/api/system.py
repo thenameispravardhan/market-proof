@@ -303,3 +303,18 @@ def backup_status_endpoint() -> dict[str, Any]:
         "max_age_hours": float(getattr(get_settings(), "BACKUP_MAX_AGE_HOURS", 0) or 0),
         "status": backup_status(),
     }
+
+
+@router.get("/exchange-lists")
+def exchange_lists_status() -> dict[str, Any]:
+    """Loaded state of the ASM / GSM / F&O-ban lists the pre-entry gates use."""
+    from app.services.exchange_lists import lists
+
+    return lists.status()
+
+
+@router.post("/exchange-lists/refresh")
+async def exchange_lists_refresh() -> dict[str, Any]:
+    from app.services.exchange_lists import lists
+
+    return await lists.refresh(force=True)
