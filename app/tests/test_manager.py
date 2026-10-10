@@ -581,8 +581,9 @@ async def test_loop_processes_published_signal(db_session, isolated_db):
                 break
             await asyncio.sleep(0.05)
         assert n, "trade row was not created"
-        # Trade.executed event fired.
-        evt = sub.get_nowait()
+        # Trade.executed event fired. The row is written during placement,
+        # before the publish, so await the event rather than get_nowait().
+        evt = await asyncio.wait_for(sub.get(), timeout=2.0)
         assert evt.payload["symbol"] == "RELIANCE"
     finally:
         event_bus.unsubscribe(CHANNEL_TRADE_EXECUTED, sub)

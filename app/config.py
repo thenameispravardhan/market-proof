@@ -1,6 +1,7 @@
 """Application configuration loaded from environment / .env file."""
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from typing import Literal
 
@@ -17,7 +18,10 @@ class Settings(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        # Tests never read the operator's .env: a local override (e.g.
+        # POLL_INTERVAL_SECONDS=2) would make default-value tests pass in
+        # CI and fail on the dev machine.
+        env_file=None if os.environ.get("TESTING") == "1" else ".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",

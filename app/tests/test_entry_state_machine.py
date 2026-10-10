@@ -473,7 +473,10 @@ async def test_e11_ws_confirmation_wins_over_rest() -> None:
         backend=backend, symbol="RELIANCE", side=OrderSide.BUY,
         quantity=1000, signal_entry=100.0, stop_loss=97.0,
     ))
-    await asyncio.sleep(0.03)  # inside the WS window, before the REST mark
+    # Publish only once the order is placed: the manager subscribes before
+    # routing, so the event can't race ahead of the subscription. A fixed
+    # sleep here was flaky under a loaded full-suite run.
+    assert await wait_for(lambda: backend.orders)
     await event_bus.publish(
         CHANNEL_TRADES_FILLED,
         {"broker_order_id": "ORD-1", "price": 100.2, "status": "filled"},
