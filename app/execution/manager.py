@@ -1222,6 +1222,12 @@ class Manager:
         if not market_clock.is_entry_window():
             return ("MARKET_CLOSED",
                     market_clock.entry_block_reason() or "outside entry window")
+        # 2b. Exchange-side gates (each OFF by default). These are orders a
+        #     broker or the exchange would refuse anyway; refusing here
+        #     names the reason instead of bouncing an order.
+        exchange_block = await self._exchange_gate(signal, settings)
+        if exchange_block is not None:
+            return exchange_block
         # 3. Order-time staleness re-check.
         if filed_at is not None and not skip_staleness:
             fa = filed_at if filed_at.tzinfo is not None else filed_at.replace(tzinfo=timezone.utc)
@@ -1230,6 +1236,70 @@ class Manager:
             if age > max_age:
                 return ("STALE_AT_ORDER",
                         f"news aged {age:.0f}s > {max_age:.0f}s at order time")
+        return None
+
+    async def _check_lpp(
+        self, symbol: str, order_type: OrderType, limit_price: Optional[float]
+    ) -> None:
+        """GATE_LPP_ENABLED: refuse an F&O limit price outside NSE's Limit
+        Price Protection band before it is sent (the exchange rejects it
+        anyway, with a far less helpful message). Raises ValueError, which
+        the orders API returns as a 400. Skips when no reference price is
+        known — the exchange remains the backstop."""
+        if limit_price is None or order_type not in (OrderType.LIMIT, OrderType.STOP_LOSS):
+            return
+        if not bool(getattr(self._settings_provider(), "GATE_LPP_ENABLED", False)):
+            return
+        from app.algo import fno
+        from app.services.exchange_lists import lpp_band
+
+        sym = symbol.strip().upper()
+        kind = "FUT" if sym.endswith("FUT") else sym[-2:] if sym.endswith(("CE", "PE")) else None
+        underlying = fno.underlying_of(sym) if kind else None
+        if not kind or not underlying:
+            return
+        quote = await self._md.get_quote(sym)
+        ref = float(quote.last_price) if quote is not None and quote.last_price else None
+        if not ref:
+            return
+        low, high = lpp_band(ref, kind, index_underlying=underlying in fno.INDEX_LOTS)
+        if not (low <= float(limit_price) <= high):
+            raise ValueError(
+                f"limit {float(limit_price):.2f} is outside NSE's price-protection band "
+                f"{low:.2f}–{high:.2f} for {sym} (LTP {ref:.2f}); the exchange would reject it"
+            )
+
+    async def _exchange_gate(
+        self, signal: Signal, settings: Any
+    ) -> Optional[tuple[str, str]]:
+        """Surveillance (ASM/GSM/T2T) and circuit-proximity gates for an
+        intraday auto entry. Fails open when the data is unavailable — a
+        missing list or depth read must not stop all trading."""
+        from app.execution.symbols import resolve_fyers_symbol
+        from app.services.exchange_lists import circuit_headroom_pct, lists
+
+        symbol = str(getattr(signal, "symbol", "") or "")
+        if not symbol:
+            return None
+        broker_symbol = resolve_fyers_symbol(symbol) or symbol
+        if bool(getattr(settings, "GATE_SURVEILLANCE_ENABLED", False)):
+            why = lists.surveillance_reason(symbol, broker_symbol)
+            if why:
+                return ("SURVEILLANCE_LIST", why)
+        prox = float(getattr(settings, "GATE_CIRCUIT_PROXIMITY_PCT", 0.0) or 0.0)
+        if prox > 0:
+            from app.api.market import _fyers_backend
+
+            lower, upper = await lists.circuit_band(broker_symbol, _fyers_backend())
+            quote = await self._md.get_quote(symbol)
+            ltp = float(quote.last_price) if quote is not None and quote.last_price else None
+            side = str(getattr(signal, "action", "") or "").upper()
+            room = circuit_headroom_pct(side, ltp or 0.0, upper, lower)
+            if room is not None and room < prox:
+                edge = "upper" if side == "BUY" else "lower"
+                return ("NEAR_CIRCUIT",
+                        f"{symbol} is {room:.2f}% from its {edge} circuit "
+                        f"(min {prox:.2f}%) — a fill there is the day's worst price")
         return None
 
     # -- backend selection ---------------------------------------------
@@ -1400,6 +1470,8 @@ class Manager:
             product_enum = ProductType(product_type.upper())
         except ValueError as e:
             raise ValueError(f"unknown product_type {product_type!r}") from e
+
+        await self._check_lpp(symbol, type_enum, limit_price)
 
         # The risk engine expects an object with these attributes.
         from types import SimpleNamespace

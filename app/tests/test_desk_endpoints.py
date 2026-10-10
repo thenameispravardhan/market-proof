@@ -13,6 +13,7 @@ class _DepthClient:
     async def get_depth(self, symbol: str) -> dict:
         return {"s": "ok", "d": {symbol: {
             "totalbuyqty": 1200, "totalsellqty": 800, "ltp": 100.5,
+            "upper_ckt": 110.55, "lower_ckt": 90.45,
             "bids": [{"price": 100.4, "volume": 50, "ord": 3}, {"price": 0, "volume": 9, "ord": 1}],
             "ask": [{"price": 100.6, "volume": 70, "ord": 4}],
         }}}
@@ -23,7 +24,8 @@ def test_backend_normalises_fyers_depth() -> None:
     be._client = _DepthClient()  # noqa: SLF001
     book = asyncio.run(be.get_depth("NSE:SBIN-EQ"))
     assert book == {"bids": [[100.4, 50.0, 3.0]], "asks": [[100.6, 70.0, 4.0]],
-                    "total_buy": 1200.0, "total_sell": 800.0, "ltp": 100.5}
+                    "total_buy": 1200.0, "total_sell": 800.0, "ltp": 100.5,
+                    "upper_circuit": 110.55, "lower_circuit": 90.45}
 
 
 def test_depth_degrades_without_fyers(client: TestClient, monkeypatch) -> None:

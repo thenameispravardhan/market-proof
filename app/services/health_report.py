@@ -420,6 +420,23 @@ async def compile_preflight() -> list[str]:
     if backup:
         problems.append(backup)
 
+    # Exchange lists for the opt-in gates: load them before the open so the
+    # first signal is checked against today's lists, and say so if NSE
+    # would not serve them (the gates then fail open).
+    s = get_settings()
+    if bool(getattr(s, "GATE_SURVEILLANCE_ENABLED", False)) or bool(getattr(s, "GATE_FNO_BAN_ENABLED", False)):
+        from app.services.exchange_lists import lists
+
+        try:
+            st = await lists.refresh()
+            for name, err in (st.get("errors") or {}).items():
+                problems.append(
+                    f"Could not load NSE {name.upper()} list ({err}) — that gate will let "
+                    "trades through until it loads."
+                )
+        except Exception as e:  # noqa: BLE001
+            problems.append(f"Exchange-list refresh failed ({e}).")
+
     return problems
 
 
