@@ -85,6 +85,9 @@ AIdataset/model/*
 # machine dies — these two are the only way to regenerate it.
 !AIdataset/model/export_live.py
 !AIdataset/model/train.py
+# The discriminative mover scorer for the DGX Spark (classification head on
+# an LM encoder + market features). Its runs/ output stays ignored.
+!AIdataset/model/train_mover_head.py
 # The SLM server. The WEIGHTS live on Hugging Face (2.9 GB — git is the wrong
 # place for them); this is the ~150-line script that serves them, and the bot
 # is useless with LLM_PROVIDER=slm unless a reader can start one.
