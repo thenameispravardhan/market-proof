@@ -255,3 +255,32 @@ def roc_auc(scores: Sequence[float], labels: Sequence[int]) -> Optional[float]:
         rank_sum += avg * sum(1 for k in range(i, j + 1) if pairs[k][1])
         i = j + 1
     return (rank_sum - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+
+
+def paired_auc_difference(a: Sequence[float], b: Sequence[float], y: Sequence[int], *,
+                          n_boot: int = 1000, seed: int = 7) -> dict:
+    """AUC(b) - AUC(a) on the SAME rows, with a paired bootstrap CI.
+
+    Paired resampling (one index draw shared by both scores) is what makes
+    a small difference detectable: the per-filing difficulty cancels."""
+    a, b, y = list(a), list(b), list(y)
+    base_a, base_b = roc_auc(a, y), roc_auc(b, y)
+    if base_a is None or base_b is None:
+        return {"n": len(y), "auc_a": base_a, "auc_b": base_b, "diff": None, "ci95": [None, None]}
+    rng = random.Random(seed)
+    n = len(y)
+    diffs = []
+    for _ in range(n_boot):
+        idx = [rng.randrange(n) for _ in range(n)]
+        ya = [y[i] for i in idx]
+        da = roc_auc([a[i] for i in idx], ya)
+        db = roc_auc([b[i] for i in idx], ya)
+        if da is not None and db is not None:
+            diffs.append(db - da)
+    diffs.sort()
+    lo = diffs[int(0.025 * (len(diffs) - 1))] if diffs else None
+    hi = diffs[int(0.975 * (len(diffs) - 1))] if diffs else None
+    return {"n": n, "auc_a": round(base_a, 4), "auc_b": round(base_b, 4),
+            "diff": round(base_b - base_a, 4),
+            "ci95": [None if lo is None else round(lo, 4), None if hi is None else round(hi, 4)],
+            "ci_excludes_zero": bool(lo is not None and (lo > 0 or hi < 0))}

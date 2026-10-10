@@ -77,6 +77,7 @@ from sqlalchemy.orm import Session
 
 from app.analyzer.deepseek_client import DeepSeekClient, DeepSeekError
 from app.analyzer.slm_adapter import build_prompt as slm_build_prompt
+from app.analyzer.slm_adapter import market_context_for as slm_market_context
 from app.analyzer.slm_adapter import to_analysis as slm_to_analysis
 from app.analyzer.fast_track import (
     FastTrackMatch,
@@ -849,6 +850,7 @@ class Service:
                     filed_at=str(announcement.filed_at or ""),
                     headline=announcement.headline or "",
                     filing_text=extraction.text if (extraction and extraction.ok) else "",
+                    **slm_market_context(announcement.symbol or "", filed_at),
                 )
             ds_result = await asyncio.wait_for(
                 llm.complete(
@@ -1012,6 +1014,21 @@ class Service:
             CHANNEL_NEW_SIGNAL,
             _signal_payload(signal, response, analysis_dict, approved=approved),
         )
+        # Step 9b: shadow-score the same filing with the SLM (record only,
+        # after the live signal is out — see app/analyzer/shadow.py).
+        if not is_slm:
+            try:
+                from app.analyzer.shadow import shadow_scorer
+
+                shadow_scorer.schedule(
+                    announcement_id=announcement_id, analysis_id=signal.analysis_id,
+                    signal_id=signal.id, symbol=announcement.symbol or "",
+                    headline=announcement.headline or "", filed_at=filed_at,
+                    filing_text=extraction.text if (extraction and extraction.ok) else "",
+                    pdf_url=announcement.pdf_url or "",
+                )
+            except Exception:  # noqa: BLE001 — shadow can never cost a signal
+                log.exception("analyzer.shadow_schedule_failed")
         # Best-effort audit trail.
         try:
             from app.services.audit_service import log_event
