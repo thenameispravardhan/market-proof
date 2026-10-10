@@ -1155,19 +1155,72 @@ def optimize(spec: dict, data: dict[str, dict], grid: list[dict[str, Any]], metr
         raise ValueError(f"{len(combos)} combinations — keep it between 1 and {MAX_COMBOS}")
     caches: dict[str, dict] = {}
     rows = []
+    daily_by_combo: list[dict[int, float]] = []
+    capital = 0.0
     for combo in combos:
         s = copy.deepcopy(spec)
         for (path, _), v in zip(axes, combo):
             set_path(s, path, v)
         s = normalize(s)
-        full = run(s, data, caches, trade_from, oos_from)["stats"]
+        capital = float(s["portfolio"]["capital"])
+        res = run(s, data, caches, trade_from, oos_from)
+        full = res["stats"]
+        # Daily net P&L of the SELECTION sample (in-sample when there is an
+        # OOS split): the series the overfitting statistics are computed on.
+        day_net: dict[int, float] = {}
+        for x in res["trades"]:
+            if oos_from is None or x["entry_t"] < oos_from:
+                k = (x["exit_t"] + IST) // 86400
+                day_net[k] = day_net.get(k, 0.0) + x["net"]
+        daily_by_combo.append(day_net)
         st = full["in_sample"] if oos_from else full
         rows.append({"params": {p: v for (p, _), v in zip(axes, combo)},
                      **{k: st.get(k) for k in ("trades", "win_rate", "net_pnl", "profit_factor", "sharpe", "sortino",
                                                "calmar", "max_drawdown", "max_drawdown_pct", "return_pct",
                                                "expectancy", "t_stat")},
                      "oos": full.get("out_of_sample")})
+    for r, d in zip(rows, daily_by_combo):
+        r["_daily"] = d
     ok = [r for r in rows if r["trades"] >= min_trades]
     ok.sort(key=lambda r: (r[metric] is not None, r[metric] or 0), reverse=True)
+    over = overfitting_stats([r["_daily"] for r in ok], capital, n_trials=len(combos))
+    for r in rows:
+        r.pop("_daily", None)
     return {"combos": len(combos), "ranked": ok[:100],
-            "too_few_trades": len(rows) - len(ok), "metric": metric}
+            "too_few_trades": len(rows) - len(ok), "metric": metric,
+            "overfitting": over}
+
+
+def overfitting_stats(daily: list[dict[int, float]], capital: float, *, n_trials: int) -> Optional[dict[str, Any]]:
+    """Deflated Sharpe Ratio of the top-ranked configuration and the
+    Probability of Backtest Overfitting across all ranked ones.
+
+    `daily` is in rank order (best first), one {day: net P&L} per
+    configuration. Days a configuration did not trade count as a 0 return.
+    `n_trials` is EVERY combination tried, not just the ranked ones: the
+    deflation is only honest with the full count of attempts."""
+    from app.research import stats as rstats
+
+    if not daily or not capital:
+        return None
+    days = sorted({k for d in daily for k in d})
+    if len(days) < 10:
+        return {"note": "fewer than 10 trading days in the selection sample; not computed"}
+    matrix = [[d.get(k, 0.0) / capital for d in daily] for k in days]
+    best = [row[0] for row in matrix]
+    trial_sr = []
+    for j in range(len(daily)):
+        col = [row[j] for row in matrix]
+        sd = rstats.stdev(col)
+        if sd:
+            trial_sr.append(sum(col) / len(col) / sd)
+    out: dict[str, Any] = {
+        "days": len(days),
+        "deflated_sharpe": rstats.deflated_sharpe(best, n_trials=max(1, n_trials),
+                                                  trial_sharpes=trial_sr if len(trial_sr) > 1 else None),
+    }
+    # 8 blocks = 70 in/out combinations: enough for a stable estimate, cheap
+    # next to the up-to-400 backtests the grid already ran.
+    splits = next((k for k in (8, 6, 4) if len(days) // k >= 2), None)
+    out["pbo"] = rstats.pbo_cscv(matrix, n_splits=splits) if splits and len(daily) >= 2 else None
+    return out

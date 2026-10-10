@@ -19,7 +19,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -246,3 +246,107 @@ async def research_results_xbrl(url: str = Query(..., description="exchange-host
         return await fetch_and_parse(url)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "reason": f"fetch failed: {str(e)[:200]}"}
+
+
+# ---------------------------------------------------------------------------
+# Pre-registered evaluation windows
+# ---------------------------------------------------------------------------
+
+
+@router.get("/windows")
+def list_windows(db: Session = Depends(get_db)) -> dict[str, Any]:
+    from app.db.models import EvaluationWindow
+    from app.research import windows
+
+    rows = db.execute(select(EvaluationWindow).order_by(EvaluationWindow.id.desc()).limit(20)).scalars().all()
+    return {"windows": [windows.report(db, w) for w in rows]}
+
+
+@router.post("/windows")
+def start_window(payload: dict[str, Any] = Body(...), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Declare a window: {name, hypothesis, weeks}. The decision-relevant
+    configuration is hashed now; changing it before the end invalidates the
+    window as evidence (and the report says which key moved)."""
+    from app.research import windows
+
+    try:
+        w = windows.start(db, name=str(payload.get("name") or "paper window"),
+                          hypothesis=str(payload.get("hypothesis") or ""),
+                          weeks=int(payload.get("weeks") or 6))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return windows.report(db, w)
+
+
+@router.post("/windows/{window_id}/close")
+def close_window(window_id: int, abandon: bool = Query(False), db: Session = Depends(get_db)) -> dict[str, Any]:
+    from app.research import windows
+
+    try:
+        w = windows.close(db, window_id, abandon=abandon)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return windows.report(db, w)
+
+
+# ---------------------------------------------------------------------------
+# Per-signal "why" card
+# ---------------------------------------------------------------------------
+
+
+@router.get("/why/{signal_id}")
+def why(signal_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Everything behind one decision on one card: the filing, what the
+    model said and why, the numbers it read, the rule that fired, every
+    risk check that blocked it, and what the price did afterwards."""
+    from app.db.models import RiskEvent, Trade
+
+    sig = db.get(Signal, signal_id)
+    if sig is None:
+        raise HTTPException(status_code=404, detail="signal not found")
+    an = db.get(Analysis, sig.analysis_id) if sig.analysis_id else None
+    ann = db.get(Announcement, an.announcement_id) if an is not None else None
+    raw = (an.raw_response or {}) if an is not None else {}
+    parsed = raw.get("parsed") if isinstance(raw.get("parsed"), dict) else raw
+    risk = [
+        {"code": e.event_type, "message": e.message, "at": e.created_at.isoformat() if e.created_at else None}
+        # risk_events has no signal column (the id lives in JSON context), so
+        # scan only the window in which this signal could have been gated.
+        for e in db.execute(select(RiskEvent).where(
+            RiskEvent.created_at >= sig.created_at - timedelta(minutes=1),
+            RiskEvent.created_at <= sig.created_at + timedelta(minutes=15),
+        ).order_by(RiskEvent.id)).scalars()
+        if isinstance(e.context, dict) and e.context.get("signal_id") == signal_id
+    ]
+    trades = [
+        {"side": t.side, "qty": t.quantity, "price": t.price, "status": t.status, "pnl": t.pnl,
+         "r_multiple": t.r_multiple, "slippage_pct": t.slippage_pct, "order_type": t.order_type}
+        for t in db.execute(select(Trade).where(Trade.signal_id == signal_id).order_by(Trade.id)).scalars()
+    ]
+    out = db.execute(select(SignalOutcome).where(SignalOutcome.signal_id == signal_id)).scalars().first()
+    rationale = sig.rationale or ""
+    return {
+        "signal": {"id": sig.id, "symbol": sig.symbol, "action": sig.action, "status": sig.status,
+                   "confidence": sig.confidence, "created_at": sig.created_at.isoformat() if sig.created_at else None,
+                   "rule_id": sig.rule_id, "rule_rationale": rationale.split(" | ")[0].strip()},
+        "block_reason": rp.block_reason(sig.status, rationale),
+        "filing": None if ann is None else {
+            "headline": ann.headline, "event_type": ann.event_type, "exchange": ann.exchange,
+            "pdf_url": ann.pdf_url, "filed_at": ann.filed_at.isoformat() if ann.filed_at else None,
+            "received_at": ann.received_at.isoformat() if ann.received_at else None},
+        "analysis": None if an is None else {
+            "model": an.model, "sentiment": an.sentiment, "sentiment_score": an.sentiment_score,
+            "confidence": an.confidence, "recommendation": an.recommendation,
+            "summary": parsed.get("summary") if isinstance(parsed, dict) else None,
+            "reasoning": (parsed.get("reasoning") if isinstance(parsed, dict) else None) or an.rationale,
+            "key_numbers": parsed.get("key_numbers") if isinstance(parsed, dict) else None,
+            "timings": raw.get("timings"),
+            "saw_filing_text": bool((raw.get("pdf_extraction") or {}).get("ok")) if isinstance(raw.get("pdf_extraction"), dict) else False},
+        "risk_checks_blocked": risk,
+        "orders": trades,
+        "outcome": None if out is None else {
+            "price_at_signal": out.price_at_signal, "move_5m_pct": out.move_5m_pct,
+            "move_30m_pct": out.move_30m_pct, "note": out.note},
+    }

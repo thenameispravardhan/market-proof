@@ -237,6 +237,34 @@ class ShadowAnalysis(Base):
 
 
 # =========================================================================
+# Research: pre-registered evaluation windows
+# =========================================================================
+#
+# A paper-trading window declared BEFORE it runs: hypothesis, length and a
+# hash of every decision-relevant setting, rule and prompt. A result counts
+# as out-of-sample evidence only if the configuration was not touched while
+# the window ran. app/research/windows.py checks that and reports which keys
+# changed if it was.
+
+
+class EvaluationWindow(Base):
+    __tablename__ = "evaluation_windows"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    hypothesis: Mapped[str] = mapped_column(Text, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    ends_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    config_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="active", nullable=False)  # active | closed | abandoned
+    # First observed configuration change inside the window: {"at", "changes"}.
+    violation: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
+    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+
+
+# =========================================================================
 # Core: dataset features (the ML training-set enrichment per signal)
 # =========================================================================
 #

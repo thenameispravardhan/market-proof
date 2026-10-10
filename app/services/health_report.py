@@ -187,7 +187,27 @@ def compile_health_report(
         "fyers_ws_last_tick": _ws_last_tick(market_data),
         "db_size_mb": _db_size_mb(),
         "audit_chain_head": _audit_head(db),
+        "evaluation_window": _window_status(db),
     }
+
+
+def _window_status(db: Session) -> Optional[str]:
+    """Daily integrity check of the active pre-registered window. Running
+    it here catches a configuration change within a day, even if nobody
+    opens the Research page."""
+    try:
+        from sqlalchemy import select as _select
+
+        from app.db.models import EvaluationWindow
+        from app.research.windows import check
+
+        w = db.execute(_select(EvaluationWindow).where(EvaluationWindow.status == "active")).scalars().first()
+        if w is None:
+            return None
+        v = check(db, w)
+        return f"{w.name}: {'frozen' if v is None else 'CONFIG CHANGED ' + v['at'][:16]}"
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _audit_head(db: Session) -> Optional[str]:
@@ -228,6 +248,8 @@ def format_report(report: dict[str, Any]) -> tuple[str, str]:
     ]
     if report.get("db_size_mb") is not None:
         lines.append(f"Database size:              {report['db_size_mb']} MB")
+    if report.get("evaluation_window"):
+        lines.append(f"Evaluation window:          {report['evaluation_window']}")
     if report.get("audit_chain_head"):
         lines.append(f"Audit chain head:           {report['audit_chain_head']}")
     return subject, "\n".join(lines)

@@ -3050,3 +3050,6 @@ a.chart-menu-item { text-decoration: none; color: var(--text); }
   border: 1px solid var(--amber);
   color: var(--amber);
 }
+
+/* Research page: wide tables scroll inside their panel on narrow screens. */
+.research-page .widget { overflow-x: auto; }

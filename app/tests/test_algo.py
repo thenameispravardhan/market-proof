@@ -665,3 +665,25 @@ def test_estimate_counts_minute_data_once_not_per_symbol() -> None:
     assert not engine.needs_minutes(rv)   # RVOL only needs candle volume
     est = _estimate_bars(s, 0, 30 * 86400)
     assert est < MAX_BARS and est < 100_000
+
+
+def test_optimizer_reports_deflated_sharpe_and_pbo():
+    """Every grid search carries the two overfitting corrections; too short
+    a sample says so instead of printing a number."""
+    closes = [100 + (i % 20) for i in range(400)]
+    spec = _cross_spec(exit_long=None, target={"type": "pct", "value": 1})
+    res = engine.optimize(spec, {"X": bars(closes)}, [
+        {"path": "entry_long.conditions.0.right.value", "values": [104, 108, 112]}], "net_pnl", min_trades=1)
+    assert "note" in res["overfitting"]
+    assert all("_daily" not in r for r in res["ranked"])
+
+
+def test_overfitting_stats_use_the_full_trial_count():
+    import random
+
+    rng = random.Random(4)
+    daily = [{d: rng.gauss(500 if j == 0 else 0, 2000) for d in range(60)} for j in range(12)]
+    out = engine.overfitting_stats(daily, 1_000_000, n_trials=40)
+    assert out["days"] == 60 and out["deflated_sharpe"]["n_trials"] == 40
+    assert 0.0 <= out["deflated_sharpe"]["dsr"] <= 1.0
+    assert 0.0 <= out["pbo"]["pbo"] <= 1.0 and out["pbo"]["n_configs"] == 12
