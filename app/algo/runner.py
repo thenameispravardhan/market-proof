@@ -42,6 +42,7 @@ from sqlalchemy import func, select
 
 from app.algo import data, engine, fno
 from app.algo import indicators
+from app.config import get_settings
 from app.db import session as db_session
 from app.db.models import AlgoStrategy, AlgoTrade, BrokerAccount
 from app.logging_config import get_logger
@@ -720,6 +721,13 @@ class AlgoRunner:
 
     async def _enter(self, s: dict, sym: str, side: str, d: dict, now: float, book: dict) -> None:
         spec, inst, pf = s["spec"], s["spec"]["instrument"], s["spec"]["portfolio"]
+        if inst["type"] != "equity" and bool(getattr(get_settings(), "GATE_FNO_BAN_ENABLED", False)):
+            from app.services.exchange_lists import lists
+
+            why = lists.fno_ban_reason(fno.fno_name(sym))
+            if why:
+                self.event("info", f"{s['name']}: {side} {sym} skipped — {why}", strategy_id=s["id"])
+                return
         u = (await _ltp([sym])).get(sym.upper())
         if u is None:
             self.event("error", f"{s['name']}: {side} {sym} skipped — no live price (no synthetic fills)",

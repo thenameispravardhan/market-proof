@@ -3038,3 +3038,18 @@ a.chart-menu-item { text-decoration: none; color: var(--text); }
 .mode-badge.live { background: var(--red); color: #fff; }
 .mode-badge.off { border: 1px solid var(--border); color: var(--text-dim); }
 .trade-card.ticket-live { box-shadow: inset 3px 0 0 var(--red); }
+
+/* Readiness banner (pre-market Fyers self-test + backup state). */
+.mode-banner.readiness-error {
+  background: var(--red-bg);
+  border: 1px solid var(--red);
+  color: var(--red);
+}
+.mode-banner.readiness-warn {
+  background: var(--amber-bg);
+  border: 1px solid var(--amber);
+  color: var(--amber);
+}
+
+/* Research page: wide tables scroll inside their panel on narrow screens. */
+.research-page .widget { overflow-x: auto; }

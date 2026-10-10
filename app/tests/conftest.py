@@ -108,3 +108,15 @@ def _reset_order_reconcile_state():
     for m in (orc.PARKED, orc.LEVELS_ON_FILL, orc.ORDER_WAITERS, orc.RECENT_TERMINAL):
         m.clear()
     yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_guards():
+    """Module-level throttles (order-rate buckets, postback cooldowns) must
+    not carry one test's history into the next."""
+    from app.api import fyers_postback
+    from app.execution import order_rate_limiter
+
+    order_rate_limiter.reset()
+    fyers_postback._reset_guards()
+    yield

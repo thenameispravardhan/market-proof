@@ -202,9 +202,9 @@ GROUPS: list[dict[str, Any]] = [
         "id": "resources",
         "title": "Host resources",
         "note": "RAM and disk watchdog for the 2 GB server. Drives the Dashboard's "
-                "Resources section and the 09:05 preflight alarm — an OOM kill and a "
+                "Resources section and the pre-market preflight alarm — an OOM kill and a "
                 "full disk have each cost a full trading day. 0 disables a check.",
-        "prefixes": ["RESOURCE_"],
+        "prefixes": ["RESOURCE_", "BACKUP_"],
     },
     {
         "id": "perf_sizer",
@@ -232,6 +232,18 @@ GROUPS: list[dict[str, Any]] = [
         "title": "Telemetry & reports",
         "note": "Outcome logging and the daily health report. No trading influence.",
         "prefixes": ["OUTCOME_LOGGER_ENABLED", "HEALTH_REPORT_", "LOG_LEVEL"],
+    },
+    {
+        "id": "compliance",
+        "title": "Broker & exchange compliance",
+        "note": "SEBI retail-algo rules (Fyers, from April 2026): daily 2FA login, a "
+                "type-200 app on a whitelisted static IP, under 10 orders/second per "
+                "app, plus exchange-side gates (surveillance lists, circuits, F&O ban, "
+                "limit price protection). Gates default off; the self-test only alarms.",
+        "prefixes": [
+            "FYERS_SELFTEST_ENABLED", "FYERS_REQUIRED_APP_TYPE", "FYERS_WHITELISTED_IPS",
+            "FYERS_EGRESS_IP_URL", "ORDER_RATE_", "GATE_",
+        ],
     },
     {
         "id": "mode",
@@ -268,6 +280,10 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "MAX_NEWS_AGE_ABSOLUTE_SECONDS": (0, 86400),
     "NSE_RSS_POLL_SECONDS": (0, 60),           # 0 = follow the global interval
     "POLL_INTERVAL_SECONDS": (1, 3600),
+    "ORDER_RATE_LIMIT_PER_SEC": (0, 10),       # 10/s is the SEBI no-registration ceiling
+    "ORDER_RATE_MAX_WAIT_SECONDS": (0, 10),
+    "GATE_CIRCUIT_PROXIMITY_PCT": (0, 20),
+    "BACKUP_MAX_AGE_HOURS": (0, 720),
     "LLM_MAX_TOKENS": (250, 4000),             # <250 truncates the JSON → lost signal
     "ATR_PERIOD": (2, 200),
     "PORTFOLIO_VALUE": (1000, 1e12),
@@ -293,6 +309,8 @@ LABELS: dict[str, str] = {
     "LLM_PROVIDER": "AI model (DeepSeek or our fine-tuned SLM)",
     "LLM_SLM_ENDPOINT": "SLM endpoint (OpenAI-compatible /chat/completions)",
     "LLM_SLM_MODEL": "SLM model name",
+    "LLM_SHADOW_ENABLED": "Shadow-score every filing with the SLM (record only)",
+    "LLM_SHADOW_TIMEOUT_SECONDS": "SLM shadow call timeout (seconds)",
     "LLM_MAX_TOKENS": "AI max output tokens",
     "LLM_TIMEOUT_SECONDS": "AI call timeout (seconds)",
     "LLM_MAX_RETRIES": "AI retries",
@@ -310,6 +328,7 @@ LABELS: dict[str, str] = {
     "ATR_STOP_MULT": "ATR stop multiple (×)",
     "RESOURCE_WARN_MEM_PCT": "Warn when memory used exceeds (%)",
     "RESOURCE_WARN_DISK_PCT": "Warn when disk used exceeds (%)",
+    "BACKUP_MAX_AGE_HOURS": "Alarm when the newest backup is older than (hours, 0 = off)",
     "MODEL_ENABLED": "Score filings with the mover model (telemetry only)",
     "MODEL_GATE_ENABLED": "Let a low model score BLOCK a trade",
     "MODEL_VARIANT": "Model variant (blank = artifact default)",
@@ -328,6 +347,16 @@ LABELS: dict[str, str] = {
     "CAP_TRADE_MID": "Trade mid caps",
     "CAP_TRADE_SMALL": "Trade small caps",
     "CAP_TRADE_UNKNOWN": "Trade symbols with no known market cap",
+    "FYERS_SELFTEST_ENABLED": "Pre-market Fyers self-test",
+    "FYERS_REQUIRED_APP_TYPE": "Required Fyers app type (blank = don't check)",
+    "FYERS_WHITELISTED_IPS": "Fyers whitelisted static IPs (comma-separated)",
+    "FYERS_EGRESS_IP_URL": "Egress-IP echo URL",
+    "ORDER_RATE_LIMIT_PER_SEC": "Order rate limit per app (orders/s, 0 = off)",
+    "ORDER_RATE_MAX_WAIT_SECONDS": "Max wait for an order-rate slot (seconds)",
+    "GATE_SURVEILLANCE_ENABLED": "Block intraday entries on ASM/GSM/T2T symbols",
+    "GATE_CIRCUIT_PROXIMITY_PCT": "Skip entries this close to the circuit (%, 0 = off)",
+    "GATE_FNO_BAN_ENABLED": "Algo Lab: block new positions in F&O-ban symbols",
+    "GATE_LPP_ENABLED": "Algo Lab: keep option limits inside NSE price protection",
     "QUOTE_PREFETCH_ENABLED": "Give rules the live quote (price, change %)",
     "AI_SCHEDULE_ENABLED": "Turn AI analysis on/off automatically",
     "AI_SCHEDULE_START_IST": "AI analysis ON at (IST)",

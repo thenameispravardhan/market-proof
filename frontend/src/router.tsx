@@ -14,6 +14,7 @@ export type TabKey =
   | "outcomes"
   | "dataset"
   | "model"
+  | "research"
   | "prompts"
   | "rules"
   | "strategies"
@@ -31,6 +32,7 @@ const VALID_TABS = new Set<TabKey>([
   "outcomes",
   "dataset",
   "model",
+  "research",
   "prompts",
   "rules",
   "strategies",

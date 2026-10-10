@@ -42,6 +42,41 @@ class Settings(BaseSettings):
     # the postback is real).
     FYERS_POSTBACK_SECRET: str = ""
 
+    # ---------- SEBI retail-algo compliance (Fyers, from 2026-04-01) ----
+    # Pre-market self-test (app/services/fyers_selftest.py), run inside the
+    # preflight. Since April 2026 the token needs a DAILY 2FA login with no
+    # refresh session, orders are accepted only from a type-200 app, and
+    # only from the whitelisted static IP — each one fails silently until
+    # the first order. Alarm only: it never blocks anything.
+    FYERS_SELFTEST_ENABLED: bool = True
+    # App type order placement needs (the app-id suffix: XC123-200).
+    # Blank disables the check.
+    FYERS_REQUIRED_APP_TYPE: str = "200"
+    # Comma-separated static IPv4(s) mapped to the app on myapi.fyers.in.
+    # Blank = the egress check only reports the address, never fails.
+    FYERS_WHITELISTED_IPS: str = ""
+    # Plain-text "what is my IP" echo used to read the server's egress IPv4.
+    FYERS_EGRESS_IP_URL: str = "https://api.ipify.org"
+    # Shared order-rate budget, per Fyers app (one API key = one 10 orders/s
+    # exchange budget, shared by the news bot, manual orders and the Algo
+    # Lab). Counts placements, modifications and cancels. Calls past the
+    # budget wait up to ORDER_RATE_MAX_WAIT_SECONDS, then are refused
+    # locally as "rate-limited, not placed". 0 disables the limiter.
+    ORDER_RATE_LIMIT_PER_SEC: float = 5.0
+    ORDER_RATE_MAX_WAIT_SECONDS: float = 1.0
+    # Pre-entry exchange gates. All OFF by default (current behaviour).
+    # Surveillance: refuse intraday (MIS) entries on ASM/GSM-listed and
+    # trade-to-trade (BE/BZ series) symbols — brokers reject MIS there.
+    GATE_SURVEILLANCE_ENABLED: bool = False
+    # Circuit proximity: refuse a BUY within this % of the upper circuit
+    # (SELL near the lower). 0 = off.
+    GATE_CIRCUIT_PROXIMITY_PCT: float = 0.0
+    # Algo Lab derivatives: refuse NEW positions in symbols on NSE's F&O
+    # ban list, and keep option limit prices inside NSE's Limit Price
+    # Protection band.
+    GATE_FNO_BAN_ENABLED: bool = False
+    GATE_LPP_ENABLED: bool = False
+
     # ---------- Storage ----------
     # Ignored if TESTING=1 (in-memory sqlite is used).
     DATABASE_URL: str = "sqlite:///./data/trading.db"
@@ -84,12 +119,14 @@ class Settings(BaseSettings):
     #                       context. Pure telemetry — it can never block.
     #   MODEL_GATE_ENABLED  additionally allow a low score to VETO a trade.
     #
-    # Both default OFF, so shipping this changes nothing until the operator
-    # opts in (non-destructive evolution, PROJECT.txt §25). The gate is the
-    # one that needs the argument: Phase 5 measured the pooled headroom over
-    # the base rate at under 1pp, so a hard pre-filter is a real risk of
-    # throwing away trades for a model that cannot see much.
-    MODEL_ENABLED: bool = False
+    # The score is ON by default: it is a dot product attached to the risk
+    # decision's context, wrapped fail-open, and it can never block (R14 in
+    # app/risk/engine.py). Every day it is off is a day of live,
+    # out-of-sample scores not recorded. The GATE stays OFF: Phase 5
+    # measured the pooled headroom over the base rate at under 1pp, so a
+    # hard pre-filter risks throwing away trades for a model that cannot
+    # see much. Turn it on only after the Model page replay supports it.
+    MODEL_ENABLED: bool = True
     MODEL_GATE_ENABLED: bool = False
     # Which trained variant to score with. Empty = the artifact's own
     # default_variant. The Model page lists every key with its holdout AUC.
@@ -108,10 +145,15 @@ class Settings(BaseSettings):
     # resources have already cost a trading day: an OOM kill on
     # 2026-08-15 (uvicorn at 1.5 GB anon-rss) and three SQLite
     # corruptions. These two thresholds drive the Dashboard's Resources
-    # section AND the 09:05 preflight alarm, so the warning arrives
+    # section AND the pre-market preflight alarm, so the warning arrives
     # before the open rather than during it. 0 disables a check.
     RESOURCE_WARN_MEM_PCT: float = 85.0
     RESOURCE_WARN_DISK_PCT: float = 85.0
+    # Preflight alarm when the newest data/backups/trading-*.db is older
+    # than this (the nightly cron stopped, or was never installed), or when
+    # backup.sh reported a failed offsite upload. 72h covers a weekend
+    # (Friday 18:30 → Monday 08:45 is 62h). 0 disables the check.
+    BACKUP_MAX_AGE_HOURS: float = 72.0
 
     # ---------- Risk defaults (per-strategy overrides in DB) ----------
     # Per-trade capital-at-risk cap. RISK.md targets 0.75%; the graduated
@@ -399,14 +441,15 @@ class Settings(BaseSettings):
     # notification channel whose events filter includes "report".
     HEALTH_REPORT_ENABLED: bool = True
     HEALTH_REPORT_TIME_IST: str = "15:45"
-    # Pre-open preflight, fired by the same service. Publishes on
+    # Pre-open preflight, fired by the same service (08:45: early enough
+    # to do the daily Fyers 2FA login before the 09:00 pre-open). Publishes on
     # `system.error` ONLY when something is wrong, so a silent morning
     # means "good to trade". Guards the two failures that have each cost
     # a whole trading day without showing up until the market was
     # already running: an expired Fyers token (every entry blocks
     # NO_LIVE_PRICE) and AI analysis left switched off (skipped filings
     # are placeholder-marked and never re-analysed). Empty = off.
-    HEALTH_REPORT_PREFLIGHT_TIME_IST: str = "09:05"
+    HEALTH_REPORT_PREFLIGHT_TIME_IST: str = "08:45"
     LLM_TIMEOUT_SECONDS: float = 12.0         # discard the opportunity past this
     # Hard cap on LLM completion tokens. Generation latency scales almost
     # linearly with output length, and a signal JSON needs only a few
@@ -442,6 +485,15 @@ class Settings(BaseSettings):
     # without --api-key). Secret, so it is .env-only — never returned by
     # GET /api/settings.
     LLM_SLM_API_KEY: str = ""
+    # Shadow mode: with DeepSeek live, ALSO send every LLM-track filing to
+    # the SLM endpoint after the live signal is out, and store its verdict
+    # in shadow_analyses. Never on the decision path, never delays a trade;
+    # it builds the paired, leak-free comparison (same filings, measured
+    # outcome) that has to show a CI clear of zero before LLM_PROVIDER=slm.
+    # OFF by default; needs LLM_SLM_ENDPOINT.
+    LLM_SHADOW_ENABLED: bool = False
+    # The SLM on CPU takes ~36 s per filing; on the DGX Spark well under 2 s.
+    LLM_SHADOW_TIMEOUT_SECONDS: float = 90.0
     # Hard end-to-end deadline (seconds from `filed_at` to signal). If a
     # fully-analysed announcement is older than this by the time the
     # signal would be created, the analysis is still stored (data for

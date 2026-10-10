@@ -40,6 +40,7 @@ from app.api import (
     positions as positions_api,
     prompts as prompts_api,
     risk as risk_api,
+    research as research_api,
     rules as rules_api,
     search as search_api,
     settings_api,
@@ -367,6 +368,11 @@ async def lifespan(app: FastAPI):
         )
         health_report_service.start()
         app.state.health_report_service = health_report_service
+        # Buffered audit writer + hash-chain sealer. The analyzer's
+        # `signal.created` entries go through it (log_event).
+        from app.services.audit_service import audit_service
+
+        audit_service.start()
 
         # Portfolio circuit-breaker monitor (RISK.md §4): periodically
         # rolls the day/week/month equity anchors, trips the daily /
@@ -566,6 +572,8 @@ async def lifespan(app: FastAPI):
             outcome_logger.stop()
             dataset_builder.stop()
             health_report_service.stop()
+            audit_service.stop()
+            await audit_service.wait_until_stopped()
             await dataset_builder.wait_until_stopped()
             await health_report_service.wait_until_stopped()
             await analyzer_service.wait_until_stopped()
@@ -664,6 +672,7 @@ app.include_router(model_api.router)
 app.include_router(system_api.router)
 app.include_router(algo_api.router)
 app.include_router(snapshots_api.router)
+app.include_router(research_api.router)
 
 
 # -------------------------------------------------------------------------

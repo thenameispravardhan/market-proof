@@ -141,6 +141,24 @@ def adverse_drift_pct(side: OrderSide | str, anchor: float, live: float) -> floa
     return (float(anchor) - float(live)) / float(anchor) * 100.0
 
 
+def _clamp_to_known_band(symbol: str, price: float) -> float:
+    try:
+        from app.execution.symbols import resolve_fyers_symbol
+        from app.services.exchange_lists import clamp_to_band, lists
+
+        lower, upper = lists.cached_band(resolve_fyers_symbol(symbol) or symbol)
+        if lower is None and upper is None:
+            return price
+        clamped = clamp_to_band(price, lower, upper)
+        if clamped != round(price, 2):
+            log.info("entry.limit_clamped_to_band", symbol=symbol, limit=price,
+                     clamped=clamped, lower=lower, upper=upper)
+            return clamped
+    except Exception:  # noqa: BLE001 — a clamp failure must not block an entry
+        pass
+    return price
+
+
 def price_for_side(quote: Optional[Quote], side: OrderSide) -> Optional[float]:
     """The price we'd actually transact at: ask for a BUY, bid for a
     SELL, falling back to last trade when the book side is unknown."""
@@ -373,6 +391,11 @@ class EntryManager:
         attempt.transition(EntryState.ORDER_ROUTING)
         buffer = float(getattr(settings, "ENTRY_BUFFER_PCT", 0.2)) / 100.0
         limit_price = live * (1.0 + buffer) if side == OrderSide.BUY else live * (1.0 - buffer)
+        # Keep the marketable limit inside today's price band when it is
+        # known (the circuit gate caches it). A limit past the circuit is
+        # rejected by the exchange outright, the one outcome worse than a
+        # slightly less aggressive price.
+        limit_price = _clamp_to_known_band(attempt.symbol, limit_price)
         attempt.limit_price = limit_price
         broker_timeout = float(getattr(settings, "BROKER_ORDER_TIMEOUT_SECONDS", 3.0))
 

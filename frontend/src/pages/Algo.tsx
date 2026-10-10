@@ -123,7 +123,30 @@ type BtResult = {
   spec: Spec;
 };
 type OptRow = { params: Record<string, number>; trades: number; win_rate: number; net_pnl: number; profit_factor: number | null; sharpe: number | null; max_drawdown: number; return_pct: number; expectancy: number; t_stat: number | null; oos: Summary | null };
-type OptResult = { combos: number; ranked: OptRow[]; too_few_trades: number; metric: string; notes: { symbol: string; note: string }[]; elapsed_s: number; oos_from: number | null };
+type Overfitting = {
+  note?: string;
+  days?: number;
+  deflated_sharpe?: { dsr: number | null; n_trials: number; sharpe_per_period: number; benchmark_sharpe: number } | null;
+  pbo?: { pbo: number; splits: number; n_configs: number } | null;
+} | null;
+type OptResult = { combos: number; ranked: OptRow[]; too_few_trades: number; metric: string; notes: { symbol: string; note: string }[]; elapsed_s: number; oos_from: number | null; overfitting?: Overfitting };
+
+// One line under the optimiser table: is the winner better than the best of
+// N lucky draws (Deflated Sharpe), and how often does the in-sample winner
+// fall below the median out of sample (PBO)?
+export function overfittingLine(o: Overfitting | undefined): string | null {
+  if (!o) return null;
+  if (o.note) return `Overfitting check: ${o.note}.`;
+  const parts: string[] = [];
+  const d = o.deflated_sharpe;
+  if (d && d.dsr !== null && d.dsr !== undefined) {
+    parts.push(`Deflated Sharpe ${(d.dsr * 100).toFixed(0)}% after ${d.n_trials} trials${d.dsr < 0.95 ? " — the top row may be luck" : ""}`);
+  }
+  if (o.pbo) {
+    parts.push(`PBO ${(o.pbo.pbo * 100).toFixed(0)}%${o.pbo.pbo > 0.5 ? " — the in-sample winner usually loses out of sample" : ""}`);
+  }
+  return parts.length ? `Overfitting check: ${parts.join(" · ")}.` : null;
+}
 type Saved = { id: number; name: string; spec: Spec; enabled: boolean; mode: "paper" | "live"; account_id: number | null; closed_trades: number; realized_pnl: number; open_positions: number; version: number; versions: number };
 type Version = { version: number; spec: Spec; note: string | null; active: boolean; created_at: string | null; closed_trades: number; realized_pnl: number };
 type LiveLeg = { symbol: string; label?: string; act: number; qty: number; entry: number; exit?: number; ltp?: number | null };
@@ -1136,6 +1159,9 @@ function Optimizer({ spec, cat, range, onApply }: { spec: Spec; cat: Catalog; ra
       {run.error && <div className="pnl-neg">{errMsg(run.error)}</div>}
       {run.data && (
         <>
+          {overfittingLine(run.data.overfitting) && (
+            <div className="meta" style={{ marginBottom: 6 }} data-testid="overfitting-line">{overfittingLine(run.data.overfitting)}</div>
+          )}
           <div className="meta" style={{ marginBottom: 6 }}>{run.data.combos} combos in {run.data.elapsed_s}s · {run.data.too_few_trades} skipped for too few trades.{run.data.oos_from ? ` Ranked on the in-sample period only (before ${ist(run.data.oos_from)}); trust rows whose OOS columns hold up.` : " Beware overfitting — hold out an out-of-sample % to check."}</div>
           <div style={{ maxHeight: 480, overflow: "auto" }}>
             <table>

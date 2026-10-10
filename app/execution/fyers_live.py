@@ -452,18 +452,35 @@ class FyersClient:
         avoids that path entirely. See also
         https://pypi.org/project/fyers-apiv3/ for the SDK reference.
         """
+        await self._order_slot("place")
         return await self._request("POST", "/orders/sync", json_body=payload)
+
+    async def _order_slot(self, what: str) -> None:
+        """Draw on the app's shared order-rate budget (SEBI: <=10 orders/s
+        per app, counting placements, modifies and cancels). A refusal is
+        raised as a local 429 — the request was never sent, so every
+        caller's existing "rate-limited, not placed" handling applies."""
+        from app.execution.order_rate_limiter import OrderRateLimited, acquire_order_slot
+
+        try:
+            await acquire_order_slot(self._app_id, what)
+        except OrderRateLimited as e:
+            raise FyersAPIError(
+                f"local order-rate limit: {e}", status_code=429, retryable=True
+            ) from e
 
     async def cancel_order(self, order_id: str) -> dict[str, Any]:
         """DELETE /orders/sync {"id": <id>} — the v3 cancel. The bare
         /orders path hits the same Cloudflare anti-bot 403 that moved
         place_order to /orders/sync."""
+        await self._order_slot("cancel")
         return await self._request("DELETE", "/orders/sync", json_body={"id": order_id})
 
     async def modify_order(self, payload: dict[str, Any]) -> dict[str, Any]:
         """PATCH /orders/sync — the v3 modify of a PENDING order (the
         official SDK's `modify_order` hits the same /sync path). Payload:
         `{"id": <order id>, "qty"?, "type"?, "limitPrice"?, "stopPrice"?}`."""
+        await self._order_slot("modify")
         return await self._request("PATCH", "/orders/sync", json_body=payload)
 
     async def get_gtt_orders(self) -> dict[str, Any]:
@@ -474,6 +491,7 @@ class FyersClient:
     async def cancel_gtt(self, gtt_id: str) -> dict[str, Any]:
         """DELETE /gtt/orders/sync {"id": <id>} — cancel one GTT / OCO
         order (the SDK's `cancel_gtt_order`)."""
+        await self._order_slot("cancel_gtt")
         return await self._request("DELETE", "/gtt/orders/sync", json_body={"id": gtt_id})
 
     async def convert_position(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -1458,6 +1476,10 @@ class FyersLiveBackend:
             "total_buy": safe_float(book.get("totalbuyqty")),
             "total_sell": safe_float(book.get("totalsellqty")),
             "ltp": safe_float(book.get("ltp")) or None,
+            # Daily price band (circuit limits). Used by the circuit-
+            # proximity gate and to keep limit prices inside the band.
+            "upper_circuit": safe_float(book.get("upper_ckt")) or None,
+            "lower_circuit": safe_float(book.get("lower_ckt")) or None,
         }
 
     # -- history (candles, for ATR) -------------------------------------
