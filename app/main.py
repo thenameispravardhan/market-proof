@@ -40,6 +40,7 @@ from app.api import (
     positions as positions_api,
     prompts as prompts_api,
     risk as risk_api,
+    research as research_api,
     rules as rules_api,
     search as search_api,
     settings_api,
@@ -671,6 +672,7 @@ app.include_router(model_api.router)
 app.include_router(system_api.router)
 app.include_router(algo_api.router)
 app.include_router(snapshots_api.router)
+app.include_router(research_api.router)
 
 
 # -------------------------------------------------------------------------
