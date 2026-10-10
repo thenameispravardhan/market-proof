@@ -186,7 +186,21 @@ def compile_health_report(
         "halted_until": halted_until,
         "fyers_ws_last_tick": _ws_last_tick(market_data),
         "db_size_mb": _db_size_mb(),
+        "audit_chain_head": _audit_head(db),
     }
+
+
+def _audit_head(db: Session) -> Optional[str]:
+    """Newest sealed audit-chain hash. Publishing it daily puts a copy of the
+    chain head OUTSIDE the box, so a wholesale rewrite of audit_log (which
+    can recompute every hash) no longer matches what the channel received."""
+    try:
+        from app.services.audit_chain import chain_head
+
+        _id, head = chain_head(db)
+        return head if _id is not None else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def format_report(report: dict[str, Any]) -> tuple[str, str]:
@@ -214,6 +228,8 @@ def format_report(report: dict[str, Any]) -> tuple[str, str]:
     ]
     if report.get("db_size_mb") is not None:
         lines.append(f"Database size:              {report['db_size_mb']} MB")
+    if report.get("audit_chain_head"):
+        lines.append(f"Audit chain head:           {report['audit_chain_head']}")
     return subject, "\n".join(lines)
 
 
