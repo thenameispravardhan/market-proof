@@ -119,12 +119,14 @@ class Settings(BaseSettings):
     #                       context. Pure telemetry — it can never block.
     #   MODEL_GATE_ENABLED  additionally allow a low score to VETO a trade.
     #
-    # Both default OFF, so shipping this changes nothing until the operator
-    # opts in (non-destructive evolution, PROJECT.txt §25). The gate is the
-    # one that needs the argument: Phase 5 measured the pooled headroom over
-    # the base rate at under 1pp, so a hard pre-filter is a real risk of
-    # throwing away trades for a model that cannot see much.
-    MODEL_ENABLED: bool = False
+    # The score is ON by default: it is a dot product attached to the risk
+    # decision's context, wrapped fail-open, and it can never block (R14 in
+    # app/risk/engine.py). Every day it is off is a day of live,
+    # out-of-sample scores not recorded. The GATE stays OFF: Phase 5
+    # measured the pooled headroom over the base rate at under 1pp, so a
+    # hard pre-filter risks throwing away trades for a model that cannot
+    # see much. Turn it on only after the Model page replay supports it.
+    MODEL_ENABLED: bool = True
     MODEL_GATE_ENABLED: bool = False
     # Which trained variant to score with. Empty = the artifact's own
     # default_variant. The Model page lists every key with its holdout AUC.
