@@ -269,3 +269,37 @@ def system_resources() -> dict[str, Any]:
         "thresholds": {"mem_pct": warn_mem, "disk_pct": warn_disk},
         "warnings": warnings,
     }
+
+
+@router.get("/fyers-selftest")
+def fyers_selftest_status() -> dict[str, Any]:
+    """The latest pre-market Fyers self-test (token, app type, app id,
+    egress IP). `result` is null until it has run once in this process."""
+    from app.services.fyers_selftest import last_result
+
+    return {
+        "enabled": bool(getattr(get_settings(), "FYERS_SELFTEST_ENABLED", True)),
+        "result": last_result(),
+    }
+
+
+@router.post("/fyers-selftest/run")
+async def fyers_selftest_run() -> dict[str, Any]:
+    """Run the self-test now (the dashboard's "Re-check" button — e.g.
+    right after the morning 2FA login)."""
+    from app.services.fyers_selftest import run_fyers_selftest
+
+    result = await run_fyers_selftest()
+    return {"enabled": True, "result": result.to_dict()}
+
+
+@router.get("/backups")
+def backup_status_endpoint() -> dict[str, Any]:
+    """Newest local backup age, copy count and the offsite upload state as
+    deploy/backup.sh last reported it. `status` is null for a non-file DB."""
+    from app.services.health_report import backup_status
+
+    return {
+        "max_age_hours": float(getattr(get_settings(), "BACKUP_MAX_AGE_HOURS", 0) or 0),
+        "status": backup_status(),
+    }

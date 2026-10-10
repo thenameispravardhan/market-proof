@@ -20,7 +20,7 @@ GET /api/metrics/health-report; POST .../health-report/send triggers the
 same publish path manually.
 
 The same service also runs a PRE-OPEN preflight at
-HEALTH_REPORT_PREFLIGHT_TIME_IST (default 09:05) and publishes on
+HEALTH_REPORT_PREFLIGHT_TIME_IST (default 08:45) and publishes on
 `system.error` only when it finds a problem — see `compile_preflight`.
 """
 from __future__ import annotations
@@ -243,6 +243,83 @@ def _db_integrity_problem() -> Optional[str]:
     return None
 
 
+def _sqlite_path() -> Optional[str]:
+    s = get_settings()
+    eff = getattr(s, "effective_database_url", None)
+    url = str(eff() if callable(eff) else getattr(s, "DATABASE_URL", "") or "")
+    if not url.startswith("sqlite") or ":memory:" in url:
+        return None
+    return url.split("///", 1)[-1]
+
+
+def backup_status(now: Optional[datetime] = None) -> Optional[dict[str, Any]]:
+    """What deploy/backup.sh last reported, plus the newest local copy's age.
+
+    backup.sh writes `data/backups/status.json` after every run (local copy
+    verified, offsite upload ok / failed / disabled). The age is read from
+    the newest `trading-*.db` itself, so a cron job that silently stopped
+    running shows up as an ageing file even if status.json says "ok".
+    None when the DB is not a file (tests, in-memory)."""
+    import glob
+    import json
+
+    db_path = _sqlite_path()
+    if db_path is None:
+        return None
+    backup_dir = os.path.join(os.path.dirname(os.path.abspath(db_path)), "backups")
+    files = sorted(glob.glob(os.path.join(backup_dir, "trading-*.db")), key=os.path.getmtime)
+    now_ts = (now or datetime.now(timezone.utc)).timestamp()
+    newest_age_h = round((now_ts - os.path.getmtime(files[-1])) / 3600.0, 1) if files else None
+    status: dict[str, Any] = {}
+    try:
+        with open(os.path.join(backup_dir, "status.json"), encoding="utf-8") as fh:
+            status = json.load(fh) or {}
+    except (OSError, ValueError):
+        status = {}
+    return {
+        "backup_dir": backup_dir,
+        "local_copies": len(files),
+        "newest_age_hours": newest_age_h,
+        "offsite": status.get("offsite", "unknown"),
+        "offsite_at": status.get("offsite_at"),
+        "offsite_target": status.get("offsite_target"),
+        "last_run_at": status.get("local_at"),
+    }
+
+
+def _backup_problem() -> Optional[str]:
+    """The live trade/outcome log is the project's research asset; a
+    backup that silently stopped (cron never installed, disk full, upload
+    credentials expired) is only discovered on the day it is needed."""
+    max_age = float(getattr(get_settings(), "BACKUP_MAX_AGE_HOURS", 0) or 0)
+    if max_age <= 0:
+        return None
+    try:
+        st = backup_status()
+    except Exception as e:  # noqa: BLE001
+        log.warning("preflight.backup_probe_failed", error=str(e))
+        return None
+    if st is None:
+        return None
+    age = st["newest_age_hours"]
+    if age is None:
+        return (
+            f"No database backup exists in {st['backup_dir']} — install the nightly "
+            "cron (deploy/setup.sh does it) or run deploy/backup.sh by hand."
+        )
+    if age > max_age:
+        return (
+            f"Newest database backup is {age:.0f}h old (limit {max_age:.0f}h) — the "
+            "backup cron has stopped; check logs/backup.log."
+        )
+    if st["offsite"] == "failed":
+        return (
+            "Last offsite backup upload FAILED — the only copies share a disk with "
+            "the live database. Check BACKUP_S3_URI credentials in logs/backup.log."
+        )
+    return None
+
+
 def _resource_problems() -> list[str]:
     """RAM/disk warnings from the same source the Dashboard reads.
 
@@ -290,7 +367,7 @@ async def compile_preflight() -> list[str]:
 
     # RAM/disk headroom. Both have already cost a full trading day (an OOM
     # kill on 2026-08-15, and three SQLite corruptions on a box that was
-    # paging), and both are gradual — 09:05 is early enough to act.
+    # paging), and both are gradual — the preflight is early enough to act.
     problems.extend(_resource_problems())
 
     # Lazy import: app.api.market reaches back into app.main for the
@@ -307,6 +384,25 @@ async def compile_preflight() -> list[str]:
             f"Fyers is not serving quotes ({PREFLIGHT_PROBE_SYMBOL}) — re-auth in the "
             "UI or every entry today blocks with NO_LIVE_PRICE."
         )
+
+    # The SEBI-regime checks (daily 2FA token, type-200 app, whitelisted
+    # egress IP). Only ERROR-severity results page someone; warnings stay on
+    # the dashboard banner so a paper-mode box is not alarmed every morning.
+    if bool(getattr(get_settings(), "FYERS_SELFTEST_ENABLED", False)):
+        from app.services.fyers_selftest import ERROR, run_fyers_selftest
+
+        try:
+            result = await run_fyers_selftest()
+            problems.extend(
+                f"Fyers {c.name}: {c.detail}" for c in result.checks if c.status == ERROR
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("preflight.fyers_selftest_failed", error=str(e))
+            problems.append(f"Fyers self-test could not run ({e}).")
+
+    backup = _backup_problem()
+    if backup:
+        problems.append(backup)
 
     return problems
 
