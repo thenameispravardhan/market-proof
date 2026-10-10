@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
-# Nightly SQLite backup with 7-day rotation.
+# Nightly SQLite backup: 7 verified local copies + one OFFSITE copy.
 #
-# Uses sqlite3's online .backup (safe against a live WAL database — no
-# need to stop the bot). Install as a weekday cron job after market close
-# (server timezone is Asia/Kolkata, so cron times are IST):
+# Uses `VACUUM INTO` (safe against a live WAL database — no need to stop
+# the bot). deploy/setup.sh installs it as a weekday cron job after market
+# close (server timezone is Asia/Kolkata, so cron times are IST):
 #
-#   crontab -e
 #   30 18 * * 1-5  /home/ubuntu/tradebot/deploy/backup.sh >> /home/ubuntu/tradebot/logs/backup.log 2>&1
+#
+# Offsite: the local copies share a disk with the live DB, so a dead disk
+# or a deleted instance takes the backups with it. Set BACKUP_S3_URI in
+# .env (e.g. s3://my-bucket/tradebot) and install the AWS CLI with
+# credentials that can s3:PutObject there; every verified backup is then
+# uploaded gzip-compressed. Retention offsite is the bucket's lifecycle
+# rule, not this script. A failed upload does NOT fail the local backup —
+# it is recorded in data/backups/status.json, which the 08:45 preflight
+# reads and alarms on.
 
 set -euo pipefail
 
@@ -56,3 +64,39 @@ trap - EXIT
 ls -1t "$DEST_DIR"/trading-*.db 2>/dev/null | tail -n +8 | xargs -r rm --
 
 echo "$(date -Is) backup written: $DEST_DIR/trading-$STAMP.db"
+
+# ---- offsite copy -------------------------------------------------------
+# BACKUP_S3_URI comes from the environment or, for cron, from .env (cron
+# runs with an empty environment). Only that one key is read from .env —
+# the file is not sourced, so nothing else in it is executed.
+if [ -z "${BACKUP_S3_URI:-}" ] && [ -f "$PROJECT_ROOT/.env" ]; then
+    BACKUP_S3_URI="$(grep -E '^BACKUP_S3_URI=' "$PROJECT_ROOT/.env" | tail -n 1 | cut -d= -f2- | tr -d "\"' \r")"
+fi
+
+OFFSITE="disabled"
+OFFSITE_AT=""
+if [ -n "${BACKUP_S3_URI:-}" ]; then
+    if ! command -v aws >/dev/null 2>&1; then
+        echo "OFFSITE FAILED: BACKUP_S3_URI is set but the aws CLI is not installed" >&2
+        OFFSITE="failed"
+    else
+        GZ="$DEST_DIR/.trading-$STAMP.db.gz"
+        if gzip -c "$DEST_DIR/trading-$STAMP.db" > "$GZ" \
+            && aws s3 cp --only-show-errors "$GZ" "${BACKUP_S3_URI%/}/trading-$STAMP.db.gz"; then
+            OFFSITE="ok"
+            OFFSITE_AT="$(date -Is)"
+            echo "$OFFSITE_AT offsite copy uploaded: ${BACKUP_S3_URI%/}/trading-$STAMP.db.gz"
+        else
+            echo "OFFSITE FAILED: upload to $BACKUP_S3_URI did not complete" >&2
+            OFFSITE="failed"
+        fi
+        rm -f "$GZ"
+    fi
+fi
+
+# Machine-readable result for the app (GET /api/system/backups and the
+# preflight). Written via a temp file so a reader never sees half of it.
+cat > "$DEST_DIR/.status.json.tmp" <<JSON
+{"local_at": "$(date -Is)", "local_file": "trading-$STAMP.db", "offsite": "$OFFSITE", "offsite_at": "$OFFSITE_AT", "offsite_target": "${BACKUP_S3_URI:-}"}
+JSON
+mv "$DEST_DIR/.status.json.tmp" "$DEST_DIR/status.json"

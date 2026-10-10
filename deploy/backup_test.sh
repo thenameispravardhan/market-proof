@@ -14,8 +14,8 @@ cat > "$WORK/bin/sqlite3" <<'STUB'
 #!/usr/bin/env bash
 db="$1"; cmd="$2"
 case "$cmd" in
-  .backup*)
-    out="$(printf '%s' "$cmd" | sed "s/^\.backup '//; s/'$//")"
+  "VACUUM INTO"*)
+    out="$(printf '%s' "$cmd" | sed "s/^VACUUM INTO '//; s/'$//")"
     case "$MODE" in
       # Reproduces 2026-08-07: exit non-zero but leave a 0-byte file behind.
       corrupt) : > "$out"; echo "Error: database disk image is malformed" >&2; exit 1 ;;
@@ -56,8 +56,40 @@ run_case() {
     fi
 }
 
+# --- stub aws (offsite upload) -------------------------------------------
+cat > "$WORK/bin/aws" <<'STUB'
+#!/usr/bin/env bash
+[ "$AWS_MODE" = fail ] && { echo "upload denied" >&2; exit 1; }
+src="${@: -2:1}"; [ -s "$src" ] || exit 1
+echo "$@" >> "$AWS_LOG"; exit 0
+STUB
+chmod +x "$WORK/bin/aws"
+
+offsite_case() {
+    local aws_mode="$1" expect="$2"
+    local root="$WORK/offsite-$aws_mode"
+    mkdir -p "$root/deploy" "$root/data/backups"
+    cp "$REPO/deploy/backup.sh" "$root/deploy/"
+    echo "livedb" > "$root/data/trading.db"
+    printf 'OTHER=1\nBACKUP_S3_URI="s3://bucket/tradebot/"\n' > "$root/.env"
+    MODE=ok AWS_MODE="$aws_mode" AWS_LOG="$root/aws.log" \
+        bash "$root/deploy/backup.sh" >/dev/null 2>&1
+    local rc=$?
+    local got; got=$(sed -n 's/.*"offsite": "\([a-z]*\)".*/\1/p' "$root/data/backups/status.json" 2>/dev/null)
+    local n; n=$(ls -1 "$root"/data/backups/trading-*.db 2>/dev/null | wc -l)
+    local stray; stray=$(ls -1a "$root/data/backups" | grep -c '\.gz$')
+    if [ "$rc" = 0 ] && [ "$got" = "$expect" ] && [ "$n" = 1 ] && [ "$stray" = 0 ]; then
+        echo "PASS  offsite aws=$aws_mode status=$got local_backups=$n"
+    else
+        echo "FAIL  offsite aws=$aws_mode rc=$rc status=$got (want $expect) local_backups=$n stray_gz=$stray"
+        FAILED=1
+    fi
+}
+
 FAILED=0
-run_case corrupt 1   # .backup fails  -> only the pre-existing backup remains
-run_case silent  1   # .backup "succeeds" but copy is corrupt -> rejected
+run_case corrupt 1   # VACUUM INTO fails  -> only the pre-existing backup remains
+run_case silent  1   # VACUUM INTO "succeeds" but copy is corrupt -> rejected
 run_case ok      2   # healthy        -> new backup joins the old one
+offsite_case ok   ok      # upload works        -> status.json says ok
+offsite_case fail failed  # upload refused      -> local backup kept, status failed
 exit $FAILED

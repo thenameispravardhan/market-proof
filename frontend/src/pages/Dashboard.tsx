@@ -8,6 +8,7 @@ import { ActivePositions } from "../components/dashboard/ActivePositions";
 import { PipelineLatency } from "../components/dashboard/PipelineLatency";
 import { PnLChart } from "../components/dashboard/PnLChart";
 import { SystemResources } from "../components/dashboard/SystemResources";
+import { ReadinessBanner } from "../components/dashboard/ReadinessBanner";
 import { AccountToggles } from "../components/dashboard/AccountToggles";
 import { AiAnalysisToggle } from "../components/dashboard/AiAnalysisToggle";
 import { useDashboardSummary, useGlobalSettings } from "../hooks/useApi";
@@ -64,6 +65,7 @@ export default function Dashboard() {
         <AccountToggles />
       </div>
       <ModeBanner />
+      <ReadinessBanner />
       <StatRow />
       <div className="dashboard-grid">
         <NewsPipeline />
