@@ -21,9 +21,12 @@ mapping decision can always be re-derived from what the model actually said.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from app.analyzer.prompts import detect_event_type
+
+_IST = timezone(timedelta(hours=5, minutes=30))
 
 # The system prompt the model saw for all 146,500 training examples. Changing
 # it moves the model off-distribution — treat it as part of the weights.
@@ -70,6 +73,63 @@ _T15 = 14
 _SCORE_SATURATION_TENTHS = 30.0
 
 
+# Line labels of the MARKET CONTEXT block, in training order. The training
+# script (train_sft.py, kept outside git) is the authority on these strings:
+# if a label differs there, change it HERE and only here. A field the bot
+# cannot measure live is omitted, never filled with a placeholder.
+MARKET_CONTEXT_KEYS: dict[str, str] = {
+    "last_trade": "last_trade",
+    "volume_ratio": "pre_news_volume_ratio",
+    "cap_tier": "cap_tier",
+    "session": "session",
+}
+
+
+def session_of(filed_at_utc: Optional[datetime]) -> Optional[str]:
+    """The training corpus' session label for a filing time:
+    same_session (09:15-15:30 IST on a weekday), same_day_preopen (before
+    09:15 on a weekday) or next_session (after the close / weekend)."""
+    if filed_at_utc is None:
+        return None
+    aware = filed_at_utc if filed_at_utc.tzinfo else filed_at_utc.replace(tzinfo=timezone.utc)
+    ist = aware.astimezone(_IST)
+    if ist.weekday() >= 5:
+        return "next_session"
+    hm = ist.hour * 60 + ist.minute
+    if hm < 9 * 60 + 15:
+        return "same_day_preopen"
+    if hm < 15 * 60 + 30:
+        return "same_session"
+    return "next_session"
+
+
+def market_context_for(symbol: str, filed_at: Optional[datetime]) -> dict[str, Any]:
+    """What the bot can honestly put in the MARKET CONTEXT block right now:
+    the prefetched quote (QUOTE_PREFETCH_ENABLED), the AMFI cap tier and the
+    session. Never blocks; a missing source just drops its line."""
+    out: dict[str, Any] = {"session": session_of(filed_at)}
+    try:
+        from app.analyzer import quote_cache
+
+        q = quote_cache.get_quote(symbol)
+        lp = (q or {}).get("last_price")
+        if lp:
+            out["last_trade"] = float(lp)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from app.config import get_settings
+        from app.services import mcap
+
+        st = get_settings()
+        tier = mcap.tier_of(mcap.lookup(symbol), float(st.CAP_LARGE_MIN_CR), float(st.CAP_MID_MIN_CR))
+        if tier:
+            out["cap_tier"] = tier
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def build_prompt(
     *,
     symbol: str,
@@ -77,22 +137,37 @@ def build_prompt(
     headline: str,
     filing_text: str,
     session: Optional[str] = None,
+    last_trade: Optional[float] = None,
+    volume_ratio: Optional[float] = None,
+    cap_tier: Optional[str] = None,
 ) -> tuple[str, str]:
-    """Render the (system, user) pair in the exact shape the model trained on.
+    """Render the (system, user) pair in the shape the model trained on.
 
-    ponytail: the training prompt also carried a MARKET CONTEXT block (last
-    trade, pre-news volume ratio, market-cap tier). The analyzer has no quote
-    provider attached, so those lines are omitted rather than faked — a wrong
-    number is worse than a missing one for a model that learned to read them.
-    Wire a quote in here if the SLM path ever moves past research use.
+    The training prompt carried a MARKET CONTEXT block (last trade before
+    the filing, pre-news volume ratio, market-cap tier, session). Serving
+    it without that block was a train/serve skew: the model was read
+    off-distribution on every filing. The analyzer now passes what it can
+    measure at decision time: the prefetched quote, the AMFI cap tier and
+    the session. Anything unknown is left out rather than faked, because a
+    wrong number is worse than a missing one for a model that learned to
+    read them.
     """
     parts = [
         f"SYMBOL: {symbol}",
         f"FILED: {filed_at}",
         f"HEADLINE: {headline}",
     ]
+    ctx: list[str] = []
+    if last_trade is not None and last_trade > 0:
+        ctx.append(f"  {MARKET_CONTEXT_KEYS['last_trade']}: {float(last_trade):.2f}")
+    if volume_ratio is not None and volume_ratio >= 0:
+        ctx.append(f"  {MARKET_CONTEXT_KEYS['volume_ratio']}: {float(volume_ratio):.2f}")
+    if cap_tier:
+        ctx.append(f"  {MARKET_CONTEXT_KEYS['cap_tier']}: {cap_tier}")
     if session:
-        parts += ["", "MARKET CONTEXT (as of the filing timestamp):", f"  session: {session}"]
+        ctx.append(f"  {MARKET_CONTEXT_KEYS['session']}: {session}")
+    if ctx:
+        parts += ["", "MARKET CONTEXT (as of the filing timestamp):", *ctx]
     parts += ["", "FILING:", filing_text or headline]
     return SYSTEM_PROMPT, "\n".join(parts)
 

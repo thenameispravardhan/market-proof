@@ -483,6 +483,15 @@ class Settings(BaseSettings):
     # without --api-key). Secret, so it is .env-only — never returned by
     # GET /api/settings.
     LLM_SLM_API_KEY: str = ""
+    # Shadow mode: with DeepSeek live, ALSO send every LLM-track filing to
+    # the SLM endpoint after the live signal is out, and store its verdict
+    # in shadow_analyses. Never on the decision path, never delays a trade;
+    # it builds the paired, leak-free comparison (same filings, measured
+    # outcome) that has to show a CI clear of zero before LLM_PROVIDER=slm.
+    # OFF by default; needs LLM_SLM_ENDPOINT.
+    LLM_SHADOW_ENABLED: bool = False
+    # The SLM on CPU takes ~36 s per filing; on the DGX Spark well under 2 s.
+    LLM_SHADOW_TIMEOUT_SECONDS: float = 90.0
     # Hard end-to-end deadline (seconds from `filed_at` to signal). If a
     # fully-analysed announcement is older than this by the time the
     # signal would be created, the analysis is still stored (data for

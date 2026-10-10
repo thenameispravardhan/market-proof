@@ -25,7 +25,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.db.models import Analysis, Announcement, Signal, SignalOutcome
+from app.db.models import Analysis, Announcement, ShadowAnalysis, Signal, SignalOutcome
 from app.db.session import get_db
 from app.research import replay as rp
 from app.research import stats
@@ -108,18 +108,19 @@ def research_calibration(
     (are the numbers themselves honest?)."""
     rows = db.execute(
         select(SignalOutcome.move_30m_pct, Signal.confidence, Analysis.confidence,
-               Analysis.model, Announcement.event_type)
+               Analysis.model, Announcement.event_type, SignalOutcome.created_at)
         .join(Signal, SignalOutcome.signal_id == Signal.id)
         .outerjoin(Analysis, Signal.analysis_id == Analysis.id)
         .outerjoin(Announcement, Analysis.announcement_id == Announcement.id)
         .where(SignalOutcome.move_30m_pct.isnot(None), SignalOutcome.created_at >= _since(days))
     ).all()
     samples = []
-    for move, sconf, aconf, model, etype in rows:
+    for move, sconf, aconf, model, etype, created in rows:
         conf = aconf if aconf is not None else sconf
         if conf is None:
             continue
-        samples.append((float(conf), int(abs(float(move)) >= mover_pct), model or "unknown", etype or "UNKNOWN"))
+        samples.append((float(conf), int(abs(float(move)) >= mover_pct), model or "unknown",
+                        etype or "UNKNOWN", created.strftime("%Y-%m") if created else "unknown"))
 
     def block(sel: list[tuple]) -> dict[str, Any]:
         probs = [s[0] for s in sel]
@@ -133,13 +134,76 @@ def research_calibration(
 
     by_model: dict[str, list] = {}
     by_event: dict[str, list] = {}
+    by_month: dict[str, list] = {}
     for s in samples:
         by_model.setdefault(s[2], []).append(s)
         by_event.setdefault(s[3], []).append(s)
+        by_month.setdefault(s[4], []).append(s)
     return {
         "days": days,
         "mover_pct": mover_pct,
         "overall": block(samples),
+        # Calibration drifts with the regime (the mover base rate moves
+        # between periods), so it is monitored month by month.
+        "by_month": [{"month": k, "n": len(v), "ece": block(v)["ece"], "auc": block(v)["auc"],
+                      "base_rate": block(v)["base_rate"]} for k, v in sorted(by_month.items())],
         "by_model": {k: block(v) for k, v in by_model.items()},
         "by_event_type": {k: block(v) for k, v in sorted(by_event.items(), key=lambda kv: -len(kv[1])) if len(v) >= 20},
+    }
+
+
+@router.get("/shadow")
+def research_shadow(
+    days: int = Query(90, ge=1, le=730),
+    mover_pct: float = Query(MOVER_THRESHOLD_PCT, gt=0, le=20),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Live model vs shadow SLM on the SAME filings, scored against the
+    measured 30-minute move. The bar for switching LLM_PROVIDER is a paired
+    AUC difference whose CI clears zero, not a better-looking average."""
+    since = _since(days)
+    status_rows = db.execute(
+        select(ShadowAnalysis.status, ShadowAnalysis.latency_ms).where(ShadowAnalysis.created_at >= since)
+    ).all()
+    by_status: dict[str, int] = {}
+    lat = []
+    for st, ms in status_rows:
+        by_status[st] = by_status.get(st, 0) + 1
+        if st == "ok" and ms is not None:
+            lat.append(float(ms))
+    lat.sort()
+
+    rows = db.execute(
+        select(ShadowAnalysis, Analysis.confidence, Analysis.recommendation, Analysis.model,
+               SignalOutcome.move_30m_pct)
+        .join(Analysis, ShadowAnalysis.analysis_id == Analysis.id)
+        .join(SignalOutcome, SignalOutcome.signal_id == ShadowAnalysis.signal_id)
+        .where(ShadowAnalysis.status == "ok", ShadowAnalysis.created_at >= since,
+               SignalOutcome.move_30m_pct.isnot(None))
+    ).all()
+    live, shadow, ys, agree = [], [], [], 0
+    live_model = None
+    for sh, conf, rec, model, move in rows:
+        if conf is None or sh.confidence is None:
+            continue
+        live_model = live_model or model
+        live.append(float(conf))
+        shadow.append(float(sh.confidence))
+        ys.append(int(abs(float(move)) >= mover_pct))
+        agree += int(str(rec or "").upper() == str(sh.recommendation or "").upper())
+
+    def pct(p: float) -> Optional[float]:
+        return round(lat[int(p * (len(lat) - 1))], 1) if lat else None
+
+    return {
+        "days": days,
+        "mover_pct": mover_pct,
+        "shadow_calls": by_status,
+        "shadow_latency_ms": {"p50": pct(0.5), "p90": pct(0.9)},
+        "paired": len(ys),
+        "live_model": live_model,
+        "recommendation_agreement": round(agree / len(ys), 4) if ys else None,
+        "auc_live_vs_shadow": stats.paired_auc_difference(live, shadow, ys) if ys else None,
+        "ece_live": stats.ece(live, ys)["ece"] if ys else None,
+        "ece_shadow": stats.ece(shadow, ys)["ece"] if ys else None,
     }

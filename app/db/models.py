@@ -206,6 +206,37 @@ class SignalOutcome(Base):
 
 
 # =========================================================================
+# Research: shadow analyses (a second model scored on the same filings)
+# =========================================================================
+#
+# Written by app/analyzer/shadow.py when LLM_SHADOW_ENABLED is on: the SLM
+# reads the same filing as the live model, AFTER the live signal has been
+# emitted, and its verdict is stored here only. Nothing reads these rows on
+# the decision path; GET /api/research/shadow compares the two models on
+# identical filings against the measured outcome.
+
+
+class ShadowAnalysis(Base):
+    __tablename__ = "shadow_analyses"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    announcement_id: Mapped[Optional[int]] = mapped_column(Integer, index=True)
+    analysis_id: Mapped[Optional[int]] = mapped_column(Integer, index=True)   # the live analysis
+    signal_id: Mapped[Optional[int]] = mapped_column(Integer, index=True)     # the live signal
+    model: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)           # ok | error | timeout
+    mover: Mapped[Optional[bool]] = mapped_column(Boolean)
+    direction: Mapped[Optional[str]] = mapped_column(String(8))
+    confidence: Mapped[Optional[float]] = mapped_column(Float)
+    sentiment_score: Mapped[Optional[float]] = mapped_column(Float)
+    recommendation: Mapped[Optional[str]] = mapped_column(String(8))
+    latency_ms: Mapped[Optional[float]] = mapped_column(Float)
+    raw: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
+    error: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False, index=True)
+
+
+# =========================================================================
 # Core: dataset features (the ML training-set enrichment per signal)
 # =========================================================================
 #

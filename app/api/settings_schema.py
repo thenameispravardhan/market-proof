@@ -309,6 +309,8 @@ LABELS: dict[str, str] = {
     "LLM_PROVIDER": "AI model (DeepSeek or our fine-tuned SLM)",
     "LLM_SLM_ENDPOINT": "SLM endpoint (OpenAI-compatible /chat/completions)",
     "LLM_SLM_MODEL": "SLM model name",
+    "LLM_SHADOW_ENABLED": "Shadow-score every filing with the SLM (record only)",
+    "LLM_SHADOW_TIMEOUT_SECONDS": "SLM shadow call timeout (seconds)",
     "LLM_MAX_TOKENS": "AI max output tokens",
     "LLM_TIMEOUT_SECONDS": "AI call timeout (seconds)",
     "LLM_MAX_RETRIES": "AI retries",
