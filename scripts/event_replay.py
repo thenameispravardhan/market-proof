@@ -40,6 +40,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--notional", type=float, default=None, help="rupees per trade (sets qty and costs)")
     ap.add_argument("--signals-only", action="store_true", help="skip HOLD signals (no hypothetical side)")
     ap.add_argument("--sweep-delay", default="", help="comma-separated delays to compare, e.g. 5,20,60")
+    ap.add_argument("--meta", action="store_true",
+                    help="also fit and evaluate the meta-labeling model on the replayed trades")
     ap.add_argument("--out", default=str(ROOT / "data" / "research"), help="output directory")
     args = ap.parse_args(argv)
 
@@ -79,6 +81,17 @@ def main(argv: list[str] | None = None) -> int:
     result = rp.run_replay(events, source, p)
     rep = rp.report(result, capital=capital)
     rep["events_loaded"] = len(events)
+    if args.meta:
+        from app.research import meta_label
+
+        rep["meta_label"] = meta_label.run(result.trades)
+        m = rep["meta_label"]
+        if m.get("ok"):
+            print(f"meta-label: test AUC {m['test_auc_meta']} vs LLM confidence "
+                  f"{m['test_auc_llm_confidence']}; kept E[R] {m['kept_by_meta_model']['expectancy_r']} "
+                  f"vs all {m['all_test_trades']['expectancy_r']}", file=sys.stderr)
+        else:
+            print(f"meta-label: {m.get('reason')}", file=sys.stderr)
     json_path = out_dir / f"replay-{stamp}.json"
     json_path.write_text(json.dumps(rep, indent=2, default=str))
     csv_path = out_dir / f"replay-{stamp}.csv"
