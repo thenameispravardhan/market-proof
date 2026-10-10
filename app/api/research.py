@@ -207,3 +207,42 @@ def research_shadow(
         "ece_live": stats.ece(live, ys)["ece"] if ys else None,
         "ece_shadow": stats.ece(shadow, ys)["ece"] if ys else None,
     }
+
+
+@router.get("/meta-label")
+async def research_meta_label(
+    days: int = Query(180, ge=7, le=730),
+    limit: int = Query(20000, ge=100, le=50000),
+    entry_delay_s: Optional[float] = Query(None, ge=0, le=600),
+    slippage_bps: Optional[float] = Query(None, ge=0, le=500),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Fit and evaluate the meta-labeling model on replayed trades (label:
+    the trade ended positive after costs under the bot's own exits). A
+    research report — nothing here gates or sizes a live order."""
+    from app.research import meta_label
+
+    events = rp.load_events(db, since=_since(days), limit=limit)
+    params = rp.ReplayParams.from_settings(get_settings(), entry_delay_s=entry_delay_s,
+                                           slippage_bps=slippage_bps)
+
+    def _run() -> dict[str, Any]:
+        result = rp.run_replay(events, rp.ParquetCandleSource(), params)
+        body = meta_label.run(result.trades)
+        body["replayed_trades"] = len(result.trades)
+        return body
+
+    return await run_in_threadpool(_run)
+
+
+@router.get("/results-xbrl")
+async def research_results_xbrl(url: str = Query(..., description="exchange-hosted XBRL instance URL")
+                                ) -> dict[str, Any]:
+    """Numeric surprise (revenue / EBITDA / PAT YoY and QoQ, margin change)
+    parsed from a results filing's XBRL."""
+    from app.research.results_xbrl import fetch_and_parse
+
+    try:
+        return await fetch_and_parse(url)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": f"fetch failed: {str(e)[:200]}"}
