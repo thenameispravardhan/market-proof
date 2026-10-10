@@ -187,12 +187,14 @@ At [myapi.fyers.in](https://myapi.fyers.in), on your app:
 
 | Task | How |
 |------|-----|
-| Fyers token re-auth (daily, pre-market) | UI → Connect Fyers |
+| Fyers token re-auth (daily, pre-market, 2FA) | UI → Connect Fyers. The 08:45 preflight checks token, app type 200, app id and egress IP; failures page through notifications and show as a red banner on the Dashboard ("Re-check" after logging in) |
 | Watch logs | `journalctl -u tradebot -f` |
 | Restart app | `sudo systemctl restart tradebot` |
 | Deploy new code (on the server) | `cd ~/tradebot && bash deploy/update.sh` |
 | Deploy new code (from your dev machine) | `bash deploy/push.sh` (or `.\deploy\push.ps1`) — see below |
-| DB backup (weekdays 18:30 IST) | `crontab -e` → `30 18 * * 1-5 /home/ubuntu/tradebot/deploy/backup.sh >> /home/ubuntu/tradebot/logs/backup.log 2>&1` |
+| DB backup (weekdays 18:30 IST) | Installed by `deploy/setup.sh` as a cron job (`crontab -l` to confirm). Offsite copy: set `BACKUP_S3_URI=s3://<bucket>/tradebot` in `.env` and install the AWS CLI with `s3:PutObject` on that prefix; give the bucket a lifecycle rule (e.g. expire after 90 days). The preflight alarms when the newest copy is older than `BACKUP_MAX_AGE_HOURS` or the last upload failed |
+| Lightsail-native alternative to S3 | Lightsail console → instance → Snapshots → enable automatic daily snapshots (whole-disk, kept 7 days, stored off the instance) |
+| Rotate secrets | Follow `docs/SECRET_ROTATION.md` |
 | Pull a backup down to Windows | `scp -i $KEY ubuntu@${IP}:~/tradebot/data/backups/<file> .` |
 
 ### One-command redeploy from your dev machine

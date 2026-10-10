@@ -12,7 +12,7 @@
 //   - a breakdown toggle for per-directory / per-file storage, since the
 //     top-line disk % never tells you WHAT grew.
 // Warn thresholds live in Settings (RESOURCE_WARN_*) — the same numbers
-// drive the 09:05 preflight alarm, so screen and alarm cannot disagree.
+// drive the pre-market preflight alarm, so screen and alarm cannot disagree.
 
 import { useEffect, useState } from "react";
 import { useSystemResources } from "../../hooks/useApi";

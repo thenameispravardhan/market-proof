@@ -45,12 +45,19 @@ class AuditService:
         self,
         session_factory: Optional[Callable[[], Any]] = None,
     ) -> None:
-        self._session_factory = session_factory or _default_session_factory
+        # Resolved per use, not here: SessionLocal is rebuilt by the test
+        # harness, and the old `or _default_session_factory` stored the
+        # resolver itself, so `self._session_factory()` returned the
+        # sessionmaker rather than a session and every flush failed.
+        self._explicit_factory = session_factory
         self._buffer: list[dict[str, Any]] = []
         self._lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
         self._flush_event = asyncio.Event()
         self._task: Optional[asyncio.Task[None]] = None
+
+    def _session_factory(self) -> Callable[[], Any]:
+        return self._explicit_factory or _default_session_factory()
 
     # -- public API -------------------------------------------------------
 
@@ -95,8 +102,12 @@ class AuditService:
     def start(self) -> asyncio.Task[None]:
         if self._task is not None and not self._task.done():
             return self._task
-        self._stop_event.clear()
-        self._flush_event.clear()
+        # Fresh primitives per start: asyncio objects bind to the loop that
+        # first awaits them, and the singleton outlives one event loop (each
+        # app lifespan in tests, a reload in dev).
+        self._lock = asyncio.Lock()
+        self._stop_event = asyncio.Event()
+        self._flush_event = asyncio.Event()
         self._task = asyncio.create_task(self._run(), name="audit-service")
         return self._task
 
@@ -132,10 +143,26 @@ class AuditService:
                     pass  # time-based flush
                 self._flush_event.clear()
                 await self._flush()
+                await self._seal()
             # Final flush on shutdown.
             await self._flush()
+            await self._seal()
         finally:
             log.info("audit_service.stop", remaining=len(self._buffer))
+
+    async def _seal(self) -> None:
+        """Extend the audit hash chain over rows committed since the last
+        pass (from this buffer AND every direct `db.add(AuditLog(...))`)."""
+        from app.services.audit_chain import seal_pending
+
+        def _do_seal() -> int:
+            with self._session_factory()() as session:
+                return seal_pending(session)
+
+        try:
+            await asyncio.get_running_loop().run_in_executor(None, _do_seal)
+        except Exception:  # noqa: BLE001 — a failed seal is retried next tick
+            log.exception("audit_service.seal_failed")
 
     async def _flush(self) -> None:
         """Write buffered entries to the DB in a single transaction."""
@@ -151,7 +178,7 @@ class AuditService:
         from app.db.models import AuditLog
 
         def _do_flush() -> None:
-            with self._session_factory() as session:
+            with self._session_factory()() as session:
                 for entry in batch:
                     session.add(
                         AuditLog(
@@ -173,3 +200,28 @@ class AuditService:
 
 # Module-level singleton — imported and wired in the app lifespan.
 audit_service = AuditService()
+
+
+def log_event(
+    *,
+    actor: str,
+    action: str,
+    target: str,
+    before: Optional[dict[str, Any]] = None,
+    after: Optional[dict[str, Any]] = None,
+) -> None:
+    """Fire-and-forget audit entry through the shared buffered writer.
+
+    The analyzer has imported this name for every `signal.created` entry
+    since the audit trail was added; it did not exist, the ImportError was
+    swallowed by a best-effort `except`, and no signal ever reached the
+    audit log. Payloads are made JSON-safe here (datetimes, enums) so one
+    odd value cannot fail the whole batch insert."""
+    import json
+
+    def _safe(d: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if d is None:
+            return None
+        return json.loads(json.dumps(d, default=str))
+
+    audit_service.log(actor, action, target, before=_safe(before), after=_safe(after))

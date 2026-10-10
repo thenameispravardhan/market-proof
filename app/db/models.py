@@ -206,6 +206,65 @@ class SignalOutcome(Base):
 
 
 # =========================================================================
+# Research: shadow analyses (a second model scored on the same filings)
+# =========================================================================
+#
+# Written by app/analyzer/shadow.py when LLM_SHADOW_ENABLED is on: the SLM
+# reads the same filing as the live model, AFTER the live signal has been
+# emitted, and its verdict is stored here only. Nothing reads these rows on
+# the decision path; GET /api/research/shadow compares the two models on
+# identical filings against the measured outcome.
+
+
+class ShadowAnalysis(Base):
+    __tablename__ = "shadow_analyses"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    announcement_id: Mapped[Optional[int]] = mapped_column(Integer, index=True)
+    analysis_id: Mapped[Optional[int]] = mapped_column(Integer, index=True)   # the live analysis
+    signal_id: Mapped[Optional[int]] = mapped_column(Integer, index=True)     # the live signal
+    model: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)           # ok | error | timeout
+    mover: Mapped[Optional[bool]] = mapped_column(Boolean)
+    direction: Mapped[Optional[str]] = mapped_column(String(8))
+    confidence: Mapped[Optional[float]] = mapped_column(Float)
+    sentiment_score: Mapped[Optional[float]] = mapped_column(Float)
+    recommendation: Mapped[Optional[str]] = mapped_column(String(8))
+    latency_ms: Mapped[Optional[float]] = mapped_column(Float)
+    raw: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
+    error: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False, index=True)
+
+
+# =========================================================================
+# Research: pre-registered evaluation windows
+# =========================================================================
+#
+# A paper-trading window declared BEFORE it runs: hypothesis, length and a
+# hash of every decision-relevant setting, rule and prompt. A result counts
+# as out-of-sample evidence only if the configuration was not touched while
+# the window ran. app/research/windows.py checks that and reports which keys
+# changed if it was.
+
+
+class EvaluationWindow(Base):
+    __tablename__ = "evaluation_windows"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    hypothesis: Mapped[str] = mapped_column(Text, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    ends_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    config_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="active", nullable=False)  # active | closed | abandoned
+    # First observed configuration change inside the window: {"at", "changes"}.
+    violation: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
+    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+
+
+# =========================================================================
 # Core: dataset features (the ML training-set enrichment per signal)
 # =========================================================================
 #
@@ -579,6 +638,12 @@ class AuditLog(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=_utcnow, nullable=False, index=True
     )
+    # Hash chain (app/services/audit_chain.py). Filled by the sealer a
+    # second or so after insert, in id order: row_hash = sha256(prev_hash +
+    # canonical row). Editing or deleting a sealed row breaks every later
+    # link, which GET /api/audit-log/verify reports.
+    prev_hash: Mapped[Optional[str]] = mapped_column(String(64))
+    row_hash: Mapped[Optional[str]] = mapped_column(String(64), index=True)
 
     __table_args__ = (Index("ix_audit_log_action_time", "action", "created_at"),)
 

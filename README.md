@@ -6,7 +6,7 @@
 <img alt="Python 3.11" src="https://img.shields.io/badge/python-3.11-3776AB?logo=python&logoColor=white">
 <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white">
 <img alt="React 18" src="https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black">
-<img alt="tests" src="https://img.shields.io/badge/tests-823%20backend%20%2B%2065%20frontend-success">
+<img alt="tests" src="https://img.shields.io/badge/tests-1262%20backend%20%2B%20244%20frontend-success">
 <img alt="model" src="https://img.shields.io/badge/%F0%9F%A4%97-tradebot--slm--v1-yellow">
 <img alt="license" src="https://img.shields.io/badge/license-MIT-blue">
 </p>
@@ -113,7 +113,7 @@ fine-tuned model described above.
 | **AI** | DeepSeek **or** `tradebot-slm-v1` (Qwen2.5-1.5B, fully fine-tuned) — one toggle |
 | **PDF** | PyMuPDF, table-aware extraction, non-Latin script filtering, OCR fallback |
 | **Frontend** | React 18, TypeScript 5, Vite 6, TanStack Query, lightweight-charts |
-| **Scale** | 26 API routers · 18 tables · 14 pages · 823 backend + 65 frontend tests |
+| **Scale** | 30 API routers · 24 tables · 15 pages · 1,262 backend + 244 frontend tests |
 | **Corpus** | 787,267 filings collected · 243,533 outcome-labelled · 98.0% text coverage |
 | **Status** | Running 24/7 on AWS Lightsail (Mumbai) behind Caddy + basic auth |
 
@@ -418,6 +418,42 @@ band and sentiment, with an automatic verdict line — `tracks reality` /
 and reliable (n=17,298). The *taken* side is thin — 97 trades. Selection looks
 ~2.2× better than random, but treat that ratio as early, not settled.
 
+### From "AI correct" to P&L after costs
+
+"AI correct" (a 5-minute directional agreement) says nothing about whether a
+signal makes money. The `app/research/` layer measures that directly, and
+everything it reports carries a confidence interval:
+
+- **Cost-aware event replay** (`/api/research/replay`,
+  `scripts/event_replay.py`). Every recorded signal is replayed on the bot's
+  own 1-minute candles with the live trade management: entry after a
+  configurable delay at the next minute's open, slippage, ATR/event-profile
+  stops, stop-before-target inside a bar, breakeven, time exit, square-off,
+  and Indian intraday charges. A ₹1 lakh round trip costs ≈ ₹82, so the
+  break-even move is ≈ 0.08% before slippage. Blocked signals are replayed
+  too, so each block reason shows what it saved or cost in R. A
+  confidence-bucket table compares the move already gone before entry
+  with the move after it, which tests the "confident = already priced"
+  explanation directly. `--sweep-delay 5,20,60` prices latency.
+- **Calibration** (`/api/research/calibration`). Reliability bins, AUC and
+  ECE per model and per month.
+- **Shadow mode** (`LLM_SHADOW_ENABLED`). The SLM scores every filing the
+  live model reads, after the live signal is out, and
+  `/api/research/shadow` reports the paired AUC difference with a
+  bootstrap CI. The switch to `LLM_PROVIDER=slm` waits for that CI to
+  clear zero.
+- **Meta-labeling** (`/api/research/meta-label`, `event_replay.py --meta`).
+  The LLM picks the side; a calibrated secondary model, trained on whether
+  the replayed trade ended positive after costs, decides whether to take
+  it. Its fractional-Kelly multipliers are reported only.
+- **Pre-registered evaluation windows**. Declare a hypothesis and a length,
+  and the decision-relevant configuration is hashed. A change while the
+  window runs marks it invalid as out-of-sample evidence and names the key.
+- **Honest model selection**. `AIdataset/model/train.py --walk-forward`
+  uses purged monthly folds with per-fold isotonic calibration, and the
+  Algo Lab optimiser reports the Deflated Sharpe Ratio and the Probability
+  of Backtest Overfitting for every grid search.
+
 ---
 
 ## 10. `tradebot-slm-v1` — our own model
@@ -640,6 +676,7 @@ Query; realtime via WebSocket hooks.
 | **Outcomes** | what every signal's stock actually did — the feedback loop |
 | **Dataset** | the ML training-set builder: column picker with leak badges, filters, exports |
 | **Model** | mover-model variants, holdout AUC/lift, and threshold replay before any gate is armed |
+| **Research** | decision funnel by block reason, confidence calibration per model (AUC, ECE, monthly drift), cost-aware replay, shadow SLM vs live model, pre-registered evaluation window, audit-chain check, per-signal "why" card |
 | **Prompts** | LLM template editor with version history and restore |
 | **Rules** | the operator's rule builder + dry-run |
 | **Strategies / Accounts / Notifications / Webhooks / Trade History / Settings** | configuration and audit |
@@ -656,8 +693,8 @@ scroll-back.
 ## 15. Testing
 
 ```powershell
-$env:TESTING=1; pytest          # 823 tests, 63 modules, in-memory SQLite
-cd frontend; npm test           # 65 tests, 9 suites
+$env:TESTING=1; pytest          # 1,262 tests, 92 modules, in-memory SQLite
+cd frontend; npm test           # 244 tests, 28 suites
 ```
 
 Two suites carry most of the weight and should be run on any change to
@@ -683,6 +720,27 @@ basic auth, with the app itself never leaving `127.0.0.1`.
 Full runbook: **[docs/DEPLOY_AWS.md](docs/DEPLOY_AWS.md)**. Server artifacts
 (bootstrap, systemd unit, Caddyfile, update/backup/restore/repair scripts) live
 in [`deploy/`](deploy/). Redeploy is one command: `bash deploy/push.sh`.
+
+Operational safeguards for the SEBI retail-algo regime (in force at every
+broker since 1 April 2026):
+
+- **08:45 IST preflight**. It checks the Fyers token (daily 2FA, no refresh
+  session), that the app is type 200, that the token was minted for the
+  app in `.env`, an authenticated `/profile` call, the server's egress
+  IPv4 against `FYERS_WHITELISTED_IPS`, DB integrity, RAM/disk and backup
+  age. Failures page through the notification channels and show as a
+  Dashboard banner with a Re-check button.
+- **One order-rate budget per Fyers app** (default 5/s, under the 10/s
+  no-registration ceiling), shared by the news bot, the Trade page and the
+  Algo Lab. Excess calls are refused locally, never sent.
+- **Opt-in exchange gates**: ASM/GSM/T2T, circuit proximity, F&O ban and
+  NSE limit-price protection. Each defaults off.
+- **Offsite backups**: `BACKUP_S3_URI`. The cron job is installed by
+  `setup.sh`; secrets rotation is in
+  [docs/SECRET_ROTATION.md](docs/SECRET_ROTATION.md).
+- **Tamper-evident audit trail**: a SHA-256 hash chain over `audit_log`,
+  verified at `/api/audit-log/verify`, with the head published in the daily
+  report.
 
 Four decisions there are load-bearing and each cost a production incident to
 learn — see below.
@@ -785,7 +843,15 @@ A section we think should be mandatory.
   the corpus never arrived. Deleting it was the correct outcome.
 - **The live model gate is off, and its own replay says keep it off.** On 3,000
   real outcomes the blocked set moved *more* often than the allowed set. That is
-  the tooling working as designed.
+  the tooling working as designed. (The score itself is now on by default as
+  telemetry: it can never block, and live scores are the only out-of-sample ones.)
+- **Earlier offline numbers used a non-purged text OOF.** The mover model's
+  TF-IDF column was built with plain 5-fold OOF, so train-side metrics were
+  inflated. `train.py` now uses purged walk-forward OOF. Re-run
+  `--walk-forward` before quoting any offline figure from before this change.
+- **The cost-aware replay is an estimate.** It does not model the
+  consolidation/stall exits or partial fills. Every report carries its
+  parameters so a reader can see what was assumed.
 
 ---
 
@@ -795,24 +861,27 @@ A section we think should be mandatory.
 app/
 ├── analyzer/          fast track · hybrid · DeepSeek client · slm_adapter ·
 │                      rules engine · PDF extract + cache · prompts · schemas
-├── api/               26 REST + WebSocket routers (the control plane)
-├── backtest/          sandboxed replay through the SAME analyzer→rules→risk path
-├── db/                18 tables, session/engine, migrations, index guard
+├── algo/              Algo Lab: indicator engine, backtests, optimiser (DSR/PBO), live runner
+├── api/               30 REST + WebSocket routers (the control plane)
+├── db/                24 tables, session/engine, migrations, index guard
 ├── execution/         paper + Fyers backends, entry state machine, trade manager,
 │                      market-data bus, quote feed, order reconciliation
 ├── monitors/          NSE API · BSE API · NSE RSS racer · manager · base loop
 ├── notifications/     telegram · discord · email · webhook channels
 ├── risk/              engine (R0–R14) · position sizer · perf sizer ·
 │                      circuit breakers · volatility · market clock
+├── research/          cost-aware replay · stats (bootstrap, ECE, DSR, PBO) ·
+│                      purged walk-forward CV · meta-labeling · results XBRL ·
+│                      pre-registered evaluation windows
 ├── services/          event bus · instrument master · outcome logger ·
-│                      dataset builder · health report · mover model · audit
-├── webhooks/          inbound + outbound dispatch, HMAC signing
-└── tests/             63 modules / 823 tests
+│                      dataset builder · health report · Fyers self-test ·
+│                      exchange lists · mover model · audit + hash chain
+└── tests/             92 modules / 1,262 tests
 AIdataset/model/       corpus build · baselines · training · eval · serve_slm · model card
-frontend/src/          14 pages, components, hooks, indicators (9 suites / 65 tests)
+frontend/src/          15 pages, components, hooks, indicators (28 suites / 244 tests)
 deploy/                Lightsail bootstrap, systemd, Caddy, backup/restore/repair
-docs/                  AWS deployment runbook
-scripts/               run · dev · smoke_slm · seeders · maintenance
+docs/                  AWS deployment runbook · secret rotation runbook
+scripts/               run · dev · smoke_slm · event_replay · seeders · maintenance
 ```
 
 ---

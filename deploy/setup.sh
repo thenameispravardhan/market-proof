@@ -18,6 +18,7 @@
 #   7. systemd unit (tradebot.service) — app bound to 127.0.0.1:8000
 #   8. Caddy: HTTPS on your domain + basic auth on everything except the
 #      Fyers postback (which has its own secret token)
+#   9. Nightly backup cron (deploy/backup.sh, weekdays 18:30 IST)
 #
 # Full runbook: docs/DEPLOY_AWS.md
 
@@ -166,6 +167,17 @@ sed -e "s|__DOMAIN__|${DOMAIN}|g" \
 sudo systemctl enable caddy
 sudo systemctl reload caddy || sudo systemctl restart caddy
 
+# ---- 10. nightly backup cron -----------------------------------------------
+# Installed, not suggested: a backup step left to the operator is a backup
+# that does not exist (the 08:45 preflight alarms when the newest copy is
+# older than BACKUP_MAX_AGE_HOURS). Idempotent — an existing backup.sh line
+# is replaced, every other crontab line is kept.
+echo "==> Installing nightly backup cron (weekdays 18:30 IST)"
+mkdir -p "$PROJECT_ROOT/logs"
+BACKUP_LINE="30 18 * * 1-5 ${PROJECT_ROOT}/deploy/backup.sh >> ${PROJECT_ROOT}/logs/backup.log 2>&1"
+{ crontab -l 2>/dev/null | grep -v 'deploy/backup.sh' || true; echo "$BACKUP_LINE"; } | crontab -
+crontab -l | grep -q 'deploy/backup.sh' && echo "    cron installed: $BACKUP_LINE"
+
 # ---- summary --------------------------------------------------------------
 echo ""
 echo "=================================================================="
@@ -188,6 +200,7 @@ echo "   2. Upload your local data/trading.db (runbook step 5)"
 echo "   3. Fyers dashboard: set redirect URI to"
 echo "        https://${DOMAIN}/api/fyers/callback"
 echo "      and whitelist this server's static IP (SEBI requirement)."
-echo "   4. Optional nightly DB backup — add to crontab -e:"
-echo "        30 18 * * 1-5 ${PROJECT_ROOT}/deploy/backup.sh"
+echo "   4. Offsite backups: set BACKUP_S3_URI=s3://<bucket>/tradebot in .env"
+echo "      and install the AWS CLI with put access (sudo snap install aws-cli --classic)."
+echo "      Then set FYERS_WHITELISTED_IPS to this server's static IP."
 echo "=================================================================="

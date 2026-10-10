@@ -73,6 +73,8 @@ _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
                     ("be_on", "BOOLEAN"), ("mtm_peak", "FLOAT"), ("margin", "FLOAT"), ("u_entry", "FLOAT"),
                     ("version", "INTEGER")],
     "algo_strategies": [("version", "INTEGER NOT NULL DEFAULT 1")],
+    # Tamper-evident audit trail (hash chain).
+    "audit_log": [("prev_hash", "VARCHAR(64)"), ("row_hash", "VARCHAR(64)")],
 }
 
 

@@ -16,6 +16,7 @@ windows overlap, so a random split leaks the future into training.
     python AIdataset/model/train.py                     # 6 models, same_session
     python AIdataset/model/train.py --session next_session
     python AIdataset/model/train.py --ablate            # which features earn it
+    python AIdataset/model/train.py --walk-forward      # purged monthly folds + calibration
 
 Writes model_comparison.png, metrics.csv and the fitted LightGBM booster here.
 """
@@ -31,6 +32,9 @@ import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT.parents[1]))  # repo root: app.research.cv is shared with the bot
+from app.research.cv import oof_predictions, purged_walk_forward  # noqa: E402
+
 MASTER = ROOT.parent / "labels" / "nse_master.parquet"
 TEST_FRACTION = 0.25  # most recent quarter of the timeline is held out
 TARGET = "mover_1_5"
@@ -211,30 +215,99 @@ def build(session: str):
         Xte[c] = Xte[c].cat.set_categories(Xtr[c].cat.categories)
     h, e = d.headline.fillna(""), d.event_id
     return (Xtr, Xte, ytr, yte, h.iloc[:cut], h.iloc[cut:],
-            e.iloc[:cut], e.iloc[cut:])
+            e.iloc[:cut], e.iloc[cut:], at.iloc[:cut], at.iloc[cut:])
 
 
-def text_score(htr, hte, ytr, label="headline") -> tuple[np.ndarray, np.ndarray]:
+def text_score(htr, hte, ytr, ttr, label="headline", purge_days: float = 1.0
+               ) -> tuple[np.ndarray, np.ndarray]:
     """Headline -> P(mover), as one column a tree can split on.
 
     Trees cannot use 50k sparse n-gram columns; a linear model can. Its
-    out-of-fold prediction on train (so the trees never see a fitted-on-itself
-    number) and its full-train prediction on test become the feature.
+    out-of-fold prediction on train and its full-train prediction on test
+    become the feature.
+
+    The OOF is PURGED WALK-FORWARD (app/research/cv.py): each month is
+    scored by a model fit only on months before it, minus a purge gap. The
+    earlier plain 5-fold OOF let a row's score come from a model trained on
+    later filings, which inflated every train-side metric built on it.
+    Rows with no prior history get NaN, which the trees treat as missing.
     """
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.linear_model import LogisticRegression
-    from sklearn.model_selection import cross_val_predict
 
     vec = TfidfVectorizer(min_df=20, ngram_range=(1, 2), sublinear_tf=True,
                           strip_accents="unicode", max_features=50_000)
     Ztr, Zte = vec.fit_transform(htr), vec.transform(hte)
-    lr = LogisticRegression(max_iter=1000, C=1.0)
-    # ponytail: plain 5-fold OOF, not purged/time-series — the inflation stays
-    # inside train, the test column is honest. Purge it if train AUC matters.
-    oof = cross_val_predict(lr, Ztr, ytr, cv=5, method="predict_proba", n_jobs=-1)
-    lr.fit(Ztr, ytr)
-    print(f"   {label} TF-IDF: {Ztr.shape[1]:,} n-grams")
-    return oof[:, 1], lr.predict_proba(Zte)[:, 1]
+    y = np.asarray(ytr)
+
+    def fit_predict(tr_idx, va_idx):
+        if len(set(y[tr_idx])) < 2:
+            return [np.nan] * len(va_idx)
+        m = LogisticRegression(max_iter=1000, C=1.0).fit(Ztr[tr_idx], y[tr_idx])
+        return m.predict_proba(Ztr[va_idx])[:, 1]
+
+    times = list(pd.to_datetime(ttr).dt.to_pydatetime())
+    oof = np.array([np.nan if v is None else v for v in oof_predictions(
+        times, fit_predict, purge=pd.Timedelta(days=purge_days).to_pytimedelta(),
+        min_train=500)], dtype=float)
+    lr = LogisticRegression(max_iter=1000, C=1.0).fit(Ztr, ytr)
+    print(f"   {label} TF-IDF: {Ztr.shape[1]:,} n-grams; purged OOF covers "
+          f"{np.isfinite(oof).mean():.0%} of train")
+    return oof, lr.predict_proba(Zte)[:, 1]
+
+
+def walk_forward(X: pd.DataFrame, y: pd.Series, times: pd.Series, num, cat,
+                 purge_days: float, out: Path) -> pd.DataFrame:
+    """Monthly expanding-window evaluation with a purge gap, refitting the
+    model AND an isotonic calibrator inside every fold.
+
+    The calibrator is fit on the last 20% (by time) of each fold's training
+    window and applied to the fold's month. One calibrator for the whole
+    timeline would be wrong: the mover base rate drifts across periods
+    (22.5% → 28.6% → 19.3% across the published splits), so a calibrator
+    fitted in one regime is miscalibrated in the next. Reports per-fold AUC,
+    PR-AUC, base rate and ECE before/after calibration, and a bootstrap CI
+    of the mean AUC across folds."""
+    from sklearn.isotonic import IsotonicRegression
+    from sklearn.metrics import average_precision_score, roc_auc_score
+
+    from app.research import stats
+
+    rows = []
+    times_py = list(pd.to_datetime(times).dt.to_pydatetime())
+    yv = y.to_numpy()
+    for fold in purged_walk_forward(times_py, purge=pd.Timedelta(days=purge_days).to_pytimedelta(),
+                                    min_train=2000, min_valid=200):
+        tr, va = np.array(fold.train), np.array(fold.valid)
+        if len(set(yv[va])) < 2:
+            continue
+        cal_cut = int(len(tr) * 0.8)
+        fit_idx, cal_idx = tr[:cal_cut], tr[cal_cut:]
+        est = models(num, cat)["LightGBM"]
+        est.fit(X.iloc[fit_idx][num + cat], yv[fit_idx])
+        p_cal = est.predict_proba(X.iloc[cal_idx][num + cat])[:, 1]
+        iso = IsotonicRegression(out_of_bounds="clip").fit(p_cal, yv[cal_idx])
+        p_raw = est.predict_proba(X.iloc[va][num + cat])[:, 1]
+        p_iso = iso.predict(p_raw)
+        rows.append({
+            "fold": fold.label, "n_train": len(tr), "n_valid": len(va),
+            "base_rate": float(yv[va].mean()),
+            "roc_auc": float(roc_auc_score(yv[va], p_raw)),
+            "pr_auc": float(average_precision_score(yv[va], p_raw)),
+            "ece_raw": stats.ece(p_raw, yv[va])["ece"],
+            "ece_isotonic": stats.ece(p_iso, yv[va])["ece"],
+        })
+        r = rows[-1]
+        print(f"   {r['fold']}  train {r['n_train']:>7,}  valid {r['n_valid']:>6,}  "
+              f"base {r['base_rate']:.1%}  AUC {r['roc_auc']:.4f}  "
+              f"ECE {r['ece_raw']:.3f} -> {r['ece_isotonic']:.3f}")
+    table = pd.DataFrame(rows)
+    if not table.empty:
+        lo, hi = stats.bootstrap_ci(table.roc_auc.tolist())
+        print(f"\n   mean AUC {table.roc_auc.mean():.4f}  95% CI [{lo:.4f}, {hi:.4f}] "
+              f"over {len(table)} folds (purge {purge_days:g} d)")
+    table.to_csv(out, index=False)
+    return table
 
 
 # "Rs. 1,234.56 crore" / "₹450 Cr" / "12.5 million". Everything -> crore.
@@ -518,11 +591,31 @@ def main() -> int:
                     help="price each feature family instead of comparing models")
     ap.add_argument("--pdf", action="store_true",
                     help="restrict to filings whose PDF body was fetched, and A/B it")
+    ap.add_argument("--walk-forward", action="store_true",
+                    help="monthly purged expanding-window evaluation with per-fold "
+                         "isotonic calibration, instead of the single time split")
+    ap.add_argument("--purge-days", type=float, default=1.0,
+                    help="gap between training and each validation block "
+                         "(at least the label horizon)")
     a = ap.parse_args()
 
-    Xtr, Xte, ytr, yte, htr, hte, etr, ete = build(a.session)
+    Xtr, Xte, ytr, yte, htr, hte, etr, ete, ttr, tte = build(a.session)
     Xtr = Xtr.copy()
-    Xtr["text_score"], Xte["text_score"] = text_score(htr, hte, ytr)
+    Xtr["text_score"], Xte["text_score"] = text_score(htr, hte, ytr, ttr, purge_days=a.purge_days)
+
+    if a.walk_forward:
+        # The text column must itself be walk-forward over the WHOLE timeline
+        # here (train and test months alike are validation blocks).
+        X = pd.concat([Xtr, Xte])
+        y = pd.concat([ytr, yte])
+        t = pd.concat([ttr, tte])
+        X["text_score"], _ = text_score(pd.concat([htr, hte]), hte.iloc[:1], y, t,
+                                        purge_days=a.purge_days)
+        for c in GROUPS["base"][1]:
+            X[c] = X[c].astype("string").fillna("NA").astype("category")
+        num, cat = cols(ALL)
+        walk_forward(X, y, t, num, cat, a.purge_days, ROOT / f"walkforward_{a.session}.csv")
+        return 0
 
     ladder = LADDER
     if a.pdf:
@@ -535,7 +628,8 @@ def main() -> int:
         print(f"   PDF bodies: train {mtr.sum():,}  test {mte.sum():,} "
               f"({yte.mean():.2%} movers)")
         btr, bte = body.loc[etr[mtr]], body.loc[ete[mte]]
-        Xtr["pdf_score"], Xte["pdf_score"] = text_score(btr, bte, ytr, label="PDF body")
+        Xtr["pdf_score"], Xte["pdf_score"] = text_score(btr, bte, ytr, ttr[mtr], label="PDF body",
+                                                        purge_days=a.purge_days)
         for X, b in ((Xtr, btr), (Xte, bte)):
             a4 = pdf_amounts(b, np.expm1(X.log_mcap.to_numpy()))
             X[a4.columns] = a4.to_numpy()
