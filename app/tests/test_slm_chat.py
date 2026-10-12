@@ -23,3 +23,16 @@ def test_slm_chat_maps_reply_and_needs_an_endpoint(client, monkeypatch):
     assert r.status_code == 200 and r.json()["mapped"]["recommendation"] == "BUY"
     assert seen["user"].startswith("SYMBOL: ABC\nFILED: ") and "HEADLINE: Order win\n" in seen["user"]
     assert seen["user"].endswith("FILING:\nRs 845 crore LoA")
+
+
+def test_small_talk_never_reaches_the_model(client, monkeypatch):
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "LLM_SLM_ENDPOINT", "http://slm/v1/chat/completions")
+
+    async def boom(*a):
+        raise AssertionError("small talk must not be sent to the SLM")
+
+    monkeypatch.setattr(model_api, "_slm_post", boom)
+    for msg in ("hi", "how are you ?"):
+        assert client.post("/api/model/slm-chat", json={"message": msg}).json()["not_filing"] is True

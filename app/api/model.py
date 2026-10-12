@@ -210,6 +210,9 @@ async def _slm_post(endpoint: str, body: dict[str, Any], api_key: str) -> dict[s
         return r.json()
 
 
+MIN_FILING_WORDS = 6
+
+
 @router.post("/slm-chat")
 async def slm_chat(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
     """Chat page: one message = one filing (first line headline, rest text),
@@ -231,6 +234,11 @@ async def slm_chat(payload: dict[str, Any] = Body(default_factory=dict)) -> dict
         raise HTTPException(422, "message is empty")
     symbol = str(payload.get("symbol") or "").strip().upper()[:32]
     headline, _, text = message.partition("\n")
+    # The SLM only knows one task (filing -> trade JSON); "hi" gets a random
+    # BUY/SELL. ponytail: word-count heuristic, a real headline is ~10-40 words;
+    # replace with a trained "not a filing" class if it misfires.
+    if len(message.split()) < MIN_FILING_WORDS:
+        return {"model": None, "latency_ms": 0, "prompt": "", "content": "", "not_filing": True}
     now = datetime.now(timezone.utc).replace(tzinfo=None)  # stored-UTC convention
     system, user = build_prompt(symbol=symbol, filed_at=now.isoformat(sep=" ", timespec="seconds"),
                                 headline=headline.strip()[:1000], filing_text=text.strip(),
