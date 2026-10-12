@@ -78,7 +78,7 @@ class ShadowScorer:
 
     def schedule(self, *, announcement_id: Optional[int], analysis_id: Optional[int],
                  signal_id: Optional[int], symbol: str, headline: str, filed_at: Optional[datetime],
-                 filing_text: str, pdf_url: Optional[str]) -> bool:
+                 filing_text: str, pdf_url: Optional[str], amount_cr: Optional[float] = None) -> bool:
         """Queue one shadow call. Returns False when skipped (disabled or
         at capacity). Must be called from the event loop."""
         if not self.enabled():
@@ -91,7 +91,7 @@ class ShadowScorer:
         task = asyncio.get_running_loop().create_task(self._score(
             announcement_id=announcement_id, analysis_id=analysis_id, signal_id=signal_id,
             symbol=symbol, headline=headline, filed_at=filed_at, filing_text=filing_text,
-            pdf_url=pdf_url))
+            pdf_url=pdf_url, amount_cr=amount_cr))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return True
@@ -114,14 +114,14 @@ class ShadowScorer:
             self._pending -= 1
 
     async def _call(self, *, announcement_id, analysis_id, signal_id, symbol, headline,
-                    filed_at, filing_text, pdf_url) -> dict[str, Any]:
+                    filed_at, filing_text, pdf_url, amount_cr=None) -> dict[str, Any]:
         s = get_settings()
         model = str(getattr(s, "LLM_SLM_MODEL", "") or "tradebot-slm-v1")
         base = {"announcement_id": announcement_id, "analysis_id": analysis_id,
                 "signal_id": signal_id, "model": model}
         client = self._get_client(str(s.LLM_SLM_ENDPOINT).strip(), str(getattr(s, "LLM_SLM_API_KEY", "") or ""))
         system, user = build_prompt(symbol=symbol, filed_at=str(filed_at or ""), headline=headline,
-                                    filing_text=filing_text, **market_context_for(symbol, filed_at))
+                                    filing_text=filing_text, **market_context_for(symbol, filed_at, amount_cr))
         t0 = time.perf_counter()
         try:
             res = await asyncio.wait_for(

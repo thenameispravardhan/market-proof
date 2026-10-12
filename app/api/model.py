@@ -22,6 +22,7 @@ history before switching the gate on.
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Optional
 
 from fastapi import APIRouter, Body, Depends, Query
@@ -211,6 +212,14 @@ async def _slm_post(endpoint: str, body: dict[str, Any], api_key: str) -> dict[s
 
 
 MIN_FILING_WORDS = 6
+_AMOUNT = re.compile(r"(?:rs\.?|inr|₹)?\s*(\d[\d,]*(?:\.\d+)?)\s*(?:crores?|cr)\b", re.I)
+
+
+def _amount_cr(text: str) -> Optional[float]:
+    """First 'Rs N crore' in a chat message (live filings get DeepSeek's deal value).
+    ponytail: regex, crore only; lakh/million amounts are ignored."""
+    m = _AMOUNT.search(text)
+    return float(m.group(1).replace(",", "")) if m else None
 
 
 @router.post("/slm-chat")
@@ -242,7 +251,7 @@ async def slm_chat(payload: dict[str, Any] = Body(default_factory=dict)) -> dict
     now = datetime.now(timezone.utc).replace(tzinfo=None)  # stored-UTC convention
     system, user = build_prompt(symbol=symbol, filed_at=now.isoformat(sep=" ", timespec="seconds"),
                                 headline=headline.strip()[:1000], filing_text=text.strip(),
-                                **market_context_for(symbol, now))
+                                **market_context_for(symbol, now, _amount_cr(message)))
     model = str(getattr(s, "LLM_SLM_MODEL", "") or "tradebot-slm-v3")
     t0 = time.perf_counter()
     try:
