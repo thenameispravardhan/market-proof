@@ -190,7 +190,9 @@ def build_prompt(
     if market_cap_cr:
         ctx.append(f"  market cap: Rs {float(market_cap_cr):,.0f} crore")
         if amount_cr:
-            ctx.append(f"  amount vs market cap: {100 * float(amount_cr) / float(market_cap_cr):.2g}%")
+            v = 100 * float(amount_cr) / float(market_cap_cr)
+            t = f"{v:.2g}"   # same as build_v4.pct: never scientific notation
+            ctx.append(f"  amount vs market cap: {t if 'e' not in t else f'{v:.12f}'.rstrip('0')}%")
     if session:
         ctx.append(f"  {MARKET_CONTEXT_KEYS['session']}: {session}")
     if ctx:

@@ -135,3 +135,9 @@ def test_size_lines_match_build_v4_exactly():
             "  amount vs market cap: 0.00081%\n  session: same_session") in user
     _, user = build_prompt(symbol="T", filed_at="t", headline="h", filing_text="x", amount_cr=10.0)
     assert "amount vs market cap" not in user   # no mcap -> no ratio, never a guess
+
+
+def test_tiny_ratio_is_never_scientific_notation():
+    _, user = build_prompt(symbol="H", filed_at="t", headline="h", filing_text="x",
+                           market_cap_cr=1_000_000.0, amount_cr=0.36)   # 0.000036 %
+    assert "  amount vs market cap: 0.000036%" in user
