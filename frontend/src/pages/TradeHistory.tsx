@@ -7,7 +7,7 @@
 // a single row. A position that hasn't been closed yet shows as "OPEN"
 // with no exit/P&L — its stop-loss / target is editable inline.
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import {
   useBrokerAccounts,
   useDeleteTrades,
@@ -55,6 +55,8 @@ function Section({
   managedBy: Map<string, ManagedPosition>;
   onDelete: (r: RoundTrip) => void;
 }) {
+  // Delete button is hidden until the row is double-clicked (toggles).
+  const [armed, setArmed] = useState<string | null>(null);
   const realised = rows.reduce((acc, r) => acc + (r.pnl ?? 0), 0);
   const closed = rows.filter((r) => !r.open);
   const openCount = rows.length - closed.length;
@@ -94,7 +96,11 @@ function Section({
               {rows.map((r) => {
                 const m = managedBy.get(r.symbol);
                 return (
-                  <tr key={r.key}>
+                  <tr
+                    key={r.key}
+                    title="Double-click to show delete"
+                    onDoubleClick={() => setArmed(armed === r.key ? null : r.key)}
+                  >
                     <td className="mono">{r.symbol}</td>
                     <td>
                       <span className={`badge ${r.side === "BUY" ? "buy" : "sell"}`}>{r.side}</span>
@@ -127,7 +133,7 @@ function Section({
                           symbol has a real open position, so a genuinely
                           live one cannot be removed from under the trade
                           manager. */}
-                      <button
+                      {armed === r.key && <button
                         className="btn-sm danger"
                         title={
                           r.open
@@ -138,7 +144,7 @@ function Section({
                         onClick={() => onDelete(r)}
                       >
                         ✕
-                      </button>
+                      </button>}
                     </td>
                   </tr>
                 );
