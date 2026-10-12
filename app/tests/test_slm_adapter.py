@@ -96,7 +96,7 @@ def test_garbage_raises_so_the_caller_stores_invalid_json():
 
 def test_prompt_matches_the_trained_format():
     system, user = build_prompt(
-        symbol="ONGC", filed_at="2026-04-04 08:27:39",
+        symbol="ONGC", filed_at="2026-04-04 02:57:39",  # stored UTC -> IST in the prompt,
         headline="ONGC stabilises fire incident", filing_text="Press Release ...",
     )
     assert system == SYSTEM_PROMPT
@@ -107,3 +107,21 @@ def test_prompt_matches_the_trained_format():
 def test_prompt_falls_back_to_the_headline_when_the_pdf_failed():
     _, user = build_prompt(symbol="X", filed_at="t", headline="H", filing_text="")
     assert user.endswith("FILING:\nH")
+
+
+def test_v3_reply_maps_straight_through():
+    reply = json.dumps({"news_summary": "Order win", "event_type": "ORDER_WIN", "reason": "r",
+                        "sentiment": "NEGATIVE", "sentiment_score": -0.8, "facts": ["filed during market hours"],
+                        "confidence": 0.8, "recommendation": "SELL"})
+    mapped, raw = to_analysis(reply)
+    assert (mapped["recommendation"], mapped["sentiment"], mapped["sentiment_score"]) == ("SELL", "negative", -80.0)
+    assert raw["recommendation"] == "SELL"
+    AnalysisResponse.model_validate(mapped)
+
+
+def test_prompt_uses_training_labels_and_ist_filed_time():
+    _, user = build_prompt(symbol="X", filed_at="2026-10-12 04:00:00", headline="H", filing_text="F",
+                           last_trade=286.5, volume_ratio=3.21, cap_tier="large", session="same_session")
+    assert "FILED: 2026-10-12 09:30:00\n" in user
+    assert ("  last trade before filing: 286.5\n  pre-news volume vs this symbol's norm: 3.2x\n"
+            "  market cap tier: Large\n  session: same_session") in user

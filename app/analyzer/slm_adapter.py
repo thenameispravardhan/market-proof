@@ -73,16 +73,27 @@ _T15 = 14
 _SCORE_SATURATION_TENTHS = 30.0
 
 
-# Line labels of the MARKET CONTEXT block, in training order. The training
-# script (train_sft.py, kept outside git) is the authority on these strings:
-# if a label differs there, change it HERE and only here. A field the bot
-# cannot measure live is omitted, never filled with a placeholder.
+# Line labels of the MARKET CONTEXT block, copied verbatim from
+# out/sft_*.jsonl (the strings every training prompt carried). The old
+# snake_case labels ("last_trade: 286.50") were a train/serve skew on every
+# live filing. A field the bot cannot measure live is omitted, never faked.
 MARKET_CONTEXT_KEYS: dict[str, str] = {
-    "last_trade": "last_trade",
-    "volume_ratio": "pre_news_volume_ratio",
-    "cap_tier": "cap_tier",
+    "last_trade": "last trade before filing",
+    "volume_ratio": "pre-news volume vs this symbol's norm",
+    "cap_tier": "market cap tier",
     "session": "session",
 }
+
+
+def _filed_ist(filed_at: str) -> str:
+    """Training FILED lines are naive IST 'YYYY-MM-DD HH:MM:SS'; the bot
+    stores UTC (naive = UTC, as in `session_of`). Unparseable passes through."""
+    try:
+        dt = datetime.fromisoformat(str(filed_at).strip())
+    except ValueError:
+        return filed_at
+    aware = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return aware.astimezone(_IST).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def session_of(filed_at_utc: Optional[datetime]) -> Optional[str]:
@@ -154,16 +165,16 @@ def build_prompt(
     """
     parts = [
         f"SYMBOL: {symbol}",
-        f"FILED: {filed_at}",
+        f"FILED: {_filed_ist(filed_at)}",
         f"HEADLINE: {headline}",
     ]
     ctx: list[str] = []
     if last_trade is not None and last_trade > 0:
-        ctx.append(f"  {MARKET_CONTEXT_KEYS['last_trade']}: {float(last_trade):.2f}")
+        ctx.append(f"  {MARKET_CONTEXT_KEYS['last_trade']}: {round(float(last_trade), 2)}")
     if volume_ratio is not None and volume_ratio >= 0:
-        ctx.append(f"  {MARKET_CONTEXT_KEYS['volume_ratio']}: {float(volume_ratio):.2f}")
+        ctx.append(f"  {MARKET_CONTEXT_KEYS['volume_ratio']}: {float(volume_ratio):.1f}x")
     if cap_tier:
-        ctx.append(f"  {MARKET_CONTEXT_KEYS['cap_tier']}: {cap_tier}")
+        ctx.append(f"  {MARKET_CONTEXT_KEYS['cap_tier']}: {str(cap_tier).capitalize()}")
     if session:
         ctx.append(f"  {MARKET_CONTEXT_KEYS['session']}: {session}")
     if ctx:
@@ -231,6 +242,9 @@ def to_analysis(
     if not isinstance(raw, dict):
         raise ValueError(f"expected a JSON object, got {type(raw).__name__}")
 
+    if "recommendation" in raw:
+        return _from_v3(raw, headline, pdf_url), raw
+
     direction = str(raw.get("direction") or "FLAT").strip().upper()
     mover = bool(raw.get("mover"))
     materiality = str(raw.get("materiality") or "UNKNOWN").strip().upper()
@@ -272,3 +286,41 @@ def to_analysis(
         ),
         "key_numbers": key_numbers,
     }, raw
+
+
+_BOT_EVENTS = frozenset(_EVENT_MAP.values()) | _RESULTS_TYPES | {
+    "MERGER", "STOCK_SPLIT", "BONUS", "RIGHTS_ISSUE"}
+
+
+def _from_v3(raw: dict[str, Any], headline: str, pdf_url: Optional[str]) -> dict[str, Any]:
+    """v3 (pravz/slm_v1@v3) already speaks the bot's shape: news_summary,
+    event_type (bot names), reason, sentiment, sentiment_score (-1..1),
+    facts (list of strings), confidence, recommendation. Its confidence is
+    a training-label echo (every BUY/SELL target was >= 0.70), so it is
+    passed through but NOT calibrated -- see the v3 audit."""
+    rec = str(raw.get("recommendation") or "HOLD").strip().upper()
+    rec = rec if rec in ("BUY", "SELL") else "HOLD"
+    ev = str(raw.get("event_type") or "OTHER").strip().upper()
+    if ev in _RESULTS_TYPES:  # the quarter comes from the bot's own detector, as for v1
+        det = detect_event_type(headline or "", pdf_url)
+        ev = det if det in _RESULTS_TYPES else ev
+    try:
+        score = round(max(-100.0, min(100.0, 100.0 * float(raw.get("sentiment_score") or 0))), 1)
+    except (TypeError, ValueError):
+        score = 0.0
+    try:
+        conf = round(max(0.0, min(1.0, float(raw.get("confidence") or 0))), 2)
+    except (TypeError, ValueError):
+        conf = 0.0
+    facts = raw.get("facts") if isinstance(raw.get("facts"), list) else []
+    return {
+        "event_type": ev if ev in _BOT_EVENTS else "OTHER",
+        "summary": str(raw.get("news_summary") or headline or "")[:500],
+        "sentiment": {"POSITIVE": "positive", "NEGATIVE": "negative"}.get(
+            str(raw.get("sentiment") or "").strip().upper(), "neutral"),
+        "sentiment_score": score,
+        "confidence": conf,
+        "recommendation": rec,
+        "reasoning": f"tradebot-slm-v3: {raw.get('reason', '')}; facts: " + "; ".join(map(str, facts))[:400],
+        "key_numbers": {},
+    }
