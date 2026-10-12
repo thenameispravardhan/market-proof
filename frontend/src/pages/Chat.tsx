@@ -14,7 +14,7 @@ type Mapped = {
   recommendation: string; sentiment: string; sentiment_score: number;
   confidence: number; event_type: string; reasoning: string; summary: string;
 };
-type Reply = { model: string; latency_ms: number; prompt: string; content: string; mapped?: Mapped; error?: string };
+type Reply = { model: string | null; latency_ms: number; prompt: string; content: string; mapped?: Mapped; error?: string; not_filing?: boolean };
 type Turn = { symbol: string; message: string; reply?: Reply; error?: string };
 
 const tone = (r: string) => (r === "BUY" ? "var(--pos, #16a34a)" : r === "SELL" ? "var(--neg, #dc2626)" : "var(--muted, #888)");
@@ -25,18 +25,27 @@ const bubble = (mine: boolean): React.CSSProperties => ({
   color: mine ? "#fff" : "inherit",
 });
 
+const ACTION: Record<string, string> = {
+  BUY: "I'd expect this stock to rise — a BUY signal.",
+  SELL: "I'd expect this stock to fall — a SELL signal.",
+  HOLD: "I don't expect a tradable move from this — HOLD.",
+};
+
 function Answer({ r }: { r: Reply }) {
+  if (r.not_filing)
+    return <span>I'm not a general chatbot — I only analyse NSE filings. Paste a filing headline (and its text, if you have it) and I'll tell you whether I'd buy, sell or hold.</span>;
   const m = r.mapped;
   if (!m) return <span style={{ color: tone("SELL") }}>{r.error || "The model did not return valid JSON."}</span>;
+  const reason = m.reasoning.replace(/^tradebot-slm-v\d+: /, "").replace(/; facts: .*$/, "");
   return (
     <>
-      <div>
-        <b style={{ color: tone(m.recommendation) }}>{m.recommendation}</b>
-        {" — "}{m.event_type.replace(/_/g, " ").toLowerCase()}, {m.sentiment} ({m.sentiment_score}), confidence {m.confidence}
+      <div><b style={{ color: tone(m.recommendation) }}>{m.recommendation}.</b> {ACTION[m.recommendation] ?? ""}</div>
+      <div style={{ marginTop: 6 }}>
+        I read it as <b>{m.event_type.replace(/_/g, " ").toLowerCase()}</b> news, {m.sentiment} in tone. {reason.charAt(0).toUpperCase() + reason.slice(1)}.
       </div>
-      <div style={{ marginTop: 6 }}>{m.reasoning.replace(/^tradebot-slm-v3: /, "")}</div>
       <details style={{ marginTop: 8 }}>
-        <summary className="meta" style={{ cursor: "pointer" }}>{r.model} · {(r.latency_ms / 1000).toFixed(1)} s · raw reply + prompt</summary>
+        <summary className="meta" style={{ cursor: "pointer" }}>details</summary>
+        <div className="meta">{r.model} · {(r.latency_ms / 1000).toFixed(1)} s · score {m.sentiment_score} · confidence {m.confidence} (not calibrated)</div>
         <pre className="mono" style={{ whiteSpace: "pre-wrap", fontSize: 12 }}>{r.content}</pre>
         <pre className="mono meta" style={{ whiteSpace: "pre-wrap", fontSize: 12 }}>{r.prompt}</pre>
       </details>
