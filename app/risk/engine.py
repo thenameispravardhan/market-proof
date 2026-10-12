@@ -238,8 +238,11 @@ async def warm_adv(symbol: str) -> Optional[float]:
     key = (symbol.upper().strip(), int((_t.time() + 19800) // 86400))
     if key not in _ADV_CACHE:
         from app.api.market import fetch_history
+        from app.execution.symbols import resolve_fyers_symbol
 
-        candles = await fetch_history(key[0], resolution="D", days=40)
+        # Fyers needs "NSE:X-EQ"; the bare symbol 422s, which left ADV unknown for
+        # every name and blocked every live entry (RISK_MIN_LIQUIDITY_UNKNOWN).
+        candles = await fetch_history(resolve_fyers_symbol(key[0]) or key[0], resolution="D", days=40)
         _ADV_CACHE[key] = adv_from_candles(candles)    # None when Fyers is unreachable
     return _ADV_CACHE[key]
 
