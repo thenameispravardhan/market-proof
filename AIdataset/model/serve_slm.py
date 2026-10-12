@@ -58,7 +58,8 @@ def generate(messages: list[dict], temperature: float, max_tokens: int) -> tuple
     import torch
 
     prompt = TOKENIZER.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+        messages, tokenize=False, add_generation_prompt=True,
+        enable_thinking=False,  # Qwen3 (v3) would otherwise emit <think>; older templates ignore it
     )
     inputs = TOKENIZER(prompt, return_tensors="pt").to(MODEL.device)
     prompt_tokens = int(inputs["input_ids"].shape[-1])

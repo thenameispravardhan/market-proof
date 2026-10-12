@@ -38,7 +38,7 @@ def test_market_context_block_carries_only_known_fields():
     _, user = slm_adapter.build_prompt(symbol="ACME", filed_at="t", headline="h", filing_text="body",
                                        session="same_session", last_trade=123.456, cap_tier="small")
     assert "MARKET CONTEXT (as of the filing timestamp):" in user
-    assert "  last_trade: 123.46" in user and "  cap_tier: small" in user
+    assert "  last trade before filing: 123.46" in user and "  market cap tier: Small" in user
     assert "volume" not in user                       # unknown -> omitted, never faked
     assert user.index("MARKET CONTEXT") < user.index("FILING:")
     _, bare = slm_adapter.build_prompt(symbol="ACME", filed_at="t", headline="h", filing_text="b")

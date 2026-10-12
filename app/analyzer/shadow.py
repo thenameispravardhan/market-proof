@@ -142,8 +142,10 @@ class ShadowScorer:
                     "raw": {"content": (res.content or "")[:2000]}, "latency_ms": latency}
         return {
             **base, "status": "ok", "latency_ms": latency, "raw": raw,
-            "mover": bool(raw.get("mover")),
-            "direction": str(raw.get("direction") or "FLAT").upper()[:8],
+            # v1 emits mover/direction; v3 only a recommendation (see slm_adapter._from_v3)
+            "mover": bool(raw["mover"]) if "mover" in raw else mapped.get("recommendation") != "HOLD",
+            "direction": str(raw.get("direction") or {"BUY": "UP", "SELL": "DOWN"}.get(
+                str(mapped.get("recommendation")), "FLAT")).upper()[:8],
             "confidence": mapped.get("confidence"),
             "sentiment_score": mapped.get("sentiment_score"),
             "recommendation": mapped.get("recommendation"),
