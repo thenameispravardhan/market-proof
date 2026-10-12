@@ -199,3 +199,56 @@ def model_preview(
         # Newest 100 for the table; the aggregates above cover the full slice.
         "rows": scored[:100],
     }
+
+
+async def _slm_post(endpoint: str, body: dict[str, Any], api_key: str) -> dict[str, Any]:
+    import httpx
+
+    async with httpx.AsyncClient(timeout=90.0) as c:
+        r = await c.post(endpoint, json=body, headers={"Authorization": f"Bearer {api_key or '-'}"})
+        r.raise_for_status()
+        return r.json()
+
+
+@router.post("/slm-chat")
+async def slm_chat(payload: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    """Chat page: one message = one filing (first line headline, rest text),
+    rendered in the trained prompt format and answered by the SLM at
+    LLM_SLM_ENDPOINT. Read-only: nothing here reaches rules or orders."""
+    from datetime import datetime, timezone
+    import time
+
+    from fastapi import HTTPException
+
+    from app.analyzer.slm_adapter import build_prompt, market_context_for, to_analysis
+
+    s = get_settings()
+    endpoint = (getattr(s, "LLM_SLM_ENDPOINT", "") or "").strip()
+    if not endpoint:
+        raise HTTPException(503, "LLM_SLM_ENDPOINT is not set (Settings → AI analysis)")
+    message = str(payload.get("message") or "").strip()[:20000]
+    if not message:
+        raise HTTPException(422, "message is empty")
+    symbol = str(payload.get("symbol") or "").strip().upper()[:32]
+    headline, _, text = message.partition("\n")
+    now = datetime.now(timezone.utc).replace(tzinfo=None)  # stored-UTC convention
+    system, user = build_prompt(symbol=symbol, filed_at=now.isoformat(sep=" ", timespec="seconds"),
+                                headline=headline.strip()[:1000], filing_text=text.strip(),
+                                **market_context_for(symbol, now))
+    model = str(getattr(s, "LLM_SLM_MODEL", "") or "tradebot-slm-v3")
+    t0 = time.perf_counter()
+    try:
+        res = await _slm_post(endpoint, {"model": model, "temperature": 0, "max_tokens": 500,
+                                         "messages": [{"role": "system", "content": system},
+                                                      {"role": "user", "content": user}]},
+                              str(getattr(s, "LLM_SLM_API_KEY", "") or ""))
+        content = res["choices"][0]["message"]["content"]
+    except Exception as e:  # noqa: BLE001 — surface, never crash the page
+        raise HTTPException(502, f"SLM unreachable: {str(e)[:200]}")
+    out: dict[str, Any] = {"model": model, "latency_ms": round((time.perf_counter() - t0) * 1000),
+                           "prompt": user, "content": content}
+    try:
+        out["mapped"], _ = to_analysis(content, headline=headline)
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"invalid_json: {e}"[:300]
+    return out
