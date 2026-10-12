@@ -1026,6 +1026,8 @@ class Service:
                     headline=announcement.headline or "", filed_at=filed_at,
                     filing_text=extraction.text if (extraction and extraction.ok) else "",
                     pdf_url=announcement.pdf_url or "",
+                    # DeepSeek's deal value: the extractor v4's training amounts came from
+                    amount_cr=response.key_numbers.deal_value_inr_crore,
                 )
             except Exception:  # noqa: BLE001 — shadow can never cost a signal
                 log.exception("analyzer.shadow_schedule_failed")

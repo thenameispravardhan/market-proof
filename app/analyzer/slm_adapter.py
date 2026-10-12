@@ -114,7 +114,13 @@ def session_of(filed_at_utc: Optional[datetime]) -> Optional[str]:
     return "next_session"
 
 
-def market_context_for(symbol: str, filed_at: Optional[datetime]) -> dict[str, Any]:
+# Models trained with the two size lines (build_v4.py); v1/v3 never saw them,
+# so sending them there would be off-distribution.
+SIZE_LINE_MODELS = frozenset({"tradebot-slm-v4"})
+
+
+def market_context_for(symbol: str, filed_at: Optional[datetime],
+                       amount_cr: Optional[float] = None) -> dict[str, Any]:
     """What the bot can honestly put in the MARKET CONTEXT block right now:
     the prefetched quote (QUOTE_PREFETCH_ENABLED), the AMFI cap tier and the
     session. Never blocks; a missing source just drops its line."""
@@ -136,6 +142,9 @@ def market_context_for(symbol: str, filed_at: Optional[datetime]) -> dict[str, A
         tier = mcap.tier_of(mcap.lookup(symbol), float(st.CAP_LARGE_MIN_CR), float(st.CAP_MID_MIN_CR))
         if tier:
             out["cap_tier"] = tier
+        if str(getattr(st, "LLM_SLM_MODEL", "")) in SIZE_LINE_MODELS:
+            out["market_cap_cr"] = mcap.lookup(symbol)
+            out["amount_cr"] = amount_cr
     except Exception:  # noqa: BLE001
         pass
     return out
@@ -151,6 +160,8 @@ def build_prompt(
     last_trade: Optional[float] = None,
     volume_ratio: Optional[float] = None,
     cap_tier: Optional[str] = None,
+    market_cap_cr: Optional[float] = None,
+    amount_cr: Optional[float] = None,
 ) -> tuple[str, str]:
     """Render the (system, user) pair in the shape the model trained on.
 
@@ -175,6 +186,11 @@ def build_prompt(
         ctx.append(f"  {MARKET_CONTEXT_KEYS['volume_ratio']}: {float(volume_ratio):.1f}x")
     if cap_tier:
         ctx.append(f"  {MARKET_CONTEXT_KEYS['cap_tier']}: {str(cap_tier).capitalize()}")
+    # Size lines: strings must match build_v4.size_lines exactly.
+    if market_cap_cr:
+        ctx.append(f"  market cap: Rs {float(market_cap_cr):,.0f} crore")
+        if amount_cr:
+            ctx.append(f"  amount vs market cap: {100 * float(amount_cr) / float(market_cap_cr):.2g}%")
     if session:
         ctx.append(f"  {MARKET_CONTEXT_KEYS['session']}: {session}")
     if ctx:

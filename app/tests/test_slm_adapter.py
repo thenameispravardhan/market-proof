@@ -125,3 +125,13 @@ def test_prompt_uses_training_labels_and_ist_filed_time():
     assert "FILED: 2026-10-12 09:30:00\n" in user
     assert ("  last trade before filing: 286.5\n  pre-news volume vs this symbol's norm: 3.2x\n"
             "  market cap tier: Large\n  session: same_session") in user
+
+
+def test_size_lines_match_build_v4_exactly():
+    # Same strings as AIdataset/model/build_v4.py size_lines/with_size (v4 trains on them).
+    _, user = build_prompt(symbol="TCS", filed_at="t", headline="h", filing_text="x", cap_tier="large",
+                           session="same_session", market_cap_cr=1234000.0, amount_cr=10.0)
+    assert ("  market cap tier: Large\n  market cap: Rs 1,234,000 crore\n"
+            "  amount vs market cap: 0.00081%\n  session: same_session") in user
+    _, user = build_prompt(symbol="T", filed_at="t", headline="h", filing_text="x", amount_cr=10.0)
+    assert "amount vs market cap" not in user   # no mcap -> no ratio, never a guess
