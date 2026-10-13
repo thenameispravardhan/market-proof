@@ -3054,3 +3054,11 @@ a.sym-link { text-decoration: none; color: inherit; }
 
 /* Research page: wide tables scroll inside their panel on narrow screens. */
 .research-page .widget { overflow-x: auto; }
+
+/* Trade page Paper / Fyers: the active mode is filled so it reads at a glance
+   (cyan = practice money, red = real money); the other one fades. */
+.tv-topbar .trade-mode { display: inline-flex; gap: 2px; flex-shrink: 0; }
+.tv-topbar .trade-mode button { font-weight: 700; }
+.tv-topbar .trade-mode button:not(.active) { opacity: .55; }
+.tv-topbar .trade-mode .mode-paper.active { background: var(--cyan); border-color: var(--cyan); color: var(--text-inv); }
+.tv-topbar .trade-mode .mode-fyers.active { background: var(--red); border-color: var(--red); color: #fff; }

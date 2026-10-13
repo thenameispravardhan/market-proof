@@ -9,6 +9,10 @@
 
 set -euo pipefail
 
+# Braces: bash reads the whole block before running it, so the `git pull`
+# below can rewrite this file without corrupting the run in flight.
+{
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
@@ -44,14 +48,15 @@ echo "==> Restarting tradebot"
 sudo systemctl daemon-reload
 sudo systemctl restart tradebot
 
-# Startup takes ~15s with a full DB (init + instrument master + services);
-# poll instead of a single premature probe.
-for i in $(seq 1 12); do
+# Startup takes ~60-65s with a full DB (init + instrument master + services);
+# poll up to 3 minutes instead of a single premature probe.
+for i in $(seq 1 36); do
     if curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; then
         echo "==> Health check: OK (after ~$((i * 5))s)"
         exit 0
     fi
     sleep 5
 done
-echo "==> Health check: NOT RESPONDING after 60s — journalctl -u tradebot -n 50 --no-pager" >&2
+echo "==> Health check: NOT RESPONDING after 180s — journalctl -u tradebot -n 50 --no-pager" >&2
 exit 1
+}
