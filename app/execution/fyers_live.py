@@ -16,9 +16,7 @@ A thin async httpx wrapper around the Fyers v3 REST API. We picked
      the "rate limit awareness" the spec asks for is trivial: a
      semaphore (default 5 in flight) + a small async sleep on 429.
 
-The pinned httpx version is 0.28.1 (see requirements.txt). If
-we ever swap to `fyers-apiv3`, the version pin is 3.1.6 — see
-the docstring in `_SDK_CANDIDATES`.
+The pinned httpx version is 0.28.1 (see requirements.txt).
 
 API surface:
 
@@ -90,16 +88,6 @@ from app.execution.market_data import Quote
 from app.logging_config import get_logger
 
 log = get_logger(__name__)
-
-
-# SDK candidates we considered. The official `fyers-apiv3` SDK
-# exists at pypi.org/project/fyers-apiv3 (latest 3.1.6 at writing)
-# but it's synchronous and ties us to the SDK's release cadence.
-# We prefer httpx for the reasons in the module docstring.
-_SDK_CANDIDATES = {
-    "httpx (chosen)": "0.28.1",
-    "fyers-apiv3 (not chosen)": "3.1.6",
-}
 
 
 # ---- Errors -------------------------------------------------------------
@@ -366,7 +354,7 @@ class FyersClient:
                     "fyers.rate_limited",
                     method=method, path=path, attempt=attempt + 1,
                 )
-                await asyncio.sleep(self._rate_limit_sleep_s())
+                await asyncio.sleep(5.0)
                 continue
             # 5xx — retryable.
             if resp.status_code in self.RETRYABLE_STATUS:
@@ -429,10 +417,6 @@ class FyersClient:
         # Unreachable.
         assert last_err is not None
         raise last_err
-
-    def _rate_limit_sleep_s(self) -> float:
-        # Operators can override via subclassing; default is 5s.
-        return 5.0
 
     async def _backoff(self, attempt: int, base: float = 1.0) -> None:
         await asyncio.sleep(base * (2 ** attempt))
@@ -1180,12 +1164,14 @@ class FyersLiveBackend:
                 return False, f"{ot.value} order requires a limit price > 0"
             if needs_stop and sp <= 0:
                 return False, f"{ot.value} order requires a stop/trigger price > 0"
-            payload.update({"type": fyers_type, "limitPrice": lp, "stopPrice": sp})
+            payload.update({"type": fyers_type, "limitPrice": _on_tick("NSE:", lp), "stopPrice": _on_tick("NSE:", sp)})
         else:
+            # Off-grid prices are rejected: a modify used to send the raw
+            # trailed / buffered stop and silently keep the old order.
             if limit_price is not None:
-                payload["limitPrice"] = float(limit_price)
+                payload["limitPrice"] = _on_tick("NSE:", float(limit_price))
             if stop_price is not None:
-                payload["stopPrice"] = float(stop_price)
+                payload["stopPrice"] = _on_tick("NSE:", float(stop_price))
         if len(payload) == 1:
             return False, "nothing to modify"
         try:
@@ -1228,7 +1214,8 @@ class FyersLiveBackend:
                 # fall back to it when `netQty` is missing (never for 0).
                 net = entry.get("netQty")
                 qty = int(safe_float(net if net is not None else entry.get("qty")))
-                avg = safe_float(entry.get("avgPrice") or entry.get("buyAvg") or 0.0)
+                avg = safe_float(entry.get("avgPrice") or entry.get("netAvg")
+                                 or entry.get("buyAvg" if qty > 0 else "sellAvg") or 0.0)
                 last = safe_float(entry.get("ltp") or entry.get("lastPrice"))
                 # Fyers spells it `unrealized_profit` (as market.py reads it);
                 # the camelCase key never existed, so live P&L was always None.

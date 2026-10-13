@@ -4520,8 +4520,10 @@ export default function ChartPanel(props: ChartPanelProps) {
       { side: "BUY", type: above ? "SL-M" : "LIMIT", price },
       { side: "SELL", type: above || ltp == null ? "LIMIT" : "SL-M", price },
     ];
-    // stop-limit on the breakout side: trigger at the price, limit one tick through it
-    if (ltp != null) out.push(above ? { side: "BUY", type: "STOP_LOSS", price, limit: round(price + tick) } : { side: "SELL", type: "STOP_LOSS", price, limit: round(price - tick) });
+    // stop-limit on the breakout side: trigger at the price, limit 0.5% (at
+    // least a tick) through it — one tick let a fast move trigger and skip it
+    const room = Math.max(tick, round(price * 0.005));
+    if (ltp != null) out.push(above ? { side: "BUY", type: "STOP_LOSS", price, limit: round(price + room) } : { side: "SELL", type: "STOP_LOSS", price, limit: round(price - room) });
     if (ltp != null) out.push({ side: "BUY", type: "MARKET", price: null }, { side: "SELL", type: "MARKET", price: null });
     return out;
   }

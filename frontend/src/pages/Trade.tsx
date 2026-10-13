@@ -504,6 +504,8 @@ function FlowPanel({ symbol }: { symbol: string | null }) {
   );
 }
 
+const eqKey = (s: string) => s.toUpperCase().split(":").pop()!.replace(/-(EQ|BE)$/, "");
+
 export default function Trade() {
   const [bottomTab, setBottomTab] = useState<BottomTab>(() => stored<BottomTab>("trade:bottomTab", "orders"));
   const [bottomOpen, setBottomOpen] = useState(() => stored("trade:bottomOpen", false));
@@ -570,8 +572,12 @@ export default function Trade() {
   // chart renders its own controls into these (TradingView-style).
   const [topSlot, setTopSlot] = useState<HTMLDivElement | null>(null);
   const [leftSlot, setLeftSlot] = useState<HTMLDivElement | null>(null);
-  const [scalper, setScalper] = useState(() => stored("trade:scalper", false));
-  useEffect(() => { try { tabLocal.setItem("trade:scalper", JSON.stringify(scalper)); } catch { /* best-effort */ } }, [scalper]);
+  // A symbol link always opens that symbol's chart — never the scalper another tab left on.
+  const [scalper, setScalper] = useState<boolean>(() => !link.current && stored("trade:scalper", false));
+  useEffect(() => {
+    if (link.current && !scalper) return;   // don't switch the other tab's scalper off
+    try { tabLocal.setItem("trade:scalper", JSON.stringify(scalper)); } catch { /* best-effort */ }
+  }, [scalper]);
   // Sizes dragged on a bigger monitor must not squeeze the chart away on a
   // smaller one: the dock and bottom bar are capped to the current window.
   const [win, setWin] = useState(() => ({ w: window.innerWidth, h: window.innerHeight }));
@@ -912,13 +918,17 @@ export default function Trade() {
   });
   // Position line / exits / close for ANY charted symbol (every layout
   // cell, the scalper's legs).
+  // The bot keys a stock "SBIN", the chart "NSE:SBIN-EQ": one position.
+  const openPos = (sym: string) =>
+    positions?.find((p) => p.quantity !== 0 && p.symbol === sym) ?? positions?.find((p) => p.quantity !== 0 && eqKey(p.symbol) === eqKey(sym));
   const positionFor = (sym: string): ChartPosition | null => {
-    const pos = positions?.find((p) => p.symbol === sym && p.quantity !== 0);
+    const pos = openPos(sym);
     if (!pos) return null;
-    const m = practice ? pos : managed?.find((x) => x.symbol === sym);
+    const m = practice ? pos : managed?.find((x) => x.symbol === pos.symbol);
     return { qty: pos.quantity, avg: pos.average_price, sl: m?.stop_loss ?? null, tp: m?.target ?? null };
   };
-  const levelsFor = (sym: string) => async (sl: number | null, tp: number | null) => {
+  const levelsFor = (chartSym: string) => async (sl: number | null, tp: number | null) => {
+    const sym = openPos(chartSym)?.symbol ?? chartSym;
     const r = await fetch(`/api/positions/${encodeURIComponent(sym)}/levels${practice ? "?practice=1" : ""}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -929,7 +939,8 @@ export default function Trade() {
     if (practice) { void qc.invalidateQueries({ queryKey: ["positions"] }); return; }
     qc.setQueryData<Managed[]>(["managed-positions"], (old) => [...(old ?? []).filter((x) => x.symbol !== j.managed.symbol), j.managed]);
   };
-  const closeFor = (sym: string) => async () => {
+  const closeFor = (chartSym: string) => async () => {
+    const sym = openPos(chartSym)?.symbol ?? chartSym;
     const r = await fetch(`/api/positions/${encodeURIComponent(sym)}/close${practice ? "?practice=1" : ""}`, { method: "POST" });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(detailText(j, r.status));

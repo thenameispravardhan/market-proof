@@ -450,7 +450,7 @@ describe("Trade page", () => {
     });
   });
 
-  it("places a stop-limit from the Trade ▸ flyout with the trigger and a one-tick limit", async () => {
+  it("places a stop-limit from the Trade ▸ flyout with the trigger and a 0.5% limit room", async () => {
     const posts: Record<string, unknown>[] = [];
     const stubs = defaultStubs();
     globalThis.fetch = makeFetchStub((url, init) => {
@@ -465,11 +465,11 @@ describe("Trade page", () => {
     const chart = await screen.findByTestId("trade-chart");
     fireEvent.contextMenu(chart.querySelector(".chart-container")!, { clientX: 40, clientY: 40 });
     await user.click(await screen.findByTestId("ctx-trade"));
-    // 100 is below the market → the breakdown side: sell stop 100, limit 99.95
-    await user.click(await screen.findByText(/Sell 1 @ 100(\.00)? stop 99\.95 limit/));
+    // 100 is below the market → the breakdown side: sell stop 100, limit 99.5
+    await user.click(await screen.findByText(/Sell 1 @ 100(\.00)? stop 99\.50? limit/));
     await user.click(screen.getByTestId("chart-ctx-place"));
     await waitFor(() => expect(posts).toHaveLength(1));
-    expect(posts[0]).toMatchObject({ side: "SELL", order_type: "STOP_LOSS", stop_price: 100, limit_price: 99.95 });
+    expect(posts[0]).toMatchObject({ side: "SELL", order_type: "STOP_LOSS", stop_price: 100, limit_price: 99.5 });
   });
 
   it("scalper: BUY CE places a market order for lots x lot size on the ATM call", async () => {
@@ -551,6 +551,17 @@ describe("Trade page", () => {
     await user.click(screen.getByTestId("scalp-buy-CE"));
     await waitFor(() => expect(posts).toHaveLength(3));
     expect(posts[2]).toMatchObject({ symbol: "NSE:RELIANCE26OCT2500CE", side: "BUY" });
+  });
+
+  it("a symbol link opens that chart even when another tab left the scalper on", async () => {
+    localStorage.setItem("trade:scalper", "true");
+    window.location.hash = "/trade?symbol=NSE:SBIN-EQ&iv=5";
+    globalThis.fetch = makeFetchStub(defaultStubs());
+    render(<Trade />, { wrapper: wrapper(makeQc()) });
+    await screen.findByTestId("tv-cell-0");
+    expect(screen.queryByTestId("scalper")).toBeNull();
+    expect(localStorage.getItem("trade:scalper")).toBe("true");   // the other tab keeps its scalper
+    window.location.hash = "";
   });
 
   it("scalper: a ladder with no spot says why instead of showing dead legs", async () => {

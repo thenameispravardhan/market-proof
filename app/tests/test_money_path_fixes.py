@@ -137,3 +137,51 @@ async def test_backstop_rests_at_broker_and_is_cancelled_on_exit(db_session, iso
         assert backend.cancelled[0] == "STOP-1"          # never left resting on a flat position
     finally:
         tm.stop()
+
+
+@pytest.mark.asyncio
+async def test_live_position_exits_at_fyers_even_in_global_paper_mode(isolated_db, monkeypatch):
+    """TRADING_MODE=paper must not turn a real Fyers position's exit into a DB-only close."""
+    from app.execution import manager as mgr_mod
+
+    acc = SimpleNamespace(id=7, name="live", paper_mode=False, app_id="APP-100", access_token="tok")
+    m = Manager(market_data=MarketDataBus(), settings_provider=lambda: SimpleNamespace(is_paper=True, FYERS_APP_ID=""))
+    monkeypatch.setattr(mgr_mod, "_load_account", lambda *_: acc)
+    assert isinstance(await m.exit_backend_for_account(7), FyersLiveBackend)
+    acc.paper_mode = True
+    m._backends.clear()
+    assert await m.exit_backend_for_account(7) is None
+
+
+def test_ticket_levels_refused_before_the_order():
+    from app.api.orders import _levels_problem
+
+    assert _levels_problem("BUY", 100.0, 95.0, 110.0) is None
+    assert _levels_problem("BUY", 100.0, 101.0, None)          # stop above a long entry
+    assert _levels_problem("SELL", 100.0, 99.0, None)          # stop below a short entry
+    assert _levels_problem("BUY", None, 110.0, 105.0)          # stop beyond target, no price needed
+
+
+def test_manual_order_lands_on_the_bots_row(isolated_db):
+    from app.db import session as dbs
+    from app.execution.manager import _position_and_halt
+
+    with dbs.SessionLocal() as db:
+        db.add(PositionRow(symbol="SBIN", quantity=10, average_price=800.0, last_price=800.0))
+        db.commit()
+    qty, _product, _halt, sym = _position_and_halt("NSE:SBIN-EQ")
+    assert (qty, sym) == (10, "SBIN")
+
+
+@pytest.mark.asyncio
+async def test_modify_snaps_prices_to_the_tick():
+    sent = {}
+
+    class C:
+        async def modify_order(self, payload):
+            sent.update(payload)
+            return {"s": "ok"}
+
+    b = FyersLiveBackend(app_id="A-100", access_token="t", broker_account_id=1, client=C())
+    assert (await b.modify_order("1", stop_price=612.37))[0]
+    assert sent["stopPrice"] == 612.35
