@@ -442,7 +442,9 @@ class FyersStreamManager:
             return
         for order in book.get("orders") or []:
             if isinstance(order, dict) and order.get("id"):
-                await self._reconcile_order(order)
+                # retry=False: the book holds every order of the day, mostly
+                # not ours (Fyers app / web); no background wait per unknown id.
+                await self._reconcile_order(order, retry=False)
         log.info("fyers_stream.order_resync", orders=len(book.get("orders") or []))
 
     async def _close_sockets(self) -> None:
@@ -915,10 +917,10 @@ class FyersStreamManager:
             return
         asyncio.run_coroutine_threadsafe(self._reconcile_order(order), loop)
 
-    async def _reconcile_order(self, order: dict[str, Any]) -> None:
+    async def _reconcile_order(self, order: dict[str, Any], retry: bool = True) -> None:
         session_factory = self._session_factory or _default_session_factory()
         try:
             with session_factory() as db:
-                await self._reconcile_fn(db, order, source="fyers_order_ws")
+                await self._reconcile_fn(db, order, source="fyers_order_ws", **({} if retry else {"retry": False}))
         except Exception:  # noqa: BLE001
             log.exception("fyers_stream.order_reconcile_failed")

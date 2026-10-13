@@ -155,3 +155,45 @@ async def test_fyers_timeout_on_place_stays_unconfirmed():
     be = FyersLiveBackend(app_id="APP", access_token="TOK", broker_account_id=1, client=TimedOut())
     res = await be.place_order(signal=None, symbol="NSE:SBIN-EQ", side=OrderSide.BUY, quantity=1)
     assert res.state == OrderState.PENDING and res.broker_order_id == ""
+
+
+def test_reversing_a_delivery_holding_is_close_then_open(client: TestClient, real_account, db_session):
+    from app.db.models import Position as PositionRow
+
+    db_session.add(PositionRow(symbol="NSE:SBIN-EQ", quantity=10, average_price=800.0, last_price=800.0, product="DELIVERY"))
+    db_session.commit()
+    stub = _install(real_account.id, _Stub())
+    sent: list[str] = []
+    orig = stub.place_order
+
+    async def spy(**kw):
+        sent.append(kw["product_type"].value)
+        return await orig(**kw)
+
+    stub.place_order = spy
+    r = client.post("/api/orders", json=_body(real_account.id, side="SELL", quantity=20))
+    assert r.status_code == 200, r.text
+    assert [p["quantity"] for p in stub.placed] == [10, 10]
+    assert sent == ["DELIVERY", "INTRADAY"]          # the holding closes as CNC, the short opens as MIS
+
+
+def test_manual_risk_gate_is_opt_in(client: TestClient, real_account, monkeypatch):
+    from types import SimpleNamespace
+
+    from app.main import app
+
+    mgr = app.state.execution_manager
+    stub = _install(real_account.id, _Stub())
+
+    async def deny(**_kw):
+        return SimpleNamespace(approved=False, codes=["MAX_TRADES"], violations=[{"message": "too many trades"}])
+
+    monkeypatch.setattr(mgr._risk, "evaluate", deny)
+    base = mgr._settings_provider()
+    r = client.post("/api/orders", json=_body(real_account.id))
+    assert r.json()["ok"] is True and len(stub.placed) == 1        # off: advisory only
+    monkeypatch.setattr(mgr, "_settings_provider", lambda: SimpleNamespace(**{**base.model_dump(), "MANUAL_RISK_ENFORCED": True}))
+    r = client.post("/api/orders", json=_body(real_account.id))
+    assert r.json()["blocked"] is True and r.json()["reason"] == "risk_block" and len(stub.placed) == 1
+    r = client.post("/api/orders", json=_body(real_account.id, bypass_risk=True))
+    assert r.json()["ok"] is True and len(stub.placed) == 2        # the typed override still sends it

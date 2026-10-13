@@ -1470,6 +1470,7 @@ class Manager:
         product_type: str = "INTRADAY",
         bypass_risk: bool = False,
         operator: str = "ui_trade_page",
+        _opening_rest: bool = False,
     ) -> dict[str, Any]:
         """Place a single order from the Trade page (NOT from a signal).
 
@@ -1507,10 +1508,27 @@ class Manager:
         pos_qty, pos_product, halt, symbol = await asyncio.get_running_loop().run_in_executor(
             TRADING_POOL, _position_and_halt, symbol
         )
+        if _opening_rest:
+            pos_qty = 0  # the close half of a split reversal is still filling
         signed = int(quantity) if side_enum == OrderSide.BUY else -int(quantity)
         reduces = pos_qty != 0 and (pos_qty > 0) != (signed > 0) and abs(signed) <= abs(pos_qty)
         if halt and not reduces:
             raise ValueError(f"trading is halted ({halt}): only orders that reduce an open position are allowed")
+        flips = pos_qty != 0 and (pos_qty > 0) != (signed > 0) and abs(signed) > abs(pos_qty)
+        if flips and pos_product and pos_product != product_enum.value:
+            # A reversal through a CNC / MARGIN position is two orders: close
+            # it with its own product, then open the rest as asked. One order
+            # left the holding open and started a separate MIS position.
+            args = dict(account=account, symbol=symbol, side=side, order_type=order_type,
+                        limit_price=limit_price, stop_price=stop_price, operator=operator)
+            closed = await self.place_manual_order(quantity=abs(pos_qty), product_type=pos_product,
+                                                   bypass_risk=True, **args)
+            if not closed.get("ok"):
+                return closed
+            opened = await self.place_manual_order(quantity=int(quantity) - abs(pos_qty), product_type=product_type,
+                                                   bypass_risk=bypass_risk, _opening_rest=True, **args)
+            opened["close_order_id"] = closed.get("broker_order_id")
+            return opened
         if reduces and pos_product and product_enum == ProductType.INTRADAY and pos_product != "INTRADAY":
             # Exiting a CNC / MARGIN position as INTRADAY opened a separate MIS one.
             product_enum = ProductType(pos_product)
@@ -1595,6 +1613,20 @@ class Manager:
                 f"no live backend for account {account.id} "
                 f"(name={account.name!r}). Complete Fyers OAuth in the Accounts page."
             )
+
+        if getattr(settings, "MANUAL_RISK_ENFORCED", False) and not bypass_risk and not reduces:
+            # Opt-in: the risk rules gate a manual order BEFORE it is sent.
+            decision = await _advise()
+            if decision is not None and not decision.approved:
+                codes = list(decision.codes)
+                message = "; ".join(str(v.get("message") or v.get("code") or v) for v in (decision.violations or []))
+                return {
+                    "ok": False, "blocked": True, "bypassed_risk": False,
+                    "risk_codes": codes, "risk_message": message, "risk_warning": message or None,
+                    "broker_order_id": None, "symbol": symbol, "status": "REJECTED_RISK",
+                    "reason": "risk_block",  # the ticket offers the typed override
+                    "error": message or "blocked by the risk rules",
+                }
 
         result = await backend.place_order(
             signal=manual_signal,
