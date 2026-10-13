@@ -401,7 +401,7 @@ async def test_order_update_routes_through_reconcile():
     holder, df, of = _factories()
     calls: list[tuple] = []
 
-    async def fake_reconcile(db, order, *, source):
+    async def fake_reconcile(db, order, *, source, **_kw):
         calls.append((order, source))
         return {"ok": True}
 

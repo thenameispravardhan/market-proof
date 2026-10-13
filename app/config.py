@@ -338,6 +338,11 @@ class Settings(BaseSettings):
     CONSECUTIVE_LOSER_PAUSE_MINUTES: int = 45
     CONSECUTIVE_LOSER_RESUME_CONFIDENCE: float = 0.85
     MAX_TRADES_PER_DAY: int = 12
+    # Off: the risk rules govern the BOT only; a Trade-page / Algo Lab order
+    # gets them as an advisory warning. On: a manual order that adds risk is
+    # blocked like a bot order (the ticket's typed override still sends it);
+    # an order that reduces an open position is never blocked.
+    MANUAL_RISK_ENFORCED: bool = False
     # §4b Clustering control. News often hits correlated names at once (e.g.
     # every PSU bank on one policy headline). The whole-portfolio sector cap
     # (SECTOR_CONCENTRATION_PCT) limits exposure; MAX_POSITIONS_PER_SECTOR

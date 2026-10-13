@@ -637,12 +637,16 @@ def _fyers_order_type(order_type: OrderType) -> int:
 
 
 def _on_tick(symbol: str, price: float) -> float:
-    """Snap an NSE/BSE price to the 0.05 grid (a multiple of 0.01 too, so it
-    also fits the sub-₹250 equity tick); Fyers rejects off-grid prices."""
-    # ponytail: fixed 0.05 grid; MCX / CDS ticks differ, read the scrip master when those are traded
-    if price <= 0 or symbol.split(":", 1)[0] not in ("NSE", "BSE"):
+    """Snap a price to the instrument's tick (the scrip master's, once it is
+    loaded); else NSE/BSE's 0.05 grid. Fyers rejects off-grid prices."""
+    from app.services import instrument_master
+
+    inst = instrument_master._master_singleton.get(symbol) if instrument_master._master_singleton else None  # noqa: SLF001 — never load it on the order path
+    tick = inst.tick_size if inst is not None and inst.tick_size > 0 else None
+    if price <= 0 or (tick is None and symbol.split(":", 1)[0] not in ("NSE", "BSE")):
         return price
-    return round(round(price / 0.05) * 0.05, 2)
+    tick = tick or 0.05
+    return round(round(price / tick) * tick, 4)
 
 
 def _fyers_side(side: OrderSide) -> int:

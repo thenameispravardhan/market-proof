@@ -681,13 +681,20 @@ class TradeManager:
         qty, avg = state
         if qty == mp.quantity:
             return mp
+        stop_oid = mp.broker_stop_id
         if qty == 0 or (qty > 0) != (mp.quantity > 0):
             await self._cancel_backstop(mp)
         if qty == 0:
             async with self._lock:
                 if in_book and self._book.get(symbol) is mp:
                     self._book.pop(symbol, None)
-            log.info("trade_manager.closed_manually", symbol=symbol, local_qty=mp.quantity)
+            booked = stop_oid and await asyncio.get_running_loop().run_in_executor(
+                None, _book_backstop_fill, self._session_factory, stop_oid, mp)
+            if booked:
+                # The broker's disaster stop closed it: a real exit with real P&L.
+                await event_bus.publish(CHANNEL_TRADE_CLOSED, booked)
+            log.info("trade_manager.closed_manually", symbol=symbol, local_qty=mp.quantity,
+                     by_broker_stop=bool(booked))
             return None
         if (qty > 0) != (mp.quantity > 0):
             # Reversed: a new position on the other side, with no levels yet.
@@ -1493,7 +1500,10 @@ class TradeManager:
                 )
                 return None
 
-        result = await _place(OrderType.LIMIT, limit_price)
+        # A stale book prices the marketable limit off a bid / ask that may be
+        # long gone (gap, frozen feed): go straight to market instead.
+        stale = quote is not None and not self._quote_fresh(quote)
+        result = await (_place(OrderType.MARKET, None) if stale else _place(OrderType.LIMIT, limit_price))
         if result is None:
             # Broker silent: the limit MAY be live. A blind market retry is a
             # double exit; fail, and the retry re-reads the broker position (_exit).
@@ -2413,6 +2423,25 @@ def _insert_backstop_row(session_factory: Callable[[], Any], mp: ManagedPosition
             product=_position_product(session_factory, mp.symbol).value,
         ))
         session.commit()
+
+
+def _book_backstop_fill(session_factory: Callable[[], Any], order_id: str, mp: ManagedPosition) -> Optional[dict[str, Any]]:
+    """P&L onto a FILLED backstop's trade row; the trade.closed payload, or None."""
+    from app.db.models import Trade as TradeRow
+
+    with session_factory() as session:
+        row = (session.query(TradeRow).filter(TradeRow.broker_order_id == order_id)
+               .order_by(TradeRow.id.asc()).first())
+        if row is None or row.status != "filled" or not row.price or row.pnl is not None:
+            return None
+        px = float(row.price)
+        row.pnl = (px - mp.entry) * mp.quantity
+        r = mp.r_multiple_at(px)
+        row.r_multiple = float(r) if r is not None else None
+        session.commit()
+        return {"symbol": mp.symbol, "reason": "BROKER_STOP", "exit_price": px, "quantity": mp.quantity,
+                "entry": mp.entry, "pnl": row.pnl, "r_multiple": row.r_multiple, "signal_id": mp.signal_id,
+                "strategy_id": mp.strategy_id, "broker_order_id": order_id}
 
 
 def _update_backstop_row(session_factory: Callable[[], Any], order_id: str, qty: int, trigger: float) -> None:

@@ -185,3 +185,14 @@ async def test_modify_snaps_prices_to_the_tick():
     b = FyersLiveBackend(app_id="A-100", access_token="t", broker_account_id=1, client=C())
     assert (await b.modify_order("1", stop_price=612.37))[0]
     assert sent["stopPrice"] == 612.35
+
+
+def test_prices_snap_to_the_instruments_own_tick(monkeypatch):
+    from app.execution.fyers_live import _on_tick
+    from app.services import instrument_master
+
+    monkeypatch.setattr(instrument_master, "_master_singleton",
+                        SimpleNamespace(get=lambda s: SimpleNamespace(tick_size=0.0025) if s == "NSE:USDINR26OCTFUT" else None))
+    assert _on_tick("NSE:USDINR26OCTFUT", 83.1234) == 83.1225
+    assert _on_tick("NSE:SBIN-EQ", 812.37) == 812.35          # not in the master: 0.05 grid
+    assert _on_tick("MCX:GOLD26OCTFUT", 71234.5) == 71234.5   # unknown + not NSE/BSE: untouched
