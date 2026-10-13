@@ -105,9 +105,9 @@ async def close(symbol: Optional[str] = None) -> list[dict[str, Any]]:
 
     with session_factory()() as db:
         q = db.query(Position).filter(Position.quantity != 0)
-        rows = [(p.symbol, int(p.quantity)) for p in (q.filter(Position.symbol == symbol) if symbol else q)]
+        rows = [(p.symbol, int(p.quantity), p.product or "INTRADAY") for p in (q.filter(Position.symbol == symbol) if symbol else q)]
     return [await place(symbol=s, side="SELL" if n > 0 else "BUY", quantity=abs(n), order_type="MARKET",
-                        limit_price=None, stop_price=None, product_type="INTRADAY") for s, n in rows]
+                        limit_price=None, stop_price=None, product_type=prod) for s, n, prod in rows]
 
 
 async def _quote(symbol: str) -> dict[str, Any]:
@@ -181,11 +181,16 @@ async def _check_levels() -> None:
         db.commit()
         armed = [(p.symbol, int(p.quantity), p.stop_loss, p.target) for p in db.query(Position).filter(
             Position.quantity != 0, (Position.stop_loss.is_not(None)) | (Position.target.is_not(None)))]
+    from app.api.orders import _fyers_stream, _manager
+
     for sym, qty, sl, tp in armed:
-        q = await _quote(sym)
-        if not q.get("ok"):
+        stream = _fyers_stream()
+        if stream is not None:
+            stream.touch_interest(sym)       # keep it on the websocket
+        q = await _manager().market_data.get_quote(sym)
+        if q is None or (q.extra or {}).get("simulated"):
             continue
-        last, long = float(q["last_price"]), qty > 0
+        last, long = float(q.last_price), qty > 0
         if (sl is not None and (last <= sl if long else last >= sl)) or (
                 tp is not None and (last >= tp if long else last <= tp)):
             _write_levels(sym, None, None)  # disarm first: one exit, never two

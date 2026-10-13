@@ -667,40 +667,16 @@ def _ensure_ok(data: Any, what: str) -> dict[str, Any]:
 
 
 def _state_from_str(status: str) -> OrderState:
-    """Map a Fyers status field to our OrderState.
+    """Fyers status (code or word) -> OrderState, via the one code table
+    (order_reconcile.FYERS_STATUS_HINTS). Anything unknown is PENDING."""
+    from app.execution.order_reconcile import FYERS_STATUS_HINTS
 
-    Fyers' documented status codes (string digits):
-        1 = Cancelled
-        2 = Traded (filled)
-        3 = (for future use)
-        4 = Transit
-        5 = Rejected
-        6 = Pending
-        7 = Expired
-    We also accept the upper-cased English form for tolerance.
-    """
     s = (status or "").strip()
-    if s.isdigit():
-        return {
-            "1": OrderState.CANCELLED,
-            "2": OrderState.FILLED,
-            "3": OrderState.PENDING,
-            "4": OrderState.PENDING,
-            "5": OrderState.REJECTED,
-            "6": OrderState.PENDING,
-            "7": OrderState.EXPIRED,
-        }.get(s, OrderState.PENDING)
-    upper = s.upper()
     return {
-        "PENDING": OrderState.PENDING,
-        "PLACED": OrderState.PENDING,
-        "TRADED": OrderState.FILLED,
-        "FILLED": OrderState.FILLED,
-        "CANCELLED": OrderState.CANCELLED,
-        "CANCELED": OrderState.CANCELLED,
-        "REJECTED": OrderState.REJECTED,
-        "EXPIRED": OrderState.EXPIRED,
-    }.get(upper, OrderState.PENDING)
+        "FILLED": OrderState.FILLED, "TRADED": OrderState.FILLED,
+        "CANCELLED": OrderState.CANCELLED, "CANCELED": OrderState.CANCELLED,
+        "REJECTED": OrderState.REJECTED, "EXPIRED": OrderState.EXPIRED,
+    }.get(FYERS_STATUS_HINTS.get(s, s.upper()), OrderState.PENDING)
 
 
 # ---- Option chain normalisation -----------------------------------------

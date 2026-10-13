@@ -504,7 +504,7 @@ function FlowPanel({ symbol }: { symbol: string | null }) {
   );
 }
 
-const eqKey = (s: string) => s.toUpperCase().split(":").pop()!.replace(/-(EQ|BE)$/, "");
+const eqKey = (s: string) => { const [ex, name] = s.toUpperCase().includes(":") ? s.toUpperCase().split(":") : ["NSE", s.toUpperCase()]; return `${ex}:${name.replace(/-(EQ|BE)$/, "")}`; };
 
 export default function Trade() {
   const [bottomTab, setBottomTab] = useState<BottomTab>(() => stored<BottomTab>("trade:bottomTab", "orders"));

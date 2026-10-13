@@ -196,3 +196,75 @@ def test_prices_snap_to_the_instruments_own_tick(monkeypatch):
     assert _on_tick("NSE:USDINR26OCTFUT", 83.1234) == 83.1225
     assert _on_tick("NSE:SBIN-EQ", 812.37) == 812.35          # not in the master: 0.05 grid
     assert _on_tick("MCX:GOLD26OCTFUT", 71234.5) == 71234.5   # unknown + not NSE/BSE: untouched
+
+
+def _bot_trade(db_session, oid: str, status: str = "expired", qty: int = 100):
+    from app.db.models import Signal, Strategy, Trade
+
+    strat = Strategy(name=f"s{oid}", enabled=True, config={})
+    db_session.add(strat)
+    db_session.commit()
+    sig = Signal(symbol="RELIANCE", action="BUY", confidence=0.9, status="blocked", strategy_id=strat.id)
+    db_session.add(sig)
+    db_session.commit()
+    db_session.add(Trade(signal_id=sig.id, symbol="RELIANCE", side="BUY", quantity=qty, price=100.0,
+                         order_type="limit", status=status, broker_order_id=oid))
+    db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_expired_entry_filled_late_is_still_handed_over(db_session, isolated_db):
+    """A pending echo must not turn 'expired' back into 'placed' (the fill then lost its stop)."""
+    from app.services.event_bus import event_bus
+
+    _bot_trade(db_session, "LATE1")
+    q = event_bus.subscribe("trade.executed")
+    try:
+        await order_reconcile.reconcile_order_update(db_session, {"id": "LATE1", "status": 6}, retry=False)
+        await order_reconcile.reconcile_order_update(
+            db_session, {"id": "LATE1", "status": 2, "filledQty": 100, "tradedPrice": 101.0}, retry=False)
+        handover = []
+        while not q.empty():
+            p = q.get_nowait().payload
+            if p.get("state") == "FILLED":
+                handover.append(p)
+        assert handover and handover[0]["quantity"] == 100 and handover[0]["entry"] == 101.0
+    finally:
+        event_bus.unsubscribe("trade.executed", q)
+
+
+@pytest.mark.asyncio
+async def test_expired_entry_part_filled_late_hands_over_the_slice(db_session, isolated_db):
+    from app.services.event_bus import event_bus
+
+    _bot_trade(db_session, "LATE2")
+    q = event_bus.subscribe("trade.executed")
+    try:
+        await order_reconcile.reconcile_order_update(
+            db_session, {"id": "LATE2", "status": 1, "filledQty": 30, "tradedPrice": 100.5}, retry=False)
+        pos = db_session.query(PositionRow).filter_by(symbol="RELIANCE").one()
+        assert pos.quantity == 30
+        filled = []
+        while not q.empty():
+            p = q.get_nowait().payload
+            if p.get("state") == "FILLED":
+                filled.append(p)
+        assert filled and filled[0]["quantity"] == 30
+    finally:
+        event_bus.unsubscribe("trade.executed", q)
+
+
+def test_real_order_never_lands_on_a_paper_position(isolated_db):
+    from app.db import session as dbs
+    from app.db.models import Trade
+    from app.execution.manager import _position_and_halt
+
+    with dbs.SessionLocal() as db:
+        db.add(PositionRow(symbol="SBIN", quantity=10, average_price=800.0, last_price=800.0))
+        db.add(Trade(symbol="SBIN", side="BUY", quantity=10, price=800.0, order_type="market",
+                     status="filled", broker_order_id="PAPER-1"))
+        db.commit()
+    with pytest.raises(ValueError, match="PAPER"):
+        _position_and_halt("SBIN")
+    assert _position_and_halt("NSE:SBIN-EQ")[3] == "NSE:SBIN-EQ"   # no alias onto the paper row
+    assert _position_and_halt("BSE:SBIN-EQ")[3] == "BSE:SBIN-EQ"

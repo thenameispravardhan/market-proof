@@ -15,8 +15,7 @@ Idempotent: keyed by ``broker_order_id`` and the resulting status, so a
 WebSocket update and a postback for the same fill converge on the same
 row rather than double-applying.
 
-The Fyers payload helpers (``_unwrap_fyers``, ``_status_text``,
-``_split_symbol``) live here too, next to the DB + event-bus side effects.
+The Fyers payload helpers (``_unwrap_fyers``, ``_status_text``) live here too, next to the DB + event-bus side effects.
 """
 from __future__ import annotations
 
@@ -82,7 +81,6 @@ def fill_serialised(fn: Any) -> Any:
 def restore_pending_levels() -> None:
     """Re-arm ticket SL / target (LEVELS_ON_FILL is in memory) for orders
     still working after a restart. Persisted by the orders API."""
-    from app.db.models import AuditLog
     from app.db.session import SessionLocal
 
     with SessionLocal() as db:
@@ -154,18 +152,6 @@ async def _backstop(order_id: str) -> None:
     PARKED.pop(order_id, None)  # never matched: an order placed outside the bot
 
 
-def _split_symbol(raw: str) -> tuple[str, str]:
-    """Split a Fyers-style symbol like "NSE:SBIN-EQ" into
-    ("NSE", "SBIN-EQ"). Defaults to ("NSE", raw) when no prefix."""
-    if not raw:
-        return ("NSE", "")
-    s = str(raw).strip()
-    if ":" in s:
-        exch, _, sym = s.partition(":")
-        return (exch.strip().upper(), sym.strip())
-    return ("NSE", s)
-
-
 def _status_text(raw: Any) -> str:
     """Map a Fyers numeric status code to its text label. Falls back
     to the raw value as a string when it doesn't match the known set."""
@@ -204,7 +190,9 @@ _STATUS_MAP = {
     "REJECTED": "rejected",
     "EXPIRED": "cancelled",
 }
-_TERMINAL = {"filled", "rejected", "cancelled"}
+# "expired" too: a late pending echo must not turn an expired entry back into
+# "placed", or its fill loses the late-fill handover (stop / target / exits).
+_TERMINAL = {"filled", "rejected", "cancelled", "expired"}
 
 
 async def reconcile_order_update(
@@ -219,7 +207,7 @@ async def reconcile_order_update(
     order = _unwrap_fyers(payload)
     order_id = str(order.get("id") or order.get("order_id") or "").strip()
     status_text = _status_text(order.get("status"))
-    _exch, sym = _split_symbol(str(order.get("symbol") or ""))
+    sym = str(order.get("symbol") or "").strip().rpartition(":")[2]
     if not order_id:
         log.warning("fyers.reconcile.no_order_id", source=source, status=status_text, symbol=sym)
         return {"ok": False, "reason": "no order id in payload"}
@@ -323,7 +311,11 @@ def _reconcile_sync(db: Session, order: dict[str, Any], order_id: str, status_te
         reported = None
     already = int(trade.filled_qty or 0)
     target_filled = reported if reported is not None else (int(trade.quantity or 0) if new_status == "filled" else already)
-    delta = target_filled - already if manual else 0
+    # A bot entry the attempt gave up on (expired) that then part-filled and
+    # cancelled is adopted like a late full fill, for the slice that traded.
+    late_slice = (not manual and trade.status == "expired" and new_status == "cancelled"
+                  and reported is not None and reported > 0)
+    delta = target_filled - already if (manual or late_slice) else 0
     # Never 0: a fill message without a traded price must not zero the cost basis.
     price = order.get("tradedPrice") or order.get("limitPrice") or None
 
@@ -342,7 +334,7 @@ def _reconcile_sync(db: Session, order: dict[str, Any], order_id: str, status_te
             trade.price = float(price)
     except (TypeError, ValueError):
         pass
-    if manual and delta > 0:
+    if (manual or late_slice) and delta > 0:
         # Fyers' tradedPrice is the order's running average: this slice's own
         # price is what moves the position's cost.
         px = float(trade.price or 0.0)
@@ -354,6 +346,8 @@ def _reconcile_sync(db: Session, order: dict[str, Any], order_id: str, status_te
     elif not manual and new_status == "filled" and trade.status != "filled":
         _apply_fill_to_position(db, trade, int(trade.quantity or 0))
         filled_now = True
+    if late_slice and filled_now:
+        trade.quantity = int(trade.filled_qty)  # the row (and the handover) is what traded
     late = not manual and filled_now and trade.status in ("expired", "cancelled", "rejected")
     if trade.status != "filled":
         trade.status = new_status

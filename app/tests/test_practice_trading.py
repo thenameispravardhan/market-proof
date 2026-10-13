@@ -49,6 +49,7 @@ async def test_practice_fills_at_touch_and_fires_its_stop(monkeypatch, isolated_
         pos = db.query(Position).filter_by(symbol="NSE:INFY-EQ").one()
         assert pos.average_price == 100.1 and (pos.stop_loss, pos.target) == (98.0, 105.0)  # BUY at ask
     px.update(last=97.5, bid=97.4, ask=97.6)
+    await practice.backend()._md.publish("NSE:INFY-EQ", 97.5, bid=97.4, ask=97.6)   # the websocket tick
     await practice._check_levels()
     with practice.session_factory()() as db:
         pos = db.query(Position).filter_by(symbol="NSE:INFY-EQ").one()
