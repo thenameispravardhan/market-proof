@@ -1676,6 +1676,7 @@ class TradeManager:
             if trigger <= 0:
                 return
             loop = asyncio.get_running_loop()
+            qty = abs(int(mp.quantity))
             if mp.broker_stop_id is None:
                 mp.broker_stop_id = await loop.run_in_executor(None, _working_backstop, self._session_factory, mp.symbol)
             if mp.broker_stop_id is not None:
@@ -1692,9 +1693,15 @@ class TradeManager:
                 # would oversell the resized position. Replace it.
                 log.warning("trade_manager.backstop_modify_failed", symbol=mp.symbol)
                 await self._cancel_backstop(mp, backend)
+                # The old stop may have FIRED (that is often why the modify was
+                # refused): rest a new one only on what the broker still holds.
+                held = await self._broker_qty(backend, mp.symbol)
+                if not held or (held > 0) != long:
+                    return
+                qty = min(qty, abs(held))
             r = await backend.place_order(
                 signal=None, symbol=mp.symbol, side=OrderSide.SELL if long else OrderSide.BUY,
-                quantity=abs(int(mp.quantity)), order_type=OrderType.STOP_LOSS_MARKET,
+                quantity=qty, order_type=OrderType.STOP_LOSS_MARKET,
                 limit_price=None, stop_price=trigger,
                 product_type=_position_product(self._session_factory, mp.symbol), validity="DAY",
             )
@@ -1721,7 +1728,7 @@ class TradeManager:
             if backend is not None and not await backend.cancel_order(oid):
                 # Refused: it has likely triggered. Let it settle, so the
                 # broker position read before any exit counts its fill.
-                await self._await_fill(backend, oid, abs(int(mp.quantity)), 3.0)
+                await self._await_fill(backend, oid, abs(int(mp.quantity)), 1.0)
         except Exception:  # noqa: BLE001
             log.exception("trade_manager.backstop_cancel_failed", symbol=mp.symbol, order_id=oid)
         return True

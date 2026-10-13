@@ -1515,20 +1515,6 @@ class Manager:
         if halt and not reduces:
             raise ValueError(f"trading is halted ({halt}): only orders that reduce an open position are allowed")
         flips = pos_qty != 0 and (pos_qty > 0) != (signed > 0) and abs(signed) > abs(pos_qty)
-        if flips and pos_product and pos_product != product_enum.value:
-            # A reversal through a CNC / MARGIN position is two orders: close
-            # it with its own product, then open the rest as asked. One order
-            # left the holding open and started a separate MIS position.
-            args = dict(account=account, symbol=symbol, side=side, order_type=order_type,
-                        limit_price=limit_price, stop_price=stop_price, operator=operator)
-            closed = await self.place_manual_order(quantity=abs(pos_qty), product_type=pos_product,
-                                                   bypass_risk=True, **args)
-            if not closed.get("ok"):
-                return closed
-            opened = await self.place_manual_order(quantity=int(quantity) - abs(pos_qty), product_type=product_type,
-                                                   bypass_risk=bypass_risk, _opening_rest=True, **args)
-            opened["close_order_id"] = closed.get("broker_order_id")
-            return opened
         if reduces and pos_product and product_enum == ProductType.INTRADAY and pos_product != "INTRADAY":
             # Exiting a CNC / MARGIN position as INTRADAY opened a separate MIS one.
             product_enum = ProductType(pos_product)
@@ -1627,6 +1613,22 @@ class Manager:
                     "reason": "risk_block",  # the ticket offers the typed override
                     "error": message or "blocked by the risk rules",
                 }
+
+        if flips and pos_product and pos_product != product_enum.value:
+            # A reversal through a CNC / MARGIN position is two orders: close
+            # it with its own product, then open the rest as asked (the risk gate
+            # above already judged the whole order). One order
+            # left the holding open and started a separate MIS position.
+            args = dict(account=account, symbol=symbol, side=side, order_type=order_type,
+                        limit_price=limit_price, stop_price=stop_price, operator=operator)
+            closed = await self.place_manual_order(quantity=abs(pos_qty), product_type=pos_product,
+                                                   bypass_risk=True, **args)
+            if not closed.get("ok"):
+                return closed
+            opened = await self.place_manual_order(quantity=int(quantity) - abs(pos_qty), product_type=product_type,
+                                                   bypass_risk=True, _opening_rest=True, **args)
+            opened["close_order_id"] = closed.get("broker_order_id")
+            return opened
 
         result = await backend.place_order(
             signal=manual_signal,
@@ -2476,25 +2478,32 @@ def _persist_trade_placed_only(
         session.commit()
 
 
-def _equity_key(symbol: str) -> str:
-    """"NSE:SBIN-EQ" and the bot's bare "SBIN" are one stock."""
-    return re.sub(r"-(EQ|BE)$", "", (symbol or "").upper().strip().split(":")[-1])
+def _equity_key(symbol: str) -> tuple[str, str]:
+    """"NSE:SBIN-EQ" and the bot's bare (NSE) "SBIN" are one stock; BSE is another."""
+    exch, _, name = (symbol or "").upper().strip().rpartition(":")
+    return exch or "NSE", re.sub(r"-(EQ|BE)$", "", name)
 
 
 def _position_and_halt(symbol: str) -> tuple[int, Optional[str], Optional[str], str]:
     """(net qty, product, why trading is halted or None, the position row's
     symbol). An open row under the other spelling of the same stock counts:
     a Trade-page "NSE:SBIN-EQ" sell closing the bot's "SBIN" must land on
-    that row, or the bot's stop sells the same shares again."""
+    that row, or the bot's stop sells the same shares again. A PAPER row is
+    never a real order's: the order is refused (ValueError)."""
     from app.db.session import SessionLocal
+    from app.execution.trade_manager import _is_paper_position
     from app.risk import circuit_breakers
 
     with SessionLocal() as db:
         pos = db.query(PositionRow).filter_by(symbol=symbol).one_or_none()
+        if pos is not None and pos.quantity and _is_paper_position(SessionLocal, pos.symbol):
+            raise ValueError(
+                f"{pos.symbol} is a PAPER position (TRADING_MODE=paper). A real order would open a "
+                "real position at Fyers instead of closing it — close it with ✕ / Exit all.")
         if pos is None or not pos.quantity:
             key = _equity_key(symbol)
             pos = next((p for p in db.query(PositionRow).filter(PositionRow.quantity != 0)
-                        if _equity_key(p.symbol) == key), pos)
+                        if _equity_key(p.symbol) == key and not _is_paper_position(SessionLocal, p.symbol)), pos)
         state = circuit_breakers.get_or_create_state(db)
         halt = (state.disabled_reason or "trading_disabled") if state.trading_disabled else None
         return ((int(pos.quantity or 0) if pos else 0), (pos.product if pos else None), halt,

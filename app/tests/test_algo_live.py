@@ -207,3 +207,15 @@ def test_unknown_broker_position_never_guesses_flat(monkeypatch, isolated_db):
     assert broker.orders == []
     with dbs.SessionLocal() as db:
         assert db.get(AlgoTrade, tid).status == "open"
+
+
+def test_accepted_but_unfilled_exit_keeps_the_trade_open(monkeypatch, isolated_db):
+    """Fyers accepting the exit is not a fill: still held at the broker -> retried, not booked."""
+    px = {"NSE:NIFTYCE": 120.0, "NSE:NIFTYPE": 80.0}
+    broker = FakeBroker(net={"NSE:NIFTYCE": 65, "NSE:NIFTYPE": -65})   # no fills reported
+    _install(monkeypatch, broker, px)
+    tid = _open_live_trade(_strategy())
+    r = rn.AlgoRunner()
+    assert asyncio.run(r._exit(_row_dict(tid), px, "STOP", T_CLOSE + 60)) is False
+    with dbs.SessionLocal() as db:
+        assert db.get(AlgoTrade, tid).status == "open"

@@ -410,8 +410,11 @@ class AlgoRunner:
                 await fno.ensure_master()
             except Exception as e:  # noqa: BLE001
                 self.event("error", f"F&O master refresh failed: {e}"[:200])
+        # Only MIS legs are auto-squared by the broker; a CNC / NRML leg (even
+        # of a strategy since edited or deleted) is still open at Fyers.
         stale = [t for t in open_trades if _naive(day_start) > t["entry_at"].replace(tzinfo=None)
-                 and not _carries(by_id.get(t["strategy_id"]))]
+                 and not _carries(by_id.get(t["strategy_id"]))
+                 and all(lg.get("product", "INTRADAY") == "INTRADAY" for lg in t["legs"])]
         if stale:
             await self._close_stale(stale)
             open_trades = [t for t in open_trades if t not in stale]
@@ -568,7 +571,17 @@ class AlgoRunner:
                     self.event("error", f"EXIT FAILED {lg['symbol']} ({reason}): {msg}", trade_id=t["id"])
                     return False
                 lg["exit_order_id"] = oid
-                px = await _fill_price(acc, oid) or px     # the broker's average, when it reports one
+                fill = await _fill_price(acc, oid)         # the broker's average, when it reports one
+                if fill is None:
+                    # Accepted is not filled: a reject after the ack leaves the
+                    # position open. Booked only once the broker holds less.
+                    after = await _broker_net(acc, lg["symbol"])
+                    if after is None or (after * lg["act"] > 0 and abs(after) >= abs(held)):
+                        self._retry_at[t["id"]] = now + 30
+                        await asyncio.to_thread(_update, t["id"], legs=legs, note=f"exit {oid} not filled yet"[:500])
+                        self.event("error", f"EXIT NOT FILLED {lg['symbol']} ({reason}): retrying", trade_id=t["id"])
+                        return False
+                px = fill or px
             lg["exit"] = px
         await self._book(t, reason, now)
         return True
