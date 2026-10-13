@@ -31,6 +31,7 @@ from app.db.models import (
     Signal,
     Trade,
 )
+from app.api.practice import get_db_for
 from app.db.session import get_db
 from app.logging_config import get_logger
 from app.monitors.base import CHANNEL_NEW
@@ -225,7 +226,7 @@ def recent_signals(
 
 
 @router.get("/api/positions")
-def list_positions(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+def list_positions(db: Session = Depends(get_db_for)) -> list[dict[str, Any]]:
     rows = db.execute(
         select(Position).order_by(Position.symbol.asc())
     ).scalars().all()
@@ -241,7 +242,7 @@ def list_trades(
         "burst of rejected HOLD signals doesn't crowd real fills out of "
         "the newest-N window.",
     ),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_db_for),
 ) -> list[dict[str, Any]]:
     stmt = select(Trade).order_by(Trade.created_at.desc())
     if status:
@@ -256,7 +257,7 @@ class TradeDeleteRequest(BaseModel):
 
 @router.post("/api/trades/delete")
 def delete_trades(
-    body: TradeDeleteRequest, db: Session = Depends(get_db)
+    body: TradeDeleteRequest, db: Session = Depends(get_db_for)
 ) -> dict[str, Any]:
     """Delete a set of trade rows in ONE transaction. Operator housekeeping.
 

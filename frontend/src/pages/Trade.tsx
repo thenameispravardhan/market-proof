@@ -746,11 +746,18 @@ export default function Trade() {
     [accounts],
   );
   const account = realAccounts[0]?.access_token ? realAccounts[0] : null;
-  const accountId: number | null = account?.id ?? null;
+  // Paper / Fyers toggle: "paper" trades a virtual practice account (-1) that
+  // fills at the real Fyers price and lives in its own DB, never the live book.
+  const [practice, setPractice] = useState<boolean>(() => stored<boolean>("trade:practice", false));
+  const pickPractice = (on: boolean) => {
+    setPractice(on);
+    try { tabLocal.setItem("trade:practice", JSON.stringify(on)); } catch { /* best-effort */ }
+  };
+  const accountId: number | null = practice ? -1 : account?.id ?? null;
   // Why this page can't place orders, in words the operator can act on.
   // The Fyers switch on the Dashboard is the paper/live master switch:
   // off means the bot is in paper mode and this page has no account.
-  const noAccountReason: string | null = account ? null
+  const noAccountReason: string | null = account || practice ? null
     : accounts === undefined ? "Loading the broker account…"
     : !accounts.some((a) => !a.paper_mode) ? "No Fyers account yet. Add and log in to one on the Accounts page to place orders."
     : realAccounts.length === 0 ? "Paper mode: Fyers trading is switched off. Turn the Fyers switch on in the Dashboard to place real orders here."
@@ -811,7 +818,7 @@ export default function Trade() {
     }
   }, [chain, selectedExpiry]);
   const { data: pending } = usePendingOrders(accountId);
-  const { data: positions } = usePositions();
+  const { data: positions } = usePositions(practice);
 
   // --- Ticket state ---
   const [side, setSide] = useState<"BUY" | "SELL">("BUY");
@@ -923,7 +930,7 @@ export default function Trade() {
     qc.setQueryData<Managed[]>(["managed-positions"], (old) => [...(old ?? []).filter((x) => x.symbol !== j.managed.symbol), j.managed]);
   };
   const closeFor = (sym: string) => async () => {
-    const r = await fetch(`/api/positions/${encodeURIComponent(sym)}/close`, { method: "POST" });
+    const r = await fetch(`/api/positions/${encodeURIComponent(sym)}/close${practice ? "?practice=1" : ""}`, { method: "POST" });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(detailText(j, r.status));
     void qc.invalidateQueries({ queryKey: ["positions"] });
@@ -1390,7 +1397,7 @@ export default function Trade() {
                         brokerLines={active && tset.showOrders ? brokerLines : undefined}
                         onPickPrice={active ? onPickPrice : undefined}
                         position={tset.showPos ? positionFor(h.symbol) : null}
-                        onLevels={levelsFor(h.symbol)}
+                        onLevels={practice ? undefined : levelsFor(h.symbol)}
                         onClosePosition={closeFor(h.symbol)}
                         onChartOrder={active ? orderFor(h.symbol, h.short_name, Number(quantity)) : undefined}
                         orderQty={active ? Number(quantity) : undefined}
@@ -1655,15 +1662,22 @@ export default function Trade() {
                   )}
                 </section>
                 {/* TICKET */}
-                <section className={`trade-card${account ? " ticket-live" : ""}`} data-testid="trade-ticket">
+                <section className={`trade-card${account && !practice ? " ticket-live" : ""}`} data-testid="trade-ticket">
                   <h2>
                     Ticket{" "}
-                    <TicketModeBadge account={account} botMode={botMode} />
+                    <span className="seg" role="group" aria-label="Trading mode" data-testid="practice-toggle">
+                      <button type="button" className={`btn-sm${practice ? " active" : ""}`} aria-pressed={practice} onClick={() => pickPractice(true)}>Paper</button>
+                      <button type="button" className={`btn-sm${!practice ? " active" : ""}`} aria-pressed={!practice} onClick={() => pickPractice(false)}>Fyers</button>
+                    </span>{" "}
+                    {!practice && <TicketModeBadge account={account} botMode={botMode} />}
                   </h2>
+                  {practice && (
+                    <div className="hint" data-testid="ticket-mode-note">Practice: paper money at the real Fyers price. Nothing goes to Fyers; trades show under Practice in Trade History.</div>
+                  )}
                   {!account && noAccountReason && (
                     <div className="hint warn-text" data-testid="ticket-mode-note">{noAccountReason}</div>
                   )}
-                  {account && botMode === "paper" && (
+                  {account && !practice && botMode === "paper" && (
                     // The bot's TRADING_MODE only steers its own signals; a
                     // manual order here always goes to the broker.
                     <div className="hint warn-text" data-testid="ticket-mode-note">

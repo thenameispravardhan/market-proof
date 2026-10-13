@@ -285,6 +285,11 @@ async def place_order(
     if lot_problem:
         raise HTTPException(status_code=422, detail=lot_problem)
 
+    from app.api import practice
+    if account_id == practice.PRACTICE_ACCOUNT_ID:
+        return await practice.place(symbol=symbol, side=side, quantity=quantity, order_type=order_type,
+                                    limit_price=limit_price, stop_price=stop_price, product_type=product_type)
+
     acc = _require_real_account(db, account_id)
 
     # A double click (or a retry while the first request is still waiting on
@@ -422,6 +427,11 @@ async def cancel_order(
         raise HTTPException(status_code=422, detail=f"missing or bad field: {e}")
     if not broker_order_id:
         raise HTTPException(status_code=422, detail="broker_order_id is required")
+    from app.api import practice
+    if account_id == practice.PRACTICE_ACCOUNT_ID:
+        ok = await practice.backend().cancel_order(broker_order_id)
+        return {"ok": ok, "broker_order_id": broker_order_id,
+                "reason": "cancelled" if ok else "already_gone", "rows_updated": int(ok)}
     acc = _require_real_account(db, account_id)
     # Look up the backend the same way Manager does.
     mgr = _manager()
@@ -659,6 +669,9 @@ async def modify_order(
         raise HTTPException(status_code=422, detail=f"missing or bad field: {e}")
     if not broker_order_id:
         raise HTTPException(status_code=422, detail="broker_order_id is required")
+    from app.api import practice
+    if account_id == practice.PRACTICE_ACCOUNT_ID:
+        raise HTTPException(status_code=400, detail="Practice orders can't be modified: cancel it and place it again.")
     quantity = _opt_int_field(body, "quantity")
     limit_price = _opt_price_field(body, "limit_price")
     stop_price = _opt_price_field(body, "stop_price")
@@ -885,6 +898,10 @@ def list_pending_orders(
     with a Cancel button. Such rows are settled as "cancelled" (the same
     status the reconciler gives a broker EXPIRED) and left out.
     """
+    from app.api import practice
+    if account_id == practice.PRACTICE_ACCOUNT_ID:
+        with practice.session_factory()() as pdb:
+            return list_pending_orders(None, limit, pdb)
     q = select(Trade).where(Trade.status == "placed").order_by(Trade.created_at.desc())
     if account_id is not None:
         q = q.where(Trade.broker_account_id == account_id)
