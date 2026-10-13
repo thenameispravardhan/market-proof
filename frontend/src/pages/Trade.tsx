@@ -1122,7 +1122,8 @@ export default function Trade() {
   // is where a risk override is typed).
   // `product` defaults to intraday; exits and reversals of a carry position
   // pass its own product so the order nets it off at Fyers.
-  const orderFor = (sym: string, name: string, qty: number, productType: ProductType = "INTRADAY") => async (o: ChartOrder): Promise<string> => {
+  const orderFor = (sym: string, name: string, ticketQty: number, productType: ProductType = "INTRADAY") => async (o: ChartOrder): Promise<string> => {
+    const qty = o.qty ?? ticketQty;
     if (!accountId) throw new Error(noAccountReason ?? "No live Fyers account is connected. Connect one on the Accounts page.");
     if (!(qty > 0)) throw new Error("Set a quantity above 0 in the order ticket first.");
     const r = await chartPlace.mutateAsync({

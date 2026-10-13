@@ -21,14 +21,12 @@ import asyncio
 import time
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, HTTPException, Request
 
 from app.api import market
 from app.db.models import Trade
 from app.db import session as db_session
-from app.db.session import get_db
-from app.execution.order_reconcile import _unwrap_fyers, reconcile_order_update, spawn, wait_for_trade
+from app.execution.order_reconcile import TRADING_POOL, _unwrap_fyers, reconcile_order_update, spawn, wait_for_trade
 from app.services.event_bus import event_bus
 
 router = APIRouter(prefix="/api/fyers", tags=["fyers"])
@@ -101,7 +99,7 @@ async def _sync_when_row_lands(order_id: str) -> None:
 
 
 @router.post("/postback")
-async def fyers_postback(request: Request, db: Session = Depends(get_db)) -> dict[str, Any]:
+async def fyers_postback(request: Request) -> dict[str, Any]:
     try:
         payload = await request.json()
     except Exception:  # noqa: BLE001
@@ -112,9 +110,16 @@ async def fyers_postback(request: Request, db: Session = Depends(get_db)) -> dic
     if not order_id:
         return {"ok": False, "reason": "no order id"}
     await event_bus.publish("broker", {"order_id": order_id, "source": "fyers_postback"})
-    row = db.query(Trade.status).filter(Trade.broker_order_id == order_id).first()
+    def _status() -> Any:
+        with db_session.SessionLocal() as db:
+            return db.query(Trade.status).filter(Trade.broker_order_id == order_id).first()
+
+    # Off the event loop: a busy SQLite must not stall ticks and orders.
+    row = await asyncio.get_running_loop().run_in_executor(TRADING_POOL, _status)
     if row is not None:
-        if row[0] in ("filled", "rejected", "cancelled"):
+        # "cancelled" is NOT settled: a cancelled order can carry a partial
+        # fill that only this re-read would bring in when the socket is down.
+        if row[0] in ("filled", "rejected"):
             # The order WebSocket already settled it: no extra Fyers call.
             return {"ok": True, "matched": True, "deduped": True, "order_id": order_id, "status": row[0]}
         return await _sync_throttled(order_id)

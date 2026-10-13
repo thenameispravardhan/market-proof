@@ -289,6 +289,8 @@ export interface ChartOrder {
   side: "BUY" | "SELL";
   /** STOP_LOSS = stop-limit: `price` is the trigger, `limit` the limit price. */
   type: "MARKET" | "LIMIT" | "SL-M" | "STOP_LOSS";
+  /** Overrides the ticket quantity (Reverse = twice the position). */
+  qty?: number;
   price: number | null;
   limit?: number | null;
 }
@@ -6273,7 +6275,7 @@ export default function ChartPanel(props: ChartPanelProps) {
                     onClick={() => {
                       const q = Math.abs(showPos.qty) * 2;
                       if (instant || window.confirm(`Reverse: ${showPos.qty > 0 ? "SELL" : "BUY"} ${q} ${shortName} at market?`)) {
-                        submitOrder({ side: showPos.qty > 0 ? "SELL" : "BUY", type: "MARKET", price: null });
+                        submitOrder({ side: showPos.qty > 0 ? "SELL" : "BUY", type: "MARKET", price: null, qty: q });
                       }
                     }}
                   >

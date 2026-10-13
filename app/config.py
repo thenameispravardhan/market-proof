@@ -403,6 +403,12 @@ class Settings(BaseSettings):
     CONSOLIDATION_MIN_PROFIT_PCT: float = 1.0
     CONSOLIDATION_MAX_PROFIT_PCT: float = 2.5
     STALL_EXIT_ENABLED: bool = True
+    # Disaster backstop: a resting SL-M at Fyers for every live managed
+    # position with a stop, BROKER_STOP_BUFFER_PCT (of entry) beyond the
+    # bot's stop so the bot's own exit fires first. It only matters when the
+    # bot / feed / server is down. Off by default (non-destructive).
+    BROKER_STOP_ENABLED: bool = False
+    BROKER_STOP_BUFFER_PCT: float = 1.0
     STALL_WINDOW_SECONDS: int = 90
     STALL_ROC_PCT: float = 0.3
     STALL_MIN_PROFIT_PCT: float = 3.0

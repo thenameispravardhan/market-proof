@@ -355,6 +355,10 @@ async def place_order(
         # if the fill was already applied (instant fill / parked update).
         oid = str(result["broker_order_id"])
         LEVELS_ON_FILL[oid] = (symbol.upper(), sl, tp)
+        # Survives a restart (order_reconcile.restore_pending_levels).
+        db.add(AuditLog(actor="ui_trade_page", action="order.levels_pending", target=f"order:{oid}",
+                        after={"order_id": oid, "symbol": symbol.upper(), "stop_loss": sl, "target": tp}))
+        await _commit_off_loop(db)
         row = db.query(Trade.status).filter(Trade.broker_order_id == oid).first()
         if row is not None and row[0] == "filled":
             from app.execution.order_reconcile import _arm_levels, spawn
@@ -376,6 +380,9 @@ async def _lot_problem(symbol: str, quantity: int) -> Optional[str]:
         except Exception as e:  # noqa: BLE001 — the refusal below stands
             log.warning("orders.fno_master_refresh_failed", error=str(e)[:200])
         problem = fno.lot_error(symbol, quantity)
+    cap = fno.freeze_qty(symbol)
+    if not problem and cap and quantity > cap:
+        problem = f"{quantity} is over the exchange freeze limit ({cap}) for {symbol}; split it into orders of at most {cap}"
     return problem
 
 

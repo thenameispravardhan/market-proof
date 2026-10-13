@@ -15,13 +15,14 @@ Idempotent: keyed by ``broker_order_id`` and the resulting status, so a
 WebSocket update and a postback for the same fill converge on the same
 row rather than double-applying.
 
-The Fyers-specific *parsing* helpers (``_unwrap_fyers``, ``_status_text``,
-``_split_symbol``) live in `app.webhooks.fyers`, which is kept a pure,
-DB-free module; this module owns the DB + event-bus side effects.
+The Fyers payload helpers (``_unwrap_fyers``, ``_status_text``,
+``_split_symbol``) live here too, next to the DB + event-bus side effects.
 """
 from __future__ import annotations
 
 import asyncio
+import functools
+import threading
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
@@ -56,10 +57,40 @@ TRADING_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="trading-db"
 _tasks: set = set()  # strong refs so background tasks aren't GC'd
 
 
-def spawn(coro: Any) -> None:
+def spawn(coro: Any) -> "asyncio.Task[Any]":
     t = asyncio.create_task(coro)
     _tasks.add(t)
     t.add_done_callback(_tasks.discard)
+    return t
+
+
+# The order-socket reconciler and the placing path both mirror fills into
+# `positions` from different threads; two readers of "placed" both applied the
+# same fill. One fill writer at a time.
+# ponytail: one process-wide lock; per-order locks if fill volume ever makes it contend
+FILL_LOCK = threading.Lock()
+
+
+def fill_serialised(fn: Any) -> Any:
+    @functools.wraps(fn)
+    def run(*a: Any, **k: Any) -> Any:
+        with FILL_LOCK:
+            return fn(*a, **k)
+    return run
+
+
+def restore_pending_levels() -> None:
+    """Re-arm ticket SL / target (LEVELS_ON_FILL is in memory) for orders
+    still working after a restart. Persisted by the orders API."""
+    from app.db.models import AuditLog
+    from app.db.session import SessionLocal
+
+    with SessionLocal() as db:
+        working = {oid for (oid,) in db.query(TradeRow.broker_order_id).filter(
+            TradeRow.status == "placed", TradeRow.broker_order_id.is_not(None))}
+        for (after,) in db.query(AuditLog.after).filter(AuditLog.action == "order.levels_pending"):
+            if isinstance(after, dict) and str(after.get("order_id")) in working:
+                LEVELS_ON_FILL[str(after["order_id"])] = (after.get("symbol"), after.get("stop_loss"), after.get("target"))
 
 
 # Fyers often confirms / rejects BEFORE the placing request has committed its
@@ -218,13 +249,23 @@ async def reconcile_order_update(
             {"trade_id": res["trade_id"], "symbol": res["symbol"], "status": res["status"],
              "broker_order_id": order_id, "price": res.get("price"), "source": source},
         )
+        if res.get("late"):
+            # A bot entry filled AFTER the attempt gave up on it (IOC expired,
+            # cancel lost the race): hand it to the TradeManager or it runs
+            # with no stop-loss / target / time exit.
+            await event_bus.publish("trade.executed", {
+                "state": "FILLED", "symbol": res["symbol"], "side": res["side"],
+                "quantity": res["qty"], "signal_id": res["signal_id"],
+                "account_id": res["account_id"], "broker_order_id": order_id,
+            })
         if res.get("filled_now") and order_id in LEVELS_ON_FILL:
             symbol, sl, tp = LEVELS_ON_FILL.pop(order_id)
             spawn(_arm_levels(order_id, symbol, sl, tp))
         if res["status"] in ("rejected", "cancelled") and not res.get("filled_now"):
             LEVELS_ON_FILL.pop(order_id, None)
     await event_bus.publish("broker", {"order_id": order_id, "status": status_text, "symbol": sym, "source": source})
-    return {k: v for k, v in res.items() if k not in ("changed", "filled_now", "symbol", "price")}
+    return {k: v for k, v in res.items()
+            if k not in ("changed", "filled_now", "symbol", "price", "late", "side", "qty", "signal_id", "account_id")}
 
 
 async def _arm_levels(order_id: str, symbol: str, sl: Any, tp: Any) -> None:
@@ -234,12 +275,23 @@ async def _arm_levels(order_id: str, symbol: str, sl: Any, tp: Any) -> None:
     if tm is None:
         return
     try:
+        # Same guard as the /levels endpoint: a wrong-side ticket level would
+        # flatten the fresh position at market on its first tick.
+        problem = await tm.check_levels(symbol, stop_loss=sl, target=tp)
+        if problem:
+            log.warning("manual_order.levels_refused", order_id=order_id, symbol=symbol, problem=problem)
+            await event_bus.publish("system.error", {
+                "source": "orders", "code": "LEVELS_NOT_ARMED", "symbol": symbol,
+                "message": f"{symbol}: the ticket's SL / target was NOT armed: {problem}",
+            })
+            return
         await tm.update_levels(symbol, stop_loss=sl, target=tp)
         log.info("manual_order.levels_armed", order_id=order_id, symbol=symbol, stop_loss=sl, target=tp)
     except Exception:  # noqa: BLE001
         log.exception("manual_order.levels_arm_failed", order_id=order_id)
 
 
+@fill_serialised
 def _reconcile_sync(db: Session, order: dict[str, Any], order_id: str, status_text: str, source: str) -> dict[str, Any]:
     new_status = _STATUS_MAP.get(status_text, "placed")
     # broker_order_id isn't unique on `trades` (see orders.cancel_order), and
@@ -293,6 +345,7 @@ def _reconcile_sync(db: Session, order: dict[str, Any], order_id: str, status_te
     elif not manual and new_status == "filled" and trade.status != "filled":
         _apply_fill_to_position(db, trade, int(trade.quantity or 0))
         filled_now = True
+    late = not manual and filled_now and trade.status in ("expired", "cancelled", "rejected")
     if trade.status != "filled":
         trade.status = new_status
     if new_status == "filled":
@@ -305,7 +358,9 @@ def _reconcile_sync(db: Session, order: dict[str, Any], order_id: str, status_te
     db.commit()
     log.info("fyers.reconcile.reconciled", source=source, order_id=order_id, trade_id=trade.id, status=trade.status)
     return {"ok": True, "matched": True, "trade_id": trade.id, "status": trade.status, "changed": True,
-            "filled_now": filled_now, "symbol": trade.symbol, "price": trade.price}
+            "filled_now": filled_now, "symbol": trade.symbol, "price": trade.price,
+            "late": late, "side": trade.side, "qty": int(trade.quantity or 0),
+            "signal_id": trade.signal_id, "account_id": trade.broker_account_id}
 
 
 def _apply_fill_to_position(db: Session, trade: TradeRow, qty: int | None = None) -> None:

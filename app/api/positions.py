@@ -61,6 +61,13 @@ async def close_position(symbol: str, request: Request) -> dict[str, Any]:
     """Close one managed position at the latest price."""
     tm = _trade_manager(request)
     result = await tm.close_position(symbol, reason="MANUAL")
+    if result is None and any(m.symbol == symbol.upper().strip() for m in tm.managed_positions()):
+        # The exit was sent but not confirmed: the position is still open.
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"exit for {symbol!r} was not confirmed by the broker; the position is still "
+                   "open and the bot keeps retrying. Check the Fyers order book.",
+        )
     if result is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -99,7 +106,7 @@ class ConvertBody(BaseModel):
 
 
 @router.post("/{symbol}/convert")
-async def convert_position(symbol: str, body: ConvertBody) -> dict[str, Any]:
+async def convert_position(symbol: str, body: ConvertBody, request: Request) -> dict[str, Any]:
     """Convert an open position's product at the broker (INTRADAY <-> DELIVERY
     for cash, INTRADAY <-> MARGIN for F&O) and record it, so the EOD
     square-off flattens it or carries it accordingly."""
@@ -128,6 +135,12 @@ async def convert_position(symbol: str, body: ConvertBody) -> dict[str, Any]:
     with db_session.SessionLocal() as db:
         db.query(PositionRow).filter_by(symbol=symbol).update({"product": to})
         db.commit()
+    # A carry position never TIME_EXITs (the rebuild rule); an INTRADAY one
+    # gets the news-bot hold window back only on a rebuild.
+    tm = getattr(request.app.state, "trade_manager", None)
+    for m in (tm.managed_positions() if tm is not None else []):
+        if m.symbol == symbol.upper().strip() and to != "INTRADAY":
+            m.max_hold_seconds = 0
     _audit("positions.convert", symbol, {"from": frm, "to": to, "qty": qty})
     return {"ok": True, "symbol": symbol, "product": to, "from": frm}
 
@@ -137,8 +150,9 @@ async def close_all(request: Request) -> dict[str, Any]:
     """Square off every managed position."""
     tm = _trade_manager(request)
     results = await tm.close_all(reason="SQUARE_OFF")
-    _audit("positions.close_all", "*", {"count": len(results)})
-    return {"ok": True, "closed": results, "count": len(results)}
+    still_open = [m.symbol for m in tm.managed_positions() if m.exit_failures]
+    _audit("positions.close_all", "*", {"count": len(results), "still_open": still_open})
+    return {"ok": not still_open, "closed": results, "count": len(results), "still_open": still_open}
 
 
 def _audit(action: str, target: str, after: dict[str, Any]) -> None:

@@ -749,8 +749,9 @@ async def test_t23_trailing_continues_after_scale_out(db_session, isolated_db):
 
 @pytest.mark.asyncio
 async def test_t24_broker_timeout_one_market_retry_then_flag(db_session, isolated_db):
-    """Broker hangs past the timeout: exactly ONE market retry, then the
-    position stays open under a retry cooldown — never a blind duplicate."""
+    """Broker hangs past the timeout: the limit MAY be live, so NO blind
+    market retry (a double exit); the position stays open under a cooldown
+    and the retry re-reads the broker position first."""
     md = MarketDataBus()
     backend = ExitStubBackend()
     backend.place_delay = 0.6      # > EXIT_BROKER_TIMEOUT_SECONDS (0.25)
@@ -762,8 +763,7 @@ async def test_t24_broker_timeout_one_market_retry_then_flag(db_session, isolate
         mp = await register(tm, entry=100.0, stop=97.0, target=106.0, account_id=make_account(db_session))
         out = await tm._exit("RELIANCE", reason="STOP", exit_price=96.8)
         assert out is None
-        assert len(backend.orders) == 2   # LIMIT attempt + ONE market retry
-        assert backend.orders[1]["order_type"] == OrderType.MARKET
+        assert len(backend.orders) == 1   # the LIMIT attempt only
         assert "RELIANCE" in tm._book     # still open, still managed
         assert mp.exit_failures == 1
         assert mp.next_exit_retry_at is not None
