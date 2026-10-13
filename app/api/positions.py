@@ -137,8 +137,11 @@ async def convert_position(symbol: str, body: ConvertBody, request: Request) -> 
     backend = market._fyers_backend()  # noqa: SLF001
     if backend is None or not hasattr(backend, "convert_position"):
         raise HTTPException(status_code=503, detail="connect a Fyers account to convert positions")
+    from app.execution.symbols import resolve_fyers_symbol
+
     try:
-        await backend.convert_position(symbol, qty, abs(qty), frm, to)
+        # The bot's rows are keyed "SBIN"; Fyers needs "NSE:SBIN-EQ".
+        await backend.convert_position(resolve_fyers_symbol(symbol) or symbol, 1 if qty > 0 else -1, abs(qty), frm, to)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"Fyers rejected the conversion: {e}")
     with db_session.SessionLocal() as db:

@@ -140,6 +140,10 @@ class ManagedPosition:
     escalated: bool = False
     next_exit_retry_at: Optional[datetime] = None
     broker_stop_id: Optional[str] = None     # resting disaster SL-M at the broker
+    # The news bot's position (registered by its entry path): its own exit
+    # rules apply. A manual / Algo Lab / carry position rebuilt from its row
+    # exits only on the operator's SL / target / square-off.
+    bot: bool = True
     price_history: deque = field(default_factory=deque)
 
     # Longest look-back any history-based rule needs; samples older than
@@ -582,6 +586,7 @@ class TradeManager:
         *,
         stop_loss: Optional[float],
         target: Optional[float],
+        vs_price: bool = True,
     ) -> Optional[str]:
         """Why an operator's SL / target edit would misfire, or None.
 
@@ -617,7 +622,7 @@ class TradeManager:
             if (long and stop_loss >= target) or (not long and stop_loss <= target):
                 side = "below" if long else "above"
                 return f"Stop-loss must be {side} the target for a {'long' if long else 'short'} position"
-        if last is not None:
+        if last is not None and vs_price:
             if stop_loss is not None and ((long and stop_loss >= last) or (not long and stop_loss <= last)):
                 side = "below" if long else "above"
                 return (f"Stop-loss {stop_loss:g} is already hit (price {last:g}); "
@@ -687,7 +692,7 @@ class TradeManager:
         if (qty > 0) != (mp.quantity > 0):
             # Reversed: a new position on the other side, with no levels yet.
             fresh = ManagedPosition(
-                symbol=symbol, quantity=qty, entry=avg, stop_loss=None, target=None,
+                symbol=symbol, quantity=qty, entry=avg, stop_loss=None, target=None, bot=False,
                 strategy_id=mp.strategy_id, broker_account_id=mp.broker_account_id,
                 scale_out_enabled=mp.scale_out_enabled, scale_out_r=mp.scale_out_r,
                 trail_activate_r=mp.trail_activate_r, trail_distance_r=mp.trail_distance_r,
@@ -827,6 +832,10 @@ class TradeManager:
         if entry is None:
             log.warning("trade_manager.no_entry_for_managed", symbol=symbol)
             return
+        if stop_loss is None:
+            # Never a bot position without a stop (a late fill whose signal
+            # carried no levels): the same 5% default the entry path uses.
+            stop_loss = float(entry) * (0.95 if side == "BUY" else 1.05)
         qty = int(payload.get("quantity") or 0)
         signed_qty = qty if side == "BUY" else -qty
         if signed_qty == 0:
@@ -1048,8 +1057,11 @@ class TradeManager:
 
         # %-of-price rules (breakeven / consolidation / stall) are sized for
         # equities; on an option a 2% move is noise. Derivatives exit on
-        # their stop / target / trailing (R-based) / time only.
-        pct_rules = not fno.is_derivative(symbol)
+        # their stop / target / trailing (R-based) / time only. And they are
+        # the NEWS BOT's rules: a manual / Algo Lab / carry position (no
+        # signal) exits only on the operator's own SL / target.
+        bot = mp.bot
+        pct_rules = bot and not fno.is_derivative(symbol)
         # 3. Breakeven lock: at +BREAKEVEN_AT_PCT the stop moves to
         #    entry ± BREAKEVEN_LOCK_PCT (never loosening an existing
         #    tighter stop). One-shot per position.
@@ -1081,7 +1093,7 @@ class TradeManager:
         # 4. Scale-out + trailing manage ONLY a position with no explicit
         #    (hard) target — an open-ended winner we let run on a trailing
         #    stop (RISK.md §3). A configured target is never overridden.
-        if not mp.has_hard_target:
+        if bot and not mp.has_hard_target:
             if (
                 mp.scale_out_enabled
                 and not mp.scaled_out
@@ -1193,6 +1205,12 @@ class TradeManager:
             symbols -= set(await asyncio.get_running_loop().run_in_executor(
                 None, _carry_position_symbols, self._session_factory
             ))
+            # The sweep re-runs this every 0.5 s: a failing exit waits out its
+            # backoff instead of hitting the broker on every pass.
+            now = datetime.now(timezone.utc)
+            async with self._lock:
+                symbols -= {s for s, m in self._book.items()
+                            if m.next_exit_retry_at is not None and now < m.next_exit_retry_at}
         # All at once: the last position must not wait N exits for its turn.
         results = await asyncio.gather(*(self.close_position(s, reason=reason) for s in symbols), return_exceptions=True)
         out: list[dict[str, Any]] = []
@@ -1651,11 +1669,19 @@ class TradeManager:
             if mp.broker_stop_id is None:
                 mp.broker_stop_id = await loop.run_in_executor(None, _working_backstop, self._session_factory, mp.symbol)
             if mp.broker_stop_id is not None:
-                if reprice and hasattr(backend, "modify_order"):
-                    await backend.modify_order(mp.broker_stop_id, quantity=abs(int(mp.quantity)), stop_price=trigger)
+                if not reprice:
+                    return
+                ok = False
+                if hasattr(backend, "modify_order"):
+                    ok, msg = await backend.modify_order(mp.broker_stop_id, quantity=abs(int(mp.quantity)), stop_price=trigger)
+                if ok:
                     await loop.run_in_executor(None, _update_backstop_row, self._session_factory,
                                                mp.broker_stop_id, abs(int(mp.quantity)), trigger)
-                return
+                    return
+                # A refused modify left the OLD size resting: if it fired it
+                # would oversell the resized position. Replace it.
+                log.warning("trade_manager.backstop_modify_failed", symbol=mp.symbol)
+                await self._cancel_backstop(mp, backend)
             r = await backend.place_order(
                 signal=None, symbol=mp.symbol, side=OrderSide.SELL if long else OrderSide.BUY,
                 quantity=abs(int(mp.quantity)), order_type=OrderType.STOP_LOSS_MARKET,
@@ -1682,8 +1708,10 @@ class TradeManager:
             return False
         try:
             backend = backend or await self._exit_backend(mp)
-            if backend is not None:
-                await backend.cancel_order(oid)
+            if backend is not None and not await backend.cancel_order(oid):
+                # Refused: it has likely triggered. Let it settle, so the
+                # broker position read before any exit counts its fill.
+                await self._await_fill(backend, oid, abs(int(mp.quantity)), 3.0)
         except Exception:  # noqa: BLE001
             log.exception("trade_manager.backstop_cancel_failed", symbol=mp.symbol, order_id=oid)
         return True
@@ -2151,6 +2179,7 @@ def _open_position_as_managed(
             opened_at=opened_at,
             max_hold_seconds=max_hold_seconds,
             initial_risk=initial_risk,
+            bot=signal_id is not None and (row.product or "INTRADAY") == "INTRADAY",
             scale_out_enabled=bool(getattr(st, "SCALE_OUT_ENABLED", True)),
             scale_out_r=float(getattr(st, "SCALE_OUT_R", 2.0)),
             trail_activate_r=float(getattr(st, "TRAIL_ACTIVATE_R", 1.5)),

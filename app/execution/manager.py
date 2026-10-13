@@ -1442,11 +1442,14 @@ class Manager:
         )
         if account is None:
             return None
-        settings = self._settings_provider()
-        if bool(getattr(account, "paper_mode", True)) or settings.is_paper:
+        # NOT the global TRADING_MODE: a real Fyers position (a Trade-page
+        # order, or one opened before the switch) must still exit at Fyers.
+        # Paper fills on a live account are kept off the broker by the
+        # TradeManager's per-position check (`_is_paper_position`).
+        if bool(getattr(account, "paper_mode", True)):
             return None
-        backend = self._backend_for(account)
-        return None if backend is self._paper else backend
+        backend = self._manual_backend_for(account)
+        return None if backend is self._paper or isinstance(backend, PaperBackend) else backend
 
     def register_backend(self, broker_account_id: int, backend: TradingBackend) -> None:
         """Inject a backend (e.g. a stub for tests)."""
@@ -1501,7 +1504,7 @@ class Manager:
 
         await self._check_lpp(symbol, type_enum, limit_price)
 
-        pos_qty, pos_product, halt = await asyncio.get_running_loop().run_in_executor(
+        pos_qty, pos_product, halt, symbol = await asyncio.get_running_loop().run_in_executor(
             TRADING_POOL, _position_and_halt, symbol
         )
         signed = int(quantity) if side_enum == OrderSide.BUY else -int(quantity)
@@ -1704,6 +1707,7 @@ class Manager:
             "risk_warning": risk_message or None,
             "bypassed_risk": bool(bypass_risk and risk_codes),
             "broker_order_id": result.broker_order_id,
+            "symbol": result.symbol,  # the position row's spelling (see _position_and_halt)
             "status": status_text,
             "error": error,
             # Surface the OrderResult's `raw` field as `reason` so
@@ -1820,69 +1824,6 @@ class Manager:
                         "bypass_risk": bypass_risk,
                         "risk_codes": risk_codes,
                         "risk_message": risk_message,
-                    },
-                )
-            )
-            session.commit()
-
-    def _persist_manual_trade_blocked(
-        self,
-        *,
-        account: BrokerAccount,
-        signal: Any,
-        side: OrderSide,
-        quantity: int,
-        price: float,
-        order_type: OrderType,
-        product_type: ProductType,
-        reason: str,
-        codes: list[str],
-        operator: str,
-    ) -> None:
-        from app.db.session import SessionLocal
-        with SessionLocal() as session:
-            session.add(
-                TradeRow(
-                    signal_id=None,
-                    broker_account_id=account.id,
-                    symbol=signal.symbol,
-                    side=side.value,
-                    quantity=int(quantity),
-                    price=float(price or 0.0),
-                    order_type=order_type.value,
-                    status="rejected_risk",
-                    broker_order_id=None,
-                )
-            )
-            session.add(
-                RiskEvent(
-                    event_type="manual_risk_block",
-                    severity="warning",
-                    message=reason,
-                    halted=False,
-                    context={
-                        "source": "manual",
-                        "operator": operator,
-                        "side": side.value,
-                        "quantity": int(quantity),
-                        "order_type": order_type.value,
-                        "product_type": product_type.value,
-                        "codes": codes,
-                    },
-                )
-            )
-            session.add(
-                AuditLog(
-                    actor=operator,
-                    action="order.manual_blocked",
-                    target=f"account:{account.id}",
-                    before=None,
-                    after={
-                        "symbol": signal.symbol,
-                        "side": side.value,
-                        "quantity": int(quantity),
-                        "reason": reason,
-                        "codes": codes,
                     },
                 )
             )
@@ -2503,13 +2444,26 @@ def _persist_trade_placed_only(
         session.commit()
 
 
-def _position_and_halt(symbol: str) -> tuple[int, Optional[str], Optional[str]]:
-    """(net qty, product) of the symbol's position row + why trading is halted (or None)."""
+def _equity_key(symbol: str) -> str:
+    """"NSE:SBIN-EQ" and the bot's bare "SBIN" are one stock."""
+    return re.sub(r"-(EQ|BE)$", "", (symbol or "").upper().strip().split(":")[-1])
+
+
+def _position_and_halt(symbol: str) -> tuple[int, Optional[str], Optional[str], str]:
+    """(net qty, product, why trading is halted or None, the position row's
+    symbol). An open row under the other spelling of the same stock counts:
+    a Trade-page "NSE:SBIN-EQ" sell closing the bot's "SBIN" must land on
+    that row, or the bot's stop sells the same shares again."""
     from app.db.session import SessionLocal
     from app.risk import circuit_breakers
 
     with SessionLocal() as db:
         pos = db.query(PositionRow).filter_by(symbol=symbol).one_or_none()
+        if pos is None or not pos.quantity:
+            key = _equity_key(symbol)
+            pos = next((p for p in db.query(PositionRow).filter(PositionRow.quantity != 0)
+                        if _equity_key(p.symbol) == key), pos)
         state = circuit_breakers.get_or_create_state(db)
         halt = (state.disabled_reason or "trading_disabled") if state.trading_disabled else None
-        return (int(pos.quantity or 0) if pos else 0), (pos.product if pos else None), halt
+        return ((int(pos.quantity or 0) if pos else 0), (pos.product if pos else None), halt,
+                pos.symbol if pos is not None and pos.quantity else symbol)

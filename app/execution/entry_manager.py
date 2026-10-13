@@ -403,25 +403,28 @@ class EntryManager:
         # WS confirmation can't slip between place_order and monitoring.
         fill_queue = event_bus.subscribe(CHANNEL_TRADES_FILLED)
         try:
+            # Shielded: a timeout stops WAITING, it never cancels the HTTP
+            # call mid-flight (the order could still reach Fyers, untracked).
+            place = asyncio.ensure_future(backend.place_order(
+                signal=signal,
+                symbol=attempt.symbol,
+                side=side,
+                quantity=attempt.quantity,
+                order_type=OrderType.LIMIT,
+                limit_price=limit_price,
+                stop_price=None,
+                product_type=product_type,
+                validity="IOC",
+            ))
             try:
-                result: OrderResult = await asyncio.wait_for(
-                    backend.place_order(
-                        signal=signal,
-                        symbol=attempt.symbol,
-                        side=side,
-                        quantity=attempt.quantity,
-                        order_type=OrderType.LIMIT,
-                        limit_price=limit_price,
-                        stop_price=None,
-                        product_type=product_type,
-                        validity="IOC",
-                    ),
-                    timeout=broker_timeout,
-                )
+                result: OrderResult = await asyncio.wait_for(asyncio.shield(place), timeout=broker_timeout)
             except asyncio.TimeoutError:
                 # The order MAY have reached the broker. Retrying blind is
-                # how double orders happen — never retry; the operator (or
-                # a later reconcile of the broker order book) resolves it.
+                # how double orders happen — never retry. If the broker does
+                # answer, the order is recorded so its fill is adopted.
+                if on_routed is not None:
+                    from app.execution.order_reconcile import spawn
+                    spawn(_adopt_late_order(place, on_routed))
                 attempt.transition(EntryState.REJECTED)
                 log.error(
                     "entry.broker_timeout",
@@ -794,6 +797,22 @@ class EntryManager:
                 quantity=attempt.filled_quantity,
             )
             return None
+
+
+async def _adopt_late_order(place: "asyncio.Future[OrderResult]", on_routed: Callable[[OrderResult], Awaitable[None]]) -> None:
+    """The broker acked an entry after it timed out: record it as expired so
+    a fill takes the late-fill handover (stop / target / exits) instead of
+    running as an untracked orphan."""
+    from app.execution.order_reconcile import apply_parked
+
+    try:
+        r = await place
+    except Exception:  # noqa: BLE001 — never reached the broker
+        return
+    if r.broker_order_id and r.state != OrderState.REJECTED:
+        log.warning("entry.late_ack_adopted", broker_order_id=r.broker_order_id, symbol=r.symbol)
+        await on_routed(replace(r, state=OrderState.EXPIRED))
+        await apply_parked(str(r.broker_order_id))
 
 
 # ---- Retracement monitor ----------------------------------------------------

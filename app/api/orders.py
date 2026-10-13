@@ -284,6 +284,17 @@ async def place_order(
     lot_problem = await _lot_problem(symbol, quantity)
     if lot_problem:
         raise HTTPException(status_code=422, detail=lot_problem)
+    # A wrong-side ticket SL / target is refused NOW, before the order goes
+    # out — not at fill time, when the position would already be running bare.
+    sl, tp = _opt_price(body.get("stop_loss")), _opt_price(body.get("target"))
+    if sl is not None or tp is not None:
+        ref = limit_price or stop_price
+        if ref is None:
+            q = await _manager().market_data.get_quote(symbol)
+            ref = float(q.last_price) if q is not None and not _is_simulated(q) else None
+        problem = _levels_problem(side, ref, sl, tp)
+        if problem:
+            raise HTTPException(status_code=422, detail=problem)
 
     from app.api import practice
     if account_id == practice.PRACTICE_ACCOUNT_ID:
@@ -353,25 +364,41 @@ async def place_order(
         return result
     # Optional SL / target from the ticket: armed on the position once THIS
     # order fills (a resting limit may fill much later), never before.
-    sl, tp = _opt_price(body.get("stop_loss")), _opt_price(body.get("target"))
     if (sl is not None or tp is not None) and result.get("broker_order_id"):
-        from app.execution.order_reconcile import LEVELS_ON_FILL
+        import asyncio
+
+        from app.execution.order_reconcile import LEVELS_ON_FILL, TRADING_POOL, _arm_levels, spawn
 
         # Armed by the reconciler the moment THIS order's fill lands — or now,
         # if the fill was already applied (instant fill / parked update).
         oid = str(result["broker_order_id"])
-        LEVELS_ON_FILL[oid] = (symbol.upper(), sl, tp)
+        pos_sym = str(result.get("symbol") or symbol).upper()
+        LEVELS_ON_FILL[oid] = (pos_sym, sl, tp)
         # Survives a restart (order_reconcile.restore_pending_levels).
         db.add(AuditLog(actor="ui_trade_page", action="order.levels_pending", target=f"order:{oid}",
-                        after={"order_id": oid, "symbol": symbol.upper(), "stop_loss": sl, "target": tp}))
+                        after={"order_id": oid, "symbol": pos_sym, "stop_loss": sl, "target": tp}))
         await _commit_off_loop(db)
-        row = db.query(Trade.status).filter(Trade.broker_order_id == oid).first()
-        if row is not None and row[0] == "filled":
-            from app.execution.order_reconcile import _arm_levels, spawn
-
-            spawn(_arm_levels(oid, *LEVELS_ON_FILL.pop(oid)))
+        row = await asyncio.get_running_loop().run_in_executor(
+            TRADING_POOL, lambda: db.query(Trade.status).filter(Trade.broker_order_id == oid).first())
+        # The reconciler may have taken the levels during the commit above.
+        levels = LEVELS_ON_FILL.pop(oid, None) if row is not None and row[0] == "filled" else None
+        if levels is not None:
+            spawn(_arm_levels(oid, *levels))
         result["levels_pending"] = {"stop_loss": sl, "target": tp}
     return result
+
+
+def _levels_problem(side: str, ref: Optional[float], sl: Optional[float], tp: Optional[float]) -> Optional[str]:
+    """Why a ticket SL / target can't protect a `side` entry near `ref`, or None."""
+    long = side == "BUY"
+    if sl is not None and tp is not None and (sl >= tp if long else sl <= tp):
+        return f"stop_loss must be {'below' if long else 'above'} the target for a {side}"
+    if ref:
+        if sl is not None and (sl >= ref if long else sl <= ref):
+            return f"stop_loss {sl:g} must be {'below' if long else 'above'} the entry {ref:g} for a {side}"
+        if tp is not None and (tp <= ref if long else tp >= ref):
+            return f"target {tp:g} must be {'above' if long else 'below'} the entry {ref:g} for a {side}"
+    return None
 
 
 async def _lot_problem(symbol: str, quantity: int) -> Optional[str]:

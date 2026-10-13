@@ -823,7 +823,7 @@ def test_ticket_sl_target_armed_only_after_fill(
     calls: list = []
 
     class TM:
-        async def check_levels(self, symbol, *, stop_loss, target):
+        async def check_levels(self, symbol, *, stop_loss, target, vs_price=True):
             return None
 
         async def update_levels(self, symbol, *, stop_loss, target):

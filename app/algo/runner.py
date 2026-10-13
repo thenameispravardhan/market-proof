@@ -778,10 +778,28 @@ class AlgoRunner:
                     lg["order_id"] = oid
                     placed.append(lg)
                     order_ids.append(str(oid))
+            if not failure:
+                # "ok" is Fyers ACCEPTING an order; a leg can still be rejected
+                # after it (RMS, exchange). A leg with no fill that the broker
+                # doesn't hold is not a hedge — unwind the rest.
+                for lg in legs:                                    # book the broker's fill, not the quote
+                    fill = await _fill_price(acc, lg.get("order_id"))
+                    if fill:
+                        lg["entry"] = fill
+                        continue
+                    net = await _broker_net(acc, lg["symbol"])
+                    if net is not None and net * lg["act"] <= 0:
+                        failure = f"{lg['symbol']}: not filled at the broker"
+                        break
             if failure:
                 for lg in placed:                                   # roll back what did fill
-                    await _order(acc, lg["symbol"], "SELL" if lg["act"] > 0 else "BUY", lg["qty"],
-                                 exit_=True, strategy_id=s["id"], product=lg["product"])
+                    qty = lg["qty"]
+                    net = await _broker_net(acc, lg["symbol"])
+                    if net is not None:                             # never sell what the broker doesn't hold
+                        qty = min(qty, abs(net)) if net * lg["act"] > 0 else 0
+                    if qty:
+                        await _order(acc, lg["symbol"], "SELL" if lg["act"] > 0 else "BUY", qty,
+                                     exit_=True, strategy_id=s["id"], product=lg["product"])
                 await asyncio.to_thread(
                     _insert, strategy_id=s["id"], symbol=sym, side=side, quantity=legs[0]["qty"], mode="live",
                     status="rejected", entry_at=_utc(now), entry_price=round(u, 2), legs=_clean(legs),
@@ -789,10 +807,6 @@ class AlgoRunner:
                     note=f"{failure}{' (placed legs rolled back)' if placed else ''}"[:500])
                 self.event("error", f"{s['name']}: LIVE {side} {sym} rejected: {failure}", strategy_id=s["id"])
                 return
-            for lg in legs:                                        # book the broker's fill, not the quote
-                fill = await _fill_price(acc, lg.get("order_id"))
-                if fill:
-                    lg["entry"] = fill
         ref_entry = u if ref == "u" else legs[0]["entry"]
         lv = engine.entry_levels(spec, rsign, ref_entry, atr_vals)
         label = " + ".join(lg["label"] for lg in legs)[:160]

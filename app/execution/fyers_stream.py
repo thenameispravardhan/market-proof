@@ -398,6 +398,7 @@ class FyersStreamManager:
         self._ondemand.clear()
         self._rejected.clear()
         self._data_connected = False
+        self._order_ready = False
         self._data_socket = self._data_factory(
             self._token,
             on_message=self._on_data_message,
@@ -423,6 +424,7 @@ class FyersStreamManager:
         # Updates sent while the order socket was down are gone — replay today's
         # order book once so no fill / reject is lost across a reconnect.
         asyncio.ensure_future(self._resync_orders())
+        self._order_ready = True  # later order-socket connects are SDK auto-reconnects
         # Order socket subscribes itself in `_on_order_connect` — that
         # covers both the initial connect AND any SDK auto-reconnect
         # (which wipes the order subscription the same way it wipes
@@ -893,6 +895,10 @@ class FyersStreamManager:
                 sock.subscribe("OnOrders,OnTrades")
             except Exception:  # noqa: BLE001
                 log.exception("fyers_stream.order_resubscribe_failed")
+        # An SDK auto-reconnect: fills sent during the gap are gone — replay
+        # today's order book, as the first connect does.
+        if getattr(self, "_order_ready", False) and self._loop is not None:
+            asyncio.run_coroutine_threadsafe(self._resync_orders(), self._loop)
 
     def _on_order_close(self, *args: Any) -> None:
         log.info("fyers_stream.order_closed")

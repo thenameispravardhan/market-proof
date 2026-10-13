@@ -257,6 +257,7 @@ async def reconcile_order_update(
                 "state": "FILLED", "symbol": res["symbol"], "side": res["side"],
                 "quantity": res["qty"], "signal_id": res["signal_id"],
                 "account_id": res["account_id"], "broker_order_id": order_id,
+                "entry": res.get("price"),  # the real fill, not a later quote
             })
         if res.get("filled_now") and order_id in LEVELS_ON_FILL:
             symbol, sl, tp = LEVELS_ON_FILL.pop(order_id)
@@ -275,9 +276,10 @@ async def _arm_levels(order_id: str, symbol: str, sl: Any, tp: Any) -> None:
     if tm is None:
         return
     try:
-        # Same guard as the /levels endpoint: a wrong-side ticket level would
-        # flatten the fresh position at market on its first tick.
-        problem = await tm.check_levels(symbol, stop_loss=sl, target=tp)
+        # Structure only (stop beyond target, non-positive). A level the
+        # price already crossed by the time it filled still arms: the
+        # position exits at once — leaving it with no stop was the worse outcome.
+        problem = await tm.check_levels(symbol, stop_loss=sl, target=tp, vs_price=False)
         if problem:
             log.warning("manual_order.levels_refused", order_id=order_id, symbol=symbol, problem=problem)
             await event_bus.publish("system.error", {
@@ -322,7 +324,8 @@ def _reconcile_sync(db: Session, order: dict[str, Any], order_id: str, status_te
     already = int(trade.filled_qty or 0)
     target_filled = reported if reported is not None else (int(trade.quantity or 0) if new_status == "filled" else already)
     delta = target_filled - already if manual else 0
-    price = order.get("tradedPrice") or order.get("limitPrice")
+    # Never 0: a fill message without a traded price must not zero the cost basis.
+    price = order.get("tradedPrice") or order.get("limitPrice") or None
 
     if trade.status == new_status and delta <= 0:
         log.info("fyers.reconcile.deduped", source=source, order_id=order_id, status=new_status)
@@ -333,13 +336,19 @@ def _reconcile_sync(db: Session, order: dict[str, Any], order_id: str, status_te
         log.info("fyers.reconcile.kept_fill", source=source, order_id=order_id, ignored_status=new_status)
         return {"ok": True, "matched": True, "deduped": True, "trade_id": trade.id, "status": trade.status}
 
+    prev_avg = float(trade.price or 0.0)
     try:
         if price is not None and (delta > 0 or new_status == "filled"):
             trade.price = float(price)
     except (TypeError, ValueError):
         pass
     if manual and delta > 0:
-        _apply_fill_to_position(db, trade, delta)
+        # Fyers' tradedPrice is the order's running average: this slice's own
+        # price is what moves the position's cost.
+        px = float(trade.price or 0.0)
+        if already > 0 and prev_avg > 0 and px > 0:
+            px = (px * (already + delta) - prev_avg * already) / delta
+        _apply_fill_to_position(db, trade, delta, px)
         trade.filled_qty = already + delta
         filled_now = True
     elif not manual and new_status == "filled" and trade.status != "filled":
@@ -363,9 +372,10 @@ def _reconcile_sync(db: Session, order: dict[str, Any], order_id: str, status_te
             "signal_id": trade.signal_id, "account_id": trade.broker_account_id}
 
 
-def _apply_fill_to_position(db: Session, trade: TradeRow, qty: int | None = None) -> None:
+def _apply_fill_to_position(db: Session, trade: TradeRow, qty: int | None = None, px: float | None = None) -> None:
     """Mirror a confirmed Fyers fill (or one partial slice of it) into positions."""
     qty = int(trade.quantity or 0) if qty is None else int(qty)
+    px = float(trade.price or 0.0) if px is None else px
     if qty <= 0:
         return
     signed = qty if (trade.side or "").upper() == "BUY" else -qty
@@ -375,12 +385,13 @@ def _apply_fill_to_position(db: Session, trade: TradeRow, qty: int | None = None
             PositionRow(
                 symbol=trade.symbol,
                 quantity=signed,
-                average_price=float(trade.price or 0.0),
-                last_price=float(trade.price or 0.0),
+                average_price=px,
+                last_price=px,
                 unrealized_pnl=0.0,
                 product=trade.product or "INTRADAY",
             )
         )
     else:
-        pos.quantity, pos.average_price = apply_fill(pos.quantity, pos.average_price, signed, trade.price)
-        pos.last_price = float(trade.price or 0.0)
+        pos.quantity, pos.average_price = apply_fill(pos.quantity, pos.average_price, signed, px)
+        if px > 0:
+            pos.last_price = px
