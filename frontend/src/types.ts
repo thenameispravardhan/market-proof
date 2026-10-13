@@ -55,6 +55,9 @@ export interface Position {
   average_price: number;
   last_price: number | null;
   unrealized_pnl: number | null;
+  /** Practice positions carry their own SL / target (live ones use the managed book). */
+  stop_loss?: number | null;
+  target?: number | null;
   strategy_id: number | null;
   product?: ProductType;
   /** Contract lot (1 for cash) — exits must be whole lots. */

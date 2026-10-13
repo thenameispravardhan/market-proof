@@ -916,17 +916,18 @@ export default function Trade() {
   const positionFor = (sym: string): ChartPosition | null => {
     const pos = positions?.find((p) => p.symbol === sym && p.quantity !== 0);
     if (!pos) return null;
-    const m = managed?.find((x) => x.symbol === sym);
+    const m = practice ? pos : managed?.find((x) => x.symbol === sym);
     return { qty: pos.quantity, avg: pos.average_price, sl: m?.stop_loss ?? null, tp: m?.target ?? null };
   };
   const levelsFor = (sym: string) => async (sl: number | null, tp: number | null) => {
-    const r = await fetch(`/api/positions/${encodeURIComponent(sym)}/levels`, {
+    const r = await fetch(`/api/positions/${encodeURIComponent(sym)}/levels${practice ? "?practice=1" : ""}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ stop_loss: sl, target: tp }),
     });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(detailText(j, r.status));
+    if (practice) { void qc.invalidateQueries({ queryKey: ["positions"] }); return; }
     qc.setQueryData<Managed[]>(["managed-positions"], (old) => [...(old ?? []).filter((x) => x.symbol !== j.managed.symbol), j.managed]);
   };
   const closeFor = (sym: string) => async () => {
@@ -1397,7 +1398,7 @@ export default function Trade() {
                         brokerLines={active && tset.showOrders ? brokerLines : undefined}
                         onPickPrice={active ? onPickPrice : undefined}
                         position={tset.showPos ? positionFor(h.symbol) : null}
-                        onLevels={practice ? undefined : levelsFor(h.symbol)}
+                        onLevels={levelsFor(h.symbol)}
                         onClosePosition={closeFor(h.symbol)}
                         onChartOrder={active ? orderFor(h.symbol, h.short_name, Number(quantity)) : undefined}
                         orderQty={active ? Number(quantity) : undefined}

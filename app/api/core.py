@@ -150,6 +150,8 @@ def _ser_position(p: Position) -> dict[str, Any]:
         "average_price": p.average_price,
         "last_price": p.last_price,
         "unrealized_pnl": p.unrealized_pnl,
+        "stop_loss": p.stop_loss,
+        "target": p.target,
         "strategy_id": p.strategy_id,
         "product": p.product or "INTRADAY",
         "lot_size": _lot_size(p.symbol),

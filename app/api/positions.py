@@ -85,10 +85,13 @@ async def close_position(symbol: str, request: Request, practice: bool = Query(F
 
 @router.post("/{symbol}/levels")
 async def update_levels(
-    symbol: str, body: LevelsUpdate, request: Request
+    symbol: str, body: LevelsUpdate, request: Request, practice: bool = Query(False)
 ) -> dict[str, Any]:
     """Edit the stop-loss / target of an open position so the trade
     manager exits on the new levels. Pass null for a level to clear it."""
+    if practice:
+        from app.api import practice as practice_mod
+        return {"ok": True, "managed": await practice_mod.set_levels(symbol, body.stop_loss, body.target)}
     tm = _trade_manager(request)
     problem = await tm.check_levels(
         symbol, stop_loss=body.stop_loss, target=body.target

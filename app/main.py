@@ -350,6 +350,10 @@ async def lifespan(app: FastAPI):
         quote_feed.start()
         trade_manager.start()
         await trade_manager.wait_until_ready()
+        if not getattr(settings, "TESTING", 0):
+            # Practice SL / target live on practice rows: watch them from boot.
+            from app.api import practice as _practice
+            _practice.backend()
         # Realtime Fyers WebSocket feed (prices + order fills). Lazily
         # connects once a live account is present; toggled off via
         # FYERS_STREAMING_ENABLED to fall back to pure REST polling.
