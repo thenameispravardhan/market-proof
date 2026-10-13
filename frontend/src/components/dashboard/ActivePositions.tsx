@@ -54,7 +54,7 @@ function PositionRow({
   return (
     <tr>
       <td className="mono symbol">
-        <a href={chartHref(p.symbol, p.opened_at)} target="_blank" rel="noopener" title="Open chart at entry">{p.symbol}</a>
+        <a href={chartHref(p.symbol, p.opened_at)} target="_blank" rel="noopener" className="sym-link" title="Open chart at entry">{p.symbol}</a>
       </td>
       <td>
         <span className={`badge ${CAP_BADGE_CLASS[capTier(p.symbol)]}`}>

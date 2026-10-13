@@ -42,6 +42,8 @@ import {
 } from "../hooks/useApi";
 import { useLiveQuote } from "../hooks/useQuotes";
 import { tabLocal, useRouter } from "../router";
+import { withWs } from "../workspace";
+import { chartLinkParams } from "../lib/chartLink";
 import ChartPanel, { type BrokerLine, type ChartOrder, type ChartPosition, type HostAction } from "../components/trade/ChartPanel";
 import Scalper, { splitDrag } from "../components/trade/Scalper";
 import { AccountManager, BOTTOM_TABS, LayoutMenu, SymbolDetails, WatchlistTable, cleanWatchItems, useLayouts, type BottomTab, type WatchState } from "../components/trade/TradePanels";
@@ -514,9 +516,25 @@ export default function Trade() {
     } catch { /* best-effort */ }
   };
   const [query, setQuery] = useState("");
+  // A symbol link from another page (#/trade?symbol=…&iv=…&at=…): open that
+  // symbol, in that timeframe, centred on that time — once.
+  const link = useRef(useState(() => {
+    const l = chartLinkParams();
+    if (l?.iv) {
+      try { tabLocal.setItem("chart:prefs", JSON.stringify({ ...JSON.parse(tabLocal.getItem("chart:prefs") ?? "{}"), interval: l.iv })); } catch { /* best-effort */ }
+    }
+    return l;
+  })[0]);
   const [selected, setSelected] = useState<InstrumentHit | null>(() => {
+    if (link.current) return link.current.hit;
     try { return JSON.parse(tabLocal.getItem(LAST_KEY) ?? "null"); } catch { return null; }
   });
+  useEffect(() => {
+    if (link.current) window.history.replaceState(null, "", withWs("#/trade"));   // a refresh mustn't jump back
+  }, []);
+  useEffect(() => {
+    if (link.current && selected?.symbol !== link.current.hit.symbol) link.current = null;
+  }, [selected]);
   // The chain stays on the last UNDERLYING picked, so clicking one of its
   // options (which opens that option's chart + ticket) keeps the chain up.
   const [chainBase, setChainBase] = useState<InstrumentHit | null>(() => (isUnderlying(selected) ? selected : stored<InstrumentHit | null>("trade:chainBase", null)));
@@ -1367,6 +1385,7 @@ export default function Trade() {
                         key={h.symbol}
                         symbol={h.symbol}
                         shortName={h.short_name}
+                        at={active && link.current?.hit.symbol === h.symbol ? link.current.at : undefined}
                         brokerLines={active && tset.showOrders ? brokerLines : undefined}
                         onPickPrice={active ? onPickPrice : undefined}
                         position={tset.showPos ? positionFor(h.symbol) : null}

@@ -2843,6 +2843,7 @@ div.ind-row { cursor: default; }
 .whats-new { margin: 2px 0 6px 18px; display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--text); }
 .tb-logo { color: var(--accent); font-weight: 800; }
 a.chart-menu-item { text-decoration: none; color: var(--text); }
+a.sym-link { text-decoration: none; color: inherit; }
 .popout-app { height: 100vh; display: flex; flex-direction: column; background: var(--bg-app); padding: 6px; }
 .popout-chart { flex: 1; min-height: 0; display: flex; }
 .popout-chart > .chart-card { flex: 1; }
