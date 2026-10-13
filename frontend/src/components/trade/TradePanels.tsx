@@ -799,7 +799,7 @@ export function AccountManager({
                   <button type="button" className="btn-sm danger" disabled={!open.length} onClick={() => {
                     if (!window.confirm(`Exit all ${open.length} open position(s) at market?`)) return;
                     void run("Exit all", async () => {
-                      const r = await fetch("/api/positions/close-all", { method: "POST" });
+                      const r = await fetch(accountId === -1 ? "/api/positions/close-all?practice=1" : "/api/positions/close-all", { method: "POST" });
                       const j = await r.json().catch(() => ({}));
                       if (!r.ok) throw new Error(typeof j.detail === "string" ? j.detail : `HTTP ${r.status}`);
                       void qc.invalidateQueries({ queryKey: ["positions"] });
@@ -820,7 +820,7 @@ export function AccountManager({
                       void run(`Reverse ${p.symbol}`, () => orderFor(p.symbol, p.symbol, q, orderProduct(productOf(p)))({ side: p.quantity > 0 ? "SELL" : "BUY", type: "MARKET", price: null }));
                     }
                   }}>⇅</button>
-                  <button type="button" className="btn-sm" title={convertTitle(p)} data-testid={`convert-${p.symbol}`} onClick={() => {
+                  {accountId !== -1 && <button type="button" className="btn-sm" title={convertTitle(p)} data-testid={`convert-${p.symbol}`} onClick={() => {
                     const to = convertTarget(p);
                     if (window.confirm(`Convert ${p.symbol} (${p.quantity}) from ${p.product ?? "INTRADAY"} to ${to}?`)) {
                       void run(`Convert ${p.symbol} → ${to}`, async () => {
@@ -832,7 +832,7 @@ export function AccountManager({
                         return `${p.symbol} is now ${j.product}`;
                       });
                     }
-                  }}>{(p.product ?? "INTRADAY") === "INTRADAY" ? "→ Carry" : "→ Intraday"}</button>
+                  }}>{(p.product ?? "INTRADAY") === "INTRADAY" ? "→ Carry" : "→ Intraday"}</button>}
                   <button type="button" className="btn-sm danger" title="Exit — full or partial, market or limit" onClick={() => setExit({ pos: { symbol: p.symbol, name: p.symbol, qty: p.quantity, avg: p.average_price, ltp: p.last_price, lot: lotOf(p.symbol), product: productOf(p) }, local: true })} data-testid={`exit-${p.symbol}`}>Exit</button>
                 </>
               )}

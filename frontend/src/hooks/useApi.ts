@@ -88,10 +88,10 @@ export function useMarketIndices() {
 }
 
 
-export function usePositions() {
+export function usePositions(practice = false) {
   return useQuery<Position[]>({
-    queryKey: ["positions"],
-    queryFn: () => api.get("/api/positions"),
+    queryKey: ["positions", practice],
+    queryFn: () => api.get(practice ? "/api/positions?practice=1" : "/api/positions"),
     refetchInterval: 5000,
   });
 }
@@ -159,23 +159,23 @@ export function useCloseAllPositions() {
   });
 }
 
-export function useTrades(limit = 200, status?: string) {
-  const qs = status ? `?limit=${limit}&status=${status}` : `?limit=${limit}`;
+export function useTrades(limit = 200, status?: string, practice = false) {
+  const qs = (status ? `?limit=${limit}&status=${status}` : `?limit=${limit}`) + (practice ? "&practice=1" : "");
   return useQuery<Trade[]>({
-    queryKey: ["trades", limit, status ?? null],
+    queryKey: ["trades", limit, status ?? null, practice],
     queryFn: () => api.get(`/api/trades${qs}`),
     refetchInterval: 10000,
   });
 }
 
-export function useDeleteTrades() {
+export function useDeleteTrades(practice = false) {
   const qc = useQueryClient();
   return useMutation({
     // One request, one transaction. Deleting legs one call at a time is
     // what strands an exit whose entry already went.
     mutationFn: (ids: number[]) =>
       api.post<{ ok: boolean; deleted: number[]; count: number }>(
-        "/api/trades/delete",
+        practice ? "/api/trades/delete?practice=1" : "/api/trades/delete",
         { ids }
       ),
     onSuccess: () => {

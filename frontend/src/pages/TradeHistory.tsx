@@ -1,5 +1,5 @@
 // Trade History — executed trades as round-trips (entry + exit paired
-// into one row), split into two sections: Fyers and Paper Trading.
+// into one row), split into three sections: Fyers, Paper Trading and Practice.
 //
 // Round-trips are reconstructed by `buildRoundTrips` (shared with the
 // dashboard P&L chart so the two views agree): filled legs are paired
@@ -166,6 +166,10 @@ export default function TradeHistory() {
   // round-trip would lose its entry and show as a phantom open position.
   const { data: trades, isLoading, error } = useTrades(500, "filled");
   const del = useDeleteTrades();
+  // Practice (Trade page "Paper" toggle) lives in its own DB: its own rows,
+  // its own delete, never summed with real money.
+  const { data: practiceTrades } = useTrades(500, "filled", true);
+  const delPractice = useDeleteTrades(true);
   const { data: accounts } = useBrokerAccounts();
   const { data: managed } = useManagedPositions();
 
@@ -181,6 +185,10 @@ export default function TradeHistory() {
     () => buildRoundTrips(trades ?? [], byId),
     [trades, byId]
   );
+  const practice = useMemo(
+    () => buildRoundTrips(practiceTrades ?? [], byId),
+    [practiceTrades, byId]
+  );
   const fyers = roundtrips.filter((r) => !r.isPaper);
   const paper = roundtrips.filter((r) => r.isPaper);
 
@@ -189,12 +197,12 @@ export default function TradeHistory() {
   // trade behind two displayed rows. So delete the whole connected
   // cluster — every row reachable through a shared leg — and name it up
   // front, instead of letting the neighbours vanish unexplained.
-  function clusterOf(r: RoundTrip): RoundTrip[] {
+  function clusterOf(r: RoundTrip, all: RoundTrip[] = roundtrips): RoundTrip[] {
     const picked = [r];
     const ids = new Set(r.tradeIds);
     for (let grew = true; grew; ) {
       grew = false;
-      for (const o of roundtrips) {
+      for (const o of all) {
         if (picked.includes(o)) continue;
         if (o.tradeIds.some((id) => ids.has(id))) {
           picked.push(o);
@@ -206,8 +214,8 @@ export default function TradeHistory() {
     return picked;
   }
 
-  async function handleDelete(r: RoundTrip) {
-    const group = clusterOf(r);
+  async function handleDelete(r: RoundTrip, isPractice = false) {
+    const group = clusterOf(r, isPractice ? practice : roundtrips);
     const ids = [...new Set(group.flatMap((g) => g.tradeIds))];
     const pnl = group.reduce((a, g) => a + (g.pnl ?? 0), 0);
 
@@ -232,7 +240,7 @@ export default function TradeHistory() {
       return;
 
     try {
-      await del.mutateAsync(ids);
+      await (isPractice ? delPractice : del).mutateAsync(ids);
     } catch (e) {
       alert(`Could not delete: ${(e as Error).message}`);
     }
@@ -243,6 +251,7 @@ export default function TradeHistory() {
   const sum = (rs: RoundTrip[]) => rs.reduce((a, r) => a + (r.pnl ?? 0), 0);
   const liveRealised = sum(fyers);
   const paperRealised = sum(paper);
+  const practiceRealised = sum(practice);
   const openCount = roundtrips.filter((r) => r.open).length;
 
   if (isLoading) {
@@ -276,6 +285,10 @@ export default function TradeHistory() {
           <div className={`stat-value ${pnlClass(paperRealised)}`}>₹{fmtMoney(paperRealised)}</div>
         </div>
         <div className="stat">
+          <div className="stat-label">Practice realised P&amp;L</div>
+          <div className={`stat-value ${pnlClass(practiceRealised)}`}>₹{fmtMoney(practiceRealised)}</div>
+        </div>
+        <div className="stat">
           <div className="stat-label">Open positions</div>
           <div className="stat-value">{openCount}</div>
         </div>
@@ -293,6 +306,12 @@ export default function TradeHistory() {
           rows={paper}
           managedBy={managedBy}
           onDelete={handleDelete}
+        />
+        <Section
+          title="Practice (Trade page) — Executed Trades"
+          rows={practice}
+          managedBy={new Map()}
+          onDelete={(r) => handleDelete(r, true)}
         />
       </div>
     </div>

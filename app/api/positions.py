@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel
 
 from app.db.models import AuditLog
@@ -57,8 +57,14 @@ def list_managed(request: Request) -> list[dict[str, Any]]:
 
 
 @router.post("/{symbol}/close")
-async def close_position(symbol: str, request: Request) -> dict[str, Any]:
+async def close_position(symbol: str, request: Request, practice: bool = Query(False)) -> dict[str, Any]:
     """Close one managed position at the latest price."""
+    if practice:
+        from app.api import practice as practice_mod
+        done = await practice_mod.close(symbol)
+        if not done:
+            raise HTTPException(status_code=404, detail=f"no practice position for {symbol!r}")
+        return {"ok": all(d["ok"] for d in done), "closed": done[0]}
     tm = _trade_manager(request)
     result = await tm.close_position(symbol, reason="MANUAL")
     if result is None and any(m.symbol == symbol.upper().strip() for m in tm.managed_positions()):
@@ -146,8 +152,12 @@ async def convert_position(symbol: str, body: ConvertBody, request: Request) -> 
 
 
 @router.post("/close-all")
-async def close_all(request: Request) -> dict[str, Any]:
+async def close_all(request: Request, practice: bool = Query(False)) -> dict[str, Any]:
     """Square off every managed position."""
+    if practice:
+        from app.api import practice as practice_mod
+        done = await practice_mod.close()
+        return {"ok": all(d["ok"] for d in done), "closed": done, "count": len(done)}
     tm = _trade_manager(request)
     results = await tm.close_all(reason="SQUARE_OFF")
     still_open = [m.symbol for m in tm.managed_positions() if m.exit_failures]
