@@ -154,8 +154,8 @@ def _account(account_id: Optional[int]) -> tuple[Optional[BrokerAccount], Option
             return None, f"broker account {account_id} not found"
         if acc.paper_mode:
             return None, "the chosen account is a paper account"
-        if not acc.enabled:
-            return None, f"account {acc.name!r} is switched off"
+        # Not `acc.enabled`: that is the Dashboard's bot switch; each Algo
+        # strategy has its own paper / live mode.
         if not acc.access_token:
             return None, f"account {acc.name!r} has no Fyers login"
         db.expunge(acc)

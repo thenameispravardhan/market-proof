@@ -321,7 +321,7 @@ describe("Trade page", () => {
     await waitFor(() => expect(screen.getByTestId("ticket-mode-note")).toHaveTextContent("still go to Fyers with real money"));
   });
 
-  it("explains paper mode when the Fyers switch is off", async () => {
+  it("ignores the Dashboard's Fyers switch (the Trade page is independent)", async () => {
     globalThis.fetch = makeFetchStub((url) => {
       if (url.includes("/api/broker-accounts")) return makeJsonResponse({ accounts: [{ ...REAL_ACCOUNT, enabled: false }, PAPER_ACCOUNT] });
       if (url.includes("/api/orders/pending")) return makeJsonResponse({ ok: true, count: 0, orders: [] });
@@ -329,9 +329,8 @@ describe("Trade page", () => {
       return makeJsonResponse({ ok: true, count: 0, hits: [] }, 200);
     });
     render(<Trade />, { wrapper: wrapper(makeQc()) });
-    await waitFor(() => expect(screen.getByTestId("ticket-mode-note")).toHaveTextContent("Turn the Fyers switch on in the Dashboard"));
-    expect(screen.getByTestId("ticket-mode")).toHaveTextContent("ORDERS OFF");
-    expect(screen.getByTestId("ticket-submit")).toBeDisabled();
+    await waitFor(() => expect(screen.getByTestId("ticket-mode")).not.toHaveTextContent("ORDERS OFF"));
+    expect(screen.queryByText(/Turn the Fyers switch/)).toBeNull();
   });
 
   it("blocks the ticket when the Fyers account is not logged in", async () => {

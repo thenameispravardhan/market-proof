@@ -54,13 +54,11 @@ def test_no_token_still_returns_none(db_session, isolated_db):
     assert _connected_fyers_account(db_session) is None
 
 
-def test_trading_still_blocked_when_disabled(db_session, isolated_db):
-    """The trade switch still works: a manual order on a disabled account is
-    rejected (400). Decoupling data from `enabled` must not open a trade
-    hole."""
+def test_trade_page_ignores_the_dashboard_switch(db_session, isolated_db):
+    """The Dashboard's Fyers switch governs the BOT only (2026-10-13): the
+    Trade page has its own Paper / Fyers toggle, so a switched-off but
+    logged-in account still takes manual orders."""
     from app.api.orders import _require_real_account
 
     acc = _disabled_but_connected_fyers(db_session)
-    with pytest.raises(HTTPException) as ei:
-        _require_real_account(db_session, acc.id)
-    assert ei.value.status_code == 400
+    assert _require_real_account(db_session, acc.id).id == acc.id

@@ -3,7 +3,9 @@
 // flag; the execution manager blocks any signal routed to a disabled
 // account, so this is a hard kill-switch per account.
 //
-// The FYERS switch is the LIVE-trading master switch: the backend flips
+// These govern the BOT's news trading only; the Trade page (Paper / Fyers in
+// its top bar) and Algo Lab strategies (per-strategy mode) are independent.
+// The FYERS switch is the bot's LIVE-trading master switch: the backend flips
 // TRADING_MODE to `live` when the real account is enabled and back to
 // `paper` when disabled. Turning it ON therefore starts real-money
 // trading — we demand a typed confirmation ("LIVE") before sending it.
@@ -77,8 +79,8 @@ export function AccountToggles() {
 
   const fyersTitle = fyers
     ? fyers.enabled
-      ? "LIVE trading is ON (real money) — click to stop and return to paper mode"
-      : "Start LIVE trading with real money — asks for confirmation, flips the bot to live mode"
+      ? "The bot's LIVE trading is ON (real money) — click to stop and return to paper mode. Trade page and Algo Lab have their own switches."
+      : "Start the bot's LIVE trading with real money — asks for confirmation. Trade page and Algo Lab have their own switches."
     : "Fyers account not found";
 
   return (
