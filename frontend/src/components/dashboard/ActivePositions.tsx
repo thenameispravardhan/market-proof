@@ -16,6 +16,7 @@ import { ApiClientError } from "../../api/client";
 import { LevelsCell } from "../positions/LevelsCell";
 import { CAP_BADGE_CLASS, capTier } from "../../lib/marketCap";
 import { SkeletonList } from "./Skeleton";
+import { chartHref } from "../../lib/chartLink";
 
 function fmtMoney(v: number | null | undefined): string {
   if (v === null || v === undefined) return "—";
@@ -52,7 +53,9 @@ function PositionRow({
       : p.unrealized_pnl;
   return (
     <tr>
-      <td className="mono symbol">{p.symbol}</td>
+      <td className="mono symbol">
+        <a href={chartHref(p.symbol, p.opened_at)} target="_blank" rel="noopener" title="Open chart at entry">{p.symbol}</a>
+      </td>
       <td>
         <span className={`badge ${CAP_BADGE_CLASS[capTier(p.symbol)]}`}>
           {capTier(p.symbol)}

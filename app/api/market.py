@@ -297,6 +297,10 @@ async def market_history(
     if to_ts <= from_ts:
         return {"ok": False, "reason": "empty time range", "candles": []}
 
+    # A bare short name ("SBIN", as announcements store it) → "NSE:SBIN-EQ".
+    from app.execution.symbols import resolve_fyers_symbol
+
+    sym = resolve_fyers_symbol(sym) or sym
     backend = _fyers_backend()
     if backend is None or not hasattr(backend, "get_history_range"):
         return {

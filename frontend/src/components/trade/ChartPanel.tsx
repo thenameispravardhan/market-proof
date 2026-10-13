@@ -645,6 +645,8 @@ export interface ChartPanelProps {
   maximized?: boolean;
   multi?: boolean;
   privacy?: boolean;
+  /** Epoch seconds: centre the chart here once the first candles load. */
+  at?: number;
 }
 
 type Dialog =
@@ -1033,7 +1035,7 @@ export default function ChartPanel(props: ChartPanelProps) {
   const flowRef = useRef<Map<number, [number, number, number]>>(new Map());
   const markersRef = useRef<{ detach: () => void; setMarkers: (m: never[]) => void } | null>(null);
   const eventsByTimeRef = useRef<Map<number, ChartEvent[]>>(new Map());
-  const pendingRangeRef = useRef<RangeDef | { at?: number; from?: number; to?: number } | null>(null);
+  const pendingRangeRef = useRef<RangeDef | { at?: number; from?: number; to?: number } | null>(props.at ? { at: props.at } : null);
   const syncApplyRef = useRef(0);
   const hoveredRef = useRef(false);
   const pointerRef = useRef<{ x: number; y: number } | null>(null);

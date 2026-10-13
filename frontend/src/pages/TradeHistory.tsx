@@ -16,6 +16,7 @@ import {
 } from "../hooks/useApi";
 import { LevelsCell } from "../components/positions/LevelsCell";
 import { buildRoundTrips, type RoundTrip } from "../lib/roundtrips";
+import { chartHref } from "../lib/chartLink";
 import type { ManagedPosition } from "../types";
 
 function fmtMoney(v: number | null | undefined): string {
@@ -101,7 +102,9 @@ function Section({
                     title="Double-click to show delete"
                     onDoubleClick={() => setArmed(armed === r.key ? null : r.key)}
                   >
-                    <td className="mono">{r.symbol}</td>
+                    <td className="mono">
+                      <a href={chartHref(r.symbol, r.entryTime)} target="_blank" rel="noopener" title="Open chart at entry">{r.symbol}</a>
+                    </td>
                     <td>
                       <span className={`badge ${r.side === "BUY" ? "buy" : "sell"}`}>{r.side}</span>
                     </td>
