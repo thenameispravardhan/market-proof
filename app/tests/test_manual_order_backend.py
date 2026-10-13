@@ -197,3 +197,22 @@ def test_manual_risk_gate_is_opt_in(client: TestClient, real_account, monkeypatc
     assert r.json()["blocked"] is True and r.json()["reason"] == "risk_block" and len(stub.placed) == 1
     r = client.post("/api/orders", json=_body(real_account.id, bypass_risk=True))
     assert r.json()["ok"] is True and len(stub.placed) == 2        # the typed override still sends it
+
+
+def test_partial_exit_of_a_paper_position_fills_on_paper(client: TestClient, real_account, db_session):
+    """TRADING_MODE=paper: Exit / Reverse on the bot's paper position never reaches Fyers."""
+    from app.db.models import Position as PositionRow, Trade
+    from app.main import app
+
+    db_session.add(PositionRow(symbol="SBIN", quantity=10, average_price=800.0, last_price=800.0))
+    db_session.add(Trade(symbol="SBIN", side="BUY", quantity=10, price=800.0, order_type="market",
+                         status="filled", broker_order_id="PAPER-1"))
+    db_session.commit()
+    app.state.execution_manager.market_data.set_quote_sync("SBIN", 810.0, bid=809.9, ask=810.1)
+    stub = _install(real_account.id, _Stub())
+    r = client.post("/api/orders", json=_body(real_account.id, symbol="SBIN", side="SELL", quantity=4))
+    assert r.status_code == 200, r.text
+    assert r.json()["paper"] is True and r.json()["status"] == "FILLED"
+    assert stub.placed == []                                    # Fyers never called
+    db_session.expire_all()
+    assert db_session.query(PositionRow).filter_by(symbol="SBIN").one().quantity == 6
