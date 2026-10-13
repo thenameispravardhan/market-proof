@@ -366,17 +366,6 @@ export default function App() {
       </nav>
 
       <main className="content" data-page={tab}>
-        {!sidebarOpen && (
-          <button
-            className="sidebar-toggle-floating"
-            onClick={toggleSidebar}
-            aria-label="Expand sidebar"
-            title="Expand sidebar"
-            data-testid="sidebar-toggle-floating"
-          >
-            ☰
-          </button>
-        )}
         {tab !== "trade" && <WorkflowBar tab={tab} navigate={navigate} />}
         <div className="content-scroll">
           <Suspense fallback={<div className="empty loading">Loading…</div>}>

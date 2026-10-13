@@ -247,23 +247,6 @@ body {
 .sidebar-toggle:hover { background: var(--bg-elev); color: var(--text); border-color: var(--border-hi); }
 
 /* Floating toggle (when collapsed) */
-.sidebar-toggle-floating {
-  position: fixed;
-  top: 8px; left: 8px;
-  z-index: 50;
-  width: 28px; height: 28px;
-  padding: 0;
-  display: inline-flex; align-items: center; justify-content: center;
-  background: var(--bg-panel);
-  border: 1px solid var(--border-hi);
-  color: var(--text);
-  font-size: 12px;
-  cursor: pointer;
-  font-family: inherit;
-  border-radius: 0;
-  z-index: 100;
-}
-.sidebar-toggle-floating:hover { background: var(--bg-elev); border-color: var(--accent); color: var(--accent); }
 
 /* Nav list */
 .nav-list {
@@ -343,9 +326,12 @@ body {
 .sidebar.collapsed .nav-section,
 .sidebar.collapsed .nav-key,
 .sidebar.collapsed .logo-text,
-.sidebar.collapsed .sidebar-footer .ws-status-text,
+.sidebar.collapsed .sidebar-footer .ws-status-text { display: none; }
 .sidebar.collapsed .sidebar-header { padding: 0; justify-content: center; }
-.sidebar.collapsed .sidebar-footer { padding: 8px 0; justify-content: center; }
+.sidebar.collapsed .logo { display: none; }  /* 48px: just the expand button */
+/* Collapsed: the theme glyph and the socket dot sit centred, not clipped on the edge. */
+.sidebar.collapsed .sidebar-footer { padding: 8px 0; align-items: center; }
+.sidebar.collapsed .theme-toggle { justify-content: center; width: 100%; font-size: 14px; }
 .sidebar.collapsed .ws-status { justify-content: center; }
 
 /* Sidebar footer / status */
@@ -2282,6 +2268,8 @@ kbd {
 .tv-grid.l4 { grid-template: 1fr 1fr / 1fr 1fr; }
 .tv-cell { min-width: 0; min-height: 0; display: flex; flex-direction: column; border-radius: 6px; }
 .tv-cell > .trade-card { flex: 1; min-height: 0; }
+/* The chart fills its cell: no card padding around the canvas. */
+.tv-cell > .chart-card { padding: 0; }
 .tv-cell.active { box-shadow: 0 0 0 1px var(--accent); }
 .chart-card { container-type: inline-size; }
 @container (max-width: 640px) {
