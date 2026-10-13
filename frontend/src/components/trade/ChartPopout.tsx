@@ -7,11 +7,11 @@ import { useEffect, useState } from "react";
 import type { InstrumentHit } from "../../types";
 import ChartPanel from "./ChartPanel";
 
-export function popoutParams(): { symbol: string; name: string; iv: string | null } | null {
+export function popoutParams(): { symbol: string; name: string; iv: string | null; at: number | undefined } | null {
   const q = new URLSearchParams(window.location.hash.split("?")[1] ?? "");
   if (q.get("popout") !== "1") return null;
   const symbol = (q.get("symbol") ?? "").trim();
-  return symbol ? { symbol, name: q.get("name") ?? symbol.split(":").pop() ?? symbol, iv: q.get("iv") } : null;
+  return symbol ? { symbol, name: q.get("name") ?? symbol.split(":").pop() ?? symbol, iv: q.get("iv"), at: Number(q.get("at")) || undefined } : null;
 }
 
 export default function ChartPopout() {
@@ -19,8 +19,10 @@ export default function ChartPopout() {
   const [hit, setHit] = useState<InstrumentHit | null>(() =>
     p ? ({ symbol: p.symbol, short_name: p.name, exchange: p.symbol.split(":")[0], segment: "", instrument_type: "", lot_size: 1, tick_size: 0.05, expiry: null, strike: null, underlying: null, display: p.name } as InstrumentHit) : null,
   );
-  // the opener's interval wins once, then the chart remembers its own
-  useEffect(() => {
+  // the opener's interval wins once, then the chart remembers its own.
+  // An initializer, not an effect: ChartPanel reads its prefs on its first
+  // render, which comes before any effect here.
+  useState(() => {
     if (!p?.iv) return;
     try {
       const prefs = JSON.parse(localStorage.getItem("chart:prefs") ?? "{}");
@@ -28,8 +30,7 @@ export default function ChartPopout() {
     } catch {
       /* best-effort */
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  });
   useEffect(() => {
     if (hit) document.title = `${hit.short_name} · chart`;
   }, [hit]);
@@ -41,6 +42,7 @@ export default function ChartPopout() {
         symbol={hit.symbol}
         shortName={hit.short_name}
         instrument={hit}
+        at={hit.symbol === p?.symbol ? p.at : undefined}
         onSymbolChange={(h) => {
           setHit(h);
           const q = new URLSearchParams({ popout: "1", symbol: h.symbol, name: h.short_name });

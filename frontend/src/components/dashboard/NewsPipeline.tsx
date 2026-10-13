@@ -14,6 +14,7 @@ import { ApiClientError } from "../../api/client";
 import { SkeletonList } from "./Skeleton";
 import { CAP_BADGE_CLASS, capTier } from "../../lib/marketCap";
 import type { Analysis, Announcement, Signal } from "../../types";
+import { chartHref } from "../../lib/chartLink";
 
 function fmtTime(iso?: string | null): string {
   if (!iso) return "—";
@@ -153,7 +154,9 @@ export function NewsPipeline() {
             <tbody>
               {rows.map(({ announcement: a, analysis: x, signal: s }) => (
                 <tr key={a.id}>
-                  <td className="mono" title={a.symbol}>{a.symbol}</td>
+                  <td className="mono" title={a.symbol}>
+                    <a href={chartHref(a.symbol, a.received_at)} target="_blank" rel="noopener">{a.symbol}</a>
+                  </td>
                   <td>
                     <span className={`badge ${CAP_BADGE_CLASS[capTier(a.symbol)]}`}>
                       {capTier(a.symbol)}

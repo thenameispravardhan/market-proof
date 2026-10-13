@@ -11,6 +11,7 @@ import { AllSettings } from "../components/settings/AllSettings";
 import { AuditLog } from "../components/settings/AuditLog";
 import { BreakerHistory } from "../components/settings/BreakerHistory";
 import { NewsSources } from "../components/settings/NewsSources";
+import { CHART_LINK_IV_KEY, chartLinkIv } from "../lib/chartLink";
 
 export default function Settings() {
   return (
@@ -40,6 +41,21 @@ export default function Settings() {
             >
               Reset panel sizes
             </button>
+            <label style={{ marginTop: 14 }}>
+              Symbol-link chart timeframe{" "}
+              <select
+                defaultValue={chartLinkIv()}
+                onChange={(e) => {
+                  try { localStorage.setItem(CHART_LINK_IV_KEY, e.target.value); } catch { /* storage off */ }
+                }}
+                data-testid="chart-link-iv"
+              >
+                {[["1", "1 min"], ["3", "3 min"], ["5", "5 min"], ["15", "15 min"], ["30", "30 min"], ["60", "1 hour"], ["1D", "1 day"]].map(([v, l]) => (
+                  <option key={v} value={v}>{l}</option>
+                ))}
+              </select>
+            </label>
+            <p className="text-dim">Clicking a symbol (Trade History, open positions, news pipeline) opens its chart at that time in this timeframe.</p>
           </div>
         </div>
       </div>
