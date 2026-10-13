@@ -155,7 +155,7 @@ export function NewsPipeline() {
               {rows.map(({ announcement: a, analysis: x, signal: s }) => (
                 <tr key={a.id}>
                   <td className="mono" title={a.symbol}>
-                    <a href={chartHref(a.symbol, a.received_at)} target="_blank" rel="noopener">{a.symbol}</a>
+                    <a href={chartHref(a.symbol, a.received_at)} target="_blank" rel="noopener" className="sym-link">{a.symbol}</a>
                   </td>
                   <td>
                     <span className={`badge ${CAP_BADGE_CLASS[capTier(a.symbol)]}`}>

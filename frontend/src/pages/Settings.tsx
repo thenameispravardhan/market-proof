@@ -55,7 +55,7 @@ export default function Settings() {
                 ))}
               </select>
             </label>
-            <p className="text-dim">Clicking a symbol (Trade History, open positions, news pipeline) opens its chart at that time in this timeframe.</p>
+            <p className="text-dim">Clicking a symbol (Trade History, open positions, news pipeline) opens the Trade page on it, at that time, in this timeframe.</p>
           </div>
         </div>
       </div>
