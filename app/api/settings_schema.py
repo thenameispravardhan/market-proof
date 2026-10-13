@@ -176,7 +176,7 @@ GROUPS: list[dict[str, Any]] = [
         "note": "Stops, targets, trailing and momentum-death exits.",
         "prefixes": [
             "DEFAULT_SL_", "DEFAULT_TARGET_RR", "SMALLCAP_PRICE", "ATR_",
-            "BREAKEVEN_", "SCALE_OUT_", "TRAIL_", "CONSOLIDATION_", "STALL_",
+            "BREAKEVEN_", "SCALE_OUT_", "TRAIL_", "CONSOLIDATION_", "STALL_", "BROKER_STOP_",
             "MAX_HOLD_SECONDS",
         ],
     },

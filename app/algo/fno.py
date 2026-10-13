@@ -48,6 +48,10 @@ WEEKLY = {"NIFTY", "SENSEX"}
 # Fallback lot sizes when the master isn't downloaded yet.
 INDEX_LOTS = {"NIFTY": 65, "BANKNIFTY": 30, "FINNIFTY": 60, "MIDCPNIFTY": 120,
               "NIFTYNXT50": 25, "SENSEX": 20, "BANKEX": 30}
+# Exchange freeze limits (max quantity per order) for index F&O.
+# ponytail: static table the exchange revises; stock F&O limits not covered (Fyers rejects those itself)
+INDEX_FREEZE = {"NIFTY": 1800, "BANKNIFTY": 900, "FINNIFTY": 1800, "MIDCPNIFTY": 2800,
+                "NIFTYNXT50": 600, "SENSEX": 1000, "BANKEX": 900}
 
 MASTER_DIR = Path(__file__).resolve().parents[2] / "data" / "scrip_master"
 FO_URLS = {"NSE_FO": "https://public.fyers.in/sym_details/NSE_FO.csv",
@@ -385,3 +389,11 @@ def lot_error(symbol: str, quantity: int) -> Optional[str]:
         return (f"quantity {quantity} isn't a whole number of lots for {symbol} "
                 f"(lot size {lot}; that's {lots:.2f} lots) — use a multiple of {lot}")
     return None
+
+
+def freeze_qty(symbol: str) -> Optional[int]:
+    """Max quantity per order for an index derivative, else None."""
+    try:
+        return INDEX_FREEZE.get(underlying_of(symbol) or "")
+    except Exception:  # noqa: BLE001 — never block an order on a lookup
+        return None

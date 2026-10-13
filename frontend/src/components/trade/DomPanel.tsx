@@ -223,7 +223,7 @@ export function DomPanel({
       <div className="dom-btns">
         <button type="button" className="btn-sm" disabled={!pos} onClick={() => pos && confirmGo(`Flatten ${symbol.short_name} at market`) && onFlatten().then(() => onMsg(`Flattened ${symbol.short_name}`), (e) => onMsg(`Flatten failed: ${e instanceof Error ? e.message : String(e)}`))} data-testid="dom-flatten">Flatten</button>
         <button type="button" className="btn-sm" disabled={!orders.length} onClick={() => { if (confirmGo(`Cancel all ${orders.length} working order(s) on ${symbol.short_name}`)) orders.forEach((o) => o.id && onCancel(o.id)); }} data-testid="dom-cxl-all">CXL All</button>
-        <button type="button" className="btn-sm" disabled={!pos} onClick={() => pos && send({ side: pos.qty > 0 ? "SELL" : "BUY", type: "MARKET", price: null }, `Reverse ${symbol.short_name}: ${pos.qty > 0 ? "SELL" : "BUY"} ${Math.abs(pos.qty) * 2} at market`)} data-testid="dom-reverse" title="Opposite side, twice the position, at market">Reverse</button>
+        <button type="button" className="btn-sm" disabled={!pos} onClick={() => pos && send({ side: pos.qty > 0 ? "SELL" : "BUY", type: "MARKET", price: null, qty: Math.abs(pos.qty) * 2 }, `Reverse ${symbol.short_name}: ${pos.qty > 0 ? "SELL" : "BUY"} ${Math.abs(pos.qty) * 2} at market`)} data-testid="dom-reverse" title="Opposite side, twice the position, at market">Reverse</button>
       </div>
       {!d ? (
         <div className="hint">Loading depth…</div>

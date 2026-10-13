@@ -102,7 +102,7 @@ log = get_logger(__name__)
 # Channels the manager publishes on.
 CHANNEL_TRADE_EXECUTED = "trade.executed"
 
-from app.execution.order_reconcile import TRADING_POOL  # noqa: E402  (trading DB writes' own threads)
+from app.execution.order_reconcile import TRADING_POOL, fill_serialised  # noqa: E402  (trading DB writes' own threads)
 CHANNEL_TRADE_CLOSED = "trade.closed"
 CHANNEL_RISK_BLOCKED = "risk.blocked"
 # A drift-blocked signal entering the passive retracement watch (not a
@@ -842,6 +842,19 @@ class Manager:
                 None, _persist_trade,
                 self._session_factory, signal, account.id, result, None,
             )
+            ex = outcome.exit_result
+            if ex is None or ex.state == OrderState.REJECTED or (
+                ex.state == OrderState.PENDING and not ex.broker_order_id
+            ):
+                # The flatten never reached / was refused by the broker: the
+                # position is live. Hand it to the TradeManager (its stop is
+                # already crossed, so it exits with retries + escalation).
+                await self._publish_trade_executed(
+                    signal=signal, strategy=strategy, account=account,
+                    backend=backend, result=result, quantity=attempt.filled_quantity,
+                    entry=result.average_price, stop_loss=stop_loss, target=target,
+                    event_max_hold=event_max_hold,
+                )
             await loop.run_in_executor(
                 None, _persist_emergency_exit,
                 self._session_factory, signal, account.id,
@@ -1337,10 +1350,13 @@ class Manager:
            the account's app_id + access_token and cache it.
         """
         cached = self._backends.get(int(account.id))
-        if cached is not None:
-            return cached
         settings = self._settings_provider()
-        if bool(getattr(account, "paper_mode", True)) or settings.is_paper:
+        paper = bool(getattr(account, "paper_mode", True)) or settings.is_paper
+        # Quote polls cache a LIVE backend for every connected account
+        # (`_manual_backend_for`); it must never outrank the paper switch.
+        if cached is not None and not (paper and isinstance(cached, FyersLiveBackend)):
+            return cached
+        if paper:
             return self._paper
         # Live. app_id comes from .env (see `_effective_app_id`); the
         # access_token is the OAuth artifact stored on the row.
@@ -1392,7 +1408,19 @@ class Manager:
     def invalidate_backend(self, broker_account_id: int) -> None:
         """Drop the cached backend for an account (e.g. after the
         Fyers OAuth callback rotates the access_token)."""
-        self._backends.pop(int(broker_account_id), None)
+        self._drop_backend(broker_account_id)
+
+    def _drop_backend(self, broker_account_id: int) -> None:
+        backend = self._backends.pop(int(broker_account_id), None)
+        if isinstance(backend, FyersLiveBackend):
+            async def _close_later() -> None:
+                await asyncio.sleep(30)  # let an in-flight order / exit finish
+                await backend.aclose()
+            try:
+                from app.execution.order_reconcile import spawn
+                spawn(_close_later())
+            except RuntimeError:
+                pass  # no running loop (sync tests)
 
     async def exit_backend_for_account(
         self, broker_account_id: Optional[int]
@@ -1473,6 +1501,17 @@ class Manager:
 
         await self._check_lpp(symbol, type_enum, limit_price)
 
+        pos_qty, pos_product, halt = await asyncio.get_running_loop().run_in_executor(
+            TRADING_POOL, _position_and_halt, symbol
+        )
+        signed = int(quantity) if side_enum == OrderSide.BUY else -int(quantity)
+        reduces = pos_qty != 0 and (pos_qty > 0) != (signed > 0) and abs(signed) <= abs(pos_qty)
+        if halt and not reduces:
+            raise ValueError(f"trading is halted ({halt}): only orders that reduce an open position are allowed")
+        if reduces and pos_product and product_enum == ProductType.INTRADAY and pos_product != "INTRADAY":
+            # Exiting a CNC / MARGIN position as INTRADAY opened a separate MIS one.
+            product_enum = ProductType(pos_product)
+
         # The risk engine expects an object with these attributes.
         from types import SimpleNamespace
         manual_signal = SimpleNamespace(
@@ -1530,7 +1569,7 @@ class Manager:
         risk_codes: list[str] = []
         risk_message = ""
 
-        async def _advise() -> None:
+        async def _advise() -> Any:
             try:
                 decision = await self._risk.evaluate(
                     signal=manual_signal, account=account, entry=entry,
@@ -1542,8 +1581,10 @@ class Manager:
                         account_id=account.id, symbol=symbol, side=side,
                         quantity=quantity, codes=list(decision.codes),
                     )
+                return decision
             except Exception as e:  # noqa: BLE001
                 log.warning("manual_order.risk_engine_failed", error=str(e))
+                return None
 
         backend = self._manual_backend_for(account)
         if backend is None:
@@ -1607,7 +1648,14 @@ class Manager:
             )
         from app.execution.order_reconcile import spawn as _spawn
 
-        _spawn(_advise())
+        advice = _spawn(_advise())
+        try:
+            decision = await asyncio.wait_for(asyncio.shield(advice), 1.5)
+            if decision is not None and not decision.approved:
+                risk_codes = list(decision.codes)
+                risk_message = "; ".join(str(v.get("message") or v.get("code") or v) for v in (decision.violations or []))
+        except asyncio.TimeoutError:
+            pass
         # `result.state` is one of PENDING / FILLED / REJECTED / etc.
         # The local `trades.status` column uses the same lowercase
         # vocab as the auto-pipeline ("placed" for new rows, "filled"
@@ -1670,6 +1718,7 @@ class Manager:
             "warning": record_warning,
         }
 
+    @fill_serialised
     def _persist_manual_trade_executed(
         self,
         account_id: int,
@@ -1887,7 +1936,7 @@ class Manager:
             if isinstance(b, FyersLiveBackend)
         ]
         for acc_id in to_drop:
-            self._backends.pop(acc_id, None)
+            self._drop_backend(acc_id)
         # Rebuild the risk engine's market data reference (it may
         # have been swapped by tests).
         if not getattr(self._risk, "_md", None):  # type: ignore[attr-defined]
@@ -1922,7 +1971,7 @@ class Manager:
                 "execution_manager.invalidate_after_token_rotation",
                 account_id=acc_id,
             )
-            self._backends.pop(acc_id, None)
+            self._drop_backend(acc_id)
         # Note: the broker_accounts row may also have changed
         # `app_id` (operator re-created their Fyers app). The
         # cached backend is keyed by `broker_account_id`; the
@@ -2099,6 +2148,7 @@ def _persist_risk_block(
         session.commit()
 
 
+@fill_serialised
 def _persist_trade(
     session_factory: Callable[[], Session],
     signal: Signal,
@@ -2132,10 +2182,11 @@ def _persist_trade(
         new_status = status_map.get(result.state, "placed")
         existing: Optional[TradeRow] = None
         if result.broker_order_id:
-            existing = (
+            existing = (  # not unique: the oldest row carries the order
                 session.query(TradeRow)
                 .filter_by(broker_order_id=result.broker_order_id)
-                .one_or_none()
+                .order_by(TradeRow.id.asc())
+                .first()
             )
         # A row the reconciler already flipped to `filled` must not have
         # its position re-applied here (dual-confirmation dedup).
@@ -2450,3 +2501,15 @@ def _persist_trade_placed_only(
             )
         )
         session.commit()
+
+
+def _position_and_halt(symbol: str) -> tuple[int, Optional[str], Optional[str]]:
+    """(net qty, product) of the symbol's position row + why trading is halted (or None)."""
+    from app.db.session import SessionLocal
+    from app.risk import circuit_breakers
+
+    with SessionLocal() as db:
+        pos = db.query(PositionRow).filter_by(symbol=symbol).one_or_none()
+        state = circuit_breakers.get_or_create_state(db)
+        halt = (state.disabled_reason or "trading_disabled") if state.trading_disabled else None
+        return (int(pos.quantity or 0) if pos else 0), (pos.product if pos else None), halt

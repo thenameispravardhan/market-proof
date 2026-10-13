@@ -139,6 +139,7 @@ class ManagedPosition:
     exit_failures: int = 0
     escalated: bool = False
     next_exit_retry_at: Optional[datetime] = None
+    broker_stop_id: Optional[str] = None     # resting disaster SL-M at the broker
     price_history: deque = field(default_factory=deque)
 
     # Longest look-back any history-based rule needs; samples older than
@@ -372,6 +373,7 @@ class TradeManager:
         # returns only after an in-flight tick exit fully settled).
         self._check_locks: dict[str, asyncio.Lock] = {}
         self._last_reconcile: float = 0.0
+        self._orphans_alerted: set[str] = set()
 
     def _check_lock(self, symbol: str) -> asyncio.Lock:
         lock = self._check_locks.get(symbol)
@@ -500,6 +502,7 @@ class TradeManager:
             self._quote_feed.watch(symbol, entry)
         # Realtime: react to every tick for this symbol, not just sweeps.
         self._ensure_tick_listener(symbol)
+        self._spawn_backstop(mp)
         # Persist the exit levels onto the position row so the book can be
         # rebuilt with them after a restart (it's otherwise in-memory only).
         await asyncio.get_running_loop().run_in_executor(
@@ -566,6 +569,7 @@ class TradeManager:
             None, _persist_position_levels,
             self._session_factory, symbol, new_sl, new_target,
         )
+        self._spawn_backstop(mp, reprice=True)
         log.info(
             "trade_manager.levels_updated",
             symbol=symbol, stop_loss=new_sl, target=new_target,
@@ -649,6 +653,7 @@ class TradeManager:
                 except Exception:  # noqa: BLE001
                     pass
             self._ensure_tick_listener(symbol)
+            self._spawn_backstop(mp)
         log.info("trade_manager.hydrated", managed=len(self._book))
 
     async def _follow_row(
@@ -671,6 +676,8 @@ class TradeManager:
         qty, avg = state
         if qty == mp.quantity:
             return mp
+        if qty == 0 or (qty > 0) != (mp.quantity > 0):
+            await self._cancel_backstop(mp)
         if qty == 0:
             async with self._lock:
                 if in_book and self._book.get(symbol) is mp:
@@ -695,6 +702,7 @@ class TradeManager:
             return fresh
         log.info("trade_manager.resized_manually", symbol=symbol, local_qty=mp.quantity, qty=qty)
         mp.quantity = qty
+        self._spawn_backstop(mp, reprice=True)
         if avg > 0:
             mp.entry = avg
         return mp
@@ -1036,11 +1044,18 @@ class TradeManager:
         if not fresh:
             return
         st = get_settings()
+        from app.algo import fno
+
+        # %-of-price rules (breakeven / consolidation / stall) are sized for
+        # equities; on an option a 2% move is noise. Derivatives exit on
+        # their stop / target / trailing (R-based) / time only.
+        pct_rules = not fno.is_derivative(symbol)
         # 3. Breakeven lock: at +BREAKEVEN_AT_PCT the stop moves to
         #    entry ± BREAKEVEN_LOCK_PCT (never loosening an existing
         #    tighter stop). One-shot per position.
         if (
-            bool(getattr(st, "BREAKEVEN_ENABLED", True))
+            pct_rules
+            and bool(getattr(st, "BREAKEVEN_ENABLED", True))
             and not mp.breakeven_armed
             and mp.entry > 0
             and mp.profit_pct_at(last) >= float(getattr(st, "BREAKEVEN_AT_PCT", 2.0))
@@ -1089,7 +1104,7 @@ class TradeManager:
         # 6. Consolidation: small winner pinned in a tight range for the
         #    whole window → take the profit, free the capital (T-05).
         profit = mp.profit_pct_at(last)
-        if bool(getattr(st, "CONSOLIDATION_EXIT_ENABLED", True)):
+        if pct_rules and bool(getattr(st, "CONSOLIDATION_EXIT_ENABLED", True)):
             lo = float(getattr(st, "CONSOLIDATION_MIN_PROFIT_PCT", 1.0))
             hi = float(getattr(st, "CONSOLIDATION_MAX_PROFIT_PCT", 2.5))
             if lo <= profit <= hi:
@@ -1105,7 +1120,7 @@ class TradeManager:
                     return
         # 7. Stall: a bigger winner whose momentum died → capture before
         #    the reversion (T-06).
-        if bool(getattr(st, "STALL_EXIT_ENABLED", True)):
+        if pct_rules and bool(getattr(st, "STALL_EXIT_ENABLED", True)):
             lo = float(getattr(st, "STALL_MIN_PROFIT_PCT", 3.0))
             hi = float(getattr(st, "STALL_MAX_PROFIT_PCT", 6.0))
             if lo <= profit <= hi:
@@ -1130,6 +1145,12 @@ class TradeManager:
         operator can always flatten it from the dashboard.
         """
         symbol = symbol.upper().strip()
+        # Same lock as the tick / sweep exit: an exit already in flight finishes
+        # (and settles the row) before this one looks, so it can't double-sell.
+        async with self._check_lock(symbol):
+            return await self._close_position_locked(symbol, reason)
+
+    async def _close_position_locked(self, symbol: str, reason: str) -> Optional[dict[str, Any]]:
         loop = asyncio.get_running_loop()
         quote = await self._md.get_quote(symbol)
         async with self._lock:
@@ -1238,13 +1259,34 @@ class TradeManager:
         # is the reconciliation path (the broker already closed it).
         backend = await self._exit_backend(mp) if route else None
         if backend is not None:
+            qty = abs(int(mp.quantity))
+            had_backstop = await self._cancel_backstop(mp, backend)
+            if booked is None or mp.exit_failures or had_backstop:
+                # Rebuilt from the DB (manual / EOD close: the book may be stale,
+                # e.g. an Algo Lab exit) or retrying an exit that may have gone
+                # through: exit only what the broker still holds.
+                held = await self._broker_qty(backend, symbol)
+                if held is not None and (held == 0 or (held > 0) != (mp.quantity > 0)):
+                    return await self._exit(symbol, reason="CLOSED_EXTERNAL", exit_price=exit_price, mp=mp, route=False)
+                if held is not None and abs(held) < qty:
+                    qty, mp.quantity = abs(held), held
             routed = await self._execute_exit_order(
                 backend, mp,
-                qty=abs(int(mp.quantity)),
+                qty=qty,
                 price_hint=settle_price,
                 reason=reason,
                 chase_remainder=True,
             )
+            if routed is not None and routed[0] < qty:
+                # Partly filled: book the slice, keep the rest under management.
+                closed = int(routed[0]) * (1 if mp.quantity > 0 else -1)
+                px = float(routed[1]) if routed[1] else settle_price
+                await asyncio.get_running_loop().run_in_executor(
+                    None, _partial_settle, self._session_factory, mp, closed, px,
+                    (px - mp.entry) * closed, mp.r_multiple_at(px), False,
+                )
+                mp.quantity -= closed
+                routed = None
             if routed is None:
                 # Broker refused / timed out: the position is STILL LIVE
                 # at the broker. Put it back under management, apply a
@@ -1257,6 +1299,7 @@ class TradeManager:
                 )
                 async with self._lock:
                     self._book.setdefault(symbol, mp)
+                self._spawn_backstop(mp)  # still open: re-arm the disaster stop
                 max_retries = int(
                     getattr(get_settings(), "EXIT_RETRY_MAX", 3) or 3
                 )
@@ -1322,6 +1365,12 @@ class TradeManager:
         None to settle directly (paper account / no router wired)."""
         if self._exit_backend_fn is None:
             return None
+        # A paper fill on a live account (TRADING_MODE=paper) must never send a
+        # real exit: decided by the position's own fills, not the account.
+        if await asyncio.get_running_loop().run_in_executor(
+            None, _is_paper_position, self._session_factory, mp.symbol
+        ):
+            return None
         try:
             return await self._exit_backend_fn(mp.broker_account_id)
         except Exception:  # noqa: BLE001
@@ -1357,6 +1406,24 @@ class TradeManager:
         be less than `qty` only when `chase_remainder=False`. None means
         NOTHING was confirmed and the position must stay under management.
         """
+        from app.algo import fno
+
+        cap = fno.freeze_qty(mp.symbol)
+        if cap and int(qty) > cap:
+            # Exchange freeze limit: slice; stop at the first slice that isn't complete.
+            total, cost, last_id = 0, 0.0, None
+            left = int(qty)
+            while left > 0:
+                n = min(cap, left)
+                r = await self._execute_exit_order(backend, mp, qty=n, price_hint=price_hint,
+                                                   reason=reason, chase_remainder=chase_remainder)
+                if r is None:
+                    break
+                total += int(r[0]); cost += float(r[1] or price_hint) * int(r[0]); last_id = r[2] or last_id
+                left -= n
+                if int(r[0]) < n:
+                    break
+            return (total, cost / total, last_id) if total else None
         st = get_settings()
         buffer = float(getattr(st, "EXIT_BUFFER_PCT", 0.2)) / 100.0
         broker_timeout = float(getattr(st, "EXIT_BROKER_TIMEOUT_SECONDS", 3.0))
@@ -1410,14 +1477,10 @@ class TradeManager:
 
         result = await _place(OrderType.LIMIT, limit_price)
         if result is None:
-            # Broker silent on the limit attempt → one market retry (T-24).
-            log.warning(
-                "trade_manager.exit_broker_timeout_market_retry",
-                symbol=mp.symbol, reason=reason,
-            )
-            result = await _place(OrderType.MARKET, None)
-            if result is None:
-                return None
+            # Broker silent: the limit MAY be live. A blind market retry is a
+            # double exit; fail, and the retry re-reads the broker position (_exit).
+            log.warning("trade_manager.exit_broker_timeout", symbol=mp.symbol, reason=reason)
+            return None
         # Rejected → market retries with backoff (T-12).
         attempts = 1
         backoff = 1.0
@@ -1441,40 +1504,12 @@ class TradeManager:
         order_id = result.broker_order_id or None
         if result.state == OrderState.FILLED and filled >= int(qty):
             return (filled, avg, order_id)
-
-        # PENDING (live broker acks then fills async) → poll the order
-        # up to the fill window; IOC EXPIRED/CANCELLED may carry a
-        # partial fill.
-        if result.state == OrderState.PENDING and order_id:
-            deadline = asyncio.get_running_loop().time() + fill_timeout
-            while asyncio.get_running_loop().time() < deadline:
-                ws = await _ws_fill(order_id, 0.6)
-                if ws is not None:
-                    if ws[0] == "FILLED":
-                        return (int(ws[1] or qty), ws[2] if ws[2] is not None else avg, order_id)
-                    break
-                try:
-                    status = await backend.get_order_status(order_id)
-                except Exception:  # noqa: BLE001
-                    continue
-                if int(getattr(status, "filled_quantity", 0) or 0) > filled:
-                    filled = int(status.filled_quantity)
-                    if getattr(status, "average_price", None):
-                        avg = float(status.average_price)
-                if getattr(status, "state", None) == OrderState.FILLED:
-                    return (max(filled, int(qty)), avg, order_id)
-                if getattr(status, "state", None) in (
-                    OrderState.REJECTED,
-                    OrderState.CANCELLED,
-                    OrderState.EXPIRED,
-                ):
-                    break
-            # Window closed with the order possibly still resting: cancel
-            # the remainder before deciding what's left to do.
-            try:
-                await backend.cancel_order(order_id)
-            except Exception:  # noqa: BLE001
-                pass
+        if result.state == OrderState.PENDING:
+            if not order_id:
+                return None  # unconfirmed (timeout / 5xx after send): may be live
+            # Live ack: wait for the fill (an IOC partial is counted).
+            filled, ws_avg = await self._await_fill(backend, order_id, int(qty), fill_timeout)
+            avg = ws_avg or avg
 
         remainder = int(qty) - filled
         if remainder <= 0:
@@ -1537,28 +1572,131 @@ class TradeManager:
         order_id = result.broker_order_id or None
         if result.state == OrderState.FILLED and filled > 0:
             return (filled, avg, order_id)
-        if order_id:
-            # Brief poll; then trust the market order to fill.
-            deadline = asyncio.get_running_loop().time() + 1.0
-            while asyncio.get_running_loop().time() < deadline:
-                ws = await _ws_fill(order_id, 0.5)
-                if ws is not None:
-                    if ws[0] == "FILLED":
-                        return (int(ws[1] or qty), ws[2] if ws[2] is not None else avg, order_id)
-                    break
-                try:
-                    status = await backend.get_order_status(order_id)
-                except Exception:  # noqa: BLE001
-                    continue
-                if getattr(status, "state", None) == OrderState.FILLED:
-                    return (
-                        int(status.filled_quantity or qty),
-                        float(status.average_price)
-                        if getattr(status, "average_price", None)
-                        else avg,
-                        order_id,
-                    )
-        return (int(qty), avg, order_id)
+        if result.state == OrderState.PENDING:
+            if not order_id:
+                return None
+            # Only a CONFIRMED fill counts: a rejected / unconfirmed market order
+            # used to be booked as filled while the position stayed open.
+            filled, ws_avg = await self._await_fill(backend, order_id, int(qty), 1.0)
+            avg = ws_avg or avg
+        return (filled, avg, order_id) if filled > 0 else None
+
+    async def _await_fill(
+        self, backend: Any, order_id: str, qty: int, window: float
+    ) -> tuple[int, Optional[float]]:
+        """(filled_qty, avg) of `order_id` once terminal. Still working at
+        `window` -> cancelled and re-read, so the count is final."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + window
+        filled, avg = 0, None
+        while True:
+            ws = await _ws_fill(order_id, 0.5)
+            if ws is not None:  # terminal on the order socket (IOC partials included)
+                n = int(float(ws[1])) if ws[1] not in (None, "") else (qty if ws[0] == "FILLED" else 0)
+                return max(filled, n), ws[2] or avg
+            try:
+                st = await backend.get_order_status(order_id)
+            except Exception:  # noqa: BLE001
+                st = None
+            if st is not None:
+                filled = max(filled, int(getattr(st, "filled_quantity", 0) or 0))
+                avg = getattr(st, "average_price", None) or avg
+                state = getattr(st, "state", None)
+                if state == OrderState.FILLED:
+                    return (filled or qty), avg
+                if state in (OrderState.REJECTED, OrderState.CANCELLED, OrderState.EXPIRED):
+                    return filled, avg
+            if loop.time() >= deadline:
+                break
+        try:
+            await backend.cancel_order(order_id)
+            st = await backend.get_order_status(order_id)
+            filled = max(filled, int(getattr(st, "filled_quantity", 0) or 0))
+            avg = getattr(st, "average_price", None) or avg
+        except Exception:  # noqa: BLE001
+            pass
+        # ponytail: a failed cancel can still fill later; the next exit attempt
+        # re-reads the broker position (_exit) before ordering again
+        return filled, avg
+
+    # -- disaster backstop (BROKER_STOP_ENABLED) ------------------------------
+
+    def _spawn_backstop(self, mp: ManagedPosition, *, reprice: bool = False) -> None:
+        if not bool(getattr(get_settings(), "BROKER_STOP_ENABLED", False)):
+            return
+        try:
+            from app.execution.order_reconcile import spawn
+            spawn(self._ensure_backstop(mp, reprice=reprice))
+        except RuntimeError:
+            pass  # no running loop (sync tests)
+
+    async def _ensure_backstop(self, mp: ManagedPosition, *, reprice: bool = False) -> None:
+        """Rest an SL-M at the broker BROKER_STOP_BUFFER_PCT beyond the bot's
+        stop (or keep the existing one's size / trigger in step). It is a
+        normal tracked order: a `trades` row (pending list, cancellable,
+        reconciled on fill) — which is also how a restart finds it again."""
+        try:
+            if mp.stop_loss is None or not mp.quantity:
+                return
+            backend = await self._exit_backend(mp)
+            if backend is None:
+                return
+            st = get_settings()
+            gap = float(getattr(st, "BROKER_STOP_BUFFER_PCT", 1.0)) / 100.0 * mp.entry
+            long = mp.quantity > 0
+            trigger = mp.stop_loss - gap if long else mp.stop_loss + gap
+            if trigger <= 0:
+                return
+            loop = asyncio.get_running_loop()
+            if mp.broker_stop_id is None:
+                mp.broker_stop_id = await loop.run_in_executor(None, _working_backstop, self._session_factory, mp.symbol)
+            if mp.broker_stop_id is not None:
+                if reprice and hasattr(backend, "modify_order"):
+                    await backend.modify_order(mp.broker_stop_id, quantity=abs(int(mp.quantity)), stop_price=trigger)
+                    await loop.run_in_executor(None, _update_backstop_row, self._session_factory,
+                                               mp.broker_stop_id, abs(int(mp.quantity)), trigger)
+                return
+            r = await backend.place_order(
+                signal=None, symbol=mp.symbol, side=OrderSide.SELL if long else OrderSide.BUY,
+                quantity=abs(int(mp.quantity)), order_type=OrderType.STOP_LOSS_MARKET,
+                limit_price=None, stop_price=trigger,
+                product_type=_position_product(self._session_factory, mp.symbol), validity="DAY",
+            )
+            if r.state == OrderState.REJECTED or not r.broker_order_id:
+                log.error("trade_manager.backstop_not_placed", symbol=mp.symbol, error=r.error)
+                return
+            mp.broker_stop_id = r.broker_order_id
+            await loop.run_in_executor(None, _insert_backstop_row, self._session_factory, mp,
+                                       r.broker_order_id, trigger)
+            async with self._lock:
+                gone = self._book.get(mp.symbol) is not mp
+            if gone:  # exited while the stop was being placed: never leave it resting
+                await self._cancel_backstop(mp, backend)
+        except Exception:  # noqa: BLE001 — a backstop must never break management
+            log.exception("trade_manager.backstop_failed", symbol=mp.symbol)
+
+    async def _cancel_backstop(self, mp: ManagedPosition, backend: Any = None) -> bool:
+        """Cancel the resting disaster stop; True when there was one."""
+        oid, mp.broker_stop_id = mp.broker_stop_id, None
+        if oid is None:
+            return False
+        try:
+            backend = backend or await self._exit_backend(mp)
+            if backend is not None:
+                await backend.cancel_order(oid)
+        except Exception:  # noqa: BLE001
+            log.exception("trade_manager.backstop_cancel_failed", symbol=mp.symbol, order_id=oid)
+        return True
+
+    async def _broker_qty(self, backend: Any, symbol: str) -> Optional[int]:
+        """Signed net quantity the broker holds in `symbol`; None = unknown."""
+        try:
+            rows = await backend.get_positions(strict=True)
+        except Exception:  # noqa: BLE001 (incl. stubs without `strict`)
+            return None
+        key = self._normalize_symbol(symbol)
+        return sum(int(getattr(p, "quantity", 0) or 0) for p in rows
+                   if self._normalize_symbol(getattr(p, "symbol", "")) == key)
 
     async def _escalate_exit_failure(self, mp: ManagedPosition, reason: str) -> None:
         """The exit retry budget is exhausted and the position is STILL
@@ -1634,22 +1772,29 @@ class TradeManager:
             backend = await self._exit_backend(mp)
             if backend is None:
                 continue
-            broker_qty = net.get(symbol, 0)
-            if broker_qty == 0:
-                log.warning(
-                    "trade_manager.closed_external",
-                    symbol=symbol, local_qty=mp.quantity,
-                )
-                fallback = await loop.run_in_executor(
-                    None, _row_exit_fallback, self._session_factory, symbol
-                )
-                await self._exit(
-                    symbol,
-                    reason="CLOSED_EXTERNAL",
-                    exit_price=fallback if fallback is not None else mp.entry,
-                    mp=mp,
-                    route=False,  # the broker already closed it
-                )
+            # Book keys may be full ids ("NSE:SBIN-EQ"); `net` is keyed bare.
+            broker_qty = net.get(self._normalize_symbol(symbol), 0)
+            if broker_qty == 0 or (broker_qty > 0) != (mp.quantity > 0):
+                # Flat, or flipped outside the bot (the old levels belong to the
+                # closed side; the new one alerts as an orphan below).
+                async with self._check_lock(symbol):
+                    async with self._lock:
+                        if self._book.get(symbol) is not mp:
+                            continue  # an exit settled it meanwhile
+                    log.warning(
+                        "trade_manager.closed_external",
+                        symbol=symbol, local_qty=mp.quantity, broker_qty=broker_qty,
+                    )
+                    fallback = await loop.run_in_executor(
+                        None, _row_exit_fallback, self._session_factory, symbol
+                    )
+                    await self._exit(
+                        symbol,
+                        reason="CLOSED_EXTERNAL",
+                        exit_price=fallback if fallback is not None else mp.entry,
+                        mp=mp,
+                        route=False,  # the broker already closed it
+                    )
                 await event_bus.publish(
                     CHANNEL_SYSTEM_ERROR,
                     {
@@ -1669,10 +1814,27 @@ class TradeManager:
                     symbol=symbol, local_qty=mp.quantity, broker_qty=broker_qty,
                 )
                 mp.quantity = broker_qty
+                self._spawn_backstop(mp, reprice=True)
                 await loop.run_in_executor(
                     None, _persist_position_quantity,
                     self._session_factory, symbol, broker_qty,
                 )
+        # Orphans: open at the broker, unknown to the bot (an entry that timed
+        # out but filled, a late fill, an order from the Fyers app). Alert once.
+        tracked = {self._normalize_symbol(s) for s in book}
+        tracked |= {self._normalize_symbol(s) for s in await loop.run_in_executor(
+            None, _open_position_symbols, self._session_factory)}
+        live = {k for k, q in net.items() if q}
+        self._orphans_alerted &= live
+        for key in sorted(live - tracked - self._orphans_alerted):
+            self._orphans_alerted.add(key)
+            log.error("trade_manager.orphan_position", symbol=key, broker_qty=net[key])
+            await event_bus.publish(CHANNEL_SYSTEM_ERROR, {
+                "source": "trade_manager", "code": "ORPHAN_POSITION", "symbol": key,
+                "quantity": net[key],
+                "message": f"{key}: {net[key]} open at the broker but not tracked by the bot "
+                           "(no stop-loss). Close or manage it in the Fyers app.",
+            })
 
     async def _scale_out(
         self, symbol: str, mp: ManagedPosition, last: float
@@ -1747,6 +1909,7 @@ class TradeManager:
         # never loosen a stop the breakeven rule already lifted above
         # entry); the trailing logic then ratchets it up from there.
         mp.quantity -= closed_signed
+        self._spawn_backstop(mp, reprice=True)
         mp.scaled_out = True
         if mp.stop_loss is None:
             mp.stop_loss = mp.entry
@@ -1982,7 +2145,7 @@ def _open_position_as_managed(
             entry=entry,
             stop_loss=stop_loss,
             target=float(row.target) if row.target is not None else None,
-            signal_id=None,
+            signal_id=signal_id,
             strategy_id=row.strategy_id,
             broker_account_id=account_id,
             opened_at=opened_at,
@@ -2038,6 +2201,9 @@ def _settle_exit(
                 order_type="market",
                 status="filled",
                 broker_order_id=broker_order_id,
+                # Already applied to the position below: the order-socket echo
+                # of this exit must dedup, not re-apply it (phantom reverse).
+                filled_qty=abs(int(mp.quantity)),
                 pnl=float(pnl),
                 r_multiple=float(r_multiple) if r_multiple is not None else None,
                 executed_at=datetime.now(timezone.utc),
@@ -2137,6 +2303,7 @@ def _partial_settle(
     exit_price: float,
     pnl: float,
     r_multiple: Optional[float] = None,
+    breakeven: bool = True,
 ) -> None:
     """Book a partial (scale-out) close: write the realised-P&L trade
     row for the closed slice and reduce the position toward zero, leaving
@@ -2158,6 +2325,7 @@ def _partial_settle(
                 order_type="market",
                 status="filled",
                 broker_order_id=None,
+                filled_qty=abs(int(closed_signed)),
                 pnl=float(pnl),
                 r_multiple=float(r_multiple) if r_multiple is not None else None,
                 executed_at=datetime.now(timezone.utc),
@@ -2168,5 +2336,60 @@ def _partial_settle(
             pos.quantity = int(pos.quantity) - int(closed_signed)
             pos.last_price = float(exit_price)
             pos.unrealized_pnl = (float(exit_price) - float(pos.average_price)) * pos.quantity
-            pos.stop_loss = mp.entry  # breakeven on the remainder
+            if breakeven:
+                pos.stop_loss = mp.entry  # breakeven on the remainder
+        session.commit()
+
+
+def _is_paper_position(session_factory: Callable[[], Any], symbol: str) -> bool:
+    """True when the symbol's latest broker-ided fill came from the paper backend."""
+    from app.db.models import Trade as TradeRow
+
+    try:
+        with session_factory() as session:
+            oid = (
+                session.query(TradeRow.broker_order_id)
+                .filter(TradeRow.symbol == symbol, TradeRow.status == "filled",
+                        TradeRow.broker_order_id.is_not(None))
+                .order_by(TradeRow.id.desc()).limit(1).scalar()
+            )
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(oid and str(oid).startswith("PAPER-"))
+
+
+def _working_backstop(session_factory: Callable[[], Any], symbol: str) -> Optional[str]:
+    """Order id of today's still-working backstop SL-M for `symbol` (restart)."""
+    from app.api.orders import _expired_day_order
+    from app.db.models import Trade as TradeRow
+
+    now = datetime.now(timezone.utc)
+    with session_factory() as session:
+        rows = (session.query(TradeRow)
+                .filter(TradeRow.symbol == symbol, TradeRow.status == "placed",
+                        TradeRow.order_type == "SL-M", TradeRow.broker_order_id.is_not(None))
+                .order_by(TradeRow.id.desc()).all())
+        return next((r.broker_order_id for r in rows if not _expired_day_order(r, now)), None)
+
+
+def _insert_backstop_row(session_factory: Callable[[], Any], mp: ManagedPosition,
+                         order_id: str, trigger: float) -> None:
+    from app.db.models import Trade as TradeRow
+
+    with session_factory() as session:
+        session.add(TradeRow(
+            signal_id=None, broker_account_id=mp.broker_account_id, symbol=mp.symbol,
+            side="SELL" if mp.quantity > 0 else "BUY", quantity=abs(int(mp.quantity)),
+            price=float(trigger), order_type="SL-M", status="placed", broker_order_id=order_id,
+            product=_position_product(session_factory, mp.symbol).value,
+        ))
+        session.commit()
+
+
+def _update_backstop_row(session_factory: Callable[[], Any], order_id: str, qty: int, trigger: float) -> None:
+    from app.db.models import Trade as TradeRow
+
+    with session_factory() as session:
+        session.query(TradeRow).filter(TradeRow.broker_order_id == order_id).update(
+            {"quantity": int(qty), "price": float(trigger)})
         session.commit()

@@ -217,7 +217,7 @@ async def lifespan(app: FastAPI):
         if b is None:
             return None
         try:
-            return await b.get_positions()
+            return await b.get_positions(strict=True)  # [] on a failed call would read as "flat"
         except Exception:  # noqa: BLE001
             return None
 
@@ -354,6 +354,11 @@ async def lifespan(app: FastAPI):
         # connects once a live account is present; toggled off via
         # FYERS_STREAMING_ENABLED to fall back to pure REST polling.
         if settings.FYERS_STREAMING_ENABLED:
+            try:
+                from app.execution.order_reconcile import restore_pending_levels
+                restore_pending_levels()
+            except Exception:  # noqa: BLE001
+                log.exception("startup.restore_pending_levels_failed")
             fyers_stream.start()
         # T6: start the notification manager — it subscribes to the
         # event bus and fans events out to operator-curated channels

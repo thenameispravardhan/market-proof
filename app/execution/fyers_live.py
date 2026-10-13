@@ -652,6 +652,15 @@ def _fyers_order_type(order_type: OrderType) -> int:
     }.get(order_type, 2)  # default to MARKET
 
 
+def _on_tick(symbol: str, price: float) -> float:
+    """Snap an NSE/BSE price to the 0.05 grid (a multiple of 0.01 too, so it
+    also fits the sub-₹250 equity tick); Fyers rejects off-grid prices."""
+    # ponytail: fixed 0.05 grid; MCX / CDS ticks differ, read the scrip master when those are traded
+    if price <= 0 or symbol.split(":", 1)[0] not in ("NSE", "BSE"):
+        return price
+    return round(round(price / 0.05) * 0.05, 2)
+
+
 def _fyers_side(side: OrderSide) -> int:
     return 1 if side == OrderSide.BUY else -1
 
@@ -925,9 +934,15 @@ class FyersLiveBackend:
             return _reject(f"{order_type.value} order requires a limit price > 0")
         if needs_stop and sp <= 0:
             return _reject(f"{order_type.value} order requires a stop/trigger price > 0")
+        # The news pipeline / book key by the bare name ("SBIN"); Fyers needs
+        # the full id. OrderResult keeps the caller's symbol (the DB / book key).
+        from app.execution.symbols import resolve_fyers_symbol
+
+        broker_symbol = resolve_fyers_symbol(symbol) or symbol
+        lp, sp = _on_tick(broker_symbol, lp), _on_tick(broker_symbol, sp)
 
         payload = {
-            "symbol": symbol,
+            "symbol": broker_symbol,
             "qty": int(quantity),
             "type": fyers_type,
             "side": _fyers_side(side),
@@ -1116,8 +1131,9 @@ class FyersLiveBackend:
         if not broker_order_id:
             return False
         try:
-            await self._orders.cancel_order(broker_order_id)
-            return True
+            data = await self._orders.cancel_order(broker_order_id)
+            # A 200 carrying `s: error` (already filled / unknown id) is a "no".
+            return str((data or {}).get("s") or "").lower() != "error"
         except FyersAPIError as e:
             log.warning("fyers.cancel.failed",
                         broker_order_id=broker_order_id, error=str(e))
@@ -1189,11 +1205,17 @@ class FyersLiveBackend:
             return False, message or "Fyers rejected the modify"
         return True, message or "order modified"
 
-    async def get_positions(self) -> list[Position]:
+    async def get_positions(self, *, strict: bool = False) -> list[Position]:
+        """`strict=True` raises on a failed call instead of returning [] —
+        anything that would read [] as "the broker is flat" must use it."""
         try:
             data = await self._client.get_positions()
+            if strict:
+                _ensure_ok(data, "positions")
         except FyersAPIError as e:
             log.warning("fyers.positions.failed", error=str(e))
+            if strict:
+                raise
             return []
         positions_data = data.get("netPositions") or data.get("data") or []
         out: list[Position] = []
@@ -1357,13 +1379,9 @@ class FyersLiveBackend:
             )
         try:
             data = await self._orders.get_order_status(broker_order_id)
-        except FyersAuthError as e:
-            return OrderStatus(
-                broker_order_id=broker_order_id,
-                state=OrderState.REJECTED,
-                error=str(e),
-            )
         except FyersAPIError as e:
+            # Includes 401: an expired token says nothing about the order, so
+            # it stays PENDING (unknown) — never REJECTED (that dropped fills).
             return OrderStatus(
                 broker_order_id=broker_order_id,
                 state=OrderState.PENDING,
