@@ -288,7 +288,8 @@ async def place_order(
     from app.api import practice
     if account_id == practice.PRACTICE_ACCOUNT_ID:
         return await practice.place(symbol=symbol, side=side, quantity=quantity, order_type=order_type,
-                                    limit_price=limit_price, stop_price=stop_price, product_type=product_type)
+                                    limit_price=limit_price, stop_price=stop_price, product_type=product_type,
+                                    stop_loss=_opt_price(body.get("stop_loss")), target=_opt_price(body.get("target")))
 
     acc = _require_real_account(db, account_id)
 

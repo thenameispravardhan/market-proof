@@ -147,6 +147,7 @@ class PaperBackend:
         session_factory: Optional[SessionFactory] = None,
         pending_timeout_s: float = 30.0,
         fill_on_market_immediate: bool = True,
+        fill_at_touch: bool = False,
     ) -> None:
         self._md = market_data or MarketDataBus()
         self._session_factory = session_factory or _default_session_factory()
@@ -164,6 +165,16 @@ class PaperBackend:
         # next tick — useful for tests that want to assert PENDING
         # state explicitly.
         self._fill_on_market_immediate = bool(fill_on_market_immediate)
+        # Opt-in (practice): fill at the touch, BUY at ask / SELL at bid,
+        # instead of the last trade. The bot's paper mode keeps LTP fills.
+        self._fill_at_touch = bool(fill_at_touch)
+
+    def _px(self, quote: Quote, side: OrderSide) -> float:
+        if self._fill_at_touch:
+            touch = quote.ask if side == OrderSide.BUY else quote.bid
+            if touch and touch > 0:
+                return float(touch)
+        return float(quote.last_price)
 
     # -- lifecycle -------------------------------------------------------
 
@@ -253,10 +264,8 @@ class PaperBackend:
             # LIMIT fills at limit_price; MARKET fills at last.
             if o.order_type == OrderType.LIMIT and o.limit_price is not None:
                 fill_price = float(o.limit_price)
-            elif o.order_type in (OrderType.STOP_LOSS, OrderType.STOP_LOSS_MARKET):
-                fill_price = last
-            else:
-                fill_price = last
+            else:  # MARKET / triggered stop fill at the touch (or last)
+                fill_price = self._px(quote, o.side)
             await self._fill(oid, fill_price)
 
     # -- TradingBackend protocol -----------------------------------------
@@ -306,7 +315,7 @@ class PaperBackend:
         if order_type == OrderType.MARKET and self._fill_on_market_immediate:
             quote = await self._md.get_quote(symbol)
             if quote is not None:
-                fill_price = float(quote.last_price)
+                fill_price = self._px(quote, side)
                 await self._fill(oid, fill_price, quantity=int(quantity),
                                  side=side, symbol=symbol,
                                  signal_id=signal_id, strategy_id=strategy_id,
@@ -336,7 +345,7 @@ class PaperBackend:
         ):
             quote = await self._md.get_quote(symbol)
             if quote is not None:
-                last = float(quote.last_price)
+                last = self._px(quote, side)
                 marketable = (
                     last <= float(limit_price) if side == OrderSide.BUY
                     else last >= float(limit_price)
