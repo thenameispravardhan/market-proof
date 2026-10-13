@@ -170,8 +170,8 @@ def _require_real_account(db: Session, account_id: int) -> BrokerAccount:
     acc = db.get(BrokerAccount, account_id)
     if acc is None:
         raise HTTPException(status_code=404, detail=f"broker_account {account_id} not found")
-    if not acc.enabled:
-        raise HTTPException(status_code=400, detail=f"broker_account {account_id} is disabled")
+    # `enabled` is the Dashboard's switch for the BOT's own trading; the Trade
+    # page is independent of it (its own Paper / Fyers toggle).
     if acc.paper_mode:
         raise HTTPException(
             status_code=400,

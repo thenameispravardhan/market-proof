@@ -339,7 +339,7 @@ function TradeSettings({ s, onChange }: { s: TradeSet; onChange: (k: keyof Trade
 function TicketModeBadge({ account, botMode }: { account: BrokerAccount | null; botMode?: string }) {
   if (!account) {
     return (
-      <span className="mode-badge off" data-testid="ticket-mode" title={botMode === "paper" ? "The bot is in paper mode; this page only trades real money" : "No logged-in Fyers account is switched on"}>
+      <span className="mode-badge off" data-testid="ticket-mode" title={botMode === "paper" ? "The bot is in paper mode; this page only trades real money" : "No logged-in Fyers account"}>
         ORDERS OFF
       </span>
     );
@@ -741,7 +741,8 @@ export default function Trade() {
   // We pick the first switched-on real account, preferring one that is
   // logged in (the backend 400s an order on an account with no token).
   const realAccounts = useMemo<BrokerAccount[]>(
-    () => (accounts?.filter((a) => !a.paper_mode && a.enabled) ?? [])
+    // Not `a.enabled`: that is the Dashboard's switch for the bot only.
+    () => (accounts?.filter((a) => !a.paper_mode) ?? [])
       .sort((a, b) => Number(!!b.access_token) - Number(!!a.access_token)),
     [accounts],
   );
@@ -755,12 +756,10 @@ export default function Trade() {
   };
   const accountId: number | null = practice ? -1 : account?.id ?? null;
   // Why this page can't place orders, in words the operator can act on.
-  // The Fyers switch on the Dashboard is the paper/live master switch:
-  // off means the bot is in paper mode and this page has no account.
+  // The Dashboard's Fyers switch governs the bot only; this page has its own.
   const noAccountReason: string | null = account || practice ? null
     : accounts === undefined ? "Loading the broker account…"
     : !accounts.some((a) => !a.paper_mode) ? "No Fyers account yet. Add and log in to one on the Accounts page to place orders."
-    : realAccounts.length === 0 ? "Paper mode: Fyers trading is switched off. Turn the Fyers switch on in the Dashboard to place real orders here."
     : "Fyers is not logged in. Log in on the Accounts page to place orders.";
   const botMode = globalSettings?.global?.TRADING_MODE;
   // The account row existing isn't enough: Fyers tokens expire every
@@ -1376,7 +1375,7 @@ export default function Trade() {
             />
           ) : (
             <div className="tv-layout">
-            <div className="tv-topbar"><div className="tv-topslot" ref={setTopSlot} /><LayoutMenu L={L} open={layoutMenuOpen} onOpen={setLayoutMenuOpen} />{settingsEl}</div>
+            <div className="tv-topbar"><div className="tv-topslot" ref={setTopSlot} /><span className="seg" role="group" aria-label="Trading mode" title="Trade page only: Paper practises at the real Fyers price, Fyers is real money. Independent of the Dashboard switch." data-testid="practice-toggle"><button type="button" className={`btn-sm${practice ? " active" : ""}`} aria-pressed={practice} onClick={() => pickPractice(true)}>Paper</button><button type="button" className={`btn-sm${!practice ? " active" : ""}`} aria-pressed={!practice} onClick={() => pickPractice(false)}>Fyers</button></span><LayoutMenu L={L} open={layoutMenuOpen} onOpen={setLayoutMenuOpen} />{settingsEl}</div>
             <div className="tv-chartrow">
             <div className="tv-leftbar" ref={setLeftSlot} />
             <div className={`tv-grid l${maxCell !== null ? "1" : layout}`} style={maxCell !== null ? undefined : gridStyle}>
@@ -1666,10 +1665,6 @@ export default function Trade() {
                 <section className={`trade-card${account && !practice ? " ticket-live" : ""}`} data-testid="trade-ticket">
                   <h2>
                     Ticket{" "}
-                    <span className="seg" role="group" aria-label="Trading mode" data-testid="practice-toggle">
-                      <button type="button" className={`btn-sm${practice ? " active" : ""}`} aria-pressed={practice} onClick={() => pickPractice(true)}>Paper</button>
-                      <button type="button" className={`btn-sm${!practice ? " active" : ""}`} aria-pressed={!practice} onClick={() => pickPractice(false)}>Fyers</button>
-                    </span>{" "}
                     {!practice && <TicketModeBadge account={account} botMode={botMode} />}
                   </h2>
                   {practice && (
