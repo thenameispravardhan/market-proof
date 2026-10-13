@@ -1159,7 +1159,7 @@ export default function Trade() {
     if (r.status === "REJECTED" || r.status === "REJECTED_RISK" || r.ok === false) {
       throw new Error(cleanError(r.error || r.risk_message, "The broker rejected the order."));
     }
-    return `${o.side} ${qty} ${name} ${o.type === "STOP_LOSS" ? "STOP-LIMIT" : o.type}${o.price != null ? ` @ ${o.price}` : ""}${o.type === "STOP_LOSS" && o.limit != null ? ` limit ${o.limit}` : ""}: ${r.status}`;
+    return `${o.side} ${qty} ${name} ${o.type === "STOP_LOSS" ? "STOP-LIMIT" : o.type}${o.price != null ? ` @ ${o.price}` : ""}${o.type === "STOP_LOSS" && o.limit != null ? ` limit ${o.limit}` : ""}: ${r.status}${r.paper ? " (paper position)" : ""}`;
   };
 
   const isFnoSel = selected != null && selected.segment !== "EQ" && selected.instrument_type !== "EQ";
@@ -1242,7 +1242,7 @@ export default function Trade() {
         setLastResult({
           type: "success",
           // The order id is not a price — "@ 2406..." read as a fill price.
-          message: `${r.status} · ${body.side} ${body.quantity} ${name} · ${ORDER_TYPE_LABEL[body.order_type]}${px}`
+          message: `${r.status}${r.paper ? " (paper position)" : ""} · ${body.side} ${body.quantity} ${name} · ${ORDER_TYPE_LABEL[body.order_type]}${px}`
             + `${levels ? ` · ${levels} set once it fills` : ""}${r.broker_order_id ? ` · order ${r.broker_order_id}` : ""}`,
           // Risk is advisory for manual orders — surface it without blocking.
           warning: r.risk_warning ?? (r.risk_message ? r.risk_message : null),

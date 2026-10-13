@@ -452,6 +452,8 @@ export interface PlaceOrderResponse {
    *  acknowledged the order (timeout) — it may still have been placed. */
   status: string;
   error: string | null;
+  /** Filled on paper: the position it traded is the bot's paper one. */
+  paper?: boolean;
   // Diagnostic marker from the Fyers backend (e.g. "ip_whitelist"
   // when Fyers rejects with the misleading "Algo orders are not
   // allowed from this app" message that's actually about the

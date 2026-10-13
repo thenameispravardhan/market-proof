@@ -1505,7 +1505,7 @@ class Manager:
 
         await self._check_lpp(symbol, type_enum, limit_price)
 
-        pos_qty, pos_product, halt, symbol = await asyncio.get_running_loop().run_in_executor(
+        pos_qty, pos_product, halt, symbol, paper = await asyncio.get_running_loop().run_in_executor(
             TRADING_POOL, _position_and_halt, symbol
         )
         if _opening_rest:
@@ -1593,7 +1593,9 @@ class Manager:
                 log.warning("manual_order.risk_engine_failed", error=str(e))
                 return None
 
-        backend = self._manual_backend_for(account)
+        # A PAPER position (TRADING_MODE=paper) trades on paper: a real order
+        # would open a real position at Fyers instead of closing it.
+        backend = self._paper if paper else self._manual_backend_for(account)
         if backend is None:
             raise RuntimeError(
                 f"no live backend for account {account.id} "
@@ -1652,22 +1654,23 @@ class Manager:
         # places the same real-money order a second time.
         record_warning: Optional[str] = None
         try:
-            await asyncio.get_running_loop().run_in_executor(
-                TRADING_POOL,
-                self._persist_manual_trade_executed,
-                account.id,
-                manual_signal,
-                side_enum,
-                int(quantity),
-                float(limit_price or stop_price or 0.0),
-                type_enum,
-                product_enum,
-                result,
-                operator,
-                bypass_risk,
-                risk_codes,
-                risk_message,
-            )
+            if not paper:  # paper wrote its own trade row and position
+                await asyncio.get_running_loop().run_in_executor(
+                    TRADING_POOL,
+                    self._persist_manual_trade_executed,
+                    account.id,
+                    manual_signal,
+                    side_enum,
+                    int(quantity),
+                    float(limit_price or stop_price or 0.0),
+                    type_enum,
+                    product_enum,
+                    result,
+                    operator,
+                    bypass_risk,
+                    risk_codes,
+                    risk_message,
+                )
             # A Fyers update that beat this commit was parked — apply it now.
             if result.broker_order_id:
                 from app.execution.order_reconcile import apply_parked
@@ -1742,6 +1745,7 @@ class Manager:
             "bypassed_risk": bool(bypass_risk and risk_codes),
             "broker_order_id": result.broker_order_id,
             "symbol": result.symbol,  # the position row's spelling (see _position_and_halt)
+            "paper": paper,           # filled on paper: the position it trades is a paper one
             "status": status_text,
             "error": error,
             # Surface the OrderResult's `raw` field as `reason` so
@@ -2484,27 +2488,24 @@ def _equity_key(symbol: str) -> tuple[str, str]:
     return exch or "NSE", re.sub(r"-(EQ|BE)$", "", name)
 
 
-def _position_and_halt(symbol: str) -> tuple[int, Optional[str], Optional[str], str]:
+def _position_and_halt(symbol: str) -> tuple[int, Optional[str], Optional[str], str, bool]:
     """(net qty, product, why trading is halted or None, the position row's
-    symbol). An open row under the other spelling of the same stock counts:
-    a Trade-page "NSE:SBIN-EQ" sell closing the bot's "SBIN" must land on
-    that row, or the bot's stop sells the same shares again. A PAPER row is
-    never a real order's: the order is refused (ValueError)."""
+    symbol, is it a PAPER position). An open row under the other spelling of
+    the same stock counts: a Trade-page "NSE:SBIN-EQ" sell closing the bot's
+    "SBIN" must land on that row, or the bot's stop sells the same shares
+    again. A paper row is traded on paper (the caller routes it there)."""
     from app.db.session import SessionLocal
     from app.execution.trade_manager import _is_paper_position
     from app.risk import circuit_breakers
 
     with SessionLocal() as db:
         pos = db.query(PositionRow).filter_by(symbol=symbol).one_or_none()
-        if pos is not None and pos.quantity and _is_paper_position(SessionLocal, pos.symbol):
-            raise ValueError(
-                f"{pos.symbol} is a PAPER position (TRADING_MODE=paper). A real order would open a "
-                "real position at Fyers instead of closing it — close it with ✕ / Exit all.")
         if pos is None or not pos.quantity:
             key = _equity_key(symbol)
             pos = next((p for p in db.query(PositionRow).filter(PositionRow.quantity != 0)
-                        if _equity_key(p.symbol) == key and not _is_paper_position(SessionLocal, p.symbol)), pos)
+                        if _equity_key(p.symbol) == key), pos)
+        open_ = pos is not None and bool(pos.quantity)
         state = circuit_breakers.get_or_create_state(db)
         halt = (state.disabled_reason or "trading_disabled") if state.trading_disabled else None
         return ((int(pos.quantity or 0) if pos else 0), (pos.product if pos else None), halt,
-                pos.symbol if pos is not None and pos.quantity else symbol)
+                pos.symbol if open_ else symbol, open_ and _is_paper_position(SessionLocal, pos.symbol))

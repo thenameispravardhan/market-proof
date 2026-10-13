@@ -169,8 +169,8 @@ def test_manual_order_lands_on_the_bots_row(isolated_db):
     with dbs.SessionLocal() as db:
         db.add(PositionRow(symbol="SBIN", quantity=10, average_price=800.0, last_price=800.0))
         db.commit()
-    qty, _product, _halt, sym = _position_and_halt("NSE:SBIN-EQ")
-    assert (qty, sym) == (10, "SBIN")
+    qty, _product, _halt, sym, paper = _position_and_halt("NSE:SBIN-EQ")
+    assert (qty, sym, paper) == (10, "SBIN", False)
 
 
 @pytest.mark.asyncio
@@ -254,7 +254,7 @@ async def test_expired_entry_part_filled_late_hands_over_the_slice(db_session, i
         event_bus.unsubscribe("trade.executed", q)
 
 
-def test_real_order_never_lands_on_a_paper_position(isolated_db):
+def test_order_on_a_paper_position_is_traded_on_paper(isolated_db):
     from app.db import session as dbs
     from app.db.models import Trade
     from app.execution.manager import _position_and_halt
@@ -264,7 +264,6 @@ def test_real_order_never_lands_on_a_paper_position(isolated_db):
         db.add(Trade(symbol="SBIN", side="BUY", quantity=10, price=800.0, order_type="market",
                      status="filled", broker_order_id="PAPER-1"))
         db.commit()
-    with pytest.raises(ValueError, match="PAPER"):
-        _position_and_halt("SBIN")
-    assert _position_and_halt("NSE:SBIN-EQ")[3] == "NSE:SBIN-EQ"   # no alias onto the paper row
-    assert _position_and_halt("BSE:SBIN-EQ")[3] == "BSE:SBIN-EQ"
+    assert _position_and_halt("SBIN")[3:] == ("SBIN", True)
+    assert _position_and_halt("NSE:SBIN-EQ")[3:] == ("SBIN", True)     # same stock, same paper book
+    assert _position_and_halt("BSE:SBIN-EQ")[3:] == ("BSE:SBIN-EQ", False)
