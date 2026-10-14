@@ -308,10 +308,16 @@ export function inSession(t: number, session: Session = NSE_SESSION): boolean {
 }
 
 /** True for a tick symbol and a chart symbol naming the same instrument
- *  ("SBIN", "NSE:SBIN-EQ" and "nse:sbin-eq" all match). Trade rows store
- *  either form depending on which path placed the order. */
+ *  ("SBIN", "NSE:SBIN-EQ", "nse:sbin-eq"; "JSTL" and "BSE:JSTL-A"). Trade
+ *  rows store either form depending on which path placed the order. A broker
+ *  id always ends in its series (-EQ, -BE, BSE groups -A/-B/-X/…, -INDEX), so
+ *  that suffix is dropped only after an exchange prefix: bare "MCDOWELL-N"
+ *  keeps its "-N". */
 export function sameInstrument(a: string, b: string): boolean {
-  const norm = (x: string) => (x || "").trim().toUpperCase().replace(/^[A-Z]+:/, "").replace(/-(EQ|BE|INDEX)$/, "");
+  const norm = (x: string) => {
+    const s = (x || "").trim().toUpperCase();
+    return s.includes(":") ? s.split(":")[1].replace(/-[A-Z0-9]+$/, "") : s.replace(/-(EQ|BE)$/, "");
+  };
   const na = norm(a);
   return na !== "" && na === norm(b);
 }

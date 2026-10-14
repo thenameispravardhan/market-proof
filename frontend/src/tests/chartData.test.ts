@@ -151,6 +151,10 @@ describe("trading sessions", () => {
     expect(sameInstrument("NSE:NIFTY25O1425000CE", "NSE:NIFTY25O1425000CE")).toBe(true);
     expect(sameInstrument("NSE:SBIN-EQ", "NSE:SBICARD-EQ")).toBe(false);
     expect(sameInstrument("", "NSE:SBIN-EQ")).toBe(false);
+    expect(sameInstrument("JSTL", "BSE:JSTL-A")).toBe(true);
+    expect(sameInstrument("ABAN", "NSE:ABAN-BE")).toBe(true);
+    expect(sameInstrument("MCDOWELL-N", "NSE:MCDOWELL-N-EQ")).toBe(true);
+    expect(sameInstrument("NSE:NIFTY50-INDEX", "NIFTY50")).toBe(true);
   });
 });
 
