@@ -649,6 +649,8 @@ export interface ChartPanelProps {
   privacy?: boolean;
   /** Epoch seconds: centre the chart here once the first candles load. */
   at?: number;
+  /** The trade a symbol link was opened for: drawn as a labelled entry line. */
+  entry?: { side: "BUY" | "SELL"; qty: number; price: number };
 }
 
 type Dialog =
@@ -818,6 +820,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     maximized = false,
     multi = false,
     privacy = false,
+    entry,
   } = props;
   const [autoId] = useState(() => `chart${++panelSeq}`);
   const myId = syncId ?? autoId;
@@ -3762,7 +3765,9 @@ export default function ChartPanel(props: ChartPanelProps) {
         position: buy ? "belowBar" : "aboveBar",
         color: buy ? "#2962FF" : col.down,
         shape: buy ? "arrowUp" : "arrowDown",
-        text: settings.executionLabels ? `${buy ? "B" : "S"} ${x.qty} @ ${fmtNum(x.price, 2)}` : "",
+        // The trade the link was opened for is always labelled.
+        text: settings.executionLabels || (entry && x.side === entry.side && x.qty === entry.qty && x.price === entry.price)
+          ? `${buy ? "B" : "S"} ${x.qty} @ ${fmtNum(x.price, 2)}` : "",
       });
     }
     const evColor: Record<ChartEvent["kind"], string> = { D: "#F23645", S: "#2962FF", E: "#FF9800", B: "#9C27B0" };
@@ -3776,7 +3781,21 @@ export default function ChartPanel(props: ChartPanelProps) {
     ms.sort((a, b) => a.time - b.time);
     markersRef.current = (safe(() => createSeriesMarkers(main, ms as never[])) as unknown as typeof markersRef.current) ?? null;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [strat, events, executions, settings.showMarks, settings.executionLabels, mainVer, dataVer]);
+  }, [strat, events, executions, settings.showMarks, settings.executionLabels, entry, mainVer, dataVer]);
+
+  // 4e) The linked trade's entry as a labelled price line (like a broker's
+  //     average-price line), recreated with the main series.
+  useEffect(() => {
+    const main = mainRef.current;
+    if (!main || !entry) return;
+    const buy = entry.side === "BUY";
+    const line = safe(() => main.createPriceLine({
+      price: entry.price, color: buy ? "#2962FF" : colorsRef.current.down, lineWidth: 1, lineStyle: LineStyle.Dashed,
+      axisLabelVisible: true, title: `${buy ? "BUY" : "SELL"} ${entry.qty} @ ${fmtNum(entry.price, 2)}`,
+    }));
+    return () => { if (line) safe(() => main.removePriceLine(line)); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [entry?.side, entry?.qty, entry?.price, mainVer]);
 
   async function runStrategy(s: StrategyItem): Promise<void> {
     const c = candlesRef.current;

@@ -43,7 +43,7 @@ import {
 import { useLiveQuote } from "../hooks/useQuotes";
 import { tabLocal, useRouter } from "../router";
 import { withWs } from "../workspace";
-import { chartLinkParams } from "../lib/chartLink";
+import { chartLinkParams, resolveBareHit } from "../lib/chartLink";
 import ChartPanel, { type BrokerLine, type ChartOrder, type ChartPosition, type HostAction } from "../components/trade/ChartPanel";
 import Scalper, { splitDrag } from "../components/trade/Scalper";
 import { AccountManager, BOTTOM_TABS, LayoutMenu, SymbolDetails, WatchlistTable, cleanWatchItems, useLayouts, type BottomTab, type WatchState } from "../components/trade/TradePanels";
@@ -528,14 +528,23 @@ export default function Trade() {
     return l;
   })[0]);
   const [selected, setSelected] = useState<InstrumentHit | null>(() => {
-    if (link.current) return link.current.hit;
+    // A bare name ("JSTL") is resolved to its real listing first (below).
+    if (link.current) return link.current.hit.symbol.includes(":") ? link.current.hit : null;
     try { return JSON.parse(tabLocal.getItem(LAST_KEY) ?? "null"); } catch { return null; }
   });
   useEffect(() => {
     if (link.current) window.history.replaceState(null, "", withWs("#/trade"));   // a refresh mustn't jump back
+    const l = link.current;
+    if (l && !l.hit.symbol.includes(":")) {
+      void resolveBareHit(l.hit.symbol).then((h) => {
+        if (link.current !== l) return;
+        l.hit = h;
+        setSelected(h);
+      });
+    }
   }, []);
   useEffect(() => {
-    if (link.current && selected?.symbol !== link.current.hit.symbol) link.current = null;
+    if (link.current && selected && selected.symbol !== link.current.hit.symbol) link.current = null;
   }, [selected]);
   // The chain stays on the last UNDERLYING picked, so clicking one of its
   // options (which opens that option's chart + ticket) keeps the chain up.
@@ -1405,6 +1414,7 @@ export default function Trade() {
                         symbol={h.symbol}
                         shortName={h.short_name}
                         at={active && link.current?.hit.symbol === h.symbol ? link.current.at : undefined}
+                        entry={active && link.current?.hit.symbol === h.symbol ? link.current.entry : undefined}
                         brokerLines={active && tset.showOrders ? brokerLines : undefined}
                         onPickPrice={active ? onPickPrice : undefined}
                         position={tset.showPos ? positionFor(h.symbol) : null}
