@@ -1,6 +1,7 @@
 // customSeries — chart styles lightweight-charts doesn't ship, as one
 // custom series: volume candles (body width ∝ volume), HLC bars, High-low
-// bars, HLC area, Kagi lines and Point & figure columns.
+// bars, HLC area, Kagi lines, Point & figure columns, and the order-flow
+// footprint (sell | buy volume per price beside a thin candle, Fyers-style).
 
 import type {
   CustomData,
@@ -14,7 +15,7 @@ import type {
   Time,
 } from "lightweight-charts";
 
-export type ShapeMode = "volcandles" | "hlc" | "highlow" | "hlcarea" | "kagi" | "pnf";
+export type ShapeMode = "volcandles" | "hlc" | "highlow" | "hlcarea" | "kagi" | "pnf" | "footprint";
 
 export interface OhlcItem extends CustomData<Time> {
   open: number;
@@ -23,7 +24,36 @@ export interface OhlcItem extends CustomData<Time> {
   close: number;
   volume: number;
   flag?: number;
+  /** Footprint: [price, buy, sell] per traded price, from recorded ticks. */
+  fp?: [number, number, number][];
+  /** Session-cumulative delta up to and including this bar. */
+  cd?: number;
 }
+
+/** 1 / 2 / 2.5 / 5 × 10^k at or above `x`: a readable footprint row height in price. */
+export function niceStep(x: number): number {
+  if (!(x > 0)) return 0.05;
+  const e = Math.pow(10, Math.floor(Math.log10(x)));
+  return ([1, 2, 2.5, 5, 10].find((m) => m * e >= x - 1e-12) ?? 10) * e;
+}
+
+/** Group a bar's per-price buy / sell into rows of `step`, lowest first. */
+export function footprintRows(fp: [number, number, number][], step: number): { p: number; buy: number; sell: number }[] {
+  const rows = new Map<number, { p: number; buy: number; sell: number }>();
+  for (const [price, buy, sell] of fp) {
+    const p = Math.round(Math.floor(price / step + 1e-9) * step * 1e6) / 1e6;
+    const r = rows.get(p) ?? { p, buy: 0, sell: 0 };
+    r.buy += buy;
+    r.sell += sell;
+    rows.set(p, r);
+  }
+  return [...rows.values()].sort((a, b) => a.p - b.p);
+}
+
+export const fmtK = (v: number): string => {
+  const a = Math.abs(v);
+  return a >= 1e7 ? `${(v / 1e7).toFixed(2)}Cr` : a >= 1e5 ? `${(v / 1e5).toFixed(2)}L` : a >= 1e3 ? `${(v / 1e3).toFixed(a >= 1e4 ? 1 : 2)}K` : String(Math.round(v));
+};
 
 export interface ShapeSeriesOptions extends CustomSeriesOptions {
   mode: ShapeMode;
@@ -109,6 +139,10 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
         }
         return;
       }
+      if (o.mode === "footprint") {
+        this.footprint(ctx, bars, lo, hi, bs, Y);
+        return;
+      }
       let maxVol = 1;
       if (o.mode === "volcandles") for (let i = lo; i < hi; i++) maxVol = Math.max(maxVol, bars[i].originalData.volume || 0);
       for (let i = lo; i < hi; i++) {
@@ -167,6 +201,71 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
         }
       }
     });
+  }
+
+  /** Order-flow footprint: a thin candle, sell volume per price row on its
+   *  left (red), buy on its right (green), shade ∝ the row's share of the
+   *  bar's busiest row; Δ and cumulative Δ above, sell / buy totals below.
+   *  A bar without recorded ticks is just the thin candle. */
+  private footprint(ctx: CanvasRenderingContext2D, bars: PaneRendererCustomData<Time, OhlcItem>["bars"], lo: number, hi: number, bs: number, Y: (p: number) => number | null): void {
+    const o = this.opts!;
+    // Row height: ≥ 14 px of price, never finer than the data's own levels.
+    let pxPer = 0;
+    for (let i = lo; i < hi && !pxPer; i++) {
+      const d = bars[i].originalData;
+      const a = Y(d.high), b = Y(d.low);
+      if (a !== null && b !== null && d.high > d.low) pxPer = Math.abs(b - a) / (d.high - d.low);
+    }
+    const step = niceStep(pxPer > 0 ? 14 / pxPer : 0.05);
+    const bodyW = Math.max(2, Math.min(6, bs * 0.08));
+    const cellW = Math.max(0, (bs * 0.94 - bodyW) / 2 - 2);
+    const text = cellW >= 24;
+    ctx.font = "10px sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    for (let i = lo; i < hi; i++) {
+      const b = bars[i];
+      const d = b.originalData;
+      const yh = Y(d.high), yl = Y(d.low), yo = Y(d.open), yc = Y(d.close);
+      if (yh === null || yl === null || yo === null || yc === null) continue;
+      const color = d.close >= d.open ? o.upColor : o.downColor;
+      ctx.fillStyle = color;
+      ctx.fillRect(b.x - 0.5, yh, 1, Math.max(1, yl - yh));
+      ctx.fillRect(b.x - bodyW / 2, Math.min(yo, yc), bodyW, Math.max(1, Math.abs(yc - yo)));
+      if (!d.fp?.length || cellW < 4) continue;
+      const rows = footprintRows(d.fp, step);
+      const max = Math.max(1, ...rows.map((r) => Math.max(r.buy, r.sell)));
+      let buy = 0, sell = 0;
+      for (const r of rows) {
+        buy += r.buy;
+        sell += r.sell;
+        const yt = Y(r.p + step), yb = Y(r.p);
+        if (yt === null || yb === null) continue;
+        const y = Math.min(yt, yb) + 0.5, h = Math.max(1, Math.abs(yb - yt) - 1);
+        const cell = (x: number, v: number, c: string) => {
+          ctx.fillStyle = alpha(c, 0.18 + 0.72 * (v / max));
+          ctx.fillRect(x, y, cellW, h);
+          if (text && h >= 9 && v > 0) {
+            ctx.fillStyle = "#FFFFFF";
+            ctx.fillText(fmtK(v), x + cellW / 2, y + h / 2);
+          }
+        };
+        cell(b.x - bodyW / 2 - 1 - cellW, r.sell, o.downColor);
+        cell(b.x + bodyW / 2 + 1, r.buy, o.upColor);
+      }
+      if (!text) continue;
+      const delta = buy - sell;
+      ctx.fillStyle = delta >= 0 ? o.upColor : o.downColor;
+      ctx.fillText(fmtK(delta), b.x, yh - 20);
+      if (d.cd !== undefined) {
+        ctx.fillStyle = d.cd >= 0 ? o.upColor : o.downColor;
+        ctx.fillText(fmtK(d.cd), b.x, yh - 8);
+      }
+      ctx.fillStyle = o.downColor;
+      ctx.fillText(fmtK(sell), b.x, yl + 9);
+      ctx.fillStyle = o.upColor;
+      ctx.fillText(fmtK(buy), b.x, yl + 21);
+    }
   }
 }
 

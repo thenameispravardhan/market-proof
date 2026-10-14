@@ -5,11 +5,15 @@ import type { InstrumentHit } from "../types";
 
 export const CHART_LINK_IV_KEY = "chart:linkIv";
 
-/** A trade the link was opened for: drawn on the chart as its entry line. */
+/** A trade the link was opened for: drawn on the chart as one arrow per leg
+ *  (the entry, and the exit once it's closed). Times are epoch seconds. */
 export interface ChartEntry {
   side: "BUY" | "SELL";
   qty: number;
   price: number;
+  at?: number;
+  exitPrice?: number;
+  exitAt?: number;
 }
 
 export function chartLinkIv(): string {
@@ -20,20 +24,34 @@ export function chartLinkIv(): string {
   }
 }
 
-/** `at`: ISO time (naive = UTC, as the API sends it). A bare name stays bare:
- *  the Trade page resolves it to its real listing (BSE-only scrips, -BE
- *  series), where forcing "NSE:X-EQ" made Fyers answer "Invalid symbol". */
-export function chartHref(symbol: string, at?: string | null, entry?: ChartEntry | null): string {
+/** ISO time (naive = UTC, as the API sends it) → epoch seconds. */
+function epoch(iso: string | null | undefined): number | undefined {
+  if (!iso) return undefined;
+  const s = iso.trim();
+  const t = Date.parse(/Z$|[+-]\d{2}:?\d{2}$/.test(s) ? s : `${s}Z`);
+  return Number.isNaN(t) ? undefined : Math.floor(t / 1000);
+}
+
+/** `at`: ISO time. A bare name stays bare: the Trade page resolves it to its
+ *  real listing (BSE-only scrips, -BE series), where forcing "NSE:X-EQ" made
+ *  Fyers answer "Invalid symbol". */
+export function chartHref(
+  symbol: string,
+  at?: string | null,
+  trade?: { side: "BUY" | "SELL"; qty: number; price: number; exitPrice?: number | null; exitTime?: string | null } | null,
+): string {
   const q = new URLSearchParams({ symbol: symbol.trim().toUpperCase(), iv: chartLinkIv() });
-  if (at) {
-    const s = /Z$|[+-]\d{2}:?\d{2}$/.test(at.trim()) ? at.trim() : `${at.trim()}Z`;
-    const t = Date.parse(s);
-    if (!Number.isNaN(t)) q.set("at", String(Math.floor(t / 1000)));
-  }
-  if (entry && entry.price > 0) {
-    q.set("side", entry.side);
-    q.set("qty", String(entry.qty));
-    q.set("px", String(entry.price));
+  const t = epoch(at);
+  if (t) q.set("at", String(t));
+  if (trade && trade.price > 0) {
+    q.set("side", trade.side);
+    q.set("qty", String(trade.qty));
+    q.set("px", String(trade.price));
+    const xt = epoch(trade.exitTime);
+    if (xt && trade.exitPrice) {
+      q.set("xpx", String(trade.exitPrice));
+      q.set("xt", String(xt));
+    }
   }
   return `${window.location.pathname}#/trade?${q.toString()}`;
 }
@@ -45,12 +63,16 @@ export function chartLinkParams(): { hit: InstrumentHit; iv: string | null; at: 
   const symbol = (q.get("symbol") ?? "").trim();
   if (!symbol || q.get("popout") === "1") return null;
   const name = symbol.split(":").pop()!.replace(/-EQ$/, "");
+  const at = Number(q.get("at")) || undefined;
   const px = Number(q.get("px"));
   return {
     hit: { symbol, short_name: name, exchange: symbol.includes(":") ? symbol.split(":")[0] : "", segment: "", instrument_type: "", lot_size: 1, tick_size: 0.05, expiry: null, strike: null, underlying: null, display: name } as InstrumentHit,
     iv: q.get("iv"),
-    at: Number(q.get("at")) || undefined,
-    entry: px > 0 ? { side: q.get("side") === "SELL" ? "SELL" : "BUY", qty: Number(q.get("qty")) || 0, price: px } : undefined,
+    at,
+    entry: px > 0 ? {
+      side: q.get("side") === "SELL" ? "SELL" : "BUY", qty: Number(q.get("qty")) || 0, price: px, at,
+      exitPrice: Number(q.get("xpx")) || undefined, exitAt: Number(q.get("xt")) || undefined,
+    } : undefined,
   };
 }
 

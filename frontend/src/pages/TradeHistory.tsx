@@ -103,7 +103,7 @@ function Section({
                     onDoubleClick={() => setArmed(armed === r.key ? null : r.key)}
                   >
                     <td className="mono">
-                      <a href={chartHref(r.symbol, r.entryTime, r.entryPrice != null ? { side: r.side === "SELL" ? "SELL" : "BUY", qty: r.quantity, price: r.entryPrice } : null)} target="_blank" rel="noopener" className="sym-link" title="Open chart at entry">{r.symbol}</a>
+                      <a href={chartHref(r.symbol, r.entryTime, r.entryPrice != null ? { side: r.side === "SELL" ? "SELL" : "BUY", qty: r.quantity, price: r.entryPrice, exitPrice: r.exitPrice, exitTime: r.exitTime } : null)} target="_blank" rel="noopener" className="sym-link" title="Open chart at entry">{r.symbol}</a>
                     </td>
                     <td>
                       <span className={`badge ${r.side === "BUY" ? "buy" : "sell"}`}>{r.side}</span>
