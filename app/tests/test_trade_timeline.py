@@ -13,7 +13,8 @@ def test_timeline_chains_filing_to_fill_and_matches_both_symbol_forms(client, db
     chain = seed_signal_chain(db_session, symbol="JSTL", action="BUY", status="executed", with_outcome=False)
     db_session.add_all([
         Trade(signal_id=chain["signal"].id, symbol="JSTL", side="BUY", quantity=25, price=101.5, status="filled"),
-        Trade(symbol="BSE:JSTL-X", side="SELL", quantity=25, price=104.2, status="filled", pnl=67.5),
+        # The bot's exit carries the entry's signal: its chain must not repeat.
+        Trade(signal_id=chain["signal"].id, symbol="BSE:JSTL-X", side="SELL", quantity=25, price=104.2, status="filled", pnl=67.5),
         Trade(symbol="JSTL", side="BUY", quantity=5, price=99.0, status="rejected"),   # not a fill
         Trade(symbol="JSTLX", side="BUY", quantity=1, price=1.0, status="filled"),     # another stock
     ])
