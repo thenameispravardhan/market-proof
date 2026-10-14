@@ -625,6 +625,10 @@ export interface ChartPanelProps {
   toolbarSlot?: HTMLElement | null;
   toolsSlot?: HTMLElement | null;
   rangeSlot?: HTMLElement | null;
+  /** false = no bottom date-range bar (1D … All, clock). The scalper: drawn
+   *  inline in the active chart, it shrank whichever chart a click activated,
+   *  so the position ✕ moved under the pointer and took a second click. */
+  rangeBar?: boolean;
   /** Dock panels the active chart renders its widgets into. */
   widgetSlots?: { data?: HTMLElement | null; tree?: HTMLElement | null; alerts?: HTMLElement | null };
   /** false = no toolbar / drawing strip at all (an inactive layout cell). */
@@ -810,6 +814,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     toolbarSlot,
     toolsSlot,
     rangeSlot,
+    rangeBar: showRangeBar = true,
     widgetSlots,
     chrome = true,
     instant = false,
@@ -6524,7 +6529,7 @@ export default function ChartPanel(props: ChartPanelProps) {
           </div>
         </div>
       </div>
-      {placeChrome(rangeBar, rangeSlot)}
+      {showRangeBar && placeChrome(rangeBar, rangeSlot)}
 
       {chrome && widgetSlots?.data && createPortal(<DataWindow {...dataWindowGroups()} />, widgetSlots.data)}
       {chrome && widgetSlots?.tree &&
