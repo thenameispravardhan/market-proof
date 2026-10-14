@@ -2742,7 +2742,6 @@ div.ind-row { cursor: default; }
 .cmodal.ind-settings .cform-ctl { flex-wrap: nowrap; }
 .cmodal.ind-settings .cform-row.off .cform-ctl { opacity: 0.45; }
 .cmodal.ind-settings .cform-num:disabled { opacity: 0.6; }
-.ind-vis-hint { margin-bottom: 4px; }
 .chart-scale-modes { position: absolute; right: 26px; bottom: 2px; z-index: 7; display: flex; gap: 2px; opacity: 0; transition: opacity 0.12s; }
 .chart-container:hover .chart-scale-modes, .chart-scale-modes.sm-always { opacity: 1; }
 .chart-scale-modes button { width: 20px; height: 20px; padding: 0; border: 1px solid var(--border); border-radius: 3px; background: var(--bg-elev); color: var(--text-dim); font-size: 10px; font-weight: 700; cursor: pointer; }

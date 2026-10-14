@@ -413,7 +413,6 @@ export function IndicatorSettings({
       )}
       {tab === "visibility" && (
         <>
-          <div className="hint ind-vis-hint">Show this indicator only on the intervals ticked below.</div>
           {allOff ? (
             <div className="hint warn-text" data-testid="ind-vis-warn">Every interval is unticked, so this indicator never shows.</div>
           ) : offHere ? (

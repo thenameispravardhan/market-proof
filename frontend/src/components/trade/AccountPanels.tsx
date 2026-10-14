@@ -658,7 +658,6 @@ export function FundsPanel({ data, privacy }: { data: FundsResp | null; privacy:
         rowKey={(r) => `${r.id}-${r.title}`}
         empty="Fyers returned no fund rows."
       />
-      <div className="hint">MTF (pay later) funding is a Fyers product feature and isn't shown here.</div>
     </section>
   );
 }

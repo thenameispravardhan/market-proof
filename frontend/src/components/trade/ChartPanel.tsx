@@ -5649,7 +5649,6 @@ export default function ChartPanel(props: ChartPanelProps) {
                   <polyline points="2,26 14,30 24,16 36,22 54,6" fill="none" stroke="#42A5F5" strokeWidth="2" strokeDasharray="4 3" strokeLinejoin="round" />
                 </svg>
                 <div>No symbols here yet — why not add some?</div>
-                <div className="hint">Search above, then pick Same % scale, New price scale or New pane.</div>
               </div>
             )}
             {compares.length > 0 && <div className="chart-menu-sep" />}
