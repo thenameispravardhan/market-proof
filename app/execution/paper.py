@@ -156,6 +156,11 @@ class PaperBackend:
         # id -> asyncio.Queue so the caller can wait for a specific
         # order to fill. We hand this back in OrderResult.raw.
         self._fill_events: dict[str, asyncio.Event] = {}
+        # An order's final state while its DB write is still running on the
+        # executor: it has already left `_pending`, so without this a status
+        # check in that window read the row mid-commit (stale "placed", and
+        # on a shared session an IllegalStateChangeError).
+        self._settling: dict[str, OrderStatus] = {}
         self._subs: dict[str, tuple[asyncio.Queue[Quote], asyncio.Task]] = {}
         self._stop_event: asyncio.Event = asyncio.Event()
         self._loop_task: Optional[asyncio.Task[None]] = None
@@ -437,10 +442,14 @@ class PaperBackend:
         if o is None:
             return False
         # Mark the trade row cancelled in DB.
-        await asyncio.get_running_loop().run_in_executor(
-            None, _update_trade_status,
-            self._session_factory, broker_order_id, "cancelled",
-        )
+        self._settling[broker_order_id] = OrderStatus(broker_order_id=broker_order_id, state=OrderState.CANCELLED)
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None, _update_trade_status,
+                self._session_factory, broker_order_id, "cancelled",
+            )
+        finally:
+            self._settling.pop(broker_order_id, None)
         log.info("paper.order_cancelled", broker_order_id=broker_order_id)
         if ev is not None:
             ev.set()
@@ -456,6 +465,9 @@ class PaperBackend:
 
     async def get_order_status(self, broker_order_id: str) -> OrderStatus:
         o = self._pending.get(broker_order_id)
+        settling = self._settling.get(broker_order_id)
+        if o is None and settling is not None:
+            return settling
         if o is None:
             # Check the DB for terminal state.
             with self._session_factory() as s:
@@ -511,6 +523,13 @@ class PaperBackend:
         stid = strategy_id if strategy_id is not None else (o.strategy_id if o else None)
         if qty <= 0:
             return
+        # Answer status checks from memory until the DB writes below land.
+        # ponytail: an exception mid-way leaves this entry (FILLED, which the
+        # in-memory book already reflects); it's one small dict row per order.
+        self._settling[broker_order_id] = OrderStatus(
+            broker_order_id=broker_order_id, state=OrderState.FILLED,
+            filled_quantity=qty, average_price=float(fill_price),
+        )
         # Update position. The DB row is the book of record: after a
         # restart the in-memory book is empty, and a SELL against a long the
         # row still holds must close it, not open a phantom short.
@@ -555,6 +574,7 @@ class PaperBackend:
             self._session_factory, sym, pos.quantity, pos.average_price,
             pos.last_price, pos.unrealized_pnl, stid,
         )
+        self._settling.pop(broker_order_id, None)
         log.info(
             "paper.order_filled",
             broker_order_id=broker_order_id,
@@ -571,10 +591,14 @@ class PaperBackend:
         ev = self._fill_events.pop(broker_order_id, None)
         if o is None:
             return
-        await asyncio.get_running_loop().run_in_executor(
-            None, _update_trade_status,
-            self._session_factory, broker_order_id, "expired",
-        )
+        self._settling[broker_order_id] = OrderStatus(broker_order_id=broker_order_id, state=OrderState.EXPIRED)
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None, _update_trade_status,
+                self._session_factory, broker_order_id, "expired",
+            )
+        finally:
+            self._settling.pop(broker_order_id, None)
         log.info("paper.order_expired", broker_order_id=broker_order_id, symbol=o.symbol)
         if ev is not None:
             ev.set()

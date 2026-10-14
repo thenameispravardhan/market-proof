@@ -269,6 +269,41 @@ async def test_market_order_with_no_quote_expires(db_session, isolated_db):
 
 
 @pytest.mark.asyncio
+async def test_status_during_expiry_write_is_expired_not_a_db_read(db_session, isolated_db, monkeypatch):
+    """CI race: _expire drops the order from memory, then writes "expired" on
+    an executor thread. A status check in that gap read the row mid-commit
+    (stale "placed"; on a shared session, IllegalStateChangeError)."""
+    import time
+
+    from app.execution import paper
+
+    original = paper._update_trade_status
+    writing = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def slow_write(*a, **kw):
+        loop.call_soon_threadsafe(writing.set)
+        time.sleep(0.4)
+        return original(*a, **kw)
+
+    monkeypatch.setattr(paper, "_update_trade_status", slow_write)
+    sig = _persist_signal(db_session, symbol="UNKNOWN", action="BUY")
+    backend = PaperBackend(
+        market_data=MarketDataBus(), session_factory=lambda: db_session,
+        pending_timeout_s=0.1, fill_on_market_immediate=False,
+    )
+    backend.start()
+    try:
+        r = await backend.place_order(signal=sig, symbol="UNKNOWN", side=OrderSide.BUY, quantity=1, order_type=OrderType.MARKET)
+        await asyncio.wait_for(writing.wait(), 5)          # the expiry write is in flight
+        assert r.broker_order_id not in backend.get_pending()
+        status = await backend.get_order_status(r.broker_order_id)
+        assert status.state == OrderState.EXPIRED
+    finally:
+        await backend.stop()
+
+
+@pytest.mark.asyncio
 async def test_sell_with_no_position_opens_short(db_session, isolated_db):
     md = MarketDataBus()
     md.set_quote_sync("TCS", last_price=3500.0)
