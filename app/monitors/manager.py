@@ -32,6 +32,7 @@ class MonitorManager:
         nse_monitor: Optional[BaseMonitor] = None,
         bse_monitor: Optional[BaseMonitor] = None,
         nse_rss_monitor: Optional[BaseMonitor] = None,
+        bse_rss_monitor: Optional[BaseMonitor] = None,
     ) -> None:
         # Construct with no explicit interval so each monitor follows
         # the live POLL_INTERVAL_SECONDS setting and picks up UI/API
@@ -74,10 +75,27 @@ class MonitorManager:
                     getattr(get_settings(), "NSE_RSS_POLL_SECONDS", 0.0) or 0.0
                 ),
             )
+        if bse_rss_monitor is None:
+            # BSE's official RSS feed: the only BSE channel left since the
+            # API went Akamai-403 for non-browser clients (2026-09-23).
+            from app.monitors.bse_rss import BSERSSMonitor
+
+            bse_rss_monitor = BSERSSMonitor(
+                start_offset=interval * 0.25,
+                enabled_fn=lambda: bool(
+                    getattr(get_settings(), "BSE_RSS_ENABLED", False)
+                ),
+                interval_fn=lambda: float(
+                    getattr(get_settings(), "BSE_RSS_POLL_SECONDS", 0.0) or 0.0
+                ),
+            )
         self._nse = nse_monitor
         self._bse = bse_monitor
         self._nse_rss = nse_rss_monitor
-        self._monitors: list[BaseMonitor] = [nse_monitor, bse_monitor, nse_rss_monitor]
+        self._bse_rss = bse_rss_monitor
+        self._monitors: list[BaseMonitor] = [
+            nse_monitor, bse_monitor, nse_rss_monitor, bse_rss_monitor,
+        ]
         self._started = False
 
     @property
@@ -91,6 +109,10 @@ class MonitorManager:
     @property
     def nse_rss(self) -> BaseMonitor:
         return self._nse_rss
+
+    @property
+    def bse_rss(self) -> BaseMonitor:
+        return self._bse_rss
 
     @property
     def monitors(self) -> list[BaseMonitor]:

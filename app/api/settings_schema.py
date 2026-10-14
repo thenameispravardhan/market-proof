@@ -141,7 +141,7 @@ GROUPS: list[dict[str, Any]] = [
         "title": "News sources",
         "note": "Each source is an independent monitor. Detection speed is the fastest "
                 "enabled source; duplicates are collapsed.",
-        "prefixes": ["NSE_API_ENABLED", "BSE_API_ENABLED", "NSE_RSS_"],
+        "prefixes": ["NSE_API_ENABLED", "BSE_API_ENABLED", "NSE_RSS_", "BSE_RSS_"],
     },
     {
         "id": "ai",
@@ -280,6 +280,7 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "PIPELINE_DEADLINE_SECONDS": (0, 300),     # 0 = disabled
     "MAX_NEWS_AGE_ABSOLUTE_SECONDS": (0, 86400),
     "NSE_RSS_POLL_SECONDS": (0, 60),           # 0 = follow the global interval
+    "BSE_RSS_POLL_SECONDS": (0, 60),           # 0 = follow the global interval
     "POLL_INTERVAL_SECONDS": (1, 3600),
     "ORDER_RATE_LIMIT_PER_SEC": (0, 10),       # 10/s is the SEBI no-registration ceiling
     "ORDER_RATE_MAX_WAIT_SECONDS": (0, 10),
@@ -336,6 +337,7 @@ LABELS: dict[str, str] = {
     "MODEL_MIN_PROBABILITY": "Min P(mover) to allow (0-1)",
     "MODEL_MIN_COVERAGE": "Min feature coverage to gate on (0-1, 0 = never abstain)",
     "NSE_RSS_POLL_SECONDS": "NSE RSS poll (seconds, 0 = follow global)",
+    "BSE_RSS_POLL_SECONDS": "BSE RSS poll (seconds, 0 = follow global)",
     "PIPELINE_DEADLINE_SECONDS": "Signal deadline (seconds, 0 = off)",
     "MAX_NEWS_AGE_ABSOLUTE_SECONDS": "Absolute news age ceiling (seconds, 0 = off)",
     "ENFORCE_MARKET_HOURS": "Enforce market hours",

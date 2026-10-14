@@ -257,6 +257,8 @@ export interface GlobalSettings {
   BSE_API_ENABLED: boolean;
   NSE_RSS_ENABLED: boolean;
   NSE_RSS_POLL_SECONDS: number;
+  BSE_RSS_ENABLED: boolean;
+  BSE_RSS_POLL_SECONDS: number;
   // ---- Mover model (Model page) -----------------------------------------
   // MODEL_ENABLED only computes and surfaces the score; MODEL_GATE_ENABLED
   // is the separate switch that lets a low score veto a trade.

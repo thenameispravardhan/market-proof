@@ -216,12 +216,12 @@ async def test_toggle_flips_live(db_session):
 # ---- manager wiring ----------------------------------------------------
 
 
-def test_manager_builds_three_sources():
+def test_manager_builds_four_sources():
     from app.monitors.manager import MonitorManager
 
     m = MonitorManager()
     labels = [f"{x.exchange}-{x.channel}" for x in m.monitors]
-    assert labels == ["NSE-API", "BSE-API", "NSE-RSS"]
+    assert labels == ["NSE-API", "BSE-API", "NSE-RSS", "BSE-RSS"]
     # Offsets spread across the poll cycle.
     assert m.nse._start_offset == 0.0
     assert m.bse._start_offset > 0.0
