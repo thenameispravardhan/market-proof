@@ -276,46 +276,6 @@ export function useStrategies() {
   });
 }
 
-export function useCreateStrategy() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (body: Partial<Strategy>) => api.post<Strategy>("/api/strategies", body),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["strategies"] }),
-  });
-}
-
-export function useUpdateStrategy(id: number | null) {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (body: Partial<Strategy>) => api.put<Strategy>(`/api/strategies/${id}`, body),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["strategies"] }),
-  });
-}
-
-export function useDeleteStrategy() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (id: number) => api.delete(`/api/strategies/${id}`),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["strategies"] });
-      qc.invalidateQueries({ queryKey: ["rules"] });
-    },
-  });
-}
-
-// Flip a strategy's `enabled` flag — backs the on/off switch in the
-// Strategies list. A disabled strategy's rules are excluded from the
-// live analyzer (see load_rules_for_enabled_strategies). Works for any
-// id (unlike useUpdateStrategy, which binds one id at hook-call time).
-export function useToggleStrategy() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: ({ id, enabled }: { id: number; enabled: boolean }) =>
-      api.put<Strategy>(`/api/strategies/${id}`, { enabled }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["strategies"] }),
-  });
-}
-
 // ---- Signal Rules (T5) ----
 
 export function useRules(strategyId?: number | null) {

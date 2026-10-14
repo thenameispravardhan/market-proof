@@ -43,7 +43,6 @@ const Research = lazy(() => import("./pages/Research"));
 const Chat = lazy(() => import("./pages/Chat"));
 const Prompts = lazy(() => import("./pages/Prompts"));
 const Rules = lazy(() => import("./pages/Rules"));
-const Strategies = lazy(() => import("./pages/Strategies"));
 const Algo = lazy(() => import("./pages/Algo"));
 const Accounts = lazy(() => import("./pages/Accounts"));
 const Notifications = lazy(() => import("./pages/Notifications"));
@@ -53,7 +52,7 @@ const Timing = lazy(() => import("./pages/Timing"));
 // Nav grouped by the OPERATOR'S WORKFLOW, not by module:
 //   LIVE        — what is happening right now
 //   STRATEGY    — how the bot decides (in pipeline order: AI → rules →
-//                 strategies → how trades are closed)
+//                 how trades are closed)
 //   PERFORMANCE — how it actually did
 //   SYSTEM      — plumbing and configuration
 // Order within each group follows that same flow, so reading the sidebar
@@ -69,7 +68,6 @@ const TABS: { key: TabKey; label: string; emoji: string; group: NavGroup }[] = [
   // How the bot decides — pipeline order
   { key: "prompts",        label: "Prompts",        emoji: "✎", group: "STRATEGY" },
   { key: "rules",          label: "Rules",          emoji: "≡", group: "STRATEGY" },
-  { key: "strategies",     label: "Strategies",     emoji: "◈", group: "STRATEGY" },
   { key: "algo",           label: "Algo Lab",       emoji: "∿", group: "STRATEGY" },
   // How it did
   { key: "trades",         label: "Trade History",  emoji: "₹", group: "PERFORMANCE" },
@@ -97,7 +95,6 @@ function PageContent({ tab }: { tab: TabKey }) {
     case "chat": return <Chat />;
     case "prompts": return <Prompts />;
     case "rules": return <Rules />;
-    case "strategies": return <Strategies />;
     case "algo": return <Algo />;
     case "accounts": return <Accounts />;
     case "notifications": return <Notifications />;

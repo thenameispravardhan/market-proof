@@ -183,6 +183,23 @@ def test_rules_crud_and_dry_run(client):
 # ═════════════════════════════════════════════════════════════════════════
 
 
+def test_rules_accept_negative_numbers(client):
+    """Rules page: any number, negative or positive — priority and values."""
+    sid = client.post("/api/strategies", json={"name": "Negative Numbers"}).json()["id"]
+    neg = {
+        "strategy_id": sid, "name": "Very negative", "priority": -5, "action": "SELL", "enabled": True,
+        "conditions": {"all_of": [{"field": "sentiment_score", "op": "<=", "value": -250},
+                                  {"field": "confidence", "op": ">=", "value": -0.5}]},
+    }
+    r = client.post("/api/rules", json=neg)
+    assert r.status_code == 201, r.text
+    assert r.json()["priority"] == -5
+    client.post("/api/rules", json={**neg, "name": "Zero", "priority": 0, "action": "BUY",
+                                    "conditions": {"all_of": [{"field": "sentiment_score", "op": "<=", "value": 0}]}})
+    r = client.post("/api/rules/dry-run", json={"analysis": {"sentiment_score": -300, "confidence": 0.9}, "strategy_id": sid})
+    assert r.json()["action"] == "SELL"   # -5 is checked before 0
+
+
 def test_prompts_lifecycle(client):
     event_type = "E2E_TEST_EVENT"
     body = {

@@ -5,8 +5,9 @@
 // you compare a number field to the string "BUY", which the engine then
 // rejected at run time):
 //   • sentiment        → enum  (positive / neutral / negative)
-//   • sentiment_score  → number (−100 … 100)
-//   • confidence       → number (0 … 1)
+//   • sentiment_score  → number (usually −100 … 100)
+//   • confidence       → number (usually 0 … 1)
+// Numbers are not clamped: any value, negative or positive, can be entered.
 //   • recommendation   → enum  (BUY / SELL / HOLD)
 import { useEffect, useState } from "react";
 import { useRules, useCreateRule, useUpdateRule } from "../../hooks/useApi";
@@ -20,9 +21,7 @@ interface FieldDef {
   label: string;
   kind: FieldKind;
   options?: { value: string; label: string }[]; // enum only
-  min?: number; // number only
-  max?: number;
-  step?: number;
+  step?: number; // number only
   fallback: string | number; // default value when this field is picked
   hint: string;
 }
@@ -45,8 +44,6 @@ const FIELDS: FieldDef[] = [
     value: "sentiment_score",
     label: "Sentiment score",
     kind: "number",
-    min: -100,
-    max: 100,
     step: 1,
     fallback: 50,
     hint: "−100 (most negative) … +100 (most positive).",
@@ -55,8 +52,6 @@ const FIELDS: FieldDef[] = [
     value: "confidence",
     label: "Confidence",
     kind: "number",
-    min: 0,
-    max: 1,
     step: 0.05,
     fallback: 0.7,
     hint: "How sure the model is, from 0 to 1.",
@@ -192,10 +187,6 @@ export function RuleEditor({ ruleId, strategyId, onSaved }: Props) {
         if (c.value === "" || Number.isNaN(n)) {
           return `Enter a number for "${def.label}".`;
         }
-        if (def.min !== undefined && n < def.min)
-          return `"${def.label}" must be ≥ ${def.min}.`;
-        if (def.max !== undefined && n > def.max)
-          return `"${def.label}" must be ≤ ${def.max}.`;
       } else {
         const allowed = def.options!.map((o) => o.value);
         if (!allowed.includes(String(c.value)))
@@ -334,8 +325,6 @@ export function RuleEditor({ ruleId, strategyId, onSaved }: Props) {
                       <input
                         aria-label="Value"
                         type="number"
-                        min={def.min}
-                        max={def.max}
                         step={def.step}
                         value={cond.value === "" ? "" : String(cond.value)}
                         onChange={(e) => changeValue(idx, def, e.target.value)}

@@ -73,7 +73,7 @@ def _validate_conditions(conds: dict) -> dict:
 class RuleCreate(BaseModel):
     strategy_id: int
     name: str = Field(..., min_length=1, max_length=128)
-    priority: int = Field(default=100, ge=0)
+    priority: int = 100   # any integer; lower is checked first (negatives too)
     conditions: dict[str, Any]
     action: str
     action_params: Optional[dict[str, Any]] = None
