@@ -18,6 +18,7 @@ import {
   formatDate,
   formatClock,
   inSession,
+  onPositionTag,
   sameInstrument,
   sessionFor,
   type Bar,
@@ -155,6 +156,13 @@ describe("trading sessions", () => {
     expect(sameInstrument("ABAN", "NSE:ABAN-BE")).toBe(true);
     expect(sameInstrument("MCDOWELL-N", "NSE:MCDOWELL-N-EQ")).toBe(true);
     expect(sameInstrument("NSE:NIFTY50-INDEX", "NIFTY50")).toBe(true);
+  });
+
+  it("knows a press on a position tag (activation waits for its click)", () => {
+    document.body.innerHTML = `<div class="tv-cell"><canvas></canvas><div class="pos-layer"><div class="pos-tag"><button>✕</button></div></div></div>`;
+    expect(onPositionTag(document.querySelector("button"))).toBe(true);
+    expect(onPositionTag(document.querySelector("canvas"))).toBe(false);
+    expect(onPositionTag(null)).toBe(false);
   });
 });
 

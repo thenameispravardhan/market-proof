@@ -7,6 +7,7 @@
 // for the session — only then do the hotkeys work too.
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import ChartPanel, { type ChartOrder, type ChartPosition } from "./ChartPanel";
+import { onPositionTag } from "./chartData";
 import { useQuote } from "../../hooks/useApi";
 import { useLiveQuote } from "../../hooks/useQuotes";
 import type { InstrumentHit, OptionChainResponse, OptionLeg, Position } from "../../types";
@@ -221,6 +222,7 @@ export default function Scalper({
       chrome={activeCol === col}
       toolbarSlot={activeCol === col ? top : undefined}
       toolsSlot={activeCol === col ? left : undefined}
+      rangeBar={false}
       instant={instant}
       showPlus={showPlus}
       position={helpers.positionFor(sym)}
@@ -280,7 +282,7 @@ export default function Scalper({
             <div className="tv-leftbar" ref={setLeft} />
             <div className="scalp-grid" style={{ gridTemplateColumns: `${cols[0]}fr ${cols[1] - cols[0]}fr ${1 - cols[1]}fr` }}>
               {[0, 1, 2].map((i) => (
-                <div key={i} className={`scalp-col${activeCol === i ? " active" : ""}`} onMouseDownCapture={() => setActiveCol(i)}>
+                <div key={i} className={`scalp-col${activeCol === i ? " active" : ""}`} onMouseDownCapture={(e) => { if (!onPositionTag(e.target)) setActiveCol(i); }} onClickCapture={() => setActiveCol(i)}>
                   {i === 0 && leg(ceRow, ce, "CE", ceOff, setCeOff)}
                   {i === 0 && (ce ? chart(ce.symbol, legName(ceRow, "CE"), 0, lots * (ce.lot_size ?? 0)) : <section className="trade-card tv-empty" />)}
                   {i === 1 && <div className="scalp-leg base"><span className="name">{name}</span><span className="scalp-ltp">{chain?.spot != null ? chain.spot.toFixed(2) : "—"}</span><span className="hint">underlying</span></div>}

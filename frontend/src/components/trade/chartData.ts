@@ -307,6 +307,15 @@ export function inSession(t: number, session: Session = NSE_SESSION): boolean {
   return m >= session.open && m < session.close;
 }
 
+/** True when a press lands on a chart's position tags (✕ close, ⇅ reverse,
+ *  TP / SL). Multi-chart layouts activate a chart on mouse-down, and the
+ *  re-render that follows can shift or rebuild the tag before mouse-up; the
+ *  browser then fires no click and the ✕ needs a second press. For these
+ *  presses activate on click instead, once the button has had its click. */
+export function onPositionTag(target: EventTarget | null): boolean {
+  return !!(target as Element | null)?.closest?.(".pos-layer");
+}
+
 /** True for a tick symbol and a chart symbol naming the same instrument
  *  ("SBIN", "NSE:SBIN-EQ", "nse:sbin-eq"; "JSTL" and "BSE:JSTL-A"). Trade
  *  rows store either form depending on which path placed the order. A broker

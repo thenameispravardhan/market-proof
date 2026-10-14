@@ -46,6 +46,7 @@ import { withWs } from "../workspace";
 import { chartLinkParams, resolveBareHit } from "../lib/chartLink";
 import ChartPanel, { type BrokerLine, type ChartOrder, type ChartPosition, type HostAction } from "../components/trade/ChartPanel";
 import Scalper, { splitDrag } from "../components/trade/Scalper";
+import { onPositionTag } from "../components/trade/chartData";
 import { AccountManager, BOTTOM_TABS, LayoutMenu, SymbolDetails, WatchlistTable, cleanWatchItems, useLayouts, type BottomTab, type WatchState } from "../components/trade/TradePanels";
 import { BookPanel, FnoPanel, type DeskTab } from "../components/trade/ProPanels";
 import { loadUserPrefs, UserSettingsDialog, type UserPrefs } from "../components/trade/UserSettings";
@@ -1469,7 +1470,7 @@ export default function Trade() {
                 const h = i === activeCell ? selected : cells[i] ?? null;
                 const active = i === activeCell;
                 return (
-                  <div key={i} className={`tv-cell${active && nCells > 1 ? " active" : ""}`} onMouseDownCapture={() => activate(i)}
+                  <div key={i} className={`tv-cell${active && nCells > 1 ? " active" : ""}`} onMouseDownCapture={(e) => { if (!onPositionTag(e.target)) activate(i); }} onClickCapture={() => activate(i)}
                     onDragOver={(e) => { if (e.dataTransfer.types.includes(DRAG_MIME)) { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; } }}
                     onDrop={dropOnCell(i)} data-testid={`tv-cell-${i}`}>
                     {/* key={symbol} remounts the panel per symbol so its candle
