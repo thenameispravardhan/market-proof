@@ -162,7 +162,8 @@ interface Candle extends OhlcvCandle {
 
 export type ChartKind =
   | "bars" | "candles" | "hollow" | "volcandles" | "hlcbars" | "line" | "linemarkers" | "step" | "area"
-  | "hlcarea" | "baseline" | "columns" | "highlow" | "heikin" | "renko" | "linebreak" | "kagi" | "pnf" | "range";
+  | "hlcarea" | "baseline" | "columns" | "highlow" | "heikin" | "renko" | "linebreak" | "kagi" | "pnf" | "range"
+  | "footprint";
 
 export const CHART_KINDS: { id: ChartKind; label: string; icon: string }[] = [
   { id: "bars", label: "Bars", icon: "┤" },
@@ -184,6 +185,7 @@ export const CHART_KINDS: { id: ChartKind; label: string; icon: string }[] = [
   { id: "kagi", label: "Kagi", icon: "⌇" },
   { id: "pnf", label: "Point & figure", icon: "✕" },
   { id: "range", label: "Range", icon: "⇳" },
+  { id: "footprint", label: "Order flow (footprint)", icon: "⊟" },
 ];
 
 const BRICK_KINDS = new Set<ChartKind>(["renko", "linebreak", "kagi", "pnf", "range"]);
@@ -194,6 +196,7 @@ const CUSTOM_MODE: Partial<Record<ChartKind, ShapeMode>> = {
   hlcarea: "hlcarea",
   kagi: "kagi",
   pnf: "pnf",
+  footprint: "footprint",
 };
 const LINE_KINDS = new Set<ChartKind>(["line", "linemarkers", "step", "area", "baseline"]);
 
@@ -649,8 +652,9 @@ export interface ChartPanelProps {
   privacy?: boolean;
   /** Epoch seconds: centre the chart here once the first candles load. */
   at?: number;
-  /** The trade a symbol link was opened for: drawn as a labelled entry line. */
-  entry?: { side: "BUY" | "SELL"; qty: number; price: number };
+  /** The trade a Trade History link was opened for: the chart then marks ONLY
+   *  its legs, one BUY and one SELL arrow labelled "qty @ price" (epoch-second times). */
+  entry?: { side: "BUY" | "SELL"; qty: number; price: number; at?: number; exitPrice?: number; exitAt?: number };
 }
 
 type Dialog =
@@ -1038,6 +1042,10 @@ export default function ChartPanel(props: ChartPanelProps) {
   const prevVolRef = useRef<number | null>(null);
   const toastSeqRef = useRef(0);
   const flowRef = useRef<Map<number, [number, number, number]>>(new Map());
+  /** Footprint per bar (chart time): per-price [price, buy, sell] + session cumulative delta. */
+  const fpRef = useRef<Map<number, { fp: [number, number, number][]; cd: number }>>(new Map());
+  /** Bar spacing from before the footprint widened it; restored on leaving. */
+  const fpSpacingRef = useRef<number | null>(null);
   const markersRef = useRef<{ detach: () => void; setMarkers: (m: never[]) => void } | null>(null);
   const eventsByTimeRef = useRef<Map<number, ChartEvent[]>>(new Map());
   const pendingRangeRef = useRef<RangeDef | { at?: number; from?: number; to?: number } | null>(props.at ? { at: props.at } : null);
@@ -1819,6 +1827,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     const col = colorsRef.current;
     if (LINE_KINDS.has(k)) return { time: c.time, value: c.close };
     if (k === "columns") return { time: c.time, value: c.close, color: c.close >= (prev?.close ?? c.open) ? col.up : col.down };
+    if (k === "footprint") return { time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume, ...fpRef.current.get(c.time) };
     if (CUSTOM_MODE[k]) return { time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume, flag: c.flag };
     const base = { time: c.time, open: c.open, high: c.high, low: c.low, close: c.close };
     if (k === "hollow") {
@@ -3382,6 +3391,14 @@ export default function ChartPanel(props: ChartPanelProps) {
     else if (chartKind === "baseline") series = safe(() => chart.addSeries(BaselineSeries, common) as ISeriesApi<SeriesType>);
     else if (chartKind === "columns") series = safe(() => chart.addSeries(HistogramSeries, common) as ISeriesApi<SeriesType>);
     else series = safe(() => chart.addSeries(CandlestickSeries, common) as ISeriesApi<SeriesType>);
+    // Footprint cells need room: widen the bars, and give the old zoom back on leaving it.
+    if (chartKind === "footprint" && fpSpacingRef.current === null) {
+      fpSpacingRef.current = safe(() => chart.timeScale().options().barSpacing) ?? 6;
+      safe(() => chart.timeScale().applyOptions({ barSpacing: 96 }));
+    } else if (chartKind !== "footprint" && fpSpacingRef.current !== null) {
+      safe(() => chart.timeScale().applyOptions({ barSpacing: fpSpacingRef.current! }));
+      fpSpacingRef.current = null;
+    }
     if (!series) return;
     mainRef.current = series;
     if (!primitiveRef.current) primitiveRef.current = new DrawingsPrimitive(drawingDeps());
@@ -3654,6 +3671,52 @@ export default function ChartPanel(props: ChartPanelProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [flowOn, symbol, iv, reloadNonce]);
 
+  // 4b') Footprint chart type: per-price buy / sell per bar from the tick
+  //      recorder, polled while it's the chart type.
+  useEffect(() => {
+    fpRef.current = new Map();
+    if (chartKind !== "footprint") return;
+    let stop = false;
+    const load = async () => {
+      const c = candlesRef.current;
+      const now = Math.floor(Date.now() / 1000);
+      const from = c.length ? c[0].time - IST : now - 5 * 86400;
+      const res = fetchPlan(ivRef.current).res;
+      try {
+        const r = await fetch(`/api/algo/ticks/flow?symbol=${encodeURIComponent(symbol)}&resolution=${res}&from=${from}&to=${now + 60}&footprint=true`);
+        const j = await r.json();
+        if (stop) return;
+        const fp = new Map<number, { fp: [number, number, number][]; cd: number }>();
+        for (const [t, p, b, s] of (j.footprint ?? []) as number[][]) {
+          const k = t + IST;
+          const e = fp.get(k) ?? { fp: [], cd: 0 };
+          e.fp.push([p, b, s]);
+          fp.set(k, e);
+        }
+        // Cumulative delta restarts each session.
+        let day = -1, cum = 0;
+        for (const k of [...fp.keys()].sort((a, b) => a - b)) {
+          const e = fp.get(k)!;
+          if (Math.floor(k / 86400) !== day) { day = Math.floor(k / 86400); cum = 0; }
+          cum += e.fp.reduce((a, [, b, s]) => a + b - s, 0);
+          e.cd = cum;
+        }
+        fpRef.current = fp;
+        setFlowNote(j.recorded ? `footprint: ${j.key}` : `no ticks recorded for ${j.key} yet — add it on Algo Lab › Data`);
+        setMainData();
+      } catch {
+        if (!stop) setFlowNote("footprint fetch failed");
+      }
+    };
+    void load();
+    const id = setInterval(load, 15000);
+    return () => {
+      stop = true;
+      clearInterval(id);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chartKind, symbol, iv, reloadNonce]);
+
   // 4c) Corporate events (dividends / splits / earnings / bonus) from the
   //     filed announcements.
   useEffect(() => {
@@ -3751,6 +3814,21 @@ export default function ChartPanel(props: ChartPanelProps) {
     };
     const col = colorsRef.current;
     const ms: { time: UTCTimestamp; position: "aboveBar" | "belowBar"; color: string; shape: "arrowUp" | "arrowDown" | "circle"; text: string }[] = [];
+    if (entry) {
+      // Opened for one trade: just its BUY and SELL arrows, nothing else.
+      const legs = [{ t: entry.at, buy: entry.side === "BUY", px: entry.price }];
+      if (entry.exitAt && entry.exitPrice) legs.push({ t: entry.exitAt, buy: entry.side !== "BUY", px: entry.exitPrice });
+      for (const l of legs) {
+        if (!l.t || l.t + IST < times[0]) continue;
+        ms.push({
+          time: snapT(l.t + IST) as UTCTimestamp, position: l.buy ? "belowBar" : "aboveBar", color: l.buy ? "#2962FF" : col.down,
+          shape: l.buy ? "arrowUp" : "arrowDown", text: `${l.buy ? "BUY" : "SELL"} ${entry.qty} @ ${fmtNum(l.px, 2)}`,
+        });
+      }
+      ms.sort((a, b) => a.time - b.time);
+      if (ms.length) markersRef.current = (safe(() => createSeriesMarkers(main, ms as never[])) as unknown as typeof markersRef.current) ?? null;
+      return;
+    }
     for (const t of strat?.trades ?? []) {
       if (t.entry_t + IST < times[0]) continue;
       const buy = t.side === "BUY";
@@ -3765,9 +3843,7 @@ export default function ChartPanel(props: ChartPanelProps) {
         position: buy ? "belowBar" : "aboveBar",
         color: buy ? "#2962FF" : col.down,
         shape: buy ? "arrowUp" : "arrowDown",
-        // The trade the link was opened for is always labelled.
-        text: settings.executionLabels || (entry && x.side === entry.side && x.qty === entry.qty && x.price === entry.price)
-          ? `${buy ? "B" : "S"} ${x.qty} @ ${fmtNum(x.price, 2)}` : "",
+        text: settings.executionLabels ? `${buy ? "B" : "S"} ${x.qty} @ ${fmtNum(x.price, 2)}` : "",
       });
     }
     const evColor: Record<ChartEvent["kind"], string> = { D: "#F23645", S: "#2962FF", E: "#FF9800", B: "#9C27B0" };
@@ -3782,20 +3858,6 @@ export default function ChartPanel(props: ChartPanelProps) {
     markersRef.current = (safe(() => createSeriesMarkers(main, ms as never[])) as unknown as typeof markersRef.current) ?? null;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [strat, events, executions, settings.showMarks, settings.executionLabels, entry, mainVer, dataVer]);
-
-  // 4e) The linked trade's entry as a labelled price line (like a broker's
-  //     average-price line), recreated with the main series.
-  useEffect(() => {
-    const main = mainRef.current;
-    if (!main || !entry) return;
-    const buy = entry.side === "BUY";
-    const line = safe(() => main.createPriceLine({
-      price: entry.price, color: buy ? "#2962FF" : colorsRef.current.down, lineWidth: 1, lineStyle: LineStyle.Dashed,
-      axisLabelVisible: true, title: `${buy ? "BUY" : "SELL"} ${entry.qty} @ ${fmtNum(entry.price, 2)}`,
-    }));
-    return () => { if (line) safe(() => main.removePriceLine(line)); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [entry?.side, entry?.qty, entry?.price, mainVer]);
 
   async function runStrategy(s: StrategyItem): Promise<void> {
     const c = candlesRef.current;
@@ -6240,7 +6302,7 @@ export default function ChartPanel(props: ChartPanelProps) {
                     <span className="lg-acts"><button type="button" title="Clear the strategy's marks" onClick={() => setStrat(null)}>✕</button></span>
                   </div>
                 )}
-                {flowOn && flowNote && <div className="lg-row hint">{flowNote}</div>}
+                {(flowOn || chartKind === "footprint") && flowNote && <div className="lg-row hint">{flowNote}</div>}
               </>
             )}
           </div>

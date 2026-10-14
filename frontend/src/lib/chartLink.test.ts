@@ -11,9 +11,12 @@ describe("chartHref", () => {
     window.location.hash = href.split("#")[1];
     expect(chartLinkParams()).toMatchObject({ hit: { symbol: "SBIN", short_name: "SBIN", exchange: "" }, iv: "5", at: Date.UTC(2026, 9, 12, 4) / 1000 });
   });
-  it("carries the trade's side, qty and price", () => {
-    window.location.hash = chartHref("NSE:SBIN-EQ", null, { side: "SELL", qty: 7, price: 812.5 }).split("#")[1];
-    expect(chartLinkParams()).toMatchObject({ hit: { symbol: "NSE:SBIN-EQ", exchange: "NSE" }, entry: { side: "SELL", qty: 7, price: 812.5 } });
+  it("carries the trade's side, qty, entry and exit legs", () => {
+    window.location.hash = chartHref("NSE:SBIN-EQ", "2026-10-12T04:00:00", { side: "SELL", qty: 7, price: 812.5, exitPrice: 805, exitTime: "2026-10-12T05:00:00" }).split("#")[1];
+    expect(chartLinkParams()).toMatchObject({
+      hit: { symbol: "NSE:SBIN-EQ", exchange: "NSE" },
+      entry: { side: "SELL", qty: 7, price: 812.5, at: Date.UTC(2026, 9, 12, 4) / 1000, exitPrice: 805, exitAt: Date.UTC(2026, 9, 12, 5) / 1000 },
+    });
   });
   it("omits at without a time; popout links are not Trade links", () => {
     expect(chartHref("NSE:SBIN-EQ", null)).not.toContain("at=");
