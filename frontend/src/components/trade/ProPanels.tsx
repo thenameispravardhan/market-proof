@@ -126,7 +126,6 @@ export function DepthPanel({ symbol, tick, onPrice, onMarket }: {
       )}
       <div className="dom-actions">
         <button type="button" className="buy" onClick={() => onMarket("BUY")}>Buy Mkt</button>
-        <span className="hint">click a qty cell → limit ticket</span>
         <button type="button" className="sell" onClick={() => onMarket("SELL")}>Sell Mkt</button>
       </div>
     </div>

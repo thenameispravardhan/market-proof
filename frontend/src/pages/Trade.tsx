@@ -1755,9 +1755,6 @@ export default function Trade() {
                     Ticket{" "}
                     {!practice && <TicketModeBadge account={account} botMode={botMode} />}
                   </h2>
-                  {practice && (
-                    <div className="hint" data-testid="ticket-mode-note">Practice: paper money at the real Fyers price. Nothing goes to Fyers; trades show under Practice in Trade History.</div>
-                  )}
                   {!account && noAccountReason && (
                     <div className="hint warn-text" data-testid="ticket-mode-note">{noAccountReason}</div>
                   )}
@@ -2082,7 +2079,6 @@ export default function Trade() {
                       ))}
                     </div>
                   )}
-                  <span className="hint">drag a price onto a chart to open it there</span>
                 </div>
                 {/* ---- option chain (index underlyings + F&O stocks) ----
                      Indices always show the panel; a cash stock shows it only when
