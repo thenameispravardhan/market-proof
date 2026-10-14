@@ -16,7 +16,7 @@ import { Toggle } from "../common/Toggle";
 import type { GlobalSettings as GS } from "../../types";
 
 interface SourceSpec {
-  key: "NSE_API_ENABLED" | "BSE_API_ENABLED" | "NSE_RSS_ENABLED";
+  key: "NSE_API_ENABLED" | "BSE_API_ENABLED" | "NSE_RSS_ENABLED" | "BSE_RSS_ENABLED";
   label: string;
   statsKey: string; // MONITOR_TICK_STATS key: "<exchange>-<channel>"
   defaultOn: boolean;
@@ -38,7 +38,7 @@ const SOURCES: SourceSpec[] = [
     label: "BSE — announcements API",
     statsKey: "BSE-API",
     defaultOn: true,
-    hintOn: "The primary BSE channel — measured as the fastest publisher overall.",
+    hintOn: "The original BSE channel (fastest when it worked). Since Sep 2026 BSE answers scripted calls with 403 — use the BSE RSS feed below.",
     hintOff: "BSE filings are NOT being monitored — only enabled sources detect news.",
   },
   {
@@ -48,6 +48,14 @@ const SOURCES: SourceSpec[] = [
     defaultOn: false,
     hintOn: "Races the NSE API: the RSS feed was measured publishing some filings EARLIER than the API. Duplicates are collapsed automatically; company names that can't be exactly matched to a symbol are skipped (the API still delivers those).",
     hintOff: "Off (default). Enable to race the NSE RSS feed against the API — detection takes whichever channel publishes first.",
+  },
+  {
+    key: "BSE_RSS_ENABLED",
+    label: "BSE — official RSS feed",
+    statsKey: "BSE-RSS",
+    defaultOn: false,
+    hintOn: "BSE's own announcements feed (polled every BSE_RSS_POLL_SECONDS, default 5s). Since Sep 2026 BSE blocks scripted access to its API, so this is the working BSE channel. It's a rolling window of recent filings; if a burst ever scrolls past it between polls, a possible-gap warning is logged.",
+    hintOff: "Off. The BSE API currently returns 403 to scripts, so with this off no BSE filings are detected.",
   },
 ];
 

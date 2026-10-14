@@ -113,6 +113,15 @@ class Settings(BaseSettings):
     # polled faster than the Akamai-fronted APIs without a ban risk.
     # 0 = follow the global POLL_INTERVAL_SECONDS.
     NSE_RSS_POLL_SECONDS: float = 1.0
+    # BSE's official RSS feed (data/xml/announcements.xml). Added
+    # 2026-10-14 because BSE's Akamai edge now 403s every non-browser call
+    # to the announcements API (BSE_API_ENABLED delivers nothing). Default
+    # OFF like every new source; the operator opts in from News sources.
+    BSE_RSS_ENABLED: bool = False
+    # The feed is served with max-age=60 and no ETag, so every poll is a
+    # full ~12 KB download. 5s keeps detection well inside that cache
+    # window without hammering BSE. 0 = follow POLL_INTERVAL_SECONDS.
+    BSE_RSS_POLL_SECONDS: float = 5.0
 
     # ---------- Mover model (offline-trained P(mover), scored live) ----
     # The artifact is AIdataset/model/live_model.json; scoring is a dot
