@@ -281,9 +281,15 @@ def trade_timeline(
         return d.isoformat() if d else None
 
     out: list[dict[str, Any]] = []
+    # The bot's exit fill carries its entry's signal: show the chain once,
+    # on the first (oldest) fill of each signal.
+    first_fill = {}
+    for t in reversed(rows):
+        if t.signal_id:
+            first_fill.setdefault(t.signal_id, t.id)
     for t in rows:
         steps: list[dict[str, Any]] = []
-        sig = db.get(Signal, t.signal_id) if t.signal_id else None
+        sig = db.get(Signal, t.signal_id) if t.signal_id and first_fill.get(t.signal_id) == t.id else None
         an = db.get(Analysis, sig.analysis_id) if sig and sig.analysis_id else None
         ann = an.announcement if an else None
         if ann:
