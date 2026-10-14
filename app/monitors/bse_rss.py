@@ -77,8 +77,12 @@ class ScripCodeResolver:
             if len(row) < 14:
                 continue
             code, short = row[12].strip(), row[13].strip().upper()
-            # Cash equities only: an "-INDEX" ticker has no announcements.
-            if code.isdigit() and short and not row[9].strip().endswith("-INDEX"):
+            # Tradable equity only. The ticker suffix is BSE's group:
+            # -F = bonds/NCDs, -G = G-secs/T-bills, -INDEX = indices. A
+            # company filing is also tagged to its NCD codes (GMR Airports
+            # -> 5GMRAL27, 5GMRAL28A, ...); keep only the stock's copy.
+            group = row[9].strip().rsplit("-", 1)[-1]
+            if code.isdigit() and short and group not in ("F", "G", "INDEX"):
                 by_code[code] = short
         self._by_code = by_code
         self._loaded_at = time.monotonic()
