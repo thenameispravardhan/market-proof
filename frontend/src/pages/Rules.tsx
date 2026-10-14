@@ -41,7 +41,7 @@ export default function Rules() {
             ? "Editing rules for this strategy"
             : hasStrategies
               ? "Pick a strategy to add rules"
-              : "Create a strategy first"}
+              : "No strategy yet — the default one is created when the bot starts"}
         </span>
       </div>
       <div className="layout-2">

@@ -18,7 +18,6 @@ export type TabKey =
   | "chat"
   | "prompts"
   | "rules"
-  | "strategies"
   | "algo"
   | "accounts"
   | "notifications"
@@ -37,7 +36,6 @@ const VALID_TABS = new Set<TabKey>([
   "chat",
   "prompts",
   "rules",
-  "strategies",
   "algo",
   "accounts",
   "notifications",
