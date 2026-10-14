@@ -23,7 +23,7 @@
 // blocking codes and a "BYPASS" field that the operator must type
 // "I ACCEPT THE RISK" into before re-submitting.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   useBrokerAccounts,
@@ -249,11 +249,12 @@ const ORDER_TYPE_LABEL: Record<OrderType, string> = { MARKET: "Market", LIMIT: "
 
 // Right-dock panels, opened / closed from the icon bar. Several can be open;
 // they stack in this order.
-type DockId = "watch" | "details" | "trade" | "chain" | "flow" | "book" | "fno" | "data" | "tree" | "alerts";
+type DockId = "watch" | "details" | "trade" | "timeline" | "chain" | "flow" | "book" | "fno" | "data" | "tree" | "alerts";
 const DOCK: { id: DockId; label: string; short: string; icon: string; hint: string }[] = [
   { id: "watch", label: "Watchlist", short: "Watch", icon: "☰", hint: "Watchlist — search and switch symbols" },
   { id: "details", label: "Details & news", short: "Details", icon: "ⓘ", hint: "Symbol details, performance, technical rating and headlines" },
   { id: "trade", label: "Trade", short: "Trade", icon: "⇅", hint: "Quote and order ticket (buy / sell)" },
+  { id: "timeline", label: "Trade timeline", short: "Timeline", icon: "⋮", hint: "The bot's trades on this symbol: filing → detected → AI → signal → fill" },
   { id: "chain", label: "Option chain", short: "Chain", icon: "⊞", hint: "Option chain — click a price to trade that option" },
   { id: "flow", label: "Order flow", short: "Flow", icon: "Δ", hint: "Real order flow from recorded ticks" },
   { id: "book", label: "Market depth", short: "Depth", icon: "≣", hint: "DOM price ladder, 5-level depth with book imbalance, and time & sales" },
@@ -504,6 +505,69 @@ function FlowPanel({ symbol }: { symbol: string | null }) {
   );
 }
 
+// The bot's trades on this symbol as a flow, newest first: filing → detected →
+// AI decision → signal → fill (GET /api/trades/timeline). Exits and manual
+// orders have no signal, so they show as a lone fill.
+type TlStep = { kind: "filed" | "detected" | "analysis" | "signal" | "fill"; at: string | null; text?: string | null; exchange?: string;
+  recommendation?: string | null; confidence?: number | null; model?: string; action?: string; status?: string;
+  side?: string; qty?: number; price?: number; pnl?: number | null };
+function TimelinePanel({ symbol }: { symbol: string | null }) {
+  const [rows, setRows] = useState<{ trade_id: number; steps: TlStep[] }[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  useEffect(() => {
+    setRows(null);
+    if (!symbol) return;
+    let stop = false;
+    const load = () => fetch(`/api/trades/timeline?symbol=${encodeURIComponent(symbol)}`)
+      .then(async (r) => { if (!r.ok) throw new Error(`Couldn't load the timeline. ${httpError(r.status)}`); return r.json(); })
+      .then((d) => { if (!stop) { setRows(d); setErr(null); } })
+      .catch((e) => { if (!stop) setErr(e instanceof Error ? e.message : String(e)); });
+    void load();
+    window.addEventListener("broker:order", load);
+    return () => { stop = true; window.removeEventListener("broker:order", load); };
+  }, [symbol]);
+  if (!symbol) return <section className="trade-card"><div className="empty">Pick a symbol first.</div></section>;
+  const ms = (at: string | null) => (at ? Date.parse(/Z$|[+-]\d{2}:?\d{2}$/.test(at) ? at : `${at}Z`) : NaN);
+  const ist = (t: number) => (Number.isFinite(t) ? new Date(t + 19800000).toISOString().slice(11, 19) : "—");
+  const gap = (t: number, p: number) => {
+    if (!Number.isFinite(t) || !Number.isFinite(p)) return "";
+    const s = Math.max(0, Math.round((t - p) / 1000));
+    return s < 60 ? `+${s}s` : s < 3600 ? `+${Math.floor(s / 60)}m ${s % 60}s` : `+${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+  };
+  const label = (s: TlStep): ReactNode => {
+    switch (s.kind) {
+      case "filed": return <><b>Filed on {s.exchange}</b><div className="hint">{s.text}</div></>;
+      case "detected": return <><b>Detected</b> <span className="hint">{(s.text ?? "").split("/").pop()}</span></>;
+      case "analysis": return <><b>AI: {(s.recommendation ?? "—").toUpperCase()}{s.confidence != null ? ` · ${Math.round(s.confidence * 100)}%` : ""}</b> <span className="hint">{s.model}</span>
+        {s.text && <div className="hint" title={s.text}>{s.text.length > 160 ? `${s.text.slice(0, 160)}…` : s.text}</div>}</>;
+      case "signal": return <><b>Signal {s.action}</b> <span className="hint">{s.status}</span></>;
+      default: return <><b className={s.side === "SELL" ? "down" : "up"}>{s.side} {s.qty} @ {s.price?.toFixed(2)}</b>
+        {s.pnl != null && <span className={s.pnl >= 0 ? "up" : "down"}> · P&amp;L ₹{s.pnl.toFixed(2)}</span>}</>;
+    }
+  };
+  return (
+    <section className="trade-card" data-testid="trade-timeline">
+      <h2>Trade timeline — {symbol}</h2>
+      {err && <div className="hint warn-text">{err}</div>}
+      {rows && rows.length === 0 && <div className="empty">No filled trades on this symbol.</div>}
+      {rows?.map((r) => (
+        <ol key={r.trade_id} style={{ listStyle: "none", margin: "0 0 14px", padding: "0 0 0 12px", borderLeft: "2px solid var(--border, #333)" }}>
+          {r.steps.map((s, i) => {
+            const t = ms(s.at);
+            return (
+              <li key={i} style={{ margin: "0 0 6px", position: "relative" }}>
+                <span style={{ position: "absolute", left: -18, top: 5, width: 10, height: 10, borderRadius: 5, background: s.kind === "fill" ? (s.side === "SELL" ? "var(--red)" : "var(--green)") : "var(--accent, #888)" }} />
+                <span className="mono hint">{ist(t)} {i > 0 && gap(t, ms(r.steps[i - 1].at))}</span>
+                <div>{label(s)}</div>
+              </li>
+            );
+          })}
+        </ol>
+      ))}
+    </section>
+  );
+}
+
 const eqKey = (s: string) => { const [ex, name] = s.toUpperCase().includes(":") ? s.toUpperCase().split(":") : ["NSE", s.toUpperCase()]; return `${ex}:${name.replace(/-(EQ|BE)$/, "")}`; };
 
 export default function Trade() {
@@ -551,7 +615,9 @@ export default function Trade() {
   const [chainBase, setChainBase] = useState<InstrumentHit | null>(() => (isUnderlying(selected) ? selected : stored<InstrumentHit | null>("trade:chainBase", null)));
   const [dock, setDock] = useState<DockId[]>(() => {
     const v = stored<DockId[]>("trade:dock", DEFAULT_DOCK);
-    return Array.isArray(v) ? v.filter((x) => DOCK.some((d) => d.id === x)) : DEFAULT_DOCK;
+    const d = Array.isArray(v) ? v.filter((x) => DOCK.some((k) => k.id === x)) : DEFAULT_DOCK;
+    // Opened from a Trade History row: that trade's timeline goes on top.
+    return link.current?.entry ? ["timeline", ...d.filter((x) => x !== "timeline")] : d;
   });
   const [dockW, setDockW] = useState(() => Number(stored("trade:dockW", 340)) || 340);
   const [layout, setLayout] = useState<Layout>(() => stored<Layout>("trade:layout", "1"));
@@ -2133,6 +2199,13 @@ export default function Trade() {
                         <section className="trade-card"><div className="empty">{!chainBase ? "Open an index or F&O stock to see its option chain." : !chain ? "Loading chain…" : "No options listed for this symbol."}</div></section>
                       )}
               </div>
+            </section>
+          )}
+          {dock.includes("timeline") && (
+            <section className="dock-panel" data-testid="dock-timeline" style={panelStyle("timeline")}>
+              {dockGrip("timeline")}
+              {dockHead("timeline", selected?.short_name)}
+              <div className="dock-body"><TimelinePanel symbol={selected?.symbol ?? null} /></div>
             </section>
           )}
           {dock.includes("flow") && (

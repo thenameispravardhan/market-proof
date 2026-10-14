@@ -253,6 +253,57 @@ def list_trades(
     return [_ser_trade(t) for t in rows]
 
 
+@router.get("/api/trades/timeline")
+def trade_timeline(
+    symbol: str = Query(..., min_length=1, max_length=64, description="Short name, e.g. JSTL"),
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+) -> list[dict[str, Any]]:
+    """The chart's Timeline panel: each filled trade on `symbol`, newest
+    first, with the chain that caused it — filing → detected → AI decision →
+    signal → fill. Manual and exit trades have no signal: just the fill.
+
+    Trade rows store the bare name or a broker id ("JSTL" / "BSE:JSTL-X"),
+    so both forms match.
+    """
+    s = symbol.strip().upper()
+    if ":" in s:   # a broker id ends in its series (-EQ, -BE, BSE -A/-X…); a bare "MCDOWELL-N" doesn't
+        s = s.split(":", 1)[1].rsplit("-", 1)[0]
+    rows = db.execute(
+        select(Trade)
+        .where(Trade.status == "filled")
+        .where((func.upper(Trade.symbol) == s) | func.upper(Trade.symbol).like(f"%:{s}-%"))
+        .order_by(Trade.created_at.desc())
+        .limit(limit)
+    ).scalars().all()
+
+    def iso(d: Optional[datetime]) -> Optional[str]:
+        return d.isoformat() if d else None
+
+    out: list[dict[str, Any]] = []
+    for t in rows:
+        steps: list[dict[str, Any]] = []
+        sig = db.get(Signal, t.signal_id) if t.signal_id else None
+        an = db.get(Analysis, sig.analysis_id) if sig and sig.analysis_id else None
+        ann = an.announcement if an else None
+        if ann:
+            steps.append({"kind": "filed", "at": iso(ann.filed_at), "text": ann.headline, "exchange": ann.exchange})
+            steps.append({"kind": "detected", "at": iso(ann.received_at), "text": ann.source})
+        if an:
+            steps.append({
+                "kind": "analysis", "at": iso(an.created_at), "text": an.rationale,
+                "recommendation": an.recommendation, "confidence": an.confidence, "model": an.model,
+            })
+        if sig:
+            steps.append({"kind": "signal", "at": iso(sig.created_at), "action": sig.action, "status": sig.status})
+        steps.append({
+            "kind": "fill", "at": iso(t.executed_at or t.created_at), "side": t.side,
+            "qty": t.quantity, "price": t.price, "pnl": t.pnl, "order_id": t.broker_order_id,
+        })
+        out.append({"trade_id": t.id, "steps": steps})
+    return out
+
+
 class TradeDeleteRequest(BaseModel):
     ids: list[int] = Field(..., min_length=1, max_length=500)
 
