@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { carryPct, imbalance, payoffAt, payoffStats, tapeSide, type Leg } from "../components/trade/ProPanels";
+import { carryPct, imbalance, netDelta, optionDelta, payoffAt, payoffStats, tapeSide, type Leg } from "../components/trade/ProPanels";
 import { mergeLayouts } from "../components/trade/TradePanels";
 import { INDICATOR_BY_TYPE, newInstance } from "../components/trade/indicatorCatalog";
 import type { OhlcvCandle } from "../lib/indicators";
@@ -26,6 +26,26 @@ describe("strategy payoff", () => {
     expect(s.maxP).toBeCloseTo(4 * 50, 6);
     expect(s.maxL).toBeCloseTo(-(10 - 4) * 50, 6);
     expect(s.be).toHaveLength(2);
+  });
+  it("protective put: a held future plus a bought put caps the downside", () => {
+    const fut: Leg = { type: "FUT", strike: 100, side: 1, lots: 1, premium: 100, lot: 50, held: true };
+    const s = payoffStats([fut, leg("PE", 100, 1, 4)], 70, 130);
+    expect(payoffAt([fut], 90)).toBe(-500);
+    expect(s.maxL).toBeCloseTo(-4 * 50, 6);
+    expect(s.maxP).toBeNull();
+    expect(s.net).toBe(-200);                       // the future costs no premium
+  });
+  it("net delta: ATM call ~0.5, put-call parity, future = 1 per unit", () => {
+    const c = optionDelta(100, 100, 0.1, 2.0, "CE");
+    const p = optionDelta(100, 100, 0.1, 1.35, "PE");
+    expect(c).toBeGreaterThan(0.45);
+    expect(c).toBeLessThan(0.65);
+    expect(p).toBeLessThan(0);
+    const fut: Leg = { type: "FUT", strike: 100, side: 1, lots: 1, premium: 100, lot: 50 };
+    expect(netDelta([fut], 100, 0.1)).toBe(50);
+    const hedged = netDelta([fut, { ...leg("PE", 100, 1, 1.35), lot: 50 }], 100, 0.1);
+    expect(hedged).toBeGreaterThan(0);
+    expect(hedged).toBeLessThan(50);
   });
 });
 

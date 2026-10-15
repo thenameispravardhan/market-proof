@@ -325,6 +325,16 @@ async def build_legs(spec: dict, sym: str, side: str, u: float, now: float) -> l
     spot = chain.get("spot") or u
     legs = []
     for c in cfgs:
+        if not c["lots"]:
+            continue
+        if c["right"] == "FUT":
+            fs = fno.future_symbol(name, inst["expiry"], now)
+            if not fs:
+                raise ValueError(f"no {inst['expiry']} {name} future in the F&O master")
+            legs.append({"symbol": fs, "kind": "FUT", "act": 1 if c["action"] == "BUY" else -1,
+                         "per_set": lot_of(fs) * c["lots"], "label": fs.split(":")[-1],
+                         "price": (await _ltp([fs])).get(fs)})
+            continue
         key = c["right"].lower()
         if c["strike"] == "PREMIUM":
             cands = [r for r in rows if (r.get(key) or {}).get("ltp")]
