@@ -103,6 +103,43 @@ def _factories():
     return holder, data_factory, order_factory
 
 
+@pytest.mark.asyncio
+async def test_hung_sdk_close_does_not_freeze_the_reconnect():
+    """2026-10-15: the SDK's close_connection() joined a thread that never
+    finished, the loop awaited it forever, and the feed stayed down after the
+    morning login. A close must time out and the new login must reconnect."""
+    import threading
+
+    release = threading.Event()
+
+    class _HangingOrderSocket(_FakeOrderSocket):
+        def close_connection(self):
+            release.wait(30)
+
+    backend = _FakeBackend()
+    holder: dict = {}
+
+    def df(token, **cb):
+        holder["data"] = _FakeDataSocket(**cb)
+        holder["token"] = token
+        return holder["data"]
+
+    mgr = FyersStreamManager(
+        market_data=MarketDataBus(), backend_provider=lambda: backend,
+        data_socket_factory=df, order_socket_factory=lambda token, **cb: _HangingOrderSocket(**cb),
+        close_timeout_s=0.2,
+    )
+    mgr._loop = asyncio.get_running_loop()
+    try:
+        await mgr._ensure_connected()
+        backend.ws_access_token = "APP-100:new-token"    # the morning re-login
+        await asyncio.wait_for(mgr._ensure_connected(), 5)
+        assert holder["token"] == "APP-100:new-token"
+        assert mgr.status()["connected"] is True
+    finally:
+        release.set()
+
+
 # ---- data socket --------------------------------------------------------
 
 
