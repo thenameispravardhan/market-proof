@@ -22,11 +22,11 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.db.init import init_db
-from app.db.models import NotificationChannel
+from app.db.models import NotificationChannel, NotificationLog
 from app.db.session import get_db
 from app.logging_config import get_logger
 from app.notifications.base import NotificationResult, redact_config
@@ -138,8 +138,10 @@ def _keep_stored_secrets(
 def _validate_config_for_kind(kind: str, config: dict[str, Any]) -> None:
     """Per-kind required fields. Empty / missing → 422."""
     if kind == "telegram":
-        if not (config.get("bot_token") or "").strip():
-            raise HTTPException(422, detail="telegram: bot_token is required")
+        # The mask itself was once saved as the token ('***'): every alert
+        # then 404'd silently for a month. A placeholder is not a token.
+        if (config.get("bot_token") or "").strip() in _SECRET_PLACEHOLDERS:
+            raise HTTPException(422, detail="telegram: bot_token is required — paste the full token from @BotFather (123456789:AA…)")
         if not (config.get("chat_id") or "").strip():
             raise HTTPException(422, detail="telegram: chat_id is required")
     elif kind == "discord":
@@ -164,7 +166,24 @@ def _validate_config_for_kind(kind: str, config: dict[str, Any]) -> None:
 @router.get("/channels")
 def list_channels(db: Session = Depends(get_db)) -> dict[str, Any]:
     rows = db.execute(select(NotificationChannel).order_by(NotificationChannel.id.asc())).scalars().all()
-    return {"channels": [_serialize(c) for c in rows]}
+    # Each channel's latest delivery, so a channel that fails every send shows
+    # it on the page instead of only when someone presses Test.
+    last_ids = select(func.max(NotificationLog.id)).group_by(NotificationLog.channel_id)
+    last = {
+        r.channel_id: r
+        for r in db.execute(select(NotificationLog).where(NotificationLog.id.in_(last_ids))).scalars()
+    }
+
+    def with_last(c: NotificationChannel) -> dict[str, Any]:
+        r = last.get(c.id)
+        return {
+            **_serialize(c),
+            "last_status": r.status if r else None,
+            "last_error": (r.error or "")[:200] if r else None,
+            "last_at": r.sent_at.isoformat() if r and r.sent_at else None,
+        }
+
+    return {"channels": [with_last(c) for c in rows]}
 
 
 @router.post("/channels", status_code=status.HTTP_201_CREATED)

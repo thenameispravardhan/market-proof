@@ -75,6 +75,14 @@ export function ChannelList({ selectedId, onSelect, onNew }: Props) {
               <div className="body reason">
                 Sends: {!c.events_filter || c.events_filter.trim() === "*" ? "everything" : c.events_filter.split(",").join(", ")}
               </div>
+              {c.last_status === "failed" && (
+                <div className="body reason pnl-neg" data-testid={`channel-failing-${c.id}`} title={c.last_error ?? ""}>
+                  Last alert failed{c.last_at ? ` (${new Date(c.last_at.endsWith("Z") ? c.last_at : `${c.last_at}Z`).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })})` : ""}: {c.last_error}
+                </div>
+              )}
+              {c.last_status === "sent" && c.last_at && (
+                <div className="body reason pnl-pos">Last alert sent {new Date(c.last_at.endsWith("Z") ? c.last_at : `${c.last_at}Z`).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}</div>
+              )}
               {result?.id === c.id && (
                 <div className={`body reason ${result.ok ? "pnl-pos" : "pnl-neg"}`}>{result.text}</div>
               )}

@@ -195,3 +195,32 @@ def test_editing_a_channel_keeps_its_masked_secret(client):
     with SessionLocal() as db:
         assert db.get(NotificationChannel, cid).config["bot_token"] == "new-token"
     client.delete(f"/api/notifications/channels/{cid}")
+
+
+def test_a_mask_saved_as_the_token_is_refused_and_failures_show(client):
+    """Production: the token stored was literally '***' — every alert 404'd
+    for a month and the page never said so."""
+    assert client.post("/api/notifications/channels", json={
+        "name": "tg-mask", "kind": "telegram", "config": {"bot_token": "***", "chat_id": "42"},
+    }).status_code == 422
+
+    cid = client.post("/api/notifications/channels", json={
+        "name": "tg-broken", "kind": "telegram", "config": {"bot_token": "T", "chat_id": "42"},
+    }).json()["id"]
+    from app.db.models import NotificationChannel, NotificationLog
+    from app.db.session import SessionLocal
+    with SessionLocal() as db:   # the broken state production was in
+        c = db.get(NotificationChannel, cid)
+        c.config = {"bot_token": "***", "chat_id": "42"}
+        db.add(NotificationLog(channel_id=cid, event_type="report", status="failed", error="http 404: Not Found"))
+        db.commit()
+
+    # Re-saving the form with the token left masked can't keep the broken mask…
+    r = client.put(f"/api/notifications/channels/{cid}", json={"config": {"bot_token": "***", "chat_id": "42"}})
+    assert r.status_code == 422 and "BotFather" in r.text
+    # …and the list says the channel is failing.
+    row = next(c for c in client.get("/api/notifications/channels").json()["channels"] if c["id"] == cid)
+    assert row["last_status"] == "failed" and "404" in row["last_error"]
+    # Pasting the real token fixes it.
+    assert client.put(f"/api/notifications/channels/{cid}", json={"config": {"bot_token": "123:REAL", "chat_id": "42"}}).status_code == 200
+    client.delete(f"/api/notifications/channels/{cid}")
