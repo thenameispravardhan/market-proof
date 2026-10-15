@@ -163,6 +163,7 @@ class FyersStreamManager:
         silence_watchdog_s: float = 30.0,
         silence_reconnect_s: float = 60.0,
         reconnect_cooldown_s: float = 90.0,
+        close_timeout_s: float = 10.0,
     ) -> None:
         self._md = market_data
         self._quote_feed = quote_feed
@@ -205,6 +206,11 @@ class FyersStreamManager:
         self._silence_reconnect_s = float(silence_reconnect_s)
         self._reconnect_cooldown_s = float(reconnect_cooldown_s)
         self._last_forced_reconnect: float = 0.0
+        # The SDK's close_connection() joins its socket threads with no
+        # timeout. One that never returned froze this loop for good: on
+        # 2026-10-15 the token expired at 06:00, the close hung, and the
+        # feed never reconnected after the 08:29 login.
+        self._close_timeout = float(close_timeout_s)
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._data_socket: Optional[Any] = None
@@ -448,14 +454,22 @@ class FyersStreamManager:
         log.info("fyers_stream.order_resync", orders=len(book.get("orders") or []))
 
     async def _close_sockets(self) -> None:
-        for sock in (self._data_socket, self._order_socket):
+        for name, sock in (("data", self._data_socket), ("order", self._order_socket)):
             if sock is None:
                 continue
             try:
                 if self._loop is not None:
-                    await self._loop.run_in_executor(None, sock.close_connection)
+                    # ponytail: a timed-out close leaves one executor thread
+                    # blocked in the SDK until its threads exit; the socket is
+                    # abandoned and a fresh one is built. Fine at one per login.
+                    await asyncio.wait_for(
+                        self._loop.run_in_executor(None, sock.close_connection),
+                        self._close_timeout,
+                    )
                 else:
                     sock.close_connection()
+            except asyncio.TimeoutError:
+                log.warning("fyers_stream.close_timeout", socket=name, timeout_s=self._close_timeout)
             except Exception:  # noqa: BLE001
                 log.debug("fyers_stream.close_failed")
         self._data_socket = None
