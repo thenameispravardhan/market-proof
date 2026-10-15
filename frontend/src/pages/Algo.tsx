@@ -29,6 +29,7 @@ import { api } from "../api/client";
 import { useSessionState } from "../router";
 import { peekQuote, useQuoteTick } from "../hooks/useQuotes";
 import { Toggle } from "../components/common/Toggle";
+import { chartHref } from "../lib/chartLink";
 
 // ---------------------------------------------------------------------------
 // types
@@ -181,6 +182,20 @@ const pnlCls = (v: number | null | undefined) => (v === null || v === undefined 
 const ist = (epoch: number) =>
   new Date(epoch * 1000).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", year: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
 const isoIst = (iso: string | null) => (iso ? ist(Date.parse(iso.endsWith("Z") || iso.includes("+") ? iso : iso + "Z") / 1000) : "—");
+// The trade on the chart, 15-minute candles at its entry: an option trade
+// opens underlying | option side by side with BUY / SELL arrows on the
+// option leg; an equity trade opens its one chart with the arrows.
+const tradeChart = (t: LiveTrade): string => {
+  const leg = t.legs?.[0];
+  const legOf = (l: LiveLeg) => ({ side: (l.act > 0 ? "BUY" : "SELL") as "BUY" | "SELL", qty: l.qty, price: l.entry, exitPrice: l.exit ?? null, exitTime: t.exit_at });
+  if (leg && leg.symbol && leg.symbol !== t.symbol) {
+    return chartHref(t.symbol, t.entry_at, null, { iv: "15", pair: { symbol: leg.symbol, trade: legOf(leg) } });
+  }
+  const own = t.entry_price ? { side: (t.side === "SELL" ? "SELL" : "BUY") as "BUY" | "SELL", qty: t.quantity, price: t.entry_price, exitPrice: t.exit_price, exitTime: t.exit_at } : null;
+  return chartHref(t.symbol, t.entry_at, own, { iv: "15" });
+};
+// Panels the operator drags taller / shorter (native corner grip).
+const grow = (height?: number): React.CSSProperties => ({ resize: "vertical", overflow: "auto", minHeight: 60, ...(height ? { height } : {}) });
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 // The server takes 5–80% out-of-sample (0 = off); round a smaller number up instead of failing the run.
 const oosParam = (pct: number) => (pct > 0 ? Math.min(80, Math.max(5, pct)) : undefined);
@@ -1259,7 +1274,7 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
         {(strategies.data?.strategies ?? []).length === 0 ? (
           <div className="empty">No saved strategies yet — build one in the Builder & backtest tab and press “Save as new strategy”.</div>
         ) : (
-          <div style={{ overflowX: "auto" }}>
+          <div style={grow()} data-testid="algo-auto-panel">
             <table>
               <thead><tr><th>On</th><th>Strategy</th><th>Version</th><th>Symbols</th><th>Trades</th><th>TF</th><th>Mode</th><th>Open</th><th>Closed</th><th>Realised</th><th></th></tr></thead>
               <tbody>{strategies.data!.strategies.map((s) => (
@@ -1323,12 +1338,12 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
       <div className="widget widget-wide" style={{ marginBottom: 12 }}>
         <h3>Open positions {sel ? <span className="meta">— {nameOf(sel)}</span> : null} <span className="meta">· live MTM {inr(liveTotal)}</span></h3>
         {!openShown.length ? <div className="empty">flat</div> : (
-          <div style={{ overflowX: "auto" }}>
+          <div style={grow()} data-testid="algo-open-panel">
             <table>
               <thead><tr><th>Strategy</th><th>Instrument</th><th>Signal</th><th>Qty</th><th>Mode</th><th>Ref entry</th><th>Ref LTP</th><th>Stop</th><th>Trail</th><th>Target</th><th>MTM</th><th>Since</th></tr></thead>
               <tbody>{openShown.map((t) => (
                 <tr key={t.id} title={(t.legs ?? []).map((l) => `${l.act > 0 ? "BUY" : "SELL"} ${l.qty} ${l.label ?? l.symbol}: ${num(l.entry)} → ${num(l.ltp)}`).join("\n")}>
-                  <td>{nameOf(t.strategy_id)}</td><td>{(t.instrument ?? t.symbol).replace(/NSE:/g, "")}</td>
+                  <td>{nameOf(t.strategy_id)}</td><td><a href={tradeChart(t)} target="_blank" rel="noopener" className="sym-link" title="Open the chart at this trade (15m)">{(t.instrument ?? t.symbol).replace(/NSE:/g, "")}</a></td>
                   <td><span className={`badge ${t.side === "BUY" ? "buy" : "sell"}`}>{t.side === "BUY" ? "LONG" : "SHORT"}</span></td><td className="mono">{t.quantity}</td><td>{t.mode}</td>
                   <td className="mono">{num(t.entry_price)}</td><td className="mono"><AlgoLiveLtp t={t} /></td><td className="mono">{t.be_on ? `BE ${num(t.entry_price)}` : num(t.stop_loss)}</td>
                   <td className="mono">{num(t.trail_stop)}</td><td className="mono">{num(t.target)}</td>
@@ -1338,17 +1353,16 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
           </div>
         )}
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(380px, 1fr))", gap: 12 }}>
-        <div className="widget">
+      <div className="widget widget-wide" style={{ marginBottom: 12 }}>
           <h3>Trades {sel ? <span className="meta">— {nameOf(sel)} <button type="button" className="btn-sm" onClick={() => setSel(null)}>show all</button></span> : <span className="meta">— all strategies</span>}</h3>
           <div className="meta" data-testid="algo-trade-summary">{summary.n} closed · {summary.n ? Math.round((summary.wins / summary.n) * 100) : 0}% winners · net <span className={pnlCls(summary.net)}>{inr(summary.net)}</span> · open MTM <span className={pnlCls(liveTotal)}>{inr(liveTotal)}</span></div>
-          <div style={{ maxHeight: 420, overflow: "auto" }}>
+          <div style={grow(420)} data-testid="algo-trades-panel">
             {!trades.data?.trades.length ? <div className="empty">none yet</div> : (
               <table>
                 <thead><tr><th>Instrument</th><th>Signal</th><th>Qty</th><th>Status</th><th>Entry</th><th>Exit</th><th>Reason</th><th>Net</th></tr></thead>
                 <tbody>{trades.data.trades.map((t) => (
                   <tr key={t.id} title={[t.note ?? "", ...(t.legs ?? []).map((l) => `${l.act > 0 ? "BUY" : "SELL"} ${l.qty} ${l.label ?? l.symbol}: ${num(l.entry)} → ${num(l.exit)}`)].filter(Boolean).join("\n")}>
-                    <td>{(t.instrument ?? t.symbol).replace(/NSE:/g, "")}</td><td>{t.side === "BUY" ? "LONG" : "SHORT"}</td><td className="mono">{t.quantity}</td>
+                    <td><a href={tradeChart(t)} target="_blank" rel="noopener" className="sym-link" title="Open the chart at this trade (15m)">{(t.instrument ?? t.symbol).replace(/NSE:/g, "")}</a></td><td>{t.side === "BUY" ? "LONG" : "SHORT"}</td><td className="mono">{t.quantity}</td>
                     <td>{t.status}{t.mode === "live" ? " ₹" : ""}</td>
                     <td className="mono">{num(t.entry_price)} <span className="meta">{isoIst(t.entry_at)}</span></td>
                     <td className="mono">{num(t.exit_price)} <span className="meta">{t.exit_at ? isoIst(t.exit_at) : ""}</span></td>
@@ -1358,16 +1372,15 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
               </table>
             )}
           </div>
-        </div>
-        <div className="widget">
+      </div>
+      <div className="widget widget-wide">
           <h3>Runner log</h3>
-          <div style={{ maxHeight: 420, overflow: "auto", fontSize: 12 }}>
+          <div style={{ ...grow(320), fontSize: 12 }} data-testid="algo-log-panel">
             {!st?.events.length ? <div className="empty">quiet</div> : st.events.map((e, i) => (
               <div key={i} className="mono" style={{ color: e.level === "error" ? "var(--red)" : e.level === "entry" ? "var(--green)" : e.level === "exit" ? "var(--accent)" : "var(--text-dim)" }}>
                 {ist(e.t)} {e.msg}
               </div>))}
           </div>
-        </div>
       </div>
     </>
   );

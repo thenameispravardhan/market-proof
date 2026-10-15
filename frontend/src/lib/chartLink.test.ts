@@ -18,6 +18,18 @@ describe("chartHref", () => {
       entry: { side: "SELL", qty: 7, price: 812.5, at: Date.UTC(2026, 9, 12, 4) / 1000, exitPrice: 805, exitAt: Date.UTC(2026, 9, 12, 5) / 1000 },
     });
   });
+  it("pairs an option chart with its underlying (Algo Lab), 15m, arrows on the option only", () => {
+    const href = chartHref("NSE:NIFTY50-INDEX", "2026-10-15T09:15:03", null, {
+      iv: "15", pair: { symbol: "NSE:NIFTY26O1923000PE", trade: { side: "BUY", qty: 65, price: 130.85, exitPrice: 130.75, exitTime: "2026-10-15T09:31:53" } },
+    });
+    window.location.hash = href.split("#")[1];
+    const p = chartLinkParams()!;
+    expect(p.iv).toBe("15");
+    expect(p.hit.symbol).toBe("NSE:NIFTY50-INDEX");
+    expect(p.entry).toBeUndefined();
+    expect(p.hit2).toMatchObject({ symbol: "NSE:NIFTY26O1923000PE", lot_size: 0 });   // unknown lot: never trade it as 1
+    expect(p.entry2).toMatchObject({ side: "BUY", qty: 65, price: 130.85, exitPrice: 130.75, at: Date.UTC(2026, 9, 15, 9, 15, 3) / 1000, exitAt: Date.UTC(2026, 9, 15, 9, 31, 53) / 1000 });
+  });
   it("omits at without a time; popout links are not Trade links", () => {
     expect(chartHref("NSE:SBIN-EQ", null)).not.toContain("at=");
     window.location.hash = "/trade?popout=1&symbol=NSE:SBIN-EQ";

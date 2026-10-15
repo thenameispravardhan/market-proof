@@ -32,47 +32,71 @@ function epoch(iso: string | null | undefined): number | undefined {
   return Number.isNaN(t) ? undefined : Math.floor(t / 1000);
 }
 
+type LinkTrade = { side: "BUY" | "SELL"; qty: number; price: number; exitPrice?: number | null; exitTime?: string | null };
+
 /** `at`: ISO time. A bare name stays bare: the Trade page resolves it to its
  *  real listing (BSE-only scrips, -BE series), where forcing "NSE:X-EQ" made
- *  Fyers answer "Invalid symbol". */
+ *  Fyers answer "Invalid symbol". `opts.pair` opens a second chart beside the
+ *  first (2-chart layout): an Algo Lab option trade, underlying left, option
+ *  right with the trade's arrows. `opts.iv` overrides the Settings timeframe. */
 export function chartHref(
   symbol: string,
   at?: string | null,
-  trade?: { side: "BUY" | "SELL"; qty: number; price: number; exitPrice?: number | null; exitTime?: string | null } | null,
+  trade?: LinkTrade | null,
+  opts?: { iv?: string; pair?: { symbol: string; trade?: LinkTrade | null } },
 ): string {
-  const q = new URLSearchParams({ symbol: symbol.trim().toUpperCase(), iv: chartLinkIv() });
+  const q = new URLSearchParams({ symbol: symbol.trim().toUpperCase(), iv: opts?.iv ?? chartLinkIv() });
   const t = epoch(at);
   if (t) q.set("at", String(t));
-  if (trade && trade.price > 0) {
-    q.set("side", trade.side);
-    q.set("qty", String(trade.qty));
-    q.set("px", String(trade.price));
-    const xt = epoch(trade.exitTime);
-    if (xt && trade.exitPrice) {
-      q.set("xpx", String(trade.exitPrice));
-      q.set("xt", String(xt));
+  const put = (tr: LinkTrade | null | undefined, k: string) => {
+    if (!tr || !(tr.price > 0)) return;
+    q.set(`side${k}`, tr.side);
+    q.set(`qty${k}`, String(tr.qty));
+    q.set(`px${k}`, String(tr.price));
+    const xt = epoch(tr.exitTime);
+    if (xt && tr.exitPrice) {
+      q.set(`xpx${k}`, String(tr.exitPrice));
+      q.set(`xt${k}`, String(xt));
     }
+  };
+  put(trade, "");
+  if (opts?.pair) {
+    q.set("sym2", opts.pair.symbol.trim().toUpperCase());
+    put(opts.pair.trade, "2");
   }
   return `${window.location.pathname}#/trade?${q.toString()}`;
 }
 
 /** What a chartHref link asked the Trade page for, or null. A bare name
  *  comes back as `hit.symbol` without an exchange: pass it to resolveBareHit. */
-export function chartLinkParams(): { hit: InstrumentHit; iv: string | null; at: number | undefined; entry: ChartEntry | undefined } | null {
+export function chartLinkParams(): {
+  hit: InstrumentHit; iv: string | null; at: number | undefined; entry: ChartEntry | undefined;
+  hit2?: InstrumentHit; entry2?: ChartEntry;
+} | null {
   const q = new URLSearchParams(window.location.hash.split("?")[1] ?? "");
   const symbol = (q.get("symbol") ?? "").trim();
   if (!symbol || q.get("popout") === "1") return null;
-  const name = symbol.split(":").pop()!.replace(/-EQ$/, "");
   const at = Number(q.get("at")) || undefined;
-  const px = Number(q.get("px"));
+  // lot 0 = unknown: the ticket blocks orders until the real lot loads (a
+  // derivative opened from a link must never trade with a guessed lot of 1).
+  const hitOf = (s: string, lot: number): InstrumentHit => {
+    const name = s.split(":").pop()!.replace(/-EQ$/, "");
+    return { symbol: s, short_name: name, exchange: s.includes(":") ? s.split(":")[0] : "", segment: "", instrument_type: "", lot_size: lot, tick_size: 0.05, expiry: null, strike: null, underlying: null, display: name } as InstrumentHit;
+  };
+  const entryOf = (k: string): ChartEntry | undefined => {
+    const px = Number(q.get(`px${k}`));
+    return px > 0 ? {
+      side: q.get(`side${k}`) === "SELL" ? "SELL" : "BUY", qty: Number(q.get(`qty${k}`)) || 0, price: px, at,
+      exitPrice: Number(q.get(`xpx${k}`)) || undefined, exitAt: Number(q.get(`xt${k}`)) || undefined,
+    } : undefined;
+  };
+  const sym2 = (q.get("sym2") ?? "").trim();
   return {
-    hit: { symbol, short_name: name, exchange: symbol.includes(":") ? symbol.split(":")[0] : "", segment: "", instrument_type: "", lot_size: 1, tick_size: 0.05, expiry: null, strike: null, underlying: null, display: name } as InstrumentHit,
+    hit: hitOf(symbol, 1),
     iv: q.get("iv"),
     at,
-    entry: px > 0 ? {
-      side: q.get("side") === "SELL" ? "SELL" : "BUY", qty: Number(q.get("qty")) || 0, price: px, at,
-      exitPrice: Number(q.get("xpx")) || undefined, exitAt: Number(q.get("xt")) || undefined,
-    } : undefined,
+    entry: entryOf(""),
+    ...(sym2 ? { hit2: hitOf(sym2, 0), entry2: entryOf("2") } : {}),
   };
 }
 
