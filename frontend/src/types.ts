@@ -193,6 +193,10 @@ export interface NotificationChannel {
   events_filter: string | null;
   enabled: boolean;
   created_at: string;
+  /** The channel's latest delivery attempt ("sent" | "failed" | "skipped"). */
+  last_status?: string | null;
+  last_error?: string | null;
+  last_at?: string | null;
 }
 
 // ---- T7 types ----
