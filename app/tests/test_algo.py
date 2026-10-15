@@ -177,6 +177,25 @@ def test_option_legs_priced_and_sized_in_lots():
     assert t["charges"] > 40                                                                  # ₹20 x 2 orders + STT etc.
 
 
+def test_protective_put_fut_leg_and_hedge_switch():
+    """A FUT leg sits beside option legs (protective put); lots 0 switches a
+    leg off, so the optimiser can compare hedged against unhedged."""
+    closes = [24500, 24520, 24540, 24560] + [24560 - 60 * k for k in range(1, 8)]
+    legs = lambda pe_lots: [{"right": "FUT", "action": "BUY", "lots": 1},  # noqa: E731
+                            {"right": "PE", "action": "BUY", "strike": "ATM", "lots": pe_lots}]
+    spec = lambda pe_lots: _opt_spec(instrument={"type": "option", "expiry_kind": "weekly", "levels_on": "underlying",  # noqa: E731
+                                                 "iv": {"source": "fixed", "value": 14}, "legs_long": legs(pe_lots)})
+    hedged = engine.run(spec(1), {"N": _nifty(closes)})["trades"][0]
+    naked = engine.run(spec(0), {"N": _nifty(closes)})["trades"][0]
+    assert [lg["label"].split()[1] for lg in hedged["legs"]] == ["FUT", "02JAN25"] and len(naked["legs"]) == 1
+    assert naked["gross"] < hedged["gross"] < 0                     # the put paid back part of the fall
+    data = {"N": _nifty(closes)}
+    r = engine.optimize(spec(1), data, [{"path": "instrument.legs_long.1.lots", "values": [0, 1]}], min_trades=1)
+    assert r["combos"] == 2 and len(r["ranked"]) == 2
+    with pytest.raises(ValueError, match="at least one leg with lots"):
+        _opt_spec(instrument={"type": "option", "legs_long": [{"right": "PE", "action": "BUY", "lots": 0}]})
+
+
 def test_short_straddle_mtm_stop():
     closes = [24500, 24520, 24540, 24560] + [24560 + 60 * k for k in range(1, 12)]
     spec = _opt_spec(instrument={"type": "option", "expiry_kind": "weekly", "iv": {"source": "fixed", "value": 14},
@@ -243,6 +262,35 @@ def test_live_legs_from_chain(monkeypatch):
     assert legs[0]["symbol"] == "NSE:NIFTYX24650CE" and legs[0]["act"] == 1
     assert legs[1]["symbol"] == "NSE:NIFTYX24500PE" and legs[1]["act"] == -1
     assert rn._pick_expiry([1791000000, 1791600000, 1793095800], "monthly", "BANKNIFTY", "current") == 1793095800
+
+
+def test_live_fut_leg_beside_options(monkeypatch):
+    import asyncio
+
+    from app.algo import fno
+    from app.algo import runner as rn
+
+    chain = {"spot": 24537, "expiries": [{"ts": "1791000000"}],
+             "strikes": [{"strike": k, "pe": {"symbol": f"NSE:NIFTYX{k}PE", "ltp": 90}} for k in range(24400, 24700, 50)]}
+
+    class B:
+        async def get_option_chain(self, sym, strikecount=10, timestamp=""):
+            return chain
+
+    async def ltp(syms):
+        return {s: 24560.0 for s in syms}
+
+    monkeypatch.setattr(rn.data, "_backend", lambda: B())
+    monkeypatch.setattr(rn, "_ltp", ltp)
+    monkeypatch.setattr(fno, "future_symbol", lambda name, which, now=None: "NSE:NIFTY26OCTFUT")
+    monkeypatch.setattr(fno, "contract_lot", lambda sym, now=None: 65)
+    spec = _opt_spec(instrument={"type": "option", "levels_on": "underlying", "legs_long": [
+        {"right": "FUT", "action": "BUY", "lots": 1}, {"right": "PE", "action": "BUY", "strike": "ATM", "lots": 1},
+        {"right": "CE", "action": "SELL", "strike": "OTM", "steps": 2, "lots": 0}]})
+    legs = asyncio.run(rn.build_legs(spec, "NSE:NIFTY50-INDEX", "BUY", 24537, 1790000000))
+    assert [(lg["symbol"], lg["kind"], lg["act"], lg["per_set"]) for lg in legs] == [
+        ("NSE:NIFTY26OCTFUT", "FUT", 1, 65), ("NSE:NIFTYX24550PE", "PE", 1, 65)]
+    assert legs[0]["price"] == 24560.0
 
 
 def test_runner_paper_straddle_mtm(monkeypatch, isolated_db):

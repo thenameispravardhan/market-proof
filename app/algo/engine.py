@@ -197,18 +197,22 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
     multi = False
     for key, used in (("legs_long", s["direction"] != "short"), ("legs_short", s["direction"] != "long")):
         legs = inst.get(key) or []
-        if opt and used and not legs:
-            raise ValueError(f"options need at least one leg in {key}")
         for lg in legs:
-            if lg.get("right") not in ("CE", "PE") or lg.get("action") not in ("BUY", "SELL"):
-                raise ValueError("each leg needs right CE|PE and action BUY|SELL")
+            # FUT = the underlying's future in the same position: a protective
+            # put / covered call / collar is FUT + option legs.
+            if lg.get("right") not in ("CE", "PE", "FUT") or lg.get("action") not in ("BUY", "SELL"):
+                raise ValueError("each leg needs right CE|PE|FUT and action BUY|SELL")
             if lg.get("strike", "ATM") not in STRIKE_MODES:
                 raise ValueError(f"strike must be one of {STRIKE_MODES}")
             lg["strike"] = lg.get("strike", "ATM")
             lg["steps"] = _num(lg.get("steps", 0), "strike steps", 0, integer=True)
             lg["premium"] = _num(lg.get("premium", 100), "target premium", 0.05)
-            lg["lots"] = _num(lg.get("lots", 1), "leg lots", 1, integer=True)
-        multi = multi or (opt and used and len(legs) > 1)
+            # 0 lots = leg switched off, so the optimiser can sweep a hedge on / off.
+            lg["lots"] = _num(lg.get("lots", 1), "leg lots", 0, integer=True)
+        active = [lg for lg in legs if lg["lots"]]
+        if opt and used and not active:
+            raise ValueError(f"options need at least one leg with lots in {key}")
+        multi = multi or (opt and used and len(active) > 1)
 
     for key, kinds in (("stop_loss", ("pct", "points", "atr")), ("target", ("pct", "points", "atr", "rr")),
                        ("trailing", ("pct", "points", "atr")), ("breakeven", ("pct", "points", "atr"))):
@@ -751,6 +755,13 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         else:
             step = float(meta.get("step") or fno.default_step(meta["name"], u))
             for cfg in inst["legs_long" if side == "BUY" else "legs_short"]:
+                if not cfg["lots"]:
+                    continue
+                if cfg["right"] == "FUT":          # priced on spot, like a future-type strategy
+                    exp = fno.expiry_after(meta["name"], meta["exch"], "monthly", inst["expiry"], t, tdays)
+                    legs.append({"kind": "FUT", "act": 1 if cfg["action"] == "BUY" else -1, "exp": exp,
+                                 "per_set": lot * cfg["lots"], "label": f"{meta['name']} FUT {fno.label_date(exp)}"})
+                    continue
                 exp = fno.expiry_after(meta["name"], meta["exch"], inst["expiry_kind"], inst["expiry"], t, tdays)
                 tyrs = fno.years_to(exp, t)
                 if cfg["strike"] == "PREMIUM":

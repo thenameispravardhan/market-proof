@@ -2238,7 +2238,7 @@ export default function Trade() {
               {dockGrip("fno")}
               {dockHead("fno", chainBase?.short_name)}
               <div className="dock-body">
-                <FnoPanel base={chainBase ?? selected} chain={chain} tab={deskTab.fno} onTab={(t) => setDeskTab((x) => ({ ...x, fno: t }))} onOpen={(h) => onSelect(h, true)} />
+                <FnoPanel base={chainBase ?? selected} chain={chain} tab={deskTab.fno} onTab={(t) => setDeskTab((x) => ({ ...x, fno: t }))} onOpen={(h) => onSelect(h, true)} positions={positions} accountId={accountId} />
               </div>
             </section>
           )}

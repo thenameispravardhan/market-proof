@@ -48,7 +48,7 @@ type Operand = {
 type Cond = { left: Operand; op: string; right?: Operand };
 type Group = { logic: "AND" | "OR"; conditions: (Cond | Group)[] };
 type Level = { type: string; value: number; atr_period?: number; activate?: number } | null;
-type Leg = { right: "CE" | "PE"; action: "BUY" | "SELL"; strike: string; steps: number; premium: number; lots: number };
+type Leg = { right: "CE" | "PE" | "FUT"; action: "BUY" | "SELL"; strike: string; steps: number; premium: number; lots: number };
 type Instrument = {
   type: "equity" | "future" | "option";
   expiry: "current" | "next";
@@ -173,7 +173,7 @@ const N = (value: number): Operand => ({ value });
 const A = (o: Operand, ago: number): Operand => ({ ...o, offset: ago });
 const C = (left: Operand, op: string, right?: Operand): Cond => ({ left, op, right });
 const G = (conditions: (Cond | Group)[], logic: "AND" | "OR" = "AND"): Group => ({ logic, conditions });
-const L = (right: "CE" | "PE", action: "BUY" | "SELL", strike = "ATM", steps = 0, lots = 1, premium = 100): Leg => ({ right, action, strike, steps, premium, lots });
+const L = (right: Leg["right"], action: "BUY" | "SELL", strike = "ATM", steps = 0, lots = 1, premium = 100): Leg => ({ right, action, strike, steps, premium, lots });
 const clone = <T,>(x: T): T => JSON.parse(JSON.stringify(x)) as T;
 const inr = (v: number | null | undefined, dp = 0) =>
   v === null || v === undefined || Number.isNaN(v) ? "—" : `₹${v.toLocaleString("en-IN", { maximumFractionDigits: dp, minimumFractionDigits: dp })}`;
@@ -321,6 +321,7 @@ function numericPaths(spec: Spec, cat: Catalog): { path: string; label: string; 
     (["legs_long", "legs_short"] as const).forEach((side) => spec.instrument[side].forEach((lg, i) => {
       if (lg.strike === "ITM" || lg.strike === "OTM") out.push({ path: `instrument.${side}.${i}.steps`, label: `${side} leg ${i + 1} ${lg.right} strikes ${lg.strike}`, value: lg.steps });
       if (lg.strike === "PREMIUM") out.push({ path: `instrument.${side}.${i}.premium`, label: `${side} leg ${i + 1} ${lg.right} target premium`, value: lg.premium });
+      if (spec.instrument[side].length > 1) out.push({ path: `instrument.${side}.${i}.lots`, label: `${side} leg ${i + 1} ${lg.action} ${lg.right} lots (0 = off: hedged vs unhedged)`, value: lg.lots });
     }));
   }
   out.push({ path: "max_trades_per_day", label: "max trades / day", value: spec.max_trades_per_day });
@@ -557,6 +558,11 @@ const LEG_PRESETS: { name: string; long: Leg[]; short: Leg[] }[] = [
   { name: "Short straddle", long: [L("CE", "SELL"), L("PE", "SELL")], short: [L("CE", "SELL"), L("PE", "SELL")] },
   { name: "Short strangle (3 OTM)", long: [L("CE", "SELL", "OTM", 3), L("PE", "SELL", "OTM", 3)], short: [L("CE", "SELL", "OTM", 3), L("PE", "SELL", "OTM", 3)] },
   { name: "Iron fly (hedged straddle)", long: [L("CE", "SELL"), L("PE", "SELL"), L("CE", "BUY", "OTM", 4), L("PE", "BUY", "OTM", 4)], short: [L("CE", "SELL"), L("PE", "SELL"), L("CE", "BUY", "OTM", 4), L("PE", "BUY", "OTM", 4)] },
+  { name: "Iron condor (hedged strangle)", long: [L("CE", "SELL", "OTM", 2), L("PE", "SELL", "OTM", 2), L("CE", "BUY", "OTM", 4), L("PE", "BUY", "OTM", 4)], short: [L("CE", "SELL", "OTM", 2), L("PE", "SELL", "OTM", 2), L("CE", "BUY", "OTM", 4), L("PE", "BUY", "OTM", 4)] },
+  // Hedged futures: the future carries the view, the option caps the loss / pays for itself.
+  { name: "Protective put / call (FUT + option)", long: [L("FUT", "BUY"), L("PE", "BUY")], short: [L("FUT", "SELL"), L("CE", "BUY")] },
+  { name: "Covered call / put (FUT − option)", long: [L("FUT", "BUY"), L("CE", "SELL", "OTM", 2)], short: [L("FUT", "SELL"), L("PE", "SELL", "OTM", 2)] },
+  { name: "Collar (FUT + put − call)", long: [L("FUT", "BUY"), L("PE", "BUY", "OTM", 1), L("CE", "SELL", "OTM", 2)], short: [L("FUT", "SELL"), L("CE", "BUY", "OTM", 1), L("PE", "SELL", "OTM", 2)] },
 ];
 
 const DRAFT_KEY = "algo.draft.v2";
@@ -810,16 +816,16 @@ function LegsEditor({ legs, onChange, title }: { legs: Leg[]; onChange: (l: Leg[
             <option value="BUY">BUY</option><option value="SELL">SELL</option>
           </select>
           <select value={lg.right} onChange={(e) => set(i, { right: e.target.value as Leg["right"] })}>
-            <option value="CE">CE (call)</option><option value="PE">PE (put)</option>
+            <option value="CE">CE (call)</option><option value="PE">PE (put)</option><option value="FUT">FUT (future)</option>
           </select>
-          <select value={strikeKey(lg)} title="strikes are counted in the underlying's strike steps" onChange={(e) => {
+          {lg.right !== "FUT" && <select value={strikeKey(lg)} title="strikes are counted in the underlying's strike steps" onChange={(e) => {
             const m = e.target.value.match(/^(ITM|OTM)(\d+)$/);
             set(i, m ? { strike: m[1], steps: Number(m[2]) } : { strike: e.target.value, steps: 0 });
           }}>
             {STRIKES.map((k) => <option key={k} value={k}>{k === "PREMIUM" ? "closest to premium ₹" : k.replace(/(\d+)$/, " $1")}</option>)}
-          </select>
-          {lg.strike === "PREMIUM" && <label className="meta">₹<NumInput width={56} value={lg.premium} onChange={(n) => set(i, { premium: n ?? 100 })} /></label>}
-          <label className="meta">lots <NumInput width={40} value={lg.lots} onChange={(n) => set(i, { lots: Math.max(1, Math.floor(n ?? 1)) })} /></label>
+          </select>}
+          {lg.right !== "FUT" && lg.strike === "PREMIUM" && <label className="meta">₹<NumInput width={56} value={lg.premium} onChange={(n) => set(i, { premium: n ?? 100 })} /></label>}
+          <label className="meta" title="0 = leg off (the optimiser can sweep a hedge on / off)">lots <NumInput width={40} value={lg.lots} onChange={(n) => set(i, { lots: Math.max(0, Math.floor(n ?? 1)) })} /></label>
           <button type="button" className="btn-sm danger" onClick={() => onChange(legs.filter((_, j) => j !== i))}>✕</button>
         </div>
       ))}
@@ -1261,7 +1267,7 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
     if (!i || i.type === "equity") return "equity";
     if (i.type === "future") return `futures · ${i.expiry}`;
     const legs = (s.spec.direction === "short" ? i.legs_short : i.legs_long) ?? [];
-    return `options · ${i.expiry_kind} ${i.expiry} · ${legs.map((l) => `${l.action[0]} ${l.strike === "PREMIUM" ? `₹${l.premium}` : l.strike + (l.steps ? l.steps : "")} ${l.right}`).join(", ")}`;
+    return `options · ${i.expiry_kind} ${i.expiry} · ${legs.filter((l) => l.lots).map((l) => l.right === "FUT" ? `${l.action[0]} FUT` : `${l.action[0]} ${l.strike === "PREMIUM" ? `₹${l.premium}` : l.strike + (l.steps ? l.steps : "")} ${l.right}`).join(", ")}`;
   };
   return (
     <>
@@ -1672,7 +1678,7 @@ export default function Algo() {
   const showLong = spec.direction !== "short";
   const showShort = spec.direction !== "long";
   const fno = inst.type !== "equity";
-  const multi = inst.type === "option" && ((showLong && inst.legs_long.length > 1) || (showShort && inst.legs_short.length > 1));
+  const multi = inst.type === "option" && ((showLong && inst.legs_long.filter((l) => l.lots).length > 1) || (showShort && inst.legs_short.filter((l) => l.lots).length > 1));
   const sizingModes = c.sizing.filter((m) => (fno ? m !== "qty" : m !== "lots"));
   const SIZE_LABEL: Record<string, string> = {
     qty: "fixed shares", lots: "fixed lots", amount: "₹ capital per trade", pct_equity: "% of equity per trade",

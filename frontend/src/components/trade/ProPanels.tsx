@@ -2,12 +2,15 @@
 //   DepthPanel     DOM price ladder + 5-level market depth + book imbalance
 //   TapePanel      Time & Sales built from the live tick stream
 //   FuturesPanel   futures chain with basis and annualised carry
-//   StrategyPanel  multi-leg options payoff (max P/L, breakevens)
-// All prices come from Fyers (depth / quotes / chain). Nothing here places an
-// order — every click prefills the ticket, which keeps its own confirm.
+//   StrategyPanel  multi-leg payoff (max P/L, breakevens), the held position as
+//                  a leg, net delta, and "Place legs" (bought legs first)
+// All prices come from Fyers (depth / quotes / chain). Apart from the strategy
+// builder's own confirmed "Place legs", every click prefills the ticket, which
+// keeps its own confirm.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { InstrumentHit, OptionChainResponse } from "../../types";
+import type { InstrumentHit, OptionChainResponse, Position } from "../../types";
+import { usePlaceOrder } from "../../hooks/useApi";
 import { useLiveQuote } from "../../hooks/useQuotes";
 import { useDepth } from "../../hooks/useDepth";
 
@@ -287,11 +290,14 @@ export function FuturesPanel({ base, onOpen }: { base: InstrumentHit | null; onO
 // Strategy builder (options payoff)
 // ---------------------------------------------------------------------------
 
-export interface Leg { type: "CE" | "PE"; strike: number; side: 1 | -1; lots: number; premium: number; lot: number }
+/** FUT = any linear leg (future or the cash stock): `premium` is its entry price.
+ *  `held` legs are open positions (never re-placed); `mark` is the live LTP. */
+export interface Leg { type: "CE" | "PE" | "FUT"; strike: number; side: 1 | -1; lots: number; premium: number; lot: number; symbol?: string; held?: boolean; mark?: number | null }
 
 /** P&L at expiry for an underlying price. */
 export function payoffAt(legs: Leg[], x: number): number {
   return legs.reduce((acc, l) => {
+    if (l.type === "FUT") return acc + l.side * (x - l.premium) * l.lots * l.lot;
     const intrinsic = l.type === "CE" ? Math.max(0, x - l.strike) : Math.max(0, l.strike - x);
     return acc + l.side * (intrinsic - l.premium) * l.lots * l.lot;
   }, 0);
@@ -309,15 +315,48 @@ export function payoffStats(legs: Leg[], lo: number, hi: number, n = 400) {
   }
   // Net call exposure above the top strike makes a side unlimited; the put
   // side is bounded by the underlying at 0, so it is evaluated there.
-  const upSlope = legs.reduce((a, l) => a + (l.type === "CE" ? l.side * l.lots * l.lot : 0), 0);
+  const upSlope = legs.reduce((a, l) => a + (l.type !== "PE" ? l.side * l.lots * l.lot : 0), 0);
   const atZero = payoffAt(legs, 0);
   const maxP = upSlope > 0 ? null : Math.max(...ys, atZero);
   const maxL = upSlope < 0 ? null : Math.min(...ys, atZero);
-  return { xs, ys, be, maxP, maxL, net: legs.reduce((a, l) => a - l.side * l.premium * l.lots * l.lot, 0) };
+  return { xs, ys, be, maxP, maxL, net: legs.reduce((a, l) => a - (l.type === "FUT" ? 0 : l.side * l.premium * l.lots * l.lot), 0) };
 }
 
-export function StrategyPanel({ chain }: { chain: OptionChainResponse | undefined }) {
+const RISK_FREE = 0.065;   // same as app/algo/fno.py
+/** Standard normal CDF (Abramowitz–Stegun 7.1.26, |error| < 1.5e-7). */
+function ncdf(x: number): number {
+  const t = 1 / (1 + (0.3275911 * Math.abs(x)) / Math.SQRT2);
+  const y = 1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp((-x * x) / 2);
+  return x >= 0 ? (1 + y) / 2 : (1 - y) / 2;
+}
+function d1(s: number, k: number, t: number, iv: number) { return (Math.log(s / k) + (RISK_FREE + (iv * iv) / 2) * t) / (iv * Math.sqrt(t)); }
+function bs(s: number, k: number, t: number, iv: number, type: "CE" | "PE") {
+  const a = d1(s, k, t, iv), b = a - iv * Math.sqrt(t), df = Math.exp(-RISK_FREE * t);
+  return type === "CE" ? s * ncdf(a) - k * df * ncdf(b) : k * df * ncdf(-b) - s * ncdf(-a);
+}
+/** Black-Scholes delta of one option at the IV its price implies (bisection). */
+export function optionDelta(s: number, k: number, t: number, price: number, type: "CE" | "PE"): number {
+  let lo = 0.01, hi = 3;
+  for (let i = 0; i < 50; i++) { const m = (lo + hi) / 2; if (bs(s, k, t, m, type) > price) hi = m; else lo = m; }
+  const n = ncdf(d1(s, k, t, (lo + hi) / 2));
+  return type === "CE" ? n : n - 1;
+}
+/** Net delta in underlying units: the position's ₹ P&L per 1-point move of the underlying. */
+export function netDelta(legs: Leg[], spot: number, tYears: number): number {
+  return legs.reduce((a, l) => a + l.side * l.lots * l.lot * (l.type === "FUT" ? 1 : optionDelta(spot, l.strike, tYears, l.mark ?? l.premium, l.type)), 0);
+}
+
+export function StrategyPanel({ chain, base, positions, accountId }: { chain: OptionChainResponse | undefined; base?: InstrumentHit | null; positions?: Position[]; accountId?: number | null }) {
   const [legs, setLegs] = useState<Leg[]>([]);
+  const [fut, setFut] = useState<{ lot: number | null; futures: FutRow[] }>({ lot: null, futures: [] });
+  useEffect(() => {
+    if (!base) return;
+    void fetch(`/api/algo/instrument?symbol=${encodeURIComponent(base.symbol)}`).then((r) => r.json())
+      .then((j) => setFut({ lot: j.lot ?? null, futures: Array.isArray(j.futures) ? j.futures : [] }))
+      .catch(() => setFut({ lot: null, futures: [] }));
+  }, [base?.symbol]); // eslint-disable-line react-hooks/exhaustive-deps
+  const place = usePlaceOrder();
+  const [msg, setMsg] = useState<string | null>(null);
   const strikes = chain?.strikes ?? [];
   const spot = chain?.spot ?? null;
   const atmIdx = useMemo(() => {
@@ -331,7 +370,46 @@ export function StrategyPanel({ chain }: { chain: OptionChainResponse | undefine
     const s = strikes[Math.max(0, Math.min(strikes.length - 1, i))];
     const o = s?.[type === "CE" ? "ce" : "pe"];
     if (!s || !o) return null;
-    return { type, strike: s.strike, side, lots, premium: o.ltp ?? 0, lot: o.lot_size || 1 };
+    return { type, strike: s.strike, side, lots, premium: o.ltp ?? 0, lot: o.lot_size || 1, symbol: o.symbol, mark: o.ltp };
+  };
+  // Open positions on this underlying (its options, futures, or the stock) as held legs.
+  const bare = (x: string) => x.toUpperCase().replace(/^NSE:|-EQ$/g, "");
+  const held: Leg[] = (positions ?? []).filter((p) => p.quantity !== 0).flatMap((p): Leg[] => {
+    const sym = p.symbol.toUpperCase();
+    const side = (p.quantity > 0 ? 1 : -1) as 1 | -1;
+    const q = Math.abs(p.quantity);
+    for (const s of strikes) {
+      for (const t of ["CE", "PE"] as const) {
+        const o = s[t === "CE" ? "ce" : "pe"];
+        if (o?.symbol.toUpperCase() === sym) return [{ type: t, strike: s.strike, side, lots: q, lot: 1, premium: p.average_price, symbol: p.symbol, held: true, mark: o.ltp ?? p.last_price }];
+      }
+    }
+    const linear = (base != null && bare(sym) === bare(base.symbol)) || fut.futures.some((f) => f.symbol.toUpperCase() === sym);
+    return linear ? [{ type: "FUT", strike: p.average_price, side, lots: q, lot: 1, premium: p.average_price, symbol: p.symbol, held: true }] : [];
+  });
+  const expTs = Number(chain?.selected_expiry ?? chain?.expiries[0]?.ts);
+  // ponytail: years to the listed expiry timestamp, no session-close / holiday adjustment.
+  const tYears = Number.isFinite(expTs) ? Math.max((expTs - Date.now() / 1000) / (365 * 86400), 1 / (365 * 24)) : null;
+  const placeLegs = async () => {
+    const todo = legs.filter((l) => !l.held).sort((a, b) => b.side - a.side);   // bought legs first (margin)
+    if (!todo.length || accountId == null) return;
+    const chainLot = (sym?: string) => strikes.flatMap((s) => [s.ce, s.pe]).find((o) => o?.symbol === sym)?.lot_size ?? null;
+    if (todo.some((l) => !l.symbol || !chainLot(l.symbol))) { setMsg("Lot size unknown for a leg (F&O master not loaded). Nothing placed."); return; }
+    const lines = todo.map((l) => `${l.side > 0 ? "BUY" : "SELL"} ${l.lots * l.lot} ${l.symbol}`);
+    if (!window.confirm(`${accountId === -1 ? "PAPER" : "REAL MONEY (Fyers)"}: place ${todo.length} intraday market orders, bought legs first?\n\n${lines.join("\n")}\n\nIf a leg fails, the rest are NOT sent and legs already sent stay open.`)) return;
+    const done: string[] = [];
+    for (const [i, l] of todo.entries()) {
+      try {
+        const r = await place.mutateAsync({ account_id: accountId, symbol: l.symbol!, side: l.side > 0 ? "BUY" : "SELL", quantity: l.lots * l.lot,
+          order_type: "MARKET", product_type: "INTRADAY", operator: "ui_strategy_builder" });
+        if (r.ok === false || r.blocked || r.status === "REJECTED" || r.status === "REJECTED_RISK") throw new Error(r.error || r.risk_message || r.status);
+        done.push(`${lines[i]} (${r.status})`);
+      } catch (e) {
+        setMsg(`Stopped at ${lines[i]}: ${(e as Error).message}. ${done.length ? `Already sent: ${done.join("; ")}. Close them from Positions if the structure is now one-sided.` : "Nothing was sent."}`);
+        return;
+      }
+    }
+    setMsg(`Sent: ${done.join("; ")}`);
   };
   const preset = (name: string) => {
     const a = atmIdx;
@@ -367,6 +445,12 @@ export function StrategyPanel({ chain }: { chain: OptionChainResponse | undefine
           <button key={p} type="button" className="btn-sm" onClick={() => preset(p)}>{p}</button>
         ))}
       </div>
+      {held.length > 0 && (
+        <div className="strat-presets">
+          <button type="button" className="btn-sm" title="Add your open position(s) on this underlying as legs, then add the hedge"
+            onClick={() => setLegs([...legs.filter((l) => !l.held), ...held])}>+ My position ({held.length})</button>
+        </div>
+      )}
       <div className="strat-add">
         <select value={pick.side} onChange={(e) => setPick({ ...pick, side: Number(e.target.value) as 1 | -1 })} aria-label="Side"><option value={1}>Buy</option><option value={-1}>Sell</option></select>
         <select value={pick.idx < 0 ? atmIdx : pick.idx} onChange={(e) => setPick({ ...pick, idx: Number(e.target.value) })} aria-label="Strike">
@@ -378,14 +462,14 @@ export function StrategyPanel({ chain }: { chain: OptionChainResponse | undefine
       </div>
       {legs.length > 0 && (
         <table className="dom-table strat-legs">
-          <thead><tr><th>Side</th><th>Strike</th><th>Type</th><th>Lots</th><th>Prem</th><th /></tr></thead>
+          <thead><tr><th>Side</th><th>Strike</th><th>Type</th><th>Qty</th><th>Prem</th><th /></tr></thead>
           <tbody>
             {legs.map((l, i) => (
               <tr key={i}>
-                <td className={l.side > 0 ? "up" : "down"}>{l.side > 0 ? "B" : "S"}</td>
-                <td>{l.strike}</td>
-                <td>{l.type}</td>
-                <td>{l.lots}×{l.lot}</td>
+                <td className={l.side > 0 ? "up" : "down"}>{l.side > 0 ? "B" : "S"}{l.held ? " · held" : ""}</td>
+                <td>{l.type === "FUT" ? "—" : l.strike}</td>
+                <td title={l.symbol}>{l.type === "FUT" ? (l.symbol?.toUpperCase().endsWith("FUT") ? "FUT" : "Stock") : l.type}</td>
+                <td>{l.lots * l.lot}</td>
                 <td>{fmt(l.premium)}</td>
                 <td><button type="button" className="chart-menu-x" onClick={() => setLegs(legs.filter((_, j) => j !== i))} aria-label="Remove leg">✕</button></td>
               </tr>
@@ -408,7 +492,24 @@ export function StrategyPanel({ chain }: { chain: OptionChainResponse | undefine
             <span>{st.net >= 0 ? "Net credit" : "Net debit"} <b>₹{Math.abs(Math.round(st.net)).toLocaleString("en-IN")}</b></span>
             <span>Breakeven <b>{st.be.length ? st.be.map((b) => b.toFixed(0)).join(" / ") : "—"}</b></span>
           </div>
-          <div className="hint">Payoff at expiry, spot ±10%. Premiums are current LTPs; costs and slippage not included.</div>
+          {spot != null && tYears != null && (() => {
+            const d = netDelta(legs, spot, tYears);
+            const lot = fut.lot ?? strikes[atmIdx]?.ce?.lot_size ?? null;
+            const n = lot ? Math.round(-d / lot) : 0;
+            return (
+              <div className="dom-stats" title="Black-Scholes delta at the IV each option's price implies: ₹ gained per 1-point rise of the underlying">
+                <span>Net delta <b>{Math.round(d).toLocaleString("en-IN")}</b></span>
+                <span>Neutralise <b>{!lot ? "—" : n === 0 ? `under ½ FUT lot (${lot})` : `${n > 0 ? "buy" : "sell"} ${Math.abs(n)} FUT lot${Math.abs(n) > 1 ? "s" : ""}`}</b></span>
+              </div>
+            );
+          })()}
+          <div className="hint">Payoff at expiry, spot ±10%. New legs at current LTPs, held legs at their average price. Costs and slippage not included.</div>
+          {accountId != null && legs.some((l) => !l.held) && (
+            <button type="button" className="btn-sm" disabled={place.isPending} onClick={() => void placeLegs()}>
+              {place.isPending ? "placing…" : `Place ${legs.filter((l) => !l.held).length} new leg(s) · ${accountId === -1 ? "paper" : "Fyers"}`}
+            </button>
+          )}
+          {msg && <div className="hint">{msg}</div>}
         </>
       )}
     </div>
@@ -441,12 +542,12 @@ export function BookPanel(p: { symbol: string | null; tick: number; tab: DeskTab
   );
 }
 
-export function FnoPanel(p: { base: InstrumentHit | null; chain: OptionChainResponse | undefined; tab: DeskTab; onTab: (t: DeskTab) => void; onOpen: (h: InstrumentHit) => void }) {
+export function FnoPanel(p: { base: InstrumentHit | null; chain: OptionChainResponse | undefined; tab: DeskTab; onTab: (t: DeskTab) => void; onOpen: (h: InstrumentHit) => void; positions?: Position[]; accountId?: number | null }) {
   const tab = p.tab === "strategy" ? "strategy" : "futures";
   return (
     <>
       <Tabs tabs={[["futures", "Futures chain"], ["strategy", "Strategy builder"]]} tab={tab} onTab={p.onTab} />
-      {tab === "futures" ? <FuturesPanel base={p.base} onOpen={p.onOpen} /> : <StrategyPanel chain={p.chain} />}
+      {tab === "futures" ? <FuturesPanel base={p.base} onOpen={p.onOpen} /> : <StrategyPanel chain={p.chain} base={p.base} positions={p.positions} accountId={p.accountId} />}
     </>
   );
 }
