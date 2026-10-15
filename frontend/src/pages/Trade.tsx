@@ -609,7 +609,8 @@ export default function Trade() {
     }
   }, []);
   useEffect(() => {
-    if (link.current && selected && selected.symbol !== link.current.hit.symbol) link.current = null;
+    // A paired link (underlying + option) stays while either of its charts is picked.
+    if (link.current && selected && selected.symbol !== link.current.hit.symbol && selected.symbol !== link.current.hit2?.symbol) link.current = null;
   }, [selected]);
   // The chain stays on the last UNDERLYING picked, so clicking one of its
   // options (which opens that option's chart + ticket) keeps the chain up.
@@ -621,11 +622,22 @@ export default function Trade() {
     return link.current?.entry ? ["timeline", ...d.filter((x) => x !== "timeline")] : d;
   });
   const [dockW, setDockW] = useState(() => Number(stored("trade:dockW", 340)) || 340);
-  const [layout, setLayout] = useState<Layout>(() => stored<Layout>("trade:layout", "1"));
-  const [cells, setCells] = useState<(InstrumentHit | null)[]>(() => stored("trade:cells", []));
+  // A paired link (Algo Lab option trade) opens two charts side by side:
+  // the underlying left, the option right.
+  const pair = link.current?.hit2 ? [link.current.hit, link.current.hit2] : null;
+  const [layout, setLayout] = useState<Layout>(() => {
+    if (!pair) return stored<Layout>("trade:layout", "1");
+    try { tabLocal.setItem("trade:layout", JSON.stringify("2")); } catch { /* best-effort */ }
+    return "2";
+  });
+  const [cells, setCells] = useState<(InstrumentHit | null)[]>(() => {
+    if (!pair) return stored("trade:cells", []);
+    try { tabLocal.setItem("trade:cells", JSON.stringify(pair)); } catch { /* best-effort */ }
+    return pair;
+  });
   // The active cell is persisted with the cells: the last-open symbol belongs
   // to it, so restoring it into cell 0 overwrote that cell's chart on reload.
-  const [activeCell, setActiveCellState] = useState(() => Math.max(0, Number(stored("trade:activeCell", 0)) || 0));
+  const [activeCell, setActiveCellState] = useState(() => (pair ? 0 : Math.max(0, Number(stored("trade:activeCell", 0)) || 0)));
   const setActiveCell = (i: number) => {
     setActiveCellState(i);
     try { tabLocal.setItem("trade:activeCell", JSON.stringify(i)); } catch { /* best-effort */ }
@@ -724,7 +736,7 @@ export default function Trade() {
   useEffect(() => { if (activeCell >= nCells) setActiveCell(0); }, [activeCell, nCells]);  // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     setCells((c) => {
-      if (sync.symbol && selected) {
+      if (sync.symbol && selected && !link.current?.hit2) {
         if (Array.from({ length: nCells }, (_, i) => c[i]?.symbol).every((x) => x === selected.symbol)) return c;
         const n = Array.from({ length: Math.max(nCells, c.length) }, () => selected);
         try { tabLocal.setItem("trade:cells", JSON.stringify(n)); } catch { /* best-effort */ }
@@ -1480,8 +1492,8 @@ export default function Trade() {
                         key={h.symbol}
                         symbol={h.symbol}
                         shortName={h.short_name}
-                        at={active && link.current?.hit.symbol === h.symbol ? link.current.at : undefined}
-                        entry={active && link.current?.hit.symbol === h.symbol ? link.current.entry : undefined}
+                        at={link.current && (link.current.hit.symbol === h.symbol || link.current.hit2?.symbol === h.symbol) ? link.current.at : undefined}
+                        entry={link.current?.hit.symbol === h.symbol ? link.current.entry : link.current?.hit2?.symbol === h.symbol ? link.current.entry2 : undefined}
                         brokerLines={active && tset.showOrders ? brokerLines : undefined}
                         onPickPrice={active ? onPickPrice : undefined}
                         position={tset.showPos ? positionFor(h.symbol) : null}
