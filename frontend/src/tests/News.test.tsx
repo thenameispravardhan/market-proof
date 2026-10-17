@@ -75,3 +75,32 @@ describe("News page", () => {
     expect(puts[1]).toMatchObject({ interval_s: 45, watchlist: ["Reliance", "RBI"] });
   });
 });
+
+describe("News page: full text from the scraper", () => {
+  it("shows a TEXT badge and opens the extracted article in a reader", async () => {
+    const withText = [{ ...ITEMS[1], extract: { status: "done", chars: 2400, error: null } },
+      { ...ITEMS[0], extract: { status: "blocked", chars: 0, error: "robots.txt" } }];
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/api/news/article")) return json({
+        status: "done", text: "Full article body about TCS results.", words: 6, date: now,
+        meta: { author: "Asha Rao", tags: ["Earnings"] }, tables: [[["Quarter", "Revenue"], ["Q2", "1234"]]], images: [],
+      });
+      if (url.includes("/api/news/items")) return json({ items: url.includes("since_id") ? [] : withText, max_id: 3 });
+      if (url.includes("/api/news/status")) return json({
+        settings: { ...SETTINGS, enabled: true, extract: true, extract_sources: { BSE: true, Moneycontrol: true } },
+        known_sources: ["BSE", "Moneycontrol"], collector: { polls: 1, last_poll_at: null, last_poll_ms: null }, sources: [],
+        extract: { handed: 2, by_status: { done: 1, blocked: 1 }, with_text: 1, paused: [] },
+      });
+      return json({}, 404);
+    }) as unknown as typeof fetch;
+    render(<News />);
+    expect((await screen.findByTitle("robots.txt")).textContent).toBe("blocked");   // why there is no text, on hover
+    fireEvent.click(screen.getByRole("button", { name: /TEXT/ }));
+    const reader = await screen.findByTestId("news-reader");
+    expect(within(reader).getByText(/Full article body/)).toBeTruthy();
+    expect(within(reader).getByText(/Asha Rao/)).toBeTruthy();
+    expect(within(reader).getByText("1234")).toBeTruthy();                // table rendered
+    expect(screen.getByTestId("news-extract")).toBeTruthy();              // full-text stats panel
+  });
+});

@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>News Wire</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#15181d; --mute:#5d6673; --line:#e3e6eb; --accent:#1f6feb;
+          --ok:#1a7f37; --warn:#b35900; --bad:#cf222e; --new:#fff6d6; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0e1116; --card:#161b22; --ink:#e6edf3; --mute:#8b949e;
+          --line:#2a313c; --accent:#58a6ff; --ok:#3fb950; --warn:#d29922; --bad:#f85149; --new:#2b2611; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { position:sticky; top:0; z-index:2; background:var(--card); border-bottom:1px solid var(--line); padding:12px 16px; }
+  .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; max-width:1200px; margin:0 auto; }
+  h1 { font-size:18px; margin:0; letter-spacing:.2px; }
+  #status { color:var(--mute); font-size:12px; margin-left:auto; }
+  #status b { color:var(--ink); font-weight:600; }
+  input[type=search] { flex:1; min-width:180px; max-width:360px; padding:7px 10px; border:1px solid var(--line);
+          border-radius:8px; background:var(--bg); color:var(--ink); font:inherit; }
+  main { max-width:1200px; margin:0 auto; padding:16px; display:grid; grid-template-columns:300px 1fr; gap:16px; }
+  @media (max-width: 860px) { main { grid-template-columns:1fr; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; }
+  .card h2 { font-size:12px; text-transform:uppercase; letter-spacing:.6px; color:var(--mute); margin:0 0 10px; }
+  .src { display:grid; grid-template-columns:10px 1fr auto; gap:8px; align-items:center; padding:6px 4px;
+          border-radius:6px; cursor:pointer; }
+  .src:hover, .src.on { background:var(--bg); }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--ok); }
+  .dot.paused, .dot.restricted, .dot.rate_limited { background:var(--bad); }
+  .dot.network, .dot.outage, .dot.budget { background:var(--warn); }
+  .src .n { color:var(--mute); font-variant-numeric:tabular-nums; font-size:12px; }
+  .bar { grid-column:2 / 4; height:4px; background:var(--line); border-radius:2px; overflow:hidden; }
+  .bar i { display:block; height:100%; background:var(--accent); }
+  .detail { grid-column:2 / 4; color:var(--bad); font-size:11px; }
+  #hist { display:flex; align-items:flex-end; gap:2px; height:70px; margin-top:4px; }
+  #hist div { flex:1; background:var(--accent); opacity:.75; border-radius:2px 2px 0 0; min-height:1px; }
+  .axis { display:flex; justify-content:space-between; color:var(--mute); font-size:11px; margin-top:4px; }
+  .item { display:grid; grid-template-columns:110px 1fr; gap:12px; padding:10px 6px; border-bottom:1px solid var(--line); }
+  .item:last-child { border-bottom:0; }
+  .item.fresh { background:var(--new); border-radius:6px; }
+  .meta { color:var(--mute); font-size:12px; }
+  .badge { display:inline-block; font-size:11px; font-weight:600; padding:1px 7px; border-radius:10px;
+          border:1px solid var(--line); margin-bottom:3px; white-space:nowrap; }
+  .item a { color:var(--ink); text-decoration:none; font-weight:600; }
+  .item a:hover { color:var(--accent); text-decoration:underline; }
+  .sum { color:var(--mute); font-size:13px; margin-top:2px; display:-webkit-box; -webkit-line-clamp:2;
+          -webkit-box-orient:vertical; overflow:hidden; }
+  #empty { color:var(--mute); padding:24px; text-align:center; }
+  #err { color:var(--bad); font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="row">
+    <h1>News Wire</h1>
+    <input type="search" id="q" placeholder="Filter headlines (e.g. Reliance, Nifty, results)" aria-label="Filter headlines">
+    <span id="status">connecting…</span>
+  </div>
+</header>
+<main>
+  <aside>
+    <div class="card">
+      <h2>Sources · last 24 h</h2>
+      <div id="sources"></div>
+      <div id="err"></div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <h2>Headlines per hour · last 24 h</h2>
+      <div id="hist"></div>
+      <div class="axis"><span>-24h</span><span>-12h</span><span>now</span></div>
+    </div>
+  </aside>
+  <section class="card">
+    <h2 id="listhead">Latest</h2>
+    <div id="list"></div>
+    <div id="empty" hidden>No headlines yet: the first poll takes a few seconds.</div>
+  </section>
+</main>
+<script>
+const EVERY = 20000;
+let all = [], since = 0, pick = null, fresh = new Set();
+const $ = id => document.getElementById(id);
+const ago = s => { s = Math.max(0, Date.now() / 1000 - s);
+  return s < 60 ? `${s | 0}s ago` : s < 3600 ? `${s / 60 | 0}m ago` : s < 86400 ? `${s / 3600 | 0}h ago` : `${s / 86400 | 0}d ago`; };
+const when = it => { const t = Date.parse(it.published); return isNaN(t) ? it.seen : t / 1000; };
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+
+async function load() {
+  try {
+    const [items, st] = await Promise.all([
+      fetch(`/api/items?since=${since}&limit=${since ? 500 : 1500}`).then(r => r.json()),
+      fetch('/api/stats').then(r => r.json())]);
+    if (since) items.forEach(it => fresh.add(it.url));
+    const known = new Set(all.map(i => i.url));
+    all = items.filter(i => !known.has(i.url)).concat(all).slice(0, 3000);
+    since = Math.max(since, ...all.map(i => i.seen), 0);
+    drawSources(st); drawHist(); drawList();
+    const c = st.collector;
+    $('status').innerHTML = '';
+    $('status').append('poll every ', el('b', '', `${st.every}s`), ` · ${c.polls} polls · last ${c.last_poll ? ago(c.last_poll) : '—'}`
+      + (c.poll_secs != null ? ` (${c.poll_secs}s)` : '') + ` · X: ${c.x}`);
+    $('err').textContent = c.error || '';
+  } catch (e) { $('status').textContent = 'collector unreachable: ' + e.message; }
+}
+
+function drawSources(st) {
+  const box = $('sources'); box.innerHTML = '';
+  const rows = Object.entries(st.sources).sort((a, b) => b[1].day - a[1].day);
+  const max = Math.max(1, ...rows.map(([, s]) => s.day));
+  for (const [name, s] of rows) {
+    const r = el('div', 'src' + (pick === name ? ' on' : ''));
+    r.title = s.detail || s.state;
+    r.append(el('span', 'dot ' + s.state), el('span', '', name),
+      el('span', 'n', `${s.day} · ${s.hour}/h`));
+    const bar = el('div', 'bar'), fill = el('i'); fill.style.width = (100 * s.day / max) + '%'; bar.append(fill); r.append(bar);
+    if (s.state !== 'ok') r.append(el('div', 'detail', `${s.state}${s.detail ? ': ' + s.detail : ''}`));
+    r.onclick = () => { pick = pick === name ? null : name; drawSources(st); drawList(); };
+    box.append(r);
+  }
+}
+
+function drawHist() {
+  const now = Date.now() / 1000, bins = new Array(24).fill(0);
+  for (const it of all) { const h = Math.floor((now - when(it)) / 3600); if (h >= 0 && h < 24) bins[23 - h]++; }
+  const max = Math.max(1, ...bins), box = $('hist'); box.innerHTML = '';
+  bins.forEach((n, i) => { const d = el('div'); d.style.height = (100 * n / max) + '%'; d.title = `${23 - i}h ago: ${n}`; box.append(d); });
+}
+
+function drawList() {
+  const q = $('q').value.trim().toLowerCase();
+  const shown = all.filter(it => (!pick || it.source === pick) &&
+    (!q || (it.title || '').toLowerCase().includes(q) || (it.summary || '').toLowerCase().includes(q)))
+    .sort((a, b) => when(b) - when(a))
+    .filter((it, i, arr) => arr.findIndex(o => o.source === it.source && o.title === it.title) === i)   // same story in two feeds
+    .slice(0, 400);
+  $('listhead').textContent = `Latest${pick ? ' · ' + pick : ''}${q ? ` · "${q}"` : ''} · ${shown.length}`;
+  const box = $('list'); box.innerHTML = '';
+  $('empty').hidden = all.length > 0;
+  for (const it of shown) {
+    const row = el('div', 'item' + (fresh.has(it.url) ? ' fresh' : ''));
+    const meta = el('div', 'meta'); meta.append(el('span', 'badge', it.source), el('div', '', ago(when(it))));
+    const body = el('div'), a = el('a', '', it.title || it.url);
+    if (/^https?:\/\//.test(it.url)) { a.href = it.url; a.target = '_blank'; a.rel = 'noopener noreferrer'; }
+    body.append(a);
+    if (it.summary) body.append(el('div', 'sum', it.summary.replace(/<[^>]*>/g, ' ')));
+    row.append(meta, body); box.append(row);
+  }
+}
+
+$('q').addEventListener('input', drawList);
+load(); setInterval(load, EVERY);
+</script>
+</body>
+</html>

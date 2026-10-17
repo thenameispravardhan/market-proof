@@ -331,6 +331,7 @@ async def lifespan(app: FastAPI):
     tick_task: asyncio.Task[None] | None = None
     fno_master_task: asyncio.Task[None] | None = None
     news_task: asyncio.Task[None] | None = None
+    news_extract_task: asyncio.Task[None] | None = None
     if not settings.TESTING:
         # T3: start the analyzer before the monitors so its event-bus
         # subscription is live before the first `announcements.new`
@@ -568,6 +569,8 @@ async def lifespan(app: FastAPI):
         from app.services.news_wire import news_wire
 
         news_task = asyncio.create_task(news_wire.run(), name="news-wire")
+        # Full article text via scraper/scrape.py: idles until "Fetch full article text" is on.
+        news_extract_task = asyncio.create_task(news_wire.run_extract(), name="news-extract")
 
     try:
         yield
@@ -575,7 +578,7 @@ async def lifespan(app: FastAPI):
         if not settings.TESTING:
             # Stop the breaker monitor first.
             for _t in (risk_monitor_task, dataset_eod_task, ai_schedule_task, algo_task, tick_task,
-                       fno_master_task, news_task):
+                       fno_master_task, news_task, news_extract_task):
                 if _t is not None:
                     _t.cancel()
                     try:

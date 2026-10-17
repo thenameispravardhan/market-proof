@@ -37,6 +37,12 @@ fyers-apiv3==3.1.6
 # legacy URL/metadata prompt path.
 PyMuPDF==1.25.1
 
+# News page full-text extraction: scraper/scrape.py (article text, metadata, tables, PDF text). Imported
+# only when "Fetch full article text" is on; never on the trading path.
+trafilatura==2.3.1
+protego==0.7.0
+pypdf==6.20.1
+
 # Testing
 pytest==8.3.4
 pytest-asyncio==0.24.0

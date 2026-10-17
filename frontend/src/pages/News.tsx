@@ -7,17 +7,22 @@ import { api } from "../api/client";
 import { Toggle } from "../components/common/Toggle";
 import { Check, Modal, Num, Row, Section, Sel } from "../components/trade/chartUi";
 
-interface Item { id: number; url: string; source: string; title: string; summary: string | null; published_at: string | null; seen_at: string }
+interface Extract { status: string | null; chars: number; error: string | null }
+interface Item { id: number; url: string; source: string; title: string; summary: string | null; published_at: string | null; seen_at: string; extract?: Extract | null }
+interface Article { status: string; error?: string | null; title?: string | null; date?: string | null; text?: string; words?: number;
+  meta?: Record<string, unknown>; tables?: (string[][] | { caption: string; rows: string[][] })[]; images?: string[] }
 interface Feed { source: string; url: string; custom?: boolean }
 interface Settings {
   enabled: boolean; interval_s: number; sources: Record<string, boolean>; custom_feeds: Feed[];
   watchlist: string[]; muted: string[]; alerts: boolean; retention_days: number;
+  extract: boolean; extract_sources: Record<string, boolean>;
 }
 interface SourceRow {
   source: string; url: string; custom: boolean; enabled: boolean; health: string; last_ok: number | null;
   error: string | null; paused_until: number | null; items_in_feed: number; hour: number; day: number; total: number; last_item: string | null;
 }
-interface Status { settings: Settings; sources: SourceRow[]; known_sources: string[]; collector: { polls: number; last_poll_at: number | null; last_poll_ms: number | null } }
+interface ExtractStats { handed: number; by_status: Record<string, number>; with_text: number; paused: { host: string; until: number; reason: string }[] }
+interface Status { settings: Settings; sources: SourceRow[]; known_sources: string[]; extract?: ExtractStats; collector: { polls: number; last_poll_at: number | null; last_poll_ms: number | null } }
 interface Prefs { notify: boolean; sound: boolean; compact: boolean; summaries: boolean; window: number }
 
 const WINDOWS: { v: number; l: string }[] = [{ v: 1, l: "1h" }, { v: 6, l: "6h" }, { v: 24, l: "24h" }, { v: 168, l: "7d" }, { v: 0, l: "All" }];
@@ -63,9 +68,14 @@ export default function News() {
   const [prefs, setPrefsState] = useState<Prefs>(loadPrefs);
   const [showSettings, setShowSettings] = useState(false);
   const [fresh, setFresh] = useState<Set<number>>(new Set());
+  const [deep, setDeep] = useState(false);
+  const [deepItems, setDeepItems] = useState<Item[] | null>(null);
+  const [open, setOpen] = useState<number | null>(null);
   const maxId = useRef(0);
   const frozenRef = useRef(false);
   frozenRef.current = frozen;
+  const itemsRef = useRef<Item[]>([]);
+  itemsRef.current = items;
 
   const setPrefs = (p: Partial<Prefs>) => setPrefsState((cur) => {
     const next = { ...cur, ...p };
@@ -107,6 +117,15 @@ export default function News() {
         else setItems((cur) => [...res.items, ...cur].slice(0, 4000));
       }
       maxId.current = Math.max(maxId.current, res.max_id);
+      if (!first && st.settings.extract) {   // the scraper finishes articles after their headline arrived: ask again
+        const waiting = itemsRef.current.filter((i) => !i.extract || i.extract.status === "queued" || i.extract.status === "deferred")
+          .slice(0, 200).map((i) => i.id);
+        if (waiting.length) {
+          const upd = await api.get<{ items: Item[] }>(`/api/news/items?limit=300&ids=${waiting.join(",")}`);
+          const byId = new Map(upd.items.map((i) => [i.id, i.extract]));
+          setItems((cur) => cur.map((i) => (byId.has(i.id) ? { ...i, extract: byId.get(i.id) } : i)));
+        }
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -119,6 +138,16 @@ export default function News() {
     return () => clearInterval(t);
   }, [load, every]);
 
+  useEffect(() => {                         // "in article text": the server searches the scraper's stored text
+    if (!deep || !q.trim()) { setDeepItems(null); return; }
+    const t = setTimeout(() => {
+      const hours = prefs.window ? `&hours=${prefs.window}` : "";
+      api.get<{ items: Item[] }>(`/api/news/items?deep=true&limit=500&q=${encodeURIComponent(q.trim())}${hours}`)
+        .then((r) => setDeepItems(r.items)).catch(() => setDeepItems([]));
+    }, 400);
+    return () => clearTimeout(t);
+  }, [deep, q, prefs.window]);
+
   const unfreeze = () => { setItems((cur) => [...pending, ...cur].slice(0, 4000)); setPending([]); setFrozen(false); };
 
   const shown = useMemo(() => {
@@ -126,15 +155,15 @@ export default function News() {
     const ql = q.trim().toLowerCase();
     const mutedRe = muted.length ? new RegExp(muted.map(esc).join("|"), "i") : null;
     const seen = new Set<string>();
-    return items
+    return (deepItems ?? items)
       .filter((i) => (!cut || when(i) >= cut) && (!picked.size || picked.has(i.source))
-        && (!ql || `${i.title} ${i.summary ?? ""}`.toLowerCase().includes(ql))
+        && (deepItems !== null || !ql || `${i.title} ${i.summary ?? ""}`.toLowerCase().includes(ql))
         && !(mutedRe && mutedRe.test(i.title))
         && (!watchOnly || (watchRe && watchRe.test(`${i.title} ${i.summary ?? ""}`))))
       .sort((a, b) => when(b) - when(a))
       .filter((i) => { const k = `${i.source}|${i.title}`; if (seen.has(k)) return false; seen.add(k); return true; })   // same story in two feeds
       .slice(0, 500);
-  }, [items, prefs.window, picked, q, muted, watchOnly, watchRe]);
+  }, [items, deepItems, prefs.window, picked, q, muted, watchOnly, watchRe]);
 
   const counts = useMemo(() => {
     const c: Record<string, number> = {};
@@ -198,6 +227,8 @@ export default function News() {
 
       <div className="news-toolbar">
         <input type="search" placeholder="Search headlines…" value={q} onChange={(e) => setQ(e.target.value)} aria-label="Search headlines" />
+        <Toggle size="sm" on={deep} onChange={setDeep} label="In article text" disabled={!settings?.extract}
+          title={settings?.extract ? "Also search the full text the scraper extracted" : "Turn on full text in Settings"} />
         {WINDOWS.map((w) => <button key={w.v} type="button" className={`chip${prefs.window === w.v ? " on" : ""}`} onClick={() => setPrefs({ window: w.v })}>{w.l}</button>)}
         <Toggle size="sm" on={watchOnly} onChange={setWatchOnly} label="Watchlist only" disabled={!watch.length} title={watch.length ? "" : "Add watchlist words in Settings"} />
         <Toggle size="sm" on={frozen} onChange={(v) => (v ? setFrozen(true) : unfreeze())} label="Pause list" />
@@ -226,7 +257,11 @@ export default function News() {
                       ? <a href={i.url} target="_blank" rel="noopener noreferrer" className="news-title"><Highlight text={i.title} words={watch} /></a>
                       : <span className="news-title"><Highlight text={i.title} words={watch} /></span>}
                     {fresh.has(i.id) && <span className="badge-new">NEW</span>}
+                    <TextBadge e={i.extract} open={open === i.id}
+                      on={!!settings?.extract && (settings.extract_sources[i.source] ?? true) && Date.now() - Date.parse(i.seen_at) < 12 * 3600_000}
+                      onClick={() => setOpen(open === i.id ? null : i.id)} />
                     {prefs.summaries && !prefs.compact && i.summary && <div className="news-sum"><Highlight text={i.summary} words={watch} /></div>}
+                    {open === i.id && <Reader url={i.url} words={watch} />}
                   </div>
                 </article>
               );
@@ -248,6 +283,20 @@ export default function News() {
               ))}
             </div>
           </div>
+          {settings?.extract && status?.extract && (
+            <div className="widget" style={{ marginTop: 12 }} data-testid="news-extract">
+              <h3>Full text · your scraper</h3>
+              <div className="widget-body">
+                <div className="news-src"><span className="news-dot ok" /><span>articles with text</span><span className="mono">{status.extract.with_text}</span></div>
+                {Object.entries(status.extract.by_status).filter(([k]) => k !== "done").map(([k, n]) => (
+                  <div key={k} className="news-src">
+                    <span className={`news-dot ${k === "queued" || k === "deferred" ? "waiting" : "error"}`} /><span>{k}</span><span className="mono">{n}</span>
+                  </div>
+                ))}
+                {status.extract.paused.map((p) => <div key={p.host} className="news-src-err">{p.host} paused until {ist(p.until * 1000)}: {p.reason}</div>)}
+              </div>
+            </div>
+          )}
           <div className="widget" style={{ marginTop: 12 }}>
             <h3>Headlines per hour · 24h</h3>
             <div className="widget-body">
@@ -262,6 +311,48 @@ export default function News() {
         <SettingsModal initial={settings} status={status} prefs={prefs} setPrefs={setPrefs}
           onSave={async (s) => { await saveSettings(s); setShowSettings(false); }} onClose={() => setShowSettings(false)}
           onCleared={() => { setItems([]); maxId.current = 0; }} />
+      )}
+    </div>
+  );
+}
+
+function TextBadge({ e, on, open, onClick }: { e?: Extract | null; on: boolean; open: boolean; onClick: () => void }) {
+  if (e?.status === "done" && e.chars > 0)
+    return <button type="button" className={`news-tbadge ok${open ? " open" : ""}`} onClick={onClick} title="Read the extracted article">{open ? "▾" : "▸"} TEXT</button>;
+  if (e && e.status && !["queued", "deferred"].includes(e.status))
+    return <span className="news-tbadge off" title={e.error || e.status}>{e.status}</span>;
+  // the scraper works through the last 12 h of headlines; older ones are not fetched, so they get no badge
+  return on ? <span className="news-tbadge wait" title="Waiting for the scraper">…</span> : null;
+}
+
+function Reader({ url, words }: { url: string; words: string[] }) {
+  const [a, setA] = useState<Article | null>(null);
+  useEffect(() => {
+    api.get<Article>(`/api/news/article?url=${encodeURIComponent(url)}`).then(setA).catch(() => setA({ status: "error" }));
+  }, [url]);
+  if (!a) return <div className="news-reader text-dim">Loading…</div>;
+  if (a.status !== "done") return <div className="news-reader text-dim">No text: {a.error || a.status}</div>;
+  const m = a.meta ?? {};
+  const tags = ([] as unknown[]).concat((m.tags as unknown[]) ?? [], (m.categories as unknown[]) ?? [])
+    .filter((t): t is string => typeof t === "string").slice(0, 8);
+  const meta = [m.author, m.sitename, a.date ? ist(Date.parse(a.date)) : null, `${a.words} words · ~${Math.max(1, Math.round((a.words ?? 0) / 200))} min read`]
+    .filter(Boolean).join(" · ");
+  const images = (a.images ?? []).filter((u) => /^https?:\/\//.test(u)).slice(0, 6);
+  return (
+    <div className="news-reader" data-testid="news-reader">
+      <div className="news-reader-meta">{meta}</div>
+      {tags.length > 0 && <div className="news-words">{tags.map((t) => <span key={t} className="chip">{t}</span>)}</div>}
+      <div className="news-reader-text"><Highlight text={a.text ?? ""} words={words} /></div>
+      {(a.tables ?? []).slice(0, 2).map((t, k) => {
+        const rows = Array.isArray(t) ? t : t.rows;
+        return (
+          <table key={k} className="news-table"><tbody>
+            {rows.slice(0, 12).map((r, ri) => <tr key={ri}>{r.map((c, ci) => <td key={ci}>{c}</td>)}</tr>)}
+          </tbody></table>
+        );
+      })}
+      {images.length > 0 && (
+        <div className="news-reader-meta">Images:{images.map((u, k) => <a key={u} href={u} target="_blank" rel="noopener noreferrer"> {k + 1}</a>)}</div>
       )}
     </div>
   );
@@ -313,6 +404,9 @@ function SettingsModal({ initial, status, prefs, setPrefs, onSave, onClose, onCl
     <Section title="Collection">
       <Row label="Monitor news" hint="Off = nothing is polled."><Toggle on={s.enabled} onChange={(v) => set({ enabled: v })} /></Row>
       <Row label="Poll every (seconds)" hint="10-600. Feeds that publish their own refresh time (Moneycontrol: 30 s) are never polled faster than that."><Num value={s.interval_s} min={10} max={600} onChange={(v) => set({ interval_s: v })} ariaLabel="Poll interval" /></Row>
+      <Row label="Fetch full article text" hint="Your scraper (scraper/scrape.py) opens each new headline's article: text, author, tags, tables, PDF text, image links. Stored in data/scrape.db on the server.">
+        <Toggle on={s.extract} onChange={(v) => set({ extract: v })} data-testid="news-extract-toggle" />
+      </Row>
       <Row label="Keep headlines (days)" hint="Older headlines are deleted hourly."><Num value={s.retention_days} min={1} max={90} onChange={(v) => set({ retention_days: v })} ariaLabel="Retention days" /></Row>
       <p className="field-hint">Headlines only (title, link, time, summary), honest user agent, conditional requests. A source that refuses (403/429) or asks for a pause is left alone for that long. Nothing here reaches the analyzer or the AI.</p>
     </Section>
@@ -325,6 +419,10 @@ function SettingsModal({ initial, status, prefs, setPrefs, onSave, onClose, onCl
           return (
             <Check key={src} label={<>{src} {h && <span className={`news-dot ${h.health}`} style={{ marginLeft: 6 }} />}</>} checked={s.sources[src] ?? true}
               onChange={(v) => set({ sources: { ...s.sources, [src]: v } })}>
+              <label className="cform-check" title="Fetch this source's articles with the scraper (Monitoring > Fetch full article text)">
+                <input type="checkbox" checked={s.extract_sources[src] ?? false}
+                  onChange={(e) => set({ extract_sources: { ...s.extract_sources, [src]: e.target.checked } })} /> full text
+              </label>
               {h && <span className="mono text-dim">{h.day}/24h{h.error ? ` · ${h.error}` : ""}</span>}
             </Check>
           );

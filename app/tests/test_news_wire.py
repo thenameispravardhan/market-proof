@@ -129,3 +129,72 @@ def test_api_settings_items_status_export(client, isolated_db, db_session):
     assert csv.splitlines()[0].startswith("published_at_utc") and "Reliance wins order" in csv
     assert client.delete("/api/news/items").json()["deleted"] == 2
     client.put("/api/news/settings", json=s)                                  # leave it off
+
+
+# ---------------------------------------------------------------- full text via scraper/scrape.py
+
+PARA = "<p>" + "Reliance Industries said its retail arm grew revenue sharply as demand for groceries rose in every region. " * 5 + "</p>"
+ARTICLE = f"""<html><head><title>Reliance retail grows</title><meta name="author" content="Asha Rao">
+<meta property="article:published_time" content="2026-10-17T09:15:00+05:30"></head><body><article>
+<h1>Reliance retail grows</h1>{PARA * 3}<p>Analysts flagged the zeptoquark margin outlook.</p>
+<table><tr><th>Quarter</th><th>Revenue</th></tr><tr><td>Q2</td><td>1234</td></tr></table>
+<img src="/chart.png" alt="chart"></article></body></html>"""
+
+
+def _site():
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            body, ctype, code = b"", "text/html", 200
+            if self.path == "/robots.txt":
+                body, ctype = b"User-agent: *\nDisallow: /private\n", "text/plain"
+            elif self.path == "/story":
+                body = ARTICLE.encode()
+            elif self.path == "/old":
+                code = 301
+            else:
+                code = 404
+            self.send_response(code)
+            if code == 301:
+                self.send_header("Location", f"http://{self.headers['Host']}/story")
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{srv.server_port}"
+
+
+def test_full_text_extraction_through_the_scraper(client, isolated_db, db_session, tmp_path, monkeypatch):
+    base = _site()
+    monkeypatch.setattr(nw.news_wire, "scrape_db", tmp_path / "scrape.db")
+    monkeypatch.setattr(nw.news_wire, "allow_private", True)
+    for path in ("/old", "/private/x"):          # a redirecting link, and one robots.txt forbids
+        db_session.add(NewsItem(url=base + path, source="Mint", feed="f", title=f"headline {path}", summary=None))
+    db_session.commit()
+    s = {**nw.DEFAULTS, "enabled": True, "extract": True}
+    assert set(nw.news_wire.pending(s)) == {base + "/old", base + "/private/x"}
+    assert asyncio.run(nw.news_wire.extract(s)) == 2
+    assert nw.news_wire.pending(s) == []                                     # nothing left: nothing refetched
+
+    art = client.get("/api/news/article", params={"url": base + "/old"}).json()   # followed the 301 to /story
+    assert art["status"] == "done" and "zeptoquark" in art["text"] and art["words"] > 50, art
+    assert art["meta"]["author"] == "Asha Rao" and art["tables"][0] == [["Quarter", "Revenue"], ["Q2", "1234"]]
+    assert art["images"] == [base + "/chart.png"]
+    blocked = client.get("/api/news/article", params={"url": base + "/private/x"}).json()
+    assert blocked["status"] == "blocked" and blocked["error"] == "robots.txt"
+
+    its = {i["url"]: i for i in client.get("/api/news/items").json()["items"]}
+    assert its[base + "/old"]["extract"]["status"] == "done" and its[base + "/old"]["extract"]["chars"] > 300
+    deep = client.get("/api/news/items", params={"q": "zeptoquark", "deep": "true"}).json()["items"]
+    assert [i["url"] for i in deep] == [base + "/old"]                       # body-only word found via full text
+    assert client.get("/api/news/items", params={"q": "zeptoquark"}).json()["items"] == []
+    st = client.get("/api/news/status").json()["extract"]
+    assert st["with_text"] == 1 and st["by_status"].get("blocked") == 1

@@ -1,0 +1,39 @@
+{
+  "_comment": "scrape.py --sources sources.example.json. Built 2026-10-17 from each source's robots.txt, feeds and terms (see SOURCES.md). The terms decide the method, not what is technically reachable. 'none' = never requested; turn one on only with a licence or written permission, or after reading the terms yourself. Hosts not listed keep the command-line defaults.",
+
+  "x.com": {"method": "none", "access": "robots.txt Disallow: / for all bots; ToS bans scraping without written consent. Use the X API v2 (developer account + bearer token, pay-per-use)."},
+  "twitter.com": {"method": "none", "access": "same as x.com"},
+
+  "www.nseindia.com": {"method": "none", "access": "Terms bar systematic/automated collection; scripted requests stall with no response. Licensed route: NSE Data & Analytics corporate data feed."},
+  "nsearchives.nseindia.com": {"method": "none", "access": "same as www.nseindia.com"},
+
+  "www.bseindia.com": {
+    "method": "feed", "delay": 5, "per_host": 1, "retries": 1, "ttl": 60, "budget": 4000, "pause": 3600, "tz": 5.5,
+    "allow": ["^https://www\\.bseindia\\.com/data/xml/(announcements|notices)\\.xml$",
+              "^https://www\\.bseindia\\.com/downloads/UploadDocs/Notices/[0-9]+-[0-9]+/[0-9]+-[0-9]+\\.pdf$"],
+    "access": "Static RSS (data/xml/announcements.xml, notices.xml) is served to scripts, max-age=60. Terms unverified (reproduction reportedly prohibited). The .aspx feeds, api.bseindia.com and the AttachLive filing PDFs (503/406 on 17 Oct 2026) block scripts: do not use."
+  },
+  "api.bseindia.com": {"method": "none", "access": "Akamai blocks scripted clients (403, robots.txt included); undocumented API."},
+
+  "www.moneycontrol.com": {"method": "none", "access": "User Agreement 4.4(iii) bars bots, scrapers, spiders and crawlers. No public API or licence programme found."},
+  "economictimes.indiatimes.com": {"method": "none", "access": "RSS is for personal, non-commercial use; site terms bar systematic downloading, building databases and automated summarisation for real-time outputs. Licence: Times Syndication Service."},
+  "www.livemint.com": {"method": "none", "access": "Terms 7A: no robots/spiders/crawlers except search engines; covers RSS and APIs."},
+  "www.business-standard.com": {"method": "none", "access": "robots.txt and terms return Akamai 403 to scripts; terms (via search) restrict reuse."},
+  "www.reuters.com": {"method": "none", "access": "robots.txt: automated collection prohibited without prior written consent. Licensed: Reuters Connect API / LSEG."},
+  "www.cnbctv18.com": {"method": "none", "access": "Network18 terms: no scraping, crawling, mining or machine-readable use without written permission."},
+  "www.financialexpress.com": {"method": "none", "access": "Terms: personal, non-commercial licence; no database building or automated extraction (covers RSS)."},
+  "www.ndtvprofit.com": {"method": "none", "access": "Akamai 403 to scripts on every path incl. robots.txt; terms could not be read."},
+
+  "feeds.feedburner.com": {
+    "method": "headlines", "delay": 10, "per_host": 1, "retries": 1, "ttl": 300, "budget": 400,
+    "access": "NDTV Profit's public Feedburner feed (ndtvprofit-latest). NDTV Profit's terms are unverified: headlines for your own signals only; article pages are blocked anyway."
+  },
+  "www.thehindubusinessline.com": {
+    "method": "headlines", "delay": 5, "per_host": 1, "retries": 1, "ttl": 300, "budget": 1000,
+    "access": "RSS is for personal and non-commercial use (THG terms). Headlines for your own trading only: not for a competition entry, redistribution or ML training without a licence. robots.txt blocks named AI crawlers."
+  },
+  "api.gdeltproject.org": {
+    "method": "headlines", "delay": 5, "per_host": 1, "retries": 0, "ttl": 900, "budget": 200, "pause": 3600,
+    "access": "GDELT: free, unrestricted use with citation. DOC API asks for 1 request / 5 s and answered our first request 429 twice (16-17 Oct 2026). 15-minute batches: a confirmation source, never first-to-know."
+  }
+}
