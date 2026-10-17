@@ -201,6 +201,7 @@ class Crawler:
         self.proxy = None                    # chosen by pick_proxy(); None = direct (or HTTPS_PROXY from env)
         self.client = self._client(None)
         self.browser = None
+        self.browser_warned = False
         self.browser_sem = asyncio.Semaphore(a.browsers)
         self.llm_sem = asyncio.Semaphore(4)
         self.pool = None
@@ -702,7 +703,11 @@ class Crawler:
         """Real browser under the host's politeness slot; returns (html, [same-host JSON responses])."""
         try:
             browser = await self.get_browser()
-        except Exception:
+        except Exception as e:
+            if not self.browser_warned:      # say once why --browser renders nothing, instead of silently storing "empty"
+                self.browser_warned = True
+                print(f"  browser unavailable, pages needing a render stay empty: {type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}",
+                      file=sys.stderr, flush=True)
             return b"", None
         async with self.browser_sem:
             try:
