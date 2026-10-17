@@ -7,7 +7,8 @@ import { api } from "../api/client";
 import { Toggle } from "../components/common/Toggle";
 import { Check, Modal, Num, Row, Section, Sel } from "../components/trade/chartUi";
 
-interface Extract { status: string | null; chars: number; error: string | null }
+interface Extract { status: string | null; chars: number; error: string | null; fetched?: number | null }
+interface Lag { p50: number | null; p90: number | null; n: number }
 interface Item { id: number; url: string; source: string; title: string; summary: string | null; published_at: string | null; seen_at: string; extract?: Extract | null }
 interface Article { status: string; error?: string | null; title?: string | null; date?: string | null; text?: string; words?: number;
   meta?: Record<string, unknown>; tables?: (string[][] | { caption: string; rows: string[][] })[]; images?: string[] }
@@ -20,9 +21,10 @@ interface Settings {
 interface SourceRow {
   source: string; url: string; custom: boolean; enabled: boolean; health: string; last_ok: number | null;
   error: string | null; paused_until: number | null; items_in_feed: number; hour: number; day: number; total: number; last_item: string | null;
+  lag?: Lag | null;
 }
-interface ExtractStats { handed: number; by_status: Record<string, number>; with_text: number; paused: { host: string; until: number; reason: string }[] }
-interface Status { settings: Settings; sources: SourceRow[]; known_sources: string[]; extract?: ExtractStats; collector: { polls: number; last_poll_at: number | null; last_poll_ms: number | null } }
+interface ExtractStats { handed: number; by_status: Record<string, number>; with_text: number; paused: { host: string; until: number; reason: string }[]; lag?: Lag }
+interface Status { settings: Settings; sources: SourceRow[]; known_sources: string[]; extract?: ExtractStats; lag?: Lag & { fastest: string | null }; collector: { polls: number; last_poll_at: number | null; last_poll_ms: number | null } }
 interface Prefs { notify: boolean; sound: boolean; compact: boolean; summaries: boolean; window: number }
 
 const WINDOWS: { v: number; l: string }[] = [{ v: 1, l: "1h" }, { v: 6, l: "6h" }, { v: 24, l: "24h" }, { v: 168, l: "7d" }, { v: 0, l: "All" }];
@@ -38,6 +40,24 @@ function ago(ms: number): string {
   return s < 60 ? `${s | 0}s` : s < 3600 ? `${(s / 60) | 0}m` : s < 86400 ? `${(s / 3600) | 0}h` : `${(s / 86400) | 0}d`;
 }
 const ist = (ms: number) => new Date(ms).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+/** 42 -> "42s", 300 -> "5m", 7200 -> "2h" */
+function dur(sec: number | null | undefined): string {
+  if (sec == null) return "–";
+  return sec < 60 ? `${Math.round(sec)}s` : sec < 3600 ? `${Math.round(sec / 60)}m` : `${(sec / 3600).toFixed(1)}h`;
+}
+/** Detection lag of one headline: published -> first seen. null when the feed gives no time or a future one, or
+ *  when it came in its source's first poll (already in the feed: that says when monitoring started, not our speed). */
+function lagOf(i: Item, firstSeen: Map<string, number>): number | null {
+  if (!i.published_at || Date.parse(i.seen_at) <= (firstSeen.get(i.source) ?? 0) + 120_000) return null;
+  const d = (Date.parse(i.seen_at) - Date.parse(i.published_at)) / 1000;
+  return d >= 0 && d < 86400 ? d : null;
+}
+const lagClass = (d: number) => (d <= 120 ? "fast" : d <= 600 ? "mid" : "slow");
+const STOP = new Set(("the a an and or of to in on for with by at from as is are was were be been it its this that these those after over "
+  + "into up down out new news says said will can may vs amid how why what who when where his her their our your all more most than "
+  + "about ahead stock stocks share shares market markets india indian today live check updates update price target top day week "
+  + "year sees set gets get make makes just also not no yes per cent rs crore lakh ltd limited should could would quote "
+  + "visit here there watch know first last big off look").split(" "));
 const esc = (w: string) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 /** Title with watchlist words wrapped in <mark> — built as React nodes, never innerHTML (headlines are untrusted). */
@@ -172,6 +192,26 @@ export default function News() {
     return c;
   }, [items, prefs.window]);
 
+  const trending = useMemo(() => {          // words in the last hour's headlines, most frequent first
+    const cut = Date.now() - 3600_000, c = new Map<string, number>();
+    for (const i of items) {
+      if (when(i) < cut) continue;
+      const seen = new Set<string>();
+      for (const w of i.title.match(/[A-Za-z][A-Za-z&.'-]{2,}/g) ?? []) {
+        const k = w.toLowerCase().replace(/['.]+$/, "");
+        if (STOP.has(k) || seen.has(k)) continue;
+        seen.add(k); c.set(k, (c.get(k) || 0) + 1);
+      }
+    }
+    return [...c.entries()].filter(([, n]) => n >= 2).sort((a, b) => b[1] - a[1]).slice(0, 14);
+  }, [items]);
+  const firstSeen = useMemo(() => {        // each source's first poll (its backlog): no lag chip
+    const m = new Map<string, number>();
+    for (const i of items) { const t = Date.parse(i.seen_at); if (!m.has(i.source) || t < m.get(i.source)!) m.set(i.source, t); }
+    return m;
+  }, [items]);
+  const lastHour = useMemo(() => items.filter((i) => when(i) >= Date.now() - 3600_000).length, [items]);
+
   const hist = useMemo(() => {
     const bins = new Array(24).fill(0), now = Date.now();
     for (const i of items) { const h = Math.floor((now - when(i)) / 3600_000); if (h >= 0 && h < 24) bins[23 - h]++; }
@@ -225,6 +265,20 @@ export default function News() {
       )}
       {error && <div className="news-banner danger">Can't reach the server: {error}</div>}
 
+      {live && status && (
+        <div className="news-stats" data-testid="news-stats">
+          <div className="news-stat"><span>Headlines · last hour</span><b>{lastHour}</b></div>
+          <div className="news-stat" title="Published → first seen, median (90th percentile) over the last 24 h; each source's first poll is left out">
+            <span>Detection lag</span><b>{dur(status.lag?.p50)}</b><small>p90 {dur(status.lag?.p90)} · n {status.lag?.n ?? 0}</small></div>
+          <div className="news-stat" title="Lowest median detection lag (24 h, at least 3 stories)"><span>Fastest source</span><b>{status.lag?.fastest ?? "–"}</b></div>
+          {settings?.extract && (
+            <div className="news-stat" title="Headline seen → article text stored, median"><span>Full texts</span><b>{status.extract?.with_text ?? 0}</b>
+              <small>text in {dur(status.extract?.lag?.p50)}</small></div>
+          )}
+          <div className="news-stat"><span>Sources up</span><b>{bySource.filter(([, s]) => s.health === "ok").length}/{bySource.filter(([, s]) => s.enabled).length}</b></div>
+        </div>
+      )}
+
       <div className="news-toolbar">
         <input type="search" placeholder="Search headlines…" value={q} onChange={(e) => setQ(e.target.value)} aria-label="Search headlines" />
         <Toggle size="sm" on={deep} onChange={setDeep} label="In article text" disabled={!settings?.extract}
@@ -235,6 +289,12 @@ export default function News() {
         {pending.length > 0 && <button type="button" className="btn-sm primary" onClick={unfreeze}>{pending.length} new ↑</button>}
       </div>
 
+      {trending.length > 0 && (
+        <div className="news-chips" data-testid="news-trending">
+          <span className="text-dim news-meta">Trending · 1h</span>
+          {trending.map(([w, n]) => <button key={w} type="button" className={`chip${q.toLowerCase() === w ? " on" : ""}`} onClick={() => setQ(q.toLowerCase() === w ? "" : w)}>{w} <span className="mono">{n}</span></button>)}
+        </div>
+      )}
       <div className="news-chips">
         {Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([s, n]) => (
           <button key={s} type="button" className={`chip${picked.has(s) ? " on" : ""}`} onClick={() => togglePick(s)}>{s} <span className="mono">{n}</span></button>
@@ -251,7 +311,11 @@ export default function News() {
               const hit = !!watchRe && watchRe.test(`${i.title} ${i.summary ?? ""}`);
               return (
                 <article key={i.id} className={`news-item${hit ? " hit" : ""}${fresh.has(i.id) ? " fresh" : ""}${prefs.compact ? " compact" : ""}`}>
-                  <div className="news-when" title={ist(when(i)) + " IST"}>{ago(when(i))}<span className="badge neutral">{i.source}</span></div>
+                  <div className="news-when" title={ist(when(i)) + " IST"}>
+                    <span>{ago(when(i))}{(() => { const d = lagOf(i, firstSeen); return d == null ? null : (
+                      <span className={`news-lag ${lagClass(d)}`} title={`Published ${ist(Date.parse(i.published_at!))}, first seen ${ist(Date.parse(i.seen_at))} IST`}> +{dur(d)}</span>); })()}</span>
+                    <span className="badge neutral">{i.source}</span>
+                  </div>
                   <div style={{ minWidth: 0 }}>
                     {/^https?:\/\//.test(i.url)
                       ? <a href={i.url} target="_blank" rel="noopener noreferrer" className="news-title"><Highlight text={i.title} words={watch} /></a>
@@ -277,7 +341,8 @@ export default function News() {
                 <div key={name} className="news-src" title={s.health}>
                   <span className={`news-dot ${s.health}`} />
                   <span className="news-src-name">{name}</span>
-                  <span className="mono text-dim">{s.hour}/h · {s.day}/24h</span>
+                  <span className="mono text-dim" title={s.lag?.n ? `detection lag p50 ${dur(s.lag.p50)}, p90 ${dur(s.lag.p90)} (n ${s.lag.n})` : ""}>
+                    {s.hour}/h · {s.day}/24h{s.lag?.n ? ` · ${dur(s.lag.p50)}` : ""}</span>
                   {(s.error || s.paused_until) && <div className="news-src-err">{s.error}{s.paused_until ? ` until ${ist(s.paused_until * 1000)}` : ""}</div>}
                 </div>
               ))}

@@ -198,3 +198,46 @@ def test_full_text_extraction_through_the_scraper(client, isolated_db, db_sessio
     assert client.get("/api/news/items", params={"q": "zeptoquark"}).json()["items"] == []
     st = client.get("/api/news/status").json()["extract"]
     assert st["with_text"] == 1 and st["by_status"].get("blocked") == 1
+
+
+def test_pending_is_fair_across_sources_and_skips_paused_hosts(isolated_db, db_session, tmp_path, monkeypatch):
+    import sqlite3
+    db = tmp_path / "scrape.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE pauses(host TEXT, start REAL, until REAL, kind TEXT, reason TEXT)")
+    con.execute("INSERT INTO pauses VALUES('paused.example', 0, ?, 'restricted', '5 access refusals')", (time.time() + 3600,))
+    con.commit()
+    con.close()
+    monkeypatch.setattr(nw.news_wire, "scrape_db", db)
+    for i in range(3):
+        db_session.add(NewsItem(url=f"https://paused.example/{i}", source="NDTV", feed="f", title=f"n{i}"))
+        db_session.add(NewsItem(url=f"https://small.example/{i}", source="Mint", feed="f", title=f"s{i}"))
+    for i in range(30):                                          # a prolific source floods the newest ids
+        db_session.add(NewsItem(url=f"https://big.example/{i}", source="Moneycontrol", feed="f", title=f"m{i}"))
+    db_session.commit()
+    s = {**nw.DEFAULTS, "enabled": True, "extract": True, "extract_sources": {**nw.DEFAULTS["extract_sources"], "NDTV": True}}
+    got = nw.news_wire.pending(s, limit=6)
+    assert sum("small.example" in u for u in got) == 3                       # was: none (all 25 slots to the big one)
+    assert not any("paused.example" in u for u in got)                       # was: paused links filled the batch
+    assert len(got) == 6
+
+
+def test_detection_lag_per_source_skips_first_poll_backlog(client, isolated_db, db_session):
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    t0 = now - timedelta(hours=2)
+    add = lambda url, src, pub, seen: db_session.add(NewsItem(url=url, source=src, feed="f", title=url, published_at=pub, seen_at=seen))  # noqa: E731
+    add("https://a/old", "Mint", t0 - timedelta(days=3), t0)                 # first poll: 3-day-old backlog, ignored
+    for i, lag in enumerate((30, 60, 90)):                                   # caught later, 30/60/90 s after publish
+        seen = now - timedelta(minutes=30 - i)
+        add(f"https://a/{i}", "Mint", seen - timedelta(seconds=lag), seen)
+    add("https://a/future", "Mint", now + timedelta(hours=1), now - timedelta(minutes=5))   # future-dated: ignored
+    add("https://b/first", "Zee Business", t0, t0)
+    for i, lag in enumerate((300, 400, 500)):
+        seen = now - timedelta(minutes=20 - i)
+        add(f"https://b/{i}", "Zee Business", seen - timedelta(seconds=lag), seen)
+    db_session.commit()
+    st = client.get("/api/news/status").json()
+    mint = next(x["lag"] for x in st["sources"] if x["source"] == "Mint")
+    assert mint == {"p50": 60.0, "p90": 90.0, "n": 3}, mint
+    assert st["lag"]["n"] == 6 and st["lag"]["fastest"] == "Mint"

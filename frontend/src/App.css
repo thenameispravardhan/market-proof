@@ -3100,3 +3100,12 @@ a.news-title:hover { color: var(--accent); text-decoration: underline; }
 .news-table { margin-top: 8px; border-collapse: collapse; font-size: 11px; }
 .news-table td { border: 1px solid var(--border); padding: 2px 6px; }
 .news-dot.waiting { background: var(--cyan); }
+.news-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin-bottom: 12px; }
+.news-stat { display: flex; flex-direction: column; gap: 2px; padding: 8px 12px; border: 1px solid var(--border); background: var(--bg-panel); }
+.news-stat span { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-dim); }
+.news-stat b { font-size: 18px; font-weight: 700; color: var(--text); }
+.news-stat small { font-size: 10.5px; color: var(--text-faint); }
+.news-lag { font-size: 10px; font-weight: 700; }
+.news-lag.fast { color: var(--green); }
+.news-lag.mid { color: var(--amber); }
+.news-lag.slow { color: var(--text-faint); }
