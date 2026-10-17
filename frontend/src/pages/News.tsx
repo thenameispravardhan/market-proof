@@ -16,14 +16,17 @@ interface Feed { source: string; url: string; custom?: boolean }
 interface Settings {
   enabled: boolean; interval_s: number; sources: Record<string, boolean>; custom_feeds: Feed[];
   watchlist: string[]; muted: string[]; alerts: boolean; retention_days: number;
-  extract: boolean; extract_sources: Record<string, boolean>;
+  extract: boolean; extract_sources: Record<string, boolean>; intervals?: Record<string, number>;
 }
 interface SourceRow {
   source: string; url: string; custom: boolean; enabled: boolean; health: string; last_ok: number | null;
   error: string | null; paused_until: number | null; items_in_feed: number; hour: number; day: number; total: number; last_item: string | null;
   lag?: Lag | null;
 }
-interface ExtractStats { handed: number; by_status: Record<string, number>; with_text: number; paused: { host: string; until: number; reason: string }[]; lag?: Lag }
+interface HostStat { host: string; done: number; failed: number; words_p50: number | null; last: number | null; error: string | null;
+  req_1h: number; req_24h: number; not_modified: number; refused: number }
+interface ExtractStats { handed: number; by_status: Record<string, number>; with_text: number; paused: { host: string; until: number; reason: string }[]; lag?: Lag;
+  hosts?: HostStat[]; requests?: { "1h": number; "24h": number; refused_24h: number } }
 interface Status { settings: Settings; sources: SourceRow[]; known_sources: string[]; extract?: ExtractStats; lag?: Lag & { fastest: string | null }; collector: { polls: number; last_poll_at: number | null; last_poll_ms: number | null } }
 interface Prefs { notify: boolean; sound: boolean; compact: boolean; summaries: boolean; window: number }
 
@@ -152,11 +155,20 @@ export default function News() {
   }, [notifyNew]);
 
   useEffect(() => { void load(true); }, []);   // eslint-disable-line react-hooks/exhaustive-deps
-  const every = Math.max(10, settings?.interval_s ?? 20) * 1000;
-  useEffect(() => {
-    const t = setInterval(() => void load(), every);
-    return () => clearInterval(t);
-  }, [load, every]);
+  useEffect(() => {                         // live: the server pushes "news" after every poll and extraction batch
+    const onNews = (e: Event) => {
+      const p = (e as CustomEvent).detail as { new?: number; extracted?: number; polls?: number; last_poll_at?: number; last_poll_ms?: number };
+      if (p.new || p.extracted) { void load(); return; }
+      if (p.last_poll_at) setStatus((cur) => (cur ? { ...cur, collector: { polls: p.polls ?? cur.collector.polls, last_poll_at: p.last_poll_at!, last_poll_ms: p.last_poll_ms ?? null } } : cur));
+    };
+    const onOpen = () => void load();       // socket back: pull what it missed
+    window.addEventListener("news:event", onNews);
+    window.addEventListener("ws:open", onOpen);
+    const t = setInterval(() => void load(), 60_000);   // fallback while the socket is down
+    return () => { window.removeEventListener("news:event", onNews); window.removeEventListener("ws:open", onOpen); clearInterval(t); };
+  }, [load]);
+  const [, setTick] = useState(0);          // "12s ago" labels count up live
+  useEffect(() => { const t = setInterval(() => setTick((n) => n + 1), 1000); return () => clearInterval(t); }, []);
 
   useEffect(() => {                         // "in article text": the server searches the scraper's stored text
     if (!deep || !q.trim()) { setDeepItems(null); return; }
@@ -212,12 +224,6 @@ export default function News() {
   }, [items]);
   const lastHour = useMemo(() => items.filter((i) => when(i) >= Date.now() - 3600_000).length, [items]);
 
-  const hist = useMemo(() => {
-    const bins = new Array(24).fill(0), now = Date.now();
-    for (const i of items) { const h = Math.floor((now - when(i)) / 3600_000); if (h >= 0 && h < 24) bins[23 - h]++; }
-    return bins;
-  }, [items]);
-
   const saveSettings = async (s: Settings) => {
     const st = await api.put<Settings>("/api/news/settings", s);
     setStatus((cur) => (cur ? { ...cur, settings: st } : cur));
@@ -252,7 +258,7 @@ export default function News() {
           {" · monitoring only, never sent to AI analysis"}
         </span>
         <span style={{ flex: 1 }} />
-        <button type="button" className="btn-sm" onClick={() => { void api.post("/api/news/poll", {}); setTimeout(() => void load(), 3000); }} disabled={!live}>Poll now</button>
+        <button type="button" className="btn-sm" onClick={() => void api.post("/api/news/poll", {})} disabled={!live}>Poll now</button>
         <a className="btn-sm" href={`/api/news/export.csv?hours=${prefs.window || 2160}${q ? `&q=${encodeURIComponent(q)}` : ""}`}>Export CSV</a>
         <button type="button" className="btn-sm primary" onClick={() => setShowSettings(true)} data-testid="news-settings-btn">⚙ Settings</button>
       </div>
@@ -352,6 +358,7 @@ export default function News() {
             <div className="widget" style={{ marginTop: 12 }} data-testid="news-extract">
               <h3>Full text · your scraper</h3>
               <div className="widget-body">
+                <ScraperInsights x={status.extract} />
                 <div className="news-src"><span className="news-dot ok" /><span>articles with text</span><span className="mono">{status.extract.with_text}</span></div>
                 {Object.entries(status.extract.by_status).filter(([k]) => k !== "done").map(([k, n]) => (
                   <div key={k} className="news-src">
@@ -362,13 +369,6 @@ export default function News() {
               </div>
             </div>
           )}
-          <div className="widget" style={{ marginTop: 12 }}>
-            <h3>Headlines per hour · 24h</h3>
-            <div className="widget-body">
-              <div className="news-hist">{hist.map((n, k) => <div key={k} style={{ height: `${(100 * n) / Math.max(1, ...hist)}%` }} title={`${23 - k}h ago: ${n}`} />)}</div>
-              <div className="news-axis"><span>-24h</span><span>-12h</span><span>now</span></div>
-            </div>
-          </div>
         </div>
       </div>
 
@@ -376,6 +376,35 @@ export default function News() {
         <SettingsModal initial={settings} status={status} prefs={prefs} setPrefs={setPrefs}
           onSave={async (s) => { await saveSettings(s); setShowSettings(false); }} onClose={() => setShowSettings(false)}
           onCleared={() => { setItems([]); maxId.current = 0; }} />
+      )}
+    </div>
+  );
+}
+
+/** What the scraper did in the last 24 h, per site: is it worth fetching (ok rate, words) and are we too much
+ *  for it (requests, 304 share, refusals)? */
+function ScraperInsights({ x }: { x: ExtractStats }) {
+  const r = x.requests, hosts = x.hosts ?? [];
+  const tot = hosts.reduce((a, h) => ({ done: a.done + h.done, failed: a.failed + h.failed }), { done: 0, failed: 0 });
+  const rate = (d: number, f: number) => (d + f ? `${Math.round((100 * d) / (d + f))}%` : "–");
+  return (
+    <div data-testid="news-insights">
+      <div className="news-stats news-stats-sm">
+        <div className="news-stat" title="Articles stored with text / all finished, last 24 h"><span>Success</span><b>{rate(tot.done, tot.failed)}</b><small>{tot.done} ok · {tot.failed} not</small></div>
+        <div className="news-stat" title="Headline seen → article text stored"><span>Text in</span><b>{dur(x.lag?.p50)}</b><small>p90 {dur(x.lag?.p90)}</small></div>
+        <div className="news-stat" title="Requests the scraper sent to publishers (pages, robots.txt, retries)"><span>Requests</span><b>{r?.["1h"] ?? 0}/h</b><small>{r?.["24h"] ?? 0} in 24h</small></div>
+        <div className="news-stat" title="401/403/429 answers in 24 h: a site saying no or slow down"><span>Refused</span><b className={r?.refused_24h ? "neg" : ""}>{r?.refused_24h ?? 0}</b><small>24h</small></div>
+      </div>
+      {hosts.length > 0 && (
+        <table className="news-table news-hosts"><thead><tr><th>Site</th><th title="Stored with text / finished">OK</th><th title="Median words per article">Words</th>
+          <th title="Requests in 24 h (last hour)">Req</th><th title="Answered 304 Not Modified">304</th><th title="401/403/429">No</th><th>Last</th></tr></thead>
+          <tbody>{hosts.map((h) => (
+            <tr key={h.host} title={h.error ? `last problem: ${h.error}` : ""}>
+              <td className="news-url">{h.host.replace(/^www\./, "")}</td><td className="mono">{rate(h.done, h.failed)}</td>
+              <td className="mono">{h.words_p50 ?? "–"}</td><td className="mono">{h.req_24h} ({h.req_1h})</td>
+              <td className="mono">{h.req_24h ? `${Math.round((100 * h.not_modified) / h.req_24h)}%` : "–"}</td>
+              <td className={`mono${h.refused ? " neg" : ""}`}>{h.refused}</td><td className="mono">{h.last ? ago(h.last * 1000) : "–"}</td>
+            </tr>))}</tbody></table>
       )}
     </div>
   );
@@ -420,6 +449,21 @@ function Reader({ url, words }: { url: string; words: string[] }) {
         <div className="news-reader-meta">Images:{images.map((u, k) => <a key={u} href={u} target="_blank" rel="noopener noreferrer"> {k + 1}</a>)}</div>
       )}
     </div>
+  );
+}
+
+/** A source's own poll interval; empty = the default (Monitoring > Poll every). */
+function Every({ src, s, set }: { src: string; s: Settings; set: (p: Partial<Settings>) => void }) {
+  const v = s.intervals?.[src];
+  return (
+    <label className="cform-check" title="Poll this source every N seconds (10-3600). Empty = the default interval.">
+      every <input className="cform-num" type="number" min={10} max={3600} style={{ width: 64 }} value={v ?? ""} placeholder={String(s.interval_s)}
+        aria-label={`${src} poll interval`} onChange={(e) => {
+          const n = { ...(s.intervals ?? {}) };
+          if (e.target.value === "") delete n[src]; else n[src] = Math.round(Number(e.target.value));
+          set({ intervals: n });
+        }} /> s
+    </label>
   );
 }
 
@@ -468,7 +512,7 @@ function SettingsModal({ initial, status, prefs, setPrefs, onSave, onClose, onCl
   if (tab === "monitor") body = (
     <Section title="Collection">
       <Row label="Monitor news" hint="Off = nothing is polled."><Toggle on={s.enabled} onChange={(v) => set({ enabled: v })} /></Row>
-      <Row label="Poll every (seconds)" hint="10-600. Feeds that publish their own refresh time (Moneycontrol: 30 s) are never polled faster than that."><Num value={s.interval_s} min={10} max={600} onChange={(v) => set({ interval_s: v })} ariaLabel="Poll interval" /></Row>
+      <Row label="Poll every (seconds)" hint="10-600. The default for every source; Sources sets one per source. Feeds that publish their own refresh time (Moneycontrol: 30 s) are never polled faster than that."><Num value={s.interval_s} min={10} max={600} onChange={(v) => set({ interval_s: v })} ariaLabel="Poll interval" /></Row>
       <Row label="Fetch full article text" hint="Your scraper (scraper/scrape.py) opens each new headline's article: text, author, tags, tables, PDF text, image links. Stored in data/scrape.db on the server.">
         <Toggle on={s.extract} onChange={(v) => set({ extract: v })} data-testid="news-extract-toggle" />
       </Row>
@@ -488,6 +532,7 @@ function SettingsModal({ initial, status, prefs, setPrefs, onSave, onClose, onCl
                 <input type="checkbox" checked={s.extract_sources[src] ?? false}
                   onChange={(e) => set({ extract_sources: { ...s.extract_sources, [src]: e.target.checked } })} /> full text
               </label>
+              <Every src={src} s={s} set={set} />
               {h && <span className="mono text-dim">{h.day}/24h{h.error ? ` · ${h.error}` : ""}</span>}
             </Check>
           );
@@ -495,7 +540,7 @@ function SettingsModal({ initial, status, prefs, setPrefs, onSave, onClose, onCl
       </Section>
       <Section title="Your own feeds">
         {s.custom_feeds.map((f) => (
-          <Row key={f.url} label={f.source}><span className="mono text-dim news-url">{f.url}</span>
+          <Row key={f.url} label={f.source}><span className="mono text-dim news-url">{f.url}</span><Every src={f.source} s={s} set={set} />
             <button type="button" className="btn-sm danger" onClick={() => set({ custom_feeds: s.custom_feeds.filter((x) => x.url !== f.url) })}>Remove</button></Row>
         ))}
         <div className="news-addfeed">

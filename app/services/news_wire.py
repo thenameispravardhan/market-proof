@@ -53,8 +53,26 @@ DEFAULT_FEEDS: list[dict[str, Any]] = [
     {"source": "Mint", "url": "https://www.livemint.com/rss/markets"},
     {"source": "BusinessLine", "url": "https://www.thehindubusinessline.com/markets/stock-markets/feeder/default.rss"},
     {"source": "BSE", "url": "https://www.bseindia.com/data/xml/announcements.xml", "ist": True},
+    # Added 2026-10-17, same check. Off until ticked in Settings > Sources (current behaviour stays the default).
+    # Business Standard and Firstpost answer this UA with 403, Financial Express's feed redirects to HTML: left out.
+    {"source": "ET Markets", "url": "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"},
+    {"source": "Times of India", "url": "https://timesofindia.indiatimes.com/rssfeeds/1898055.cms"},
+    {"source": "Business Today", "url": "https://www.businesstoday.in/rssfeeds/?id=225346"},
+    {"source": "The Hindu", "url": "https://www.thehindu.com/business/markets/feeder/default.rss"},
+    {"source": "News18", "url": "https://www.news18.com/commonfeeds/v1/eng/rss/business.xml"},
+    {"source": "RBI", "url": "https://www.rbi.org.in/pressreleases_rss.xml"},
+    {"source": "SEBI", "url": "https://www.sebi.gov.in/sebirss.xml"},   # dates only, no time: published_at stays empty
+    {"source": "Mint Companies", "url": "https://www.livemint.com/rss/companies"},
+    {"source": "ET Industry", "url": "https://economictimes.indiatimes.com/industry/rssfeeds/13352306.cms"},
+    {"source": "BusinessLine Companies", "url": "https://www.thehindubusinessline.com/companies/feeder/default.rss"},
+    {"source": "Indian Express", "url": "https://indianexpress.com/section/business/feed/"},
+    {"source": "ThePrint", "url": "https://theprint.in/category/economy/feed/"},
+    # Also tried: Google News (robots.txt denies bots), PIB + Zee Business markets (403), Financial Express, Deccan
+    # Herald, Moneylife, Outlook Business, NDTV Profit markets (feed gone), Investing.com (US filings, not India).
 ]
 SOURCES = sorted({f["source"] for f in DEFAULT_FEEDS})
+NEW_OFF = {"ET Markets", "Times of India", "Business Today", "The Hindu", "News18", "RBI", "SEBI",
+           "Mint Companies", "ET Industry", "BusinessLine Companies", "Indian Express", "ThePrint"}
 # Full text comes from scraper/scrape.py (the operator's crawler), into its own SQLite store. These sources'
 # article links refuse an honest client (BSE AttachLive PDFs 503/406, ndtvprofit.com Akamai 403, ndtv.com 403 x5 on
 # 2026-10-17, which the scraper then paused): off by default.
@@ -64,7 +82,8 @@ EXTRACT_OFF = {"BSE", "NDTV Profit", "NDTV"}
 DEFAULTS: dict[str, Any] = {
     "enabled": False,        # off until the operator turns it on from the News page
     "interval_s": 20,
-    "sources": {s: True for s in SOURCES},
+    "sources": {s: s not in NEW_OFF for s in SOURCES},
+    "intervals": {},         # {source: seconds}: its own poll interval; a source not listed uses interval_s
     "custom_feeds": [],      # [{"source": "My blog", "url": "https://..."}]
     "watchlist": [],         # highlighted on the page; optional alerts
     "muted": [],             # hidden on the page
@@ -242,7 +261,7 @@ class NewsWire:
                 if s["enabled"]:
                     await self.poll(s)
                     self.prune(s)
-                wait = s["interval_s"] if s["enabled"] else 5
+                wait = self.next_wait(s) if s["enabled"] else 5
             except asyncio.CancelledError:
                 raise
             except Exception:                    # one bad poll never stops the monitor
@@ -254,6 +273,11 @@ class NewsWire:
             except asyncio.TimeoutError:
                 pass
 
+    def next_wait(self, s: dict[str, Any]) -> float:
+        """Seconds until the soonest feed is due (each has its own interval), at least 1."""
+        due = [max(st.next_at, st.paused_until) for f in feeds_for(s) if (st := self.state.get(f["url"]))]
+        return max(1.0, min(due) - time.time()) if due else s["interval_s"]
+
     async def poll(self, s: dict[str, Any]) -> int:
         t0, now = time.time(), time.time()
         due = [f for f in feeds_for(s)
@@ -262,11 +286,13 @@ class NewsWire:
         new = sum(results)
         self.polls += 1
         self.last_poll_at, self.last_poll_ms = time.time(), int((time.time() - t0) * 1000)
+        await event_bus.publish("news", {"new": new, "polls": self.polls, "last_poll_at": self.last_poll_at,
+                                         "last_poll_ms": self.last_poll_ms})   # the News page updates without polling
         return new
 
     async def fetch(self, f: dict[str, Any], s: dict[str, Any]) -> int:
         st, url = self.state[f["url"]], f["url"]
-        st.next_at = time.time() + max(s["interval_s"], f.get("min_s", 0))
+        st.next_at = time.time() + max(s["intervals"].get(f["source"], s["interval_s"]), f.get("min_s", 0))
         hdrs = {k: v for k, v in (("If-None-Match", st.etag), ("If-Modified-Since", st.modified)) if v}
         try:
             async with self.client().stream("GET", url, headers=hdrs) as r:
@@ -408,6 +434,7 @@ class NewsWire:
             c.db.close()
             self._hosts = c.hosts
         self.extracted += len(urls)
+        await event_bus.publish("news", {"extracted": len(urls)})
         return len(urls)
 
 
