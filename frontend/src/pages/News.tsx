@@ -309,6 +309,7 @@ export default function News() {
       </div>
 
       <div className="news-grid">
+        <div style={{ minWidth: 0 }}>
         <div className="widget">
           <h3>Headlines <span className="mono" style={{ marginLeft: 8, color: "var(--text-faint)" }}>{shown.length}</span></h3>
           <div className="news-list">
@@ -338,6 +339,22 @@ export default function News() {
             })}
           </div>
         </div>
+          {settings?.extract && status?.extract && (
+            <div className="widget" style={{ marginTop: 12 }} data-testid="news-extract">
+              <h3>Full text · your scraper</h3>
+              <div className="widget-body">
+                <ScraperInsights x={status.extract} />
+                <div className="news-src"><span className="news-dot ok" /><span>articles with text</span><span className="mono">{status.extract.with_text}</span></div>
+                {Object.entries(status.extract.by_status).filter(([k]) => k !== "done").map(([k, n]) => (
+                  <div key={k} className="news-src">
+                    <span className={`news-dot ${k === "queued" || k === "deferred" ? "waiting" : "error"}`} /><span>{k}</span><span className="mono">{n}</span>
+                  </div>
+                ))}
+                {status.extract.paused.map((p) => <div key={p.host} className="news-src-err">{p.host} paused until {ist(p.until * 1000)}: {p.reason}</div>)}
+              </div>
+            </div>
+          )}
+        </div>
 
         <div className="news-side">
           <div className="widget">
@@ -354,21 +371,6 @@ export default function News() {
               ))}
             </div>
           </div>
-          {settings?.extract && status?.extract && (
-            <div className="widget" style={{ marginTop: 12 }} data-testid="news-extract">
-              <h3>Full text · your scraper</h3>
-              <div className="widget-body">
-                <ScraperInsights x={status.extract} />
-                <div className="news-src"><span className="news-dot ok" /><span>articles with text</span><span className="mono">{status.extract.with_text}</span></div>
-                {Object.entries(status.extract.by_status).filter(([k]) => k !== "done").map(([k, n]) => (
-                  <div key={k} className="news-src">
-                    <span className={`news-dot ${k === "queued" || k === "deferred" ? "waiting" : "error"}`} /><span>{k}</span><span className="mono">{n}</span>
-                  </div>
-                ))}
-                {status.extract.paused.map((p) => <div key={p.host} className="news-src-err">{p.host} paused until {ist(p.until * 1000)}: {p.reason}</div>)}
-              </div>
-            </div>
-          )}
         </div>
       </div>
 
