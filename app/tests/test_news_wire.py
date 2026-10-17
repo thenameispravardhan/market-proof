@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -66,6 +67,12 @@ def test_fetch_stores_once_uses_conditional_get_and_respects_refusals(isolated_d
     asyncio.run(w.fetch(FEED, SETTINGS))
     st = w.state[FEED["url"]]
     assert st.paused_until - time.time() > 7000 and "429" in st.last_error                   # their pause, not ours
+    mode["status"], t = 200, time.time()                                                      # its own interval
+    w2 = _wire(handler)
+    w2.state[FEED["url"]] = nw.FeedState()
+    asyncio.run(w2.fetch(FEED, SETTINGS | {"intervals": {FEED["source"]: 300}}))
+    assert 299 < w2.state[FEED["url"]].next_at - t < 302
+    assert 290 < w2.next_wait(SETTINGS | {"custom_feeds": [FEED], "sources": {s: False for s in nw.SOURCES}}) <= 300
     n = len(seen)
     asyncio.run(w.poll(SETTINGS | {"custom_feeds": [FEED], "sources": {s: False for s in nw.SOURCES}}))
     assert len(seen) == n                                                                     # paused: no request
@@ -115,6 +122,10 @@ def test_api_settings_items_status_export(client, isolated_db, db_session):
     assert client.put("/api/news/settings", json={**body, "interval_s": 5}).status_code == 422
     bad = {**body, "custom_feeds": [{"source": "x", "url": "http://127.0.0.1:8000/feed"}]}
     assert client.put("/api/news/settings", json=bad).status_code == 422      # internal host refused
+    assert s["sources"]["SEBI"] is False and s["sources"]["Moneycontrol"] is True   # new sources ship off
+    assert client.put("/api/news/settings", json={**body, "intervals": {"BSE": 5}}).status_code == 422
+    r = client.put("/api/news/settings", json={**body, "intervals": {"BSE": 60, "Nope": 60}}).json()
+    assert r["intervals"] == {"BSE": 60}                                      # unknown source dropped
 
     w = _wire(lambda req: httpx.Response(200, content=RSS))
     w.state[FEED["url"]] = nw.FeedState()
@@ -198,6 +209,9 @@ def test_full_text_extraction_through_the_scraper(client, isolated_db, db_sessio
     assert client.get("/api/news/items", params={"q": "zeptoquark"}).json()["items"] == []
     st = client.get("/api/news/status").json()["extract"]
     assert st["with_text"] == 1 and st["by_status"].get("blocked") == 1
+    h = next(x for x in st["hosts"] if x["host"] == urlsplit(base).netloc)      # per-site insights
+    assert h["done"] == 1 and h["failed"] == 1 and h["words_p50"] > 50 and h["req_24h"] >= 3 and h["refused"] == 0, h
+    assert st["requests"]["24h"] >= 3 and st["requests"]["refused_24h"] == 0
 
 
 def test_pending_is_fair_across_sources_and_skips_paused_hosts(isolated_db, db_session, tmp_path, monkeypatch):

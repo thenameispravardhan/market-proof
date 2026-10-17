@@ -55,6 +55,15 @@ class NewsSettings(BaseModel):
     retention_days: int = Field(ge=1, le=90)
     extract: bool = False
     extract_sources: dict[str, bool] = {}
+    intervals: dict[str, int] = {}
+
+    @field_validator("intervals")
+    @classmethod
+    def _intervals(cls, v: dict[str, int]) -> dict[str, int]:
+        bad = [k for k, n in v.items() if not 10 <= n <= 3600]
+        if bad:
+            raise ValueError(f"poll interval must be 10-3600 s: {', '.join(bad)}")
+        return v
 
     @field_validator("watchlist", "muted")
     @classmethod
@@ -204,11 +213,49 @@ def _lags(db: Session) -> dict:
     return {"by_source": by, "overall": {**_pct(allv), "fastest": fastest}}
 
 
+def _host_stats(con) -> tuple[list[dict], dict]:
+    """Per article host over the last 24 h: outcomes, words per article, last error, and what we sent it
+    (requests, 304s, refusals): the numbers that say whether a site is worth fetching and whether we're too much."""
+    now = time.time()
+    hosts: dict[str, dict] = {}
+
+    def row(h: str) -> dict:
+        return hosts.setdefault(h, {"host": h, "done": 0, "failed": 0, "words": [], "last": None, "error": None,
+                                    "req_1h": 0, "req_24h": 0, "not_modified": 0, "refused": 0})
+    for url, st, err, fetched, words in con.execute(
+            "SELECT url, status, error, fetched, CASE WHEN text IS NULL THEN 0 ELSE length(text) - length(replace(text, ' ', '')) + 1 END"
+            " FROM pages WHERE fetched > ? ORDER BY fetched", (now - 86400,)):
+        r = row(urlsplit(url).netloc.lower())
+        if st == "done":
+            r["done"] += 1
+            if words:
+                r["words"].append(words)
+        elif st not in ("queued", "deferred", "redirect", "duplicate"):   # an alias of another row, not an outcome
+            r["failed"] += 1
+            r["error"] = err or st
+        r["last"] = fetched
+    for h, t, code in con.execute("SELECT host, t, status FROM requests WHERE t > ?", (now - 86400,)):
+        r = row(h)
+        r["req_24h"] += 1
+        r["req_1h"] += t > now - 3600
+        r["not_modified"] += code == "304"
+        r["refused"] += code in ("401", "403", "429")
+    out = []
+    for r in hosts.values():
+        w = sorted(r.pop("words"))
+        r["words_p50"] = w[len(w) // 2] if w else None
+        out.append(r)
+    out.sort(key=lambda r: -r["req_24h"])
+    return out, {"1h": sum(r["req_1h"] for r in out), "24h": sum(r["req_24h"] for r in out),
+                 "refused_24h": sum(r["refused"] for r in out)}
+
+
 def _extract_stats(db: Session) -> dict:
     """Scraper store summary: outcomes, articles with text, live pauses (hosts it is leaving alone), and the
     extraction lag (headline first seen -> article text stored)."""
     import sqlite3
-    out = {"handed": nw.news_wire.extracted, "by_status": {}, "with_text": 0, "paused": [], "lag": _pct([])}
+    out = {"handed": nw.news_wire.extracted, "by_status": {}, "with_text": 0, "paused": [], "lag": _pct([]),
+           "hosts": [], "requests": {"1h": 0, "24h": 0, "refused_24h": 0}}
     if not nw.news_wire.scrape_db.exists():
         return out
     con = sqlite3.connect(f"file:{nw.news_wire.scrape_db}?mode=ro", uri=True)
@@ -217,6 +264,7 @@ def _extract_stats(db: Session) -> dict:
         out["with_text"] = con.execute("SELECT COUNT(*) FROM pages WHERE status='done' AND text IS NOT NULL").fetchone()[0]
         out["paused"] = [{"host": h, "until": u, "reason": r} for h, u, r in con.execute(
             "SELECT host, MAX(until), reason FROM pauses GROUP BY host HAVING MAX(until) > ?", (time.time(),))]
+        out["hosts"], out["requests"] = _host_stats(con)
     except sqlite3.OperationalError:
         pass
     finally:
@@ -245,6 +293,8 @@ async def put_settings(body: NewsSettings, db: Session = Depends(get_db)):
     s = body.model_dump()
     s["sources"] = {k: bool(v) for k, v in s["sources"].items() if k in nw.SOURCES}
     s["extract_sources"] = {k: bool(v) for k, v in s["extract_sources"].items() if k in nw.SOURCES}
+    known = set(nw.SOURCES) | {c["source"] for c in s["custom_feeds"]}
+    s["intervals"] = {k: v for k, v in s["intervals"].items() if k in known}
     nw.save_settings(db, s)
     nw.news_wire.poll_now()
     return nw.load_settings(db)

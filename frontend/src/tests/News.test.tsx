@@ -135,4 +135,15 @@ describe("News page: detection lag and trends", () => {
     expect(within(trend).getByRole("button", { name: /infosys/ })).toBeTruthy();   // appears twice in the last hour
     expect(within(trend).queryByRole("button", { name: /^rbi/ })).toBeNull();      // once: not trending
   });
+
+  it("updates live from the server's push, without polling", async () => {
+    render(<News />);
+    await screen.findByText("TCS board meeting");
+    const calls = () => (globalThis.fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls.filter((c) => String(c[0]).includes("since_id")).length;
+    const before = calls();
+    window.dispatchEvent(new CustomEvent("news:event", { detail: { new: 0, polls: 5, last_poll_at: Date.now() / 1000 } }));
+    expect(calls()).toBe(before);                                       // nothing new: no request
+    window.dispatchEvent(new CustomEvent("news:event", { detail: { new: 2 } }));
+    await waitFor(() => expect(calls()).toBe(before + 1));              // new headlines: fetched at once
+  });
 });

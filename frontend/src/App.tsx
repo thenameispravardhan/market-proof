@@ -250,13 +250,14 @@ export default function App() {
   const [tab, navigate] = useRouter();
   const qc = useQueryClient();
   const { status } = useWebSocket({
-    channels: ["signals", "quotes", "depth", "broker", "trades.filled", "trade.executed", "trade.closed", "algo.entry", "algo.exit", "algo.update"],
+    channels: ["signals", "quotes", "depth", "broker", "trades.filled", "trade.executed", "trade.closed", "algo.entry", "algo.exit", "algo.update", "news"],
     onEvent: (msg) => {
       if (msg.channel === "quotes") { ingestQuote(msg.payload); return; }
       if (msg.channel === "depth") { ingestDepth(msg.payload); return; }
       // Fills / closes / order updates (bot, app or web) refresh every view at once — no 3-5 s poll wait.
       if (msg.channel === "broker" || msg.channel.startsWith("trade")) refreshTrading(qc);
       if (msg.channel.startsWith("algo.")) window.dispatchEvent(new CustomEvent("algo:event", { detail: msg.payload }));
+      if (msg.channel === "news") window.dispatchEvent(new CustomEvent("news:event", { detail: msg.payload }));
     },
   });
   // After a (re)connect, pull what may have been missed while the socket was down.
