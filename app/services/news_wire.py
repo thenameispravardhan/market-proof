@@ -16,6 +16,7 @@ import socket
 import sqlite3
 import time
 import xml.etree.ElementTree as ET
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -361,19 +362,30 @@ class NewsWire:
             await asyncio.sleep(5 if n else 30)
 
     def pending(self, s: dict[str, Any], limit: int = 25) -> list[str]:
-        """Newest headlines (12 h) from sources with full text on that the scraper hasn't finished yet. Rows the
-        scraper parked (paused host: 'deferred') stay pending; it sends them nothing until the pause ends."""
+        """Headlines (12 h) from sources with full text on that the scraper hasn't finished, newest first and shared
+        round-robin across sources, so a prolific source (Moneycontrol's sitemap) can't starve the rest. Links on a
+        host the scraper has paused are skipped rather than filling the batch; they stay pending until it ends."""
         custom = {c["source"] for c in s["custom_feeds"]}
         on = [k for k, v in s["extract_sources"].items() if v and s["sources"].get(k, True)] + sorted(custom)
         db = db_session.SessionLocal()
         try:
             cut = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=12)
-            urls = list(db.execute(select(NewsItem.url).where(NewsItem.source.in_(on), NewsItem.seen_at >= cut)
-                                   .order_by(NewsItem.id.desc()).limit(400)).scalars())
+            rows = db.execute(select(NewsItem.source, NewsItem.url).where(NewsItem.source.in_(on), NewsItem.seen_at >= cut)
+                              .order_by(NewsItem.id.desc()).limit(3000)).all()
         finally:
             db.close()
-        state = lookup(urls, self.scrape_db, text=False)
-        return [u for u in urls if (state.get(u) or {}).get("status") in (None, "queued", "deferred")][:limit]
+        state = lookup([u for _, u in rows], self.scrape_db, text=False)
+        paused = paused_hosts(self.scrape_db)
+        queues: dict[str, list[str]] = defaultdict(list)
+        for src, u in rows:
+            if (state.get(u) or {}).get("status") in (None, "queued", "deferred") and urlsplit(u).netloc.lower() not in paused:
+                queues[src].append(u)
+        out: list[str] = []
+        while len(out) < limit and any(queues.values()):
+            for q in queues.values():
+                if q and len(out) < limit:
+                    out.append(q.pop(0))
+        return out
 
     async def extract(self, s: dict[str, Any]) -> int:
         urls = self.pending(s)
@@ -397,6 +409,19 @@ class NewsWire:
             self._hosts = c.hosts
         self.extracted += len(urls)
         return len(urls)
+
+
+def paused_hosts(db_path: Path) -> set[str]:
+    """Hosts the scraper is leaving alone right now (its persisted pauses)."""
+    if not db_path.exists():
+        return set()
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        return {h for (h,) in con.execute("SELECT host FROM pauses GROUP BY host HAVING MAX(until) > ?", (time.time(),))}
+    except sqlite3.OperationalError:
+        return set()
+    finally:
+        con.close()
 
 
 def lookup(urls: list[str], db_path: Path, text: bool = True) -> dict[str, dict[str, Any]]:

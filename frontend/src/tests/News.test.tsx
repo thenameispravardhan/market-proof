@@ -104,3 +104,35 @@ describe("News page: full text from the scraper", () => {
     expect(screen.getByTestId("news-extract")).toBeTruthy();              // full-text stats panel
   });
 });
+
+describe("News page: detection lag and trends", () => {
+  it("shows each headline's lag, the stats strip and trending words", async () => {
+    const seen = new Date(Date.now() - 5 * 60_000);
+    const mk = (id: number, title: string, lagS: number) => ({ id, url: `https://x.example/${id}`, source: "Mint", title, summary: null,
+      published_at: new Date(seen.getTime() - lagS * 1000).toISOString(), seen_at: seen.toISOString() });
+    const first = { ...mk(0, "Old backlog story", 7200), seen_at: new Date(Date.now() - 3600_000).toISOString() };   // Mint's first poll
+    const list = [mk(1, "Infosys buyback approved by board", 45), mk(2, "Infosys shares rally after buyback", 900), mk(3, "RBI policy today", 30), first];
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/api/news/items")) return json({ items: url.includes("since_id") ? [] : list, max_id: 3 });
+      if (url.includes("/api/news/status")) return json({
+        settings: { ...SETTINGS, watchlist: [], muted: [], enabled: true, extract: false, extract_sources: {} },
+        known_sources: ["Mint"], collector: { polls: 3, last_poll_at: null, last_poll_ms: null },
+        sources: [{ source: "Mint", url: "u", custom: false, enabled: true, health: "ok", last_ok: null, error: null, paused_until: null,
+          items_in_feed: 3, hour: 3, day: 3, total: 3, last_item: null, lag: { p50: 45, p90: 900, n: 3 } }],
+        lag: { p50: 45, p90: 900, n: 3, fastest: "Mint" },
+      });
+      return json({}, 404);
+    }) as unknown as typeof fetch;
+    render(<News />);
+    const strip = await screen.findByTestId("news-stats");
+    expect(within(strip).getByText("45s")).toBeTruthy();                  // median detection lag
+    expect(within(strip).getAllByText("Mint").length).toBe(1);            // fastest source
+    expect(screen.getByText("+45s").className).toContain("fast");        // per-headline lag, colour by speed
+    expect(screen.getByText("+15m").className).toContain("slow");
+    expect(screen.queryByText("+2.0h")).toBeNull();                       // first-poll backlog: no lag chip
+    const trend = screen.getByTestId("news-trending");
+    expect(within(trend).getByRole("button", { name: /infosys/ })).toBeTruthy();   // appears twice in the last hour
+    expect(within(trend).queryByRole("button", { name: /^rbi/ })).toBeNull();      // once: not trending
+  });
+});

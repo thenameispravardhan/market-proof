@@ -121,7 +121,8 @@ def items(since_id: int = 0, q: str = Query("", max_length=100), source: Optiona
     out = []
     for r in rows:
         e = ext.get(r.url)
-        out.append({**_row(r), "extract": {"status": e["status"], "chars": e["chars"] or 0, "error": e["error"]} if e else None})
+        out.append({**_row(r), "extract": {"status": e["status"], "chars": e["chars"] or 0, "error": e["error"],
+                                            "fetched": e["fetched"]} if e else None})
     return {"items": out, "max_id": max_id}
 
 
@@ -158,6 +159,7 @@ def status(db: Session = Depends(get_db)):
         select(NewsItem.source, func.sum(case((when >= now - timedelta(hours=1), 1), else_=0)),
                func.sum(case((when >= now - timedelta(hours=24), 1), else_=0)), func.count(), func.max(NewsItem.seen_at))
         .group_by(NewsItem.source))}
+    lag = _lags(db)
     sources = []
     for f in nw.DEFAULT_FEEDS + [{**c, "custom": True} for c in s["custom_feeds"]]:
         st = nw.news_wire.state.get(f["url"])
@@ -169,16 +171,44 @@ def status(db: Session = Depends(get_db)):
                         "health": health, "last_ok": st.last_ok if st else None, "error": st.last_error if st else None,
                         "paused_until": st.paused_until if st and st.paused_until > time.time() else None,
                         "items_in_feed": st.items if st else 0, "hour": h1, "day": h24, "total": total,
+                        "lag": lag["by_source"].get(f["source"]),
                         "last_item": last.replace(tzinfo=timezone.utc).isoformat() if last else None})
     w = nw.news_wire
-    return {"settings": s, "sources": sources, "known_sources": nw.SOURCES, "extract": _extract_stats(),
+    return {"settings": s, "sources": sources, "known_sources": nw.SOURCES, "extract": _extract_stats(db),
+            "lag": lag["overall"],
             "collector": {"polls": w.polls, "last_poll_at": w.last_poll_at, "last_poll_ms": w.last_poll_ms}}
 
 
-def _extract_stats() -> dict:
-    """Scraper store summary: outcomes, articles with text, live pauses (hosts it is leaving alone)."""
+def _pct(xs: list[float]) -> dict:
+    xs = sorted(xs)
+    return {"p50": xs[len(xs) // 2], "p90": xs[int(len(xs) * 0.9)], "n": len(xs)} if xs else {"p50": None, "p90": None, "n": 0}
+
+
+def _lags(db: Session) -> dict:
+    """Detection lag = seen_at - published_at, per source and overall, for headlines seen in the last 24 h.
+    A source's first poll is left out: those stories were already in the feed, so their lag only says when
+    monitoring started."""
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    first = dict(db.execute(select(NewsItem.source, func.min(NewsItem.seen_at)).group_by(NewsItem.source)).all())
+    per: dict[str, list[float]] = {}
+    for src, pub, seen in db.execute(select(NewsItem.source, NewsItem.published_at, NewsItem.seen_at)
+                                     .where(NewsItem.seen_at >= now - timedelta(hours=24), NewsItem.published_at.is_not(None))):
+        if seen <= first[src] + timedelta(seconds=120):
+            continue
+        d = (seen - pub).total_seconds()
+        if 0 <= d <= 24 * 3600:              # a future date or a re-dated old story says nothing about our speed
+            per.setdefault(src, []).append(d)
+    by = {k: _pct(v) for k, v in per.items()}
+    allv = [x for v in per.values() for x in v]
+    fastest = min((k for k, v in by.items() if v["n"] >= 3), key=lambda k: by[k]["p50"], default=None)
+    return {"by_source": by, "overall": {**_pct(allv), "fastest": fastest}}
+
+
+def _extract_stats(db: Session) -> dict:
+    """Scraper store summary: outcomes, articles with text, live pauses (hosts it is leaving alone), and the
+    extraction lag (headline first seen -> article text stored)."""
     import sqlite3
-    out = {"handed": nw.news_wire.extracted, "by_status": {}, "with_text": 0, "paused": []}
+    out = {"handed": nw.news_wire.extracted, "by_status": {}, "with_text": 0, "paused": [], "lag": _pct([])}
     if not nw.news_wire.scrape_db.exists():
         return out
     con = sqlite3.connect(f"file:{nw.news_wire.scrape_db}?mode=ro", uri=True)
@@ -191,6 +221,13 @@ def _extract_stats() -> dict:
         pass
     finally:
         con.close()
+    cut = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=24)
+    recent = db.execute(select(NewsItem.url, NewsItem.seen_at).where(NewsItem.seen_at >= cut)
+                        .order_by(NewsItem.id.desc()).limit(2000)).all()
+    got = nw.lookup([u for u, _ in recent], nw.news_wire.scrape_db, text=False)
+    out["lag"] = _pct([got[u]["fetched"] - seen.replace(tzinfo=timezone.utc).timestamp() for u, seen in recent
+                       if u in got and got[u]["status"] == "done" and got[u]["fetched"]
+                       and got[u]["fetched"] >= seen.replace(tzinfo=timezone.utc).timestamp()])
     return out
 
 
