@@ -904,3 +904,45 @@ def test_report_metrics(tmp_path):
 
 if __name__ == "__main__":
     main()                                   # the pytest-only cases need: python -m pytest test_scrape.py
+
+
+class Waf(H):
+    """A publisher's rate limiter, the way real ones escalate: over 4 requests in 2 s -> 429 Retry-After 1;
+    a request inside that wait is a strike; 3 strikes -> 403 for good (the IP ban a disguised bot earns)."""
+    def do_GET(self):
+        w, now = self.server.waf, time.monotonic()
+        w["log"] = [t for t in w["log"] if now - t < 2] + [now]
+        if w["strikes"] >= 3:
+            return self.send(403)
+        if now < w["until"]:
+            w["strikes"] += 1
+            w["early"].append(round(w["until"] - now, 4))   # seconds too soon
+            return self.send(429, Retry_After="1")
+        if len(w["log"]) > 4:
+            w["until"], w["429"] = now + 1, w["429"] + 1
+            return self.send(429, Retry_After="1")
+        base = f"http://{self.headers['Host']}"
+        if self.path == "/robots.txt":
+            return self.send(200, "User-agent: *\nAllow: /\n", "text/plain")
+        if self.path == "/feed.rss":
+            if self.headers.get("If-None-Match") == '"f"':
+                return self.send(304)
+            items = "".join(f"<item><title>s{i}</title><link>{base}/n/{i}</link></item>" for i in range(12))
+            return self.send(200, f'<?xml version="1.0"?><rss version="2.0"><channel>{items}</channel></rss>',
+                             "application/rss+xml", ETag='"f"')
+        w["pages"][self.path] += 1
+        return self.send(200, VARIANT(self.path))
+
+
+def test_rate_limited_site_never_bans_us(tmp_path):
+    base, s_ = start(Waf)
+    s_.waf = {"log": [], "until": 0.0, "strikes": 0, "429": 0, "early": [], "pages": Counter()}
+    db = str(tmp_path / "waf.db")
+    for _ in range(3):                       # three polls back to back, no gap: harsher than news.py's 20 s
+        crawl(db, [f"{base}/feed.rss"], "--per-host", "1", "--max-delay", "5")
+    w = s_.waf
+    assert w["429"] > 0                                                         # the limit was really hit
+    assert w["strikes"] == 0, w                                                 # never asked again too early (was: 15 ms early on Windows)
+    st = Counter(s for (s,) in rows(db, "SELECT status FROM pages WHERE url LIKE ?", f"{base}/n/%"))
+    assert st == {"done": 12}, st                                               # and still collected everything
+    assert set(w["pages"].values()) == {1}                                      # each article fetched once across polls

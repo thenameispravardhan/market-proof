@@ -9,7 +9,7 @@ uv venv .venv --python 3.11 && uv pip install --python .venv/Scripts/python.exe 
 .venv/Scripts/python.exe scrape.py -f feeds.txt --db news.db --sources sources.example.json   # per-source limits
 .venv/Scripts/python.exe scrape.py --db news.db --sources sources.example.json --report         # health; exit 1 = alert
 uv pip install --python .venv/Scripts/python.exe pytest
-.venv/Scripts/python.exe -m pytest test_scrape.py -q         # full suite (16 tests, ~75 s)
+.venv/Scripts/python.exe -m pytest test_scrape.py -q         # full suite (17 tests, ~80 s)
 .venv/Scripts/python.exe test_scrape.py                    # original self-check only, prints ok
 .venv/Scripts/python.exe bench/latency.py feeds.txt --minutes 375 --db latency.db --sources sources.example.json  # market hours
 ```
