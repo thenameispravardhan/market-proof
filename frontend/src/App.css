@@ -3148,3 +3148,16 @@ a.news-title:hover { color: var(--accent); text-decoration: underline; }
 .news-stocks a:hover { color: var(--accent); }
 .news-stocks .pos { color: var(--green); }
 .news-stocks .neg { color: var(--red); }
+/* News: Latest/Top order, unread since last visit, importance, reaction since the story, breaking stocks */
+.news-seg { display: inline-flex; gap: 2px; }
+.news-unread { margin-left: 10px; color: var(--accent); font-size: 10px; letter-spacing: .04em; }
+.news-score { color: var(--amber); font-size: 10px; font-weight: 700; cursor: help; }
+.news-rx { padding: 0 4px; border: 1px solid var(--border-hi); border-radius: 3px; color: var(--text-dim);
+  font-family: var(--mono); font-size: 10px; font-weight: 700; line-height: 15px; cursor: help; }
+.news-rx.pos { border-color: var(--green); color: var(--green); }
+.news-rx.neg { border-color: var(--red); color: var(--red); }
+.news-tk.hot { border-color: var(--accent); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent); }
+.news-hot { margin-left: 6px; color: var(--accent); font-size: 10px; font-weight: 700; }
+.news-more { display: block; margin-top: 6px; padding: 0; border: 0; background: none; color: var(--text-dim); font-size: 11px; cursor: pointer; }
+.news-more:hover { color: var(--accent); }
+.news-group-btns { display: flex; gap: 6px; margin-bottom: 4px; }

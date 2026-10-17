@@ -192,6 +192,7 @@ At [myapi.fyers.in](https://myapi.fyers.in), on your app:
 | Restart app | `sudo systemctl restart tradebot` |
 | Deploy new code (on the server) | `cd ~/tradebot && bash deploy/update.sh` |
 | Deploy new code (from your dev machine) | `bash deploy/push.sh` (or `.\deploy\push.ps1`) — see below |
+| Deploy new code (from GitHub, no dev machine) | Actions → **Deploy** → Run workflow — see below |
 | DB backup (weekdays 18:30 IST) | Installed by `deploy/setup.sh` as a cron job (`crontab -l` to confirm). Offsite copy: set `BACKUP_S3_URI=s3://<bucket>/tradebot` in `.env` and install the AWS CLI with `s3:PutObject` on that prefix; give the bucket a lifecycle rule (e.g. expire after 90 days). The preflight alarms when the newest copy is older than `BACKUP_MAX_AGE_HOURS` or the last upload failed |
 | Lightsail-native alternative to S3 | Lightsail console → instance → Snapshots → enable automatic daily snapshots (whole-disk, kept 7 days, stored off the instance) |
 | Rotate secrets | Follow `docs/SECRET_ROTATION.md` |
@@ -220,6 +221,28 @@ The private file holds only the *address*, never a secret — the SSH key stays
 at `TRADEBOT_SSH_KEY`'s path and the dashboard password lives only in Caddy.
 Security rests on the key + password, not on the address being hidden; still,
 keep port 22 restricted to your IP where you can.
+
+### Deploy from GitHub (no dev machine)
+
+[`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml) runs the same
+`deploy/update.sh` over SSH from a GitHub runner, so a deploy needs only a
+browser (or a Claude Code session with GitHub access). Actions → **Deploy** →
+Run workflow. It deploys `main`, refuses during market hours (09:00–15:45 IST,
+Mon–Fri) unless *force* is ticked, and stops if the server's checkout is on
+another branch.
+
+One-time setup, in the repository's Settings → Secrets and variables → Actions:
+
+| Secret | Value |
+|--------|-------|
+| `DEPLOY_HOST` | the static IP (or the DuckDNS name) |
+| `DEPLOY_SSH_KEY` | the private key the server accepts (the Lightsail `.pem` contents) |
+| `DEPLOY_KNOWN_HOSTS` | optional: `ssh-keyscan -t ed25519 <static IP>`; without it the host key is trusted on first sight |
+
+Variables `DEPLOY_USER` (default `ubuntu`) and `DEPLOY_DIR` (default
+`~/tradebot`) are optional. The runners connect from GitHub's IP ranges: if
+port 22 is restricted to your home IP, they can't reach it — use `push.sh`
+then, or widen the rule while you deploy.
 
 ## Troubleshooting
 

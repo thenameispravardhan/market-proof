@@ -1,0 +1,80 @@
+# Deploy main to the Lightsail server: SSH in and run deploy/update.sh (pull, deps, dashboard rebuild when frontend/
+# changed, restart, health check). The same thing deploy/push.sh does from a dev machine, for when there is none.
+#
+# Manual only (Actions > Deploy > Run workflow). A restart is ~15 s down plus ~60 s of startup, so it refuses to run
+# during market hours (09:00-15:45 IST, Monday-Friday) unless "force" is ticked. It deploys only if the server's
+# checkout is on main: it never switches the server's branch.
+#
+# One-time setup, repository secrets (Settings > Secrets and variables > Actions):
+#   DEPLOY_HOST          the Lightsail static IP (or its DuckDNS name)
+#   DEPLOY_SSH_KEY       a private key the server accepts for DEPLOY_USER (the Lightsail .pem works)
+#   DEPLOY_KNOWN_HOSTS   optional, `ssh-keyscan -t ed25519 <host>`: without it the host key is trusted on first sight
+# Optional repository variables: DEPLOY_USER (default ubuntu), DEPLOY_DIR (default ~/tradebot).
+# The Lightsail firewall must let GitHub's runners reach port 22.
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Deploy even during market hours (restarts the bot)"
+        type: boolean
+        default: false
+      frontend:
+        description: "Rebuild the dashboard even if frontend/ did not change"
+        type: boolean
+        default: false
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Refuse during market hours
+        if: ${{ !inputs.force }}
+        run: |
+          now=$(TZ=Asia/Kolkata date +%u%H%M)        # weekday 1-7, then HHMM
+          day=${now:0:1} hm=${now:1}
+          if [ "$day" -le 5 ] && [ "$hm" -ge 0900 ] && [ "$hm" -lt 1545 ]; then
+            echo "::error::Market hours (09:00-15:45 IST): a deploy restarts the bot. Run it again with force to deploy anyway."
+            exit 1
+          fi
+      - name: Check the secrets
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          missing=""
+          [ -n "$HOST" ] || missing="$missing DEPLOY_HOST"
+          [ -n "$KEY" ] || missing="$missing DEPLOY_SSH_KEY"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing (Settings > Secrets and variables > Actions; see .github/workflows/deploy.yml)"
+            exit 1
+          fi
+      - name: SSH key and host key
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/deploy && chmod 600 ~/.ssh/deploy
+          if [ -n "$KNOWN" ]; then
+            printf '%s\n' "$KNOWN" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -T 15 "$HOST" > ~/.ssh/known_hosts 2>/dev/null
+            echo "::warning::DEPLOY_KNOWN_HOSTS is not set: trusting the host key the server shows now"
+          fi
+      - name: Deploy main
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          LOGIN: ${{ vars.DEPLOY_USER || 'ubuntu' }}
+          DIR: ${{ vars.DEPLOY_DIR || '~/tradebot' }}
+          FRONTEND: ${{ inputs.frontend && '--frontend' || '' }}
+        run: |
+          ssh -i ~/.ssh/deploy -o StrictHostKeyChecking=yes -o ConnectTimeout=20 "$LOGIN@$HOST" \
+            "cd $DIR && b=\$(git rev-parse --abbrev-ref HEAD) && { [ \"\$b\" = main ] || { echo \"server is on \$b, not main: not deploying\"; exit 1; }; } && bash deploy/update.sh $FRONTEND"

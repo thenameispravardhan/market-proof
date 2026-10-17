@@ -7,6 +7,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api } from "../api/client";
 import { chartHref } from "../lib/chartLink";
+import { capTier } from "../lib/marketCap";
 import { clusterStories, STOP, tickerName } from "../lib/newsStories";
 import type { InstrumentHit } from "../types";
 import { Toggle } from "../components/common/Toggle";
@@ -23,6 +24,7 @@ interface Settings {
   enabled: boolean; interval_s: number; sources: Record<string, boolean>; custom_feeds: Feed[];
   watchlist: string[]; muted: string[]; alerts: boolean; retention_days: number;
   extract: boolean; extract_sources: Record<string, boolean>; intervals?: Record<string, number>;
+  bursts?: boolean; burst_sources?: number; burst_minutes?: number;
 }
 interface SourceRow {
   source: string; url: string; custom: boolean; enabled: boolean; health: string; last_ok: number | null;
@@ -34,20 +36,26 @@ interface HostStat { host: string; done: number; failed: number; words_p50: numb
 interface ExtractStats { handed: number; by_status: Record<string, number>; with_text: number; paused: { host: string; until: number; reason: string }[]; lag?: Lag;
   hosts?: HostStat[]; requests?: { "1h": number; "24h": number; refused_24h: number } }
 interface Status { settings: Settings; sources: SourceRow[]; known_sources: string[]; extract?: ExtractStats; lag?: Lag & { fastest: string | null }; collector: { polls: number; last_poll_at: number | null; last_poll_ms: number | null };
-  watch_stocks?: Record<string, string[]>; kinds?: [string, string][] }
-interface Prefs { notify: boolean; sound: boolean; compact: boolean; summaries: boolean; window: number; group: boolean }
+  watch_stocks?: Record<string, string[]>; kinds?: [string, string][]; source_groups?: [string, string[]][] }
+interface Prefs { notify: boolean; sound: boolean; compact: boolean; summaries: boolean; window: number; group: boolean; sort: "latest" | "top" }
+/** How a story's stock moved since it broke (/api/news/reaction): from the last whole minute before it. */
+interface Reaction { sym: string; t0: number; px0: number; px: number; pct: number; traded: boolean; hi_pct?: number; lo_pct?: number;
+  nifty_pct?: number; excess_pct?: number }
 interface Quote { ltp: number | null; change: number | null; change_pct: number | null }
 interface StockRow { sym: string; stories: Set<number>; sources: Set<string>; last: number; title: string }
 
 const WINDOWS: { v: number; l: string }[] = [{ v: 1, l: "1h" }, { v: 6, l: "6h" }, { v: 24, l: "24h" }, { v: 168, l: "7d" }, { v: 0, l: "All" }];
 const PREFS_KEY = "news:prefs";
-const DEFAULT_PREFS: Prefs = { notify: false, sound: false, compact: false, summaries: true, window: 24, group: true };
+const DEFAULT_PREFS: Prefs = { notify: false, sound: false, compact: false, summaries: true, window: 24, group: true, sort: "latest" };
+const SEEN_KEY = "news:lastSeen";           // the newest headline id this browser has had on screen
 const KEYS: [string, string][] = [["j / k", "next / previous story"], ["o or Enter", "open the article"], ["t", "read the full text"],
   ["e", "show the other sources"], ["c", "chart the stock"], ["/", "search"], ["Esc", "leave the list"], ["?", "this help"]];
 
 function loadPrefs(): Prefs {
   try { return { ...DEFAULT_PREFS, ...JSON.parse(localStorage.getItem(PREFS_KEY) || "{}") }; } catch { return DEFAULT_PREFS; }
 }
+const readSeen = () => { try { return Number(localStorage.getItem(SEEN_KEY)) || 0; } catch { return 0; } };
+const saveSeen = (id: number) => { try { if (id) localStorage.setItem(SEEN_KEY, String(id)); } catch { /* storage off */ } };
 /** Story time: published, unless the feed has none or claims a time after we first saw it (a wrong time zone
  *  would otherwise pin the headline to the top as "0s" for hours): then first seen. */
 function when(i: Item): number {
@@ -74,6 +82,25 @@ function lagOf(i: Item, firstSeen: Map<string, number>): number | null {
 const lagClass = (d: number) => (d <= 120 ? "fast" : d <= 600 ? "mid" : "slow");
 const esc = (w: string) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const pct = (v: number | null | undefined) => (v == null ? "" : `${v > 0 ? "+" : ""}${v.toFixed(2)}%`);
+const KIND_WEIGHT: Record<string, number> = { results: 3, orders: 3, deals: 3, actions: 2, legal: 2, mgmt: 2, ratings: 1.5,
+  funding: 1.5, macro: 1.5, ipo: 1, market: 0.5 };
+/** How much a story matters, for the Top sort: its kind, how many outlets carried it, the size of the stocks it
+ *  names, a watchlist hit, a breaking stock; then halved by 6 h of age. `why` spells out each part. */
+function importance(lead: Item, outlets: number, hit: boolean, breaking: boolean, label: (k: string) => string): { score: number; why: string[] } {
+  const why: string[] = [];
+  let s = 0;
+  const add = (v: number, what: string) => { if (v) { s += v; why.push(`${what} +${v}`); } };
+  const kind = [...(lead.tags ?? [])].sort((a, b) => (KIND_WEIGHT[b] ?? 0) - (KIND_WEIGHT[a] ?? 0))[0];
+  if (kind) add(KIND_WEIGHT[kind] ?? 0, label(kind));
+  if (outlets > 1) add(Math.min(8, (outlets - 1) * 2), `${outlets} outlets`);
+  const tiers = (lead.tickers ?? []).map(capTier);
+  if (tiers.includes("Large")) add(2, "large cap"); else if (tiers.includes("Mid")) add(1, "mid cap");
+  if (hit) add(3, "watchlist");
+  if (breaking) add(2, "breaking");
+  const age = Math.max(0, (Date.now() - when(lead)) / 3600_000), decay = 1 / (1 + age / 6);
+  if (s && age >= 1) why.push(`× ${decay.toFixed(2)} for ${Math.round(age)} h of age`);
+  return { score: Math.round(s * decay * 10) / 10, why };
+}
 
 /** Title with watchlist words wrapped in <mark> — built as React nodes, never innerHTML (headlines are untrusted). */
 function Highlight({ text, words }: { text: string; words: string[] }) {
@@ -114,6 +141,8 @@ export default function News() {
   const [cursor, setCursor] = useState<number | null>(null);       // keyboard: the story under the cursor
   const [showKeys, setShowKeys] = useState(false);
   const [quotes, setQuotes] = useState<Record<string, Quote>>({});
+  const [reactions, setReactions] = useState<Record<number, Reaction>>({});
+  const [sinceVisit, setSinceVisit] = useState(0);   // headlines new since this browser's last visit
   const maxId = useRef(0);
   const ready = useRef(false);             // the first (backlog) load has landed: increments may apply
   const searchRef = useRef<HTMLInputElement>(null);
@@ -163,6 +192,9 @@ export default function News() {
       const got = first ? res.items : res.items.filter((i) => i.id > maxId.current);
       if (first) {
         setItems(got);
+        const last = readSeen();               // a returning browser: what came in while it was away is NEW
+        const unread = last ? got.filter((i) => i.id > last).map((i) => i.id) : [];
+        if (unread.length) { setFresh(new Set(unread)); setSinceVisit(unread.length); }
       } else if (got.length) {
         if (maxId.current > 0) {           // the first batch onto an empty page is backlog: no NEW badge, no alert
           notifyNew(got);
@@ -188,6 +220,14 @@ export default function News() {
   }, [notifyNew]);
 
   useEffect(() => { void load(true); }, []);   // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {                         // remember the newest headline shown, for "new since your last visit"
+    const save = () => saveSeen(maxId.current);
+    const onVis = () => { if (document.visibilityState === "hidden") save(); };
+    document.addEventListener("visibilitychange", onVis);
+    window.addEventListener("pagehide", save);
+    return () => { save(); document.removeEventListener("visibilitychange", onVis); window.removeEventListener("pagehide", save); };
+  }, []);
+  const markSeen = () => { setFresh(new Set()); setSinceVisit(0); saveSeen(maxId.current); };
   useEffect(() => {                         // live: the server pushes "news" after every poll and extraction batch
     const onNews = (e: Event) => {
       const p = (e as CustomEvent).detail as { new?: number; extracted?: number; polls?: number; last_poll_at?: number; last_poll_ms?: number };
@@ -318,6 +358,47 @@ export default function News() {
     return { by, shared, top: [...by.entries()].sort((a, b) => b[1] - a[1])[0] as [string, number] | undefined };
   }, [storyOf, outlets, prefs.window]);
 
+  // Breaking now: stocks that burst_sources+ outlets named within burst_minutes (the server's burst alert, on the page).
+  const minute = Math.floor(Date.now() / 60_000);   // re-checked each minute, as bursts age out
+  const burstN = settings?.burst_sources ?? 3, burstM = settings?.burst_minutes ?? 30;
+  const breaking = useMemo(() => {
+    const cut = Date.now() - burstM * 60_000, by = new Map<string, Set<string>>();
+    for (const i of items) {
+      if (when(i) < cut || (mutedRe && mutedRe.test(i.title))) continue;
+      for (const sym of i.tickers ?? []) {
+        let s = by.get(sym);
+        if (!s) by.set(sym, s = new Set());
+        s.add(i.source);
+      }
+    }
+    return new Map([...by].filter(([, s]) => s.size >= burstN));
+  }, [items, mutedRe, burstN, burstM, minute]);   // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Top: the rows ranked by importance() instead of time.
+  const scores = useMemo(() => new Map(rows.map(({ lead, story }) => [lead.id, importance(lead,
+    prefs.group ? outlets.get(leadOf.get(lead.id) ?? -1) ?? 1 : 1, story.some(isHit),
+    !!lead.tickers?.some((t) => breaking.has(t)), (k) => kindLabel.get(k) ?? k)])),
+  [rows, prefs.group, outlets, leadOf, isHit, breaking, kindLabel, minute]);   // eslint-disable-line react-hooks/exhaustive-deps
+  const list = useMemo(() => (prefs.sort === "top"
+    ? [...rows].sort((a, b) => scores.get(b.lead.id)!.score - scores.get(a.lead.id)!.score || when(b.lead) - when(a.lead))
+    : rows), [rows, prefs.sort, scores]);
+
+  // The market's reaction to each tagged story on screen (the first 40), while Fyers is connected.
+  const reactIds = list.filter((r) => r.lead.tickers?.length).slice(0, 40).map((r) => r.lead.id).sort((a, b) => a - b).join(",");
+  useEffect(() => {
+    if (!reactIds) return;
+    let live = true;
+    const get = () => {
+      if (document.hidden) return;
+      api.get<{ ok: boolean; reactions: Record<string, Reaction> }>(`/api/news/reaction?ids=${reactIds}`)
+        .then((r) => { if (live && r.ok) setReactions((cur) => ({ ...cur, ...r.reactions })); })
+        .catch(() => { /* no prices: no reactions */ });
+    };
+    get();
+    const t = setInterval(get, 60_000);
+    return () => { live = false; clearInterval(t); };
+  }, [reactIds]);
+
   const trending = useMemo(() => {          // words in the last hour's headlines, most frequent first
     const cut = Date.now() - 3600_000, c = new Map<string, number>();
     for (const i of items) {
@@ -360,8 +441,8 @@ export default function News() {
     return [...m.entries()];
   }, [status]);   // eslint-disable-line react-hooks/exhaustive-deps
   const live = !!settings?.enabled;
-  const keyState = useRef({ rows, cursor, modal: showSettings, help: showKeys });
-  keyState.current = { rows, cursor, modal: showSettings, help: showKeys };
+  const keyState = useRef({ rows: list, cursor, modal: showSettings, help: showKeys });
+  keyState.current = { rows: list, cursor, modal: showSettings, help: showKeys };
   useEffect(() => {                         // keyboard (unless typing somewhere): "/" search, j/k move, o open, ... (KEYS)
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
@@ -452,12 +533,18 @@ export default function News() {
         <Toggle size="sm" on={deep} onChange={setDeep} label="In article text" disabled={!settings?.extract}
           title={settings?.extract ? "Also search the full text the scraper extracted" : "Turn on full text in Settings"} />
         {WINDOWS.map((w) => <button key={w.v} type="button" className={`chip${prefs.window === w.v ? " on" : ""}`} onClick={() => setPrefs({ window: w.v })}>{w.l}</button>)}
+        <span className="news-seg" role="group" aria-label="Order">
+          <button type="button" className={`chip${prefs.sort === "latest" ? " on" : ""}`} onClick={() => setPrefs({ sort: "latest" })} title="Newest first">Latest</button>
+          <button type="button" className={`chip${prefs.sort === "top" ? " on" : ""}`} onClick={() => setPrefs({ sort: "top" })}
+            title="Most important first: kind, outlets, stock size, watchlist, breaking; fading over 6 h (hover a ★ for the parts)">Top</button>
+        </span>
         <Toggle size="sm" on={watchOnly} onChange={setWatchOnly} label="Watchlist only" disabled={!watch.length} title={watch.length ? "" : "Add watchlist words in Settings"} />
         <Toggle size="sm" on={multiOnly} onChange={setMultiOnly} label="2+ sources" title="Only stories two or more outlets carried" />
         <Toggle size="sm" on={frozen} onChange={(v) => (v ? setFrozen(true) : unfreeze())} label="Pause list" />
         {stockPick && <button type="button" className="chip on" onClick={() => setStockPick(null)} title="Show every stock again">{tickerName(stockPick)} ×</button>}
         {pending.length > 0 && <button type="button" className="btn-sm primary" onClick={unfreeze}>{pending.length} new ↑</button>}
-        {fresh.size > 0 && <button type="button" className="btn-sm" onClick={() => setFresh(new Set())} title="Clear the NEW badges">Mark seen ({fresh.size})</button>}
+        {fresh.size > 0 && <button type="button" className="btn-sm" onClick={markSeen}
+          title={sinceVisit ? `${sinceVisit} came in since your last visit; clear the NEW badges` : "Clear the NEW badges"}>Mark seen ({fresh.size})</button>}
         <button type="button" className="btn-sm" onClick={() => setShowKeys((v) => !v)} title="Keyboard shortcuts ( ? )" aria-expanded={showKeys} aria-label="Keyboard shortcuts">⌨</button>
       </div>
       {showKeys && <div className="news-keys" data-testid="news-keys">{KEYS.map(([k, d]) => <span key={k}><kbd>{k}</kbd> {d}</span>)}</div>}
@@ -489,10 +576,11 @@ export default function News() {
         <div className="widget">
           <h3>Headlines <span className="mono" style={{ marginLeft: 8, color: "var(--text-faint)" }}
             title={rows.length !== shown.length ? "Stories (one story's reports from several outlets are one row) · headlines" : ""}>
-            {rows.length !== shown.length ? `${rows.length} stories · ${shown.length}` : shown.length}</span></h3>
+            {rows.length !== shown.length ? `${rows.length} stories · ${shown.length}` : shown.length}</span>
+            {sinceVisit > 0 && <span className="news-unread" data-testid="news-unread">{sinceVisit} new since your last visit</span>}</h3>
           <div className="news-list">
-            {rows.length === 0 && <p className="empty">{live ? "No headlines match." : "Turn monitoring on to start collecting."}</p>}
-            {rows.map(({ lead: i, story }) => {
+            {list.length === 0 && <p className="empty">{live ? "No headlines match." : "Turn monitoring on to start collecting."}</p>}
+            {list.map(({ lead: i, story }) => {
               const hit = story.some(isHit);
               const n = prefs.group ? outlets.get(leadOf.get(i.id) ?? -1) ?? 1 : 1;    // outlets that carried the story
               const ahead = n > 1 && story[0].id === i.id ? story.find((x) => x.source !== i.source) : undefined;
@@ -503,6 +591,8 @@ export default function News() {
                     <span>{ago(when(i))}{(() => { const d = lagOf(i, firstSeen); return d == null ? null : (
                       <span className={`news-lag ${lagClass(d)}`} title={`Published ${ist(Date.parse(i.published_at!))}, first seen ${ist(Date.parse(i.seen_at))} IST`}> +{dur(d)}</span>); })()}</span>
                     <span className="badge neutral">{i.source}</span>
+                    {prefs.sort === "top" && (() => { const sc = scores.get(i.id); return sc ? (
+                      <span className="news-score" title={sc.why.join(" · ") || "no weight"}>★ {sc.score}</span>) : null; })()}
                   </div>
                   <div style={{ minWidth: 0 }}>
                     {/^https?:\/\//.test(i.url)
@@ -514,8 +604,10 @@ export default function News() {
                       onClick={() => setOpen(open === i.id ? null : i.id)} />
                     <div className="news-tags">
                       {(i.tickers ?? []).map((sym) => (
-                        <Ticker key={sym} sym={sym} at={when(i)} on={stockPick === sym} onPick={() => setStockPick(stockPick === sym ? null : sym)} />
+                        <Ticker key={sym} sym={sym} at={when(i)} on={stockPick === sym} hot={breaking.get(sym)?.size}
+                          onPick={() => setStockPick(stockPick === sym ? null : sym)} />
                       ))}
+                      {reactions[i.id]?.traded && <ReactionBadge rx={reactions[i.id]} />}
                       {(i.tags ?? []).slice(0, 2).map((k) => <span key={k} className={`news-kind k-${k}`} title="Keyword rules on the headline, not AI">{kindLabel.get(k) ?? k}</span>)}
                       {n > 1 && (
                         <button type="button" className={`news-tbadge story${expanded === i.id ? " open" : ""}${story.some((x) => x.id !== i.id && fresh.has(x.id)) ? " new" : ""}`}
@@ -568,7 +660,9 @@ export default function News() {
                     return (
                       <tr key={s.sym} className={stockPick === s.sym ? "on" : ""} title={`Latest: ${s.title}`}>
                         <td><button type="button" className="news-stock-name" onClick={() => setStockPick(stockPick === s.sym ? null : s.sym)}
-                          title={stockPick === s.sym ? "Show every stock again" : `Only ${name}'s news`}>{name}</button></td>
+                          title={stockPick === s.sym ? "Show every stock again" : `Only ${name}'s news`}>{name}</button>
+                          {breaking.has(s.sym) && <span className="news-hot" title={`Breaking: ${breaking.get(s.sym)!.size} outlets in the last ${burstM} min`}>
+                            🔥{breaking.get(s.sym)!.size}</span>}</td>
                         <td className="mono">{s.stories.size}</td><td className="mono">{s.sources.size}</td><td className="mono">{ago(s.last)}</td>
                         {hasQuotes && <td className={`mono${cp == null ? "" : cp >= 0 ? " pos" : " neg"}`}>{pct(cp)}</td>}
                         <td><a href={chartHref(s.sym, new Date(s.last).toISOString())} target="_blank" rel="noopener noreferrer"
@@ -582,7 +676,7 @@ export default function News() {
           <div className="widget">
             <h3>Sources</h3>
             <div className="widget-body">
-              {bySource.map(([name, s]) => (
+              {bySource.filter(([, s]) => s.enabled).map(([name, s]) => (
                 <div key={name} className="news-src" title={s.health}>
                   <span className={`news-dot ${s.health}`} />
                   <span className="news-src-name">{name}</span>
@@ -592,6 +686,10 @@ export default function News() {
                   {(s.error || s.paused_until) && <div className="news-src-err">{s.error}{s.paused_until ? ` until ${ist(s.paused_until * 1000)}` : ""}</div>}
                 </div>
               ))}
+              {bySource.some(([, s]) => !s.enabled) && (
+                <button type="button" className="news-more" onClick={() => setShowSettings(true)} title="Pick sources in Settings > Sources">
+                  {(() => { const n = bySource.filter(([, s]) => !s.enabled).length; return `${n} more source${n === 1 ? "" : "s"} off · Settings`; })()}</button>
+              )}
             </div>
           </div>
         </div>
@@ -677,16 +775,28 @@ function StockLinks({ item }: { item: Item }) {
   );
 }
 
-/** A stock the server found in the headline: click for only its news, ↗ for its chart at the story's time. */
-function Ticker({ sym, at, on, onPick }: { sym: string; at: number; on: boolean; onPick: () => void }) {
+/** A stock the server found in the headline: click for only its news, ↗ for its chart at the story's time. "hot":
+ *  the outlets naming it right now, when it is breaking. */
+function Ticker({ sym, at, on, hot, onPick }: { sym: string; at: number; on: boolean; hot?: number; onPick: () => void }) {
   const name = tickerName(sym);
   return (
-    <span className={`news-tk${on ? " on" : ""}`}>
+    <span className={`news-tk${on ? " on" : ""}${hot ? " hot" : ""}`} title={hot ? `Breaking: ${hot} outlets naming it right now` : undefined}>
       <button type="button" onClick={onPick} title={on ? "Show every stock again" : `Only ${name}'s news`}>{name}</button>
       <a href={chartHref(sym, new Date(at).toISOString())} target="_blank" rel="noopener noreferrer"
         title={`${name} chart at ${ist(at)} IST`} aria-label={`${name} chart`}>↗</a>
     </span>
   );
+}
+
+/** How the story's stock has moved since it broke: from the close of the last whole minute before it to the live
+ *  price. The tooltip adds the range traded since and NIFTY over the same span, so its own move shows apart. */
+function ReactionBadge({ rx }: { rx: Reaction }) {
+  const name = tickerName(rx.sym), px = (v: number) => v.toLocaleString("en-IN", { maximumFractionDigits: 2 });
+  const tip = [`${name} since the story: ${px(rx.px0)} at ${ist((rx.t0 + 60) * 1000)} IST → ${px(rx.px)}`,
+    rx.hi_pct != null ? `range since ${pct(rx.lo_pct)} to ${pct(rx.hi_pct)}` : "",
+    rx.nifty_pct != null ? `NIFTY ${pct(rx.nifty_pct)} over the same span: ${pct(rx.excess_pct)} against the market` : ""]
+    .filter(Boolean).join("\n");
+  return <span className={`news-rx${rx.pct > 0 ? " pos" : rx.pct < 0 ? " neg" : ""}`} title={tip} data-testid="news-reaction">{pct(rx.pct)} since</span>;
 }
 
 /** A story's other reports, oldest first: which outlet, how long after the first, and the link. */
@@ -818,10 +928,17 @@ function SettingsModal({ initial, status, prefs, setPrefs, onSave, onClose, onCl
       <p className="field-hint">Headlines only (title, link, time, summary), honest user agent, conditional requests. A source that refuses (403/429) or asks for a pause is left alone for that long. Nothing here reaches the analyzer or the AI.</p>
     </Section>
   );
+  const groups: [string, string[]][] = status.source_groups?.length ? status.source_groups : [["Built-in sources", status.known_sources]];
+  const allOf = (list: string[], on: boolean) => set({ sources: { ...s.sources, ...Object.fromEntries(list.map((k) => [k, on])) } });
   if (tab === "sources") body = (
     <>
-      <Section title="Built-in sources">
-        {status.known_sources.map((src) => {
+      {groups.map(([g, list]) => (
+      <Section key={g} title={`${g} · ${list.filter((k) => s.sources[k] ?? true).length}/${list.length} on`}>
+        <div className="news-group-btns">
+          <button type="button" className="btn-sm" onClick={() => allOf(list, true)}>All on</button>
+          <button type="button" className="btn-sm" onClick={() => allOf(list, false)}>All off</button>
+        </div>
+        {list.map((src) => {
           const h = health(src);
           return (
             <Check key={src} label={<>{src} {h && <span className={`news-dot ${h.health}`} style={{ marginLeft: 6 }} />}</>} checked={s.sources[src] ?? true}
@@ -836,6 +953,7 @@ function SettingsModal({ initial, status, prefs, setPrefs, onSave, onClose, onCl
           );
         })}
       </Section>
+      ))}
       <Section title="Your own feeds">
         {s.custom_feeds.map((f) => (
           <Row key={f.url} label={f.source}><span className="mono text-dim news-url">{f.url}</span><Every src={f.source} s={s} set={set} />
@@ -866,6 +984,16 @@ function SettingsModal({ initial, status, prefs, setPrefs, onSave, onClose, onCl
       </Section>
       <Section title="Muted words">
         <Words words={s.muted} onChange={(w) => set({ muted: w })} placeholder="Hide headlines containing… (e.g. horoscope, cricket)" />
+      </Section>
+      <Section title="Breaking stocks">
+        <Check label="Alert when one stock is named by several outlets within minutes" checked={!!s.bursts} onChange={(v) => set({ bursts: v })}
+          testid="news-bursts-toggle" />
+        <Row label="Outlets" hint="How many different outlets must name the stock (2-10)">
+          <Num value={s.burst_sources ?? 3} min={2} max={10} onChange={(v) => set({ burst_sources: v })} ariaLabel="Burst outlets" /></Row>
+        <Row label="Within (minutes)" hint="5-240">
+          <Num value={s.burst_minutes ?? 30} min={5} max={240} onChange={(v) => set({ burst_minutes: v })} ariaLabel="Burst minutes" /></Row>
+        <p className="field-hint">Goes to the same channels as watchlist hits (Notifications page: "News watchlist hits"), once per stock per
+          burst. The page marks breaking stocks with 🔥 either way.</p>
       </Section>
       <Section title="Alerts">
         <Check label="Send watchlist hits to my notification channels" checked={s.alerts} onChange={(v) => set({ alerts: v })} />

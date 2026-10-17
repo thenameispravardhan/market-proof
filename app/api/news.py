@@ -3,6 +3,7 @@ test, CSV export. Monitoring only."""
 from __future__ import annotations
 
 import asyncio
+import bisect
 import csv
 import io
 import time
@@ -58,6 +59,9 @@ class NewsSettings(BaseModel):
     extract: bool = False
     extract_sources: dict[str, bool] = {}
     intervals: dict[str, int] = {}
+    bursts: bool = False
+    burst_sources: int = Field(3, ge=2, le=10)
+    burst_minutes: int = Field(30, ge=5, le=240)
 
     @field_validator("intervals")
     @classmethod
@@ -161,6 +165,88 @@ def article(url: str = Query(min_length=8, max_length=1000)):
             "fetched_at": e["fetched"]}
 
 
+# ---------------------------------------------------------------- market reaction
+
+NIFTY = "NSE:NIFTY50-INDEX"
+REACTION_STORIES, REACTION_STOCKS = 40, 12      # per request: what one News page asks of the broker's history API
+REACTION_DAYS = 3                               # stories older than this get no reaction
+_SERIES_TTL = 120.0                             # a symbol's 1-minute candles are reused for 2 min
+_series: dict[str, tuple[float, int, list]] = {}   # symbol -> (fetched at, from, [[ts, o, h, l, c, v], ...])
+
+
+def move_since(candles: list, t: float, ltp: Optional[float] = None) -> Optional[dict]:
+    """How a price moved since a story at epoch t. The reference is the close of the last whole minute before it:
+    never a price the story could already have moved. Then the latest price (the live quote, else the last close)
+    and the range traded since. None when no candle precedes the story."""
+    i = bisect.bisect_right([c[0] for c in candles], t - 60)    # candles[:i] closed by t
+    if i == 0 or not float(candles[i - 1][4]) > 0:
+        return None
+    px0, after = float(candles[i - 1][4]), candles[i:]
+    px = float(ltp) if ltp else float(candles[-1][4])
+    pct = lambda v: round((v / px0 - 1) * 100, 2)   # noqa: E731
+    out = {"t0": int(candles[i - 1][0]), "px0": px0, "px": px, "pct": pct(px), "traded": bool(after)}
+    if after:
+        out["hi_pct"], out["lo_pct"] = pct(max(float(c[2]) for c in after)), pct(min(float(c[3]) for c in after))
+    return out
+
+
+async def _minutes(backend, sym: str, frm: int) -> list:
+    hit = _series.get(sym)
+    if hit and hit[1] == frm and time.time() - hit[0] < _SERIES_TTL:
+        return hit[2]
+    got = await backend.get_history_range(sym, resolution="1", from_ts=frm, to_ts=int(time.time()))
+    if got is None:                             # the call failed: keep what we had
+        return hit[2] if hit else []
+    if len(_series) > 200:
+        _series.pop(min(_series, key=lambda k: _series[k][0]))
+    _series[sym] = (time.time(), frm, got)
+    return got
+
+
+@router.get("/reaction")
+async def reaction(ids: str = Query("", max_length=1000), db: Session = Depends(get_db)):
+    """How the stock each story names (the first) moved since the story broke, next to NIFTY 50 over the same span,
+    so its own move shows apart from the market's. Needs the connected Fyers account (1-minute history);
+    {"ok": false} otherwise. Monitoring only: read by the News page, never by the analyzer."""
+    from app.api import market
+
+    backend = market._fyers_backend()
+    if backend is None or not hasattr(backend, "get_history_range"):
+        return {"ok": False, "reason": "connect a Fyers account for prices", "reactions": {}}
+    try:
+        wanted = [int(x) for x in ids.split(",") if x][:REACTION_STORIES]
+    except ValueError:
+        raise HTTPException(422, "ids: comma-separated integers")
+    now = time.time()
+    stories = []
+    for r in db.execute(select(NewsItem).where(NewsItem.id.in_(wanted))).scalars():
+        tickers = nt.tag(r.title, r.summary)["tickers"]
+        t = (r.published_at if r.published_at and r.published_at <= r.seen_at else r.seen_at).replace(tzinfo=timezone.utc)
+        if tickers and now - t.timestamp() < REACTION_DAYS * 86400:
+            stories.append((r.id, tickers[0], t.timestamp()))
+    syms = sorted({s for _, s, _ in stories})[:REACTION_STOCKS]
+    if not syms:
+        return {"ok": True, "reactions": {}, "asof": now}
+    frm = int(now // 3600 * 3600 - (REACTION_DAYS + 1) * 86400)   # whole hours: one cache key; a day before the oldest
+    sem = asyncio.Semaphore(4)
+
+    async def one(sym: str) -> tuple[str, list]:
+        async with sem:
+            return sym, await _minutes(backend, sym, frm)
+    series = dict(await asyncio.gather(*(one(s) for s in [*syms, NIFTY])))
+    ltp = {s: q.last_price for s, q in (await market.fyers_quotes([*syms, NIFTY])).items()}
+    out = {}
+    for iid, sym, t in stories:
+        m = move_since(series[sym], t, ltp.get(sym)) if sym in series else None
+        if m is None:
+            continue
+        n = move_since(series[NIFTY], t, ltp.get(NIFTY))
+        if n is not None and m["traded"]:
+            m["nifty_pct"], m["excess_pct"] = n["pct"], round(m["pct"] - n["pct"], 2)
+        out[iid] = {"sym": sym, **m}
+    return {"ok": True, "reactions": out, "asof": now}
+
+
 @router.get("/status")
 def status(db: Session = Depends(get_db)):
     s = nw.load_settings(db)
@@ -187,6 +273,8 @@ def status(db: Session = Depends(get_db)):
     w = nw.news_wire
     return {"settings": s, "sources": sources, "known_sources": nw.SOURCES, "extract": _extract_stats(db),
             "lag": lag["overall"], "watch_stocks": nt.watch_stocks(s["watchlist"]),
+            "source_groups": [[g, sorted(k for k, v in nw.SOURCE_GROUPS.items() if v == g)]
+                              for g in (nw.MARKETS, nw.BUSINESS, nw.OFFICIAL, nw.GLOBAL)],
             "kinds": [[k, label] for k, label in nt.KIND_LABELS.items()],
             "collector": {"polls": w.polls, "last_poll_at": w.last_poll_at, "last_poll_ms": w.last_poll_ms}}
 

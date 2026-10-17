@@ -21,6 +21,7 @@ let puts: unknown[] = [];
 
 beforeEach(() => {
   puts = [];
+  try { localStorage.removeItem("news:lastSeen"); } catch { /* storage off */ }
   globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     if (url.includes("/api/news/settings") && init?.method === "PUT") {
@@ -222,22 +223,27 @@ describe("News page: stocks, stories, kinds and keys", () => {
   const KINDS = [["results", "Results"], ["orders", "Orders"], ["deals", "Stake / M&A"], ["market", "Markets"]];
   const opened: string[] = [];
   let watching: Record<string, string[]> = {};               // watchlist word -> the stocks it names
+  let statusExtra: Record<string, unknown> = {}, settingsExtra: Record<string, unknown> = {};
+  let reactions: Record<string, unknown> | null = null;     // /api/news/reaction: null = Fyers not connected
 
   beforeEach(() => {
     opened.length = 0;
     watching = {};
+    statusExtra = {}; settingsExtra = {}; reactions = null;
     vi.spyOn(window, "open").mockImplementation((u?: string | URL) => { opened.push(String(u)); return null; });
     try { localStorage.removeItem("news:prefs"); } catch { /* storage off */ }
-    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
+      if (url.includes("/api/news/settings") && init?.method === "PUT") { const b = JSON.parse(String(init.body)); puts.push(b); return json(b); }
       if (url.includes("/api/market/quotes")) return json({ quotes: { [REL]: { ltp: 2950, change: 36, change_pct: 1.25 } } });
+      if (url.includes("/api/news/reaction")) return json(reactions ? { ok: true, reactions } : { ok: false, reactions: {} });
       if (url.includes("/api/news/items")) return json({ items: url.includes("since_id") ? [] : LIST, max_id: 5 });
       if (url.includes("/api/news/status")) return json({
-        settings: { ...SETTINGS, enabled: true, watchlist: Object.keys(watching), muted: [] }, known_sources: ["Mint"], kinds: KINDS,
+        settings: { ...SETTINGS, enabled: true, watchlist: Object.keys(watching), muted: [], ...settingsExtra }, known_sources: ["Mint"], kinds: KINDS,
         collector: { polls: 3, last_poll_at: null, last_poll_ms: null }, watch_stocks: watching,
         sources: [{ source: "Moneycontrol", url: "u", custom: false, enabled: true, health: "ok", last_ok: null, error: null, paused_until: null,
           items_in_feed: 3, hour: 1, day: 1, total: 1, last_item: null }],
-        lag: { p50: 45, p90: 90, n: 3, fastest: "Mint" },
+        lag: { p50: 45, p90: 90, n: 3, fastest: "Mint" }, ...statusExtra,
       });
       return json({}, 404);
     }) as unknown as typeof fetch;
@@ -343,5 +349,75 @@ describe("News page: stocks, stories, kinds and keys", () => {
     const search = screen.getByLabelText("Search headlines");
     fireEvent.keyDown(search, { key: "j" });                                             // typing: the list stays put
     expect(document.querySelector(".news-item.cursor")).toBeNull();
+  });
+
+  const fetched = () => (globalThis.fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls.map((c) => String(c[0]));
+
+  it("shows how each tagged story's stock moved since it broke, against NIFTY", async () => {
+    reactions = { 4: { sym: TCS, t0: 0, px0: 4000, px: 4072, pct: 1.8, traded: true, hi_pct: 2.1, lo_pct: -0.3, nifty_pct: 0.2, excess_pct: 1.6 },
+      3: { sym: REL, t0: 0, px0: 2900, px: 2900, pct: 0, traded: false } };
+    render(<News />);
+    const tcs = (await screen.findByText(/TCS bags/)).closest("article")!;
+    const rx = await within(tcs).findByTestId("news-reaction");
+    expect(rx.textContent).toBe("+1.80% since");
+    expect(rx.className).toContain("pos");
+    expect(rx.getAttribute("title")).toContain("NIFTY +0.20% over the same span: +1.60% against the market");
+    expect(rx.getAttribute("title")).toContain("range since -0.30% to +2.10%");
+    const ret = screen.getByText(/Retail to acquire/).closest("article")!;
+    expect(within(ret).queryByTestId("news-reaction")).toBeNull();                       // not traded since: nothing to say
+    expect(fetched().find((u) => u.includes("/api/news/reaction"))).toContain("ids=1,3,4");   // the tagged stories on screen
+  });
+
+  it("ranks stories by importance with Top, and says why", async () => {
+    render(<News />);
+    await screen.findByText(/TCS bags/);
+    const titles = () => [...document.querySelectorAll("article .news-title")].map((e) => e.textContent ?? "");
+    expect(titles()[0]).toMatch(/Sensex ends/);                                           // Latest: newest first
+    fireEvent.click(screen.getByRole("button", { name: "Top" }));
+    expect(titles()[0]).toMatch(/Reliance Q2 net profit/);                                // results, 2 outlets, a large cap
+    expect(titles()[titles().length - 1]).toMatch(/Sensex ends/);                         // a market wrap weighs least
+    expect(document.querySelector('[data-row="1"] .news-score')!.getAttribute("title")).toContain("2 outlets +2");
+    expect(JSON.parse(localStorage.getItem("news:prefs")!).sort).toBe("top");             // remembered in this browser
+  });
+
+  it("marks what came in since this browser's last visit", async () => {
+    localStorage.setItem("news:lastSeen", "3");
+    render(<News />);
+    expect((await screen.findByTestId("news-unread")).textContent).toBe("2 new since your last visit");
+    expect(screen.getAllByText("NEW")).toHaveLength(2);                                   // TCS and the Sensex wrap
+    fireEvent.click(screen.getByRole("button", { name: /Mark seen \(2\)/ }));
+    expect(screen.queryByText("NEW")).toBeNull();
+    expect(localStorage.getItem("news:lastSeen")).toBe("5");
+  });
+
+  it("marks a stock several outlets name within minutes as breaking", async () => {
+    settingsExtra = { burst_minutes: 60 };
+    render(<News />);
+    const panel = await screen.findByTestId("news-stocks-panel");
+    expect(within(panel).getByTitle(/Breaking: 3 outlets in the last 60 min/).textContent).toBe("🔥3");
+    expect(screen.getByText(/Retail to acquire/).closest("article")!.querySelector(".news-tk.hot")).toBeTruthy();
+    expect(screen.getByText(/TCS bags/).closest("article")!.querySelector(".news-tk.hot")).toBeNull();   // one outlet
+  });
+
+  it("groups the sources in Settings with all on / all off, and saves the breaking-stock alert", async () => {
+    statusExtra = { known_sources: ["BSE", "CNBC", "Mint", "NSE"],
+      source_groups: [["India · markets", ["Mint"]], ["Exchanges & regulators", ["BSE", "NSE"]], ["Global", ["CNBC"]]],
+      sources: [{ source: "Mint", url: "u1", custom: false, enabled: true, health: "ok", last_ok: null, error: null, paused_until: null, items_in_feed: 1, hour: 1, day: 1, total: 1, last_item: null },
+        { source: "CNBC", url: "u2", custom: false, enabled: false, health: "off", last_ok: null, error: null, paused_until: null, items_in_feed: 0, hour: 0, day: 0, total: 0, last_item: null }] };
+    settingsExtra = { sources: { Mint: true, BSE: true, NSE: false, CNBC: false }, extract_sources: {} };
+    render(<News />);
+    expect(await screen.findByRole("button", { name: /1 more source off/ })).toBeTruthy();   // the sidebar lists what is polled
+    fireEvent.click(screen.getByTestId("news-settings-btn"));
+    const dlg = await screen.findByTestId("news-settings");
+    fireEvent.click(within(dlg).getByRole("tab", { name: "Sources" }));
+    const official = within(dlg).getByText("Exchanges & regulators · 1/2 on").parentElement!;
+    fireEvent.click(within(official).getByRole("button", { name: "All on" }));
+    expect(within(dlg).getByText("Exchanges & regulators · 2/2 on")).toBeTruthy();
+    fireEvent.click(within(dlg).getByRole("tab", { name: "Watchlist & alerts" }));
+    fireEvent.click(within(dlg).getByTestId("news-bursts-toggle"));
+    fireEvent.change(within(dlg).getByLabelText("Burst outlets"), { target: { value: "4" } });
+    fireEvent.click(within(dlg).getByTestId("news-save"));
+    await waitFor(() => expect(puts).toHaveLength(1));
+    expect(puts[0]).toMatchObject({ bursts: true, burst_sources: 4, sources: { BSE: true, NSE: true, CNBC: false } });
   });
 });
