@@ -1,4 +1,5 @@
-"""News page API: headlines, source health, settings, poll-now, feed test, CSV export. Monitoring only."""
+"""News page API: headlines (with the stocks they name and their kind), source health, settings, poll-now, feed
+test, CSV export. Monitoring only."""
 from __future__ import annotations
 
 import asyncio
@@ -17,6 +18,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import NewsItem
 from app.db.session import get_db
+from app.services import news_tags as nt
 from app.services import news_wire as nw
 
 router = APIRouter(prefix="/api/news", tags=["news"])
@@ -74,7 +76,7 @@ class NewsSettings(BaseModel):
 def _row(n: NewsItem) -> dict:
     iso = lambda d: d.replace(tzinfo=timezone.utc).isoformat() if d else None   # noqa: E731 (stored naive UTC)
     return {"id": n.id, "url": n.url, "source": n.source, "title": n.title, "summary": n.summary,
-            "published_at": iso(n.published_at), "seen_at": iso(n.seen_at)}
+            "published_at": iso(n.published_at), "seen_at": iso(n.seen_at), **nt.tag(n.title, n.summary)}
 
 
 def _query(db: Session, q: str, source: Optional[str], hours: Optional[float]):
@@ -184,7 +186,8 @@ def status(db: Session = Depends(get_db)):
                         "last_item": last.replace(tzinfo=timezone.utc).isoformat() if last else None})
     w = nw.news_wire
     return {"settings": s, "sources": sources, "known_sources": nw.SOURCES, "extract": _extract_stats(db),
-            "lag": lag["overall"],
+            "lag": lag["overall"], "watch_stocks": nt.watch_stocks(s["watchlist"]),
+            "kinds": [[k, label] for k, label in nt.KIND_LABELS.items()],
             "collector": {"polls": w.polls, "last_poll_at": w.last_poll_at, "last_poll_ms": w.last_poll_ms}}
 
 
@@ -334,9 +337,10 @@ def export(q: str = Query("", max_length=100), source: Optional[str] = None,
     stmt, when = _query(db, q, source, hours)
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["published_at_utc", "seen_at_utc", "source", "title", "url"])
+    w.writerow(["published_at_utc", "seen_at_utc", "source", "title", "url", "tickers", "tags"])
     for n in db.execute(stmt.order_by(when.desc()).limit(20000)).scalars():
-        w.writerow([n.published_at or "", n.seen_at, n.source, n.title, n.url])
+        t = nt.tag(n.title, n.summary)
+        w.writerow([n.published_at or "", n.seen_at, n.source, n.title, n.url, " ".join(t["tickers"]), " ".join(t["tags"])])
     return Response(buf.getvalue(), media_type="text/csv",
                     headers={"Content-Disposition": f'attachment; filename="news-{int(time.time())}.csv"'})
 

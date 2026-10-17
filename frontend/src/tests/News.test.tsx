@@ -206,3 +206,142 @@ describe("News page: fixes and trader shortcuts", () => {
     expect(links[0].getAttribute("href")).toMatch(/&at=\d+/);
   });
 });
+
+describe("News page: stocks, stories, kinds and keys", () => {
+  const REL = "NSE:RELIANCE-EQ", TCS = "NSE:TCS-EQ";
+  const at = (m: number) => new Date(Date.now() - m * 60_000).toISOString();
+  const mk = (id: number, source: string, title: string, mins: number, tickers: string[] = [], tags: string[] = []) =>
+    ({ id, url: `https://x.example/${id}`, source, title, summary: null, published_at: at(mins), seen_at: at(mins), tickers, tags });
+  const LIST = [
+    mk(1, "Moneycontrol", "Reliance Q2 net profit rises 10% to ₹19,323 crore", 30, [REL], ["results"]),
+    mk(2, "Economic Times", "RIL Q2 net profit rises 10% to ₹19,323 crore; revenue up 5%", 26, [REL], ["results"]),
+    mk(3, "Mint", "Reliance Retail to acquire a beauty brand", 20, [REL], ["deals"]),
+    mk(4, "Zee Business", "TCS bags $1 billion order from UK insurer", 10, [TCS], ["orders"]),
+    mk(5, "NDTV", "Sensex ends 300 points higher", 5, [], ["market"]),
+  ];
+  const KINDS = [["results", "Results"], ["orders", "Orders"], ["deals", "Stake / M&A"], ["market", "Markets"]];
+  const opened: string[] = [];
+  let watching: Record<string, string[]> = {};               // watchlist word -> the stocks it names
+
+  beforeEach(() => {
+    opened.length = 0;
+    watching = {};
+    vi.spyOn(window, "open").mockImplementation((u?: string | URL) => { opened.push(String(u)); return null; });
+    try { localStorage.removeItem("news:prefs"); } catch { /* storage off */ }
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/api/market/quotes")) return json({ quotes: { [REL]: { ltp: 2950, change: 36, change_pct: 1.25 } } });
+      if (url.includes("/api/news/items")) return json({ items: url.includes("since_id") ? [] : LIST, max_id: 5 });
+      if (url.includes("/api/news/status")) return json({
+        settings: { ...SETTINGS, enabled: true, watchlist: Object.keys(watching), muted: [] }, known_sources: ["Mint"], kinds: KINDS,
+        collector: { polls: 3, last_poll_at: null, last_poll_ms: null }, watch_stocks: watching,
+        sources: [{ source: "Moneycontrol", url: "u", custom: false, enabled: true, health: "ok", last_ok: null, error: null, paused_until: null,
+          items_in_feed: 3, hour: 1, day: 1, total: 1, last_item: null }],
+        lag: { p50: 45, p90: 90, n: 3, fastest: "Mint" },
+      });
+      return json({}, 404);
+    }) as unknown as typeof fetch;
+  });
+
+  it("ranks the stocks in the news by stories, with their day's move, and filters the list by one", async () => {
+    render(<News />);
+    const panel = await screen.findByTestId("news-stocks-panel");
+    const cells = (r: Element) => [...r.querySelectorAll("td")].map((c) => c.textContent);
+    const rows = [...panel.querySelectorAll("tbody tr")];
+    expect(rows.map((r) => cells(r).slice(0, 3))).toEqual([["RELIANCE", "2", "3"], ["TCS", "1", "1"]]);   // the repost is one story
+    await waitFor(() => expect(within(panel).getByText("+1.25%").className).toContain("pos"));
+    expect(within(panel).getByText("Today")).toBeTruthy();                             // shown once Fyers answers
+    expect(within(panel).getByLabelText("RELIANCE chart").getAttribute("href")).toContain("symbol=NSE%3ARELIANCE-EQ");
+
+    fireEvent.click(within(panel).getByRole("button", { name: "RELIANCE" }));
+    expect(screen.queryByText(/TCS bags/)).toBeNull();
+    expect(screen.getByText(/Reliance Retail/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "RELIANCE ×" }));                // the toolbar chip clears it
+    expect(screen.getByText(/TCS bags/)).toBeTruthy();
+  });
+
+  it("tags each headline with its stocks and kind, and filters by kind", async () => {
+    render(<News />);
+    const tcs = (await screen.findByText(/TCS bags/)).closest("article")!;
+    expect(within(tcs).getByLabelText("TCS chart").getAttribute("href")).toMatch(/symbol=NSE%3ATCS-EQ.*&at=\d+/);
+    expect(within(tcs).getByText("Orders")).toBeTruthy();
+    expect(within(tcs).queryByRole("button", { name: /chart/ })).toBeNull();          // tagged: no lookup needed
+    const kinds = screen.getByTestId("news-kinds");
+    expect([...kinds.querySelectorAll("button")].map((b) => b.textContent)).toEqual(["Results 2", "Orders 1", "Stake / M&A 1", "Markets 1"]);
+    fireEvent.click(within(kinds).getByRole("button", { name: /^Orders/ }));
+    expect(screen.queryByText(/Sensex ends/)).toBeNull();
+    expect(screen.getByText(/TCS bags/)).toBeTruthy();
+  });
+
+  it("shows one story's reports from several outlets as one row, with who had it first", async () => {
+    render(<News />);
+    const lead = (await screen.findByText(/Reliance Q2 net profit/)).closest("article")!;
+    expect(screen.queryByText(/RIL Q2 net profit/)).toBeNull();                       // folded into the first report
+    expect(within(lead).getByText("1st by 4m")).toBeTruthy();
+    expect(screen.getByText("4 stories · 5")).toBeTruthy();
+    fireEvent.click(within(lead).getByRole("button", { name: /2 sources/ }));
+    const story = within(lead).getByTestId("news-story");
+    expect(within(story).getByText(/RIL Q2 net profit/)).toBeTruthy();
+    expect(within(story).getByText("+4m")).toBeTruthy();
+    const strip = screen.getByTestId("news-stats");
+    const first = within(strip).getByText("First to report").parentElement!;
+    expect(first.textContent).toContain("Moneycontrol1 of 1 shared stories");
+    expect(first.getAttribute("title")).toContain("Moneycontrol 1");
+
+    fireEvent.click(screen.getByRole("switch", { name: /2\+ sources/ }));
+    expect(screen.queryByText(/TCS bags/)).toBeNull();
+    expect(screen.getByText(/Reliance Q2 net profit/)).toBeTruthy();
+  });
+
+  it("lists every headline again with grouping off", async () => {
+    localStorage.setItem("news:prefs", JSON.stringify({ group: false }));
+    render(<News />);
+    expect(await screen.findByText(/RIL Q2 net profit/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /sources$/ })).toBeNull();
+  });
+
+  it("a watchlist word that names a stock hits the headlines that call it something else", async () => {
+    watching = { Reliance: [REL] };
+    localStorage.setItem("news:prefs", JSON.stringify({ group: false }));            // the RIL report on its own row
+    render(<News />);
+    const ril = (await screen.findByText(/RIL Q2 net profit/)).closest("article")!;   // no "Reliance" in it
+    expect(ril.className).toContain("hit");
+    const tcs = screen.getByText(/TCS bags/).closest("article")!;
+    expect(tcs.className).not.toContain("hit");
+    fireEvent.click(screen.getByRole("switch", { name: /Watchlist only/ }));
+    expect(screen.queryByText(/TCS bags/)).toBeNull();
+    fireEvent.click(screen.getByTestId("news-settings-btn"));
+    const dlg = await screen.findByTestId("news-settings");
+    fireEvent.click(within(dlg).getByRole("tab", { name: "Watchlist & alerts" }));
+    expect(within(dlg).getByTestId("news-watch-stocks").textContent).toContain("Reliance → RELIANCE");
+  });
+
+  it("moves through the stories with j / k and acts on the one under the cursor", async () => {
+    render(<News />);
+    await screen.findByText(/Sensex ends/);
+    const row = (id: number) => document.querySelector(`[data-row="${id}"]`)!;
+    fireEvent.keyDown(document.body, { key: "j" });
+    expect(row(5).className).toContain("cursor");
+    fireEvent.keyDown(document.body, { key: "j" });
+    expect(row(4).className).toContain("cursor");
+    fireEvent.keyDown(document.body, { key: "k" });
+    expect(row(5).className).toContain("cursor");
+    fireEvent.keyDown(document.body, { key: "o" });
+    expect(opened).toEqual(["https://x.example/5"]);
+    fireEvent.keyDown(document.body, { key: "j" });
+    fireEvent.keyDown(document.body, { key: "c" });                                      // TCS: its chart
+    expect(opened[1]).toContain("symbol=NSE%3ATCS-EQ");
+    fireEvent.keyDown(document.body, { key: "j" });
+    fireEvent.keyDown(document.body, { key: "j" });
+    fireEvent.keyDown(document.body, { key: "e" });                                      // the Reliance story's sources
+    expect(within(row(1) as HTMLElement).getByTestId("news-story")).toBeTruthy();
+    fireEvent.keyDown(document.body, { key: "?" });
+    expect(screen.getByTestId("news-keys")).toBeTruthy();
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(screen.queryByTestId("news-keys")).toBeNull();
+    expect(document.querySelector(".news-item.cursor")).toBeNull();
+    const search = screen.getByLabelText("Search headlines");
+    fireEvent.keyDown(search, { key: "j" });                                             // typing: the list stays put
+    expect(document.querySelector(".news-item.cursor")).toBeNull();
+  });
+});
