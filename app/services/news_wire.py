@@ -13,12 +13,14 @@ import ipaddress
 import json
 import re
 import socket
+import sqlite3
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Optional
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
@@ -52,6 +54,11 @@ DEFAULT_FEEDS: list[dict[str, Any]] = [
     {"source": "BSE", "url": "https://www.bseindia.com/data/xml/announcements.xml", "ist": True},
 ]
 SOURCES = sorted({f["source"] for f in DEFAULT_FEEDS})
+# Full text comes from scraper/scrape.py (the operator's crawler), into its own SQLite store. These sources'
+# article links refuse an honest client (BSE AttachLive PDFs 503/406, ndtvprofit.com Akamai 403, ndtv.com 403 x5 on
+# 2026-10-17, which the scraper then paused): off by default.
+SCRAPE_DB = Path("data/scrape.db")
+EXTRACT_OFF = {"BSE", "NDTV Profit", "NDTV"}
 
 DEFAULTS: dict[str, Any] = {
     "enabled": False,        # off until the operator turns it on from the News page
@@ -62,6 +69,8 @@ DEFAULTS: dict[str, Any] = {
     "muted": [],             # hidden on the page
     "alerts": False,         # send watchlist hits to notification channels subscribed to "news"
     "retention_days": 7,
+    "extract": False,        # fetch each new headline's article with the scraper: text, metadata, tables, PDF text
+    "extract_sources": {s: s not in EXTRACT_OFF for s in SOURCES},
 }
 
 
@@ -80,6 +89,7 @@ def load_settings(db=None) -> dict[str, Any]:
             db.close()
     out = {**DEFAULTS, **{k: v for k, v in saved.items() if k in DEFAULTS}}
     out["sources"] = {**DEFAULTS["sources"], **(saved.get("sources") or {})}
+    out["extract_sources"] = {**DEFAULTS["extract_sources"], **(saved.get("extract_sources") or {})}
     return out
 
 
@@ -204,6 +214,10 @@ class NewsWire:
     _wake: Optional[asyncio.Event] = None
     _client: Optional[httpx.AsyncClient] = None
     _pruned_at: float = 0.0
+    scrape_db: Path = SCRAPE_DB
+    allow_private: bool = False          # tests only: lets the scraper reach a local mock server
+    extracted: int = 0                   # articles handed to the scraper since start
+    _hosts: dict = field(default_factory=dict)   # the scraper's per-host state (robots.txt, gaps, pauses) across runs
 
     def client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -330,6 +344,97 @@ class NewsWire:
             db.commit()
         finally:
             db.close()
+
+
+    # ------------------------------------------------------------ full text (scraper/scrape.py)
+
+    async def run_extract(self) -> None:
+        while True:
+            try:
+                s = load_settings()
+                n = await self.extract(s) if s["enabled"] and s["extract"] else 0
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("news_wire.extract_failed")
+                n = 0
+            await asyncio.sleep(5 if n else 30)
+
+    def pending(self, s: dict[str, Any], limit: int = 25) -> list[str]:
+        """Newest headlines (12 h) from sources with full text on that the scraper hasn't finished yet. Rows the
+        scraper parked (paused host: 'deferred') stay pending; it sends them nothing until the pause ends."""
+        custom = {c["source"] for c in s["custom_feeds"]}
+        on = [k for k, v in s["extract_sources"].items() if v and s["sources"].get(k, True)] + sorted(custom)
+        db = db_session.SessionLocal()
+        try:
+            cut = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=12)
+            urls = list(db.execute(select(NewsItem.url).where(NewsItem.source.in_(on), NewsItem.seen_at >= cut)
+                                   .order_by(NewsItem.id.desc()).limit(400)).scalars())
+        finally:
+            db.close()
+        state = lookup(urls, self.scrape_db, text=False)
+        return [u for u in urls if (state.get(u) or {}).get("status") in (None, "queued", "deferred")][:limit]
+
+    async def extract(self, s: dict[str, Any]) -> int:
+        urls = self.pending(s)
+        if not urls:
+            return 0
+        from scraper import scrape          # heavy (trafilatura): imported only once full text is switched on
+
+        argv = ["--db", str(self.scrape_db), "--workers", "1", "--concurrency", "4", "--max-delay", "30",
+                "--max-pages", str(len(urls) * 3)] + (["--allow-private"] if self.allow_private else [])
+        a = scrape.parse_args(argv)
+        # one polite profile for every article host: html only (no link-walking, no browser), 3 s apart,
+        # one at a time per host, one retry; a refusing host is paused (persisted in scrape.db)
+        a.sources = {urlsplit(scrape.normalize(u) or u).netloc: {"method": "html", "delay": 3, "per_host": 1,
+                                                                   "retries": 1, "pause": 3600} for u in urls}
+        c = scrape.Crawler(a)
+        c.hosts = self._hosts
+        try:
+            await c.run(urls)
+        finally:
+            c.db.close()
+            self._hosts = c.hosts
+        self.extracted += len(urls)
+        return len(urls)
+
+
+def lookup(urls: list[str], db_path: Path, text: bool = True) -> dict[str, dict[str, Any]]:
+    """Scraper rows for these headline URLs, keyed by the headline URL. Follows the scraper's URL normalisation
+    and one redirect hop (an article URL that 301s to its canonical address). {} until scrape.db exists."""
+    if not urls or not db_path.exists():
+        return {}
+    from scraper.scrape import normalize
+
+    cols = "url, status, http, final_url, error, fetched, length(text)" + (", title, date, text, meta, tables" if text else "")
+    norm = {u: normalize(u) or u for u in urls}
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        def rows(keys):
+            out = {}
+            keys = list(keys)
+            for i in range(0, len(keys), 500):
+                part = keys[i:i + 500]
+                for r in con.execute(f"SELECT {cols} FROM pages WHERE url IN ({','.join('?' * len(part))})", part):
+                    out[r[0]] = r
+            return out
+
+        got = rows(set(norm.values()))
+        hops = {r[3] for r in got.values() if r[1] == "redirect" and r[3]}
+        got.update(rows(hops - set(got)))
+        names = [c.strip().split(" ")[0].replace("length(text)", "chars") for c in cols.split(",")]
+        out = {}
+        for u, n in norm.items():
+            r = got.get(n)
+            if r and r[1] == "redirect" and r[3] in got:
+                r = got[r[3]]
+            if r:
+                out[u] = dict(zip(names, r))
+        return out
+    except sqlite3.OperationalError:                 # scrape.db exists but has no pages table yet
+        return {}
+    finally:
+        con.close()
 
 
 def _retry_after(v: Optional[str]) -> Optional[float]:

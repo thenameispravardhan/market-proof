@@ -1,0 +1,6 @@
+https://www.bseindia.com/data/xml/announcements.xml
+https://www.bseindia.com/data/xml/notices.xml
+https://www.thehindubusinessline.com/feeder/default.rss
+https://www.thehindubusinessline.com/companies/feeder/default.rss
+https://www.thehindubusinessline.com/markets/stock-markets/feeder/default.rss
+https://feeds.feedburner.com/ndtvprofit-latest

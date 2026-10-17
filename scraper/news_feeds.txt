@@ -1,0 +1,10 @@
+https://www.moneycontrol.com/news/news-sitemap.xml
+https://feeds.feedburner.com/ndtvprofit-latest
+https://feeds.feedburner.com/ndtvnews-top-stories
+https://www.zeebiz.com/latest.xml
+https://www.cnbctv18.com/commonfeeds/v1/cne/rss/latest.xml
+https://www.cnbctv18.com/commonfeeds/v1/cne/rss/market.xml
+https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms
+https://www.livemint.com/rss/markets
+https://www.thehindubusinessline.com/markets/stock-markets/feeder/default.rss
+https://www.bseindia.com/data/xml/announcements.xml

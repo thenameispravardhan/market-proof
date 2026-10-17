@@ -1,0 +1,20 @@
+{
+  "_comment": "news.py: headlines only (title, link, time, summary from each feed; no article pages), honest UA, robots.txt honoured, polled every 20 s. Several publishers' terms restrict automated or commercial use (see SOURCES.md): personal use is your call.",
+  "www.moneycontrol.com": {"method": "headlines", "delay": 2, "per_host": 1, "retries": 1, "pause": 3600, "ttl": 30,
+                           "access": "terms (4.4(iii)) bar bots; news sitemap listed in robots.txt (its RSS stopped in 2024); headlines for personal use; ttl 30 = its max-age, no ETag"},
+  "feeds.feedburner.com": {"method": "headlines", "delay": 2, "per_host": 1, "retries": 1, "pause": 3600,
+                           "access": "NDTV's public Feedburner feeds; ndtvprofit.com itself blocks scripts"},
+  "www.zeebiz.com": {"method": "headlines", "delay": 2, "per_host": 1, "retries": 1, "pause": 3600,
+                     "access": "robots.txt allows generic bots (blocks named AI crawlers)"},
+  "www.cnbctv18.com": {"method": "headlines", "delay": 2, "per_host": 1, "retries": 1, "pause": 3600,
+                       "access": "Network18 terms restrict machine use; headlines for personal use"},
+  "economictimes.indiatimes.com": {"method": "headlines", "delay": 2, "per_host": 1, "retries": 1, "pause": 3600,
+                                   "access": "RSS for personal, non-commercial use"},
+  "www.livemint.com": {"method": "headlines", "delay": 2, "per_host": 1, "retries": 1, "pause": 3600,
+                       "access": "terms restrict crawlers; headlines for personal use"},
+  "www.thehindubusinessline.com": {"method": "headlines", "delay": 2, "per_host": 1, "retries": 1, "pause": 3600,
+                                   "access": "RSS for personal, non-commercial use"},
+  "www.bseindia.com": {"method": "headlines", "delay": 2, "per_host": 1, "retries": 1, "pause": 3600, "tz": 5.5,
+                       "access": "exchange announcements RSS; pubDate is IST"},
+  "x.com": {"method": "none", "access": "robots.txt disallows all bots: news.py reads X only through the official API (X_BEARER_TOKEN)"}
+}
