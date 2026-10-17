@@ -31,6 +31,7 @@ from app.db import session as db_session
 from app.db.infra_models import AppSetting
 from app.db.models import NewsItem
 from app.logging_config import get_logger
+from app.services import news_tags
 from app.services.event_bus import event_bus
 
 log = get_logger(__name__)
@@ -353,9 +354,12 @@ class NewsWire:
             db.close()
 
     async def _alert(self, fresh: list[dict[str, Any]], watchlist: list[str]) -> None:
-        for i in fresh:
+        # A watchlist word that names a stock also hits every headline tagged with it ("Reliance" -> "RIL shares
+        # jump"). Tagging is CPU work, so it runs off the event loop the trading path shares.
+        named, tagged = await asyncio.get_running_loop().run_in_executor(None, _alert_tags, fresh, watchlist)
+        for i, stocks in zip(fresh, tagged):
             hay = f"{i['title']} {i.get('summary') or ''}".lower()
-            hits = [w for w in watchlist if w.lower() in hay]
+            hits = [w for w in watchlist if w.lower() in hay or stocks & set(named.get(w, ()))]
             if hits:
                 await event_bus.publish("news.alert", {"keywords": hits, "title": i["title"], "source": i["source"],
                                                        "url": i["url"]})
@@ -436,6 +440,10 @@ class NewsWire:
         self.extracted += len(urls)
         await event_bus.publish("news", {"extracted": len(urls)})
         return len(urls)
+
+
+def _alert_tags(fresh: list[dict[str, Any]], watchlist: list[str]) -> tuple[dict[str, list[str]], list[set[str]]]:
+    return news_tags.watch_stocks(watchlist), [set(news_tags.stocks(i["title"], i.get("summary"))) for i in fresh]
 
 
 def paused_hosts(db_path: Path) -> set[str]:
