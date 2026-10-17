@@ -17,6 +17,7 @@ const EVENT_TYPES: { value: string; label: string }[] = [
   { value: "risk_halt", label: "Risk halts (trading paused)" },
   { value: "error", label: "System errors" },
   { value: "report", label: "Daily health report" },
+  { value: "news", label: "News watchlist hits" },
 ];
 
 // GET masks secrets as "***". Never put the mask in an input: it would be

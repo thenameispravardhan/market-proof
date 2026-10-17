@@ -8,6 +8,7 @@ import { withWs, wsId } from "./workspace";
 export type TabKey =
   | "dashboard"
   | "trade"
+  | "news"
   | "exits"
   | "timing"
   | "trades"
@@ -26,6 +27,7 @@ export type TabKey =
 const VALID_TABS = new Set<TabKey>([
   "dashboard",
   "trade",
+  "news",
   "exits",
   "timing",
   "trades",
