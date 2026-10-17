@@ -27,6 +27,9 @@ jobs:
           cache: pip
           cache-dependency-path: requirements.txt
       - run: pip install -r requirements.txt
+      # scraper/test_scrape.py::test_selfcheck renders a JS-only page with --browser (Playwright).
+      # The server never uses the browser path, so Playwright stays out of requirements.txt.
+      - run: pip install playwright==1.56.0 && python -m playwright install --with-deps chromium
       - run: python -m pytest -q -p no:cacheprovider
 
   frontend:
