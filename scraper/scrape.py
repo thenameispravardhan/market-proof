@@ -87,6 +87,13 @@ CREATE INDEX IF NOT EXISTS pauses_host ON pauses(host, start)"""
 CONTENT_COLS = ("title", "date", "text", "meta", "tables", "jsonld", "links", "xhr", "data", "digest")  # NULLed by a content verdict
 
 
+async def sleep_until(t):
+    """asyncio may wake a timer up to one clock tick early (15.6 ms on Windows): a strict limiter counts that as
+    ignoring Retry-After, so sleep again until the monotonic clock really is past t."""
+    while (left := t - time.monotonic()) > 0:
+        await asyncio.sleep(left)
+
+
 def normalize(url, base=None):
     """Canonical URL: lowercase scheme/host, drop default port/userinfo/fragment and tracking params."""
     if base:
@@ -362,7 +369,7 @@ class Crawler:
         now = time.monotonic()
         wait = max(0.0, h.next_at - now)
         h.next_at = max(now, h.next_at) + h.delay
-        await asyncio.sleep(wait)
+        await sleep_until(now + wait)
 
     async def is_public(self, url):
         if self.a.allow_private:
@@ -463,7 +470,7 @@ class Crawler:
                     raise
                 wait = 2 ** attempt
             h.next_at = max(h.next_at, time.monotonic() + min(wait, self.a.max_delay))
-            await asyncio.sleep(max(0.0, h.next_at - time.monotonic()))
+            await sleep_until(h.next_at)
             if h.paused_until > time.time():
                 raise Paused(h.pause_note)
         return None
