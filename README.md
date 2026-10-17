@@ -671,6 +671,7 @@ Query; realtime via WebSocket hooks.
 |---|---|
 | **Dashboard** | live pipeline (scrape → analyse → signal), positions, P&L, risk, resources |
 | **Trade** | manual order ticket, TradingView-style charts, option chain, positions |
+| **News** | live headline monitor over 41 sources, never sent to the AI: the stocks each headline names (chart at the news time) and how each moved since the story broke against NIFTY, one row per story across outlets with who had it first, breaking-stock alerts, a Top ranking, news-type filters, watchlist alerts by keyword or stock, detection lag, full text via the scraper, j/k keys |
 | **Exits** | every exit-engine knob as a bounded, plain-English control with a live worked example |
 | **Timing** | per-layer latency waterfall (detection / analysis / signal→order / order→fill) + the detection race |
 | **Outcomes** | what every signal's stock actually did — the feedback loop |

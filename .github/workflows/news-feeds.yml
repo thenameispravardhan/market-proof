@@ -1,0 +1,32 @@
+# News page feeds, checked from a GitHub runner the way the collector reads them (scripts/check_news_feeds.py):
+# status, robots.txt, headlines, freshness. Report only, in the job summary: a publisher being down is never a reason
+# to block a merge. Runs when the feed list or the checker changes, and on demand.
+name: News feeds
+
+on:
+  pull_request:
+    paths:
+      - app/services/news_wire.py
+      - scripts/check_news_feeds.py
+      - .github/workflows/news-feeds.yml
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TESTING: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - run: pip install -r requirements.txt
+      - run: python scripts/check_news_feeds.py --summary --json feeds.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: news-feeds
+          path: feeds.json

@@ -36,6 +36,25 @@ def test_parse_rss_atom_news_sitemap_and_bse_dates():
     assert nw.parse_feed(b"not xml") == [] and nw.parse_feed(b"<urlset><url><loc>https://x/y</loc></url></urlset>") == []
 
 
+def test_nse_titles_become_company_and_subject():
+    body = b"""<rss><channel><item><title>Vedant Fashions Limited</title><link>https://nsearchives.nseindia.com/x.xml</link>
+<description>VEDANT FASHIONS LIMITED has informed the Exchange about Board Meeting |SUBJECT: Board Meeting Intimation</description>
+<pubDate>19-Jul-2026 00:02:49</pubDate></item></channel></rss>"""
+    (i,) = nw.parse_feed(body, ist=True, subject=True)
+    assert i["title"] == "Vedant Fashions Limited: Board Meeting Intimation"
+    assert i["summary"] == "VEDANT FASHIONS LIMITED has informed the Exchange about Board Meeting"
+    assert i["published_at"].isoformat() == "2026-07-18T18:32:49"                  # IST without a zone
+    assert nw.parse_feed(body)[0]["title"] == "Vedant Fashions Limited"           # other feeds: untouched
+    nse = next(f for f in nw.DEFAULT_FEEDS if f["source"] == "NSE")
+    assert nse["subject"] and nse["ist"]
+
+
+def test_every_feed_has_a_group_and_added_sources_ship_off():
+    assert {f.get("group") for f in nw.DEFAULT_FEEDS} <= {nw.MARKETS, nw.BUSINESS, nw.OFFICIAL, nw.GLOBAL}
+    assert {s for s, on in nw.DEFAULTS["sources"].items() if on} == nw.ORIGINAL   # the defaults poll what they did
+    assert not nw.DEFAULTS["extract_sources"]["NSE"]                               # filings, not articles
+
+
 def _wire(handler) -> nw.NewsWire:
     w = nw.NewsWire()
     w._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))

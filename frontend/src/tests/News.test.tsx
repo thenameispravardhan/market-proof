@@ -21,6 +21,7 @@ let puts: unknown[] = [];
 
 beforeEach(() => {
   puts = [];
+  try { localStorage.removeItem("news:lastSeen"); } catch { /* storage off */ }
   globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     if (url.includes("/api/news/settings") && init?.method === "PUT") {
@@ -204,5 +205,219 @@ describe("News page: fixes and trader shortcuts", () => {
     expect(links.map((a) => a.textContent)).toEqual(["RELIANCE ↗"]);
     expect(links[0].getAttribute("href")).toContain("#/trade?symbol=NSE%3ARELIANCE-EQ");   // NSE listing preferred
     expect(links[0].getAttribute("href")).toMatch(/&at=\d+/);
+  });
+});
+
+describe("News page: stocks, stories, kinds and keys", () => {
+  const REL = "NSE:RELIANCE-EQ", TCS = "NSE:TCS-EQ";
+  const at = (m: number) => new Date(Date.now() - m * 60_000).toISOString();
+  const mk = (id: number, source: string, title: string, mins: number, tickers: string[] = [], tags: string[] = []) =>
+    ({ id, url: `https://x.example/${id}`, source, title, summary: null, published_at: at(mins), seen_at: at(mins), tickers, tags });
+  const LIST = [
+    mk(1, "Moneycontrol", "Reliance Q2 net profit rises 10% to ₹19,323 crore", 30, [REL], ["results"]),
+    mk(2, "Economic Times", "RIL Q2 net profit rises 10% to ₹19,323 crore; revenue up 5%", 26, [REL], ["results"]),
+    mk(3, "Mint", "Reliance Retail to acquire a beauty brand", 20, [REL], ["deals"]),
+    mk(4, "Zee Business", "TCS bags $1 billion order from UK insurer", 10, [TCS], ["orders"]),
+    mk(5, "NDTV", "Sensex ends 300 points higher", 5, [], ["market"]),
+  ];
+  const KINDS = [["results", "Results"], ["orders", "Orders"], ["deals", "Stake / M&A"], ["market", "Markets"]];
+  const opened: string[] = [];
+  let watching: Record<string, string[]> = {};               // watchlist word -> the stocks it names
+  let statusExtra: Record<string, unknown> = {}, settingsExtra: Record<string, unknown> = {};
+  let reactions: Record<string, unknown> | null = null;     // /api/news/reaction: null = Fyers not connected
+
+  beforeEach(() => {
+    opened.length = 0;
+    watching = {};
+    statusExtra = {}; settingsExtra = {}; reactions = null;
+    vi.spyOn(window, "open").mockImplementation((u?: string | URL) => { opened.push(String(u)); return null; });
+    try { localStorage.removeItem("news:prefs"); } catch { /* storage off */ }
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/api/news/settings") && init?.method === "PUT") { const b = JSON.parse(String(init.body)); puts.push(b); return json(b); }
+      if (url.includes("/api/market/quotes")) return json({ quotes: { [REL]: { ltp: 2950, change: 36, change_pct: 1.25 } } });
+      if (url.includes("/api/news/reaction")) return json(reactions ? { ok: true, reactions } : { ok: false, reactions: {} });
+      if (url.includes("/api/news/items")) return json({ items: url.includes("since_id") ? [] : LIST, max_id: 5 });
+      if (url.includes("/api/news/status")) return json({
+        settings: { ...SETTINGS, enabled: true, watchlist: Object.keys(watching), muted: [], ...settingsExtra }, known_sources: ["Mint"], kinds: KINDS,
+        collector: { polls: 3, last_poll_at: null, last_poll_ms: null }, watch_stocks: watching,
+        sources: [{ source: "Moneycontrol", url: "u", custom: false, enabled: true, health: "ok", last_ok: null, error: null, paused_until: null,
+          items_in_feed: 3, hour: 1, day: 1, total: 1, last_item: null }],
+        lag: { p50: 45, p90: 90, n: 3, fastest: "Mint" }, ...statusExtra,
+      });
+      return json({}, 404);
+    }) as unknown as typeof fetch;
+  });
+
+  it("ranks the stocks in the news by stories, with their day's move, and filters the list by one", async () => {
+    render(<News />);
+    const panel = await screen.findByTestId("news-stocks-panel");
+    const cells = (r: Element) => [...r.querySelectorAll("td")].map((c) => c.textContent);
+    const rows = [...panel.querySelectorAll("tbody tr")];
+    expect(rows.map((r) => cells(r).slice(0, 3))).toEqual([["RELIANCE", "2", "3"], ["TCS", "1", "1"]]);   // the repost is one story
+    await waitFor(() => expect(within(panel).getByText("+1.25%").className).toContain("pos"));
+    expect(within(panel).getByText("Today")).toBeTruthy();                             // shown once Fyers answers
+    expect(within(panel).getByLabelText("RELIANCE chart").getAttribute("href")).toContain("symbol=NSE%3ARELIANCE-EQ");
+
+    fireEvent.click(within(panel).getByRole("button", { name: "RELIANCE" }));
+    expect(screen.queryByText(/TCS bags/)).toBeNull();
+    expect(screen.getByText(/Reliance Retail/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "RELIANCE ×" }));                // the toolbar chip clears it
+    expect(screen.getByText(/TCS bags/)).toBeTruthy();
+  });
+
+  it("tags each headline with its stocks and kind, and filters by kind", async () => {
+    render(<News />);
+    const tcs = (await screen.findByText(/TCS bags/)).closest("article")!;
+    expect(within(tcs).getByLabelText("TCS chart").getAttribute("href")).toMatch(/symbol=NSE%3ATCS-EQ.*&at=\d+/);
+    expect(within(tcs).getByText("Orders")).toBeTruthy();
+    expect(within(tcs).queryByRole("button", { name: /chart/ })).toBeNull();          // tagged: no lookup needed
+    const kinds = screen.getByTestId("news-kinds");
+    expect([...kinds.querySelectorAll("button")].map((b) => b.textContent)).toEqual(["Results 2", "Orders 1", "Stake / M&A 1", "Markets 1"]);
+    fireEvent.click(within(kinds).getByRole("button", { name: /^Orders/ }));
+    expect(screen.queryByText(/Sensex ends/)).toBeNull();
+    expect(screen.getByText(/TCS bags/)).toBeTruthy();
+  });
+
+  it("shows one story's reports from several outlets as one row, with who had it first", async () => {
+    render(<News />);
+    const lead = (await screen.findByText(/Reliance Q2 net profit/)).closest("article")!;
+    expect(screen.queryByText(/RIL Q2 net profit/)).toBeNull();                       // folded into the first report
+    expect(within(lead).getByText("1st by 4m")).toBeTruthy();
+    expect(screen.getByText("4 stories · 5")).toBeTruthy();
+    fireEvent.click(within(lead).getByRole("button", { name: /2 sources/ }));
+    const story = within(lead).getByTestId("news-story");
+    expect(within(story).getByText(/RIL Q2 net profit/)).toBeTruthy();
+    expect(within(story).getByText("+4m")).toBeTruthy();
+    const strip = screen.getByTestId("news-stats");
+    const first = within(strip).getByText("First to report").parentElement!;
+    expect(first.textContent).toContain("Moneycontrol1 of 1 shared stories");
+    expect(first.getAttribute("title")).toContain("Moneycontrol 1");
+
+    fireEvent.click(screen.getByRole("switch", { name: /2\+ sources/ }));
+    expect(screen.queryByText(/TCS bags/)).toBeNull();
+    expect(screen.getByText(/Reliance Q2 net profit/)).toBeTruthy();
+  });
+
+  it("lists every headline again with grouping off", async () => {
+    localStorage.setItem("news:prefs", JSON.stringify({ group: false }));
+    render(<News />);
+    expect(await screen.findByText(/RIL Q2 net profit/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /sources$/ })).toBeNull();
+  });
+
+  it("a watchlist word that names a stock hits the headlines that call it something else", async () => {
+    watching = { Reliance: [REL] };
+    localStorage.setItem("news:prefs", JSON.stringify({ group: false }));            // the RIL report on its own row
+    render(<News />);
+    const ril = (await screen.findByText(/RIL Q2 net profit/)).closest("article")!;   // no "Reliance" in it
+    expect(ril.className).toContain("hit");
+    const tcs = screen.getByText(/TCS bags/).closest("article")!;
+    expect(tcs.className).not.toContain("hit");
+    fireEvent.click(screen.getByRole("switch", { name: /Watchlist only/ }));
+    expect(screen.queryByText(/TCS bags/)).toBeNull();
+    fireEvent.click(screen.getByTestId("news-settings-btn"));
+    const dlg = await screen.findByTestId("news-settings");
+    fireEvent.click(within(dlg).getByRole("tab", { name: "Watchlist & alerts" }));
+    expect(within(dlg).getByTestId("news-watch-stocks").textContent).toContain("Reliance → RELIANCE");
+  });
+
+  it("moves through the stories with j / k and acts on the one under the cursor", async () => {
+    render(<News />);
+    await screen.findByText(/Sensex ends/);
+    const row = (id: number) => document.querySelector(`[data-row="${id}"]`)!;
+    fireEvent.keyDown(document.body, { key: "j" });
+    expect(row(5).className).toContain("cursor");
+    fireEvent.keyDown(document.body, { key: "j" });
+    expect(row(4).className).toContain("cursor");
+    fireEvent.keyDown(document.body, { key: "k" });
+    expect(row(5).className).toContain("cursor");
+    fireEvent.keyDown(document.body, { key: "o" });
+    expect(opened).toEqual(["https://x.example/5"]);
+    fireEvent.keyDown(document.body, { key: "j" });
+    fireEvent.keyDown(document.body, { key: "c" });                                      // TCS: its chart
+    expect(opened[1]).toContain("symbol=NSE%3ATCS-EQ");
+    fireEvent.keyDown(document.body, { key: "j" });
+    fireEvent.keyDown(document.body, { key: "j" });
+    fireEvent.keyDown(document.body, { key: "e" });                                      // the Reliance story's sources
+    expect(within(row(1) as HTMLElement).getByTestId("news-story")).toBeTruthy();
+    fireEvent.keyDown(document.body, { key: "?" });
+    expect(screen.getByTestId("news-keys")).toBeTruthy();
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(screen.queryByTestId("news-keys")).toBeNull();
+    expect(document.querySelector(".news-item.cursor")).toBeNull();
+    const search = screen.getByLabelText("Search headlines");
+    fireEvent.keyDown(search, { key: "j" });                                             // typing: the list stays put
+    expect(document.querySelector(".news-item.cursor")).toBeNull();
+  });
+
+  const fetched = () => (globalThis.fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls.map((c) => String(c[0]));
+
+  it("shows how each tagged story's stock moved since it broke, against NIFTY", async () => {
+    reactions = { 4: { sym: TCS, t0: 0, px0: 4000, px: 4072, pct: 1.8, traded: true, hi_pct: 2.1, lo_pct: -0.3, nifty_pct: 0.2, excess_pct: 1.6 },
+      3: { sym: REL, t0: 0, px0: 2900, px: 2900, pct: 0, traded: false } };
+    render(<News />);
+    const tcs = (await screen.findByText(/TCS bags/)).closest("article")!;
+    const rx = await within(tcs).findByTestId("news-reaction");
+    expect(rx.textContent).toBe("+1.80% since");
+    expect(rx.className).toContain("pos");
+    expect(rx.getAttribute("title")).toContain("NIFTY +0.20% over the same span: +1.60% against the market");
+    expect(rx.getAttribute("title")).toContain("range since -0.30% to +2.10%");
+    const ret = screen.getByText(/Retail to acquire/).closest("article")!;
+    expect(within(ret).queryByTestId("news-reaction")).toBeNull();                       // not traded since: nothing to say
+    expect(fetched().find((u) => u.includes("/api/news/reaction"))).toContain("ids=1,3,4");   // the tagged stories on screen
+  });
+
+  it("ranks stories by importance with Top, and says why", async () => {
+    render(<News />);
+    await screen.findByText(/TCS bags/);
+    const titles = () => [...document.querySelectorAll("article .news-title")].map((e) => e.textContent ?? "");
+    expect(titles()[0]).toMatch(/Sensex ends/);                                           // Latest: newest first
+    fireEvent.click(screen.getByRole("button", { name: "Top" }));
+    expect(titles()[0]).toMatch(/Reliance Q2 net profit/);                                // results, 2 outlets, a large cap
+    expect(titles()[titles().length - 1]).toMatch(/Sensex ends/);                         // a market wrap weighs least
+    expect(document.querySelector('[data-row="1"] .news-score')!.getAttribute("title")).toContain("2 outlets +2");
+    expect(JSON.parse(localStorage.getItem("news:prefs")!).sort).toBe("top");             // remembered in this browser
+  });
+
+  it("marks what came in since this browser's last visit", async () => {
+    localStorage.setItem("news:lastSeen", "3");
+    render(<News />);
+    expect((await screen.findByTestId("news-unread")).textContent).toBe("2 new since your last visit");
+    expect(screen.getAllByText("NEW")).toHaveLength(2);                                   // TCS and the Sensex wrap
+    fireEvent.click(screen.getByRole("button", { name: /Mark seen \(2\)/ }));
+    expect(screen.queryByText("NEW")).toBeNull();
+    expect(localStorage.getItem("news:lastSeen")).toBe("5");
+  });
+
+  it("marks a stock several outlets name within minutes as breaking", async () => {
+    settingsExtra = { burst_minutes: 60 };
+    render(<News />);
+    const panel = await screen.findByTestId("news-stocks-panel");
+    expect(within(panel).getByTitle(/Breaking: 3 outlets in the last 60 min/).textContent).toBe("🔥3");
+    expect(screen.getByText(/Retail to acquire/).closest("article")!.querySelector(".news-tk.hot")).toBeTruthy();
+    expect(screen.getByText(/TCS bags/).closest("article")!.querySelector(".news-tk.hot")).toBeNull();   // one outlet
+  });
+
+  it("groups the sources in Settings with all on / all off, and saves the breaking-stock alert", async () => {
+    statusExtra = { known_sources: ["BSE", "CNBC", "Mint", "NSE"],
+      source_groups: [["India · markets", ["Mint"]], ["Exchanges & regulators", ["BSE", "NSE"]], ["Global", ["CNBC"]]],
+      sources: [{ source: "Mint", url: "u1", custom: false, enabled: true, health: "ok", last_ok: null, error: null, paused_until: null, items_in_feed: 1, hour: 1, day: 1, total: 1, last_item: null },
+        { source: "CNBC", url: "u2", custom: false, enabled: false, health: "off", last_ok: null, error: null, paused_until: null, items_in_feed: 0, hour: 0, day: 0, total: 0, last_item: null }] };
+    settingsExtra = { sources: { Mint: true, BSE: true, NSE: false, CNBC: false }, extract_sources: {} };
+    render(<News />);
+    expect(await screen.findByRole("button", { name: /1 more source off/ })).toBeTruthy();   // the sidebar lists what is polled
+    fireEvent.click(screen.getByTestId("news-settings-btn"));
+    const dlg = await screen.findByTestId("news-settings");
+    fireEvent.click(within(dlg).getByRole("tab", { name: "Sources" }));
+    const official = within(dlg).getByText("Exchanges & regulators · 1/2 on").parentElement!;
+    fireEvent.click(within(official).getByRole("button", { name: "All on" }));
+    expect(within(dlg).getByText("Exchanges & regulators · 2/2 on")).toBeTruthy();
+    fireEvent.click(within(dlg).getByRole("tab", { name: "Watchlist & alerts" }));
+    fireEvent.click(within(dlg).getByTestId("news-bursts-toggle"));
+    fireEvent.change(within(dlg).getByLabelText("Burst outlets"), { target: { value: "4" } });
+    fireEvent.click(within(dlg).getByTestId("news-save"));
+    await waitFor(() => expect(puts).toHaveLength(1));
+    expect(puts[0]).toMatchObject({ bursts: true, burst_sources: 4, sources: { BSE: true, NSE: true, CNBC: false } });
   });
 });
