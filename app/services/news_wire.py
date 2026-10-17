@@ -31,6 +31,7 @@ from app.db import session as db_session
 from app.db.infra_models import AppSetting
 from app.db.models import NewsItem
 from app.logging_config import get_logger
+from app.services import news_tags
 from app.services.event_bus import event_bus
 
 log = get_logger(__name__)
@@ -39,45 +40,94 @@ UA = "tradebot-newswire/1.0 (+https://github.com/thenameispravardhan)"
 IST = timezone(timedelta(hours=5, minutes=30))
 MAX_BYTES = 5_000_000
 SETTINGS_KEY = "news:settings"
+BURST_QUIET_S = 2 * 3600                         # after a stock's burst alert, none again for it this long
+
+# Settings > Sources lists the sources in these groups.
+MARKETS, BUSINESS, OFFICIAL, GLOBAL = "India · markets", "India · business", "Exchanges & regulators", "Global"
 
 # Checked 2026-10-17 with this UA: each returns a live feed and robots.txt allows it. min_s = the feed's own
 # freshness (Moneycontrol's sitemap is cached 30 s with no ETag, so polling it faster only re-downloads it).
+# `python scripts/check_news_feeds.py` re-checks them all the way the collector reads them.
 DEFAULT_FEEDS: list[dict[str, Any]] = [
-    {"source": "Moneycontrol", "url": "https://www.moneycontrol.com/news/news-sitemap.xml", "min_s": 30},
-    {"source": "NDTV Profit", "url": "https://feeds.feedburner.com/ndtvprofit-latest"},
-    {"source": "NDTV", "url": "https://feeds.feedburner.com/ndtvnews-top-stories"},
-    {"source": "Zee Business", "url": "https://www.zeebiz.com/latest.xml"},
-    {"source": "CNBC-TV18", "url": "https://www.cnbctv18.com/commonfeeds/v1/cne/rss/latest.xml"},
-    {"source": "CNBC-TV18", "url": "https://www.cnbctv18.com/commonfeeds/v1/cne/rss/market.xml"},
-    {"source": "Economic Times", "url": "https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms"},
-    {"source": "Mint", "url": "https://www.livemint.com/rss/markets"},
-    {"source": "BusinessLine", "url": "https://www.thehindubusinessline.com/markets/stock-markets/feeder/default.rss"},
-    {"source": "BSE", "url": "https://www.bseindia.com/data/xml/announcements.xml", "ist": True},
+    {"source": "Moneycontrol", "group": MARKETS, "min_s": 30,
+     "url": "https://www.moneycontrol.com/news/news-sitemap.xml"},
+    {"source": "NDTV Profit", "url": "https://feeds.feedburner.com/ndtvprofit-latest", "group": MARKETS},
+    {"source": "NDTV", "url": "https://feeds.feedburner.com/ndtvnews-top-stories", "group": BUSINESS},
+    {"source": "Zee Business", "url": "https://www.zeebiz.com/latest.xml", "group": MARKETS},
+    {"source": "CNBC-TV18", "url": "https://www.cnbctv18.com/commonfeeds/v1/cne/rss/latest.xml", "group": MARKETS},
+    {"source": "CNBC-TV18", "url": "https://www.cnbctv18.com/commonfeeds/v1/cne/rss/market.xml", "group": MARKETS},
+    {"source": "Economic Times", "group": MARKETS,
+     "url": "https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms"},
+    {"source": "Mint", "url": "https://www.livemint.com/rss/markets", "group": MARKETS},
+    {"source": "BusinessLine", "group": MARKETS,
+     "url": "https://www.thehindubusinessline.com/markets/stock-markets/feeder/default.rss"},
+    {"source": "BSE", "url": "https://www.bseindia.com/data/xml/announcements.xml", "ist": True, "group": OFFICIAL},
     # Added 2026-10-17, same check. Off until ticked in Settings > Sources (current behaviour stays the default).
     # Business Standard and Firstpost answer this UA with 403, Financial Express's feed redirects to HTML: left out.
-    {"source": "ET Markets", "url": "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"},
-    {"source": "Times of India", "url": "https://timesofindia.indiatimes.com/rssfeeds/1898055.cms"},
-    {"source": "Business Today", "url": "https://www.businesstoday.in/rssfeeds/?id=225346"},
-    {"source": "The Hindu", "url": "https://www.thehindu.com/business/markets/feeder/default.rss"},
-    {"source": "News18", "url": "https://www.news18.com/commonfeeds/v1/eng/rss/business.xml"},
-    {"source": "RBI", "url": "https://www.rbi.org.in/pressreleases_rss.xml"},
-    {"source": "SEBI", "url": "https://www.sebi.gov.in/sebirss.xml"},   # dates only, no time: published_at stays empty
-    {"source": "Mint Companies", "url": "https://www.livemint.com/rss/companies"},
-    {"source": "ET Industry", "url": "https://economictimes.indiatimes.com/industry/rssfeeds/13352306.cms"},
-    {"source": "BusinessLine Companies", "url": "https://www.thehindubusinessline.com/companies/feeder/default.rss"},
-    {"source": "Indian Express", "url": "https://indianexpress.com/section/business/feed/"},
-    {"source": "ThePrint", "url": "https://theprint.in/category/economy/feed/"},
+    {"source": "ET Markets", "group": MARKETS,
+     "url": "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"},
+    {"source": "Times of India", "url": "https://timesofindia.indiatimes.com/rssfeeds/1898055.cms", "group": BUSINESS},
+    {"source": "Business Today", "url": "https://www.businesstoday.in/rssfeeds/?id=225346", "group": MARKETS},
+    {"source": "The Hindu", "url": "https://www.thehindu.com/business/markets/feeder/default.rss", "group": MARKETS},
+    {"source": "News18", "url": "https://www.news18.com/commonfeeds/v1/eng/rss/business.xml", "group": BUSINESS},
+    {"source": "RBI", "url": "https://www.rbi.org.in/pressreleases_rss.xml", "group": OFFICIAL},
+    {"source": "SEBI", "url": "https://www.sebi.gov.in/sebirss.xml", "group": OFFICIAL},   # dates only: no published_at
+    {"source": "Mint Companies", "url": "https://www.livemint.com/rss/companies", "group": BUSINESS},
+    {"source": "ET Industry", "group": BUSINESS,
+     "url": "https://economictimes.indiatimes.com/industry/rssfeeds/13352306.cms"},
+    {"source": "BusinessLine Companies", "group": BUSINESS,
+     "url": "https://www.thehindubusinessline.com/companies/feeder/default.rss"},
+    {"source": "Indian Express", "url": "https://indianexpress.com/section/business/feed/", "group": BUSINESS},
+    {"source": "ThePrint", "url": "https://theprint.in/category/economy/feed/", "group": BUSINESS},
     # Also tried: Google News (robots.txt denies bots), PIB + Zee Business markets (403), Financial Express, Deccan
     # Herald, Moneylife, Outlook Business, NDTV Profit markets (feed gone), Investing.com (US filings, not India).
+    # Added 2026-10-17 once scripts/check_news_feeds.py passed them from a GitHub runner (CI job "News feeds"). The
+    # same run: Business Standard and Financial Express 403, Yahoo Finance and Entrackr 404, WSJ Markets, India
+    # Today and Moneycontrol's RSS (results, IPO, market reports) frozen for over a year: left out. Indian Express
+    # (above) answered that runner 403 too, kept as it was.
+    {"source": "ET Earnings", "group": MARKETS,
+     "url": "https://economictimes.indiatimes.com/markets/stocks/earnings/rssfeeds/2143429.cms"},
+    {"source": "ET IPO", "group": MARKETS,
+     "url": "https://economictimes.indiatimes.com/markets/ipos/fpos/rssfeeds/14655708.cms"},
+    {"source": "ET Commodities", "group": MARKETS,
+     "url": "https://economictimes.indiatimes.com/markets/commodities/rssfeeds/1808152121.cms"},
+    {"source": "CNBC-TV18 Economy", "group": BUSINESS,
+     "url": "https://www.cnbctv18.com/commonfeeds/v1/cne/rss/economy.xml"},
+    {"source": "ET Economy", "group": BUSINESS,
+     "url": "https://economictimes.indiatimes.com/news/economy/rssfeeds/1373380680.cms"},
+    {"source": "Mint Economy", "url": "https://www.livemint.com/rss/economy", "group": BUSINESS},
+    {"source": "Mint Money", "url": "https://www.livemint.com/rss/money", "group": BUSINESS},
+    {"source": "BusinessLine Economy", "group": BUSINESS,
+     "url": "https://www.thehindubusinessline.com/economy/feeder/default.rss"},
+    {"source": "The Hindu Economy", "group": BUSINESS,
+     "url": "https://www.thehindu.com/business/Economy/feeder/default.rss"},
+    {"source": "Hindustan Times", "group": BUSINESS,
+     "url": "https://www.hindustantimes.com/feeds/rss/business/rssfeed.xml"},
+    {"source": "Inc42", "url": "https://inc42.com/feed/", "group": BUSINESS},
+    # NSE's announcements file: a static CDN copy (no cookies), titles are company names, so the headline is
+    # "Company: <its |SUBJECT: suffix>"; times are IST without a zone. It timed out from the (US) GitHub runner:
+    # NSE throttles foreign IPs, and the analyzer's NSE RSS racer was measured on this file from India.
+    {"source": "NSE", "url": "https://nsearchives.nseindia.com/content/RSS/Online_announcements.xml", "ist": True,
+     "subject": True, "group": OFFICIAL},
+    {"source": "RBI Notifications", "url": "https://www.rbi.org.in/notifications_rss.xml", "group": OFFICIAL},
+    {"source": "Federal Reserve", "url": "https://www.federalreserve.gov/feeds/press_all.xml", "group": GLOBAL},
+    {"source": "CNBC", "url": "https://www.cnbc.com/id/100003114/device/rss/rss.html", "group": GLOBAL},
+    {"source": "CNBC Asia", "url": "https://www.cnbc.com/id/19832390/device/rss/rss.html", "group": GLOBAL},
+    {"source": "MarketWatch", "url": "https://feeds.content.dowjones.io/public/rss/mw_topstories", "group": GLOBAL},
+    {"source": "BBC Business", "url": "https://feeds.bbci.co.uk/news/business/rss.xml", "group": GLOBAL},
+    {"source": "Nikkei Asia", "url": "https://asia.nikkei.com/rss/feed/nar", "group": GLOBAL},
+    {"source": "OilPrice", "url": "https://oilprice.com/rss/main", "group": GLOBAL},
 ]
 SOURCES = sorted({f["source"] for f in DEFAULT_FEEDS})
-NEW_OFF = {"ET Markets", "Times of India", "Business Today", "The Hindu", "News18", "RBI", "SEBI",
-           "Mint Companies", "ET Industry", "BusinessLine Companies", "Indian Express", "ThePrint"}
+SOURCE_GROUPS = {f["source"]: f["group"] for f in DEFAULT_FEEDS}
+ORIGINAL = {"Moneycontrol", "NDTV Profit", "NDTV", "Zee Business", "CNBC-TV18", "Economic Times", "Mint",
+            "BusinessLine", "BSE"}
+NEW_OFF = set(SOURCES) - ORIGINAL                # every source added since ships off: the defaults poll what they did
 # Full text comes from scraper/scrape.py (the operator's crawler), into its own SQLite store. These sources'
 # article links refuse an honest client (BSE AttachLive PDFs 503/406, ndtvprofit.com Akamai 403, ndtv.com 403 x5 on
-# 2026-10-17, which the scraper then paused): off by default.
+# 2026-10-17, which the scraper then paused), are exchange filings (NSE: XBRL / PDF) or sit behind a paywall: off.
 SCRAPE_DB = Path("data/scrape.db")
-EXTRACT_OFF = {"BSE", "NDTV Profit", "NDTV"}
+EXTRACT_OFF = {"BSE", "NDTV Profit", "NDTV", "NSE", "MarketWatch", "Nikkei Asia"}
 
 DEFAULTS: dict[str, Any] = {
     "enabled": False,        # off until the operator turns it on from the News page
@@ -91,6 +141,9 @@ DEFAULTS: dict[str, Any] = {
     "retention_days": 7,
     "extract": False,        # fetch each new headline's article with the scraper: text, metadata, tables, PDF text
     "extract_sources": {s: s not in EXTRACT_OFF for s in SOURCES},
+    "bursts": False,         # alert when burst_sources+ outlets name one stock within burst_minutes (breaking news)
+    "burst_sources": 3,
+    "burst_minutes": 30,
 }
 
 
@@ -181,9 +234,10 @@ def _text(e: Optional[ET.Element]) -> str:
     return " ".join("".join(e.itertext()).split()) if e is not None else ""
 
 
-def parse_feed(body: bytes, ist: bool = False) -> list[dict[str, Any]]:
+def parse_feed(body: bytes, ist: bool = False, subject: bool = False) -> list[dict[str, Any]]:
     """Items of an RSS / Atom / news-sitemap document. A plain sitemap (no titles) gives []. Stdlib ElementTree
-    resolves no external entities, and Python's expat caps entity expansion."""
+    resolves no external entities, and Python's expat caps entity expansion. subject: the feed's titles are company
+    names and its descriptions end in "|SUBJECT: ..." (NSE): the headline becomes "Company: subject"."""
     try:
         root = ET.fromstring(body)
     except ET.ParseError:
@@ -203,6 +257,9 @@ def parse_feed(body: bytes, ist: bool = False) -> list[dict[str, Any]]:
             continue
         summary = _text(first("description", "summary"))
         summary = html.unescape(re.sub(r"<[^>]+>", " ", summary))
+        if subject and "|SUBJECT:" in summary:
+            summary, subj = summary.split("|SUBJECT:", 1)
+            title = f"{title}: {' '.join(subj.split())}" if subj.strip() else title
         out.append({"url": url[:1000], "title": title[:1000], "summary": " ".join(summary.split())[:600] or None,
                     "published_at": _when(_text(first("pubDate", "published", "publication_date", "updated", "date")), ist)})
     return out
@@ -238,6 +295,8 @@ class NewsWire:
     allow_private: bool = False          # tests only: lets the scraper reach a local mock server
     extracted: int = 0                   # articles handed to the scraper since start
     _hosts: dict = field(default_factory=dict)   # the scraper's per-host state (robots.txt, gaps, pauses) across runs
+    _new: list = field(default_factory=list)     # this poll's headlines from primed feeds, for the burst check
+    _burst_at: dict = field(default_factory=dict)   # symbol -> when its last burst alert went out
 
     def client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -284,6 +343,9 @@ class NewsWire:
                if self.state.setdefault(f["url"], FeedState()).next_at <= now and self.state[f["url"]].paused_until <= now]
         results = await asyncio.gather(*(self.fetch(f, s) for f in due))
         new = sum(results)
+        fresh, self._new = self._new, []
+        if fresh and s["bursts"]:
+            await self._bursts(fresh, s)
         self.polls += 1
         self.last_poll_at, self.last_poll_ms = time.time(), int((time.time() - t0) * 1000)
         await event_bus.publish("news", {"new": new, "polls": self.polls, "last_poll_at": self.last_poll_at,
@@ -318,13 +380,15 @@ class NewsWire:
         if r.status_code != 200:
             return self._failed(st, r.status_code, f"HTTP {r.status_code}")
         st.etag, st.modified = r.headers.get("etag"), r.headers.get("last-modified")
-        items = parse_feed(bytes(body), ist=f.get("ist", False))
+        items = parse_feed(bytes(body), ist=f.get("ist", False), subject=f.get("subject", False))
         if not items:
             return self._failed(st, 200, "no items (not a feed?)")
         fresh = self._store(f["source"], url, items)
         st.last_ok, st.last_error, st.fails, st.items, st.last_new = time.time(), None, 0, len(items), len(fresh)
         if st.primed and fresh and s["alerts"] and s["watchlist"]:
             await self._alert(fresh, s["watchlist"])
+        if st.primed:
+            self._new.extend(fresh)
         st.primed = True
         return len(fresh)
 
@@ -353,12 +417,28 @@ class NewsWire:
             db.close()
 
     async def _alert(self, fresh: list[dict[str, Any]], watchlist: list[str]) -> None:
-        for i in fresh:
+        # A watchlist word that names a stock also hits every headline tagged with it ("Reliance" -> "RIL shares
+        # jump"). Tagging is CPU work, so it runs off the event loop the trading path shares.
+        named, tagged = await asyncio.get_running_loop().run_in_executor(None, _alert_tags, fresh, watchlist)
+        for i, stocks in zip(fresh, tagged):
             hay = f"{i['title']} {i.get('summary') or ''}".lower()
-            hits = [w for w in watchlist if w.lower() in hay]
+            hits = [w for w in watchlist if w.lower() in hay or stocks & set(named.get(w, ()))]
             if hits:
                 await event_bus.publish("news.alert", {"keywords": hits, "title": i["title"], "source": i["source"],
                                                        "url": i["url"]})
+
+    async def _bursts(self, fresh: list[dict[str, Any]], s: dict[str, Any]) -> None:
+        """Breaking news: a stock this poll's headlines name that burst_sources+ outlets have named within
+        burst_minutes. One alert per stock per burst (none again for 2 h); off the event loop like _alert."""
+        found = await asyncio.get_running_loop().run_in_executor(None, _burst_scan, fresh, s)
+        for b in found:
+            if time.time() - self._burst_at.get(b["symbol"], 0) < BURST_QUIET_S:
+                continue
+            self._burst_at[b["symbol"]] = time.time()
+            await event_bus.publish("news.alert", {
+                "keywords": [f"{b['name']}: {len(b['sources'])} outlets in {s['burst_minutes']} min"],
+                "title": b["title"], "source": ", ".join(sorted(b["sources"])), "url": b["url"],
+                "symbol": b["symbol"], "burst": True})
 
     def prune(self, s: dict[str, Any]) -> None:
         if time.time() - self._pruned_at < 3600:
@@ -436,6 +516,39 @@ class NewsWire:
         self.extracted += len(urls)
         await event_bus.publish("news", {"extracted": len(urls)})
         return len(urls)
+
+
+def _alert_tags(fresh: list[dict[str, Any]], watchlist: list[str]) -> tuple[dict[str, list[str]], list[set[str]]]:
+    return news_tags.watch_stocks(watchlist), [set(news_tags.stocks(i["title"], i.get("summary"))) for i in fresh]
+
+
+def _burst_scan(fresh: list[dict[str, Any]], s: dict[str, Any]) -> list[dict[str, Any]]:
+    """The stocks in `fresh` that burst_sources+ outlets named in headlines published (or, undated, first seen)
+    within the last burst_minutes, muted headlines left out. Each with its outlets and its latest headline."""
+    names = {t for i in fresh for t in news_tags.stocks(i["title"], i.get("summary"))}
+    if not names:
+        return []
+    cut = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=s["burst_minutes"])
+    muted = [w.lower() for w in s["muted"]]
+    db = db_session.SessionLocal()
+    try:
+        rows = db.execute(select(NewsItem.source, NewsItem.title, NewsItem.summary, NewsItem.url, NewsItem.published_at,
+                                 NewsItem.seen_at).where(NewsItem.seen_at >= cut)).all()
+    finally:
+        db.close()
+    by: dict[str, dict[str, Any]] = {}
+    for src, title, summary, url, pub, seen in rows:
+        when = pub if pub and pub <= seen else seen
+        if when < cut or any(m in title.lower() for m in muted):
+            continue
+        for sym in news_tags.stocks(title, summary):
+            if sym in names:
+                b = by.setdefault(sym, {"symbol": sym, "name": sym.split(":")[-1].rsplit("-", 1)[0],
+                                        "sources": set(), "when": when, "title": title, "url": url})
+                b["sources"].add(src)
+                if when >= b["when"]:
+                    b.update(when=when, title=title, url=url)
+    return [b for b in by.values() if len(b["sources"]) >= s["burst_sources"]]
 
 
 def paused_hosts(db_path: Path) -> set[str]:

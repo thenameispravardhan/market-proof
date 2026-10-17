@@ -61,6 +61,7 @@ class Instrument:
     strike: Optional[float] = None
     underlying: Optional[str] = None
     aliases: list[str] = field(default_factory=list)
+    name: str = ""           # company name from the Fyers master ("STATE BANK OF INDIA"); "" for the seed
 
     def to_dict(self) -> dict:
         return {
@@ -268,6 +269,7 @@ def _fyers_csv_row_to_instrument(row: list[str]) -> Optional[Instrument]:
         tick_size=tick,
         expiry=expiry,
         aliases=[short],
+        name=(row[1] or "").strip(),
     )
 
 
