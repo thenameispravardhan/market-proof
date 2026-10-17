@@ -4,6 +4,8 @@
 // conveniences (sound, desktop notifications, view) live in localStorage.
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api } from "../api/client";
+import { chartHref } from "../lib/chartLink";
+import type { InstrumentHit } from "../types";
 import { Toggle } from "../components/common/Toggle";
 import { Check, Modal, Num, Row, Section, Sel } from "../components/trade/chartUi";
 
@@ -37,7 +39,12 @@ const DEFAULT_PREFS: Prefs = { notify: false, sound: false, compact: false, summ
 function loadPrefs(): Prefs {
   try { return { ...DEFAULT_PREFS, ...JSON.parse(localStorage.getItem(PREFS_KEY) || "{}") }; } catch { return DEFAULT_PREFS; }
 }
-const when = (i: Item) => Date.parse(i.published_at || i.seen_at);
+/** Story time: published, unless the feed has none or claims a time after we first saw it (a wrong time zone
+ *  would otherwise pin the headline to the top as "0s" for hours): then first seen. */
+function when(i: Item): number {
+  const seen = Date.parse(i.seen_at), pub = i.published_at ? Date.parse(i.published_at) : NaN;
+  return pub <= seen ? pub : seen;
+}
 function ago(ms: number): string {
   const s = Math.max(0, (Date.now() - ms) / 1000);
   return s < 60 ? `${s | 0}s` : s < 3600 ? `${(s / 60) | 0}m` : s < 86400 ? `${(s / 3600) | 0}h` : `${(s / 86400) | 0}d`;
@@ -94,7 +101,10 @@ export default function News() {
   const [deep, setDeep] = useState(false);
   const [deepItems, setDeepItems] = useState<Item[] | null>(null);
   const [open, setOpen] = useState<number | null>(null);
+  const [stocks, setStocks] = useState<number | null>(null);
   const maxId = useRef(0);
+  const ready = useRef(false);             // the first (backlog) load has landed: increments may apply
+  const searchRef = useRef<HTMLInputElement>(null);
   const frozenRef = useRef(false);
   frozenRef.current = frozen;
   const itemsRef = useRef<Item[]>([]);
@@ -110,18 +120,22 @@ export default function News() {
   const watch = settings?.watchlist ?? [];
   const muted = settings?.muted ?? [];
   const watchRe = useMemo(() => (watch.length ? new RegExp(watch.map(esc).join("|"), "i") : null), [watch]);
+  const mutedRe = useMemo(() => (muted.length ? new RegExp(muted.map(esc).join("|"), "i") : null), [muted]);
 
   const notifyNew = useCallback((arrived: Item[]) => {
     if (!watchRe) return;
-    const hits = arrived.filter((i) => watchRe.test(`${i.title} ${i.summary ?? ""}`));
+    const hits = arrived.filter((i) => watchRe.test(`${i.title} ${i.summary ?? ""}`) && !(mutedRe && mutedRe.test(i.title)));
     if (!hits.length) return;
     if (prefs.sound) beep();
     if (prefs.notify && "Notification" in window && Notification.permission === "granted") {
       for (const h of hits.slice(0, 3)) new Notification(`${h.source}: watchlist`, { body: h.title, tag: h.url });
     }
-  }, [watchRe, prefs.sound, prefs.notify]);
+  }, [watchRe, mutedRe, prefs.sound, prefs.notify]);
 
   const load = useCallback(async (first = false) => {
+    // A push or the socket's "open" during the first load would ask for since_id=0 and land the whole backlog
+    // again, as NEW (with a watchlist alert) and twice in the list: wait for the first load instead.
+    if (!first && !ready.current) return;
     try {
       const [res, st] = await Promise.all([
         api.get<{ items: Item[]; max_id: number }>(first ? "/api/news/items?hours=2160&limit=2000" : `/api/news/items?since_id=${maxId.current}&limit=500`),
@@ -129,17 +143,20 @@ export default function News() {
       ]);
       setStatus(st);
       setError(null);
+      // two increments in flight ask with the same since_id: keep only what the page hasn't got yet
+      const got = first ? res.items : res.items.filter((i) => i.id > maxId.current);
       if (first) {
-        setItems(res.items);
-      } else if (res.items.length) {
+        setItems(got);
+      } else if (got.length) {
         if (maxId.current > 0) {           // the first batch onto an empty page is backlog: no NEW badge, no alert
-          notifyNew(res.items);
-          setFresh((f) => new Set([...f, ...res.items.map((i) => i.id)]));
+          notifyNew(got);
+          setFresh((f) => new Set([...f, ...got.map((i) => i.id)]));
         }
-        if (frozenRef.current) setPending((p) => [...res.items, ...p]);
-        else setItems((cur) => [...res.items, ...cur].slice(0, 4000));
+        if (frozenRef.current) setPending((p) => [...got, ...p]);
+        else setItems((cur) => [...got, ...cur].slice(0, 4000));
       }
       maxId.current = Math.max(maxId.current, res.max_id);
+      if (first) ready.current = true;
       if (!first && st.settings.extract) {   // the scraper finishes articles after their headline arrived: ask again
         const waiting = itemsRef.current.filter((i) => !i.extract || i.extract.status === "queued" || i.extract.status === "deferred")
           .slice(0, 200).map((i) => i.id);
@@ -185,7 +202,6 @@ export default function News() {
   const shown = useMemo(() => {
     const cut = prefs.window ? Date.now() - prefs.window * 3600_000 : 0;
     const ql = q.trim().toLowerCase();
-    const mutedRe = muted.length ? new RegExp(muted.map(esc).join("|"), "i") : null;
     const seen = new Set<string>();
     return (deepItems ?? items)
       .filter((i) => (!cut || when(i) >= cut) && (!picked.size || picked.has(i.source))
@@ -195,14 +211,14 @@ export default function News() {
       .sort((a, b) => when(b) - when(a))
       .filter((i) => { const k = `${i.source}|${i.title}`; if (seen.has(k)) return false; seen.add(k); return true; })   // same story in two feeds
       .slice(0, 500);
-  }, [items, deepItems, prefs.window, picked, q, muted, watchOnly, watchRe]);
+  }, [items, deepItems, prefs.window, picked, q, mutedRe, watchOnly, watchRe]);
 
-  const counts = useMemo(() => {
+  const counts = useMemo(() => {          // per source chip: what the list would show (muted words left out)
     const c: Record<string, number> = {};
     const cut = prefs.window ? Date.now() - prefs.window * 3600_000 : 0;
-    for (const i of items) if (!cut || when(i) >= cut) c[i.source] = (c[i.source] || 0) + 1;
+    for (const i of items) if ((!cut || when(i) >= cut) && !(mutedRe && mutedRe.test(i.title))) c[i.source] = (c[i.source] || 0) + 1;
     return c;
-  }, [items, prefs.window]);
+  }, [items, prefs.window, mutedRe]);
 
   const trending = useMemo(() => {          // words in the last hour's headlines, most frequent first
     const cut = Date.now() - 3600_000, c = new Map<string, number>();
@@ -246,6 +262,17 @@ export default function News() {
     return [...m.entries()];
   }, [status]);   // eslint-disable-line react-hooks/exhaustive-deps
   const live = !!settings?.enabled;
+  useEffect(() => {                         // "/" jumps to search (unless typing somewhere already)
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (e.key !== "/" || e.ctrlKey || e.metaKey || e.altKey || (t && (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.isContentEditable))) return;
+      e.preventDefault(); searchRef.current?.focus();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+  const exportHref = `/api/news/export.csv?hours=${prefs.window || 2160}${q ? `&q=${encodeURIComponent(q)}` : ""}`
+    + (picked.size === 1 ? `&source=${encodeURIComponent([...picked][0])}` : "");   // the API takes one source
   const togglePick = (s: string) => setPicked((p) => { const n = new Set(p); if (n.has(s)) n.delete(s); else n.add(s); return n; });
 
   return (
@@ -259,7 +286,7 @@ export default function News() {
         </span>
         <span style={{ flex: 1 }} />
         <button type="button" className="btn-sm" onClick={() => void api.post("/api/news/poll", {})} disabled={!live}>Poll now</button>
-        <a className="btn-sm" href={`/api/news/export.csv?hours=${prefs.window || 2160}${q ? `&q=${encodeURIComponent(q)}` : ""}`}>Export CSV</a>
+        <a className="btn-sm" href={exportHref} title={picked.size > 1 ? "Exports every source; pick one source to export only it" : "Download the headlines in this window as CSV"}>Export CSV</a>
         <button type="button" className="btn-sm primary" onClick={() => setShowSettings(true)} data-testid="news-settings-btn">⚙ Settings</button>
       </div>
 
@@ -286,13 +313,15 @@ export default function News() {
       )}
 
       <div className="news-toolbar">
-        <input type="search" placeholder="Search headlines…" value={q} onChange={(e) => setQ(e.target.value)} aria-label="Search headlines" />
+        <input ref={searchRef} type="search" placeholder="Search headlines… ( / )" value={q} onChange={(e) => setQ(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Escape") { setQ(""); e.currentTarget.blur(); } }} aria-label="Search headlines" />
         <Toggle size="sm" on={deep} onChange={setDeep} label="In article text" disabled={!settings?.extract}
           title={settings?.extract ? "Also search the full text the scraper extracted" : "Turn on full text in Settings"} />
         {WINDOWS.map((w) => <button key={w.v} type="button" className={`chip${prefs.window === w.v ? " on" : ""}`} onClick={() => setPrefs({ window: w.v })}>{w.l}</button>)}
         <Toggle size="sm" on={watchOnly} onChange={setWatchOnly} label="Watchlist only" disabled={!watch.length} title={watch.length ? "" : "Add watchlist words in Settings"} />
         <Toggle size="sm" on={frozen} onChange={(v) => (v ? setFrozen(true) : unfreeze())} label="Pause list" />
         {pending.length > 0 && <button type="button" className="btn-sm primary" onClick={unfreeze}>{pending.length} new ↑</button>}
+        {fresh.size > 0 && <button type="button" className="btn-sm" onClick={() => setFresh(new Set())} title="Clear the NEW badges">Mark seen ({fresh.size})</button>}
       </div>
 
       {trending.length > 0 && (
@@ -332,7 +361,10 @@ export default function News() {
                       on={!!settings?.extract && (settings.extract_sources[i.source] ?? true) && Date.now() - Date.parse(i.seen_at) < 12 * 3600_000}
                       onClick={() => setOpen(open === i.id ? null : i.id)} />
                     {prefs.summaries && !prefs.compact && i.summary && <div className="news-sum"><Highlight text={i.summary} words={watch} /></div>}
+                    <button type="button" className="news-tbadge" onClick={() => setStocks(stocks === i.id ? null : i.id)}
+                      title="Find the stock in this headline and open its chart at the news time" aria-expanded={stocks === i.id}>📈 chart</button>
                     {open === i.id && <Reader url={i.url} words={watch} />}
+                    {stocks === i.id && <StockLinks item={i} />}
                   </div>
                 </article>
               );
@@ -377,7 +409,7 @@ export default function News() {
       {showSettings && settings && status && (
         <SettingsModal initial={settings} status={status} prefs={prefs} setPrefs={setPrefs}
           onSave={async (s) => { await saveSettings(s); setShowSettings(false); }} onClose={() => setShowSettings(false)}
-          onCleared={() => { setItems([]); maxId.current = 0; }} />
+          onCleared={() => { setItems([]); setPending([]); setFresh(new Set()); setOpen(null); setStocks(null); maxId.current = 0; }} />
       )}
     </div>
   );
@@ -408,6 +440,48 @@ function ScraperInsights({ x }: { x: ExtractStats }) {
               <td className={`mono${h.refused ? " neg" : ""}`}>{h.refused}</td><td className="mono">{h.last ? ago(h.last * 1000) : "–"}</td>
             </tr>))}</tbody></table>
       )}
+    </div>
+  );
+}
+
+/** Words in a headline that may be a ticker: capitalised and not a stop word, alone and paired with the next one
+ *  ("Tata Motors" -> TATAMOTORS, "HDFC Bank" -> HDFCBANK, "Reliance" -> RELIANCE). */
+function nameCandidates(title: string): string[] {
+  const words = (title.match(/[A-Za-z][A-Za-z&]*/g) ?? []).map((w) => (/^[A-Z]/.test(w) && !STOP.has(w.toLowerCase()) && w.length >= 2 ? w : ""));
+  const out: string[] = [];
+  const add = (w: string) => { if (w && !out.some((o) => o.toLowerCase() === w.toLowerCase())) out.push(w); };
+  words.forEach((w, k) => { if (w && words[k + 1]) add(`${w} ${words[k + 1]}`); });
+  words.forEach(add);
+  return out.slice(0, 6);
+}
+
+/** Listed stocks a headline names, each a link to its Trade chart centred on the story's time: the market's
+ *  reaction to the news, and the order ticket, one click away. Looked up only when asked; only exact tickers
+ *  count, so "Board" or "Results" never turn into a random fuzzy match. */
+function StockLinks({ item }: { item: Item }) {
+  const [hits, setHits] = useState<InstrumentHit[] | null>(null);
+  useEffect(() => {
+    let live = true;
+    void Promise.all(nameCandidates(item.title).map((w) => {
+      const n = w.replace(/\s+/g, "").toUpperCase();
+      return api.get<{ hits: InstrumentHit[] }>(`/api/search/symbols?q=${encodeURIComponent(w)}&segment=EQ&limit=4`)
+        .then((r) => (r.hits ?? []).filter((h) => h.short_name.toUpperCase() === n).sort((a, b) => Number(b.exchange === "NSE") - Number(a.exchange === "NSE")).slice(0, 1))
+        .catch(() => [] as InstrumentHit[]);
+    })).then((rs) => {
+      if (!live) return;
+      const seen = new Set<string>();
+      setHits(rs.flat().filter((h) => !seen.has(h.short_name) && !!seen.add(h.short_name)).slice(0, 4));
+    });
+    return () => { live = false; };
+  }, [item.title]);
+  if (!hits) return <div className="news-reader text-dim">Looking for the stock…</div>;
+  if (!hits.length) return <div className="news-reader text-dim">No listed stock found in this headline. Search it on the Trade page.</div>;
+  return (
+    <div className="news-words" data-testid="news-stocks">
+      {hits.map((h) => (
+        <a key={h.symbol} className="chip" href={chartHref(h.symbol, new Date(when(item)).toISOString())}
+          target="_blank" rel="noopener noreferrer" title={`${h.display} · chart at ${ist(when(item))} IST`}>{h.short_name} ↗</a>
+      ))}
     </div>
   );
 }

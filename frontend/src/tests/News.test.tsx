@@ -147,3 +147,62 @@ describe("News page: detection lag and trends", () => {
     await waitFor(() => expect(calls()).toBe(before + 1));              // new headlines: fetched at once
   });
 });
+
+describe("News page: fixes and trader shortcuts", () => {
+  it("source chip counts leave out muted headlines, like the list does", async () => {
+    render(<News />);
+    await screen.findByText("TCS board meeting");
+    expect(screen.getByRole("button", { name: /^Moneycontrol/ }).textContent).toBe("Moneycontrol 1");   // the horoscope is muted
+  });
+
+  it("an update that repeats headlines the page already has adds no NEW badge and no duplicate", async () => {
+    const f = globalThis.fetch as unknown as (u: RequestInfo | URL, i?: RequestInit) => Promise<Response>;
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) =>
+      (String(input).includes("since_id") ? json({ items: ITEMS, max_id: 3 }) : f(input, init))) as unknown as typeof fetch;
+    render(<News />);
+    await screen.findByText("TCS board meeting");
+    window.dispatchEvent(new CustomEvent("news:event", { detail: { new: 1 } }));
+    await waitFor(() => expect((globalThis.fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls.some((c) => String(c[0]).includes("since_id"))).toBe(true));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(screen.queryByText("NEW")).toBeNull();
+    expect(screen.getAllByText("TCS board meeting")).toHaveLength(1);
+  });
+
+  it("a feed time in the future (wrong time zone) does not pin the story to the top", async () => {
+    const seen = new Date(Date.now() - 10 * 60_000).toISOString();
+    const list = [
+      { id: 1, url: "https://x.example/1", source: "Mint", title: "Story with a future time", summary: null, published_at: new Date(Date.now() + 5.5 * 3600_000).toISOString(), seen_at: seen },
+      { id: 2, url: "https://x.example/2", source: "Mint", title: "Story from five minutes ago", summary: null, published_at: new Date(Date.now() - 5 * 60_000).toISOString(), seen_at: new Date().toISOString() },
+    ];
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/api/news/items")) return json({ items: url.includes("since_id") ? [] : list, max_id: 2 });
+      if (url.includes("/api/news/status")) return json({ settings: { ...SETTINGS, watchlist: [], muted: [] }, known_sources: ["Mint"], collector: { polls: 0, last_poll_at: null, last_poll_ms: null }, sources: [] });
+      return json({}, 404);
+    }) as unknown as typeof fetch;
+    render(<News />);
+    await screen.findByText("Story with a future time");
+    const titles = [...document.querySelectorAll(".news-title")].map((e) => e.textContent);
+    expect(titles).toEqual(["Story from five minutes ago", "Story with a future time"]);
+    expect(screen.getByText("10m")).toBeTruthy();                         // aged from when it was first seen
+  });
+
+  it("chart links the stock a headline names (exact tickers only) to the Trade page at the news time", async () => {
+    const f = globalThis.fetch as unknown as (u: RequestInfo | URL, i?: RequestInit) => Promise<Response>;
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (!url.includes("/api/search/symbols")) return f(input, init);
+      const q = new URL(url, "http://x").searchParams.get("q");
+      const hit = (s: string, ex = "NSE") => ({ symbol: `${ex}:${s}-EQ`, short_name: s, exchange: ex, segment: "EQ", instrument_type: "EQ", lot_size: 1, tick_size: 0.05, expiry: null, strike: null, underlying: null, display: s });
+      return json({ hits: q === "Reliance" ? [hit("RELIANCE", "BSE"), hit("RELIANCE")] : [hit("WINSOME")] });   // "wins" fuzzy-matches: ignored
+    }) as unknown as typeof fetch;
+    render(<News />);
+    await screen.findByText(/wins/);
+    fireEvent.click(screen.getAllByRole("button", { name: /chart/ })[0]);
+    const box = await screen.findByTestId("news-stocks");
+    const links = within(box).getAllByRole("link");
+    expect(links.map((a) => a.textContent)).toEqual(["RELIANCE ↗"]);
+    expect(links[0].getAttribute("href")).toContain("#/trade?symbol=NSE%3ARELIANCE-EQ");   // NSE listing preferred
+    expect(links[0].getAttribute("href")).toMatch(/&at=\d+/);
+  });
+});
