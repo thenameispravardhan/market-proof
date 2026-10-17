@@ -733,6 +733,22 @@ class AlgoTrade(Base):
     version: Mapped[Optional[int]] = mapped_column(Integer)    # strategy version that opened it
 
 
+
+class NewsItem(Base):
+    """One headline seen by the News page monitor (app/services/news_wire.py).
+    Monitoring only: nothing here is sent to the analyzer or the AI."""
+
+    __tablename__ = "news_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    url: Mapped[str] = mapped_column(String(1000), unique=True, nullable=False)
+    source: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    feed: Mapped[str] = mapped_column(String(500), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    summary: Mapped[Optional[str]] = mapped_column(Text)
+    published_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)   # UTC, from the feed
+    seen_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False, index=True)
+
 # -------------------------------------------------------------------------
 # Re-export all model classes so siblings can do `from app.db.models import *`
 # -------------------------------------------------------------------------
@@ -756,4 +772,5 @@ __all__ = [
     "AlgoStrategy",
     "AlgoTrade",
     "AlgoStrategyVersion",
+    "NewsItem",
 ]

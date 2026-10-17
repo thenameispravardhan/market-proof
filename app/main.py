@@ -42,6 +42,7 @@ from app.api import (
     prompts as prompts_api,
     risk as risk_api,
     research as research_api,
+    news as news_api,
     rules as rules_api,
     search as search_api,
     settings_api,
@@ -329,6 +330,7 @@ async def lifespan(app: FastAPI):
     algo_task: asyncio.Task[None] | None = None
     tick_task: asyncio.Task[None] | None = None
     fno_master_task: asyncio.Task[None] | None = None
+    news_task: asyncio.Task[None] | None = None
     if not settings.TESTING:
         # T3: start the analyzer before the monitors so its event-bus
         # subscription is live before the first `announcements.new`
@@ -561,13 +563,19 @@ async def lifespan(app: FastAPI):
 
         fno_master_task = asyncio.create_task(_fno_master_refresh(), name="fno-master")
 
+        # News page headline monitor: monitoring only (never feeds the analyzer). Idles until the
+        # operator switches it on from the News page.
+        from app.services.news_wire import news_wire
+
+        news_task = asyncio.create_task(news_wire.run(), name="news-wire")
+
     try:
         yield
     finally:
         if not settings.TESTING:
             # Stop the breaker monitor first.
             for _t in (risk_monitor_task, dataset_eod_task, ai_schedule_task, algo_task, tick_task,
-                       fno_master_task):
+                       fno_master_task, news_task):
                 if _t is not None:
                     _t.cancel()
                     try:
@@ -692,6 +700,7 @@ app.include_router(system_api.router)
 app.include_router(algo_api.router)
 app.include_router(snapshots_api.router)
 app.include_router(research_api.router)
+app.include_router(news_api.router)
 
 
 # -------------------------------------------------------------------------

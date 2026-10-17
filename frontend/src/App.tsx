@@ -46,6 +46,7 @@ const Rules = lazy(() => import("./pages/Rules"));
 const Algo = lazy(() => import("./pages/Algo"));
 const Accounts = lazy(() => import("./pages/Accounts"));
 const Notifications = lazy(() => import("./pages/Notifications"));
+const News = lazy(() => import("./pages/News"));
 const Settings = lazy(() => import("./pages/Settings"));
 const Timing = lazy(() => import("./pages/Timing"));
 
@@ -65,6 +66,7 @@ const TABS: { key: TabKey; label: string; emoji: string; group: NavGroup }[] = [
   // What's happening now
   { key: "dashboard",      label: "Dashboard",      emoji: "▤", group: "LIVE" },
   { key: "trade",          label: "Trade",          emoji: "▶", group: "LIVE" },
+  { key: "news",           label: "News",           emoji: "✉", group: "LIVE" },
   // How the bot decides — pipeline order
   { key: "prompts",        label: "Prompts",        emoji: "✎", group: "STRATEGY" },
   { key: "rules",          label: "Rules",          emoji: "≡", group: "STRATEGY" },
@@ -87,6 +89,7 @@ function PageContent({ tab }: { tab: TabKey }) {
   switch (tab) {
     case "dashboard": return <Dashboard />;
     case "trade": return <Trade />;
+    case "news": return <News />;
     case "trades": return <TradeHistory />;
     case "outcomes": return <Outcomes />;
     case "dataset": return <Dataset />;

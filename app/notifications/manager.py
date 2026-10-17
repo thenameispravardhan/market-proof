@@ -68,6 +68,8 @@ CHANNELS = (
     # Daily health report (app/services/health_report.py) — operators
     # opt in by adding "report" to a channel's events filter.
     ("system.report", "report"),
+    # News page watchlist hits (app/services/news_wire.py), opt in with "news".
+    ("news.alert", "news"),
 )
 
 RETRY_BACKOFFS_S = (0.0, 1.0, 2.0)  # 3 attempts total
@@ -234,6 +236,12 @@ def _render_trade_exit(payload: dict[str, Any]) -> tuple[str, str]:
     return subject, "\n".join(lines)
 
 
+def _render_news(payload: dict[str, Any]) -> tuple[str, str]:
+    words = ", ".join(payload.get("keywords") or [])
+    subject = f"News: {words}" if words else "News"
+    return subject, "\n".join(str(payload.get(k, "")) for k in ("title", "source", "url"))
+
+
 RENDERERS: dict[str, Callable[[dict[str, Any]], tuple[str, str]]] = {
     "signal": _render_signal,
     "trade": _render_trade,
@@ -242,6 +250,7 @@ RENDERERS: dict[str, Callable[[dict[str, Any]], tuple[str, str]]] = {
     "risk_halt": _render_risk_halt,
     "error": _render_error,
     "report": _render_report,
+    "news": _render_news,
 }
 
 
