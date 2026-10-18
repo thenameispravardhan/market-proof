@@ -307,9 +307,10 @@ def _lags(db: Session) -> dict:
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     first = dict(db.execute(select(NewsItem.feed, func.min(NewsItem.seen_at)).group_by(NewsItem.feed)).all())
     per: dict[str, list[float]] = {}
-    for src, feed, pub, seen in db.execute(select(NewsItem.source, NewsItem.feed, NewsItem.published_at, NewsItem.seen_at)
-                                           .where(NewsItem.seen_at >= now - timedelta(hours=24), NewsItem.published_at.is_not(None))):
-        if seen <= first[feed] + timedelta(seconds=120):
+    for src, feed, url, pub, seen in db.execute(
+            select(NewsItem.source, NewsItem.feed, NewsItem.url, NewsItem.published_at, NewsItem.seen_at)
+            .where(NewsItem.seen_at >= now - timedelta(hours=24), NewsItem.published_at.is_not(None))):
+        if seen <= first[feed] + timedelta(seconds=120) or "#update-" in url:   # a re-title is no detection
             continue
         d = (seen - pub).total_seconds()
         if 0 <= d <= 24 * 3600:              # a future date or a re-dated old story says nothing about our speed
