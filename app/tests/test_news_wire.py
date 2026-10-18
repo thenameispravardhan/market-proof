@@ -94,6 +94,11 @@ def test_fetch_stores_once_uses_conditional_get_and_respects_refusals(isolated_d
     asyncio.run(w2.fetch(FEED, SETTINGS | {"intervals": {FEED["source"]: 300}}))
     assert 299 < w2.state[FEED["url"]].next_at - t < 302
     assert 290 < w2.next_wait(SETTINGS | {"custom_feeds": [FEED], "sources": {s: False for s in nw.SOURCES}}) <= 300
+    fast = {**FEED, "every": 5}                                                       # the feed's own cadence...
+    asyncio.run(w2.fetch(fast, SETTINGS))
+    assert 4 < w2.state[FEED["url"]].next_at - time.time() <= 5
+    asyncio.run(w2.fetch(fast, SETTINGS | {"intervals": {FEED["source"]: 60}}))       # ...unless the operator set one
+    assert 59 < w2.state[FEED["url"]].next_at - time.time() <= 60
     n = len(seen)
     asyncio.run(w.poll(SETTINGS | {"custom_feeds": [FEED], "sources": {s: False for s in nw.SOURCES}}))
     assert len(seen) == n                                                                     # paused: no request
