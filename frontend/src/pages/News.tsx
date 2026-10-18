@@ -80,7 +80,7 @@ function dur(sec: number | null | undefined): string {
 /** Detection lag of one headline: published -> first seen. null when the feed gives no time or a future one, or
  *  when it came in its feed's first poll (already in the feed: that says when monitoring started, not our speed). */
 function lagOf(i: Item, firstSeen: Map<string, number>): number | null {
-  if (!i.published_at || Date.parse(i.seen_at) <= (firstSeen.get(i.feed ?? i.source) ?? 0) + 120_000) return null;
+  if (!i.published_at || i.url.includes("#update-") || Date.parse(i.seen_at) <= (firstSeen.get(i.feed ?? i.source) ?? 0) + 120_000) return null;
   const d = (Date.parse(i.seen_at) - Date.parse(i.published_at)) / 1000;
   return d >= 0 && d < 86400 ? d : null;
 }

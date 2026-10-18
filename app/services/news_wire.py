@@ -75,7 +75,10 @@ DEFAULT_FEEDS: list[dict[str, Any]] = [
     {"source": "ET Markets", "group": MARKETS,
      "url": "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"},
     {"source": "Times of India", "url": "https://timesofindia.indiatimes.com/rssfeeds/1898055.cms", "group": BUSINESS},
-    {"source": "Business Today", "url": "https://www.businesstoday.in/rssfeeds/?id=225346", "group": MARKETS},
+    # Business Today: its RSS showed a story 22 min after publishing, its Google News sitemap ~21 s (2026-10-18)
+    {"source": "Business Today", "group": MARKETS, "every": 10,
+     "paths": ("/markets/", "/latest/economy/", "/latest/corporate/", "/personal-finance/"),
+     "url": "https://www.businesstoday.in/rssfeeds/news-sitemap.xml"},
     {"source": "The Hindu", "url": "https://www.thehindu.com/business/markets/feeder/default.rss", "group": MARKETS},
     {"source": "News18", "url": "https://www.news18.com/commonfeeds/v1/eng/rss/business.xml", "group": BUSINESS,
      "every": 10},

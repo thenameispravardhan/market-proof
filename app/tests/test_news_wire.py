@@ -328,6 +328,7 @@ def test_detection_lag_per_source_skips_first_poll_backlog(client, isolated_db, 
         seen = now - timedelta(minutes=30 - i)
         add(f"https://a/{i}", "Mint", seen - timedelta(seconds=lag), seen)
     add("https://a/future", "Mint", now + timedelta(hours=1), now - timedelta(minutes=5))   # future-dated: ignored
+    add("https://a/0#update-1", "Mint", now - timedelta(hours=1), now - timedelta(minutes=4))   # a re-title: ignored
     add("https://b/first", "Zee Business", t0, t0)
     for i, lag in enumerate((300, 400, 500)):
         seen = now - timedelta(minutes=20 - i)
