@@ -51,6 +51,9 @@ _PLAIN = {w.upper() for w in COMMON} | {"INDIAN", "NATIONAL", "NEW", "FIRST", "U
 # Phrases that are a company's name with "of India" cut, or its start, but mean something else in a headline.
 _GENERIC = ("Central Bank", "New India", "Life Insurance", "General Insurance", "Indian Railway", "Indian Railways",
             "Indian Bank Association", "State Government", "Union Government", "National Stock", "Dalal Street")
+# Aliases that are everyday words, read in prose (a summary, an article) only past a sentence's first word:
+# "Persistent rain is forecast" names no company.
+_OPENER = re.compile(r"(^|[.!?][\"'’”]?\s+)(Persistent|Eternal|Mankind)\b")
 # A broker call names the broker last: "Buy CEAT; target of Rs 4500: ICICI Securities" is CEAT's news, not ISEC's.
 _BROKER = re.compile(r"^((?:buy|sell|hold|add|reduce|accumulate|neutral)\b[^:;]*[:;]\s*target[^:;]*|subscribe\b[^:;]*)"
                      r"[:;]\s*[^:;]+$", re.I)
@@ -396,8 +399,12 @@ def kinds(title: str) -> list[str]:
 def _tag(title: str, summary: str, sig: tuple) -> tuple[tuple[str, ...], tuple[str, ...]]:
     ix = _cache["ix"]
     m = _BROKER.match(title)
-    found = _scan(m[1] if m else title, ix)[:MAX_STOCKS] or _scan(summary, ix)[:2]
+    found = _scan(m[1] if m else title, ix)[:MAX_STOCKS] or _scan(_prose(summary), ix)[:2]
     return tuple(found), tuple(kinds(title))
+
+
+def _prose(text: str) -> str:
+    return _OPENER.sub(lambda m: m[1] + m[2].lower(), text)
 
 
 def tag(title: str, summary: Optional[str] = None) -> dict[str, list[str]]:
@@ -423,7 +430,7 @@ def find(title: str, summary: Optional[str] = None, text: Optional[str] = None) 
         ix = _index()
         m = _BROKER.match(title)
         out: list[str] = []
-        for part in (m[1] if m else title, summary or "", (text or "")[:2000]):
+        for part in (m[1] if m else title, _prose(summary or ""), _prose((text or "")[:2000])):
             out += [s for s in _scan(part, ix) if s not in out]
         return out[:6]
     except Exception:  # noqa: BLE001
