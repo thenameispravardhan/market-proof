@@ -3118,9 +3118,8 @@ a.news-title:hover { color: var(--accent); text-decoration: underline; }
 .news-tags .news-tbadge { margin-left: 0; }
 .news-tk { display: inline-flex; align-items: stretch; border: 1px solid var(--border-hi); border-radius: 3px; overflow: hidden;
   font-family: var(--mono); font-size: 10px; font-weight: 700; line-height: 15px; }
-.news-tk button { background: none; border: 0; padding: 0 5px; color: var(--cyan); font: inherit; cursor: pointer; }
-.news-tk a { padding: 0 4px; border-left: 1px solid var(--border-hi); color: var(--text-dim); text-decoration: none; }
-.news-tk button:hover, .news-tk a:hover { color: var(--accent); }
+.news-tk { padding: 0 5px; color: var(--cyan); text-decoration: none; }
+.news-tk:hover { color: var(--accent); }
 .news-tk.on { border-color: var(--cyan); background: var(--cyan-bg); }
 .news-kind { padding: 0 4px; border-radius: 3px; background: var(--bg-surface); color: var(--text-dim);
   font-size: 9px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; line-height: 15px; }
