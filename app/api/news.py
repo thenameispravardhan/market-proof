@@ -55,7 +55,7 @@ class NewsSettings(BaseModel):
     watchlist: list[str] = Field(max_length=50)
     muted: list[str] = Field(max_length=50)
     alerts: bool
-    retention_days: int = Field(ge=1, le=90)
+    retention_days: int = Field(ge=0, le=90)           # 0: keep every headline
     extract: bool = False
     extract_sources: dict[str, bool] = {}
     intervals: dict[str, int] = {}
@@ -141,6 +141,17 @@ def items(since_id: int = 0, q: str = Query("", max_length=100), source: Optiona
     return {"items": out, "max_id": max_id}
 
 
+@router.get("/stocks")
+def find_stocks(id: int, db: Session = Depends(get_db)):
+    """The chart button: the story's stocks looked for again, in the headline, its summary and the article text
+    the scraper stored, so a headline that names none can still lead to its chart."""
+    n = db.get(NewsItem, id)
+    if n is None:
+        raise HTTPException(404, "no such headline")
+    e = nw.lookup([n.url], nw.news_wire.scrape_db).get(n.url) or {}
+    return {"tickers": nt.find(n.title, n.summary, e.get("text"))}
+
+
 @router.get("/article")
 def article(url: str = Query(min_length=8, max_length=1000)):
     """What the scraper extracted for one headline: text, metadata (author, tags, image, site), tables, images."""
@@ -150,15 +161,20 @@ def article(url: str = Query(min_length=8, max_length=1000)):
     if not e:
         return {"status": "pending"}
     meta = json.loads(e["meta"]) if e.get("meta") else {}
-    images = []
+    images, jl = [], None
     try:
         con = sqlite3.connect(f"file:{nw.news_wire.scrape_db}?mode=ro", uri=True)
         images = [u for (u,) in con.execute("SELECT a.url FROM assets a JOIN asset_pages p ON p.asset = a.url "
                                             "WHERE p.page = ? AND a.kind = 'image' LIMIT 12", (e["url"],))]
+        if e["status"] == "paywalled":
+            jl = con.execute("SELECT jsonld FROM pages WHERE url = ?", (e["url"],)).fetchone()
         con.close()
     except sqlite3.OperationalError:
         pass
     text = e.get("text") or ""
+    if e["status"] == "paywalled":           # only what the publisher gives away (scraper/scrape.py free_part);
+        from scraper.scrape import description   # rows stored before it: the summary the page publishes
+        text = meta.pop("free", None) or (description(json.loads(jl[0])) if jl and jl[0] else "")
     return {"status": e["status"], "error": e["error"], "http": e["http"], "title": e.get("title"), "date": e.get("date"),
             "text": text, "words": len(text.split()), "meta": meta,
             "tables": json.loads(e["tables"]) if e.get("tables") else [], "images": images,

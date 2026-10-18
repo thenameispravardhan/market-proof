@@ -110,7 +110,8 @@ DEFAULT_FEEDS: list[dict[str, Any]] = [
     {"source": "NSE", "url": "https://nsearchives.nseindia.com/content/RSS/Online_announcements.xml", "ist": True,
      "subject": True, "group": OFFICIAL},
     {"source": "RBI Notifications", "url": "https://www.rbi.org.in/notifications_rss.xml", "group": OFFICIAL},
-    {"source": "Federal Reserve", "url": "https://www.federalreserve.gov/feeds/press_all.xml", "group": GLOBAL},
+    {"source": "Federal Reserve", "url": "https://www.federalreserve.gov/feeds/press_all.xml", "group": GLOBAL,
+     "min_s": 120},   # a few releases a day; 20 s polls only collected its CDN's stray 404s
     {"source": "CNBC", "url": "https://www.cnbc.com/id/100003114/device/rss/rss.html", "group": GLOBAL},
     {"source": "CNBC Asia", "url": "https://www.cnbc.com/id/19832390/device/rss/rss.html", "group": GLOBAL},
     {"source": "MarketWatch", "url": "https://feeds.content.dowjones.io/public/rss/mw_topstories", "group": GLOBAL},
@@ -138,7 +139,7 @@ DEFAULTS: dict[str, Any] = {
     "watchlist": [],         # highlighted on the page; optional alerts
     "muted": [],             # hidden on the page
     "alerts": False,         # send watchlist hits to notification channels subscribed to "news"
-    "retention_days": 7,
+    "retention_days": 0,     # days a headline is kept; 0 = every headline, for good
     "extract": False,        # fetch each new headline's article with the scraper: text, metadata, tables, PDF text
     "extract_sources": {s: s not in EXTRACT_OFF for s in SOURCES},
     "bursts": False,         # alert when burst_sources+ outlets name one stock within burst_minutes (breaking news)
@@ -394,7 +395,9 @@ class NewsWire:
 
     def _failed(self, st: FeedState, status: Optional[int], err: str) -> int:
         st.fails += 1
-        st.last_status, st.last_error = status, err
+        st.last_status = status
+        if st.fails >= 2:        # one miss is noise (the Fed's CDN 404s about 1 poll in 16 between two 304s)
+            st.last_error = err
         st.next_at = time.time() + min(30 * 2 ** st.fails, 600)    # back off: 1, 2, 4 ... up to 10 min
         return 0
 
@@ -402,14 +405,25 @@ class NewsWire:
         db = db_session.SessionLocal()
         try:
             urls = [i["url"] for i in items]
-            known = set(db.execute(select(NewsItem.url).where(NewsItem.url.in_(urls))).scalars())
+            known = dict(db.execute(select(NewsItem.url, NewsItem.title).where(NewsItem.url.in_(urls))).all())
             fresh, seen = [], set()
             for i in items:
-                if i["url"] in known or i["url"] in seen:
+                url = i["url"]
+                if url in seen:
                     continue
-                seen.add(i["url"])
-                fresh.append({**i, "source": source})
-                db.add(NewsItem(url=i["url"], source=source, feed=feed, title=i["title"], summary=i["summary"],
+                seen.add(url)
+                if url in known:
+                    if _same(known[url], i["title"]):
+                        continue
+                    # The feed re-titled a story it already ran ("HDFC Bank Q2: NII meets estimates" -> "...: margins
+                    # at record low"): new information, kept as a row of its own beside every earlier one.
+                    prior = db.execute(select(NewsItem.title).where(NewsItem.url >= f"{url}#update-",
+                                                                    NewsItem.url < f"{url}#update.")).scalars().all()
+                    if any(_same(t, i["title"]) for t in prior):
+                        continue
+                    url = f"{url}#update-{len(prior) + 1}"
+                fresh.append({**i, "url": url, "source": source})
+                db.add(NewsItem(url=url, source=source, feed=feed, title=i["title"], summary=i["summary"],
                                 published_at=i["published_at"]))
             db.commit()
             return fresh
@@ -441,7 +455,7 @@ class NewsWire:
                 "symbol": b["symbol"], "burst": True})
 
     def prune(self, s: dict[str, Any]) -> None:
-        if time.time() - self._pruned_at < 3600:
+        if not s["retention_days"] or time.time() - self._pruned_at < 3600:   # 0: keep every headline
             return
         self._pruned_at = time.time()
         db = db_session.SessionLocal()
@@ -600,6 +614,11 @@ def lookup(urls: list[str], db_path: Path, text: bool = True) -> dict[str, dict[
         return {}
     finally:
         con.close()
+
+
+def _same(a: str, b: str) -> bool:
+    """One headline re-punctuated ("details here." / "details here"): no update."""
+    return re.sub(r"\W+", " ", a.lower()).strip() == re.sub(r"\W+", " ", b.lower()).strip()
 
 
 def _retry_after(v: Optional[str]) -> Optional[float]:

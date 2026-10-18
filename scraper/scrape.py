@@ -16,6 +16,7 @@ A round-robin per-host scheduler keeps one slow host from stalling the rest.
 """
 import argparse
 import asyncio
+import copy
 import gzip
 import hashlib
 import html as htmllib
@@ -494,8 +495,8 @@ class Crawler:
             return self.save(url, status="deferred", error=verdict)
         if not verdict:
             return self.save(url, status="blocked", error="robots.txt")
-        row = self.db.execute("SELECT etag, modified, text, title FROM pages WHERE url=?", (url,)).fetchone()
-        etag, modified, prev_text, prev_title = row if row else (None, None, None, None)
+        row = self.db.execute("SELECT etag, modified, text, title, status FROM pages WHERE url=?", (url,)).fetchone()
+        etag, modified, prev_text, prev_title, prev_status = row if row else (None, None, None, None, None)
         # conditional only when a 304 has something to keep: stored text, or a feed (its links are already queued).
         # A 304 on a paywalled/optout/duplicate row (no text) would otherwise turn it into 'empty'
         keep = bool(prev_text) or (prev_title or "").startswith("feed: ")
@@ -510,7 +511,7 @@ class Crawler:
         except Exception as e:
             return self.save(url, status="failed", error=repr(e)[:300])
         if r.status_code == 304:             # not modified: content still valid (audit #6)
-            return self.save(url, http=304, status="done" if keep else "empty")
+            return self.save(url, http=304, status=(prev_status if prev_status == "duplicate" else "done") if keep else "empty")
         if 300 <= r.status_code < 400 and r.headers.get("location"):
             return self.redirect(url, depth, normalize(r.headers["location"], base=url), r.status_code)
         if r.status_code >= 400:
@@ -601,8 +602,9 @@ class Crawler:
             return self.save(url, status="blocked", error="challenge/anti-bot page", **hdr)
         if res["notfound"]:
             return self.save(url, status="failed", error="soft 404 (title)", **hdr)
-        if res["paywalled"]:
-            return self.save(url, status="paywalled", **blob, **hdr)
+        if res["paywalled"]:                 # only the part it gives away, kept apart from text: never an article
+            return self.save(url, status="paywalled", meta=dumps({"free": res["free"]}) if res["free"] else None,
+                             **blob, **hdr)
         if res["doc"] is None:
             return self.save(url, status="empty", title=res["fallback_title"], **blob, **hdr)
         doc = res["doc"]
@@ -612,10 +614,11 @@ class Crawler:
         # ponytail: exact text only; near-duplicates (a different sidebar) need simhash/minhash
         first = self.db.execute("SELECT url FROM pages WHERE digest=? AND url<>? AND status='done' LIMIT 1",
                                 (digest, url)).fetchone()
-        if first:
-            return self.save(url, status="duplicate", final_url=first[0], **hdr)
         info = {k: v for k, v in doc.items() if v and k not in ("text", "raw_text", "title", "date")}
         info.update({k: v for k, v in flags.items() if v})
+        if first:                            # kept whole too: a copy is still the operator's record of that page
+            return self.save(url, status="duplicate", title=doc.get("title"), date=doc.get("date"), text=doc["text"],
+                             meta=json.dumps(info, ensure_ascii=False), digest=digest, **{**blob, "final_url": first[0]}, **hdr)
         self.save(url, status="done", title=doc.get("title"), date=doc.get("date"), text=doc["text"],
                   meta=json.dumps(info, ensure_ascii=False), data=data, error=None, digest=digest, **blob, **hdr)
 
@@ -1132,7 +1135,7 @@ def parse_page(body, url, follow, charset=None, recall=False):
     doc = extract(body, url, recall)
     out = {"doc": doc, "links": [], "tables": [], "jsonld": [], "media": [], "thin": False,
            "blocked": False, "optout": False, "paywalled": False, "nofollow": False, "fallback_title": None,
-           "notfound": False, "refresh": None}
+           "notfound": False, "refresh": None, "free": None}
     try:
         parser = lxml_html.HTMLParser(encoding=charset) if charset else None
         tree = lxml_html.document_fromstring(body, parser=parser)
@@ -1153,6 +1156,7 @@ def parse_page(body, url, follow, charset=None, recall=False):
     jl = jsonld(tree)
     out["jsonld"] = jl
     out["paywalled"] = any(_free_false(b) for b in jl)
+    out["free"] = free_part(tree, jl, url) if out["paywalled"] else None
     # challenge/anti-bot page served with 200 and a little boilerplate text (audit #5)
     if doc is None or len((doc.get("text") or "")) < 300:
         blob = ((out["fallback_title"] or "") + " " + text_sample)
@@ -1172,18 +1176,70 @@ def parse_page(body, url, follow, charset=None, recall=False):
     return out
 
 
-def _free_false(block):
+def _ld(block):
+    """Every object in a JSON-LD block, nested ones too."""
     stack = [block]
     while stack:
         d = stack.pop()
         if isinstance(d, list):
             stack += d
         elif isinstance(d, dict):
-            v = d.get("isAccessibleForFree")
-            if v in (False, "False", "false"):
-                return True
+            yield d
             stack += [x for x in d.values() if isinstance(x, (dict, list))]
-    return False
+
+
+def _paid(d):
+    return d.get("isAccessibleForFree") in (False, "False", "false")
+
+
+def _free_false(block):
+    return any(map(_paid, _ld(block)))
+
+
+def _plain(s):
+    return " ".join(htmllib.unescape(re.sub(r"<[^>]+>", " ", s)).split())
+
+
+def description(jl, tree=None):
+    """The summary a page publishes about itself (JSON-LD, else og:/meta description): public even when the
+    article is paywalled."""
+    d = next((d["description"] for d in _ld(jl) if isinstance(d.get("description"), str) and d["description"].strip()), "")
+    if not d and tree is not None:
+        d = tree.xpath("string(//meta[@property='og:description']/@content)") or tree.xpath("string(//meta[@name='description']/@content)")
+    return _plain(d)
+
+
+_SEL = re.compile(r"^([a-z][a-z0-9]*)?([.#])([\w-]+)$", re.I)   # "div.paywall", ".paywall", "#premium"
+FREE_CAP = 1500                                                  # a teaser's length: bounds any markup surprise
+
+
+def free_part(tree, jl, url):
+    """What a paywalled page gives away, never what it sells: its description, then its text with the parts it
+    marks paid (JSON-LD hasPart isAccessibleForFree false + a .class / #id cssSelector) cut out, kept only when
+    marked parts were found and cut, and ended where any paid text starts (a cut part's, or the paid text the page
+    declares in hasPart "value"): Mint ships its paid paragraphs a second time outside .paywall."""
+    t, cut = None, 0
+    paid = [" ".join(d["value"].split())[:120] for d in filter(_paid, _ld(jl)) if isinstance(d.get("value"), str)]
+    for d in filter(_paid, _ld(jl)):
+        sels = d.get("cssSelector")
+        for sel in (sels if isinstance(sels, list) else [sels]):
+            for part in (sel.split(",") if isinstance(sel, str) else []):
+                m = _SEL.match(part.strip())
+                if not m:
+                    continue
+                t = t if t is not None else copy.deepcopy(tree)
+                cls = f"[contains(concat(' ', normalize-space(@class), ' '), ' {m[3]} ')]" if m[2] == "." else f"[@id='{m[3]}']"
+                for el in t.xpath(f"//{m[1] or '*'}{cls}"):
+                    paid.append(" ".join(el.text_content().split())[:120])
+                    el.drop_tree()
+                    cut += 1
+    lead = " ".join(((extract(lxml_html.tostring(t), url) or {}).get("text") or "").split()) if cut else ""
+    starts = [lead.find(p) for p in paid if len(p) >= 40 and p in lead]
+    lead = lead[:min(starts)].strip() if starts else lead
+    if len(lead) > FREE_CAP:
+        lead = lead[:FREE_CAP].rsplit(" ", 1)[0] + " …"
+    desc = description(jl, tree)
+    return "\n\n".join(x for x in (desc if desc not in lead else "", lead) if x) or None
 
 
 def _cell_text(cell):

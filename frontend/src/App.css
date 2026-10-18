@@ -3091,6 +3091,8 @@ a.news-title:hover { color: var(--accent); text-decoration: underline; }
 .news-tbadge.ok { color: var(--green); border-color: var(--green); cursor: pointer; }
 .news-tbadge.ok.open { background: var(--green); color: var(--text-inv); }
 .news-tbadge.off { text-transform: uppercase; }
+.news-tbadge.part { color: var(--amber); border-color: var(--amber); cursor: pointer; }
+.news-tbadge.part.open { background: var(--amber-bg); }
 .news-reader { margin-top: 8px; padding: 10px 12px; border-left: 2px solid var(--green); background: var(--bg-surface); }
 .news-reader-meta { font-size: 11px; color: var(--text-dim); margin-bottom: 6px; }
 .news-reader-text { white-space: pre-wrap; font-size: 12.5px; line-height: 1.55; max-height: 360px; overflow-y: auto; color: var(--text); }

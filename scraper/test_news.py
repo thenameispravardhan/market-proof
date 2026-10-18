@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 SEEN = []                                    # query strings the fake X API received
+AGO = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - 120))   # inside "last 24 h" on any day
 
 
 class FakeX(BaseHTTPRequestHandler):
@@ -26,9 +27,9 @@ class FakeX(BaseHTTPRequestHandler):
             return self.reply(429, {}, {"x-rate-limit-reset": str(int(time.time()) + 600)})
         since = int(q.get("since_id", ["0"])[0])
         posts = [p for p in ({"id": "1900000000000000001", "author_id": "7", "text": "Nifty at record high",
-                              "created_at": "2026-10-17T03:00:00.000Z"},
+                              "created_at": AGO},
                              {"id": "1900000000000000002", "author_id": "7", "text": "Sensex up 500",
-                              "created_at": "2026-10-17T03:01:00.000Z"}) if int(p["id"]) > since]
+                              "created_at": AGO}) if int(p["id"]) > since]
         self.reply(200, {"data": posts, "includes": {"users": [{"id": "7", "username": "marketdesk"}]}} if posts else {"meta": {"result_count": 0}})
 
     def reply(self, code, body, headers=None):
