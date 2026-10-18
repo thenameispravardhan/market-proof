@@ -56,11 +56,16 @@ DEFAULT_FEEDS: list[dict[str, Any]] = [
     {"source": "Zee Business", "url": "https://www.zeebiz.com/latest.xml", "group": MARKETS},
     {"source": "CNBC-TV18", "url": "https://www.cnbctv18.com/commonfeeds/v1/cne/rss/latest.xml", "group": MARKETS},
     {"source": "CNBC-TV18", "url": "https://www.cnbctv18.com/commonfeeds/v1/cne/rss/market.xml", "group": MARKETS},
+    # ET and BusinessLine: their Google News sitemaps (listed in robots.txt) show a story ~1.5 min after it is
+    # published; their section RSS took 8-14 min (ET) and 3-4 min (measured 2026-10-18). A sitemap is the whole site,
+    # so "paths" keeps only these sections. Their other RSS feeds still run: a story they carry first is kept there.
     {"source": "Economic Times", "group": MARKETS,
-     "url": "https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms"},
+     "paths": ("/markets/", "/industry/", "/news/economy/", "/news/company/"),
+     "url": "https://economictimes.indiatimes.com/etstatic/sitemaps/et/news/sitemap-today.xml"},
     {"source": "Mint", "url": "https://www.livemint.com/rss/markets", "group": MARKETS},
     {"source": "BusinessLine", "group": MARKETS,
-     "url": "https://www.thehindubusinessline.com/markets/stock-markets/feeder/default.rss"},
+     "paths": ("/markets/", "/companies/", "/economy/", "/money-and-banking/", "/portfolio/"),
+     "url": "https://www.thehindubusinessline.com/sitemap/googlenews/all/all.xml"},
     {"source": "BSE", "url": "https://www.bseindia.com/data/xml/announcements.xml", "ist": True, "group": OFFICIAL},
     # Added 2026-10-17, same check. Off until ticked in Settings > Sources (current behaviour stays the default).
     # Business Standard and Firstpost answer this UA with 403, Financial Express's feed redirects to HTML: left out.
@@ -384,6 +389,8 @@ class NewsWire:
         items = parse_feed(bytes(body), ist=f.get("ist", False), subject=f.get("subject", False))
         if not items:
             return self._failed(st, 200, "no items (not a feed?)")
+        if f.get("paths"):                       # a whole-site sitemap: only the sections the feed names
+            items = [i for i in items if urlsplit(i["url"]).path.startswith(f["paths"])]
         fresh = self._store(f["source"], url, items)
         st.last_ok, st.last_error, st.fails, st.items, st.last_new = time.time(), None, 0, len(items), len(fresh)
         if st.primed and fresh and s["alerts"] and s["watchlist"]:
@@ -522,6 +529,13 @@ class NewsWire:
                                                                    "retries": 1, "pause": 3600} for u in urls}
         c = scrape.Crawler(a)
         c.hosts = self._hosts
+        loop, pushed = asyncio.get_running_loop(), [0.0]
+
+        def saved(url: str, status: Optional[str]) -> None:   # each stored page, at most every 2 s: the page's
+            if time.time() - pushed[0] >= 2:                   # scraper counts and TEXT badges move as it works,
+                pushed[0] = time.time()                        # not once per batch of 25
+                loop.create_task(event_bus.publish("news", {"extracted": 1}))
+        c.on_save = saved
         try:
             await c.run(urls)
         finally:

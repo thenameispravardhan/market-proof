@@ -79,7 +79,7 @@ class NewsSettings(BaseModel):
 
 def _row(n: NewsItem) -> dict:
     iso = lambda d: d.replace(tzinfo=timezone.utc).isoformat() if d else None   # noqa: E731 (stored naive UTC)
-    return {"id": n.id, "url": n.url, "source": n.source, "title": n.title, "summary": n.summary,
+    return {"id": n.id, "url": n.url, "source": n.source, "feed": n.feed, "title": n.title, "summary": n.summary,
             "published_at": iso(n.published_at), "seen_at": iso(n.seen_at), **nt.tag(n.title, n.summary)}
 
 
@@ -302,14 +302,14 @@ def _pct(xs: list[float]) -> dict:
 
 def _lags(db: Session) -> dict:
     """Detection lag = seen_at - published_at, per source and overall, for headlines seen in the last 24 h.
-    A source's first poll is left out: those stories were already in the feed, so their lag only says when
-    monitoring started."""
+    A feed's first poll is left out: those stories were already in the feed, so their lag only says when
+    monitoring started (or when a source moved to a new feed URL)."""
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    first = dict(db.execute(select(NewsItem.source, func.min(NewsItem.seen_at)).group_by(NewsItem.source)).all())
+    first = dict(db.execute(select(NewsItem.feed, func.min(NewsItem.seen_at)).group_by(NewsItem.feed)).all())
     per: dict[str, list[float]] = {}
-    for src, pub, seen in db.execute(select(NewsItem.source, NewsItem.published_at, NewsItem.seen_at)
-                                     .where(NewsItem.seen_at >= now - timedelta(hours=24), NewsItem.published_at.is_not(None))):
-        if seen <= first[src] + timedelta(seconds=120):
+    for src, feed, pub, seen in db.execute(select(NewsItem.source, NewsItem.feed, NewsItem.published_at, NewsItem.seen_at)
+                                           .where(NewsItem.seen_at >= now - timedelta(hours=24), NewsItem.published_at.is_not(None))):
+        if seen <= first[feed] + timedelta(seconds=120):
             continue
         d = (seen - pub).total_seconds()
         if 0 <= d <= 24 * 3600:              # a future date or a re-dated old story says nothing about our speed

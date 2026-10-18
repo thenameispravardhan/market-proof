@@ -199,6 +199,7 @@ class Crawler:
         self.handled = 0
         self.llm_calls = 0
         self.wake = asyncio.Event()
+        self.on_save = None                  # called with (url, status) after each page is stored
         self.proxy = None                    # chosen by pick_proxy(); None = direct (or HTTPS_PROXY from env)
         self.client = self._client(None)
         self.browser = None
@@ -257,6 +258,7 @@ class Crawler:
         if "text" not in {r[1] for r in self.db.execute("PRAGMA table_info(assets)")}:
             self.db.execute("ALTER TABLE assets ADD COLUMN text TEXT")
         self.db.execute("CREATE INDEX IF NOT EXISTS pages_digest ON pages(digest)")
+        self.db.execute("CREATE INDEX IF NOT EXISTS pages_fetched ON pages(fetched)")   # the News page's 24 h stats
 
     def ensure_pool(self):
         if self.pool is None:
@@ -310,6 +312,8 @@ class Crawler:
         # ponytail: append-only, one row per outcome; prune with DELETE FROM events WHERE t < ? if it grows
         self.db.execute("INSERT INTO events VALUES(?,?,?,?,?)", (cols["fetched"], urlsplit(url).netloc,
                         cols.get("status"), cols.get("http"), cols.get("error")))
+        if self.on_save:
+            self.on_save(url, cols.get("status"))
 
     # ---- politeness ----
     def host(self, url):
