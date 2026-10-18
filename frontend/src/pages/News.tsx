@@ -604,8 +604,7 @@ export default function News() {
                       onClick={() => setOpen(open === i.id ? null : i.id)} />
                     <div className="news-tags">
                       {(i.tickers ?? []).map((sym) => (
-                        <Ticker key={sym} sym={sym} at={when(i)} on={stockPick === sym} hot={breaking.get(sym)?.size}
-                          onPick={() => setStockPick(stockPick === sym ? null : sym)} />
+                        <Ticker key={sym} sym={sym} at={when(i)} on={stockPick === sym} hot={breaking.get(sym)?.size} />
                       ))}
                       {reactions[i.id]?.traded && <ReactionBadge rx={reactions[i.id]} />}
                       {(i.tags ?? []).slice(0, 2).map((k) => <span key={k} className={`news-kind k-${k}`} title="Keyword rules on the headline, not AI">{kindLabel.get(k) ?? k}</span>)}
@@ -775,16 +774,14 @@ function StockLinks({ item }: { item: Item }) {
   );
 }
 
-/** A stock the server found in the headline: click for only its news, ↗ for its chart at the story's time. "hot":
- *  the outlets naming it right now, when it is breaking. */
-function Ticker({ sym, at, on, hot, onPick }: { sym: string; at: number; on: boolean; hot?: number; onPick: () => void }) {
+/** A stock the server found in the headline: opens its chart at the story's time. "hot": the outlets naming it
+ *  right now, when it is breaking. */
+function Ticker({ sym, at, on, hot }: { sym: string; at: number; on: boolean; hot?: number }) {
   const name = tickerName(sym);
   return (
-    <span className={`news-tk${on ? " on" : ""}${hot ? " hot" : ""}`} title={hot ? `Breaking: ${hot} outlets naming it right now` : undefined}>
-      <button type="button" onClick={onPick} title={on ? "Show every stock again" : `Only ${name}'s news`}>{name}</button>
-      <a href={chartHref(sym, new Date(at).toISOString())} target="_blank" rel="noopener noreferrer"
-        title={`${name} chart at ${ist(at)} IST`} aria-label={`${name} chart`}>↗</a>
-    </span>
+    <a className={`news-tk${on ? " on" : ""}${hot ? " hot" : ""}`} href={chartHref(sym, new Date(at).toISOString())}
+      target="_blank" rel="noopener noreferrer" aria-label={`${name} chart`}
+      title={`${name} chart at ${ist(at)} IST${hot ? ` · breaking: ${hot} outlets naming it right now` : ""}`}>{name} ↗</a>
   );
 }
 
