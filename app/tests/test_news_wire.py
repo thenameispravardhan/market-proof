@@ -99,6 +99,22 @@ def test_fetch_stores_once_uses_conditional_get_and_respects_refusals(isolated_d
     assert len(seen) == n                                                                     # paused: no request
 
 
+def test_a_whole_site_sitemap_keeps_only_the_sections_its_feed_names(isolated_db, db_session):
+    url = lambda path, title: (f'<url><loc>https://p.example{path}</loc><news:news><news:title>{title}</news:title>'   # noqa: E731
+                               '<news:publication_date>2026-10-18T09:00:00+05:30</news:publication_date></news:news></url>')
+    sm = lambda *urls: ('<urlset xmlns:news="http://www.google.com/schemas/sitemap-news/0.9">'   # noqa: E731
+                        + "".join(urls) + "</urlset>").encode()
+    f = {"source": "Test", "url": "https://p.example/sitemap.xml", "paths": ("/markets/", "/industry/")}
+    w = _wire(lambda req: httpx.Response(200, content=sm(url("/markets/stocks/a", "TCS Q2 profit up"),
+                                                         url("/astrology/b", "Horoscope today"))))
+    w.state[f["url"]] = nw.FeedState()
+    assert asyncio.run(w.fetch(f, SETTINGS)) == 1
+    assert [r.title for r in db_session.query(NewsItem)] == ["TCS Q2 profit up"]
+    w._client = httpx.AsyncClient(transport=httpx.MockTransport(lambda req: httpx.Response(200, content=sm(url("/sports/c", "Match")))))
+    w._failed(w.state[f["url"]], 500, "earlier")                             # one miss on record
+    assert asyncio.run(w.fetch(f, SETTINGS)) == 0 and w.state[f["url"]].fails == 0   # none in its sections: no failure
+
+
 def test_a_retitled_story_is_kept_as_an_update_and_nothing_is_pruned_at_zero(isolated_db, db_session):
     item = lambda t: f'<rss><channel><item><title>{t}</title><link>https://pub.example/q2</link></item></channel></rss>'.encode()   # noqa: E731
     w = nw.NewsWire()
@@ -239,7 +255,13 @@ def test_full_text_extraction_through_the_scraper(client, isolated_db, db_sessio
     db_session.commit()
     s = {**nw.DEFAULTS, "enabled": True, "extract": True}
     assert set(nw.news_wire.pending(s)) == {base + "/old", base + "/private/x", base + "/paid"}
-    assert asyncio.run(nw.news_wire.extract(s)) == 3
+    q = event_bus.subscribe("news")
+    try:
+        assert asyncio.run(nw.news_wire.extract(s)) == 3
+        sent = [q.get_nowait().payload for _ in range(q.qsize())]
+    finally:
+        event_bus.unsubscribe("news", q)
+    assert sent[0] == {"extracted": 1} and sent[-1] == {"extracted": 3}      # pushed as pages land, then the batch
     assert nw.news_wire.pending(s) == []                                     # nothing left: nothing refetched
 
     art = client.get("/api/news/article", params={"url": base + "/old"}).json()   # followed the 301 to /story

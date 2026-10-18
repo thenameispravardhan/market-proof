@@ -14,7 +14,7 @@ import { Check, Modal, Num, Row, Section, Sel } from "../components/trade/chartU
 
 interface Extract { status: string | null; chars: number; error: string | null; fetched?: number | null }
 interface Lag { p50: number | null; p90: number | null; n: number }
-interface Item { id: number; url: string; source: string; title: string; summary: string | null; published_at: string | null; seen_at: string; extract?: Extract | null;
+interface Item { id: number; url: string; source: string; feed?: string; title: string; summary: string | null; published_at: string | null; seen_at: string; extract?: Extract | null;
   tickers?: string[]; tags?: string[] }
 interface Article { status: string; error?: string | null; title?: string | null; date?: string | null; text?: string; words?: number;
   meta?: Record<string, unknown>; tables?: (string[][] | { caption: string; rows: string[][] })[]; images?: string[] }
@@ -78,9 +78,9 @@ function dur(sec: number | null | undefined): string {
   return sec < 60 ? `${Math.round(sec)}s` : sec < 3600 ? `${Math.round(sec / 60)}m` : `${(sec / 3600).toFixed(1)}h`;
 }
 /** Detection lag of one headline: published -> first seen. null when the feed gives no time or a future one, or
- *  when it came in its source's first poll (already in the feed: that says when monitoring started, not our speed). */
+ *  when it came in its feed's first poll (already in the feed: that says when monitoring started, not our speed). */
 function lagOf(i: Item, firstSeen: Map<string, number>): number | null {
-  if (!i.published_at || Date.parse(i.seen_at) <= (firstSeen.get(i.source) ?? 0) + 120_000) return null;
+  if (!i.published_at || Date.parse(i.seen_at) <= (firstSeen.get(i.feed ?? i.source) ?? 0) + 120_000) return null;
   const d = (Date.parse(i.seen_at) - Date.parse(i.published_at)) / 1000;
   return d >= 0 && d < 86400 ? d : null;
 }
@@ -435,9 +435,9 @@ export default function News() {
     }
     return [...c.entries()].filter(([, n]) => n >= 2).sort((a, b) => b[1] - a[1]).slice(0, 14);
   }, [items]);
-  const firstSeen = useMemo(() => {        // each source's first poll (its backlog): no lag chip
+  const firstSeen = useMemo(() => {        // each feed's first poll (its backlog): no lag chip
     const m = new Map<string, number>();
-    for (const i of items) { const t = Date.parse(i.seen_at); if (!m.has(i.source) || t < m.get(i.source)!) m.set(i.source, t); }
+    for (const i of items) { const k = i.feed ?? i.source, t = Date.parse(i.seen_at); if (!m.has(k) || t < m.get(k)!) m.set(k, t); }
     return m;
   }, [items]);
   const lastHour = useMemo(() => items.filter((i) => when(i) >= Date.now() - 3600_000).length, [items]);
