@@ -340,8 +340,9 @@ KINDS: list[tuple[str, str, re.Pattern]] = [
         r"\bpromoters?\s+(?:sells?|sold|buys?|bought|pledges?|offloads?|trims?|raises?|hikes?)\b",
         r"\bsells?\s+(?:its\s+)?(?:business|unit|division|arm|subsidiary)\b")),
     ("actions", "Corp action", _any(
-        r"\b(?:dividends?|buy[- ]?backs?|bonus|stock split|share split|splits?|sub-?division|record date|ex[- ]?date|"
-        r"ex[- ]?dividend|rights issue|rights entitlement|face value)\b")),
+        r"\b(?:dividends?|buy[- ]?backs?|bonus (?:issue|shares?|ratio)|stock split|share split|splits?|sub-?division|"
+        r"record date|ex[- ]?date|ex[- ]?dividend|rights issue|rights entitlement|face value)\b",
+        r"\b\d+\s*:\s*\d+\s+bonus\b")),                  # not a shop's "exchange bonus" or a Diwali bonus
     ("ipo", "IPO", _any(
         r"\b(?:ipos?|listings?|debuts?|debuted|gmp|grey market|price band|subscribed|oversubscribed|subscription|"
         r"allotment status|listing gains?)\b", r"\banchor\s+(?:book|investors?|round)\b", r"\blists?\s+(?:at|on)\b")),
@@ -371,9 +372,11 @@ KINDS: list[tuple[str, str, re.Pattern]] = [
     ("macro", "Macro", _any(
         r"\b(?:rbi|repo rate|reverse repo|crr|slr|mpc|monetary policy|inflation|cpi|wpi|gdp|iip|pmi|fiscal deficit|"
         r"trade deficit|current account|forex reserves?|rupee|dollar index|bond yields?|g-?secs?|treasury yields?|fed|"
-        r"fomc|powell|ecb|boj|crude|brent|oil prices|opec|gold prices|silver prices|budget|gst council|"
+        r"fomc|powell|ecb|boj|crude|brent|oil prices|opec|gold prices|silver prices|gst council|"
         r"gst collections?|tax collections?|monsoon|unemployment|jobs data|payrolls|recession|economy|"
         r"interest rates?)\b", r"\brate\s+(?:cut|hike)s?\b",
+        # the Union Budget, not a film's or a household's
+        r"\b(?:union|interim|annual|state|federal)\s+budget\b|\bbudget\s+(?:20\d\d|session|deficit|speech|estimates?)\b",
         # trade tariffs; a telecom or power "tariff hike" is a price, not macro
         r"(?<!raises )(?<!raised )(?<!hikes )(?<!hiked )(?<!mobile )(?<!telecom )(?<!power )(?<!electricity )"
         r"(?<!data )\btariffs?\b(?!\s+(?:hikes?|plans?|revisions?|cuts?))")),

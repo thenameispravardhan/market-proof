@@ -275,6 +275,26 @@ describe("News page: stocks, stories, kinds and keys", () => {
     expect(within(screen.getByText(/300 points lower/).closest("article")!).getByRole("button", { name: /1 earlier/ })).toBeTruthy();
   });
 
+  it("Market news only hides headlines that name no stock and no news type, and is remembered", async () => {
+    const MIX = [
+      mk(21, "Moneycontrol", "India vs West Indies 5th T20I: live score", 12),
+      mk(22, "Moneycontrol", "TCS bags $1 billion order from UK insurer", 8, [TCS], ["orders"]),
+      mk(23, "Mint", "Sensex ends 300 points higher", 4, [], ["market"]),
+    ];
+    const f = globalThis.fetch as unknown as (u: RequestInfo | URL, i?: RequestInit) => Promise<Response>;
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => (String(input).includes("/api/news/items")
+      ? json({ items: String(input).includes("since_id") ? [] : MIX, max_id: 23 }) : f(input, init))) as unknown as typeof fetch;
+    render(<News />);
+    await screen.findByText(/T20I/);
+    expect(screen.getByRole("button", { name: "Moneycontrol 2" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("switch", { name: /Market news only/ }));
+    expect(screen.queryByText(/T20I/)).toBeNull();
+    expect(screen.getByText(/TCS bags/)).toBeTruthy();
+    expect(screen.getByText(/Sensex ends/)).toBeTruthy();                                 // a news type, no stock: kept
+    expect(screen.getByRole("button", { name: "Moneycontrol 1" })).toBeTruthy();           // the chip counts what is listed
+    expect(JSON.parse(localStorage.getItem("news:prefs") || "{}").marketOnly).toBe(true);
+  });
+
   it("ranks the stocks in the news by stories, with their day's move, and filters the list by one", async () => {
     render(<News />);
     const panel = await screen.findByTestId("news-stocks-panel");

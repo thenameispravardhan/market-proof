@@ -154,6 +154,10 @@ def test_an_everyday_word_alias_opening_a_sentence_in_prose_names_no_company(see
     ("SEBI bars promoters; penalty of ₹5 crore", ["legal"]),
     ("US imposes 25% tariff on Indian goods", ["macro"]),
     ("Jio raises tariff by 15%", []),                                                # a telecom tariff is no macro
+    ("Yash confirms Rs 4,000 crore budget for Ramayana", []),                        # a film's budget
+    ("Budget 2027: what changes for salaried taxpayers", ["macro"]),
+    ("iPhone 17 price drops: exchange bonus and more", []),                          # a shop's bonus
+    ("Board recommends 1:1 bonus; record date soon", ["actions"]),
     ("Nifty hits record high; FIIs buy ₹2,000 crore", ["market"]),
 ])
 def test_kinds(title, want):

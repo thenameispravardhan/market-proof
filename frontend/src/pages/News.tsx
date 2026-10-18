@@ -36,7 +36,8 @@ interface ExtractStats { handed: number; by_status: Record<string, number>; with
   hosts?: HostStat[]; requests?: { "1h": number; "24h": number; refused_24h: number } }
 interface Status { settings: Settings; sources: SourceRow[]; known_sources: string[]; extract?: ExtractStats; lag?: Lag & { fastest: string | null }; collector: { polls: number; last_poll_at: number | null; last_poll_ms: number | null };
   watch_stocks?: Record<string, string[]>; kinds?: [string, string][]; source_groups?: [string, string[]][] }
-interface Prefs { notify: boolean; sound: boolean; compact: boolean; summaries: boolean; window: number; group: boolean; threads: boolean; sort: "latest" | "top" }
+interface Prefs { notify: boolean; sound: boolean; compact: boolean; summaries: boolean; window: number; group: boolean; threads: boolean;
+  marketOnly: boolean; sort: "latest" | "top" }
 /** A list row: a story (its reports from several outlets) and, with Prefs.threads, its stock's earlier stories. */
 interface Row { lead: Item; story: Item[]; earlier: Item[] }
 /** How a story's stock moved since it broke (/api/news/reaction): from the last whole minute before it. */
@@ -47,7 +48,7 @@ interface StockRow { sym: string; stories: Set<number>; sources: Set<string>; la
 
 const WINDOWS: { v: number; l: string }[] = [{ v: 1, l: "1h" }, { v: 6, l: "6h" }, { v: 24, l: "24h" }, { v: 168, l: "7d" }, { v: 0, l: "All" }];
 const PREFS_KEY = "news:prefs";
-const DEFAULT_PREFS: Prefs = { notify: false, sound: false, compact: false, summaries: true, window: 24, group: true, threads: true, sort: "latest" };
+const DEFAULT_PREFS: Prefs = { notify: false, sound: false, compact: false, summaries: true, window: 24, group: true, threads: true, marketOnly: false, sort: "latest" };
 const SEEN_KEY = "news:lastSeen";           // the newest headline id this browser has had on screen
 const KEYS: [string, string][] = [["j / k", "next / previous story"], ["o or Enter", "open the article"], ["t", "read the full text"],
   ["e", "show the other sources"], ["c", "chart the stock"], ["/", "search"], ["Esc", "leave the list"], ["?", "this help"]];
@@ -63,6 +64,9 @@ function when(i: Item): number {
   const seen = Date.parse(i.seen_at), pub = i.published_at ? Date.parse(i.published_at) : NaN;
   return pub <= seen ? pub : seen;
 }
+/** Market news: names a listed stock or a news type. Cricket, film and city stories name neither (54% of a day's
+ *  headlines on 2026-10-18); "Market news only" hides them from the list, never from the store. */
+const isMarket = (i: Item) => !!i.tickers?.length || !!i.tags?.length;
 function ago(ms: number): string {
   const s = Math.max(0, (Date.now() - ms) / 1000);
   return s < 60 ? `${s | 0}s` : s < 3600 ? `${(s / 60) | 0}m` : s < 86400 ? `${(s / 3600) | 0}h` : `${(s / 86400) | 0}d`;
@@ -281,13 +285,14 @@ export default function News() {
         && (deepItems !== null || !ql || `${i.title} ${i.summary ?? ""}`.toLowerCase().includes(ql))
         && !(mutedRe && mutedRe.test(i.title))
         && (!watchOnly || isHit(i))
+        && (!prefs.marketOnly || isMarket(i))
         && (!kindPick.size || !!i.tags?.some((k) => kindPick.has(k)))
         && (!stockPick || !!i.tickers?.includes(stockPick))
         && (!multiOnly || (outlets.get(leadOf.get(i.id) ?? -1) ?? 1) >= 2))
       .sort((a, b) => when(b) - when(a))
       .filter((i) => { const k = `${i.source}|${i.title}`; if (seen.has(k)) return false; seen.add(k); return true; })   // same story in two feeds
       .slice(0, 500);
-  }, [items, deepItems, prefs.window, picked, q, mutedRe, watchOnly, isHit, kindPick, stockPick, multiOnly, outlets, leadOf]);
+  }, [items, deepItems, prefs.window, prefs.marketOnly, picked, q, mutedRe, watchOnly, isHit, kindPick, stockPick, multiOnly, outlets, leadOf]);
 
   // The list, one row per story: its earliest headline the filters let through, placed at that time (a later
   // outlet picking the story up adds to its sources instead of pushing it back to the top as news).
@@ -323,12 +328,12 @@ export default function News() {
     const c: Record<string, number> = {}, k: Record<string, number> = {};
     const cut = prefs.window ? Date.now() - prefs.window * 3600_000 : 0;
     for (const i of items) {
-      if ((cut && when(i) < cut) || (mutedRe && mutedRe.test(i.title))) continue;
+      if ((cut && when(i) < cut) || (mutedRe && mutedRe.test(i.title)) || (prefs.marketOnly && !isMarket(i))) continue;
       c[i.source] = (c[i.source] || 0) + 1;
       for (const t of i.tags ?? []) k[t] = (k[t] || 0) + 1;
     }
     return { bySource: c, byKind: k };
-  }, [items, prefs.window, mutedRe]);
+  }, [items, prefs.window, prefs.marketOnly, mutedRe]);
   const kindLabel = useMemo(() => new Map(status?.kinds ?? []), [status?.kinds]);
   const kindOrder = useMemo(() => [...(status?.kinds ?? []).map(([k]) => k), ...Object.keys(counts.byKind)]
     .filter((k, n, a) => counts.byKind[k] && a.indexOf(k) === n), [status?.kinds, counts]);
@@ -556,6 +561,8 @@ export default function News() {
           <button type="button" className={`chip${prefs.sort === "top" ? " on" : ""}`} onClick={() => setPrefs({ sort: "top" })}
             title="Most important first: kind, outlets, stock size, watchlist, breaking; fading over 6 h (hover a ★ for the parts)">Top</button>
         </span>
+        <Toggle size="sm" on={prefs.marketOnly} onChange={(v) => setPrefs({ marketOnly: v })} label="Market news only"
+          title="Only headlines that name a listed stock or a news type (results, orders, deals...). The rest stay stored." />
         <Toggle size="sm" on={watchOnly} onChange={setWatchOnly} label="Watchlist only" disabled={!watch.length} title={watch.length ? "" : "Add watchlist words in Settings"} />
         <Toggle size="sm" on={multiOnly} onChange={setMultiOnly} label="2+ sources" title="Only stories two or more outlets carried" />
         <Toggle size="sm" on={frozen} onChange={(v) => (v ? setFrozen(true) : unfreeze())} label="Pause list" />
