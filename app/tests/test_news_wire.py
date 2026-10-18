@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from urllib.parse import urlsplit
 
 import httpx
@@ -165,7 +166,9 @@ def test_api_settings_items_status_export(client, isolated_db, db_session):
     r = client.put("/api/news/settings", json={**body, "intervals": {"BSE": 60, "Nope": 60}}).json()
     assert r["intervals"] == {"BSE": 60}                                      # unknown source dropped
 
-    w = _wire(lambda req: httpx.Response(200, content=RSS))
+    now = format_datetime(datetime.now(timezone.utc) - timedelta(minutes=5)).encode()   # inside the 48 h export
+    rss = RSS.replace(b"Fri, 16 Oct 2026 09:15:00 +0530", now).replace(b"Fri, 16 Oct 2026 10:00:00 +0530", now)
+    w = _wire(lambda req: httpx.Response(200, content=rss))
     w.state[FEED["url"]] = nw.FeedState()
     asyncio.run(w.fetch(FEED, SETTINGS))
     got = client.get("/api/news/items").json()

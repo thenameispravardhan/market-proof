@@ -128,6 +128,12 @@ def test_the_chart_button_looks_in_the_summary_and_the_article_lead_too(named):
     assert _short(nt.find("Bank stocks fall", None, "ICICI Bank shares fell 3%")) == ["ICICIBANK"]
 
 
+def test_an_everyday_word_alias_opening_a_sentence_in_prose_names_no_company(seed):
+    assert nt.find("SA vs AUS 2nd Test: where to watch", None, "Toss at 9. Persistent rain is forecast.") == []
+    assert nt.stocks("Q2 results", "Persistent selling hit IT stocks") == []
+    assert _short(nt.find("Q2 results", "Shares of Persistent rose 4%.")) == ["PERSISTENT"]   # mid-sentence: the stock
+
+
 @pytest.mark.parametrize("title,want", [
     ("Reliance Q2 net profit rises 10%; board declares dividend", ["results", "actions"]),
     ("Infosys beats estimates; revenue up 5% YoY", ["results"]),
