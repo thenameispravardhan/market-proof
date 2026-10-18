@@ -145,7 +145,7 @@ def test_watchlist_alert_only_for_new_items_after_first_read(isolated_db):
         return httpx.Response(200, content=feeds[0])
 
     async def go():
-        q = event_bus.subscribe("news.alert")
+        q, page = event_bus.subscribe("news.alert"), event_bus.subscribe("news")
         try:
             w = _wire(handler)
             w.state[FEED["url"]] = nw.FeedState()
@@ -156,8 +156,11 @@ def test_watchlist_alert_only_for_new_items_after_first_read(isolated_db):
             await w.fetch(FEED, s)
             evt = await asyncio.wait_for(q.get(), 1)
             assert evt.payload["keywords"] == ["TCS"] and evt.payload["url"] == "https://pub.example/a3"
+            pushed = [page.get_nowait().payload for _ in range(page.qsize())]
+            assert pushed[-1] == {"new": 1}           # the page hears of it from the fetch itself, not the round's end
         finally:
             event_bus.unsubscribe("news.alert", q)
+            event_bus.unsubscribe("news", page)
 
     asyncio.run(go())
 

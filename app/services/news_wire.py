@@ -399,6 +399,8 @@ class NewsWire:
             items = [i for i in items if urlsplit(i["url"]).path.startswith(f["paths"])]
         fresh = self._store(f["source"], url, items)
         st.last_ok, st.last_error, st.fails, st.items, st.last_new = time.time(), None, 0, len(items), len(fresh)
+        if fresh:                                # on screen now, not when the round's slowest feed answers
+            await event_bus.publish("news", {"new": len(fresh)})
         if st.primed and fresh and s["alerts"] and s["watchlist"]:
             await self._alert(fresh, s["watchlist"])
         if st.primed:
