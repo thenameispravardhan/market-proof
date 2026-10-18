@@ -524,6 +524,7 @@ def regressions(base, dead, prx, tmp):
     done = [u for u, s_, _ in rows if s_ == "done"]
     assert len(done) == 1 and [s_ for _, s_, _ in rows].count("duplicate") == 5, rows
     assert all(f == done[0] for _, s_, f in rows if s_ == "duplicate")
+    assert q(ddb, "SELECT COUNT(*) FROM pages WHERE status='duplicate' AND text IS NOT NULL")[0][0] == 5   # copies kept too
     n_ = scrape.normalize                                                      # one row per URL, whatever its spelling
     assert n_("HTTP://Example.COM:80/a?utm_source=x&id=2#top") == n_("http://example.com/a?id=2") == "http://example.com/a?id=2"
 
@@ -946,3 +947,15 @@ def test_rate_limited_site_never_bans_us(tmp_path):
     st = Counter(s for (s,) in rows(db, "SELECT status FROM pages WHERE url LIKE ?", f"{base}/n/%"))
     assert st == {"done": 12}, st                                               # and still collected everything
     assert set(w["pages"].values()) == {1}                                      # each article fetched once across polls
+
+
+def test_paywalled_page_keeps_only_what_it_gives_away():
+    ld = ('{"@type":"NewsArticle","description":"Free summary.","isAccessibleForFree":"False","articleBody":"%s",'
+          '"hasPart":{"@type":"WebPageElement","isAccessibleForFree":false,"cssSelector":".paywall"}}' % ("x" * 6000))
+    paid = "<p>" + "Paid paragraph with the numbers subscribers pay for. " * 20 + "</p>"
+    page = (f'<html><head><script type="application/ld+json">{ld}</script></head><body><article><h1>T</h1>'
+            f'<p>{"Free lead paragraph anyone can read. " * 12}</p>{paid}<div class="story paywall">{paid}</div></article></body></html>')   # Mint: paid text twice
+    free = scrape.parse_page(page.encode(), "https://p.example/a", False)["free"]
+    assert free.startswith("Free summary.") and "Free lead paragraph" in free and "Paid paragraph" not in free, free
+    unmarked = page.replace('class="story paywall"', 'class="story"')      # the paid part is not where the markup says
+    assert scrape.parse_page(unmarked.encode(), "https://p.example/a", False)["free"] == "Free summary."

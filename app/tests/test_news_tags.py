@@ -3,6 +3,8 @@ of news it is; how they reach the API, the CSV export and the watchlist alerts."
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 
 import httpx
 import pytest
@@ -42,6 +44,8 @@ NAMED = [
     ("NSE:ICICIBANK-EQ", "ICICI BANK LTD."), ("BSE:ICICIBKX-X", "ICICI BANK LTD"),       # a big name and a tiny clash
     ("BSE:ACMEONE-X", "ACME HOLDINGS LTD"), ("BSE:ACMETWO-X", "ACME HOLDINGS LIMITED"),  # two unknowns: no one
     ("NSE:JUNKCO-EQ", "JUNKCO-EQ"),                                                    # a name that is only the ticker
+    ("NSE:RAILTEL-EQ", "RailTel Corporation of India L"), ("NSE:HSCL-EQ", "HIMADRI SPECIALITY CHEM L"),   # cut at 30
+    ("BSE:KAMDHENU-B", "Kamdhenu Limited"), ("NSE:858HUDCO29-N2", "8.58% HUDCO 2029"),
 ]
 
 
@@ -111,6 +115,17 @@ def test_names_from_the_fyers_master(named):
     assert s("Acme Holdings shares jump") == []                                       # shared, sizes unknown: no one
     assert s("HDFC Bank Q2") == [] and s("Zomato Q2") == []                           # seed scrips the master dropped
     assert nt.stocks("Reliance Q2")[0] == "NSE:RELIANCE-EQ"                           # NSE listing over BSE's
+    assert s("RailTel Corporation of India Ltd (543265)") == ["RAILTEL"]               # Fyers' "L" is a cut "Ltd"
+    assert s("Himadri Speciality Q2 results") == ["HSCL"]                              # a cut name's start
+    assert s("Kamdhenu Ltd (532741)") == ["KAMDHENU"] and s("Kamdhenu Q2") == []       # "Ltd" makes one word a company
+    assert s("Forex Reserves Fall $8.58 Billion") == []                                # a bond's name starts with no word
+    assert s("Buy ICICI Bank; target of Rs 1500: Reliance Power") == ["ICICIBANK"]      # the broker is not the news
+
+
+def test_the_chart_button_looks_in_the_summary_and_the_article_lead_too(named):
+    got = nt.find("Q2 results: profit rises 12%", "Oil India and ICICI Bank reported", "x " * 1100 + "Reliance Power")
+    assert _short(got) == ["OIL", "ICICIBANK"]                                       # past the lead: peers, not the story
+    assert _short(nt.find("Bank stocks fall", None, "ICICI Bank shares fell 3%")) == ["ICICIBANK"]
 
 
 @pytest.mark.parametrize("title,want", [
@@ -149,11 +164,12 @@ def test_a_broken_index_never_breaks_the_page(monkeypatch):
     assert nt.tag("Reliance Q2") == {"tickers": [], "tags": []}
 
 
-RSS = b"""<?xml version="1.0"?><rss><channel>
+_NOW = format_datetime(datetime.now(timezone.utc) - timedelta(minutes=5))   # inside the export's 48 h on any day
+RSS = f"""<?xml version="1.0"?><rss><channel>
 <item><title>RIL Q2 profit rises 10%; board declares dividend</title><link>https://pub.example/r1</link>
-<pubDate>Fri, 16 Oct 2026 09:15:00 +0530</pubDate></item>
-<item><title>Oil prices surge</title><link>https://pub.example/r2</link><pubDate>Fri, 16 Oct 2026 09:20:00 +0530</pubDate></item>
-</channel></rss>"""
+<pubDate>{_NOW}</pubDate></item>
+<item><title>Oil prices surge</title><link>https://pub.example/r2</link><pubDate>{_NOW}</pubDate></item>
+</channel></rss>""".encode()
 FEED = {"source": "Test", "url": "https://pub.example/rss"}
 
 

@@ -188,22 +188,23 @@ describe("News page: fixes and trader shortcuts", () => {
     expect(screen.getByText("10m")).toBeTruthy();                         // aged from when it was first seen
   });
 
-  it("chart links the stock a headline names (exact tickers only) to the Trade page at the news time", async () => {
+  it("chart asks the server to look for the stocks again and links each to the Trade page at the news time", async () => {
     const f = globalThis.fetch as unknown as (u: RequestInfo | URL, i?: RequestInit) => Promise<Response>;
+    const asked: string[] = [];
     globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      if (!url.includes("/api/search/symbols")) return f(input, init);
-      const q = new URL(url, "http://x").searchParams.get("q");
-      const hit = (s: string, ex = "NSE") => ({ symbol: `${ex}:${s}-EQ`, short_name: s, exchange: ex, segment: "EQ", instrument_type: "EQ", lot_size: 1, tick_size: 0.05, expiry: null, strike: null, underlying: null, display: s });
-      return json({ hits: q === "Reliance" ? [hit("RELIANCE", "BSE"), hit("RELIANCE")] : [hit("WINSOME")] });   // "wins" fuzzy-matches: ignored
+      if (!url.includes("/api/news/stocks")) return f(input, init);
+      asked.push(url);
+      return json({ tickers: ["NSE:RELIANCE-EQ"] });
     }) as unknown as typeof fetch;
     render(<News />);
     await screen.findByText(/wins/);
     fireEvent.click(screen.getAllByRole("button", { name: /chart/ })[0]);
     const box = await screen.findByTestId("news-stocks");
     const links = within(box).getAllByRole("link");
+    expect(asked).toEqual(["/api/news/stocks?id=1"]);
     expect(links.map((a) => a.textContent)).toEqual(["RELIANCE ↗"]);
-    expect(links[0].getAttribute("href")).toContain("#/trade?symbol=NSE%3ARELIANCE-EQ");   // NSE listing preferred
+    expect(links[0].getAttribute("href")).toContain("#/trade?symbol=NSE%3ARELIANCE-EQ");
     expect(links[0].getAttribute("href")).toMatch(/&at=\d+/);
   });
 });
@@ -249,6 +250,31 @@ describe("News page: stocks, stories, kinds and keys", () => {
     }) as unknown as typeof fetch;
   });
 
+  it("folds a stock's updates of one kind, and a re-titled headline, under the newest; nothing is dropped", async () => {
+    const URB = "NSE:URBANCO-EQ";
+    const THREAD = [
+      mk(11, "Moneycontrol", "Urban Company Q2 results: revenue jumps 41%", 50, [URB], ["results"]),
+      mk(12, "Mint", "InstaHelp drags Urban Company profit lower", 40, [URB], ["results"]),
+      mk(13, "Inc42", "Urban Company net loss triples in September quarter", 30, [URB], ["results"]),
+      mk(14, "CNBC-TV18", "Urban Company plans ₹2,500 crore QIP", 20, [URB], ["funding"]),        // another kind: its own row
+      mk(15, "BusinessLine", "Midday movers: PNB, DLF and Urban Company", 25, [URB, "NSE:PNB-EQ"], ["market"]),   // a roundup
+      mk(16, "NDTV", "Sensex flat ahead of results", 15, [], ["market"]),
+      { ...mk(17, "NDTV", "Sensex ends 300 points lower", 5, [], ["market"]), url: "https://x.example/16#update-1" },   // re-titled
+    ];
+    const f = globalThis.fetch as unknown as (u: RequestInfo | URL, i?: RequestInit) => Promise<Response>;
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => (String(input).includes("/api/news/items")
+      ? json({ items: String(input).includes("since_id") ? [] : THREAD, max_id: 17 }) : f(input, init))) as unknown as typeof fetch;
+    render(<News />);
+    await screen.findByText(/net loss triples/);
+    expect([...document.querySelectorAll(".news-title")].map((e) => e.textContent)).toEqual(["Sensex ends 300 points lower",
+      "Urban Company plans ₹2,500 crore QIP", "Midday movers: PNB, DLF and Urban Company", "Urban Company net loss triples in September quarter"]);
+    const row = screen.getByText(/net loss triples/).closest("article")!;
+    fireEvent.click(within(row).getByRole("button", { name: /2 earlier/ }));
+    expect(within(within(row).getByTestId("news-story")).getAllByRole("link").map((a) => a.textContent))
+      .toEqual(["Urban Company Q2 results: revenue jumps 41%", "InstaHelp drags Urban Company profit lower"]);   // oldest first
+    expect(within(screen.getByText(/300 points lower/).closest("article")!).getByRole("button", { name: /1 earlier/ })).toBeTruthy();
+  });
+
   it("ranks the stocks in the news by stories, with their day's move, and filters the list by one", async () => {
     render(<News />);
     const panel = await screen.findByTestId("news-stocks-panel");
@@ -271,7 +297,7 @@ describe("News page: stocks, stories, kinds and keys", () => {
     const tcs = (await screen.findByText(/TCS bags/)).closest("article")!;
     expect(within(tcs).getByLabelText("TCS chart").getAttribute("href")).toMatch(/symbol=NSE%3ATCS-EQ.*&at=\d+/);
     expect(within(tcs).getByText("Orders")).toBeTruthy();
-    expect(within(tcs).queryByRole("button", { name: /chart/ })).toBeNull();          // tagged: no lookup needed
+    expect(within(tcs).getByRole("button", { name: /chart/ })).toBeTruthy();          // tagged: can still look again
     const kinds = screen.getByTestId("news-kinds");
     expect([...kinds.querySelectorAll("button")].map((b) => b.textContent)).toEqual(["Results 2", "Orders 1", "Stake / M&A 1", "Markets 1"]);
     fireEvent.click(within(kinds).getByRole("button", { name: /^Orders/ }));

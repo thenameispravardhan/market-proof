@@ -30,7 +30,8 @@ _MAX_WORDS = 6                                    # the longest run of words tri
 _WORD = re.compile(r"[A-Za-z0-9&]+(?:['’][A-Za-z]+)?")
 _POSSESSIVE = re.compile(r"['’]S$")
 _NONKEY = re.compile(r"[^A-Z0-9&]")
-_LEGAL = re.compile(r"[\s.,-]*\b(?:LIMITED|LTD|PVT|PRIVATE)\b[\s.]*$")
+# Fyers cuts names at 30 characters, so "Ltd" can end as a lone "L" ("RAILTEL CORPORATION OF INDIA L")
+_LEGAL = re.compile(r"[\s.,-]*\b(?:LIMITED|LTD|PVT|PRIVATE|L|LT|LI|LIM|LIMI|LIMIT|LIMITE)\b[\s.]*$")
 _TAIL = re.compile(r"\s*(?:\(INDIA\)|\bOF INDIA|\bINDIA)$")
 _FIRM = re.compile(r"\s*\b(?:COMPANY|CORPORATION|CORP|CO)\.?$")
 _SERIES = {"EQ", "BE", "BZ", "SM", "ST", "A", "B", "T", "X", "XT", "M", "MT", "Z", "ZP"}
@@ -43,9 +44,16 @@ COMMON = {"apex", "bright", "clean", "crest", "crown", "data", "deep", "delta", 
           "global", "horizon", "idea", "natural", "oil", "pace", "par", "premier", "race", "rain", "route",
           "royal", "safe", "shree", "star", "super", "supreme", "take", "total", "unity", "vital", "wealth",
           "worth", "gold", "silver", "power", "energy", "bank", "india", "market", "auto", "metal", "steel"}
-# Phrases that are a company's name with "of India" cut, but mean something else in a headline.
+# Words a name's start needs more than: "Indian Energy" is no company until "Exchange" follows it.
+_PLAIN = {w.upper() for w in COMMON} | {"INDIAN", "NATIONAL", "NEW", "FIRST", "UNITED", "GENERAL", "STATE",
+                                        "CENTRAL", "ASIAN", "INTERNATIONAL", "BHARAT", "HINDUSTAN", "TAMIL", "UTTAR",
+                                        "WEST", "SOUTH", "NORTH", "EAST", "WORLD", "DIGITAL", "SHRI", "SRI", "JAI"}
+# Phrases that are a company's name with "of India" cut, or its start, but mean something else in a headline.
 _GENERIC = ("Central Bank", "New India", "Life Insurance", "General Insurance", "Indian Railway", "Indian Railways",
-            "Indian Bank Association", "State Government", "Union Government", "National Stock")
+            "Indian Bank Association", "State Government", "Union Government", "National Stock", "Dalal Street")
+# A broker call names the broker last: "Buy CEAT; target of Rs 4500: ICICI Securities" is CEAT's news, not ISEC's.
+_BROKER = re.compile(r"^((?:buy|sell|hold|add|reduce|accumulate|neutral)\b[^:;]*[:;]\s*target[^:;]*|subscribe\b[^:;]*)"
+                     r"[:;]\s*[^:;]+$", re.I)
 
 # Media names that are neither the ticker nor the company name, each to its tickers in order of preference: the
 # first one the scrip master lists wins (TATAMOTORS before the 2025 demerger, TMPV after). A name whose tickers are
@@ -59,6 +67,7 @@ ALIASES: dict[str, tuple[str, ...]] = {
     "Reliance Capital": ("RELCAPITAL",), "Reliance Communications": ("RCOM",), "Reliance Home Finance": ("RHFL",),
     "Reliance Group": (), "Reliance ADAG": (), "Anil Ambani Group": (),
     "Jio Financial": ("JIOFIN",), "Jio Financial Services": ("JIOFIN",),
+    "Jio": ("RELIANCE",), "Jio Platforms": ("RELIANCE",), "Reliance Jio": ("RELIANCE",),   # unlisted: its parent
     "Tata Group": (), "Tata Sons": (), "Adani Group": (), "Bajaj Group": (), "Birla Group": (), "Mahindra Group": (),
     "Tata Motors PV": ("TMPV",), "Tata Motors CV": ("TMCV",), "Tata Consumer": ("TATACONSUM",),
     "Tata Chemicals": ("TATACHEM",), "Tata Communications": ("TATACOMM",), "Tata Elxsi": ("TATAELXSI",),
@@ -106,6 +115,8 @@ ALIASES: dict[str, tuple[str, ...]] = {
     "United Spirits": ("UNITDSPR", "MCDOWELL-N"), "United Breweries": ("UBL",), "Jubilant FoodWorks": ("JUBLFOOD",),
     "DMart": ("DMART",), "Avenue Supermarts": ("DMART",), "Zomato": ("ETERNAL", "ZOMATO"), "Eternal": ("ETERNAL",),
     "Swiggy": ("SWIGGY",), "Nykaa": ("NYKAA",), "Naukri": ("NAUKRI",), "Info Edge": ("NAUKRI",),
+    "Groww": ("GROWW",), "Meesho": ("MEESHO",), "Lenskart": ("LENSKART",), "PhysicsWallah": ("PWL",),
+    "Ixigo": ("IXIGO",), "CEAT": ("CEATLTD",), "Urban Company": ("URBANCO",),
     "IndiGo": ("INDIGO",), "InterGlobe": ("INDIGO",), "Page Industries": ("PAGEIND",), "PVR": ("PVRINOX",),
     "PVR Inox": ("PVRINOX",), "Zee": ("ZEEL",), "Zee Entertainment": ("ZEEL",),
     "Sun Pharma": ("SUNPHARMA",), "Cipla": ("CIPLA",), "Lupin": ("LUPIN",), "Biocon": ("BIOCON",),
@@ -225,6 +236,7 @@ def _index() -> _Index:
             listings[inst.short_name] = inst
     ix = _Index(sig=sig)
     cand: dict[str, set[str]] = {}
+    pref: dict[str, set[str]] = {}                   # the first 2+ words of a name: a cut name's start still matches
     for short, inst in listings.items():
         tk = "".join(_words(short))                  # BAJAJ-AUTO -> BAJAJAUTO, M&M stays
         if not tk:
@@ -233,6 +245,9 @@ def _index() -> _Index:
             ix.caps[tk] = inst.symbol
         variants = [w for w in _names(inst.name) if w]
         full = variants[0] if variants else []
+        if len(full) == 1:                           # "Kamdhenu Ltd": the suffix makes a one-word name a company
+            for sfx in ("LTD", "LIMITED"):
+                cand.setdefault(full[0] + sfx, set()).add(short)
         named = len(full) >= 2 and not (full[-1] in _SERIES and "".join(full[:-1]) == tk)
         if named:
             for w in variants:
@@ -240,9 +255,15 @@ def _index() -> _Index:
                     cand.setdefault("".join(w), set()).add(short)
             if _cuts(tk, full):
                 cand.setdefault(tk, set()).add(short)
+            # "Himadri Speciality" for "HIMADRI SPECIALITY CHEM": a start led by a real word ("8.58% HUDCO", "P B M
+            # Polytex", "Shri Krishna ..." are no company's start in a headline)
+            if full[0].isalpha() and full[0] not in _PLAIN and all(len(w) > 1 for w in full[:2]):
+                for n in range(2, len(full)):
+                    if full[n - 1] not in _CONNECT:
+                        pref.setdefault("".join(full[:n]), set()).add(short)
         else:                                        # the seed and old CSVs have no names: any 2+ words that spell it
             cand.setdefault(tk, set()).add(short)
-    for k, shorts in cand.items():
+    for k, shorts in [*pref.items(), *cand.items()]:  # a whole name wins over another name's start
         best = _pick(shorts)
         ix.multi[k] = listings[best].symbol if best else None
     for g in _GENERIC:
@@ -374,7 +395,8 @@ def kinds(title: str) -> list[str]:
 @lru_cache(maxsize=20000)
 def _tag(title: str, summary: str, sig: tuple) -> tuple[tuple[str, ...], tuple[str, ...]]:
     ix = _cache["ix"]
-    found = _scan(title, ix)[:MAX_STOCKS] or _scan(summary, ix)[:2]
+    m = _BROKER.match(title)
+    found = _scan(m[1] if m else title, ix)[:MAX_STOCKS] or _scan(summary, ix)[:2]
     return tuple(found), tuple(kinds(title))
 
 
@@ -392,6 +414,21 @@ def tag(title: str, summary: Optional[str] = None) -> dict[str, list[str]]:
 
 def stocks(title: str, summary: Optional[str] = None) -> list[str]:
     return tag(title, summary)["tickers"]
+
+
+def find(title: str, summary: Optional[str] = None, text: Optional[str] = None) -> list[str]:
+    """The chart button's look again: the headline's stocks, then its summary's, then the article lead's (the
+    first 2,000 characters: later paragraphs name peers and brokers), at most six, by the same rules as tag()."""
+    try:
+        ix = _index()
+        m = _BROKER.match(title)
+        out: list[str] = []
+        for part in (m[1] if m else title, summary or "", (text or "")[:2000]):
+            out += [s for s in _scan(part, ix) if s not in out]
+        return out[:6]
+    except Exception:  # noqa: BLE001
+        log.exception("news_tags.find_failed", title=title[:120])
+        return []
 
 
 def watch_stocks(words: list[str]) -> dict[str, list[str]]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import timedelta
 from urllib.parse import urlsplit
 
 import httpx
@@ -97,6 +98,24 @@ def test_fetch_stores_once_uses_conditional_get_and_respects_refusals(isolated_d
     assert len(seen) == n                                                                     # paused: no request
 
 
+def test_a_retitled_story_is_kept_as_an_update_and_nothing_is_pruned_at_zero(isolated_db, db_session):
+    item = lambda t: f'<rss><channel><item><title>{t}</title><link>https://pub.example/q2</link></item></channel></rss>'.encode()   # noqa: E731
+    w = nw.NewsWire()
+    for title in ("HDFC Bank Q2: NII meets estimates", "HDFC Bank Q2: NII meets estimates.",   # re-punctuated: same
+                  "HDFC Bank Q2: margins at record low", "HDFC Bank Q2: NII meets estimates",   # back again: known
+                  "HDFC Bank Q2: margins at record low"):
+        w._client = httpx.AsyncClient(transport=httpx.MockTransport(lambda req, b=item(title): httpx.Response(200, content=b)))
+        w.state[FEED["url"]] = nw.FeedState()
+        asyncio.run(w.fetch(FEED, SETTINGS))
+    rows = [(r.url, r.title) for r in db_session.query(NewsItem).order_by(NewsItem.id)]
+    assert rows == [("https://pub.example/q2", "HDFC Bank Q2: NII meets estimates"),
+                    ("https://pub.example/q2#update-1", "HDFC Bank Q2: margins at record low")]
+    db_session.query(NewsItem).update({NewsItem.seen_at: NewsItem.seen_at - timedelta(days=400)})
+    db_session.commit()
+    w.prune(SETTINGS)                                                         # retention 0 (the default): keep all
+    assert db_session.query(NewsItem).count() == 2
+
+
 def test_watchlist_alert_only_for_new_items_after_first_read(isolated_db):
     feeds = [RSS]
 
@@ -169,6 +188,10 @@ ARTICLE = f"""<html><head><title>Reliance retail grows</title><meta name="author
 <h1>Reliance retail grows</h1>{PARA * 3}<p>Analysts flagged the zeptoquark margin outlook.</p>
 <table><tr><th>Quarter</th><th>Revenue</th></tr><tr><td>Q2</td><td>1234</td></tr></table>
 <img src="/chart.png" alt="chart"></article></body></html>"""
+PAYWALLED = ('<html><head><script type="application/ld+json">{"@type":"NewsArticle","description":"Free summary.",'
+             '"isAccessibleForFree":false,"hasPart":{"@type":"WebPageElement","isAccessibleForFree":false,'
+             '"cssSelector":".paywall"}}</script></head><body><article><h1>Paid story</h1>'
+             f'<p>{"Free lead paragraph anyone can read. " * 12}</p><div class="paywall">{PARA}</div></article></body></html>')
 
 
 def _site():
@@ -185,6 +208,8 @@ def _site():
                 body, ctype = b"User-agent: *\nDisallow: /private\n", "text/plain"
             elif self.path == "/story":
                 body = ARTICLE.encode()
+            elif self.path == "/paid":
+                body = PAYWALLED.encode()
             elif self.path == "/old":
                 code = 301
             else:
@@ -206,12 +231,12 @@ def test_full_text_extraction_through_the_scraper(client, isolated_db, db_sessio
     base = _site()
     monkeypatch.setattr(nw.news_wire, "scrape_db", tmp_path / "scrape.db")
     monkeypatch.setattr(nw.news_wire, "allow_private", True)
-    for path in ("/old", "/private/x"):          # a redirecting link, and one robots.txt forbids
+    for path in ("/old", "/private/x", "/paid"):   # a redirecting link, one robots.txt forbids, a paywalled one
         db_session.add(NewsItem(url=base + path, source="Mint", feed="f", title=f"headline {path}", summary=None))
     db_session.commit()
     s = {**nw.DEFAULTS, "enabled": True, "extract": True}
-    assert set(nw.news_wire.pending(s)) == {base + "/old", base + "/private/x"}
-    assert asyncio.run(nw.news_wire.extract(s)) == 2
+    assert set(nw.news_wire.pending(s)) == {base + "/old", base + "/private/x", base + "/paid"}
+    assert asyncio.run(nw.news_wire.extract(s)) == 3
     assert nw.news_wire.pending(s) == []                                     # nothing left: nothing refetched
 
     art = client.get("/api/news/article", params={"url": base + "/old"}).json()   # followed the 301 to /story
@@ -220,16 +245,21 @@ def test_full_text_extraction_through_the_scraper(client, isolated_db, db_sessio
     assert art["images"] == [base + "/chart.png"]
     blocked = client.get("/api/news/article", params={"url": base + "/private/x"}).json()
     assert blocked["status"] == "blocked" and blocked["error"] == "robots.txt"
+    paid = client.get("/api/news/article", params={"url": base + "/paid"}).json()   # only what it gives away
+    assert paid["status"] == "paywalled" and paid["text"].startswith("Free summary.") and "Free lead" in paid["text"]
+    assert "Reliance" not in paid["text"], paid
 
     its = {i["url"]: i for i in client.get("/api/news/items").json()["items"]}
     assert its[base + "/old"]["extract"]["status"] == "done" and its[base + "/old"]["extract"]["chars"] > 300
+    found = client.get("/api/news/stocks", params={"id": its[base + "/old"]["id"]}).json()   # the chart button
+    assert found["tickers"] == ["NSE:RELIANCE-EQ"]                          # named only in the article text
     deep = client.get("/api/news/items", params={"q": "zeptoquark", "deep": "true"}).json()["items"]
     assert [i["url"] for i in deep] == [base + "/old"]                       # body-only word found via full text
     assert client.get("/api/news/items", params={"q": "zeptoquark"}).json()["items"] == []
     st = client.get("/api/news/status").json()["extract"]
     assert st["with_text"] == 1 and st["by_status"].get("blocked") == 1
     h = next(x for x in st["hosts"] if x["host"] == urlsplit(base).netloc)      # per-site insights
-    assert h["done"] == 1 and h["failed"] == 1 and h["words_p50"] > 50 and h["req_24h"] >= 3 and h["refused"] == 0, h
+    assert h["done"] == 1 and h["failed"] == 2 and h["words_p50"] > 50 and h["req_24h"] >= 3 and h["refused"] == 0, h   # robots.txt + paywalled
     assert st["requests"]["24h"] >= 3 and st["requests"]["refused_24h"] == 0
 
 

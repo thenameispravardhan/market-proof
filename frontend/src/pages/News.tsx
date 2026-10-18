@@ -9,7 +9,6 @@ import { api } from "../api/client";
 import { chartHref } from "../lib/chartLink";
 import { capTier } from "../lib/marketCap";
 import { clusterStories, STOP, tickerName } from "../lib/newsStories";
-import type { InstrumentHit } from "../types";
 import { Toggle } from "../components/common/Toggle";
 import { Check, Modal, Num, Row, Section, Sel } from "../components/trade/chartUi";
 
@@ -37,7 +36,9 @@ interface ExtractStats { handed: number; by_status: Record<string, number>; with
   hosts?: HostStat[]; requests?: { "1h": number; "24h": number; refused_24h: number } }
 interface Status { settings: Settings; sources: SourceRow[]; known_sources: string[]; extract?: ExtractStats; lag?: Lag & { fastest: string | null }; collector: { polls: number; last_poll_at: number | null; last_poll_ms: number | null };
   watch_stocks?: Record<string, string[]>; kinds?: [string, string][]; source_groups?: [string, string[]][] }
-interface Prefs { notify: boolean; sound: boolean; compact: boolean; summaries: boolean; window: number; group: boolean; sort: "latest" | "top" }
+interface Prefs { notify: boolean; sound: boolean; compact: boolean; summaries: boolean; window: number; group: boolean; threads: boolean; sort: "latest" | "top" }
+/** A list row: a story (its reports from several outlets) and, with Prefs.threads, its stock's earlier stories. */
+interface Row { lead: Item; story: Item[]; earlier: Item[] }
 /** How a story's stock moved since it broke (/api/news/reaction): from the last whole minute before it. */
 interface Reaction { sym: string; t0: number; px0: number; px: number; pct: number; traded: boolean; hi_pct?: number; lo_pct?: number;
   nifty_pct?: number; excess_pct?: number }
@@ -46,7 +47,7 @@ interface StockRow { sym: string; stories: Set<number>; sources: Set<string>; la
 
 const WINDOWS: { v: number; l: string }[] = [{ v: 1, l: "1h" }, { v: 6, l: "6h" }, { v: 24, l: "24h" }, { v: 168, l: "7d" }, { v: 0, l: "All" }];
 const PREFS_KEY = "news:prefs";
-const DEFAULT_PREFS: Prefs = { notify: false, sound: false, compact: false, summaries: true, window: 24, group: true, sort: "latest" };
+const DEFAULT_PREFS: Prefs = { notify: false, sound: false, compact: false, summaries: true, window: 24, group: true, threads: true, sort: "latest" };
 const SEEN_KEY = "news:lastSeen";           // the newest headline id this browser has had on screen
 const KEYS: [string, string][] = [["j / k", "next / previous story"], ["o or Enter", "open the article"], ["t", "read the full text"],
   ["e", "show the other sources"], ["c", "chart the stock"], ["/", "search"], ["Esc", "leave the list"], ["?", "this help"]];
@@ -138,6 +139,7 @@ export default function News() {
   const [stockPick, setStockPick] = useState<string | null>(null);
   const [multiOnly, setMultiOnly] = useState(false);
   const [expanded, setExpanded] = useState<number | null>(null);   // story (its first report's id) showing every source
+  const [thread, setThread] = useState<number | null>(null);       // row showing its stock's earlier stories
   const [cursor, setCursor] = useState<number | null>(null);       // keyboard: the story under the cursor
   const [showKeys, setShowKeys] = useState(false);
   const [quotes, setQuotes] = useState<Record<string, Quote>>({});
@@ -289,17 +291,33 @@ export default function News() {
 
   // The list, one row per story: its earliest headline the filters let through, placed at that time (a later
   // outlet picking the story up adds to its sources instead of pushing it back to the top as news).
+  // A stock's updates, with Prefs.threads: its single-stock stories of one kind (Urban Company's Q2 coverage; its
+  // fundraise is another thread), and a headline the feed re-titled (kept as url#update-N by
+  // app/services/news_wire.py), fold under the newest; "N earlier" lists the rest, oldest first. Roundups naming
+  // several stocks stay rows of their own. Display only: every headline stays stored and listed.
   const rows = useMemo(() => {
-    if (!prefs.group) return shown.map((i) => ({ lead: i, story: [i] }));
-    const first = new Map<number, Item>();
-    for (const i of shown) {
-      const k = leadOf.get(i.id) ?? -i.id;    // a full-text hit the page never loaded: a story of its own
-      const cur = first.get(k);
-      if (!cur || when(i) < when(cur)) first.set(k, i);
+    let rs: Row[];
+    if (!prefs.group) rs = shown.map((i) => ({ lead: i, story: [i], earlier: [] }));
+    else {
+      const first = new Map<number, Item>();
+      for (const i of shown) {
+        const k = leadOf.get(i.id) ?? -i.id;    // a full-text hit the page never loaded: a story of its own
+        const cur = first.get(k);
+        if (!cur || when(i) < when(cur)) first.set(k, i);
+      }
+      rs = [...first.entries()].map(([k, lead]) => ({ lead, story: storyOf.get(k) ?? [lead], earlier: [] as Item[] }))
+        .sort((a, b) => when(b.lead) - when(a.lead));
     }
-    return [...first.entries()].map(([k, lead]) => ({ lead, story: storyOf.get(k) ?? [lead] }))
-      .sort((a, b) => when(b.lead) - when(a.lead));
-  }, [shown, prefs.group, leadOf, storyOf]);
+    if (!prefs.threads || stockPick) return rs;
+    const out: Row[] = [], head = new Map<string, Row>();
+    for (const r of rs) {
+      const keys = [`@${r.lead.url.replace(/#update-\d+$/, "")}`, ...(r.lead.tickers?.length === 1 ? [`$${r.lead.tickers[0]}|${r.lead.tags?.[0] ?? ""}`] : [])];
+      const h = keys.map((k) => head.get(k)).find(Boolean);
+      if (h) h.earlier.unshift(r.lead); else out.push(r);
+      for (const k of keys) if (!head.has(k)) head.set(k, h ?? r);
+    }
+    return out;
+  }, [shown, prefs.group, prefs.threads, stockPick, leadOf, storyOf]);
 
   const counts = useMemo(() => {          // per source and per kind chip: what the list would show (muted words left out)
     const c: Record<string, number> = {}, k: Record<string, number> = {};
@@ -580,7 +598,7 @@ export default function News() {
             {sinceVisit > 0 && <span className="news-unread" data-testid="news-unread">{sinceVisit} new since your last visit</span>}</h3>
           <div className="news-list">
             {list.length === 0 && <p className="empty">{live ? "No headlines match." : "Turn monitoring on to start collecting."}</p>}
-            {list.map(({ lead: i, story }) => {
+            {list.map(({ lead: i, story, earlier }) => {
               const hit = story.some(isHit);
               const n = prefs.group ? outlets.get(leadOf.get(i.id) ?? -1) ?? 1 : 1;    // outlets that carried the story
               const ahead = n > 1 && story[0].id === i.id ? story.find((x) => x.source !== i.source) : undefined;
@@ -613,14 +631,20 @@ export default function News() {
                           onClick={() => setExpanded(expanded === i.id ? null : i.id)} aria-expanded={expanded === i.id} title="The same story from other outlets">
                           {expanded === i.id ? "▾" : "▸"} {n} sources</button>
                       )}
-                      {ahead && <span className="news-first" title={`${i.source} had it first${gap >= 60 ? `, ${dur(gap)} before ${ahead.source}` : ""}`}>1st{gap >= 60 ? ` by ${dur(gap)}` : ""}</span>}
-                      {!i.tickers?.length && (
-                        <button type="button" className="news-tbadge" onClick={() => setStocks(stocks === i.id ? null : i.id)}
-                          title="Find the stock in this headline and open its chart at the news time" aria-expanded={stocks === i.id}>📈 chart</button>
+                      {earlier.length > 0 && (
+                        <button type="button" className={`news-tbadge story${thread === i.id ? " open" : ""}${earlier.some((x) => fresh.has(x.id)) ? " new" : ""}`}
+                          onClick={() => setThread(thread === i.id ? null : i.id)} aria-expanded={thread === i.id}
+                          title="Earlier updates: this stock's earlier stories of this kind, or this headline before the feed re-titled it">
+                          {thread === i.id ? "▾" : "▸"} {earlier.length} earlier</button>
                       )}
+                      {ahead && <span className="news-first" title={`${i.source} had it first${gap >= 60 ? `, ${dur(gap)} before ${ahead.source}` : ""}`}>1st{gap >= 60 ? ` by ${dur(gap)}` : ""}</span>}
+                      <button type="button" className="news-tbadge" onClick={() => setStocks(stocks === i.id ? null : i.id)}
+                        title="Look for the stocks again (headline, summary and article text) and chart them at the news time"
+                        aria-expanded={stocks === i.id}>📈 chart</button>
                     </div>
                     {prefs.summaries && !prefs.compact && i.summary && <div className="news-sum"><Highlight text={i.summary} words={watch} /></div>}
                     {expanded === i.id && <StoryList story={story} lead={i} fresh={fresh} words={watch} />}
+                    {thread === i.id && <StoryList story={[...earlier, i]} lead={i} fresh={fresh} words={watch} />}
                     {open === i.id && <Reader url={i.url} words={watch} />}
                     {stocks === i.id && <StockLinks item={i} />}
                   </div>
@@ -732,51 +756,24 @@ function ScraperInsights({ x }: { x: ExtractStats }) {
   );
 }
 
-/** Words in a headline that may be a ticker: capitalised and not a stop word, alone and paired with the next one
- *  ("Tata Motors" -> TATAMOTORS, "HDFC Bank" -> HDFCBANK, "Reliance" -> RELIANCE). */
-function nameCandidates(title: string): string[] {
-  const words = (title.match(/[A-Za-z][A-Za-z&]*/g) ?? []).map((w) => (/^[A-Z]/.test(w) && !STOP.has(w.toLowerCase()) && w.length >= 2 ? w : ""));
-  const out: string[] = [];
-  const add = (w: string) => { if (w && !out.some((o) => o.toLowerCase() === w.toLowerCase())) out.push(w); };
-  words.forEach((w, k) => { if (w && words[k + 1]) add(`${w} ${words[k + 1]}`); });
-  words.forEach(add);
-  return out.slice(0, 6);
-}
-
-/** Listed stocks a headline names, each a link to its Trade chart centred on the story's time: the market's
- *  reaction to the news, and the order ticket, one click away. Looked up only when asked; only exact tickers
- *  count, so "Board" or "Results" never turn into a random fuzzy match. */
+/** The 📈 button: the server looks for the story's stocks again, in the headline, its summary and the article
+ *  text it stored (app/services/news_tags.py find), each a chip to its chart at the story's time. */
 function StockLinks({ item }: { item: Item }) {
-  const [hits, setHits] = useState<InstrumentHit[] | null>(null);
+  const [syms, setSyms] = useState<string[] | null>(null);
   useEffect(() => {
     let live = true;
-    void Promise.all(nameCandidates(item.title).map((w) => {
-      const n = w.replace(/\s+/g, "").toUpperCase();
-      return api.get<{ hits: InstrumentHit[] }>(`/api/search/symbols?q=${encodeURIComponent(w)}&segment=EQ&limit=4`)
-        .then((r) => (r.hits ?? []).filter((h) => h.short_name.toUpperCase() === n).sort((a, b) => Number(b.exchange === "NSE") - Number(a.exchange === "NSE")).slice(0, 1))
-        .catch(() => [] as InstrumentHit[]);
-    })).then((rs) => {
-      if (!live) return;
-      const seen = new Set<string>();
-      setHits(rs.flat().filter((h) => !seen.has(h.short_name) && !!seen.add(h.short_name)).slice(0, 4));
-    });
+    api.get<{ tickers: string[] }>(`/api/news/stocks?id=${item.id}`)
+      .then((r) => { if (live) setSyms(r.tickers ?? []); }).catch(() => { if (live) setSyms([]); });
     return () => { live = false; };
-  }, [item.title]);
-  if (!hits) return <div className="news-reader text-dim">Looking for the stock…</div>;
-  if (!hits.length) return <div className="news-reader text-dim">No listed stock found in this headline. Search it on the Trade page.</div>;
-  return (
-    <div className="news-words" data-testid="news-stocks">
-      {hits.map((h) => (
-        <a key={h.symbol} className="chip" href={chartHref(h.symbol, new Date(when(item)).toISOString())}
-          target="_blank" rel="noopener noreferrer" title={`${h.display} · chart at ${ist(when(item))} IST`}>{h.short_name} ↗</a>
-      ))}
-    </div>
-  );
+  }, [item.id]);
+  if (!syms) return <div className="news-reader text-dim">Looking for the stock…</div>;
+  if (!syms.length) return <div className="news-reader text-dim">No listed stock in the headline, summary or article text. Search it on the Trade page.</div>;
+  return <div className="news-tags" data-testid="news-stocks">{syms.map((s) => <Ticker key={s} sym={s} at={when(item)} />)}</div>;
 }
 
 /** A stock the server found in the headline: opens its chart at the story's time. "hot": the outlets naming it
  *  right now, when it is breaking. */
-function Ticker({ sym, at, on, hot }: { sym: string; at: number; on: boolean; hot?: number }) {
+function Ticker({ sym, at, on, hot }: { sym: string; at: number; on?: boolean; hot?: number }) {
   const name = tickerName(sym);
   return (
     <a className={`news-tk${on ? " on" : ""}${hot ? " hot" : ""}`} href={chartHref(sym, new Date(at).toISOString())}
@@ -816,8 +813,11 @@ function StoryList({ story, lead, fresh, words }: { story: Item[]; lead: Item; f
 }
 
 function TextBadge({ e, on, open, onClick }: { e?: Extract | null; on: boolean; open: boolean; onClick: () => void }) {
-  if (e?.status === "done" && e.chars > 0)
+  if ((e?.status === "done" || e?.status === "duplicate") && e.chars > 0)
     return <button type="button" className={`news-tbadge ok${open ? " open" : ""}`} onClick={onClick} title="Read the extracted article">{open ? "▾" : "▸"} TEXT</button>;
+  if (e?.status === "paywalled")
+    return <button type="button" className={`news-tbadge part${open ? " open" : ""}`} onClick={onClick}
+      title="Paywalled: read the part the publisher gives away (its summary and opening lines)">{open ? "▾" : "▸"} FREE PART</button>;
   if (e && e.status && !["queued", "deferred"].includes(e.status))
     return <span className="news-tbadge off" title={e.error || e.status}>{e.status}</span>;
   // the scraper works through the last 12 h of headlines; older ones are not fetched, so they get no badge
@@ -830,7 +830,8 @@ function Reader({ url, words }: { url: string; words: string[] }) {
     api.get<Article>(`/api/news/article?url=${encodeURIComponent(url)}`).then(setA).catch(() => setA({ status: "error" }));
   }, [url]);
   if (!a) return <div className="news-reader text-dim">Loading…</div>;
-  if (a.status !== "done") return <div className="news-reader text-dim">No text: {a.error || a.status}</div>;
+  const part = a.status === "paywalled" && !!a.text;
+  if (a.status !== "done" && a.status !== "duplicate" && !part) return <div className="news-reader text-dim">No text: {a.error || a.status}</div>;
   const m = a.meta ?? {};
   const tags = ([] as unknown[]).concat((m.tags as unknown[]) ?? [], (m.categories as unknown[]) ?? [])
     .filter((t): t is string => typeof t === "string").slice(0, 8);
@@ -839,7 +840,7 @@ function Reader({ url, words }: { url: string; words: string[] }) {
   const images = (a.images ?? []).filter((u) => /^https?:\/\//.test(u)).slice(0, 6);
   return (
     <div className="news-reader" data-testid="news-reader">
-      <div className="news-reader-meta">{meta}</div>
+      <div className="news-reader-meta">{part ? "Paywalled · only the part the publisher gives away · " : ""}{meta}</div>
       {tags.length > 0 && <div className="news-words">{tags.map((t) => <span key={t} className="chip">{t}</span>)}</div>}
       <div className="news-reader-text"><Highlight text={a.text ?? ""} words={words} /></div>
       {(a.tables ?? []).slice(0, 2).map((t, k) => {
@@ -921,7 +922,7 @@ function SettingsModal({ initial, status, prefs, setPrefs, onSave, onClose, onCl
       <Row label="Fetch full article text" hint="Your scraper (scraper/scrape.py) opens each new headline's article: text, author, tags, tables, PDF text, image links. Stored in data/scrape.db on the server.">
         <Toggle on={s.extract} onChange={(v) => set({ extract: v })} data-testid="news-extract-toggle" />
       </Row>
-      <Row label="Keep headlines (days)" hint="Older headlines are deleted hourly."><Num value={s.retention_days} min={1} max={90} onChange={(v) => set({ retention_days: v })} ariaLabel="Retention days" /></Row>
+      <Row label="Keep headlines (days)" hint="0 keeps every headline. Otherwise older ones are deleted hourly."><Num value={s.retention_days} min={0} max={90} onChange={(v) => set({ retention_days: v })} ariaLabel="Retention days" /></Row>
       <p className="field-hint">Headlines only (title, link, time, summary), honest user agent, conditional requests. A source that refuses (403/429) or asks for a pause is left alone for that long. Nothing here reaches the analyzer or the AI.</p>
     </Section>
   );
@@ -1008,6 +1009,7 @@ function SettingsModal({ initial, status, prefs, setPrefs, onSave, onClose, onCl
       <Check label="Compact list (titles only)" checked={prefs.compact} onChange={(v) => setPrefs({ compact: v })} />
       <Check label="Show summaries" checked={prefs.summaries} onChange={(v) => setPrefs({ summaries: v })} />
       <Check label="One row per story (the same story from several outlets, grouped)" checked={prefs.group} onChange={(v) => setPrefs({ group: v })} />
+      <Check label="One row per stock's updates (its earlier stories of the same kind and re-titled headlines fold under the newest)" checked={prefs.threads} onChange={(v) => setPrefs({ threads: v })} />
       <Row label="Default time window"><Sel value={prefs.window} options={WINDOWS} onChange={(v) => setPrefs({ window: v })} ariaLabel="Default time window" /></Row>
       <p className="field-hint">Saved in this browser at once; the Save button is for the server settings.</p>
       <p className="field-hint">Keys on the list: {KEYS.map(([k, d]) => `${k} ${d}`).join(" · ")}.</p>
