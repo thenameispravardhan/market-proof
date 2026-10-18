@@ -45,11 +45,13 @@ BURST_QUIET_S = 2 * 3600                         # after a stock's burst alert, 
 # Settings > Sources lists the sources in these groups.
 MARKETS, BUSINESS, OFFICIAL, GLOBAL = "India · markets", "India · business", "Exchanges & regulators", "Global"
 
-# Checked 2026-10-17 with this UA: each returns a live feed and robots.txt allows it. min_s = the feed's own
-# freshness (Moneycontrol's sitemap is cached 30 s with no ETag, so polling it faster only re-downloads it).
+# Checked 2026-10-17 with this UA: each returns a live feed and robots.txt allows it. every = how often the feed is
+# polled unless the operator set an interval for its source: its cache's lifetime allows it (ET's sitemap is cached
+# 4 s and answers 304, Moneycontrol's / Mint's / News18's 30 s, BSE's 60 s at the origin), and the sooner a poll
+# lands after a refresh, the sooner a story is seen. min_s = a floor no interval goes under.
 # `python scripts/check_news_feeds.py` re-checks them all the way the collector reads them.
 DEFAULT_FEEDS: list[dict[str, Any]] = [
-    {"source": "Moneycontrol", "group": MARKETS, "min_s": 30,
+    {"source": "Moneycontrol", "group": MARKETS, "every": 10,
      "url": "https://www.moneycontrol.com/news/news-sitemap.xml"},
     {"source": "NDTV Profit", "url": "https://feeds.feedburner.com/ndtvprofit-latest", "group": MARKETS},
     {"source": "NDTV", "url": "https://feeds.feedburner.com/ndtvnews-top-stories", "group": BUSINESS},
@@ -59,14 +61,15 @@ DEFAULT_FEEDS: list[dict[str, Any]] = [
     # ET and BusinessLine: their Google News sitemaps (listed in robots.txt) show a story ~1.5 min after it is
     # published; their section RSS took 8-14 min (ET) and 3-4 min (measured 2026-10-18). A sitemap is the whole site,
     # so "paths" keeps only these sections. Their other RSS feeds still run: a story they carry first is kept there.
-    {"source": "Economic Times", "group": MARKETS,
+    {"source": "Economic Times", "group": MARKETS, "every": 5,
      "paths": ("/markets/", "/industry/", "/news/economy/", "/news/company/"),
      "url": "https://economictimes.indiatimes.com/etstatic/sitemaps/et/news/sitemap-today.xml"},
-    {"source": "Mint", "url": "https://www.livemint.com/rss/markets", "group": MARKETS},
-    {"source": "BusinessLine", "group": MARKETS,
+    {"source": "Mint", "url": "https://www.livemint.com/rss/markets", "group": MARKETS, "every": 10},
+    {"source": "BusinessLine", "group": MARKETS, "every": 10,
      "paths": ("/markets/", "/companies/", "/economy/", "/money-and-banking/", "/portfolio/"),
      "url": "https://www.thehindubusinessline.com/sitemap/googlenews/all/all.xml"},
-    {"source": "BSE", "url": "https://www.bseindia.com/data/xml/announcements.xml", "ist": True, "group": OFFICIAL},
+    {"source": "BSE", "url": "https://www.bseindia.com/data/xml/announcements.xml", "ist": True, "group": OFFICIAL,
+     "every": 10},
     # Added 2026-10-17, same check. Off until ticked in Settings > Sources (current behaviour stays the default).
     # Business Standard and Firstpost answer this UA with 403, Financial Express's feed redirects to HTML: left out.
     {"source": "ET Markets", "group": MARKETS,
@@ -74,10 +77,11 @@ DEFAULT_FEEDS: list[dict[str, Any]] = [
     {"source": "Times of India", "url": "https://timesofindia.indiatimes.com/rssfeeds/1898055.cms", "group": BUSINESS},
     {"source": "Business Today", "url": "https://www.businesstoday.in/rssfeeds/?id=225346", "group": MARKETS},
     {"source": "The Hindu", "url": "https://www.thehindu.com/business/markets/feeder/default.rss", "group": MARKETS},
-    {"source": "News18", "url": "https://www.news18.com/commonfeeds/v1/eng/rss/business.xml", "group": BUSINESS},
+    {"source": "News18", "url": "https://www.news18.com/commonfeeds/v1/eng/rss/business.xml", "group": BUSINESS,
+     "every": 10},
     {"source": "RBI", "url": "https://www.rbi.org.in/pressreleases_rss.xml", "group": OFFICIAL},
     {"source": "SEBI", "url": "https://www.sebi.gov.in/sebirss.xml", "group": OFFICIAL},   # dates only: no published_at
-    {"source": "Mint Companies", "url": "https://www.livemint.com/rss/companies", "group": BUSINESS},
+    {"source": "Mint Companies", "url": "https://www.livemint.com/rss/companies", "group": BUSINESS, "every": 10},
     {"source": "ET Industry", "group": BUSINESS,
      "url": "https://economictimes.indiatimes.com/industry/rssfeeds/13352306.cms"},
     {"source": "BusinessLine Companies", "group": BUSINESS,
@@ -100,8 +104,8 @@ DEFAULT_FEEDS: list[dict[str, Any]] = [
      "url": "https://www.cnbctv18.com/commonfeeds/v1/cne/rss/economy.xml"},
     {"source": "ET Economy", "group": BUSINESS,
      "url": "https://economictimes.indiatimes.com/news/economy/rssfeeds/1373380680.cms"},
-    {"source": "Mint Economy", "url": "https://www.livemint.com/rss/economy", "group": BUSINESS},
-    {"source": "Mint Money", "url": "https://www.livemint.com/rss/money", "group": BUSINESS},
+    {"source": "Mint Economy", "url": "https://www.livemint.com/rss/economy", "group": BUSINESS, "every": 10},
+    {"source": "Mint Money", "url": "https://www.livemint.com/rss/money", "group": BUSINESS, "every": 10},
     {"source": "BusinessLine Economy", "group": BUSINESS,
      "url": "https://www.thehindubusinessline.com/economy/feeder/default.rss"},
     {"source": "The Hindu Economy", "group": BUSINESS,
@@ -113,7 +117,7 @@ DEFAULT_FEEDS: list[dict[str, Any]] = [
     # "Company: <its |SUBJECT: suffix>"; times are IST without a zone. It timed out from the (US) GitHub runner:
     # NSE throttles foreign IPs, and the analyzer's NSE RSS racer was measured on this file from India.
     {"source": "NSE", "url": "https://nsearchives.nseindia.com/content/RSS/Online_announcements.xml", "ist": True,
-     "subject": True, "group": OFFICIAL},
+     "subject": True, "group": OFFICIAL, "every": 10},
     {"source": "RBI Notifications", "url": "https://www.rbi.org.in/notifications_rss.xml", "group": OFFICIAL},
     {"source": "Federal Reserve", "url": "https://www.federalreserve.gov/feeds/press_all.xml", "group": GLOBAL,
      "min_s": 120},   # a few releases a day; 20 s polls only collected its CDN's stray 404s
@@ -360,7 +364,7 @@ class NewsWire:
 
     async def fetch(self, f: dict[str, Any], s: dict[str, Any]) -> int:
         st, url = self.state[f["url"]], f["url"]
-        st.next_at = time.time() + max(s["intervals"].get(f["source"], s["interval_s"]), f.get("min_s", 0))
+        st.next_at = time.time() + max(s["intervals"].get(f["source"], f.get("every", s["interval_s"])), f.get("min_s", 0))
         hdrs = {k: v for k, v in (("If-None-Match", st.etag), ("If-Modified-Since", st.modified)) if v}
         try:
             async with self.client().stream("GET", url, headers=hdrs) as r:
@@ -386,7 +390,9 @@ class NewsWire:
         if r.status_code != 200:
             return self._failed(st, r.status_code, f"HTTP {r.status_code}")
         st.etag, st.modified = r.headers.get("etag"), r.headers.get("last-modified")
-        items = parse_feed(bytes(body), ist=f.get("ist", False), subject=f.get("subject", False))
+        # Moneycontrol's 500 KB sitemap takes ~25 ms to parse, every 10 s: off the loop the trading path shares
+        items = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: parse_feed(bytes(body), ist=f.get("ist", False), subject=f.get("subject", False)))
         if not items:
             return self._failed(st, 200, "no items (not a feed?)")
         if f.get("paths"):                       # a whole-site sitemap: only the sections the feed names
