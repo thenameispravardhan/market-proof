@@ -489,6 +489,9 @@ export interface PendingOrder {
   status: string;
   /** Quantity already filled (partial fills) — absent from older backends. */
   filled_qty?: number;
+  /** Paper orders: the SL / target armed when it fills. */
+  stop_loss?: number | null;
+  target?: number | null;
   created_at: string | null;
 }
 

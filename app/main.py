@@ -265,6 +265,8 @@ async def lifespan(app: FastAPI):
     from app.api.market import INDICES as _INDICES
 
     from app.algo.ticks import recorder as _get_recorder
+    from app.api import practice as _practice
+    from app.api.ws import watched_symbols as _ws_watched
 
     _tick_recorder = _get_recorder()
     fyers_stream = FyersStreamManager(
@@ -273,7 +275,7 @@ async def lifespan(app: FastAPI):
         # Keep the index symbols streaming all session so the status-bar
         # ticker is sub-second, not REST-polled.
         always_subscribe=[idx["symbol"] for idx in _INDICES],
-        extra_symbols=_tick_recorder.symbols,
+        extra_symbols=lambda: _tick_recorder.symbols() + _ws_watched() + _practice.live_symbols(),
     )
     # Real order flow: every frame for a recorded symbol is classified and
     # kept (app/algo/ticks.py). Only symbols on the recorder's list.

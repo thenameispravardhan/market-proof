@@ -73,6 +73,19 @@ def backend() -> Any:
     return _backend
 
 
+def live_symbols() -> list[str]:
+    """Open practice positions + resting practice orders: kept on the Fyers
+    socket so their P&L, SL / target and limit fills run on live ticks even
+    with no browser open."""
+    from app.db.models import Position
+
+    with session_factory()() as db:
+        out = [s for (s,) in db.query(Position.symbol).filter(Position.quantity != 0)]
+    if _backend is not None:
+        out += [o.symbol for o in _backend.get_pending().values()]
+    return [s.upper() for s in out if s and ":" in s]
+
+
 async def place(*, symbol: str, side: str, quantity: int, order_type: str,
                 limit_price: Optional[float], stop_price: Optional[float],
                 product_type: str, stop_loss: Optional[float] = None,
@@ -97,6 +110,47 @@ async def place(*, symbol: str, side: str, quantity: int, order_type: str,
     return {"ok": r.state != OrderState.REJECTED, "practice": True, "blocked": False,
             "risk_codes": [], "risk_message": "", "broker_order_id": r.broker_order_id,
             "status": r.state.value, "error": r.error}
+
+
+async def modify(oid: str, body: dict[str, Any]) -> dict[str, Any]:
+    """Move a resting practice order (limit / trigger price) and/or the SL /
+    target it arms on fill — the chart's drag-to-modify. Keys absent from
+    `body` are left as they are; a null SL / target clears it."""
+    from app.db.models import Trade
+    from app.execution.base import OrderType
+
+    o = backend()._pending.get(oid)  # noqa: SLF001 — mutate the live resting order in place
+    if o is None:
+        raise HTTPException(status_code=404, detail="That practice order already filled or was cancelled.")
+    px = {k: (float(body[k]) if body.get(k) is not None else None) for k in ("limit_price", "stop_price")}
+    for k, v in px.items():
+        if v is not None and v <= 0:
+            raise HTTPException(status_code=422, detail=f"{k} must be a positive price")
+    if px["limit_price"] is not None:
+        o.limit_price = px["limit_price"]
+    if px["stop_price"] is not None:
+        o.stop_price = px["stop_price"]
+    if "stop_loss" in body or "target" in body:
+        _, sl0, tp0 = PENDING_LEVELS.get(oid, (o.symbol, None, None))
+        sl = body.get("stop_loss", sl0)
+        tp = body.get("target", tp0)
+        sl, tp = (float(sl) if sl is not None else None), (float(tp) if tp is not None else None)
+        if sl is None and tp is None:
+            PENDING_LEVELS.pop(oid, None)
+        else:
+            PENDING_LEVELS[oid] = (o.symbol, sl, tp)
+    shown = o.stop_price if o.order_type in (OrderType.STOP_LOSS, OrderType.STOP_LOSS_MARKET) else o.limit_price
+    with session_factory()() as db:
+        for t in db.query(Trade).filter(Trade.broker_order_id == oid, Trade.status == "placed"):
+            if shown is not None:
+                t.price = shown
+        db.commit()
+    return {"ok": True, "practice": True, "broker_order_id": oid, "message": "modified", "rows_updated": 1}
+
+
+def pending_levels(oid: Optional[str]) -> tuple[Optional[float], Optional[float]]:
+    _, sl, tp = PENDING_LEVELS.get(oid or "", (None, None, None))
+    return sl, tp
 
 
 async def close(symbol: Optional[str] = None) -> list[dict[str, Any]]:

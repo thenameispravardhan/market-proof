@@ -782,9 +782,15 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         per_set_margin = position_margin(legs, u, pf["leverage"])
         per_set_risk = lv["sl_dist"] * legs[0]["per_set"] if lv["sl_dist"] else None
         eq = equity_now()
+        # Losses always come out of the account, compounding or not: once the
+        # cash is gone there is nothing left to trade with (compounding only
+        # decides whether sizing follows the equity curve).
+        cash = min(eq, pf["capital"] + realized)
+        if cash <= 0:
+            return "no_capital"
         sets = units(spec, eq, per_set_margin, per_set_risk)
         if per_set_margin > 0:
-            sets = min(sets, int(max(0.0, eq - used_margin) // per_set_margin))
+            sets = min(sets, int(max(0.0, cash - used_margin) // per_set_margin))
         if sets < 1:
             return "no_capital"
         for l in legs:

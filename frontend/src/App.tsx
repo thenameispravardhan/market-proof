@@ -3,7 +3,7 @@ import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useRouter } from "./router";
 import type { TabKey } from "./router";
 import { useWebSocket } from "./hooks/useWebSocket";
-import { ingestQuote, useLiveQuote } from "./hooks/useQuotes";
+import { ingestQuote, onInterestChange, useLiveQuote, watchedSymbols } from "./hooks/useQuotes";
 import { ingestDepth } from "./hooks/useDepth";
 import { usePanelSizes } from "./hooks/usePanelSizes";
 import {
@@ -249,7 +249,7 @@ function refreshTrading(qc: QueryClient): void {
 export default function App() {
   const [tab, navigate] = useRouter();
   const qc = useQueryClient();
-  const { status } = useWebSocket({
+  const { status, send } = useWebSocket({
     channels: ["signals", "quotes", "depth", "broker", "trades.filled", "trade.executed", "trade.closed", "algo.entry", "algo.exit", "algo.update", "news"],
     onEvent: (msg) => {
       if (msg.channel === "quotes") { ingestQuote(msg.payload); return; }
@@ -267,6 +267,19 @@ export default function App() {
     refreshTrading(qc);
     window.dispatchEvent(new Event("ws:open"));
   }, [status, qc]);
+  // Browser tab title = the page (Trade sets its own: the open chart's symbol + price).
+  useEffect(() => {
+    if (tab !== "trade") document.title = `${TABS.find((t) => t.key === tab)?.label ?? "TradeBot"} · TradeBot`;
+  }, [tab]);
+  // Every symbol on screen stays on the Fyers socket (sent on change and on each reconnect).
+  useEffect(() => {
+    if (status !== "open") return;
+    let t: ReturnType<typeof setTimeout> | undefined;
+    const push = () => { clearTimeout(t); t = setTimeout(() => send({ type: "watch", symbols: watchedSymbols() }), 150); };
+    push();
+    onInterestChange(push);
+    return () => { clearTimeout(t); onInterestChange(null); };
+  }, [status, send]);
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(readSidebarOpen);
   const [skin, setSkin] = useState<AppTheme>(getTheme);
   useEffect(() => {

@@ -55,3 +55,29 @@ async def test_practice_fills_at_touch_and_fires_its_stop(monkeypatch, isolated_
         pos = db.query(Position).filter_by(symbol="NSE:INFY-EQ").one()
         assert pos.quantity == 0 and pos.stop_loss is None      # stopped out, disarmed
     practice._watcher.cancel()
+
+
+def test_practice_limit_order_drags_and_arms_its_levels(client, monkeypatch, isolated_db):
+    """The chart drags a resting paper order: its price moves, and the SL / TP
+    pulled out of its tag show on /pending and arm when it fills."""
+    practice._backend = None
+    practice.PENDING_LEVELS.clear()
+
+    async def fake_quote(*, symbol, db):  # noqa: ARG001
+        await practice.backend()._md.publish(symbol, 100.0)
+        return {"ok": True, "last_price": 100.0}
+
+    monkeypatch.setattr("app.api.orders.get_quote", fake_quote)
+    r = client.post("/api/orders", json={"account_id": -1, "symbol": "NSE:SBIN-EQ", "side": "BUY",
+                                         "quantity": 5, "order_type": "LIMIT", "limit_price": 95}).json()
+    oid = r["broker_order_id"]
+    assert r["status"] == "PENDING"
+    m = client.post("/api/orders/modify", json={"account_id": -1, "broker_order_id": oid,
+                                                "limit_price": 96, "stop_loss": 94, "target": 99})
+    assert m.status_code == 200 and m.json()["ok"]
+    o = client.get("/api/orders/pending?account_id=-1").json()["orders"][0]
+    assert (o["price"], o["stop_loss"], o["target"]) == (96.0, 94.0, 99.0)
+    assert practice.backend()._pending[oid].limit_price == 96.0
+    client.post("/api/orders/modify", json={"account_id": -1, "broker_order_id": oid, "target": None})
+    assert client.get("/api/orders/pending?account_id=-1").json()["orders"][0]["target"] is None
+    assert oid not in practice.PENDING_LEVELS or practice.PENDING_LEVELS[oid][2] is None

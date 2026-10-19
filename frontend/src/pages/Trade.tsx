@@ -44,7 +44,8 @@ import { useLiveQuote } from "../hooks/useQuotes";
 import { tabLocal, useRouter } from "../router";
 import { withWs } from "../workspace";
 import { chartLinkParams, resolveBareHit } from "../lib/chartLink";
-import ChartPanel, { type BrokerLine, type ChartOrder, type ChartPosition, type HostAction } from "../components/trade/ChartPanel";
+import ChartPanel, { type ChartOrder, type ChartPosition, type HostAction } from "../components/trade/ChartPanel";
+import type { ChartWorkingOrder, OrderPatch } from "../components/trade/OrderLayer";
 import Scalper, { splitDrag } from "../components/trade/Scalper";
 import { onPositionTag } from "../components/trade/chartData";
 import { AccountManager, BOTTOM_TABS, LayoutMenu, SymbolDetails, WatchlistTable, cleanWatchItems, useLayouts, type BottomTab, type WatchState } from "../components/trade/TradePanels";
@@ -887,6 +888,12 @@ export default function Trade() {
   const ltp = live?.last_price ?? (quote?.ok ? quote.last_price : null);
   const bid = live?.bid ?? (quote?.ok ? quote.bid : null);
   const ask = live?.ask ?? (quote?.ok ? quote.ask : null);
+  // Browser tab title: the open chart's symbol and price, like TradingView.
+  const titleName = selected?.short_name || selected?.symbol?.split(":").pop();
+  const titlePx = ltp != null ? ` ${ltp.toFixed(2)}` : "";
+  useEffect(() => {
+    document.title = titleName ? `${titleName}${titlePx} · Trade` : "Trade · TradeBot";
+  }, [titleName, titlePx]);
   // Selected option-chain expiry (epoch ts). Reset on each new symbol.
   const [selectedExpiry, setSelectedExpiry] = useState<string | null>(null);
   // The chain is available for index underlyings AND F&O stocks. We fetch
@@ -977,20 +984,23 @@ export default function Trade() {
 
   // Broker state drawn on the chart: open position average + pending
   // order prices for the charted symbol.
-  const brokerLines = useMemo<BrokerLine[]>(() => {
-    if (!selected) return [];
-    const lines: BrokerLine[] = [];
-    for (const o of pending?.orders ?? []) {
-      if (o.symbol === selected.symbol && o.price > 0) {
-        lines.push({
-          price: o.price,
-          title: `${o.side} ${o.quantity} ${o.order_type}`,
-          kind: "order",
-        });
-      }
-    }
-    return lines;
-  }, [selected, pending]);
+  // Working orders per charted symbol: draggable lines (paper ones also carry the SL / TP they arm).
+  const ordersFor = (sym: string): ChartWorkingOrder[] =>
+    (pending?.orders ?? []).filter((o) => o.symbol === sym && o.price > 0 && o.broker_order_id).map((o) => ({
+      id: o.broker_order_id!, side: o.side, qty: o.quantity - (o.filled_qty ?? 0), type: o.order_type.toUpperCase(), price: o.price,
+      sl: o.stop_loss ?? null, tp: o.target ?? null, levels: practice,
+    }));
+  const modifyChartOrder = async (o: ChartWorkingOrder, patch: OrderPatch) => {
+    const body: Record<string, unknown> = { account_id: accountId, broker_order_id: o.id };
+    if (patch.price != null) body[o.type === "SL-M" ? "stop_price" : "limit_price"] = patch.price;
+    if ("sl" in patch) body.stop_loss = patch.sl;
+    if ("tp" in patch) body.target = patch.tp;
+    const r = await fetch("/api/orders/modify", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(detailText(j, r.status));
+    if (j.ok === false) throw new Error(j.message || "the broker refused the change");
+    void qc.invalidateQueries({ queryKey: ["pending-orders"] });
+  };
 
   // The open position on the charted symbol + the exits the trade manager
   // is watching for it: drawn as a live-P&L line with draggable SL / TP.
@@ -1095,6 +1105,17 @@ export default function Trade() {
     // Intraday-only bot — F&O included. Every ticket is MIS/INTRADAY; the
     // backend rejects anything else, so there is nothing per-instrument to set.
     setOrderType(loadUserPrefs().defaultOrderType);
+  };
+
+  // A position / order row's symbol → its chart (looked up for the lot, tick, expiry).
+  const openSymbol = async (sym: string) => {
+    let h: InstrumentHit | undefined;
+    try {
+      const r = await fetch(`/api/search/symbols?q=${encodeURIComponent(sym)}&limit=10`);
+      h = r.ok ? ((await r.json()).hits ?? []).find((x: InstrumentHit) => x.symbol === sym) : undefined;
+    } catch { /* offline: the bare id below still charts */ }
+    const core = sym.split(":").pop() ?? sym;
+    onSelect(h ?? ({ symbol: sym, short_name: core, exchange: sym.split(":")[0], segment: "", instrument_type: "", lot_size: 1, tick_size: 0.05, expiry: null, strike: null, underlying: null, display: core } as InstrumentHit), true, true);
   };
 
   const sp = splits[layout] ?? { x: layout === "3" ? 0.6 : 0.5, y: 0.5 };
@@ -1474,7 +1495,34 @@ export default function Trade() {
             />
           ) : (
             <div className="tv-layout">
-            <div className="tv-topbar"><div className="tv-topslot" ref={setTopSlot} /><span className="seg trade-mode" role="group" aria-label="Trading mode" title="Trade page only: Paper practises at the real Fyers price, Fyers is real money. Independent of the Dashboard switch." data-testid="practice-toggle"><button type="button" className={`btn-sm mode-paper${practice ? " active" : ""}`} aria-pressed={practice} onClick={() => pickPractice(true)}>Paper</button><button type="button" className={`btn-sm mode-fyers${!practice ? " active" : ""}`} aria-pressed={!practice} onClick={() => pickPractice(false)}>Fyers</button></span><LayoutMenu L={L} open={layoutMenuOpen} onOpen={setLayoutMenuOpen} />{settingsEl}</div>
+            <div className="tv-topbar"><div className="tv-topslot" ref={setTopSlot} /><span className="seg trade-mode" role="group" aria-label="Trading mode" title="Trade page only: Paper practises at the real Fyers price, Fyers is real money. Independent of the Dashboard switch." data-testid="practice-toggle"><button type="button" className={`btn-sm mode-paper${practice ? " active" : ""}`} aria-pressed={practice} onClick={() => pickPractice(true)}>Paper</button><button type="button" className={`btn-sm mode-fyers${!practice ? " active" : ""}`} aria-pressed={!practice} onClick={() => pickPractice(false)}>Fyers</button></span><span className="tv-top-tools">
+              <span className="tv-top-pop-wrap" ref={layoutPopRef}>
+                <button type="button" className={`btn-sm${layoutOpen || (!scalper && layout !== "1") ? " active" : ""}`} aria-expanded={layoutOpen} title="Chart layout — several charts at once" onClick={() => setLayoutOpen((o) => !o)} data-testid="rail-layout">
+                  {LAYOUTS.find((l) => l.id === layout)?.icon ?? "▢"} Layout
+                </button>
+                {layoutOpen && (
+                  <div className="tv-rail-pop tv-top-pop" role="menu">
+                    {LAYOUTS.map((l) => (
+                      <button key={l.id} type="button" role="menuitem" className={`tv-layout-btn${!scalper && layout === l.id ? " on" : ""}`} onClick={() => pickLayout(l.id)}>
+                        <span className="ico">{l.icon}</span>
+                        {l.label}
+                      </button>
+                    ))}
+                    <div className="tv-sync">
+                      <div className="chart-menu-head">Sync in layout</div>
+                      {SYNC_LABELS.map(([k, label]) => (
+                        <label key={k} className="tset-row">
+                          <input type="checkbox" checked={!!sync[k]} onChange={(e) => setSync(k, e.target.checked)} data-testid={`sync-${k}`} />
+                          {label}
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </span>
+              <button type="button" className={`btn-sm${scalper ? " active" : ""}`} aria-pressed={scalper} title="Option scalper — CE, underlying and PE charts with one-click buy / sell" onClick={() => { setScalper((v) => !v); setLayoutOpen(false); }} data-testid="rail-scalper">⚡ Scalp</button>
+              <button type="button" className={`btn-sm${dock.includes("alerts") ? " active" : ""}`} aria-pressed={dock.includes("alerts")} title={`Alerts manager and log — click to ${dock.includes("alerts") ? "close" : "open"}`} onClick={() => toggleDock("alerts")} data-testid="rail-alerts">🔔 Alerts</button>
+            </span><LayoutMenu L={L} open={layoutMenuOpen} onOpen={setLayoutMenuOpen} />{settingsEl}</div>
             <div className="tv-chartrow">
             <div className="tv-leftbar" ref={setLeftSlot} />
             <div className={`tv-grid l${maxCell !== null ? "1" : layout}`} style={maxCell !== null ? undefined : gridStyle}>
@@ -1494,7 +1542,9 @@ export default function Trade() {
                         shortName={h.short_name}
                         at={link.current && (link.current.hit.symbol === h.symbol || link.current.hit2?.symbol === h.symbol) ? link.current.at : undefined}
                         entry={link.current?.hit.symbol === h.symbol ? link.current.entry : link.current?.hit2?.symbol === h.symbol ? link.current.entry2 : undefined}
-                        brokerLines={active && tset.showOrders ? brokerLines : undefined}
+                        orders={tset.showOrders ? ordersFor(h.symbol) : undefined}
+                        onModifyOrder={modifyChartOrder}
+                        onCancelOrder={(o) => { if (tset.instant || window.confirm(`Cancel ${o.side} ${o.qty} ${h.short_name} @ ${o.price}?`)) void onCancel(o.id, `${o.side} ${o.qty} ${h.symbol}`); }}
                         onPickPrice={active ? onPickPrice : undefined}
                         position={tset.showPos ? positionFor(h.symbol) : null}
                         onLevels={levelsFor(h.symbol)}
@@ -1571,7 +1621,8 @@ export default function Trade() {
               tab={bottomTab}
               onTab={(t) => openBottom(t)}
               positions={positions}
-              managed={managed}
+              managed={practice ? positions?.map((p) => ({ symbol: p.symbol, stop_loss: p.stop_loss ?? null, target: p.target ?? null, trail_active: false, breakeven_armed: false, exit_failures: 0 })) : managed}
+              onOpenSymbol={(s) => void openSymbol(s)}
               pendingOrders={pending?.orders ?? []}
               onCancel={(id, label) => void onCancel(id, label)}
               cancelBusyId={cancelOrder.isPending ? cancelOrder.variables?.broker_order_id ?? null : null}
@@ -2292,7 +2343,7 @@ export default function Trade() {
         />
       )}
       <nav className="tv-rail" aria-label="Panels">
-        {DOCK.map((d) => (
+        {DOCK.filter((d) => d.id !== "alerts").map((d) => (
           <button
             key={d.id}
             type="button"
@@ -2306,50 +2357,6 @@ export default function Trade() {
             <span className="lbl">{d.short}</span>
           </button>
         ))}
-        <div className="tv-rail-sep" />
-        <div className="tv-rail-pop-wrap" ref={layoutPopRef}>
-          <button
-            type="button"
-            className={`tv-rail-btn${layoutOpen || (!scalper && layout !== "1") ? " on" : ""}`}
-            aria-expanded={layoutOpen}
-            title="Chart layout — several charts at once"
-            onClick={() => setLayoutOpen((o) => !o)}
-            data-testid="rail-layout"
-          >
-            <span className="ico">{LAYOUTS.find((l) => l.id === layout)?.icon ?? "▢"}</span>
-            <span className="lbl">Layout</span>
-          </button>
-          {layoutOpen && (
-            <div className="tv-rail-pop" role="menu">
-              {LAYOUTS.map((l) => (
-                <button key={l.id} type="button" role="menuitem" className={`tv-layout-btn${!scalper && layout === l.id ? " on" : ""}`} onClick={() => pickLayout(l.id)}>
-                  <span className="ico">{l.icon}</span>
-                  {l.label}
-                </button>
-              ))}
-              <div className="tv-sync">
-                <div className="chart-menu-head">Sync in layout</div>
-                {SYNC_LABELS.map(([k, label]) => (
-                  <label key={k} className="tset-row">
-                    <input type="checkbox" checked={!!sync[k]} onChange={(e) => setSync(k, e.target.checked)} data-testid={`sync-${k}`} />
-                    {label}
-                  </label>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-        <button
-          type="button"
-          className={`tv-rail-btn${scalper ? " on" : ""}`}
-          aria-pressed={scalper}
-          title="Option scalper — CE, underlying and PE charts with one-click buy / sell"
-          onClick={() => { setScalper((v) => !v); setLayoutOpen(false); }}
-          data-testid="rail-scalper"
-        >
-          <span className="ico">⚡</span>
-          <span className="lbl">Scalp</span>
-        </button>
       </nav>
     </div>
   );

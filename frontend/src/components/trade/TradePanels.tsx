@@ -598,7 +598,10 @@ export function AccountManager({
   onMaximize,
   maximized,
   onCollapse,
+  onOpenSymbol,
 }: {
+  /** Click a position's symbol: open its chart. */
+  onOpenSymbol?: (symbol: string) => void;
   tab: BottomTab;
   onTab: (t: BottomTab | null) => void;
   positions: Position[] | undefined;
@@ -633,9 +636,11 @@ export function AccountManager({
   const [showClosed, setShowClosed] = useState(false);
   const bookTabs: BottomTab[] = ["orders", "smart", "allpositions", "positions", "trade", "account"];
   const book = useApiJson<BrokerBook>(connected && bookTabs.includes(tab) ? "/api/broker/book" : null, 15000);
-  const trades = useApiJson<TradeRow[]>(["orders", "trades", "account", "smart", "positions"].includes(tab) ? "/api/trades?limit=200" : null, 10000);
+  // Paper (practice) mode reads the practice book; the live one otherwise.
+  const pq = accountId === -1 ? "&practice=1" : "";
+  const trades = useApiJson<TradeRow[]>(["orders", "trades", "account", "smart", "positions"].includes(tab) ? `/api/trades?limit=200${pq}` : null, 10000);
   // Same URL as the chart's trade marks, so the two share one request.
-  const filledTrades = useApiJson<TradeRow[]>(["trades", "account", "positions"].includes(tab) ? "/api/trades?status=filled&limit=1000" : null, 10000);
+  const filledTrades = useApiJson<TradeRow[]>(["trades", "account", "positions"].includes(tab) ? `/api/trades?status=filled&limit=1000${pq}` : null, 10000);
   const funds = useApiJson<{ ok: boolean; available: number | null; reason?: string | null }>(tab === "account" || tab === "positions" ? "/api/market/funds" : null, 30000);
   const fundsFull = useApiJson<FundsResp>(tab === "funds" ? "/api/broker/funds" : null, 30000);
   const holdings = useApiJson<HoldingsResp>(tab === "holdings" || tab === "account" ? "/api/broker/holdings" : null, 60000);
@@ -699,7 +704,8 @@ export function AccountManager({
   const label = (k: BottomTab, l: string) =>
     k === "positions" && open.length ? `${l} (${open.length})` : k === "orders" && workingCount ? `${l} (${workingCount})` : k === "log" && log.length ? `${l} (${log.length})` : l;
   const posCols: Col<Position>[] = [
-    { id: "symbol", label: "Symbol", get: (p) => p.symbol, fixed: true, cls: () => "sym" },
+    { id: "symbol", label: "Symbol", get: (p) => p.symbol, fixed: true, cls: () => "sym",
+      render: (p) => onOpenSymbol ? <button type="button" className="am-link" title="Open chart" onClick={() => onOpenSymbol(p.symbol)} data-testid={`pos-open-${p.symbol}`}>{p.symbol}</button> : p.symbol },
     { id: "side", label: "Buy/Sell", get: (p) => (p.quantity > 0 ? "BUY" : p.quantity < 0 ? "SELL" : "CLOSED"), cls: (p) => (p.quantity > 0 ? "up" : p.quantity < 0 ? "down" : undefined) },
     { id: "product", label: "Product", get: (p) => productOf(p) },
     { id: "qty", label: "Net qty", get: (p) => p.quantity, render: (p) => p.quantity, cls: (p) => (p.quantity > 0 ? "up" : p.quantity < 0 ? "down" : undefined), num: true },

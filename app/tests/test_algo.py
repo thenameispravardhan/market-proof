@@ -735,3 +735,17 @@ def test_overfitting_stats_use_the_full_trial_count():
     assert out["days"] == 60 and out["deflated_sharpe"]["n_trials"] == 40
     assert 0.0 <= out["deflated_sharpe"]["dsr"] <= 1.0
     assert 0.0 <= out["pbo"]["pbo"] <= 1.0 and out["pbo"]["n_configs"] == 12
+
+
+def test_backtest_stops_when_funds_run_out_even_without_compounding():
+    """Srinu 5/24 went to -Rs 2.4 lakh on Rs 1 lakh: with compounding off the
+    losses never left the account, so it kept trading on money it didn't have."""
+    closes = [100, 101, 106, 108, 80, 79] * 600       # each cycle: buy ~106, exit ~80
+    spec = _cross_spec(sizing={"mode": "qty", "value": 100},
+                       portfolio={"capital": 12000, "leverage": 1, "compounding": False})
+    out = engine.run(spec, {"X": bars(closes, spread=0)})
+    cash = 12000.0
+    for t in out["trades"]:
+        assert t["qty"] * t["entry"] <= cash          # never buys with money it doesn't have
+        cash += t["net"]
+    assert cash > 0 and out["stats"]["skipped"]["no_capital"] > 0
