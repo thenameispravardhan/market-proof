@@ -251,6 +251,11 @@ def _text(e: Optional[ET.Element]) -> str:
     return " ".join("".join(e.itertext()).split()) if e is not None else ""
 
 
+_SLUG_UPPER = {"nse", "bse", "ipo", "rbi", "sebi", "gst", "us", "uk", "ai", "fii", "dii", "fpi", "gdp", "cpi", "wpi", "it",
+               "ev", "lic", "sbi", "hdfc", "icici", "tcs", "lt", "itc", "ongc", "ntpc", "bpcl", "hpcl", "irctc", "nifty", "mf"}
+_SLUG_SMALL = {"a", "an", "and", "at", "by", "for", "in", "of", "on", "or", "the", "to", "vs", "with", "from", "over", "as"}
+
+
 def slug_title(url: str) -> str:
     """An English headline from a link's slug: CNBC Awaaz writes in Hindi but
     its URLs summarise the story in English (".../hindustan-zinc-q2-results-
@@ -260,7 +265,12 @@ def slug_title(url: str) -> str:
     slug = re.sub(r"-\d{4,}$", "", slug)                 # the article id
     slug = re.sub(r"-(read|know|see)-(details|more|here)$", "", slug)
     words = slug.replace("-", " ").split()
-    return " ".join(words)[:1].upper() + " ".join(words)[1:] if words else ""
+    # Title Case, so stock names read (and tag) as names: "Hindustan Zinc Q2 Results ..."
+    def case(i: int, w: str) -> str:
+        if w in _SLUG_UPPER or re.fullmatch(r"(q[1-4]|fy\d{2,4}|h[12])", w):
+            return w.upper()
+        return w if i and w in _SLUG_SMALL else w.capitalize()
+    return " ".join(case(i, w) for i, w in enumerate(words))
 
 
 def parse_feed(body: bytes, ist: bool = False, subject: bool = False, slug: bool = False) -> list[dict[str, Any]]:
