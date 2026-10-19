@@ -15,8 +15,8 @@ import { Check, Modal, Num, Row, Section, Sel } from "../components/trade/chartU
 interface Extract { status: string | null; chars: number; error: string | null; fetched?: number | null }
 interface Lag { p50: number | null; p90: number | null; n: number }
 interface Item { id: number; url: string; source: string; feed?: string; title: string; summary: string | null; published_at: string | null; seen_at: string; extract?: Extract | null;
-  tickers?: string[]; tags?: string[] }
-interface Article { status: string; error?: string | null; title?: string | null; date?: string | null; text?: string; words?: number;
+  tickers?: string[]; tags?: string[]; tone?: number }
+interface Article { status: string; error?: string | null; title?: string | null; date?: string | null; text?: string; words?: number; figures?: string[];
   meta?: Record<string, unknown>; tables?: (string[][] | { caption: string; rows: string[][] })[]; images?: string[] }
 interface Feed { source: string; url: string; custom?: boolean }
 interface Settings {
@@ -44,7 +44,7 @@ interface Row { lead: Item; story: Item[]; earlier: Item[] }
 interface Reaction { sym: string; t0: number; px0: number; px: number; pct: number; traded: boolean; hi_pct?: number; lo_pct?: number;
   nifty_pct?: number; excess_pct?: number }
 interface Quote { ltp: number | null; change: number | null; change_pct: number | null }
-interface StockRow { sym: string; stories: Set<number>; sources: Set<string>; last: number; title: string }
+interface StockRow { sym: string; stories: Set<number>; sources: Set<string>; last: number; title: string; pos: number; neg: number }
 
 const WINDOWS: { v: number; l: string }[] = [{ v: 1, l: "1h" }, { v: 6, l: "6h" }, { v: 24, l: "24h" }, { v: 168, l: "7d" }, { v: 0, l: "All" }];
 const PREFS_KEY = "news:prefs";
@@ -142,6 +142,7 @@ export default function News() {
   const [kindPick, setKindPick] = useState<Set<string>>(new Set());
   const [stockPick, setStockPick] = useState<string | null>(null);
   const [multiOnly, setMultiOnly] = useState(false);
+  const [tonePick, setTonePick] = useState(0);      // 1 good news only, -1 bad news only
   const [expanded, setExpanded] = useState<number | null>(null);   // story (its first report's id) showing every source
   const [thread, setThread] = useState<number | null>(null);       // row showing its stock's earlier stories
   const [cursor, setCursor] = useState<number | null>(null);       // keyboard: the story under the cursor
@@ -278,7 +279,7 @@ export default function News() {
   }, [items, mutedRe]);
 
   const section = prefs.section ?? "news";
-  const nFilters = kindPick.size + picked.size + Number(deep) + Number(watchOnly) + Number(multiOnly) + Number(frozen);
+  const nFilters = kindPick.size + picked.size + Number(deep) + Number(watchOnly) + Number(multiOnly) + Number(frozen) + Number(!!tonePick);
   const globalSrc = useMemo(() => new Set(status?.source_groups?.find(([g]) => g === "Global")?.[1] ?? []), [status?.source_groups]);
   const shown = useMemo(() => {
     const cut = prefs.window ? Date.now() - prefs.window * 3600_000 : 0;
@@ -293,11 +294,12 @@ export default function News() {
         && (!prefs.region || prefs.region === "all" || globalSrc.has(i.source) === (prefs.region === "global"))
         && (!kindPick.size || !!i.tags?.some((k) => kindPick.has(k)))
         && (!stockPick || !!i.tickers?.includes(stockPick))
-        && (!multiOnly || (outlets.get(leadOf.get(i.id) ?? -1) ?? 1) >= 2))
+        && (!multiOnly || (outlets.get(leadOf.get(i.id) ?? -1) ?? 1) >= 2)
+        && (!tonePick || i.tone === tonePick))
       .sort((a, b) => when(b) - when(a))
       .filter((i) => { const k = `${i.source}|${i.title}`; if (seen.has(k)) return false; seen.add(k); return true; })   // same story in two feeds
       .slice(0, 500);
-  }, [items, deepItems, prefs.window, prefs.marketOnly, prefs.region, globalSrc, picked, q, mutedRe, watchOnly, isHit, kindPick, stockPick, multiOnly, outlets, leadOf]);
+  }, [items, deepItems, prefs.window, prefs.marketOnly, prefs.region, globalSrc, picked, q, mutedRe, watchOnly, isHit, kindPick, stockPick, multiOnly, tonePick, outlets, leadOf]);
 
   // The list, one row per story: its earliest headline the filters let through, placed at that time (a later
   // outlet picking the story up adds to its sources instead of pushing it back to the top as news).
@@ -351,7 +353,8 @@ export default function News() {
       if ((cut && when(i) < cut) || (mutedRe && mutedRe.test(i.title))) continue;
       for (const sym of i.tickers ?? []) {
         let e = m.get(sym);
-        if (!e) m.set(sym, e = { sym, stories: new Set(), sources: new Set(), last: 0, title: "" });
+        if (!e) m.set(sym, e = { sym, stories: new Set(), sources: new Set(), last: 0, title: "", pos: 0, neg: 0 });
+        if (i.tone && !e.stories.has(leadOf.get(i.id) ?? i.id)) { if (i.tone > 0) e.pos++; else e.neg++; }   // once per story
         e.stories.add(leadOf.get(i.id) ?? i.id);
         e.sources.add(i.source);
         if (when(i) > e.last) { e.last = when(i); e.title = i.title; }
@@ -446,6 +449,12 @@ export default function News() {
     return m;
   }, [items]);
   const lastHour = useMemo(() => items.filter((i) => when(i) >= Date.now() - 3600_000).length, [items]);
+  const mood = useMemo(() => {              // the window's headlines by tone (what the list would show, filters aside)
+    const cut = prefs.window ? Date.now() - prefs.window * 3600_000 : 0;
+    let pos = 0, neg = 0;
+    for (const i of items) if (!cut || when(i) >= cut) { if ((i.tone ?? 0) > 0) pos++; else if ((i.tone ?? 0) < 0) neg++; }
+    return { pos, neg };
+  }, [items, prefs.window]);
 
   const saveSettings = async (s: Settings) => {
     const st = await api.put<Settings>("/api/news/settings", s);
@@ -556,6 +565,9 @@ export default function News() {
             <div className="news-stat" title="Headline seen → article text stored, median"><span>Full texts</span><b>{status.extract?.with_text ?? 0}</b>
               <small>text in {dur(status.extract?.lag?.p50)}</small></div>
           )}
+          <div className="news-stat" title="Headline tone in this window: keyword rules (beats, jumps, wins / falls, misses, penalty...), not AI">
+            <span>Tone</span><b><span className="pos">▲{mood.pos}</span> <span className="neg">▼{mood.neg}</span></b>
+            <small>{mood.pos + mood.neg ? `${Math.round(mood.pos / (mood.pos + mood.neg) * 100)}% positive` : "–"}</small></div>
           <div className="news-stat"><span>Sources up</span><b>{bySource.filter(([, s]) => s.health === "ok").length}/{bySource.filter(([, s]) => s.enabled).length}</b></div>
         </div>
       )}
@@ -572,7 +584,7 @@ export default function News() {
         <span className="seg" role="group" aria-label="Region">
           {([["all", "All"], ["in", "Indian"], ["global", "Global"]] as const).map(([v, l]) => (
             <button key={v} type="button" className={`chip${(prefs.region ?? "all") === v ? " on" : ""}`} onClick={() => setPrefs({ region: v })}
-              title={v === "global" ? "World markets: Fed, CNBC, MarketWatch, BBC, Nikkei, OilPrice" : v === "in" ? "Indian outlets, exchanges and regulators" : "Every source"} data-testid={`news-region-${v}`}>{l}</button>
+              title={v === "global" ? "World markets: Fed, ECB, Bank of England, Bloomberg, FT, CNBC, Guardian, NYT, Investing.com..." : v === "in" ? "Indian outlets, exchanges and regulators" : "Every source"} data-testid={`news-region-${v}`}>{l}</button>
           ))}
         </span>
         <Toggle size="sm" on={prefs.marketOnly} onChange={(v) => setPrefs({ marketOnly: v })} label="Market news only"
@@ -599,6 +611,11 @@ export default function News() {
                 title={settings?.extract ? "Also search the full text the scraper extracted" : "Turn on full text in Settings"} />
               <Toggle size="sm" on={watchOnly} onChange={setWatchOnly} label="Watchlist only" disabled={!watch.length} title={watch.length ? "" : "Add watchlist words in Settings"} />
               <Toggle size="sm" on={multiOnly} onChange={setMultiOnly} label="2+ sources" title="Only stories two or more outlets carried" />
+              <span className="news-seg" role="group" aria-label="Tone" title="Headline tone: keyword rules, not AI">
+                {([[0, "Any tone"], [1, "▲ Positive"], [-1, "▼ Negative"]] as const).map(([v, l]) => (
+                  <button key={v} type="button" className={`chip${tonePick === v ? " on" : ""}`} onClick={() => setTonePick(v)} data-testid={`news-tone-${v}`}>{l}</button>
+                ))}
+              </span>
               <Toggle size="sm" on={frozen} onChange={(v) => (v ? setFrozen(true) : unfreeze())} label="Pause list" />
           </div>
           {kindOrder.length > 0 && (
@@ -660,6 +677,7 @@ export default function News() {
                         <Ticker key={sym} sym={sym} at={when(i)} on={stockPick === sym} hot={breaking.get(sym)?.size} />
                       ))}
                       {reactions[i.id]?.traded && <ReactionBadge rx={reactions[i.id]} />}
+                      {!!i.tone && <span className={`news-tone ${i.tone > 0 ? "pos" : "neg"}`} title="Headline tone: keyword rules, not AI">{i.tone > 0 ? "▲" : "▼"}</span>}
                       {(i.tags ?? []).slice(0, 2).map((k) => <span key={k} className={`news-kind k-${k}`} title="Keyword rules on the headline, not AI">{kindLabel.get(k) ?? k}</span>)}
                       {n > 1 && (
                         <button type="button" className={`news-tbadge story${expanded === i.id ? " open" : ""}${story.some((x) => x.id !== i.id && fresh.has(x.id)) ? " new" : ""}`}
@@ -712,7 +730,7 @@ export default function News() {
               <div className="widget-body">
                 <table className="news-table news-hosts news-stocks"><thead><tr><th>Stock</th>
                   <th title="Stories naming it (one story's reports from several outlets count once)">Stories</th><th title="Outlets">Src</th>
-                  <th title="Latest story">Last</th>{hasQuotes && <th title="Today's change (Fyers)">Today</th>}<th /></tr></thead>
+                  <th title="Stories with a positive / negative headline (keyword rules, not AI)">Tone</th><th title="Latest story">Last</th>{hasQuotes && <th title="Today's change (Fyers)">Today</th>}<th /></tr></thead>
                   <tbody>{stocksInNews.map((s) => {
                     const name = tickerName(s.sym), cp = quotes[s.sym]?.change_pct;
                     return (
@@ -721,7 +739,9 @@ export default function News() {
                           title={stockPick === s.sym ? "Show every stock again" : `Only ${name}'s news`}>{name}</button>
                           {breaking.has(s.sym) && <span className="news-hot" title={`Breaking: ${breaking.get(s.sym)!.size} outlets in the last ${burstM} min`}>
                             🔥{breaking.get(s.sym)!.size}</span>}</td>
-                        <td className="mono">{s.stories.size}</td><td className="mono">{s.sources.size}</td><td className="mono">{ago(s.last)}</td>
+                        <td className="mono">{s.stories.size}</td><td className="mono">{s.sources.size}</td>
+                        <td className="mono">{s.pos ? <span className="pos">▲{s.pos}</span> : null}{s.pos && s.neg ? " " : ""}{s.neg ? <span className="neg">▼{s.neg}</span> : null}{!s.pos && !s.neg ? "–" : ""}</td>
+                        <td className="mono">{ago(s.last)}</td>
                         {hasQuotes && <td className={`mono${cp == null ? "" : cp >= 0 ? " pos" : " neg"}`}>{pct(cp)}</td>}
                         <td><a href={chartHref(s.sym, new Date(s.last).toISOString())} target="_blank" rel="noopener noreferrer"
                           title={`${name} chart at its latest story (${ist(s.last)} IST)`} aria-label={`${name} chart`}>↗</a></td>
@@ -878,6 +898,10 @@ function Reader({ url, words }: { url: string; words: string[] }) {
     <div className="news-reader" data-testid="news-reader">
       <div className="news-reader-meta">{part ? "Paywalled · only the part the publisher gives away · " : ""}{meta}</div>
       {tags.length > 0 && <div className="news-words">{tags.map((t) => <span key={t} className="chip">{t}</span>)}</div>}
+      {!!a.figures?.length && (
+        <div className="news-figures" data-testid="news-figures"><span className="text-dim news-meta" title="Amounts and % moves found in the article text">Key figures</span>
+          {a.figures.map((f) => <span key={f} className="chip">{f}</span>)}</div>
+      )}
       <div className="news-reader-text"><Highlight text={a.text ?? ""} words={words} /></div>
       {(a.tables ?? []).slice(0, 2).map((t, k) => {
         const rows = Array.isArray(t) ? t : t.rows;

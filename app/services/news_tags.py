@@ -396,14 +396,59 @@ def kinds(title: str) -> list[str]:
     return [k for k, _, rx in KINDS if rx.search(title)]
 
 
+_POS = re.compile(
+    r"\b(?:beats?|jumps?|jumped|surges?|surged|soars?|soared|rall(?:y|ies|ied)|gains?|gained|rises?|rose|climbs?|"
+    r"climbed|zooms?|zoomed|rebounds?|rebounded|record high|all[- ]time high|upgrades?|upgraded|outperforms?|bags?|"
+    r"bagged|wins?|won|secures?|secured|doubles?|doubled|robust|strong|bullish|upper circuit|multibagger|boosts?|"
+    r"approves?|approved|approval|expands?|beat estimates|tops? estimates|narrows?|narrowed)\b", re.I)
+_NEG = re.compile(
+    r"\b(?:falls?|fell|drops?|dropped|plunges?|plunged|slumps?|slumped|tumbles?|tumbled|crash(?:es|ed)?|sinks?|sank|"
+    r"slips?|slipped|declines?|declined|misses?|missed|downgrades?|downgraded|underperforms?|loss(?:es)?|widens?|"
+    r"widened|penalty|penalised|penalized|fined|probes?|raids?|raided|fraud|defaults?|defaulted|resigns?|resigned|"
+    r"bearish|lower circuit|sell-?off|warns?|warning|bans?|banned|halts?|halted|lawsuit|weak|cuts? (?:guidance|"
+    r"outlook|forecast|target)|slashes|recovery certificate|notice of demand|attachment)\b", re.I)
+# "loss narrows" is good news, "profit falls" bad: a loss word only counts against when nothing turns it round
+_TURN = re.compile(r"\bloss(?:es)?\s+(?:narrows?|narrowed|shrinks?|cut)\b|\b(?:turns?|swings?) to (?:a )?profit\b", re.I)
+
+
+def tone(title: str) -> int:
+    """+1 good news / -1 bad / 0 neither or mixed: keyword rules on the headline (not AI, no context)."""
+    if _TURN.search(title):
+        return 1
+    d = len(_POS.findall(title)) - len(_NEG.findall(title))
+    return (d > 0) - (d < 0)
+
+
+_FIG = re.compile(
+    r"(?:(?:₹|rs\.?|inr|us\$|\$|usd|€|£)\s?\d[\d,]*(?:\.\d+)?(?:\s?(?:lakh crore|crore|cr|lakh|million|mn|billion|bn|"
+    r"trillion|tn))?|\d[\d,]*(?:\.\d+)?\s?(?:lakh crore|crore|lakh|million|billion|trillion)(?:\s(?:rupees|dollars))?"
+    r"|\d+(?:\.\d+)?\s?(?:%|per ?cent|bps|basis points))", re.I)
+
+
+def figures(text: Optional[str], limit: int = 8) -> list[str]:
+    """Key numbers in an article, each with the few words before it in its sentence: "net profit jumped 54%",
+    "penalty of ₹5 lakh". First mention of each number, in reading order."""
+    out, seen = [], set()
+    for m in _FIG.finditer(text or ""):
+        val = m[0].strip()
+        if val.lower() in seen or not re.search(r"[1-9]", val):
+            continue
+        seen.add(val.lower())
+        before = re.split(r"[.,;:!?\n]\s", text[max(0, m.start() - 80):m.start()])[-1].split()[-4:]
+        out.append(" ".join(before + [val]))
+        if len(out) >= limit:
+            break
+    return out
+
+
 # ---------------------------------------------------------------- public
 
 @lru_cache(maxsize=20000)
-def _tag(title: str, summary: str, sig: tuple) -> tuple[tuple[str, ...], tuple[str, ...]]:
+def _tag(title: str, summary: str, sig: tuple) -> tuple[tuple[str, ...], tuple[str, ...], int]:
     ix = _cache["ix"]
     m = _BROKER.match(title)
     found = _scan(m[1] if m else title, ix)[:MAX_STOCKS] or _scan(_prose(summary), ix)[:2]
-    return tuple(found), tuple(kinds(title))
+    return tuple(found), tuple(kinds(title)), tone(title)
 
 
 def _prose(text: str) -> str:
@@ -415,11 +460,11 @@ def tag(title: str, summary: Optional[str] = None) -> dict[str, list[str]]:
     The summary counts only when the title names no stock (it also names peers), and for at most two. Never raises:
     tags enrich the News page and must not take it down."""
     try:
-        stocks, ks = _tag(title, summary or "", _index().sig)
+        stocks, ks, tn = _tag(title, summary or "", _index().sig)
     except Exception:  # noqa: BLE001
         log.exception("news_tags.failed", title=title[:120])
-        return {"tickers": [], "tags": []}
-    return {"tickers": list(stocks), "tags": list(ks)}
+        return {"tickers": [], "tags": [], "tone": 0}
+    return {"tickers": list(stocks), "tags": list(ks), "tone": tn}
 
 
 def stocks(title: str, summary: Optional[str] = None) -> list[str]:

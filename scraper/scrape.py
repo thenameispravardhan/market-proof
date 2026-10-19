@@ -609,6 +609,13 @@ class Crawler:
         if res["paywalled"]:                 # only the part it gives away, kept apart from text: never an article
             return self.save(url, status="paywalled", meta=dumps({"free": res["free"]}) if res["free"] else None,
                              **blob, **hdr)
+        # A wrapper page (SEBI orders / circulars): the content is the PDF in its <iframe>, the HTML only a title.
+        pdf = embedded_pdf(res["media"]) if len((res["doc"] or {}).get("text") or "") < 400 else None
+        if pdf:
+            text, pmeta = await self.linked_pdf(pdf)
+            if text:
+                res["doc"] = {"title": res["fallback_title"], **(res["doc"] or {}), "text": text, "pdf": pdf,
+                              **({"pdf_meta": pmeta} if pmeta else {})}
         if res["doc"] is None:
             return self.save(url, status="empty", title=res["fallback_title"], **blob, **hdr)
         doc = res["doc"]
@@ -625,6 +632,19 @@ class Crawler:
                              meta=json.dumps(info, ensure_ascii=False), digest=digest, **{**blob, "final_url": first[0]}, **hdr)
         self.save(url, status="done", title=doc.get("title"), date=doc.get("date"), text=doc["text"],
                   meta=json.dumps(info, ensure_ascii=False), data=data, error=None, digest=digest, **blob, **hdr)
+
+    async def linked_pdf(self, url):
+        """(text, meta) of the PDF a page embeds, under the same robots, SSRF guard and host pacing as a page."""
+        if not await self.is_public(url) or await self.allowed(url) is not True or self.host(url).paused_until > time.time():
+            return None, None
+        try:
+            await self.pace(url)
+            r, body = await self.fetch(url, {}, self.a.max_file_mb * 1_000_000, kind="download")
+        except Exception:                    # the page itself still saves (as before: title only / empty)
+            return None, None
+        if r.status_code >= 400 or body[:5] != b"%PDF-":
+            return None, None
+        return await self.cpu(pdf_text, body)
 
     def redirect(self, url, depth, tgt, http):
         if tgt and LOGIN_RE.search(urlsplit(tgt).path):   # bounced to a sign-in form: no content here for us
@@ -1377,6 +1397,19 @@ def item_date(v):
             except ValueError:
                 return v
     return d.isoformat()
+
+
+def embedded_pdf(media):
+    """The PDF an <iframe>/<embed> shows: its src, or a viewer's ?file=<pdf> (SEBI: /web/?file=...pdf)."""
+    for m in media:
+        if m["kind"] != "embed":
+            continue
+        u = urlsplit(m["url"])
+        for cand in [m["url"]] + [v for k, v in parse_qsl(u.query) if k == "file"]:
+            c = urlsplit(cand)
+            if c.scheme in ("http", "https") and c.path.lower().endswith(".pdf"):
+                return cand
+    return None
 
 
 def pdf_text(body):

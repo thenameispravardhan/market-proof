@@ -134,6 +134,39 @@ DEFAULT_FEEDS: list[dict[str, Any]] = [
     {"source": "BBC Business", "url": "https://feeds.bbci.co.uk/news/business/rss.xml", "group": GLOBAL},
     {"source": "Nikkei Asia", "url": "https://asia.nikkei.com/rss/feed/nar", "group": GLOBAL},
     {"source": "OilPrice", "url": "https://oilprice.com/rss/main", "group": GLOBAL},
+    # Added 2026-10-19 after scripts/check_news_feeds.py passed each from the AWS (Mumbai) server: live, fresh,
+    # robots.txt allows. Business Standard, Goodreturns, Zee Business markets 403; Financial Express / Free Press
+    # Journal HTML; Medianama robots.txt disallows; Moneycontrol market reports frozen; Yahoo Finance, Kitco 404.
+    {"source": "ET Stocks", "group": MARKETS,
+     "url": "https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms"},
+    {"source": "CNBC-TV18 Stocks", "url": "https://www.cnbctv18.com/commonfeeds/v1/cne/rss/stocks.xml", "group": MARKETS},
+    {"source": "BusinessLine Markets", "group": MARKETS,
+     "url": "https://www.thehindubusinessline.com/markets/feeder/default.rss"},
+    {"source": "News18 Markets", "url": "https://www.news18.com/commonfeeds/v1/eng/rss/markets.xml", "group": MARKETS,
+     "every": 10},
+    {"source": "CNBC-TV18 Business", "url": "https://www.cnbctv18.com/commonfeeds/v1/cne/rss/business.xml",
+     "group": BUSINESS},
+    {"source": "ET Banking", "group": BUSINESS,
+     "url": "https://economictimes.indiatimes.com/industry/banking/finance/rssfeeds/13358259.cms"},
+    {"source": "ET Tech", "url": "https://economictimes.indiatimes.com/tech/rssfeeds/13357270.cms", "group": BUSINESS},
+    {"source": "Rediff Money", "url": "https://www.rediff.com/rss/moneyrss.xml", "group": BUSINESS},
+    {"source": "YourStory", "url": "https://yourstory.com/feed", "group": BUSINESS},
+    {"source": "Bloomberg Markets", "url": "https://feeds.bloomberg.com/markets/news.rss", "group": GLOBAL},
+    {"source": "Bloomberg Economics", "url": "https://feeds.bloomberg.com/economics/news.rss", "group": GLOBAL},
+    {"source": "Financial Times", "url": "https://www.ft.com/markets?format=rss", "group": GLOBAL},
+    {"source": "CNBC World", "url": "https://www.cnbc.com/id/100727362/device/rss/rss.html", "group": GLOBAL},
+    {"source": "CNBC Economy", "url": "https://www.cnbc.com/id/20910258/device/rss/rss.html", "group": GLOBAL},
+    {"source": "CNBC Finance", "url": "https://www.cnbc.com/id/10000664/device/rss/rss.html", "group": GLOBAL},
+    {"source": "Guardian Business", "url": "https://www.theguardian.com/uk/business/rss", "group": GLOBAL},
+    {"source": "NYT Business", "url": "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml", "group": GLOBAL},
+    {"source": "Investing.com", "url": "https://www.investing.com/rss/news_25.rss", "group": GLOBAL},
+    {"source": "Forexlive", "url": "https://www.forexlive.com/feed/news", "group": GLOBAL},
+    {"source": "Seeking Alpha", "url": "https://seekingalpha.com/market_currents.xml", "group": GLOBAL},
+    {"source": "Euronews Business", "url": "https://www.euronews.com/rss?level=vertical&name=business", "group": GLOBAL},
+    {"source": "Economist Finance", "url": "https://www.economist.com/finance-and-economics/rss.xml", "group": GLOBAL,
+     "min_s": 300},
+    {"source": "ECB", "url": "https://www.ecb.europa.eu/rss/press.html", "group": GLOBAL, "min_s": 120},
+    {"source": "Bank of England", "url": "https://www.bankofengland.co.uk/rss/news", "group": GLOBAL, "min_s": 120},
 ]
 SOURCES = sorted({f["source"] for f in DEFAULT_FEEDS})
 SOURCE_GROUPS = {f["source"]: f["group"] for f in DEFAULT_FEEDS}
@@ -145,6 +178,8 @@ NEW_OFF = set(SOURCES) - ORIGINAL                # every source added since ship
 # 2026-10-17, which the scraper then paused), are exchange filings (NSE: XBRL / PDF) or sit behind a paywall: off.
 SCRAPE_DB = Path("data/scrape.db")
 EXTRACT_OFF = {"BSE", "NDTV Profit", "NDTV", "NSE", "MarketWatch", "Nikkei Asia", "CNBC Awaaz"}   # Awaaz: Hindi article text
+EXTRACT_OFF |= {"Bloomberg Markets", "Bloomberg Economics", "Financial Times", "NYT Business", "Seeking Alpha",
+                "Economist Finance"}         # paywalled: the headline is all they give an honest client
 
 DEFAULTS: dict[str, Any] = {
     "enabled": False,        # off until the operator turns it on from the News page
