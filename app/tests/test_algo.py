@@ -749,3 +749,19 @@ def test_backtest_stops_when_funds_run_out_even_without_compounding():
         assert t["qty"] * t["entry"] <= cash          # never buys with money it doesn't have
         cash += t["net"]
     assert cash > 0 and out["stats"]["skipped"]["no_capital"] > 0
+
+
+def test_atr_stop_on_an_option_premium_is_the_underlyings_atr_times_delta():
+    """It used to be refused ("ATR on a premium makes no sense"), so the
+    builder hid ATR for option strategies with levels on the option."""
+    spec = _opt_spec(stop_loss={"type": "atr", "value": 1, "atr_period": 14})
+    assert spec["instrument"]["levels_on"] == "instrument"
+    leg = {"kind": "CE", "K": 24550.0, "exp": DAY0 + 3 * 86400}
+    atm = engine.premium_atr({14: 40.0}, leg, 24550.0, DAY0, 0.14)[14]
+    assert 15 < atm < 25                                   # ATM delta ~0.5 → about half the underlying's ATR
+    deep = engine.premium_atr({14: 40.0}, {**leg, "K": 23000.0}, 24550.0, DAY0, 0.14)[14]
+    assert deep > 38                                       # deep ITM moves almost 1:1
+    priced = {**leg, "price": engine.fno.bs_price(24550.0, 24550.0, engine.fno.years_to(leg["exp"], DAY0), 0.14, "CE")}
+    assert abs(engine.premium_atr({14: 40.0}, priced, 24550.0, DAY0)[14] - atm) < 0.5   # IV implied from the live price
+    closes = [24500, 24520, 24540, 24560, 24600, 24650, 24700] + [24700] * 30
+    assert engine.run(spec, {"N": _nifty(closes)})["trades"]      # backtests instead of a ValueError

@@ -1706,7 +1706,8 @@ export default function Algo() {
       </div>
     );
   };
-  const levelKinds = inst.type === "option" && inst.levels_on === "instrument" ? ["pct", "points"] : ["pct", "points", "atr"];
+  // ATR on an option premium = the underlying's ATR × the option's delta (engine.premium_atr).
+  const levelKinds = ["pct", "points", "atr"];
   const levelsHint = inst.type === "option"
     ? inst.levels_on === "instrument" ? "measured on the option premium" : "measured on the underlying's price"
     : inst.type === "future" && inst.levels_on === "instrument" ? "measured on the futures price" : "measured on the traded price";

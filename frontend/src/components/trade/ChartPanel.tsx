@@ -5780,7 +5780,7 @@ ${hh ? `${hh}:${String(mm).padStart(2, "0")}` : mm}:${String(ss).padStart(2, "0"
       ))}
       <div className="chart-group chart-menu-wrap">
         <button type="button" className={`chart-btn${!favIntervals.includes(iv) ? " on" : ""}`} onClick={menuBtn("interval")} title="Time interval" data-testid="chart-tf">
-          {!favIntervals.includes(iv) ? `${ivLabel} ` : ""}▾
+          {!favIntervals.includes(iv) ? `${ivLabel} ` : <span className="tb-compact-only">{ivLabel} </span>}▾
         </button>
         {menuOpen === "interval" && (
           <div className="chart-menu chart-iv-menu">
@@ -5841,11 +5841,11 @@ ${hh ? `${hh}:${String(mm).padStart(2, "0")}` : mm}:${String(ss).padStart(2, "0"
       {/* chart style */}
       {favKinds.map((k) => {
         const d = CHART_KINDS.find((x) => x.id === k);
-        return d ? <button key={k} type="button" className={`chart-btn${chartKind === k ? " on" : ""}`} onClick={() => setChartKind(k)} title={d.label}>{d.icon}</button> : null;
+        return d ? <button key={k} type="button" className={`chart-btn fav-kind${chartKind === k ? " on" : ""}`} onClick={() => setChartKind(k)} title={d.label}>{d.icon}</button> : null;
       })}
       <div className="chart-group chart-menu-wrap">
         <button type="button" className={`chart-btn${!favKinds.includes(chartKind) ? " on" : ""}`} onClick={menuBtn("kind")} title={`Bar's style: ${CHART_KINDS.find((k) => k.id === chartKind)?.label}`} data-testid="chart-type">
-          {!favKinds.includes(chartKind) ? `${CHART_KINDS.find((k) => k.id === chartKind)?.icon} ` : ""}▾
+          {!favKinds.includes(chartKind) ? `${CHART_KINDS.find((k) => k.id === chartKind)?.icon} ` : <span className="tb-compact-only">{CHART_KINDS.find((k) => k.id === chartKind)?.icon} </span>}▾
         </button>
         {menuOpen === "kind" && (
           <div className="chart-menu">

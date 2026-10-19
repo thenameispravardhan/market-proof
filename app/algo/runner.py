@@ -770,6 +770,8 @@ class AlgoRunner:
         rsign = sign if ref == "u" else legs[0]["act"]
         atr_vals = {p: engine.series(d, {"ind": "ATR", "params": {"period": p}}, {})[-1]
                     for p in engine.atr_periods(spec)}
+        if ref != "u":                                   # levels on the option premium: its own ATR
+            atr_vals = engine.premium_atr(atr_vals, legs[0], u, time.time())
         # Sizing on the quoted prices (the stop distance only needs the shape).
         pre = engine.entry_levels(spec, rsign, u if ref == "u" else legs[0]["price"], atr_vals)
         per_set_margin = engine.position_margin(legs, u, pf["leverage"], price_key="price")
