@@ -41,19 +41,35 @@ const STEPS = [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5];
 
 // Drag a split line of a grid (layouts, scalper columns): `set` gets the
 // pointer's position as a fraction of the grid's width / height.
-export function splitDrag(e: React.PointerEvent, axis: "x" | "y", set: (f: number) => void, lo = 0.15, hi = 0.85): void {
+export function splitDrag(e: React.PointerEvent, axis: "x" | "y", set: (f: number) => void, lo?: number, hi?: number): void {
+  // TradingView-style: a chart can be squeezed to ~60 px, the divider follows the
+  // pointer once per frame (no re-render storm), and the drag survives crossing a chart.
   e.preventDefault();
-  const r = (e.currentTarget as HTMLElement).parentElement!.getBoundingClientRect();
+  const handle = e.currentTarget as HTMLElement;
+  const r = handle.parentElement!.getBoundingClientRect();
+  const size = axis === "x" ? r.width : r.height;
+  const minF = Math.min(0.45, 60 / Math.max(1, size));
+  const a = lo ?? minF, b = hi ?? 1 - minF;
+  try { handle.setPointerCapture(e.pointerId); } catch { /* not a captured pointer */ }
+  handle.classList.add("dragging");
+  document.body.style.cursor = axis === "x" ? "col-resize" : "row-resize";
+  document.body.style.userSelect = "none";
+  let raf = 0, last = 0;
   const move = (ev: PointerEvent) => {
-    const f = axis === "x" ? (ev.clientX - r.left) / r.width : (ev.clientY - r.top) / r.height;
-    set(Math.max(lo, Math.min(hi, f)));
+    last = axis === "x" ? (ev.clientX - r.left) / r.width : (ev.clientY - r.top) / r.height;
+    if (!raf) raf = requestAnimationFrame(() => { raf = 0; set(Math.max(a, Math.min(b, last))); });
   };
   const up = () => {
     window.removeEventListener("pointermove", move);
     window.removeEventListener("pointerup", up);
+    window.removeEventListener("pointercancel", up);
+    handle.classList.remove("dragging");
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
   };
   window.addEventListener("pointermove", move);
   window.addEventListener("pointerup", up);
+  window.addEventListener("pointercancel", up);
 }
 
 /** Drag payload for an instrument (watchlist row, option chain cell). */
