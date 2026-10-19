@@ -104,3 +104,40 @@ async def server_info() -> dict[str, object]:
         "public_ip": public_ip,
         "ip_source": "api.ipify.org (cached 5 min)",
     }
+
+
+@router.post("/api/system/restart")
+async def system_restart(body: dict[str, object]) -> dict[str, object]:
+    """Settings → Server: restart the app (systemd brings it back in ~15 s:
+    Restart=always) or reboot the whole server (~1-2 min). The body must
+    carry {"confirm": "RESTART"} so a stray request can't take the bot down.
+    Open positions keep their broker-side state; the trade manager re-arms
+    exits from the database on start."""
+    import asyncio
+    import os
+    import signal
+    import subprocess
+
+    from app.db.models import AuditLog
+    from app.db.session import SessionLocal
+
+    if body.get("confirm") != "RESTART":
+        from fastapi import HTTPException
+
+        raise HTTPException(status_code=422, detail='type RESTART to confirm')
+    what = "reboot" if body.get("what") == "reboot" else "app"
+    if get_settings().TESTING:
+        return {"ok": True, "what": what, "dry_run": True}
+    with SessionLocal() as db:
+        db.add(AuditLog(actor="ui", action=f"system.{what}", target="server", after={"what": what}))
+        db.commit()
+    log.warning("system.restart_requested", what=what)
+
+    def go() -> None:
+        if what == "reboot":
+            subprocess.Popen(["sudo", "-n", "systemctl", "reboot"])   # noqa: S603,S607 — fixed argv, the app user's NOPASSWD sudo
+        else:
+            os.kill(os.getpid(), signal.SIGTERM)                     # graceful stop; systemd restarts it
+
+    asyncio.get_running_loop().call_later(1.0, go)                   # answer first, then go
+    return {"ok": True, "what": what, "back_in_s": 120 if what == "reboot" else 15}

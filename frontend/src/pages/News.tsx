@@ -146,6 +146,7 @@ export default function News() {
   const [thread, setThread] = useState<number | null>(null);       // row showing its stock's earlier stories
   const [cursor, setCursor] = useState<number | null>(null);       // keyboard: the story under the cursor
   const [showKeys, setShowKeys] = useState(false);
+  const [shownN, setShownN] = useState(120);
   const [quotes, setQuotes] = useState<Record<string, Quote>>({});
   const [reactions, setReactions] = useState<Record<number, Reaction>>({});
   const [sinceVisit, setSinceVisit] = useState(0);   // headlines new since this browser's last visit
@@ -626,9 +627,13 @@ export default function News() {
             title={rows.length !== shown.length ? "Stories (one story's reports from several outlets are one row) · headlines" : ""}>
             {rows.length !== shown.length ? `${rows.length} stories · ${shown.length}` : shown.length}</span>
             {sinceVisit > 0 && <span className="news-unread" data-testid="news-unread">{sinceVisit} new since your last visit</span>}</h3>
-          <div className="news-list">
+          <div className="news-list" onScroll={(e) => {
+            // Rows render in pages as the list scrolls: 300+ stories at once made opening the page stutter.
+            const el = e.currentTarget;
+            if (shownN < list.length && el.scrollTop + el.clientHeight > el.scrollHeight - 900) setShownN((n) => n + 150);
+          }}>
             {list.length === 0 && <p className="empty">{live ? "No headlines match." : "Turn monitoring on to start collecting."}</p>}
-            {list.map(({ lead: i, story, earlier }) => {
+            {list.slice(0, Math.max(shownN, list.findIndex((r) => r.lead.id === cursor) + 20)).map(({ lead: i, story, earlier }) => {
               const hit = story.some(isHit);
               const n = prefs.group ? outlets.get(leadOf.get(i.id) ?? -1) ?? 1 : 1;    // outlets that carried the story
               const ahead = n > 1 && story[0].id === i.id ? story.find((x) => x.source !== i.source) : undefined;

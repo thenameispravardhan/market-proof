@@ -3117,6 +3117,7 @@ a.btn-sm { color: var(--text); text-decoration: none; }
    keeping its own height (a taller panel left a blank gap, a shorter one two scrollbars). */
 .widget.news-headlines { height: calc(100vh - 230px); overflow: hidden; }
 .news-headlines .news-list { max-height: none; flex: 1 1 auto; min-height: 0; }
+.news-item { content-visibility: auto; contain-intrinsic-size: auto 72px; }   /* off-screen rows skip layout and paint */
 .news-item { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 10px; padding: 9px 12px; border-bottom: 1px solid var(--border); }
 .news-item.compact { padding: 5px 12px; }
 .news-item.hit { box-shadow: inset 3px 0 0 var(--amber); }
@@ -3260,3 +3261,13 @@ a.news-title:hover { color: var(--accent); text-decoration: underline; }
 .news-filters { display: flex; flex-direction: column; gap: 6px; margin: 2px 0 8px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-panel); }
 .news-filters .news-chips { margin: 0; }
 .news-filters .news-keys { margin: 0; }
+/* Order Flow panel: fits the dock (no clipped totals or CVD column), the table fills the free height. */
+.flow-card { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; }
+.flow-card .quote-row { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.flow-card .quote-cell .v { font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.flow-scroll { flex: 1 1 auto; min-height: 120px; overflow: auto; }
+.flow-table { width: 100%; table-layout: fixed; font-size: 11px; }
+.flow-table th, .flow-table td { padding: 2px 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: right; }
+.flow-table th:first-child, .flow-table td:first-child { text-align: left; }
+.flow-table .flow-bar-col { width: 22%; }
+.dock-panel[data-testid="dock-flow"] .dock-body { overflow: hidden; }
