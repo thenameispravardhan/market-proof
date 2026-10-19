@@ -179,7 +179,7 @@ def article(url: str = Query(min_length=8, max_length=1000)):
         from scraper.scrape import description   # rows stored before it: the summary the page publishes
         text = meta.pop("free", None) or (description(json.loads(jl[0])) if jl and jl[0] else "")
     return {"status": e["status"], "error": e["error"], "http": e["http"], "title": e.get("title"), "date": e.get("date"),
-            "text": text, "words": len(text.split()), "meta": meta,
+            "text": text, "words": len(text.split()), "meta": meta, "figures": nt.figures(text),
             "tables": json.loads(e["tables"]) if e.get("tables") else [], "images": images,
             "fetched_at": e["fetched"]}
 

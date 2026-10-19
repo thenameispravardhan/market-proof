@@ -13,7 +13,7 @@ const SETTINGS = {
   watchlist: ["Reliance"], muted: ["horoscope"], alerts: false, retention_days: 7,
 };
 const ITEMS = [
-  { id: 1, url: "https://mc.example/1", source: "Moneycontrol", title: "Reliance wins <b>order</b>", summary: null, published_at: now, seen_at: now },
+  { id: 1, url: "https://mc.example/1", source: "Moneycontrol", title: "Reliance wins <b>order</b>", summary: null, published_at: now, seen_at: now, tone: 1 },
   { id: 2, url: "https://bse.example/2", source: "BSE", title: "TCS board meeting", summary: "Results", published_at: now, seen_at: now },
   { id: 3, url: "https://mc.example/3", source: "Moneycontrol", title: "Daily horoscope", summary: null, published_at: now, seen_at: now },
 ];
@@ -63,6 +63,15 @@ describe("News page", () => {
     fireEvent.click(screen.getByRole("button", { name: /^BSE/ }));
     expect(screen.queryByText(/wins/)).toBeNull();
     expect(screen.getByText("TCS board meeting")).toBeTruthy();
+  });
+
+  it("filters by headline tone", async () => {
+    render(<News />);
+    await screen.findByText("TCS board meeting");
+    await openFilters();
+    fireEvent.click(screen.getByTestId("news-tone-1"));
+    expect(screen.queryByText("TCS board meeting")).toBeNull();       // tone 0: not positive
+    expect(screen.getByText(/wins <b>order<\/b>/)).toBeTruthy();
   });
 
   it("is off until enabled, and Settings saves the interval and watchlist", async () => {

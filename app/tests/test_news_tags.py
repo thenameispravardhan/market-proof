@@ -171,7 +171,20 @@ def test_watchlist_words_that_name_a_stock(seed):
 
 def test_a_broken_index_never_breaks_the_page(monkeypatch):
     monkeypatch.setattr(nt, "_index", lambda: (_ for _ in ()).throw(ValueError("boom")))
-    assert nt.tag("Reliance Q2") == {"tickers": [], "tags": []}
+    assert nt.tag("Reliance Q2") == {"tickers": [], "tags": [], "tone": 0}
+
+
+def test_headline_tone_and_article_figures():
+    assert nt.tone("Bajaj Finance Q2: net profit jumps 29%, beats estimates") == 1
+    assert nt.tone("Sensex falls 876 points as IT stocks slump") == -1
+    assert nt.tone("Vodafone Idea Q2 loss narrows to Rs 6,000 crore") == 1      # a shrinking loss is good news
+    assert nt.tone("Tata Motors shares rise; Infosys falls") == 0                # mixed
+    assert nt.tone("Notice of Demand under Recovery Certificate issued against Akash Infra") == -1
+    text = ("LTTS reported a net profit of ₹548 crore. Net profit jumped 54% from a year ago, while revenue rose "
+            "12.5 per cent. SEBI imposed a penalty of Rs 5 lakh. Margins expanded 120 bps. It has 0% debt.")
+    assert nt.figures(text) == ["a net profit of ₹548 crore", "Net profit jumped 54%", "while revenue rose 12.5 per cent",
+                                "imposed a penalty of Rs 5 lakh", "Margins expanded 120 bps"]
+    assert nt.figures(None) == []
 
 
 _NOW = format_datetime(datetime.now(timezone.utc) - timedelta(minutes=5))   # inside the export's 48 h on any day

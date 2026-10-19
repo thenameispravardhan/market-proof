@@ -624,6 +624,11 @@ class P(H):
             if PH[port, path] > 1:
                 return self.send(403, "<html><head><title>Access denied</title></head><body>" + "denied " * 200 + "</body></html>")
             return self.send(200, "<html><body><div id=app>loading</div></body></html>")
+        if path == "/sebi":                     # SEBI-style wrapper: a title, the order is the PDF in a viewer iframe
+            return self.send(200, f"<html><head><title>SEBI order</title></head><body><h1>SEBI order</h1>"
+                                  f"<iframe src='/web/?file={base}/attach/o.pdf'></iframe></body></html>")
+        if path == "/attach/o.pdf":
+            return self.send(200, make_pdf("SEBIORDERMARK penalty of Rs 5 lakh"), "application/pdf")
         return self.send(404)
 
 
@@ -658,6 +663,14 @@ def sources(tmp_path, cfg):
     f = tmp_path / "sources.json"
     f.write_text(json.dumps(cfg))
     return ["--sources", str(f)]
+
+
+def test_wrapper_page_takes_its_embedded_pdf_text(tmp_path):
+    base, _ = srv()
+    db = str(tmp_path / "w.db")
+    crawl(db, [f"{base}/sebi"])
+    st, text, meta = rows(db, "SELECT status, text, meta FROM pages WHERE url=?", f"{base}/sebi")[0]
+    assert st == "done" and "SEBIORDERMARK" in text and "/attach/o.pdf" in meta    # was: 'empty' (title only)
 
 
 def test_rss2_links_and_unchanged_feed_is_304(tmp_path):

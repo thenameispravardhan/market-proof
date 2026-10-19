@@ -3178,6 +3178,11 @@ a.news-title:hover { color: var(--accent); text-decoration: underline; }
 .news-tk { padding: 0 5px; color: var(--cyan); text-decoration: none; }
 .news-tk:hover { color: var(--accent); }
 .news-tk.on { border-color: var(--cyan); background: var(--cyan-bg); }
+.news-tone { font-size: 10px; line-height: 1; }
+.news-tone.pos, .news-stat .pos, .news-stocks .pos { color: var(--green); }
+.news-tone.neg, .news-stat .neg, .news-stocks .neg { color: var(--red); }
+.news-figures { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin: 4px 0 6px; }
+.news-figures .chip { cursor: default; }
 .news-kind { padding: 0 4px; border-radius: 3px; background: var(--bg-surface); color: var(--text-dim);
   font-size: 9px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; line-height: 15px; }
 .news-kind.k-results, .news-kind.k-ratings { color: var(--cyan); }
