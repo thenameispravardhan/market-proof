@@ -1334,7 +1334,7 @@ describe("Trade page", () => {
     const panel = await screen.findByTestId("trade-positions");
     await waitFor(() => expect(panel.textContent).toMatch(/NSE:RELIANCE-EQ/));
     expect(screen.getByText("Exit all")).toBeInTheDocument();
-    expect(screen.getByTitle("Reverse at market")).toBeInTheDocument();
+    expect(screen.getAllByTitle("Reverse at market").length).toBeGreaterThan(0);   // both books are listed
   });
 
   it("cancel the broker refused: says the order may still be working and keeps the row", async () => {

@@ -62,6 +62,8 @@ export interface Position {
   product?: ProductType;
   /** Contract lot (1 for cash) — exits must be whole lots. */
   lot_size?: number;
+  /** Set on the Trade page's merged Positions table: the practice (paper) book. */
+  paper?: boolean;
   opened_at: string;
   updated_at: string;
 }

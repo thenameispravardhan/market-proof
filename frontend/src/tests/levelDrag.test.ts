@@ -24,3 +24,12 @@ describe("chart stop-loss / target drag", () => {
     expect(levelProblem("sl", 90, null, true)).toBeNull();
   });
 });
+
+import { snapLot } from "../components/trade/levelDrag";
+
+test("quantities stay on the lot grid (750 lot: never 751 / 1501)", () => {
+  expect(snapLot(751, 750)).toBe(750);
+  expect(snapLot(1501, 750)).toBe(1500);
+  expect(snapLot(1, 750)).toBe(750);
+  expect(snapLot(7, 1)).toBe(7);
+});

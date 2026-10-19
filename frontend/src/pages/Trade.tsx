@@ -47,9 +47,11 @@ import { chartLinkParams, resolveBareHit } from "../lib/chartLink";
 import ChartPanel, { type ChartOrder, type ChartPosition, type HostAction } from "../components/trade/ChartPanel";
 import type { ChartWorkingOrder, OrderPatch } from "../components/trade/OrderLayer";
 import Scalper, { DRAG_MIME, splitDrag } from "../components/trade/Scalper";
+import { DomPanel } from "../components/trade/DomPanel";
+import { orderRows } from "../components/trade/AccountPanels";
 import { Toggle } from "../components/common/Toggle";
 import { onPositionTag } from "../components/trade/chartData";
-import { AccountManager, BOTTOM_TABS, LayoutMenu, SymbolDetails, WatchlistTable, cleanWatchItems, useLayouts, type BottomTab, type WatchState } from "../components/trade/TradePanels";
+import { AccountManager, LayoutMenu, bottomTabsShown, SymbolDetails, WatchlistTable, cleanWatchItems, useLayouts, type BottomTab, type WatchState } from "../components/trade/TradePanels";
 import { BookPanel, FnoPanel, type DeskTab } from "../components/trade/ProPanels";
 import { loadUserPrefs, UserSettingsDialog, type UserPrefs } from "../components/trade/UserSettings";
 import type { SyncFlags } from "../components/trade/chartSync";
@@ -251,11 +253,12 @@ const ORDER_TYPE_LABEL: Record<OrderType, string> = { MARKET: "Market", LIMIT: "
 
 // Right-dock panels, opened / closed from the icon bar. Several can be open;
 // they stack in this order.
-type DockId = "watch" | "details" | "trade" | "timeline" | "chain" | "flow" | "book" | "fno" | "data" | "tree" | "alerts";
+type DockId = "watch" | "details" | "trade" | "dom" | "timeline" | "chain" | "flow" | "book" | "fno" | "data" | "tree" | "alerts";
 const DOCK: { id: DockId; label: string; short: string; icon: string; hint: string }[] = [
   { id: "watch", label: "Watchlist", short: "Watch", icon: "☰", hint: "Watchlist — search and switch symbols" },
   { id: "details", label: "Details & news", short: "Details", icon: "ⓘ", hint: "Symbol details, performance, technical rating and headlines" },
   { id: "trade", label: "Trade", short: "Trade", icon: "⇅", hint: "Quote and order ticket (buy / sell)" },
+  { id: "dom", label: "DOM", short: "DOM", icon: "⇕", hint: "DOM — one-click trading from the price ladder (was the bottom bar's Trade tab)" },
   { id: "timeline", label: "Trade timeline", short: "Timeline", icon: "⋮", hint: "The bot's trades on this symbol: filing → detected → AI → signal → fill" },
   { id: "chain", label: "Option chain", short: "Chain", icon: "⊞", hint: "Option chain — click a price to trade that option" },
   { id: "flow", label: "Order flow", short: "Flow", icon: "Δ", hint: "Real order flow from recorded ticks" },
@@ -338,7 +341,6 @@ function TradeSettings({ s, onChange, more }: { s: TradeSet; onChange: (k: keyof
   );
   return (
     <div className="tset" onMouseDown={(e) => e.stopPropagation()}>
-      {s.instant && <span className="tset-badge" title="Chart and scalper orders are placed without a confirm">⚡ instant</span>}
       <button type="button" className={`chart-btn${open ? " on" : ""}`} onClick={() => setOpen((o) => !o)} title="Settings — trading, chart, user, alerts, scalper" data-testid="trade-settings">⚙</button>
       {open && (
         <div className="chart-menu tset-menu">
@@ -594,7 +596,7 @@ function TimelinePanel({ symbol }: { symbol: string | null }) {
 const eqKey = (s: string) => { const [ex, name] = s.toUpperCase().includes(":") ? s.toUpperCase().split(":") : ["NSE", s.toUpperCase()]; return `${ex}:${name.replace(/-(EQ|BE)$/, "")}`; };
 
 export default function Trade() {
-  const [bottomTab, setBottomTab] = useState<BottomTab>(() => stored<BottomTab>("trade:bottomTab", "orders"));
+  const [bottomTab, setBottomTab] = useState<BottomTab>(() => { const t = stored<BottomTab>("trade:bottomTab", "orders"); return t === "trade" ? "positions" : t; });   // the DOM tab moved to the right dock
   const [bottomOpen, setBottomOpen] = useState(() => stored("trade:bottomOpen", false));
   const openBottom = (tab: BottomTab | null) => {
     if (tab) setBottomTab(tab);
@@ -939,6 +941,10 @@ export default function Trade() {
   }, [chain, selectedExpiry]);
   const { data: pending } = usePendingOrders(accountId);
   const { data: positions } = usePositions(practice);
+  // The Positions table shows BOTH books (Real / Paper column); everything else uses the mode's.
+  const { data: otherPositions } = usePositions(!practice);
+  const bothBooks = useMemo(() => [...(positions ?? []).map((p) => ({ ...p, paper: practice })), ...(otherPositions ?? []).map((p) => ({ ...p, paper: !practice }))],
+    [positions, otherPositions, practice]);
 
   // --- Ticket state ---
   const [side, setSide] = useState<"BUY" | "SELL">("BUY");
@@ -1045,21 +1051,22 @@ export default function Trade() {
     const m = practice ? pos : managed?.find((x) => x.symbol === pos.symbol);
     return { qty: pos.quantity, avg: pos.average_price, sl: m?.stop_loss ?? null, tp: m?.target ?? null };
   };
-  const levelsFor = (chartSym: string) => async (sl: number | null, tp: number | null) => {
-    const sym = openPos(chartSym)?.symbol ?? chartSym;
-    const r = await fetch(`/api/positions/${encodeURIComponent(sym)}/levels${practice ? "?practice=1" : ""}`, {
+  // `paper` picks the book (a Positions row may be the other mode's): the mode's own by default.
+  const levelsFor = (chartSym: string, paper: boolean = practice) => async (sl: number | null, tp: number | null) => {
+    const sym = paper === practice ? openPos(chartSym)?.symbol ?? chartSym : chartSym;
+    const r = await fetch(`/api/positions/${encodeURIComponent(sym)}/levels${paper ? "?practice=1" : ""}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ stop_loss: sl, target: tp }),
     });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(detailText(j, r.status));
-    if (practice) { void qc.invalidateQueries({ queryKey: ["positions"] }); return; }
+    if (paper) { void qc.invalidateQueries({ queryKey: ["positions"] }); return; }
     qc.setQueryData<Managed[]>(["managed-positions"], (old) => [...(old ?? []).filter((x) => x.symbol !== j.managed.symbol), j.managed]);
   };
-  const closeFor = (chartSym: string) => async () => {
-    const sym = openPos(chartSym)?.symbol ?? chartSym;
-    const r = await fetch(`/api/positions/${encodeURIComponent(sym)}/close${practice ? "?practice=1" : ""}`, { method: "POST" });
+  const closeFor = (chartSym: string, paper: boolean = practice) => async () => {
+    const sym = paper === practice ? openPos(chartSym)?.symbol ?? chartSym : chartSym;
+    const r = await fetch(`/api/positions/${encodeURIComponent(sym)}/close${paper ? "?practice=1" : ""}`, { method: "POST" });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(detailText(j, r.status));
     void qc.invalidateQueries({ queryKey: ["positions"] });
@@ -1309,12 +1316,13 @@ export default function Trade() {
   // is where a risk override is typed).
   // `product` defaults to intraday; exits and reversals of a carry position
   // pass its own product so the order nets it off at Fyers.
-  const orderFor = (sym: string, name: string, ticketQty: number, productType: ProductType = "INTRADAY") => async (o: ChartOrder): Promise<string> => {
+  const orderFor = (sym: string, name: string, ticketQty: number, productType: ProductType = "INTRADAY", paper: boolean = practice) => async (o: ChartOrder): Promise<string> => {
     const qty = o.qty ?? ticketQty;
-    if (!accountId) throw new Error(noAccountReason ?? "No live Fyers account is connected. Connect one on the Accounts page.");
+    const acct = paper === practice ? accountId : paper ? -1 : account?.id ?? null;
+    if (!acct) throw new Error(noAccountReason ?? "No live Fyers account is connected. Connect one on the Accounts page.");
     if (!(qty > 0)) throw new Error("Set a quantity above 0 in the order ticket first.");
     const r = await chartPlace.mutateAsync({
-      account_id: accountId,
+      account_id: acct,
       symbol: sym,
       side: o.side,
       quantity: qty,
@@ -1642,9 +1650,8 @@ export default function Trade() {
           {bottomOpen && <div className="tv-resize" onPointerDown={(e) => { setBottomMax(false); drag(e, "y", Math.min(bottomH, Math.max(120, win.h * 0.6)), setBottomH, 120, window.innerHeight * 0.6, "trade:bottomH"); }} title="Drag to resize" />}
           {!bottomOpen && (
             <div className="tabs trade-tabs" role="tablist">
-              <button type="button" role="tab" aria-selected={false} className="tab am-trade-tab" onClick={() => openBottom("trade")} title="DOM — trade from the price ladder">Trade</button>
-              {BOTTOM_TABS.map(([k, l]) => {
-                const n = k === "positions" ? positions?.filter((p) => p.quantity !== 0).length ?? 0 : k === "orders" ? pending?.count ?? 0 : 0;
+              {bottomTabsShown(null).map(([k, l]) => {
+                const n = k === "positions" ? bothBooks.filter((p) => p.quantity !== 0).length : k === "orders" ? pending?.count ?? 0 : 0;
                 return <button key={k} type="button" role="tab" aria-selected={false} className="tab" onClick={() => openBottom(k)}>{l}{n ? ` (${n})` : ""}</button>;
               })}
               <button type="button" className="tab tv-collapse" onClick={() => openBottom(bottomTab)} title="Open panel">▴</button>
@@ -1654,8 +1661,8 @@ export default function Trade() {
             <AccountManager
               tab={bottomTab}
               onTab={(t) => openBottom(t)}
-              positions={positions}
-              managed={practice ? positions?.map((p) => ({ symbol: p.symbol, stop_loss: p.stop_loss ?? null, target: p.target ?? null, trail_active: false, breakeven_armed: false, exit_failures: 0 })) : managed}
+              positions={bothBooks}
+              managed={managed}
               onOpenSymbol={(s) => void openSymbol(s)}
               pendingOrders={pending?.orders ?? []}
               onCancel={(id, label) => void onCancel(id, label)}
@@ -2307,6 +2314,31 @@ export default function Trade() {
               {dockGrip("flow")}
               {dockHead("flow", selected?.short_name)}
               <div className="dock-body"><FlowPanel symbol={selected?.symbol ?? null} /></div>
+            </section>
+          )}
+          {dock.includes("dom") && (
+            <section className="dock-panel" data-testid="dock-dom" style={panelStyle("dom")}>
+              {dockGrip("dom")}
+              {dockHead("dom", selected?.short_name)}
+              <div className="dock-body">
+                <DomPanel
+                  symbol={selected}
+                  position={selected && openPos(selected.symbol) ? { qty: openPos(selected.symbol)!.quantity, avg: openPos(selected.symbol)!.average_price } : null}
+                  orders={orderRows(null, pending?.orders ?? [], []).filter((r) => r.bucket === "working" && r.symbol === selected?.symbol)}
+                  qty={Number(quantity)}
+                  onQty={(n) => setQuantity(n)}
+                  instant={tset.instant}
+                  onOrder={(o, q) => (selected ? orderFor(selected.symbol, selected.short_name, q)(o) : Promise.reject(new Error("Open a symbol first.")))}
+                  onCancel={(id) => void onCancel(id)}
+                  onModify={async (o, price) => {
+                    await modifyChartOrder({ id: o.id ?? "", side: o.side === "SELL" ? "SELL" : "BUY", qty: o.qty, type: o.type.toUpperCase(), price: o.limit ?? o.stop ?? price, levels: false }, { price });
+                    return `Moved ${o.side} ${o.remaining ?? o.qty} ${o.symbol} to ${price}`;
+                  }}
+                  onFlatten={() => (selected ? closeFor(selected.symbol)() : Promise.resolve())}
+                  onClose={() => toggleDock("dom")}
+                  onMsg={(m) => setLastResult({ type: m.startsWith("✕") ? "error" : "success", message: m })}
+                />
+              </div>
             </section>
           )}
           {dock.includes("book") && (

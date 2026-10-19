@@ -23,3 +23,10 @@ export function levelProblem(which: "sl" | "tp", price: number, ltp: number | nu
   }
   return null;
 }
+
+/** A quantity on the contract's lot grid: whole lots, at least one. 751 with a
+ *  750 lot is 750 — the exchange refuses a part lot. */
+export function snapLot(n: number, lot: number): number {
+  const l = lot > 1 ? Math.floor(lot) : 1;
+  return Math.max(l, Math.round((Number.isFinite(n) ? n : l) / l) * l);
+}
