@@ -1412,6 +1412,32 @@ def embedded_pdf(media):
     return None
 
 
+OCR_PAGES = 4                  # a scanned PDF is OCRed only this far (SEBI notices: 1-3 pages)
+
+
+def ocr_pdf(body, pages=OCR_PAGES):
+    """Text of a scanned PDF (images, no text layer) via poppler's pdftoppm + tesseract, when both are installed
+    (deploy/setup.sh installs them on the server); None otherwise. ~3 s a page on 2 vCPUs."""
+    import shutil
+    import subprocess
+    import tempfile
+    if not (shutil.which("pdftoppm") and shutil.which("tesseract")):
+        return None
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "in.pdf")
+        with open(src, "wb") as f:
+            f.write(body)
+        try:
+            subprocess.run(["pdftoppm", "-r", "200", "-gray", "-png", "-l", str(pages), src, os.path.join(d, "p")],
+                           check=True, capture_output=True, timeout=30)
+            out = [subprocess.run(["tesseract", os.path.join(d, png), "-", "-l", "eng"], check=True,
+                                  capture_output=True, timeout=25).stdout.decode("utf-8", "replace")
+                   for png in sorted(x for x in os.listdir(d) if x.endswith(".png"))]
+        except (subprocess.SubprocessError, OSError):
+            return None
+    return "\n".join(out).strip() or None
+
+
 def pdf_text(body):
     from pypdf import PdfReader
     try:
@@ -1420,6 +1446,8 @@ def pdf_text(body):
         md = reader.metadata or {}
         meta = {k: str(v) for k, v in (("author", md.get("/Author")), ("title", md.get("/Title")),
                                        ("date", md.get("/CreationDate"))) if v}
+        if not text and (text := ocr_pdf(body)):
+            meta["ocr"] = True       # read off a scan: expect the odd misread character
         return text, meta
     except Exception:
         return None, None
