@@ -281,16 +281,33 @@ def ticks_config(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
 
 
 @router.get("/ticks/flow")
-def ticks_flow(symbol: str, resolution: str = "5", from_ts: int = Query(..., alias="from"),
-               to_ts: int = Query(..., alias="to"), footprint: bool = False) -> dict[str, Any]:
+async def ticks_flow(symbol: str, resolution: str = "5", from_ts: int = Query(..., alias="from"),
+                     to_ts: int = Query(..., alias="to"), footprint: bool = False) -> dict[str, Any]:
     """REAL order flow per chart candle: buy / sell volume classified from
     recorded ticks, delta, trades, and the resting book at the candle's end.
     Candles align with /api/market/history (09:15 buckets, D = session).
-    With footprint=true also buy/sell per price per candle."""
-    from app.algo import ticks
+    With footprint=true also buy/sell per price per candle. Crypto: Binance's
+    taker-buy volume per candle (every trade's aggressor), no footprint."""
+    from app.services import crypto
 
     if resolution != "D" and not resolution.isdigit():
         raise HTTPException(422, detail="resolution is minutes or D")
+    if crypto.is_crypto(symbol):
+        try:
+            rows = await crypto.klines(symbol.upper(), resolution, from_ts, to_ts)
+        except ValueError as e:
+            raise HTTPException(422, detail=str(e)) from None
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, detail=f"Binance unavailable: {e!s}"[:200]) from None
+        out = {"symbol": symbol, "key": symbol.upper(), "recorded": bool(rows),
+               "bars": [[int(t), round(tb, 6), round(v - tb, 6), round(2 * tb - v, 6)] for t, *_, v, tb in rows]}
+        return {**out, "footprint": []} if footprint else out
+    return await asyncio.to_thread(_recorded_flow, symbol, resolution, from_ts, to_ts, footprint)
+
+
+def _recorded_flow(symbol: str, resolution: str, from_ts: int, to_ts: int, footprint: bool) -> dict[str, Any]:
+    from app.algo import ticks
+
     span = 86400 if resolution == "D" else int(resolution) * 60
     rec = ticks.recorder()
     key = ticks.flow_key(data.fyers_symbol(symbol))

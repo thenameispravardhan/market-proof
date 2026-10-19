@@ -275,7 +275,8 @@ async def lifespan(app: FastAPI):
         # Keep the index symbols streaming all session so the status-bar
         # ticker is sub-second, not REST-polled.
         always_subscribe=[idx["symbol"] for idx in _INDICES],
-        extra_symbols=lambda: _tick_recorder.symbols() + _ws_watched() + _practice.live_symbols(),
+        extra_symbols=lambda: _tick_recorder.symbols() + [s for s in _ws_watched() if not s.startswith("CRYPTO:")]
+        + _practice.live_symbols(),
     )
     # Real order flow: every frame for a recorded symbol is classified and
     # kept (app/algo/ticks.py). Only symbols on the recorder's list.
@@ -334,6 +335,7 @@ async def lifespan(app: FastAPI):
     fno_master_task: asyncio.Task[None] | None = None
     news_task: asyncio.Task[None] | None = None
     news_extract_task: asyncio.Task[None] | None = None
+    crypto_task: asyncio.Task[None] | None = None
     if not settings.TESTING:
         # T3: start the analyzer before the monitors so its event-bus
         # subscription is live before the first `announcements.new`
@@ -573,6 +575,10 @@ async def lifespan(app: FastAPI):
         news_task = asyncio.create_task(news_wire.run(), name="news-wire")
         # Full article text via scraper/scrape.py: idles until "Fetch full article text" is on.
         news_extract_task = asyncio.create_task(news_wire.run_extract(), name="news-extract")
+        # Crypto pairs on screen stream from Binance's public feed (watch / chart only, never traded).
+        from app.services.crypto import feed as _crypto_feed
+
+        crypto_task = asyncio.create_task(_crypto_feed.run(_ws_watched), name="crypto-feed")
 
     try:
         yield
@@ -580,7 +586,7 @@ async def lifespan(app: FastAPI):
         if not settings.TESTING:
             # Stop the breaker monitor first.
             for _t in (risk_monitor_task, dataset_eod_task, ai_schedule_task, algo_task, tick_task,
-                       fno_master_task, news_task, news_extract_task):
+                       fno_master_task, news_task, news_extract_task, crypto_task):
                 if _t is not None:
                     _t.cancel()
                     try:

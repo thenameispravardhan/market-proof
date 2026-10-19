@@ -149,6 +149,13 @@ ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 
+# Capital words that are a sector, a market body or a macro term in news, whatever ticker shares them:
+# "IT stocks drag Nifty", "Indian IT", "the NSE said". A company with such a ticker still tags by its name.
+_NOT_TICKERS = frozenset({"IT", "AI", "EV", "EVS", "US", "UK", "EU", "PM", "MD", "CEO", "CFO", "NSE", "BSE", "SEBI",
+                          "RBI", "GST", "GDP", "CPI", "IPO", "IPOS", "FII", "FIIS", "DII", "DIIS", "FPI", "FPIS",
+                          "SME", "MSME", "PSU", "PSUS", "FMCG", "NBFC", "NBFCS", "ETF", "ETFS", "OMC", "OMCS"})
+
+
 def _key(word: str) -> str:
     """One word as the index spells it: capitals, no possessive, letters/digits/& only; "and" is "&"."""
     w = _NONKEY.sub("", _POSSESSIVE.sub("", word.upper()))
@@ -301,7 +308,8 @@ def _scan(text: str, ix: _Index, lenient: bool = False, short_caps: bool = True)
             w, k = raw[i], keys[i]
             if k in ix.single and (lenient or w[0].isupper()):
                 hit = ix.single[k]
-            elif k in ix.caps and (short_caps or len(w) > 2) and ((w.isupper() and not shouting) or (lenient and w.lower() not in COMMON)):
+            elif (k in ix.caps and k not in _NOT_TICKERS and (short_caps or len(w) > 2)
+                  and ((w.isupper() and not shouting) or (lenient and w.lower() not in COMMON))):
                 hit = ix.caps[k]
         if hit and hit not in out:
             out.append(hit)

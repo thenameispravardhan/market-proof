@@ -125,7 +125,7 @@ describe("News page: full text from the scraper", () => {
 });
 
 describe("News page: detection lag and trends", () => {
-  it("shows each headline's lag, the stats strip and trending words", async () => {
+  it("shows each headline's lag and the stats strip, and no trending-words row", async () => {
     const seen = new Date(Date.now() - 5 * 60_000);
     const mk = (id: number, title: string, lagS: number) => ({ id, url: `https://x.example/${id}`, source: "Mint", title, summary: null,
       published_at: new Date(seen.getTime() - lagS * 1000).toISOString(), seen_at: seen.toISOString() });
@@ -148,9 +148,7 @@ describe("News page: detection lag and trends", () => {
     const strip = await screen.findByTestId("news-stats");
     expect(within(strip).getByText("45s")).toBeTruthy();                  // median detection lag
     expect(within(strip).getAllByText("Mint").length).toBe(1);            // fastest source
-    const trend = screen.getByTestId("news-trending");
-    expect(within(trend).getByRole("button", { name: /infosys/ })).toBeTruthy();   // appears twice in the last hour
-    expect(within(trend).queryByRole("button", { name: /^rbi/ })).toBeNull();      // once: not trending
+    expect(screen.queryByTestId("news-trending")).toBeNull();            // removed: common words, not news
     fireEvent.click(screen.getByTestId("news-section-news"));   // the list: per-headline lag chips
     expect(screen.getByText("+45s").className).toContain("fast");        // per-headline lag, colour by speed
     expect(screen.getByText("+15m").className).toContain("slow");

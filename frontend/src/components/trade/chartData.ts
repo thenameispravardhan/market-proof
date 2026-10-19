@@ -202,6 +202,7 @@ function combine(into: Bar, b: Bar): void {
  *  from midnight for anything before the open. History aggregation and
  *  live ticks both use it, so a bar keeps its time across a reload. */
 export function intradayBucket(t: number, len: number, sessionOpen: number = NSE_SESSION.open): number {
+  if (sessionOpen < 0) return Math.floor((t - IST_S) / len) * len + IST_S;   // 24/7 (crypto): Binance's UTC grid
   const day0 = Math.floor(t / DAY) * DAY;
   const open = day0 + sessionOpen * 60;
   const anchor = t >= open ? open : day0;
@@ -283,12 +284,16 @@ export interface Session {
 
 /** NSE / BSE cash and F&O: 09:15–15:30. */
 export const NSE_SESSION: Session = { open: 555, close: 930 };
+/** Crypto never closes: open < 0 means "always in session", bars on the UTC grid (chart times are IST-shifted). */
+export const CRYPTO_SESSION: Session = { open: -1, close: 1440 };
+const IST_S = 19800;
 
 /** The regular session of a Fyers symbol. MCX trades into the night and
  *  NSE / BSE currency derivatives until 17:00; everything else keeps the
  *  equity hours. */
 export function sessionFor(symbol: string): Session {
   const s = (symbol || "").trim().toUpperCase();
+  if (s.startsWith("CRYPTO:")) return CRYPTO_SESSION;
   if (s.startsWith("MCX:")) return { open: 540, close: 1435 }; // 09:00–23:55 (23:30 in US summer)
   if (/^(NSE|BSE):(USD|EUR|GBP|JPY)INR/.test(s)) return { open: 540, close: 1020 }; // 09:00–17:00
   return NSE_SESSION;
@@ -301,6 +306,7 @@ export function minuteOfDay(t: number): number {
 
 /** True when chart time `t` falls on a weekday inside the session. */
 export function inSession(t: number, session: Session = NSE_SESSION): boolean {
+  if (session.open < 0) return true;
   const dow = new Date(t * 1000).getUTCDay(); // chart times are IST-shifted: read as UTC
   if (dow === 0 || dow === 6) return false;
   const m = minuteOfDay(t);

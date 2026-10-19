@@ -8,7 +8,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { api } from "../api/client";
 import { chartHref } from "../lib/chartLink";
 import { capTier } from "../lib/marketCap";
-import { clusterStories, STOP, tickerName } from "../lib/newsStories";
+import { clusterStories, tickerName } from "../lib/newsStories";
 import { Toggle } from "../components/common/Toggle";
 import { Check, Modal, Num, Row, Section, Sel } from "../components/trade/chartUi";
 
@@ -43,7 +43,7 @@ interface Prefs { notify: boolean; sound: boolean; compact: boolean; summaries: 
   /** Count stocks named only in the article text (the scraper's), not just the headline's. */
   textStocks?: boolean;
   stocksSort?: "stories" | "latest" | "pos" | "neg" | "move"; stocksAll?: boolean }
-const PANELS: [string, string][] = [["stats", "Stats"], ["trending", "Trending"], ["scraper", "Full text"], ["sources", "Sources"], ["stocks", "Stocks in the news"]];
+const PANELS: [string, string][] = [["stats", "Stats"], ["scraper", "Full text"], ["sources", "Sources"], ["stocks", "Stocks in the news"]];
 /** A list row: a story (its reports from several outlets) and, with Prefs.threads, its stock's earlier stories. */
 interface Row { lead: Item; story: Item[]; earlier: Item[] }
 /** How a story's stock moved since it broke (/api/news/reaction): from the last whole minute before it. */
@@ -450,19 +450,6 @@ export default function News() {
     return () => { live = false; clearInterval(t); };
   }, [reactIds]);
 
-  const trending = useMemo(() => {          // words in the last hour's headlines, most frequent first
-    const cut = Date.now() - 3600_000, c = new Map<string, number>();
-    for (const i of items) {
-      if (when(i) < cut) continue;
-      const seen = new Set<string>();
-      for (const w of i.title.match(/[A-Za-z][A-Za-z&.'-]{2,}/g) ?? []) {
-        const k = w.toLowerCase().replace(/['.]+$/, "");
-        if (STOP.has(k) || seen.has(k)) continue;
-        seen.add(k); c.set(k, (c.get(k) || 0) + 1);
-      }
-    }
-    return [...c.entries()].filter(([, n]) => n >= 2).sort((a, b) => b[1] - a[1]).slice(0, 14);
-  }, [items]);
   const firstSeen = useMemo(() => {        // each feed's first poll (its backlog): no lag chip
     const m = new Map<string, number>();
     for (const i of items) { const k = i.feed ?? i.source, t = Date.parse(i.seen_at); if (!m.has(k) || t < m.get(k)!) m.set(k, t); }
@@ -625,12 +612,6 @@ export default function News() {
           title="More filters, news types, sources and keyboard shortcuts ( ? )">{showKeys ? "▴" : "▾"} Filters{nFilters ? ` · ${nFilters}` : ""}</button>
       </div>}
 
-      {section === "insights" && panelOn("trending") && trending.length > 0 && (
-        <div className="news-chips" data-testid="news-trending">
-          <span className="text-dim news-meta">Trending · 1h</span>
-          {trending.map(([w, n]) => <button key={w} type="button" className={`chip${q.toLowerCase() === w ? " on" : ""}`} onClick={() => setQ(q.toLowerCase() === w ? "" : w)}>{w} <span className="mono">{n}</span></button>)}
-        </div>
-      )}
       {/* Filters ▾: the extra switches, news types, sources and the shortcuts, folded into one panel. */}
       {section === "news" && showKeys && (
         <div className="news-filters" data-testid="news-filters">

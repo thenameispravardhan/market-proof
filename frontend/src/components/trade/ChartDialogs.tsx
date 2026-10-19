@@ -23,6 +23,7 @@ const TYPE_CHIPS: { id: string; label: string; seg?: string; types?: string }[] 
   { id: "etf", label: "ETFs", types: "ETF" },
   { id: "commodity", label: "Commodities", seg: "COM" },
   { id: "currency", label: "Currency", seg: "CD" },
+  { id: "crypto", label: "Crypto", seg: "SPOT" },
 ];
 
 /** Sources: exchange + segment (NFO = NSE F&O, BFO = BSE F&O, CDS = NSE currency). */
@@ -34,9 +35,10 @@ const SOURCES: { v: string; l: string }[] = [
   { v: "NFO", l: "NFO · NSE F&O" },
   { v: "BFO", l: "BFO · BSE F&O" },
   { v: "CDS", l: "CDS · currency" },
+  { v: "CRYPTO", l: "Crypto · Binance (watch only)" },
 ];
 
-const TYPE_BADGE: Record<string, string> = { EQ: "stock", FUT: "futures", CE: "call", PE: "put", IND: "index" };
+const TYPE_BADGE: Record<string, string> = { EQ: "stock", FUT: "futures", CE: "call", PE: "put", IND: "index", CRYPTO: "crypto" };
 const PAGE = 50;
 
 const isEtf = (h: InstrumentHit) => h.instrument_type === "EQ" && /ETF|BEES/i.test(`${h.short_name} ${h.symbol}`);
@@ -61,6 +63,7 @@ export function hitMatches(h: InstrumentHit, chip: string, src: string): boolean
   if (src === "NFO") return h.exchange === "NSE" && fo;
   if (src === "BFO") return h.exchange === "BSE" && fo;
   if (src === "CDS") return h.exchange === "NSE" && cd;
+  if (src === "CRYPTO") return h.exchange === "CRYPTO";
   return true;
 }
 

@@ -98,6 +98,22 @@ async def _fyers_quote(db: Session, sym: str) -> Optional[dict[str, Any]]:
     }
 
 
+
+# MCX / currency / crypto are on the Trade page for charts, quotes and order flow only: crypto can't be routed
+# through Fyers, and MCX / currency P&L needs each contract's multiplier (gold quotes per 10 g against a 1 kg
+# lot), which the scrip master doesn't carry, so paper fills and the app's SL / target would be mis-sized.
+UNTRADABLE_REASON = "charts and data only for now — MCX, currency and crypto orders aren't enabled"
+
+
+def tradable_market(symbol: str) -> bool:
+    from app.services.instrument_master import get_master
+
+    s = symbol.strip().upper()
+    if s.startswith(("CRYPTO:", "MCX:")):
+        return False
+    inst = get_master().get(s)
+    return not (inst is not None and inst.segment == "CD")
+
 def _bus_quote_is_fresh(q: Quote) -> bool:
     """True when a bus quote is recent enough to serve as-is.
 
@@ -273,6 +289,8 @@ async def place_order(
         raise HTTPException(status_code=422, detail="symbol is required")
     if symbol.endswith("-INDEX"):
         raise HTTPException(status_code=422, detail=f"{symbol} is an index — it can't be traded; use its future or an option")
+    if not tradable_market(symbol):
+        raise HTTPException(status_code=422, detail=f"{symbol}: {UNTRADABLE_REASON}")
     if quantity <= 0:
         raise HTTPException(status_code=422, detail="quantity must be > 0")
     # Fyers v3 price requirements by type:

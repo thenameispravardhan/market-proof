@@ -297,6 +297,18 @@ async def market_history(
     if to_ts <= from_ts:
         return {"ok": False, "reason": "empty time range", "candles": []}
 
+    from app.services import crypto
+
+    if crypto.is_crypto(sym):                    # Binance public candles: watch / chart only, never traded
+        try:
+            rows = await crypto.klines(sym, res, from_ts, to_ts)
+        except ValueError as e:
+            return {"ok": False, "reason": str(e), "candles": []}
+        except Exception as e:  # noqa: BLE001
+            log.warning("market.history.crypto_failed", symbol=sym, error=str(e))
+            return {"ok": False, "reason": f"Binance history unavailable: {e!s}"[:120], "candles": []}
+        return {"ok": True, "symbol": sym, "resolution": res, "candles": [r[:6] for r in rows], "reason": None}
+
     # A bare short name ("SBIN", as announcements store it) → "NSE:SBIN-EQ".
     from app.execution.symbols import resolve_fyers_symbol
 
@@ -338,10 +350,12 @@ async def market_history(
 async def market_quotes(symbols: str = "") -> dict[str, Any]:
     """Watchlist: last price / change / % for up to 50 comma-separated
     symbols in one Fyers call. Empty `quotes` when Fyers isn't connected."""
+    from app.services import crypto
+
     syms = list(dict.fromkeys(s.strip().upper() for s in symbols.split(",") if s.strip()))[:50]
-    qs = await fyers_quotes(syms)
-    return {"quotes": {s: {"ltp": q.last_price, "change": q.change, "change_pct": q.change_pct}
-                       for s, q in qs.items()}}
+    qs = await fyers_quotes([s for s in syms if not crypto.is_crypto(s)])
+    return {"quotes": {**{s: {"ltp": q.last_price, "change": q.change, "change_pct": q.change_pct}
+                          for s, q in qs.items()}, **await crypto.quotes(syms)}}
 
 
 _ORDER_TYPES = {1: "LIMIT", 2: "MARKET", 3: "SL-M", 4: "SL-L"}
