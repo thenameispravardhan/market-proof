@@ -273,7 +273,10 @@ def ticks_config(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     syms = body.get("symbols") or []
     if not isinstance(syms, list) or len(syms) > ticks.MAX_SYMBOLS:
         raise HTTPException(422, detail=f"symbols must be a list of at most {ticks.MAX_SYMBOLS}")
-    ticks.recorder().save_config(bool(body.get("enabled", True)), [str(x) for x in syms])
+    keep = body.get("retention_days")
+    if keep is not None and (not isinstance(keep, int) or not 1 <= keep <= 365):
+        raise HTTPException(422, detail="retention_days must be 1-365")
+    ticks.recorder().save_config(bool(body.get("enabled", True)), [str(x) for x in syms], keep)
     return ticks.recorder().status()
 
 

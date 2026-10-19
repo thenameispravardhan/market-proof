@@ -32,6 +32,7 @@ from __future__ import annotations
 import copy
 import itertools
 import math
+import statistics
 from typing import Any, Callable, Optional
 
 from app.algo import fno
@@ -819,7 +820,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                      "risk": lv["sl_dist"] * legs[0]["per_set"] * sets
                      if lv["sl_dist"] and (ref != "u" or inst["type"] != "option") else None,
                      "t": t, "i": i, "day": (t + IST) // 86400, "u0": u, "sets": sets, "margin": margin,
-                     "exit_pending": None}
+                     "exit_pending": None, "mid_bar": u_fill is not None}
         used_margin += margin
         open_n += 1
         open_syms.add(sym)
@@ -833,6 +834,9 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         iv = d["iv"][i] if inst["type"] == "option" else 0.0
         sgn = pos["sign"]
         later = i > pos["i"]
+        # A mid-bar (triggered) fill can't claim the entry bar's favourable
+        # extreme: OHLC doesn't say it came after the fill. Stops still count.
+        fav_ok = later or not pos.get("mid_bar")
         f = lambda u: ref_at(pos, u, t, iv)  # noqa: E731
         stops = [x for x in (pos["sl"], pos["trail"], pos["ref_entry"] if pos["be_on"] else None) if x is not None]
         if stops:
@@ -845,7 +849,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                 return close(sym, o, t, why, i)
             if sgn * (f(u_adv) - stop) <= 0:
                 return close(sym, _solve(f, stop, o, u_adv), t, why, i)
-        if pos["tg"] is not None:
+        if pos["tg"] is not None and fav_ok:
             ro = f(o)
             u_fav = max((h, l), key=lambda u: sgn * f(u))
             if later and sgn * (ro - pos["tg"]) >= 0:
@@ -867,7 +871,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                 why = "MTM_SL"
             if floor is not None and m(lo_u) <= floor:
                 return close(sym, o if m(o) <= floor else _solve(m, floor, o, lo_u), t, why, i)
-            if mtm_rules["target"] and m(hi_u) >= mtm_rules["target"]:
+            if mtm_rules["target"] and fav_ok and m(hi_u) >= mtm_rules["target"]:
                 u_x = o if m(o) >= mtm_rules["target"] else _solve(m, mtm_rules["target"], o, hi_u)
                 return close(sym, u_x, t, "MTM_TARGET", i, slipped=False)
 
@@ -1054,6 +1058,9 @@ def stats(trades: list[dict[str, Any]], capital: float) -> dict[str, Any]:
         "profit_factor": round(gross_win / gross_loss, 2) if gross_loss else (None if not gross_win else 999.0),
         "avg_win": round(gross_win / len(wins), 2) if wins else 0.0,
         "avg_loss": round(-gross_loss / len(losses), 2) if losses else 0.0,
+        # the typical trade, unmoved by one huge winner or loser
+        "median_win": round(statistics.median(wins), 2) if wins else 0.0,
+        "median_loss": round(statistics.median(losses), 2) if losses else 0.0,
         "expectancy": round(net / n, 2) if n else 0.0,
         "largest_win": round(max(nets), 2) if nets else 0.0,
         "largest_loss": round(min(nets), 2) if nets else 0.0,

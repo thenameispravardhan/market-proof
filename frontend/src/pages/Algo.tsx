@@ -973,6 +973,7 @@ function Results({ r }: { r: BtResult }) {
           <Metric label="Charges" value={inr(s.charges)} hint="brokerage, STT, exchange, SEBI, GST, stamp — by segment" />
           <Metric label="Gross P&L" value={inr(s.gross_pnl)} cls={pnlCls(s.gross_pnl)} />
           <Metric label="Avg win / loss" value={`${inr(s.avg_win)} / ${inr(s.avg_loss)}`} />
+          <Metric label="Median win / loss" value={`${inr(s.median_win)} / ${inr(s.median_loss)}`} />
           <Metric label="Largest win / loss" value={`${inr(s.largest_win)} / ${inr(s.largest_loss)}`} />
           <Metric label="Best / worst day" value={`${inr(s.best_day)} / ${inr(s.worst_day)}`} />
           <Metric label="Streaks W / L" value={`${s.max_consecutive_wins} / ${s.max_consecutive_losses}`} />
@@ -1394,7 +1395,7 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
 
 type RecStatus = { enabled: boolean; config_symbols: string[]; strategy_symbols: string[]; subscribed: string[];
   today: Record<string, { ticks: number; trades: number; buy: number; sell: number; last: number }>;
-  days_recorded: Record<string, number>; disk_mb: number };
+  days_recorded: Record<string, number>; disk_mb: number; retention_days?: number; max_symbols?: number };
 
 function RecorderPanel() {
   const qc = useQueryClient();
@@ -1402,9 +1403,9 @@ function RecorderPanel() {
   const [syms, setSyms] = useState<string[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const list = syms ?? st.data?.config_symbols ?? [];
-  const save = async (enabled: boolean, symbols: string[]) => {
+  const save = async (enabled: boolean, symbols: string[], retention_days?: number) => {
     setErr(null);
-    try { await api.put("/api/algo/ticks/config", { enabled, symbols }); setSyms(null); qc.invalidateQueries({ queryKey: ["algo", "ticks"] }); }
+    try { await api.put("/api/algo/ticks/config", { enabled, symbols, ...(retention_days ? { retention_days } : {}) }); setSyms(null); qc.invalidateQueries({ queryKey: ["algo", "ticks"] }); }
     catch (e) { setErr(errMsg(e)); }
   };
   const fmt = (v: number) => Math.round(v).toLocaleString("en-IN");
@@ -1416,11 +1417,21 @@ function RecorderPanel() {
       <div className="algo-operand" style={{ gap: 10 }}>
         <Toggle on={!!st.data?.enabled} onChange={(on: boolean) => save(on, list)} label="recording" />
         <span className="meta">{st.data ? `${st.data.subscribed.length} subscribed · ${st.data.disk_mb} MB on disk` : "…"}</span>
+        <label className="meta" title="Older tick files are deleted after each day's close">
+          Keep{" "}
+          <select value={st.data?.retention_days ?? 30} onChange={(e) => save(st.data?.enabled ?? true, list, Number(e.target.value))} data-testid="ticks-retention">
+            {[7, 15, 30, 60, 90].map((d) => <option key={d} value={d}>{d} days</option>)}
+          </select>
+        </label>
       </div>
       <div className="meta" style={{ margin: "8px 0 4px" }}>Symbols to record ("NIFTY:FUT" = the current NIFTY future, rolls by itself; an index records its future). Symbols of switched-on strategies are added automatically.</div>
       <SymbolPicker value={list} onChange={(v) => setSyms(v)} />
       <div className="algo-operand" style={{ gap: 6, marginTop: 6 }}>
-        {["NIFTY:FUT", "BANKNIFTY:FUT", "FINNIFTY:FUT", "MIDCPNIFTY:FUT", "SENSEX:FUT"].filter((x) => !list.includes(x)).map((x) => (
+        {!list.includes("ALL:FUT") && (
+          <button type="button" className="btn-sm ghost" onClick={() => setSyms([...list, "ALL:FUT"])}
+            title="Every index and stock future (~220), current month, rolling by itself — the order flow an index's chart uses">+ All F&amp;O futures</button>
+        )}
+        {["NIFTY:FUT", "BANKNIFTY:FUT", "FINNIFTY:FUT", "MIDCPNIFTY:FUT", "SENSEX:FUT"].filter((x) => !list.includes(x) && !list.includes("ALL:FUT")).map((x) => (
           <button key={x} type="button" className="btn-sm ghost" onClick={() => setSyms([...list, x])}>+ {x.replace(":FUT", " future")}</button>
         ))}
         {syms && <button type="button" className="primary" onClick={() => save(st.data?.enabled ?? true, list)}>Save list</button>}
