@@ -37,7 +37,7 @@ interface ExtractStats { handed: number; by_status: Record<string, number>; with
 interface Status { settings: Settings; sources: SourceRow[]; known_sources: string[]; extract?: ExtractStats; lag?: Lag & { fastest: string | null }; collector: { polls: number; last_poll_at: number | null; last_poll_ms: number | null };
   watch_stocks?: Record<string, string[]>; kinds?: [string, string][]; source_groups?: [string, string[]][] }
 interface Prefs { notify: boolean; sound: boolean; compact: boolean; summaries: boolean; window: number; group: boolean; threads: boolean;
-  marketOnly: boolean; sort: "latest" | "top" }
+  marketOnly: boolean; sort: "latest" | "top"; region?: "all" | "in" | "global" }
 /** A list row: a story (its reports from several outlets) and, with Prefs.threads, its stock's earlier stories. */
 interface Row { lead: Item; story: Item[]; earlier: Item[] }
 /** How a story's stock moved since it broke (/api/news/reaction): from the last whole minute before it. */
@@ -276,6 +276,7 @@ export default function News() {
     return { leadOf, storyOf, outlets };
   }, [items, mutedRe]);
 
+  const globalSrc = useMemo(() => new Set(status?.source_groups?.find(([g]) => g === "Global")?.[1] ?? []), [status?.source_groups]);
   const shown = useMemo(() => {
     const cut = prefs.window ? Date.now() - prefs.window * 3600_000 : 0;
     const ql = q.trim().toLowerCase();
@@ -286,13 +287,14 @@ export default function News() {
         && !(mutedRe && mutedRe.test(i.title))
         && (!watchOnly || isHit(i))
         && (!prefs.marketOnly || isMarket(i))
+        && (!prefs.region || prefs.region === "all" || globalSrc.has(i.source) === (prefs.region === "global"))
         && (!kindPick.size || !!i.tags?.some((k) => kindPick.has(k)))
         && (!stockPick || !!i.tickers?.includes(stockPick))
         && (!multiOnly || (outlets.get(leadOf.get(i.id) ?? -1) ?? 1) >= 2))
       .sort((a, b) => when(b) - when(a))
       .filter((i) => { const k = `${i.source}|${i.title}`; if (seen.has(k)) return false; seen.add(k); return true; })   // same story in two feeds
       .slice(0, 500);
-  }, [items, deepItems, prefs.window, prefs.marketOnly, picked, q, mutedRe, watchOnly, isHit, kindPick, stockPick, multiOnly, outlets, leadOf]);
+  }, [items, deepItems, prefs.window, prefs.marketOnly, prefs.region, globalSrc, picked, q, mutedRe, watchOnly, isHit, kindPick, stockPick, multiOnly, outlets, leadOf]);
 
   // The list, one row per story: its earliest headline the filters let through, placed at that time (a later
   // outlet picking the story up adds to its sources instead of pushing it back to the top as news).
@@ -560,6 +562,12 @@ export default function News() {
           <button type="button" className={`chip${prefs.sort === "latest" ? " on" : ""}`} onClick={() => setPrefs({ sort: "latest" })} title="Newest first">Latest</button>
           <button type="button" className={`chip${prefs.sort === "top" ? " on" : ""}`} onClick={() => setPrefs({ sort: "top" })}
             title="Most important first: kind, outlets, stock size, watchlist, breaking; fading over 6 h (hover a ★ for the parts)">Top</button>
+        </span>
+        <span className="seg" role="group" aria-label="Region">
+          {([["all", "All"], ["in", "Indian"], ["global", "Global"]] as const).map(([v, l]) => (
+            <button key={v} type="button" className={`chip${(prefs.region ?? "all") === v ? " on" : ""}`} onClick={() => setPrefs({ region: v })}
+              title={v === "global" ? "World markets: Fed, CNBC, MarketWatch, BBC, Nikkei, OilPrice" : v === "in" ? "Indian outlets, exchanges and regulators" : "Every source"} data-testid={`news-region-${v}`}>{l}</button>
+          ))}
         </span>
         <Toggle size="sm" on={prefs.marketOnly} onChange={(v) => setPrefs({ marketOnly: v })} label="Market news only"
           title="Only headlines that name a listed stock or a news type (results, orders, deals...). The rest stay stored." />

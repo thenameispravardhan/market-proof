@@ -2192,7 +2192,8 @@ kbd {
 .tv-top-tools { display: inline-flex; gap: 4px; align-items: center; }
 .tv-top-tools .btn-sm { white-space: nowrap; }
 .tv-top-pop-wrap { position: relative; }
-.tv-top-pop { right: auto; left: 0; top: calc(100% + 4px); max-height: 70vh; }
+.tv-topbar { position: relative; z-index: 40; }   /* its pop-ups open over the charts below */
+.tv-rail-pop.tv-top-pop { right: auto; left: 0; top: calc(100% + 4px); max-height: 75vh; }
 .tv-rail-btn { display: flex; flex-direction: column; align-items: center; gap: 3px; padding: 8px 0 6px; background: transparent; border: 0; border-radius: 4px; color: var(--text-dim); cursor: pointer; }
 .tv-rail-btn .ico { font-size: 16px; line-height: 1; }
 .tv-rail-btn .lbl { font-size: 9px; letter-spacing: 0.04em; text-transform: uppercase; }
@@ -2679,6 +2680,25 @@ div.ind-row { cursor: default; }
 .tv-grid.l7 > .tv-cell { grid-column: span 3; }
 .tv-grid.l7 > .tv-cell:nth-child(-n + 3) { grid-column: span 4; }
 .tv-grid.l8v { grid-template: repeat(4, 1fr) / 1fr 1fr; }
+.tv-grid.l9 { grid-template: repeat(3, 1fr) / repeat(3, 1fr); }
+.tv-grid.l10 { grid-template: 1fr 1fr / repeat(5, 1fr); }
+.tv-grid.l12 { grid-template: repeat(3, 1fr) / repeat(4, 1fr); }
+.tv-grid.l14 { grid-template: 1fr 1fr / repeat(7, 1fr); }
+.tv-grid.l16 { grid-template: repeat(4, 1fr) / repeat(4, 1fr); }
+/* Layout picker (TradingView-style): a row per chart count, icons drawn by the grid CSS itself. */
+.tv-rail-pop.tv-top-pop.layout-pop { min-width: 300px; padding: 6px 10px; }
+.lay-row { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; padding: 5px 0; border-bottom: 1px solid var(--border); }
+.lay-n { width: 18px; color: var(--text-dim); font-size: 11px; }
+.lay-btn { padding: 4px; background: transparent; border: 0; border-radius: 4px; cursor: pointer; }
+.lay-btn:hover { background: var(--bg-elev); }
+.lay-btn.on { background: var(--text); }
+.lay-btn.on .lay-ico { border-color: var(--bg-panel); }
+.lay-btn.on .lay-ico .tv-cell { border-color: var(--bg-panel); }
+.lay-ico.tv-grid { display: grid; width: 22px; height: 16px; gap: 0; border: 1.5px solid var(--text-dim); border-radius: 3px; overflow: hidden; }
+.lay-ico .tv-cell { border: 0.75px solid var(--text-dim); min-width: 0; min-height: 0; }
+.lay-btn:hover .lay-ico, .lay-btn:hover .lay-ico .tv-cell { border-color: var(--text); }
+.lay-sync { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 6px 0; font-size: 12px; color: var(--text); }
+.lay-info { display: inline-grid; place-items: center; width: 13px; height: 13px; margin-left: 4px; border-radius: 50%; background: var(--text-faint); color: var(--bg-panel); font-size: 9px; font-weight: 700; cursor: help; }
 .tv-sync { border-top: 1px solid var(--border); margin-top: 4px; padding-top: 2px; }
 .tv-rangeslot:empty { display: none; }
 .tv-rangeslot { flex-shrink: 0; background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; }
@@ -3185,3 +3205,5 @@ a.news-title:hover { color: var(--accent); text-decoration: underline; }
 .news-more { display: block; margin-top: 6px; padding: 0; border: 0; background: none; color: var(--text-dim); font-size: 11px; cursor: pointer; }
 .news-more:hover { color: var(--accent); }
 .news-group-btns { display: flex; gap: 6px; margin-bottom: 4px; }
+.lay-ico .tv-cell { border-radius: 0; }
+.chart-menu.tools-menu { max-height: min(70vh, 560px); overflow-y: auto; overscroll-behavior: contain; min-width: 240px; }

@@ -886,7 +886,12 @@ export default function ChartPanel(props: ChartPanelProps) {
   const [showFavBar, setShowFavBar] = useState(prefs.showFavBar ?? false);
   const [toolsCollapsed, setToolsCollapsed] = useState(prefs.toolsCollapsed ?? false);
   // TradingView / Fyers pin these to the top bar out of the box
-  const [pinnedTools, setPinnedTools] = useState<string[]>(prefs.pinnedTools ?? ["flow", "scalper", "positions", "chain", "replay"]);
+  // Nothing pinned by default — every tool lives in Tools ▾ (★ pins one back). A saved
+  // list equal to the old default is that default, not a choice.
+  const [pinnedTools, setPinnedTools] = useState<string[]>(() => {
+    const p = prefs.pinnedTools ?? [];
+    return p.join() === "flow,scalper,positions,chain,replay" ? [] : p;
+  });
 
   // ---- state: transient ----
   const [drawMode, setDrawModeState] = useState<DrawMode>(null);
@@ -2835,9 +2840,8 @@ export default function ChartPanel(props: ChartPanelProps) {
     // drag turns Auto off and moves the prices (TradingView behaviour).
     if (autoScaleRef.current) {
       const h = paneDims().height;
-      const top = safe(() => mainRef.current?.coordinateToPrice(0) as number | null, null);
-      const bot = safe(() => mainRef.current?.coordinateToPrice(h) as number | null, null);
-      if (top != null && bot != null && h > 0) vPanRef.current = { y: e.clientY, top, bot, h, on: false };
+      const vr = safe(() => mainRef.current?.priceScale().getVisibleRange() ?? null, null);   // margins excluded, like setVisibleRange
+      if (vr && h > 0) vPanRef.current = { y: e.clientY, top: vr.to, bot: vr.from, h, on: false };
     }
   }
 
@@ -3305,8 +3309,35 @@ export default function ChartPanel(props: ChartPanelProps) {
     if (e.touches.length === 0) touchRef.current = { mode: null, x: 0, dist: 0 };
   }
 
-  const implRef = useRef({ onCrosshair, onVisibleRange, onKeyDown, onHostMouseDown, onHostMouseUp, onWindowMouseMove, onWindowMouseUp, onHostDblClick, onTouch });
-  implRef.current = { onCrosshair, onVisibleRange, onKeyDown, onHostMouseDown, onHostMouseUp, onWindowMouseMove, onWindowMouseUp, onHostDblClick, onTouch };
+  /** Two-finger scroll / wheel over the PRICE SCALE squashes (up) or
+   *  stretches (down) the prices around the middle; Auto turns off. Over the
+   *  plot it still zooms time (the engine's own wheel handling). */
+  function onHostWheel(e: WheelEvent): void {
+    const host = containerRef.current;
+    const main = mainRef.current;
+    if (!host || !main || !e.deltaY) return;
+    const r = host.getBoundingClientRect();
+    const x = e.clientX - r.left, y = e.clientY - r.top;
+    const dims = paneDims();
+    const left = paneLeft();
+    const onScale = settingsRef.current.scaleSide === "left" ? x < left : x > left + dims.width;
+    if (!onScale || y < 0 || y > dims.height) return;
+    e.preventDefault();
+    e.stopPropagation();
+    // The engine's range, NOT the pane edges: it excludes the scale margins.
+    const vr = safe(() => main.priceScale().getVisibleRange());
+    if (!vr) return;
+    const f = Math.min(1.5, Math.max(0.66, Math.exp(-e.deltaY * 0.002)));
+    const mid = (vr.from + vr.to) / 2, half = (Math.abs(vr.to - vr.from) / 2) * f;
+    if (autoScaleRef.current) {
+      safe(() => main.priceScale().applyOptions({ autoScale: false }));
+      setAutoScale(false);
+    }
+    safe(() => main.priceScale().setVisibleRange({ from: mid - half, to: mid + half }));
+  }
+
+  const implRef = useRef({ onCrosshair, onVisibleRange, onKeyDown, onHostMouseDown, onHostMouseUp, onWindowMouseMove, onWindowMouseUp, onHostDblClick, onTouch, onHostWheel });
+  implRef.current = { onCrosshair, onVisibleRange, onKeyDown, onHostMouseDown, onHostMouseUp, onWindowMouseMove, onWindowMouseUp, onHostDblClick, onTouch, onHostWheel };
 
   // ------------------------------------------------------------------
   // Effects
@@ -3365,6 +3396,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     const winMoveH = (e: MouseEvent) => implRef.current.onWindowMouseMove(e);
     const winUpH = () => implRef.current.onWindowMouseUp();
     const touchH = (e: TouchEvent) => implRef.current.onTouch(e);
+    const wheelH = (e: WheelEvent) => implRef.current.onHostWheel(e);
     safe(() => chart.subscribeCrosshairMove(moveH));
     safe(() => chart.timeScale().subscribeVisibleLogicalRangeChange(rangeH));
     window.addEventListener("keydown", keyH);
@@ -3372,6 +3404,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     el.addEventListener("mousedown", downH, true);
     el.addEventListener("mouseup", upH, true);
     el.addEventListener("dblclick", dblH, true);
+    el.addEventListener("wheel", wheelH, { capture: true, passive: false });
     for (const ev of ["touchstart", "touchmove", "touchend", "touchcancel"]) el.addEventListener(ev, touchH as EventListener, { capture: true, passive: false });
     window.addEventListener("mousemove", winMoveH);
     window.addEventListener("mouseup", winUpH);
@@ -3381,6 +3414,7 @@ export default function ChartPanel(props: ChartPanelProps) {
       el.removeEventListener("mousedown", downH, true);
       el.removeEventListener("mouseup", upH, true);
       el.removeEventListener("dblclick", dblH, true);
+      el.removeEventListener("wheel", wheelH, true);
       for (const ev of ["touchstart", "touchmove", "touchend", "touchcancel"]) el.removeEventListener(ev, touchH as EventListener, true);
       window.removeEventListener("mousemove", winMoveH);
       window.removeEventListener("mouseup", winUpH);
@@ -4658,6 +4692,13 @@ export default function ChartPanel(props: ChartPanelProps) {
     }`;
 
   // Controls render inline, into a shared slot (layouts), or not at all.
+  // The Trade page's global settings menu opens the ACTIVE chart's settings.
+  useEffect(() => {
+    if (!chrome) return;
+    const on = () => setDialog({ k: "settings" });
+    window.addEventListener("chart:settings", on);
+    return () => window.removeEventListener("chart:settings", on);
+  }, [chrome]);
   const placeChrome = (el: ReactNode, slot: HTMLElement | null | undefined) => (!chrome ? null : slot ? createPortal(el, slot) : el);
 
   function openCtx(e: React.MouseEvent): void {
@@ -5629,20 +5670,6 @@ export default function ChartPanel(props: ChartPanelProps) {
   const toolbar = (
     <div className={`chart-toolbar-wrap${tbScroll.left || tbScroll.right ? " scrolls" : ""}`}>
     <div className="chart-toolbar" data-testid="chart-toolbar" ref={toolbarRef} onScroll={() => { measureToolbar(); positionToolbarMenu(); }}>
-      {onAction && (
-        <div className="chart-group chart-menu-wrap">
-          <button type="button" className={`chart-btn tb-logo${menuOpen === "products" ? " on" : ""}`} onClick={menuBtn("products")} title="Products" data-testid="chart-products">◆▾</button>
-          {menuOpen === "products" && (
-            <div className="chart-menu cdrop" data-testid="products-menu">
-              <div className="chart-menu-head">Fyers products</div>
-              <a className="chart-menu-item" href="https://trade.fyers.in/" target="_blank" rel="noopener noreferrer" onClick={() => setMenuOpen(null)}>FYERS Web ↗</a>
-              <button type="button" className="chart-menu-item" onClick={() => { setMenuOpen(null); onAction("panel:flow"); }}>Smart Charts (order flow)</button>
-              <button type="button" className="chart-menu-item" onClick={() => { setMenuOpen(null); onAction("scalper"); }}>Option Scalper</button>
-              <button type="button" className="chart-menu-item" onClick={() => { setMenuOpen(null); setDialog({ k: "whatsnew" }); }} data-testid="whats-new">What's New</button>
-            </div>
-          )}
-        </div>
-      )}
       <button type="button" className="chart-btn chart-sym-btn" onClick={() => setDialog({ k: "symbol", q: shortName ?? "", select: true })} title={onSymbolChange ? "Symbol search (type on the chart)" : symbol} disabled={!onSymbolChange} data-testid="chart-symbol">
         <span className="ico">⌕</span><span className="sym">{shortName}</span>
       </button>
@@ -5811,24 +5838,6 @@ export default function ChartPanel(props: ChartPanelProps) {
       <button type="button" className={`chart-btn${dialog?.k === "indicators" ? " on" : ""}`} onClick={() => setDialog({ k: "indicators" })} title="Indicators, metrics & strategies ( / )" data-testid="chart-indicators-btn">
         ƒx Indicators
       </button>
-      <div className="chart-group chart-menu-wrap">
-        <button type="button" className="chart-btn" onClick={menuBtn("templates")} title="Indicator templates" data-testid="chart-templates-btn">▦</button>
-        {menuOpen === "templates" && (
-          <div className="chart-menu">
-            <button type="button" className="chart-menu-item" onClick={saveIndTemplate} data-testid="chart-template-save">Save indicator template…</button>
-            {templates.length > 0 && <div className="chart-menu-sep" />}
-            {templates.map((t) => (
-              <div key={t.name} className="chart-menu-row">
-                <button type="button" className="chart-menu-item" onClick={() => applyIndTemplate(t)} title={templateScope(t, intervalLongLabel) ? `Also switches to ${templateScope(t, intervalLongLabel)}` : undefined}>
-                  {t.name} <span className="hint">{t.items.length}{templateScope(t, intervalLabel) ? ` · ${templateScope(t, intervalLabel)}` : ""}</span>
-                </button>
-                <button type="button" className="chart-menu-x" title="Rename template" onClick={() => renameIndTemplate(t)} data-testid={`chart-template-rename-${t.name}`}>✎</button>
-                <button type="button" className="chart-menu-x" title="Delete template" onClick={() => deleteIndTemplate(t.name)}>✕</button>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
       <span className="chart-tsep" />
       {onChartOrder && (
         <button
@@ -5848,26 +5857,6 @@ export default function ChartPanel(props: ChartPanelProps) {
           ⚡<span className={`qt-switch${instant ? " on" : ""}`} aria-hidden="true"><i /></span>
         </button>
       )}
-      {/* alerts */}
-      <div className="chart-group chart-menu-wrap">
-        <button type="button" className={`chart-btn${drawMode === "alert" || alerts.some((a) => a.active) ? " on" : ""}`} onClick={menuBtn("alerts")} title="Alerts" data-testid="chart-alerts-btn">
-          🔔{alerts.filter((a) => a.active).length > 0 ? ` ${alerts.filter((a) => a.active).length}` : ""}
-        </button>
-        {menuOpen === "alerts" && (
-          <div className="chart-menu" data-testid="chart-alerts-menu">
-            <button type="button" className="chart-menu-item" onClick={() => { setMenuOpen(null); setDrawMode("alert"); }} data-testid="chart-alert-add">⊕ Add alert (click a price)</button>
-            <button type="button" className="chart-menu-item" onClick={() => { setMenuOpen(null); openAlertDialog(); }} data-testid="chart-alert-create">Create alert…<span className="kbd">Alt+A</span></button>
-            {onAction && <button type="button" className="chart-menu-item" onClick={() => { setMenuOpen(null); onAction("panel:alerts"); }}>Alerts manager & log</button>}
-            {alerts.length > 0 && <div className="chart-menu-sep" />}
-            {alerts.map((a) => (
-              <div key={a.id} className={`chart-menu-row${a.active ? "" : " off"}`}>
-                <button type="button" className="chart-menu-item" onClick={() => { setMenuOpen(null); setDialog({ k: "alert", alert: a }); }}>{describeCond(a)}</button>
-                <button type="button" className="chart-menu-x" onClick={() => removeAlert(a.id)} title="Remove alert" data-testid={`chart-alert-del-${a.id}`}>✕</button>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
       {pinnedTools.map((id) => {
         const t = TOOLS_MENU.find((x) => x.id === id);
         if (!t || (t.host && !onAction)) return null;
@@ -5886,9 +5875,50 @@ export default function ChartPanel(props: ChartPanelProps) {
         );
       })}
       <div className="chart-group chart-menu-wrap">
-        <button type="button" className={`chart-btn${menuOpen === "tools" ? " on" : ""}`} onClick={menuBtn("tools")} title="Tools" data-testid="chart-tools-menu">Tools ▾</button>
+        <button type="button" className={`chart-btn${menuOpen === "tools" ? " on" : ""}`} onClick={menuBtn("tools")} title="Tools — alerts, templates, snapshot, undo, settings and every other feature" data-testid="chart-tools-menu">Tools{alerts.some((a) => a.active) ? ` 🔔${alerts.filter((a) => a.active).length}` : ""} ▾</button>
         {menuOpen === "tools" && (
-          <div className="chart-menu">
+          <div className="chart-menu tools-menu" data-testid="chart-tools-list">
+            <div className="chart-menu-head">Alerts</div>
+            <div data-testid="chart-alerts-menu">
+            <button type="button" className="chart-menu-item" onClick={() => { setMenuOpen(null); setDrawMode("alert"); }} data-testid="chart-alert-add">⊕ Add alert (click a price)</button>
+            <button type="button" className="chart-menu-item" onClick={() => { setMenuOpen(null); openAlertDialog(); }} data-testid="chart-alert-create">Create alert…<span className="kbd">Alt+A</span></button>
+            {onAction && <button type="button" className="chart-menu-item" onClick={() => { setMenuOpen(null); onAction("panel:alerts"); }}>Alerts manager & log</button>}
+            {alerts.length > 0 && <div className="chart-menu-sep" />}
+            {alerts.map((a) => (
+              <div key={a.id} className={`chart-menu-row${a.active ? "" : " off"}`}>
+                <button type="button" className="chart-menu-item" onClick={() => { setMenuOpen(null); setDialog({ k: "alert", alert: a }); }}>{describeCond(a)}</button>
+                <button type="button" className="chart-menu-x" onClick={() => removeAlert(a.id)} title="Remove alert" data-testid={`chart-alert-del-${a.id}`}>✕</button>
+              </div>
+            ))}
+            </div>
+            <div className="chart-menu-sep" />
+            <div className="chart-menu-head">Chart</div>
+            <button type="button" className="chart-menu-item" onClick={() => { setMenuOpen(null); setDialog({ k: "settings" }); }} data-testid="chart-settings-btn">⚙ Chart settings…</button>
+            <button type="button" className="chart-menu-item" disabled={!canUndo} onClick={undo} title={canUndo ? `Undo ${undoLabel} (Ctrl+Z)` : "Nothing to undo"} data-testid="chart-undo">↶ Undo<span className="kbd">Ctrl+Z</span></button>
+            <button type="button" className="chart-menu-item" disabled={!canRedo} onClick={redo} title={canRedo ? `Redo ${redoLabel} (Ctrl+Y)` : "Nothing to redo"} data-testid="chart-redo">↷ Redo<span className="kbd">Ctrl+Y</span></button>
+            {onAction && <button type="button" className="chart-menu-item" onClick={() => { setMenuOpen(null); onAction("scalper"); }}>⚡ Option scalper</button>}
+            <div className="chart-menu-sep" />
+            <div className="chart-menu-head">Indicator templates</div>
+            <button type="button" className="chart-menu-item" onClick={saveIndTemplate} data-testid="chart-template-save">Save indicator template…</button>
+            {templates.length > 0 && <div className="chart-menu-sep" />}
+            {templates.map((t) => (
+              <div key={t.name} className="chart-menu-row">
+                <button type="button" className="chart-menu-item" onClick={() => applyIndTemplate(t)} title={templateScope(t, intervalLongLabel) ? `Also switches to ${templateScope(t, intervalLongLabel)}` : undefined}>
+                  {t.name} <span className="hint">{t.items.length}{templateScope(t, intervalLabel) ? ` · ${templateScope(t, intervalLabel)}` : ""}</span>
+                </button>
+                <button type="button" className="chart-menu-x" title="Rename template" onClick={() => renameIndTemplate(t)} data-testid={`chart-template-rename-${t.name}`}>✎</button>
+                <button type="button" className="chart-menu-x" title="Delete template" onClick={() => deleteIndTemplate(t.name)}>✕</button>
+              </div>
+            ))}
+            <div className="chart-menu-sep" />
+            <div className="chart-menu-head">Snapshot</div>
+            <button type="button" className="chart-menu-item" onClick={() => void takeSnapshot("download")} data-testid="chart-snapshot-download">Download image<span className="kbd">Ctrl+Alt+S</span></button>
+            <button type="button" className="chart-menu-item" onClick={() => void takeSnapshot("copy")}>Copy image<span className="kbd">Ctrl+Shift+S</span></button>
+            <button type="button" className="chart-menu-item" onClick={() => void takeSnapshot("link")} data-testid="chart-snapshot-link">Copy link<span className="kbd">Alt+S</span></button>
+            <button type="button" className="chart-menu-item" onClick={() => void takeSnapshot("open")}>Open in new tab</button>
+            <button type="button" className="chart-menu-item" onClick={() => void takeSnapshot("tweet")}>Tweet image</button>
+            <div className="chart-menu-sep" />
+            <div className="chart-menu-head">More tools</div>
             {TOOLS_MENU.filter((t) => !t.host || onAction).map((t) => (
               <div key={t.id} className="chart-menu-row">
                 {t.href ? (
@@ -5905,36 +5935,29 @@ export default function ChartPanel(props: ChartPanelProps) {
                 {star(pinnedTools.includes(t.id), () => setPinnedTools((l) => toggleIn(l, t.id)), `Pin ${t.label}`)}
               </div>
             ))}
+            {onAction && (
+              <>
+                <div className="chart-menu-sep" />
+                <div className="chart-menu-head">Fyers products</div>
+                        <a className="chart-menu-item" href="https://trade.fyers.in/" target="_blank" rel="noopener noreferrer" onClick={() => setMenuOpen(null)}>FYERS Web ↗</a>
+            <button type="button" className="chart-menu-item" onClick={() => { setMenuOpen(null); onAction("panel:flow"); }}>Smart Charts (order flow)</button>
+            <button type="button" className="chart-menu-item" onClick={() => { setMenuOpen(null); onAction("scalper"); }}>Option Scalper</button>
+            <button type="button" className="chart-menu-item" onClick={() => { setMenuOpen(null); setDialog({ k: "whatsnew" }); }} data-testid="whats-new">What's New</button>
+
+                <button type="button" className="chart-menu-item" onClick={() => { setMenuOpen(null); onAction("logout"); }} title="Logout from the trading terminal (disconnects Fyers)" data-testid="chart-logout">⏻ Logout</button>
+              </>
+            )}
           </div>
         )}
       </div>
-      <span className="chart-tsep" />
-      <button type="button" className="chart-btn" disabled={!canUndo} onClick={undo} title={canUndo ? `Undo ${undoLabel} (Ctrl+Z)` : "Nothing to undo"} data-testid="chart-undo">↶</button>
-      <button type="button" className="chart-btn" disabled={!canRedo} onClick={redo} title={canRedo ? `Redo ${redoLabel} (Ctrl+Y)` : "Nothing to redo"} data-testid="chart-redo">↷</button>
       <div className="chart-group chart-right" role="group" aria-label="chart controls">
         <button type="button" className="chart-btn" onClick={() => setDialog({ k: "palette" })} title="Quick search (Ctrl+K)" data-testid="chart-quick-search">⌕</button>
-        <button type="button" className="chart-btn" onClick={() => setDialog({ k: "settings" })} title="Settings" data-testid="chart-settings-btn">⚙</button>
         {multi && onAction && (
           <button type="button" className={`chart-btn${maximized ? " on" : ""}`} onClick={() => onAction("maximize")} title={maximized ? "Restore chart (Alt+Enter)" : "Maximize chart (Alt+Enter)"} data-testid="chart-maximize">{maximized ? "❐" : "⬚"}</button>
         )}
         <button type="button" className={`chart-btn${fullscreen ? " on" : ""}`} onClick={toggleFullscreen} title={fullscreen ? "Exit fullscreen (Esc)" : "Fullscreen (Shift+F)"} data-testid="chart-fullscreen-btn">
           {fullscreen ? "🗕" : "⛶"}
         </button>
-        <div className="chart-menu-wrap">
-          <button type="button" className="chart-btn" onClick={menuBtn("snapshot")} title="Take a snapshot" data-testid="chart-screenshot">📷</button>
-          {menuOpen === "snapshot" && (
-            <div className="chart-menu cdrop right">
-              <button type="button" className="chart-menu-item" onClick={() => void takeSnapshot("download")} data-testid="chart-snapshot-download">Download image<span className="kbd">Ctrl+Alt+S</span></button>
-              <button type="button" className="chart-menu-item" onClick={() => void takeSnapshot("copy")}>Copy image<span className="kbd">Ctrl+Shift+S</span></button>
-              <button type="button" className="chart-menu-item" onClick={() => void takeSnapshot("link")} data-testid="chart-snapshot-link">Copy link<span className="kbd">Alt+S</span></button>
-              <button type="button" className="chart-menu-item" onClick={() => void takeSnapshot("open")}>Open in new tab</button>
-              <button type="button" className="chart-menu-item" onClick={() => void takeSnapshot("tweet")}>Tweet image</button>
-            </div>
-          )}
-        </div>
-        {onAction && (
-          <button type="button" className="chart-btn" onClick={() => onAction("logout")} title="Logout from the trading terminal (disconnects Fyers)" data-testid="chart-logout">⏻</button>
-        )}
       </div>
     </div>
       {tbScroll.left && (

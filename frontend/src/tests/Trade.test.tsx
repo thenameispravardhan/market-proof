@@ -1298,7 +1298,7 @@ describe("Trade page", () => {
     globalThis.fetch = makeFetchStub(defaultStubs());
     const user = userEvent.setup();
     await openReliance(user);
-    await user.click(screen.getByTestId("chart-alerts-btn"));
+    await user.click(screen.getByTestId("chart-tools-menu"));     // alerts live in Tools now
     await user.click(await screen.findByTestId("chart-alert-create"));
     await user.selectOptions(await screen.findByLabelText("Condition"), "crossUp");
     await user.selectOptions(screen.getByLabelText("Trigger"), "oncePerBar");
@@ -1314,7 +1314,8 @@ describe("Trade page", () => {
     globalThis.fetch = makeFetchStub(defaultStubs());
     const user = userEvent.setup();
     await openReliance(user);
-    await user.click(screen.getByTestId("chart-settings-btn"));
+    await user.click(screen.getByTestId("chart-tools-menu"));
+    await user.click(await screen.findByTestId("chart-settings-btn"));
     await user.click(await screen.findByRole("tab", { name: "Canvas" }));
     await user.selectOptions(screen.getByLabelText("Grid lines"), "horz");
     await user.click(screen.getByTestId("chart-settings-ok"));

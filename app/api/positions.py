@@ -89,6 +89,10 @@ async def update_levels(
 ) -> dict[str, Any]:
     """Edit the stop-loss / target of an open position so the trade
     manager exits on the new levels. Pass null for a level to clear it."""
+    from app.api.orders import snap_tick
+
+    body.stop_loss = snap_tick(symbol, body.stop_loss) if body.stop_loss else body.stop_loss
+    body.target = snap_tick(symbol, body.target) if body.target else body.target
     if practice:
         from app.api import practice as practice_mod
         return {"ok": True, "managed": await practice_mod.set_levels(symbol, body.stop_loss, body.target)}

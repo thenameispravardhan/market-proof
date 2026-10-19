@@ -37,10 +37,12 @@ from __future__ import annotations
 import csv
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
+
+_IST = timezone(timedelta(hours=5, minutes=30))
 
 
 # Where the daily CSVs land. Created on first call.
@@ -393,6 +395,10 @@ class InstrumentMaster:
         self._by_symbol: dict[str, Instrument] = {}
         self._by_short: dict[str, list[Instrument]] = {}
         self._by_underlying: dict[str, list[Instrument]] = {}
+        # Option contracts from the F&O masters as bare tuples (symbol, strike,
+        # CE/PE, expiry epoch, lot, tick), by underlying: ~90k contracts would
+        # cost far more as Instruments. Search builds Instruments for hits only.
+        self._options: dict[str, list[tuple[str, float, str, int, int, float]]] = {}
         self.reload()
 
     def reload(self) -> int:
@@ -401,6 +407,8 @@ class InstrumentMaster:
         self._by_symbol.clear()
         self._by_short.clear()
         self._by_underlying.clear()
+        self._options = {}
+        now = datetime.now().timestamp() - 86400
         for inst in _seed_instruments():
             self._add(inst)
         if self._data_dir.is_dir():
@@ -413,6 +421,16 @@ class InstrumentMaster:
                             # (symbol ticker at col 9) vs the simple legacy
                             # format the seed/tests use.
                             if len(row) >= 17 and ":" in (row[9] or ""):
+                                if row[16].strip().upper() in ("CE", "PE"):
+                                    try:
+                                        exp = int(row[8])
+                                        if exp > now:
+                                            self._options.setdefault(row[13].strip().upper(), []).append((
+                                                row[9].strip(), float(row[15]), row[16].strip().upper(), exp,
+                                                int(float(row[3] or 1)), float(row[4] or 0.05)))
+                                    except (ValueError, IndexError):
+                                        pass
+                                    continue
                                 inst = _fyers_csv_row_to_instrument(row)
                             else:
                                 inst = _row_to_instrument(row)
@@ -463,7 +481,49 @@ class InstrumentMaster:
         return len(self._by_symbol)
 
     def get(self, symbol: str) -> Optional[Instrument]:
-        return self._by_symbol.get(symbol)
+        hit = self._by_symbol.get(symbol)
+        if hit is None and symbol.endswith(("CE", "PE")) and ":" in symbol:
+            core = symbol.split(":", 1)[1]
+            for u in sorted(self._options, key=len, reverse=True):
+                if core.startswith(u):
+                    hit = next((self._opt(u, r) for r in self._options[u] if r[0] == symbol), None)
+                    break
+        return hit
+
+    def _opt(self, underlying: str, r: tuple[str, float, str, int, int, float]) -> Instrument:
+        sym, strike, typ, exp, lot, tick = r
+        return Instrument(symbol=sym, short_name=underlying, exchange=sym.split(":", 1)[0], segment="FO",
+                          instrument_type=typ, lot_size=lot, tick_size=tick, strike=strike,
+                          expiry=datetime.fromtimestamp(exp, _IST).replace(tzinfo=None), underlying=underlying)
+
+    def _search_words(self, q: str, limit: int, keep: Callable[[Instrument], bool]) -> list[Instrument]:
+        """Several words ("NIFTY FUT", "NIFTY 23100 PE", "NIFTY23100CE",
+        "RELIANCE OCT FUT"): options by underlying + strike + side, nearest
+        expiry first; everything else when every word is in its id or name."""
+        m = re.fullmatch(r"([A-Z&-]+?)(\d+(?:\.\d+)?)(CE|PE)", q.replace(" ", ""))
+        words = [m.group(1), m.group(2), m.group(3)] if m else q.split()
+        u, rest = words[0], words[1:]
+        u = {"NIFTY50": "NIFTY", "NIFTYBANK": "BANKNIFTY"}.get(u, u)
+        out: list[Instrument] = []
+        if u in self._options:
+            num = next((w for w in rest if re.fullmatch(r"\d+(?:\.\d+)?", w)), None)
+            side = next((w for w in rest if w in ("CE", "PE", "CALL", "PUT")), None)
+            side = {"CALL": "CE", "PUT": "PE"}.get(side or "", side)
+            other = [w for w in rest if w not in (num, side, "CALL", "PUT")]
+            rows = [r for r in self._options[u]
+                    if (side is None or r[2] == side)
+                    and (num is None or f"{r[1]:g}".startswith(num))
+                    and all(w in r[0] for w in other)]
+            want = float(num) if num else 0.0
+            rows.sort(key=lambda r: (r[3], abs(r[1] - want), r[2]))
+            out = [i for i in (self._opt(u, r) for r in rows[: limit * 3]) if keep(i)][:limit]
+        if len(out) < limit and len(words) > 1 and "CE" not in words and "PE" not in words:
+            more = [i for i in self._by_symbol.values()
+                    if all(w in f"{i.symbol} {i.short_name} {i.name} {i.instrument_type}".upper() for w in words) and keep(i)]
+            # "NIFTY FUT": NIFTY's own futures before BANKNIFTY / FINNIFTY, nearest expiry first
+            more.sort(key=lambda i: (i.short_name != u, not i.short_name.startswith(u), i.expiry or datetime.min))
+            out += more[: limit - len(out)]
+        return out
 
     def search(
         self,
@@ -558,7 +618,11 @@ class InstrumentMaster:
             if len(sub) >= limit - len(exact) - len(prefix):
                 break
 
-        return (exact + prefix + sub)[:limit]
+        found = (exact + prefix + sub)[:limit]
+        if len(found) < limit and (" " in q or re.search(r"\d(CE|PE)$", q) or q in self._options):
+            have = {i.symbol for i in found}
+            found += [i for i in self._search_words(q, limit, keep) if i.symbol not in have][: limit - len(found)]
+        return found
 
     def option_chain(
         self,

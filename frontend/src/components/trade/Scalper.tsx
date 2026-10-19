@@ -56,6 +56,9 @@ export function splitDrag(e: React.PointerEvent, axis: "x" | "y", set: (f: numbe
   window.addEventListener("pointerup", up);
 }
 
+/** Drag payload for an instrument (watchlist row, option chain cell). */
+export const DRAG_MIME = "application/x-tradebot-instrument";
+
 export default function Scalper({
   base,
   underlyings,
@@ -70,7 +73,10 @@ export default function Scalper({
   onInstant,
   settings,
   showPlus,
+  onClose,
 }: {
+  /** Back to the normal chart layout. */
+  onClose: () => void;
   base: InstrumentHit | null;
   underlyings: InstrumentHit[];
   onBase: (h: InstrumentHit) => void;
@@ -83,7 +89,7 @@ export default function Scalper({
   /** Trading setting: no confirm per order (also arms the hotkeys). */
   instant: boolean;
   onInstant: (v: boolean) => void;
-  /** The settings menu, shown at the end of the shared top bar. */
+  /** Paper / Fyers, Layout, Scalp toggle and settings, shown at the end of the top bar. */
   settings: ReactNode;
   showPlus: boolean;
 }) {
@@ -189,8 +195,23 @@ export default function Scalper({
     return () => window.removeEventListener("keydown", onKey);
   });
 
+  // An option dragged from the chain onto the scalper becomes that leg; a stock / index, the underlying.
+  const onDrop = (e: React.DragEvent) => {
+    const raw = e.dataTransfer.getData(DRAG_MIME);
+    if (!raw) return;
+    e.preventDefault();
+    try {
+      const h = JSON.parse(raw) as { symbol: string };
+      const t = /CE$/i.test(h.symbol) ? "CE" : /PE$/i.test(h.symbol) ? "PE" : null;
+      if (!t) return onBase(h as InstrumentHit);
+      if (!strikes.some((r) => (t === "CE" ? r.ce : r.pe)?.symbol === h.symbol)) return setMsg(`✕ ${h.symbol} isn't in this expiry's chain — pick its expiry first`);
+      setPin((p) => ({ ...p, [t]: h.symbol }));
+    } catch { /* not ours */ }
+  };
+  const dragOver = (e: React.DragEvent) => { if (e.dataTransfer.types.includes(DRAG_MIME)) { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; } };
+
   if (!base) {
-    return <section className="trade-card tv-empty"><div className="empty">Open an index or F&amp;O stock first — the scalper trades its options.</div></section>;
+    return <section className="trade-card tv-empty" onDragOver={dragOver} onDrop={onDrop}><div className="empty">Open an index or F&amp;O stock first — the scalper trades its options. <button type="button" className="btn-sm" onClick={onClose} data-testid="scalp-close">✕ Exit scalper</button></div></section>;
   }
 
   const stepLabel = (o: number) => (o === 0 ? "ATM" : o > 0 ? `OTM ${o}` : `ITM ${-o}`);
@@ -236,8 +257,9 @@ export default function Scalper({
   const lotSize = ce?.lot_size || pe?.lot_size || null;
 
   return (
-    <div className="scalp" data-testid="scalper">
+    <div className="scalp" data-testid="scalper" onDragOver={dragOver} onDrop={onDrop}>
       <div className="scalp-bar">
+        <button type="button" className="btn-sm" onClick={onClose} title="Back to the normal chart layout" data-testid="scalp-close">✕ Exit scalper</button>
         <b className="scalp-title">⚡ Scalper</b>
         <select value={base.symbol} onChange={(e) => { const h = underlyings.find((u) => u.symbol === e.target.value); if (h) onBase(h); }} aria-label="Underlying">
           {underlyings.map((u) => <option key={u.symbol} value={u.symbol}>{u.short_name}</option>)}

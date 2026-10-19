@@ -46,7 +46,8 @@ import { withWs } from "../workspace";
 import { chartLinkParams, resolveBareHit } from "../lib/chartLink";
 import ChartPanel, { type ChartOrder, type ChartPosition, type HostAction } from "../components/trade/ChartPanel";
 import type { ChartWorkingOrder, OrderPatch } from "../components/trade/OrderLayer";
-import Scalper, { splitDrag } from "../components/trade/Scalper";
+import Scalper, { DRAG_MIME, splitDrag } from "../components/trade/Scalper";
+import { Toggle } from "../components/common/Toggle";
 import { onPositionTag } from "../components/trade/chartData";
 import { AccountManager, BOTTOM_TABS, LayoutMenu, SymbolDetails, WatchlistTable, cleanWatchItems, useLayouts, type BottomTab, type WatchState } from "../components/trade/TradePanels";
 import { BookPanel, FnoPanel, type DeskTab } from "../components/trade/ProPanels";
@@ -135,7 +136,6 @@ function detailText(j: { detail?: unknown }, status: number): string {
   return httpError(status);
 }
 
-const DRAG_MIME = "application/x-tradebot-instrument";
 
 /** A price snapped to the instrument's tick (Fyers rejects off-grid prices). */
 export function roundToTick(v: number, tick = 0.05): number {
@@ -269,7 +269,7 @@ const DEFAULT_DOCK: DockId[] = ["watch", "trade"];
 
 // Multi-chart layouts (TradingView-style). Click a chart to make it the
 // active one: it follows the watchlist / search and drives the ticket.
-type Layout = "1" | "2" | "2v" | "3" | "3c" | "3r" | "4" | "4c" | "4r" | "4l" | "5" | "5l" | "6" | "6v" | "7" | "8" | "8v";
+type Layout = "1" | "2" | "2v" | "3" | "3c" | "3r" | "4" | "4c" | "4r" | "4l" | "5" | "5l" | "6" | "6v" | "7" | "8" | "8v" | "9" | "10" | "12" | "14" | "16";
 const LAYOUTS: { id: Layout; n: number; icon: string; label: string }[] = [
   { id: "1", n: 1, icon: "▢", label: "1 chart" },
   { id: "2", n: 2, icon: "◫", label: "2 side by side" },
@@ -288,10 +288,27 @@ const LAYOUTS: { id: Layout; n: number; icon: string; label: string }[] = [
   { id: "7", n: 7, icon: "▦", label: "7 (3 + 4)" },
   { id: "8", n: 8, icon: "▩", label: "8 (4 × 2)" },
   { id: "8v", n: 8, icon: "▤", label: "8 (2 × 4)" },
+  { id: "9", n: 9, icon: "▦", label: "9 (3 × 3)" },
+  { id: "10", n: 10, icon: "▦", label: "10 (5 × 2)" },
+  { id: "12", n: 12, icon: "▦", label: "12 (4 × 3)" },
+  { id: "14", n: 14, icon: "▦", label: "14 (7 × 2)" },
+  { id: "16", n: 16, icon: "▦", label: "16 (4 × 4)" },
 ];
+/** A layout's icon: the real grid CSS on a tiny box, so it always matches what opens. */
+const LayoutIcon = ({ id, n }: { id: Layout; n: number }) => (
+  <span className={`tv-grid l${id} lay-ico`}>{Array.from({ length: n }, (_, i) => <span key={i} className="tv-cell" />)}</span>
+);
 
 type LayoutSync = SyncFlags & { symbol: boolean };
 const SYNC_DEFAULT: LayoutSync = { symbol: false, interval: false, crosshair: true, time: false, dateRange: false, drawings: true };
+const SYNC_HINTS: Record<keyof LayoutSync, string> = {
+  symbol: "Changing the symbol on one chart changes it on every chart",
+  interval: "Changing the timeframe on one chart changes it on every chart",
+  crosshair: "The crosshair moves on every chart at the same time",
+  time: "Scrolling one chart scrolls the others to the same time",
+  dateRange: "Picking a date range (1D, 5D …) applies it to every chart",
+  drawings: "Drawings show on every chart of the same symbol",
+};
 const SYNC_LABELS: [keyof LayoutSync, string][] = [
   ["symbol", "Symbol"],
   ["interval", "Interval"],
@@ -305,7 +322,7 @@ const SYNC_LABELS: [keyof LayoutSync, string][] = [
 type TradeSet = { instant: boolean; showPos: boolean; showOrders: boolean; plus: boolean };
 const TRADE_SET_DEFAULT: TradeSet = { instant: false, showPos: true, showOrders: true, plus: true };
 
-function TradeSettings({ s, onChange }: { s: TradeSet; onChange: (k: keyof TradeSet, v: boolean) => void }) {
+function TradeSettings({ s, onChange, more }: { s: TradeSet; onChange: (k: keyof TradeSet, v: boolean) => void; more?: { label: string; run: () => void; on?: boolean }[] }) {
   const [open, setOpen] = useState(false);
   useEffect(() => {
     if (!open) return;
@@ -322,7 +339,7 @@ function TradeSettings({ s, onChange }: { s: TradeSet; onChange: (k: keyof Trade
   return (
     <div className="tset" onMouseDown={(e) => e.stopPropagation()}>
       {s.instant && <span className="tset-badge" title="Chart and scalper orders are placed without a confirm">⚡ instant</span>}
-      <button type="button" className={`chart-btn${open ? " on" : ""}`} onClick={() => setOpen((o) => !o)} title="Trading settings" data-testid="trade-settings">⚙</button>
+      <button type="button" className={`chart-btn${open ? " on" : ""}`} onClick={() => setOpen((o) => !o)} title="Settings — trading, chart, user, alerts, scalper" data-testid="trade-settings">⚙</button>
       {open && (
         <div className="chart-menu tset-menu">
           <div className="chart-menu-head">Trading</div>
@@ -330,6 +347,10 @@ function TradeSettings({ s, onChange }: { s: TradeSet; onChange: (k: keyof Trade
           {row("showPos", "Positions on chart (P&L, SL / TP)", "The live position line with draggable stop-loss and target")}
           {row("showOrders", "Pending orders on chart", "A dashed line per working order")}
           {row("plus", "'+' button on the price scale", "Alert / order / line at the hovered price")}
+          {more && more.length > 0 && <div className="chart-menu-sep" />}
+          {more?.map((m) => (
+            <button key={m.label} type="button" className={`chart-menu-item${m.on ? " on" : ""}`} onClick={() => { setOpen(false); m.run(); }}>{m.label}</button>
+          ))}
         </div>
       )}
     </div>
@@ -653,7 +674,6 @@ export default function Trade() {
     setTset(n);
     try { tabLocal.setItem("trade:settings", JSON.stringify(n)); } catch { /* best-effort */ }
   };
-  const settingsEl = <TradeSettings s={tset} onChange={changeSetting} />;
   // Layout split positions (fractions), draggable, per layout.
   const [splits, setSplits] = useState<Record<string, { x: number; y: number }>>(() => stored("trade:splits", {}));
   useEffect(() => { try { tabLocal.setItem("trade:splits", JSON.stringify(splits)); } catch { /* best-effort */ } }, [splits]);
@@ -1107,6 +1127,46 @@ export default function Trade() {
     setOrderType(loadUserPrefs().defaultOrderType);
   };
 
+  const settingsEl = <TradeSettings s={tset} onChange={changeSetting} more={[
+    { label: "Chart settings… (active chart)", run: () => window.dispatchEvent(new Event("chart:settings")) },
+    { label: "User settings…", run: () => setUserSettingsOpen(true) },
+    { label: "🔔 Alerts manager & log", run: () => toggleDock("alerts"), on: dock.includes("alerts") },
+    { label: scalper ? "⚡ Exit option scalper" : "⚡ Option scalper", run: () => { setScalper((v) => !v); setLayoutOpen(false); }, on: scalper },
+  ]} />;
+  // Paper / Fyers, Layout, Scalp, Alerts, layouts and settings: one set, on the
+  // chart top bar AND the scalper's (it has its own bar — without these there
+  // was no way back from the scalper).
+  const topTools = (<><span className="seg trade-mode" role="group" aria-label="Trading mode" title="Trade page only: Paper practises at the real Fyers price, Fyers is real money. Independent of the Dashboard switch." data-testid="practice-toggle"><button type="button" className={`btn-sm mode-paper${practice ? " active" : ""}`} aria-pressed={practice} onClick={() => pickPractice(true)}>Paper</button><button type="button" className={`btn-sm mode-fyers${!practice ? " active" : ""}`} aria-pressed={!practice} onClick={() => pickPractice(false)}>Fyers</button></span><span className="tv-top-tools">
+              <span className="tv-top-pop-wrap" ref={layoutPopRef}>
+                <button type="button" className={`btn-sm${layoutOpen || (!scalper && layout !== "1") ? " active" : ""}`} aria-expanded={layoutOpen} title="Chart layout — several charts at once" onClick={() => setLayoutOpen((o) => !o)} data-testid="rail-layout">
+                  {LAYOUTS.find((l) => l.id === layout)?.icon ?? "▢"} Layout
+                </button>
+                {layoutOpen && (
+                  <div className="tv-rail-pop tv-top-pop layout-pop" role="menu">
+                    {[...new Set(LAYOUTS.map((l) => l.n))].map((n) => (
+                      <div key={n} className="lay-row">
+                        <span className="lay-n">{n}</span>
+                        {LAYOUTS.filter((l) => l.n === n).map((l) => (
+                          <button key={l.id} type="button" role="menuitem" className={`lay-btn${!scalper && layout === l.id ? " on" : ""}`} onClick={() => pickLayout(l.id)} title={l.label} aria-label={l.label}>
+                            <LayoutIcon id={l.id} n={l.n} />
+                          </button>
+                        ))}
+                      </div>
+                    ))}
+                    <div className="tv-sync">
+                      <div className="chart-menu-head">Sync in layout</div>
+                      {SYNC_LABELS.map(([k, label]) => (
+                        <div key={k} className="lay-sync">
+                          <span>{label} <span className="lay-info" title={SYNC_HINTS[k]}>i</span></span>
+                          <Toggle on={!!sync[k]} onChange={(v) => setSync(k, v)} size="sm" data-testid={`sync-${k}`} />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </span>
+            </span><LayoutMenu L={L} open={layoutMenuOpen} onOpen={setLayoutMenuOpen} />{settingsEl}</>);
+
   // A position / order row's symbol → its chart (looked up for the lot, tick, expiry).
   const openSymbol = async (sym: string) => {
     let h: InstrumentHit | undefined;
@@ -1490,39 +1550,13 @@ export default function Trade() {
               helpers={{ positionFor: (sym) => (tset.showPos ? positionFor(sym) : null), levelsFor, closeFor, orderFor }}
               instant={tset.instant}
               onInstant={(v) => changeSetting("instant", v)}
-              settings={settingsEl}
+              settings={topTools}
               showPlus={tset.plus}
+              onClose={() => setScalper(false)}
             />
           ) : (
             <div className="tv-layout">
-            <div className="tv-topbar"><div className="tv-topslot" ref={setTopSlot} /><span className="seg trade-mode" role="group" aria-label="Trading mode" title="Trade page only: Paper practises at the real Fyers price, Fyers is real money. Independent of the Dashboard switch." data-testid="practice-toggle"><button type="button" className={`btn-sm mode-paper${practice ? " active" : ""}`} aria-pressed={practice} onClick={() => pickPractice(true)}>Paper</button><button type="button" className={`btn-sm mode-fyers${!practice ? " active" : ""}`} aria-pressed={!practice} onClick={() => pickPractice(false)}>Fyers</button></span><span className="tv-top-tools">
-              <span className="tv-top-pop-wrap" ref={layoutPopRef}>
-                <button type="button" className={`btn-sm${layoutOpen || (!scalper && layout !== "1") ? " active" : ""}`} aria-expanded={layoutOpen} title="Chart layout — several charts at once" onClick={() => setLayoutOpen((o) => !o)} data-testid="rail-layout">
-                  {LAYOUTS.find((l) => l.id === layout)?.icon ?? "▢"} Layout
-                </button>
-                {layoutOpen && (
-                  <div className="tv-rail-pop tv-top-pop" role="menu">
-                    {LAYOUTS.map((l) => (
-                      <button key={l.id} type="button" role="menuitem" className={`tv-layout-btn${!scalper && layout === l.id ? " on" : ""}`} onClick={() => pickLayout(l.id)}>
-                        <span className="ico">{l.icon}</span>
-                        {l.label}
-                      </button>
-                    ))}
-                    <div className="tv-sync">
-                      <div className="chart-menu-head">Sync in layout</div>
-                      {SYNC_LABELS.map(([k, label]) => (
-                        <label key={k} className="tset-row">
-                          <input type="checkbox" checked={!!sync[k]} onChange={(e) => setSync(k, e.target.checked)} data-testid={`sync-${k}`} />
-                          {label}
-                        </label>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </span>
-              <button type="button" className={`btn-sm${scalper ? " active" : ""}`} aria-pressed={scalper} title="Option scalper — CE, underlying and PE charts with one-click buy / sell" onClick={() => { setScalper((v) => !v); setLayoutOpen(false); }} data-testid="rail-scalper">⚡ Scalp</button>
-              <button type="button" className={`btn-sm${dock.includes("alerts") ? " active" : ""}`} aria-pressed={dock.includes("alerts")} title={`Alerts manager and log — click to ${dock.includes("alerts") ? "close" : "open"}`} onClick={() => toggleDock("alerts")} data-testid="rail-alerts">🔔 Alerts</button>
-            </span><LayoutMenu L={L} open={layoutMenuOpen} onOpen={setLayoutMenuOpen} />{settingsEl}</div>
+            <div className="tv-topbar"><div className="tv-topslot" ref={setTopSlot} />{topTools}</div>
             <div className="tv-chartrow">
             <div className="tv-leftbar" ref={setLeftSlot} />
             <div className={`tv-grid l${maxCell !== null ? "1" : layout}`} style={maxCell !== null ? undefined : gridStyle}>
