@@ -28,6 +28,15 @@ log = get_logger(__name__)
 
 PING_INTERVAL_S = 20.0
 
+# Symbols each open browser is showing ({"type": "watch", "symbols": [...]}).
+# The Fyers stream keeps their union subscribed, so every stock / option on
+# screen streams without any REST poll touching it first.
+WATCHED: dict[int, set[str]] = {}
+
+
+def watched_symbols() -> list[str]:
+    return sorted(set().union(*WATCHED.values())) if WATCHED else []
+
 
 async def _relay_task(ws: WebSocket, channel: str, q: asyncio.Queue) -> None:
     """Read from a subscribed event-bus queue and forward to the websocket.
@@ -109,6 +118,9 @@ async def websocket_endpoint(ws: WebSocket) -> None:
             elif kind == "unsubscribe":
                 for ch in msg.get("channels", []) or []:
                     _unsubscribe(ch)
+            elif kind == "watch":
+                syms = msg.get("symbols") or []
+                WATCHED[id(ws)] = {str(x).strip().upper() for x in syms[:300] if ":" in str(x)}
             elif kind == "ping":
                 await ws.send_json({"type": "pong", "ts": time.time()})
             elif kind == "pong":
@@ -150,6 +162,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
         log.info("ws.disconnected", client=ws.client.host if ws.client else "?")
     finally:
         correlation_id_var.set(None)
+        WATCHED.pop(id(ws), None)
         for ch in list(subs.keys()):
             _unsubscribe(ch)
         for t in (reader_task, pinger_task):

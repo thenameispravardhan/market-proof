@@ -31,6 +31,7 @@ interface UseWebSocketResult {
   lastMessage: WsMessage | null;
   subscribe: (channels: string[]) => void;
   unsubscribe: (channels: string[]) => void;
+  send: (msg: unknown) => void;
 }
 
 // Capture the readyState constants at module load so the unmount
@@ -146,5 +147,5 @@ export function useWebSocket(options: UseWebSocketOptions = {}): UseWebSocketRes
     [send]
   );
 
-  return { status, lastMessage, subscribe, unsubscribe };
+  return { status, lastMessage, subscribe, unsubscribe, send };
 }

@@ -152,6 +152,7 @@ import { AlertsPanel, DataWindow, ObjectTree, type DataRow, type GroupAction, ty
 import { AboutIndicatorDialog, InsightsDialog, ManagePanesDialog, WhatsNewDialog } from "./ChartInfoDialogs";
 import { CHART_SETTINGS_EVENT } from "./UserSettings";
 import { LEVEL_DRAG_SLOP, levelProblem, snapToTick } from "./levelDrag";
+import OrderLayer, { type ChartWorkingOrder, type OrderPatch } from "./OrderLayer";
 
 const IST = IST_OFFSET;
 
@@ -642,6 +643,10 @@ export interface ChartPanelProps {
   onTrading?: (k: keyof TradingFlags, v: boolean) => void;
   /** Position-average / pending-order levels to mark on the chart. */
   brokerLines?: BrokerLine[];
+  /** Working orders on this symbol, drawn as draggable lines (replaces their brokerLines). */
+  orders?: ChartWorkingOrder[];
+  onModifyOrder?: (o: ChartWorkingOrder, patch: OrderPatch) => Promise<void>;
+  onCancelOrder?: (o: ChartWorkingOrder) => void;
   /** When set, the "→ Ticket" tool sends a clicked price to the caller. */
   onPickPrice?: (price: number) => void;
   /** Symbol search on the chart switches the host's symbol. */
@@ -804,6 +809,9 @@ export default function ChartPanel(props: ChartPanelProps) {
     shortName,
     instrument,
     brokerLines,
+    orders,
+    onModifyOrder,
+    onCancelOrder,
     onPickPrice,
     position,
     onLevels,
@@ -853,7 +861,8 @@ export default function ChartPanel(props: ChartPanelProps) {
   const [scaleMode, setScaleMode] = useState<ScaleMode>(prefs.scaleMode ?? "normal");
   const scaleModeRef = useRef(scaleMode);
   scaleModeRef.current = scaleMode;
-  const [autoScale, setAutoScale] = useState(prefs.autoScale ?? true);
+  // Always open fitted: Auto off without a saved price range left the chart blank on return to the page.
+  const [autoScale, setAutoScale] = useState(true);
   const autoScaleRef = useRef(autoScale);
   autoScaleRef.current = autoScale;
   const [invert, setInvert] = useState(prefs.invert ?? false);
@@ -2822,8 +2831,17 @@ export default function ChartPanel(props: ChartPanelProps) {
       e.stopPropagation();
       return;
     }
+    // Auto scale pins the price axis, so the engine pans time only. A vertical
+    // drag turns Auto off and moves the prices (TradingView behaviour).
+    if (autoScaleRef.current) {
+      const h = paneDims().height;
+      const top = safe(() => mainRef.current?.coordinateToPrice(0) as number | null, null);
+      const bot = safe(() => mainRef.current?.coordinateToPrice(h) as number | null, null);
+      if (top != null && bot != null && h > 0) vPanRef.current = { y: e.clientY, top, bot, h, on: false };
+    }
   }
 
+  const vPanRef = useRef<{ y: number; top: number; bot: number; h: number; on: boolean } | null>(null);
   const pressRef = useRef<{ x: number; y: number } | null>(null);
   const zoomDragRef = useRef<{ start: DrawingPoint; startPt: { x: number; y: number }; moved: boolean } | null>(null);
 
@@ -2840,6 +2858,19 @@ export default function ChartPanel(props: ChartPanelProps) {
 
   function onWindowMouseMove(e: MouseEvent): void {
     shiftRef.current = e.shiftKey;
+    const vp = vPanRef.current;
+    if (vp && (e.buttons & 1)) {
+      const dy = e.clientY - vp.y;
+      if (!vp.on && Math.abs(dy) > 6) {
+        vp.on = true;
+        safe(() => mainRef.current?.priceScale().applyOptions({ autoScale: false }));
+        setAutoScale(false);
+      }
+      if (vp.on) {
+        const d = (dy * (vp.top - vp.bot)) / vp.h * (invertRef.current ? -1 : 1);
+        safe(() => mainRef.current?.priceScale().setVisibleRange({ from: Math.min(vp.top, vp.bot) + d, to: Math.max(vp.top, vp.bot) + d }));
+      }
+    }
     const zd = zoomDragRef.current;
     if (zd) {
       const pt = paneCoords(e, true);
@@ -2923,6 +2954,9 @@ export default function ChartPanel(props: ChartPanelProps) {
   }
 
   function onWindowMouseUp(): void {
+    vPanRef.current = null;
+    // Dragging the price axis switches the engine's auto scale off; keep the A button (and later re-renders) in step.
+    if (autoScaleRef.current && safe(() => mainRef.current?.priceScale().options().autoScale, true) === false) setAutoScale(false);
     const zd = zoomDragRef.current;
     if (zd) {
       // (a release without travel was already handled as a click by onHostMouseUp)
@@ -4236,8 +4270,11 @@ export default function ChartPanel(props: ChartPanelProps) {
   }, []);
 
   // 10) Bar-close countdown under the last-price label (intraday, market hours).
+  // Per frame, so it moves WITH the price label instead of catching up a second later.
   useEffect(() => {
-    const id = setInterval(() => {
+    let raf = 0;
+    const frame = () => {
+      raf = requestAnimationFrame(frame);
       const el = countdownRef.current;
       if (!el) return;
       const candles = viewRef.current;
@@ -4266,7 +4303,8 @@ export default function ChartPanel(props: ChartPanelProps) {
       const hh = Math.floor(remaining / 3600);
       const mm = Math.floor((remaining % 3600) / 60);
       const ss = remaining % 60;
-      el.textContent = `${hh ? `${hh}:${String(mm).padStart(2, "0")}` : mm}:${String(ss).padStart(2, "0")}`;
+      const txt = `${hh ? `${hh}:${String(mm).padStart(2, "0")}` : mm}:${String(ss).padStart(2, "0")}`;
+      if (el.textContent !== txt) el.textContent = txt;
       el.style.display = "block";
       el.style.top = `${y + 10}px`;
       const left = s.scaleSide === "left";
@@ -4274,8 +4312,9 @@ export default function ChartPanel(props: ChartPanelProps) {
       el.style.width = `${w}px`;
       el.style.left = left ? "0px" : "auto";
       el.style.right = left ? "auto" : "0px";
-    }, 1000);
-    return () => clearInterval(id);
+    };
+    raf = requestAnimationFrame(frame);
+    return () => cancelAnimationFrame(raf);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -6309,6 +6348,13 @@ export default function ChartPanel(props: ChartPanelProps) {
                 {(flowOn || chartKind === "footprint") && flowNote && <div className="lg-row hint">{flowNote}</div>}
               </>
             )}
+            {/* Always-visible arrow: with many indicators the legend covers the chart — ⌃ hides them, ⌄ N brings them back. */}
+            {(indicators.length > 0 || compares.length > 0) && (
+              <button type="button" className="lg-fold" onClick={() => setLegendCollapsed((v) => !v)}
+                title={legendCollapsed ? `Show indicators (${indicators.length})` : "Hide indicators"} data-testid="legend-fold">
+                {legendCollapsed ? `⌄ ${indicators.length + compares.length}` : "⌃"}
+              </button>
+            )}
           </div>
           {/* per-pane legends + pane buttons */}
           {paneRects.filter((r) => r.i > 0).map((r) => {
@@ -6348,11 +6394,11 @@ export default function ChartPanel(props: ChartPanelProps) {
               <div ref={(el) => { posTagRefs.current.entry = el; }} className={`pos-tag ${showPos.qty > 0 ? "long" : "short"}`} data-testid="chart-position">
                 <span className="side">{showPos.qty > 0 ? "LONG" : "SHORT"} {Math.abs(showPos.qty)}</span>
                 <span className="pnl" />
-                {onLevels && showPos.tp == null && levelDrag !== "tp" && (
-                  <span className="grab tp" onPointerDown={(e) => startLevelDrag(e, "tp")} title="Drag up / down to set a target">TP</span>
+                {onLevels && showPos.tp == null && (
+                  <span className="grab tp" style={levelDrag === "tp" ? { visibility: "hidden" } : undefined} onPointerDown={(e) => startLevelDrag(e, "tp")} title="Drag up / down to set a target">TP</span>
                 )}
-                {onLevels && showPos.sl == null && levelDrag !== "sl" && (
-                  <span className="grab sl" onPointerDown={(e) => startLevelDrag(e, "sl")} title="Drag up / down to set a stop-loss">SL</span>
+                {onLevels && showPos.sl == null && (
+                  <span className="grab sl" style={levelDrag === "sl" ? { visibility: "hidden" } : undefined} onPointerDown={(e) => startLevelDrag(e, "sl")} title="Drag up / down to set a stop-loss">SL</span>
                 )}
                 {onChartOrder && settings.reverseButton && (
                   <button
@@ -6396,6 +6442,21 @@ export default function ChartPanel(props: ChartPanelProps) {
                 ) : null,
               )}
             </div>
+          )}
+          {orders && orders.length > 0 && onModifyOrder && status.kind === "ready" && !hide.positions && (
+            <OrderLayer
+              orders={orders}
+              tick={tickRef.current}
+              fmt={fmtPrice}
+              toast={addToast}
+              onModify={onModifyOrder}
+              onCancel={onCancelOrder}
+              geo={() => {
+                const host = containerRef.current;
+                if (!host || !mainRef.current) return null;
+                return { priceToY, yToPrice, height: paneDims().height, left: paneLeft(), right: settingsRef.current.scaleSide === "left" ? 0 : scaleWidth("right"), top: host.getBoundingClientRect().top };
+              }}
+            />
           )}
           {showPlus && (
             <button

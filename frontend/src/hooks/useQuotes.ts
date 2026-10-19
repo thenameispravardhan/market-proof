@@ -11,7 +11,7 @@
 // subscribers at most once per animation frame (~60fps) — still real
 // time, but one repaint per frame no matter the tick rate.
 
-import { useCallback, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useSyncExternalStore } from "react";
 
 export interface QuoteTick {
   symbol: string;
@@ -74,6 +74,35 @@ export function peekQuote(symbol: string): QuoteTick | undefined {
   return store.get(symbol.toUpperCase());
 }
 
+// Symbols on screen (refcounted). App sends the set to the server over /ws
+// ("watch"), which keeps each one subscribed on the Fyers socket — so any
+// stock or option a chart, row or ticket shows streams on its own.
+const interest = new Map<string, number>();
+let interestListener: ((syms: string[]) => void) | null = null;
+
+export function watchedSymbols(): string[] {
+  return [...interest.keys()];
+}
+
+export function onInterestChange(cb: ((syms: string[]) => void) | null): void {
+  interestListener = cb;
+}
+
+/** Register interest in a symbol; returns the release. */
+export function watchSymbol(symbol: string): () => void {
+  const key = symbol.toUpperCase();
+  if (!key.includes(":")) return () => {};
+  const n = interest.get(key) ?? 0;
+  interest.set(key, n + 1);
+  if (!n) interestListener?.(watchedSymbols());
+  return () => {
+    const m = (interest.get(key) ?? 1) - 1;
+    if (m > 0) { interest.set(key, m); return; }
+    interest.delete(key);
+    interestListener?.(watchedSymbols());
+  };
+}
+
 /** Imperative per-symbol tick callback (no React re-render) — for the chart,
  *  which applies ticks straight to its series. Returns the unsubscribe. */
 export function onQuote(symbol: string, cb: (q: QuoteTick) => void): () => void {
@@ -88,8 +117,10 @@ export function onQuote(symbol: string, cb: (q: QuoteTick) => void): () => void 
     }
   };
   listeners.add(l);
+  const release = watchSymbol(key);
   return () => {
     listeners.delete(l);
+    release();
   };
 }
 
@@ -101,5 +132,6 @@ export function onQuote(symbol: string, cb: (q: QuoteTick) => void): () => void 
 export function useLiveQuote(symbol?: string | null): QuoteTick | undefined {
   const key = symbol ? symbol.toUpperCase() : "";
   const getSnapshot = useCallback(() => (key ? store.get(key) : undefined), [key]);
+  useEffect(() => (key ? watchSymbol(key) : undefined), [key]);
   return useSyncExternalStore(subscribe, getSnapshot);
 }

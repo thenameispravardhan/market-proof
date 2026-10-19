@@ -1298,3 +1298,34 @@ async def test_expired_token_does_not_open_the_socket():
     assert "data" not in holder
     assert mgr.status() == {"connected": False, "reason": "token_expired", "subscribed": 0,
                             "last_tick_age_s": None, "rejected_symbols": []}
+
+
+@pytest.mark.asyncio
+async def test_browser_watched_symbols_stream_and_survive_reconnect():
+    """Every symbol an open browser shows ({"type": "watch"} on /ws) is kept
+    subscribed — re-subscribed after an SDK reconnect, dropped when the tab goes."""
+    from app.api import ws as ws_mod
+
+    md = MarketDataBus()
+    holder, df, of = _factories()
+    mgr = FyersStreamManager(
+        market_data=md, quote_feed=_FakeQuoteFeed([]), backend_provider=lambda: _FakeBackend(),
+        data_socket_factory=df, order_socket_factory=of, resolve_fn=lambda s: None,
+        extra_symbols=ws_mod.watched_symbols, ondemand_ttl_s=0,
+    )
+    mgr._loop = asyncio.get_running_loop()
+    opt = "NSE:NIFTY26O2023150CE"
+    ws_mod.WATCHED[1] = {opt}
+    try:
+        await mgr._ensure_connected()
+        await mgr._reconcile_subscriptions()
+        assert opt in holder["data"].subscribed[0][0]
+        mgr._on_data_close()
+        mgr._on_data_connect()
+        holder["data"].subscribed.clear()
+        await mgr._reconcile_subscriptions()
+        assert opt in holder["data"].subscribed[0][0]
+    finally:
+        ws_mod.WATCHED.pop(1, None)
+    await mgr._reconcile_subscriptions()
+    assert opt not in mgr._subscribed

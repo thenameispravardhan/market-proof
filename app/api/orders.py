@@ -699,7 +699,7 @@ async def modify_order(
         raise HTTPException(status_code=422, detail="broker_order_id is required")
     from app.api import practice
     if account_id == practice.PRACTICE_ACCOUNT_ID:
-        raise HTTPException(status_code=400, detail="Practice orders can't be modified: cancel it and place it again.")
+        return await practice.modify(broker_order_id, body)
     quantity = _opt_int_field(body, "quantity")
     limit_price = _opt_price_field(body, "limit_price")
     stop_price = _opt_price_field(body, "stop_price")
@@ -929,7 +929,10 @@ def list_pending_orders(
     from app.api import practice
     if account_id == practice.PRACTICE_ACCOUNT_ID:
         with practice.session_factory()() as pdb:
-            return list_pending_orders(None, limit, pdb)
+            out = list_pending_orders(None, limit, pdb)
+        for o in out["orders"]:      # the SL / target each resting order arms on fill
+            o["stop_loss"], o["target"] = practice.pending_levels(o["broker_order_id"])
+        return out
     q = select(Trade).where(Trade.status == "placed").order_by(Trade.created_at.desc())
     if account_id is not None:
         q = q.where(Trade.broker_account_id == account_id)
