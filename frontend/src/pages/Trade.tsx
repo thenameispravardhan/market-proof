@@ -23,6 +23,7 @@
 // blocking codes and a "BYPASS" field that the operator must type
 // "I ACCEPT THE RISK" into before re-submitting.
 
+import { pointValue } from "../lib/contract";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -2047,7 +2048,7 @@ export default function Trade() {
                   </label>
                   <div className="ticket-row ticket-est" data-testid="ticket-est">
                     <span>Est. amount</span>
-                    <span>{estPrice != null ? fmtMoney(estPrice * quantity) : "—"}</span>
+                    <span>{estPrice != null && selected ? fmtMoney(estPrice * quantity * pointValue(selected.symbol)) : "—"}</span>
                     <span className="hint">funds {funds?.ok && funds.available != null ? fmtMoney(funds.available) : "—"}</span>
                   </div>
   
@@ -2058,7 +2059,8 @@ export default function Trade() {
                       disabled={!canSubmit || placeOrder.isPending}
                       onClick={() => onSubmit()}
                       data-testid="ticket-submit"
-                      title={account ? `Sends a real ${side} order to Fyers (${account.name})` : undefined}
+                      title={practice ? `Places a paper ${side} order on the practice account (no real money)`
+                        : account ? `Sends a real ${side} order to Fyers (${account.name})` : undefined}
                     >
                       {placeOrder.isPending ? "placing…" : selected ? `${side} ${quantity} ${selected.short_name || selected.symbol}` : `PLACE ${side}`}
                     </button>
