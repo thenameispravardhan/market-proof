@@ -676,8 +676,9 @@ def test_resolve_cache_clear_forces_relookup(monkeypatch):
 
 def test_silence_watchdog_fires_when_connected_subscribed_but_no_ticks(monkeypatch):
     """After `silence_watchdog_s` of silence (no _on_data_message calls),
-    the next `_log_stats()` must emit `fyers_stream.silent` at WARNING.
-    Off-market this also fires — that's intentional, the operator filters."""
+    the next `_log_stats()` must emit `fyers_stream.silent` at WARNING — during
+    market hours. Off-market silence is normal (no trades, no frames): it used to
+    fire every ~11 s all night (7,916 warnings on 2026-10-19), so it stays quiet."""
     md = MarketDataBus()
     holder, df, of = _factories()
     mgr = FyersStreamManager(
@@ -706,6 +707,11 @@ def test_silence_watchdog_fires_when_connected_subscribed_but_no_ticks(monkeypat
 
     monkeypatch.setattr("app.execution.fyers_stream.log.warning", fake_warning)
     monkeypatch.setattr("app.execution.fyers_stream.log.info", fake_info)
+    monkeypatch.setattr("app.risk.market_clock.is_market_open", lambda now=None: False)
+    mgr._log_stats()
+    assert not [c for c in captured if c[1] == "fyers_stream.silent"]       # off-market: expected silence
+    mgr._last_stats_log = 0.0
+    monkeypatch.setattr("app.risk.market_clock.is_market_open", lambda now=None: True)
 
     mgr._log_stats()
 

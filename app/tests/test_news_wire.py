@@ -255,6 +255,8 @@ def _site():
 
 
 def test_full_text_extraction_through_the_scraper(client, isolated_db, db_session, tmp_path, monkeypatch):
+    pytest.importorskip("trafilatura")          # the scraper's extractor (requirements.txt); runs where installed
+    pytest.importorskip("protego")
     base = _site()
     monkeypatch.setattr(nw.news_wire, "scrape_db", tmp_path / "scrape.db")
     monkeypatch.setattr(nw.news_wire, "allow_private", True)
@@ -298,6 +300,12 @@ def test_full_text_extraction_through_the_scraper(client, isolated_db, db_sessio
 
 def test_pending_is_fair_across_sources_and_skips_paused_hosts(isolated_db, db_session, tmp_path, monkeypatch):
     import sqlite3
+    import importlib.util
+    import sys
+    import types
+
+    if importlib.util.find_spec("trafilatura") is None:       # only scraper.normalize is used here
+        monkeypatch.setitem(sys.modules, "trafilatura", types.ModuleType("trafilatura"))
     db = tmp_path / "scrape.db"
     con = sqlite3.connect(db)
     con.execute("CREATE TABLE pauses(host TEXT, start REAL, until REAL, kind TEXT, reason TEXT)")

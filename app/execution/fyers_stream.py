@@ -313,7 +313,9 @@ class FyersStreamManager:
             subscribed=len(self._subscribed),
             silent=silent,
         )
-        if silent:
+        from app.risk.market_clock import is_market_open
+
+        if silent and is_market_open():          # off-market silence is expected: no trades, no frames
             log.warning(
                 "fyers_stream.silent",
                 threshold_s=self._silence_watchdog_s,
@@ -693,7 +695,7 @@ class FyersStreamManager:
         the interest is fresh. Non-blocking; the caller then serves the
         symbol from the bus (which the socket keeps warm). No-op until the
         socket is connected."""
-        if not symbol:
+        if not symbol or symbol.strip().upper().startswith("CRYPTO:"):   # Binance's feed carries those
             return
         bus_key = symbol.strip().upper()
         full = self._resolve(symbol) or (bus_key if ":" in bus_key else None)

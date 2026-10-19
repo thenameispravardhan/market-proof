@@ -223,3 +223,26 @@ def test_backend_treats_a_fyers_error_payload_as_a_failed_call() -> None:
     assert asyncio.run(be.get_history_range("NSE:SBIN-EQ", resolution="5", from_ts=1, to_ts=2)) == []
     be._client = _Client({"s": "ok", "candles": CANDLES})  # noqa: SLF001
     assert asyncio.run(be.get_history_range("NSE:SBIN-EQ", resolution="5", from_ts=1, to_ts=2)) == CANDLES
+
+
+def test_a_symbol_fyers_calls_invalid_is_not_asked_again() -> None:
+    import asyncio
+
+    from app.execution import fyers_live
+    from app.execution.fyers_live import FyersAPIError, FyersLiveBackend
+
+    calls = []
+
+    class _Bad:
+        async def get_history(self, symbol, **kw):
+            calls.append(symbol)
+            raise FyersAPIError('fyers 422: {"code":-300,"message":"Invalid symbol provided","s":"error"}', status_code=422)
+
+    fyers_live._BAD_SYMBOLS.clear()
+    be = FyersLiveBackend.__new__(FyersLiveBackend)
+    be._client = _Bad()  # noqa: SLF001
+    assert asyncio.run(be.get_history("NSE:UDAYJEW-EQ", resolution="1", days=2)) == []
+    assert asyncio.run(be.get_history("NSE:UDAYJEW-EQ", resolution="1", days=2)) == []
+    assert asyncio.run(be.get_history_range("NSE:UDAYJEW-EQ", resolution="5", from_ts=0, to_ts=60)) == []
+    assert calls == ["NSE:UDAYJEW-EQ"]                          # one request, not one per caller per pass
+    fyers_live._BAD_SYMBOLS.clear()
