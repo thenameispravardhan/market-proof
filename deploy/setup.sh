@@ -84,6 +84,8 @@ export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update -y
 sudo apt-get install -y software-properties-common curl git sqlite3 \
     debian-keyring debian-archive-keyring apt-transport-https
+# OCR for scanned PDFs the news scraper meets (SEBI recovery notices): pdftoppm + tesseract
+sudo apt-get install -y poppler-utils tesseract-ocr
 
 # Python 3.11 (Ubuntu 24.04 ships 3.12; the project targets 3.11)
 if ! command -v python3.11 >/dev/null 2>&1; then

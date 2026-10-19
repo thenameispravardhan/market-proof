@@ -673,6 +673,13 @@ def test_wrapper_page_takes_its_embedded_pdf_text(tmp_path):
     assert st == "done" and "SEBIORDERMARK" in text and "/attach/o.pdf" in meta    # was: 'empty' (title only)
 
 
+def test_scanned_pdf_falls_back_to_ocr(monkeypatch):
+    monkeypatch.setattr(scrape, "ocr_pdf", lambda body: "Recovery Certificate No. 6665 for Rs. 1,12,000")
+    text, meta = scrape.pdf_text(make_pdf(""))          # no text layer, like a scanned SEBI notice
+    assert text.startswith("Recovery Certificate") and meta["ocr"] is True
+    assert scrape.pdf_text(make_pdf("TEXTLAYER"))[1].get("ocr") is None   # a real text layer: no OCR
+
+
 def test_rss2_links_and_unchanged_feed_is_304(tmp_path):
     base, port = srv()
     db = str(tmp_path / "rss.db")
