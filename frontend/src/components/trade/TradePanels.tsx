@@ -526,6 +526,8 @@ export type BottomTab =
   | "account" | "basket" | "broker" | "log";
 
 /** Tab labels (the collapsed bar shows them too). "Trade" is the DOM, beside the Account Manager. */
+type ManagedLevels = { stop_loss: number | null; target: number | null; trail_active?: boolean; breakeven_armed?: boolean; exit_failures?: number };
+
 export const BOTTOM_TABS: [BottomTab, string][] = [
   ["positions", "Positions"],
   ["allpositions", "All positions"],
@@ -540,6 +542,10 @@ export const BOTTOM_TABS: [BottomTab, string][] = [
   ["broker", "Fyers live"],
   ["log", "Notifications"],
 ];
+/** Always on the bottom bar; the rest open from Tools ▾ (and show while open). */
+export const BOTTOM_CORE: BottomTab[] = ["positions", "orders", "trades"];
+export const bottomTabsShown = (open: BottomTab | null): [BottomTab, string][] =>
+  BOTTOM_TABS.filter(([k]) => BOTTOM_CORE.includes(k) || k === open);
 
 interface ProfileResp { ok: boolean; client_id?: string | null; name?: string | null; email?: string | null; reason?: string }
 
@@ -617,9 +623,10 @@ export function AccountManager({
   connected: boolean;
   accountLabel: string;
   selected: InstrumentHit | null;
-  closeFor: (sym: string) => () => Promise<void>;
-  levelsFor: (sym: string) => (sl: number | null, tp: number | null) => Promise<void>;
-  orderFor: (sym: string, name: string, qty: number, product?: ProductType) => (o: ChartOrder) => Promise<string>;
+  /** `paper` routes to that row's book (the table shows both). */
+  closeFor: (sym: string, paper?: boolean) => () => Promise<void>;
+  levelsFor: (sym: string, paper?: boolean) => (sl: number | null, tp: number | null) => Promise<void>;
+  orderFor: (sym: string, name: string, qty: number, product?: ProductType, paper?: boolean) => (o: ChartOrder) => Promise<string>;
   instant?: boolean;
   /** The ticket quantity (shared with the DOM). */
   qty: number;
@@ -631,9 +638,8 @@ export function AccountManager({
 }) {
   const [msg, setMsg] = useState<string | null>(null);
   const [modify, setModify] = useState<OrderRow | null>(null);
-  const [exit, setExit] = useState<{ pos: ExitTarget; local: boolean } | null>(null);
+  const [exit, setExit] = useState<{ pos: ExitTarget; local: boolean; paper?: boolean } | null>(null);
   const qc = useQueryClient();
-  const [showClosed, setShowClosed] = useState(false);
   const bookTabs: BottomTab[] = ["orders", "smart", "allpositions", "positions", "trade", "account"];
   const book = useApiJson<BrokerBook>(connected && bookTabs.includes(tab) ? "/api/broker/book" : null, 15000);
   // Paper (practice) mode reads the practice book; the live one otherwise.
@@ -652,17 +658,23 @@ export function AccountManager({
   const tradeRows = Array.isArray(trades.data) ? trades.data : [];
   const executed = tradedRows(tradeRows, Array.isArray(filledTrades.data) ? filledTrades.data : []);
   const today = new Date().toDateString();
-  const realizedBy = (sym: string) => {
-    const bp = book.data?.ok ? book.data.positions.filter((x) => x.symbol === sym) : [];
+  const modeIsPaper = accountId === -1;
+  const realizedBy = (sym: string, paper = modeIsPaper) => {
+    if (paper !== modeIsPaper) return null;          // the other book's trades aren't loaded here
+    const bp = book.data?.ok && !paper ? book.data.positions.filter((x) => x.symbol === sym) : [];
     if (bp.length) return bp.reduce((a, x) => a + (x.realized ?? 0), 0);
     const ts = executed.filter((t) => t.symbol === sym && t.pnl != null && t.executed_at && new Date(t.executed_at).toDateString() === today);
     return ts.length ? ts.reduce((a, t) => a + (t.pnl ?? 0), 0) : null;
   };
   // Fyers' product for a live position; the bot's own row otherwise (paper, or the book not loaded).
-  const productOf = (p: Position) => (book.data?.ok ? book.data.positions.find((x) => x.symbol === p.symbol && x.net_qty !== 0)?.product : null) ?? p.product ?? "INTRADAY";
-  // Today's positions closed flat (the bot's book keeps them at qty 0) — shown on request.
-  const closed = (positions ?? []).filter((p) => p.quantity === 0 && new Date(p.updated_at).toDateString() === today);
-  const posRows = showClosed ? [...open, ...closed] : open;
+  const productOf = (p: Position) => (book.data?.ok && !p.paper ? book.data.positions.find((x) => x.symbol === p.symbol && x.net_qty !== 0)?.product : null) ?? p.product ?? "INTRADAY";
+  // Running positions first, then today's closed ones (the book keeps them at qty 0), newest first.
+  const closed = (positions ?? []).filter((p) => p.quantity === 0 && new Date(p.updated_at).toDateString() === today)
+    .sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
+  const posRows = [...open, ...closed];
+  const mine = open.filter((p) => !!p.paper === modeIsPaper);   // "Exit all" flattens the mode's own book only
+  const levelsOf = (p: Position): ManagedLevels | undefined =>
+    p.paper ? { stop_loss: p.stop_loss ?? null, target: p.target ?? null } : managed?.find((x) => x.symbol === p.symbol);
   // Live: Fyers' realized figure for the whole account; paper: the bot's closing trades.
   const realized = book.data?.ok
     ? book.data.positions.reduce((a, x) => a + (x.realized ?? 0), 0)
@@ -706,24 +718,25 @@ export function AccountManager({
   const posCols: Col<Position>[] = [
     { id: "symbol", label: "Symbol", get: (p) => p.symbol, fixed: true, cls: () => "sym",
       render: (p) => onOpenSymbol ? <button type="button" className="am-link" title="Open chart" onClick={() => onOpenSymbol(p.symbol)} data-testid={`pos-open-${p.symbol}`}>{p.symbol}</button> : p.symbol },
+    { id: "book", label: "Real / Paper", get: (p) => (p.paper ? "Paper" : "Real"), render: (p) => <span className={`badge ${p.paper ? "neutral" : "live"}`} data-testid={`pos-book-${p.symbol}`}>{p.paper ? "PAPER" : "REAL"}</span> },
     { id: "side", label: "Buy/Sell", get: (p) => (p.quantity > 0 ? "BUY" : p.quantity < 0 ? "SELL" : "CLOSED"), cls: (p) => (p.quantity > 0 ? "up" : p.quantity < 0 ? "down" : undefined) },
     { id: "product", label: "Product", get: (p) => productOf(p) },
     { id: "qty", label: "Net qty", get: (p) => p.quantity, render: (p) => p.quantity, cls: (p) => (p.quantity > 0 ? "up" : p.quantity < 0 ? "down" : undefined), num: true },
     { id: "avg", label: "Avg", get: (p) => p.average_price, num: true },
     { id: "ltp", label: "LTP", get: (p) => p.last_price, render: (p) => <LiveLtp symbol={p.symbol} fallback={p.last_price} />, num: true },
     { id: "pnl", label: "Unrealized P&L", get: (p) => localPnl(p, peekQuote(p.symbol)?.last_price), render: (p) => <LocalPnl p={p} privacy={privacy} />, num: true },
-    { id: "realized", label: "Realized P&L", get: (p) => realizedBy(p.symbol), render: (p) => { const v = realizedBy(p.symbol); return <span className={v == null ? "" : v >= 0 ? "up" : "down"}>{money(v)}</span>; }, num: true },
+    { id: "realized", label: "Realized P&L", get: (p) => realizedBy(p.symbol, p.paper), render: (p) => { const v = realizedBy(p.symbol, p.paper); return <span className={v == null ? "" : v >= 0 ? "up" : "down"}>{money(v)}</span>; }, num: true },
     {
-      id: "sl", label: "SL", get: (p) => managed?.find((x) => x.symbol === p.symbol)?.stop_loss ?? null,
+      id: "sl", label: "SL", get: (p) => levelsOf(p)?.stop_loss ?? null,
       render: (p) => {
         if (!p.quantity) return "—";
-        const m = managed?.find((x) => x.symbol === p.symbol);
+        const m = levelsOf(p);
         // Say when the bot (not the operator) moved the stop, and when its
         // exit is failing at the broker, instead of changing it silently.
         const tag = m?.trail_active ? "trailing" : m?.breakeven_armed ? "breakeven" : null;
         return (
           <>
-            <button type="button" className="am-link" onClick={() => askLevel(p.symbol, "SL", m?.stop_loss ?? null, m?.target ?? null)}>{m?.stop_loss != null ? fmt(m.stop_loss) : "+ SL"}</button>
+            <button type="button" className="am-link" onClick={() => askLevel(p, "SL", m?.stop_loss ?? null, m?.target ?? null)}>{m?.stop_loss != null ? fmt(m.stop_loss) : "+ SL"}</button>
             {tag && <span className="text-dim" title={tag === "trailing" ? "The bot is trailing this stop behind the best price" : "The bot moved this stop to lock in profit"} data-testid={`sl-tag-${p.symbol}`}> · {tag}</span>}
             {m?.exit_failures ? <span className="down" title="The broker refused or timed out the bot's exit order; it keeps retrying. Exit manually if this persists." data-testid={`exit-failing-${p.symbol}`}> · exit failing</span> : null}
           </>
@@ -731,11 +744,12 @@ export function AccountManager({
       },
     },
     {
-      id: "tp", label: "TP", get: (p) => managed?.find((x) => x.symbol === p.symbol)?.target ?? null,
-      render: (p) => { if (!p.quantity) return "—"; const m = managed?.find((x) => x.symbol === p.symbol); return <button type="button" className="am-link" onClick={() => askLevel(p.symbol, "TP", m?.stop_loss ?? null, m?.target ?? null)}>{m?.target != null ? fmt(m.target) : "+ TP"}</button>; },
+      id: "tp", label: "TP", get: (p) => levelsOf(p)?.target ?? null,
+      render: (p) => { if (!p.quantity) return "—"; const m = levelsOf(p); return <button type="button" className="am-link" onClick={() => askLevel(p, "TP", m?.stop_loss ?? null, m?.target ?? null)}>{m?.target != null ? fmt(m.target) : "+ TP"}</button>; },
     },
   ];
-  function askLevel(sym: string, which: "SL" | "TP", sl: number | null, tp: number | null): void {
+  function askLevel(row: Position, which: "SL" | "TP", sl: number | null, tp: number | null): void {
+    const sym = row.symbol;
     const cur = which === "SL" ? sl : tp;
     const v = window.prompt(`${which} for ${sym} (blank clears)`, cur != null ? String(cur) : "");
     if (v === null) return;
@@ -745,23 +759,22 @@ export function AccountManager({
       return;
     }
     // A level already through the market fires the exit on the next tick.
-    const pos = open.find((p) => p.symbol === sym);
+    const pos = row;
     const ltp = peekQuote(sym)?.last_price ?? pos?.last_price ?? null;
     if (n !== null && pos && ltp != null) {
       const long = pos.quantity > 0;
       const through = which === "SL" ? (long ? n >= ltp : n <= ltp) : long ? n <= ltp : n >= ltp;
       if (through && !window.confirm(`${which} ${fmt(n)} is already ${long === (which === "SL") ? "above" : "below"} the last price ${fmt(ltp)} — the position will exit at once. Set it anyway?`)) return;
     }
-    void run(`Exits ${sym}`, () => levelsFor(sym)(which === "SL" ? n : sl, which === "TP" ? n : tp));
+    void run(`Exits ${sym}`, () => levelsFor(sym, row.paper)(which === "SL" ? n : sl, which === "TP" ? n : tp));
   }
   const domPos = selected ? open.find((p) => p.symbol === selected.symbol) : undefined;
   return (
     <>
       <div className="tabs trade-tabs am-tabs" role="tablist">
-        <button type="button" role="tab" aria-selected={tab === "trade"} className={`tab am-trade-tab ${tab === "trade" ? "active" : ""}`} onClick={() => onTab("trade")} title="DOM — trade from the price ladder" data-testid="am-tab-trade">Trade</button>
         <span className="am-title">Account Manager</span>
         <div className="am-tab-scroll">
-          {BOTTOM_TABS.map(([k, l]) => (
+          {bottomTabsShown(tab).map(([k, l]) => (
             <button key={k} type="button" role="tab" aria-selected={tab === k} className={`tab ${tab === k ? "active" : ""}`} onClick={() => onTab(k)} data-testid={`am-tab-${k}`}>{label(k, l)}</button>
           ))}
         </div>
@@ -798,12 +811,12 @@ export function AccountManager({
               id="positions"
               cols={posCols}
               rows={posRows}
-              rowKey={(p) => p.symbol}
-              empty={showClosed ? "No open or closed positions today." : "There are no open positions in your trading account yet."}
+              rowKey={(p) => `${p.paper ? "P" : "R"}:${p.symbol}`}
+              empty="No open or closed positions today."
               toolbar={
                 <>
-                  <button type="button" className="btn-sm danger" disabled={!open.length} onClick={() => {
-                    if (!window.confirm(`Exit all ${open.length} open position(s) at market?`)) return;
+                  <button type="button" className="btn-sm danger" disabled={!mine.length} onClick={() => {
+                    if (!window.confirm(`Exit all ${mine.length} ${modeIsPaper ? "PAPER" : "REAL"} position(s) at market?`)) return;
                     void run("Exit all", async () => {
                       const r = await fetch(accountId === -1 ? "/api/positions/close-all?practice=1" : "/api/positions/close-all", { method: "POST" });
                       const j = await r.json().catch(() => ({}));
@@ -812,10 +825,9 @@ export function AccountManager({
                       void qc.invalidateQueries({ queryKey: ["managed-positions"] });
                       book.reload();
                       const n = typeof j.count === "number" ? j.count : 0;
-                      return n === open.length ? `closed ${n}` : `closed ${n} of ${open.length} — check the Orders tab for the rest`;
+                      return n === mine.length ? `closed ${n}` : `closed ${n} of ${mine.length} — check the Orders tab for the rest`;
                     });
-                  }}>Exit all</button>
-                  <label className="am-check"><input type="checkbox" checked={showClosed} onChange={(e) => setShowClosed(e.target.checked)} data-testid="positions-show-closed" /> Closed today{closed.length ? ` (${closed.length})` : ""}</label>
+                  }} title={`Flatten every ${modeIsPaper ? "PAPER" : "REAL"} position (the mode you are in)`}>Exit all</button>
                 </>
               }
               actions={(p) => !p.quantity ? null : (
@@ -823,10 +835,10 @@ export function AccountManager({
                   <button type="button" className="btn-sm" title="Reverse at market" aria-label={`Reverse ${p.symbol}`} onClick={() => {
                     const q = Math.abs(p.quantity) * 2;
                     if (window.confirm(`Reverse ${p.symbol}: ${p.quantity > 0 ? "SELL" : "BUY"} ${q} at market? You will end up ${p.quantity > 0 ? "SHORT" : "LONG"} ${Math.abs(p.quantity)}.`)) {
-                      void run(`Reverse ${p.symbol}`, () => orderFor(p.symbol, p.symbol, q, orderProduct(productOf(p)))({ side: p.quantity > 0 ? "SELL" : "BUY", type: "MARKET", price: null }));
+                      void run(`Reverse ${p.symbol}`, () => orderFor(p.symbol, p.symbol, q, orderProduct(productOf(p)), p.paper)({ side: p.quantity > 0 ? "SELL" : "BUY", type: "MARKET", price: null }));
                     }
                   }}>⇅</button>
-                  {accountId !== -1 && <button type="button" className="btn-sm" title={convertTitle(p)} data-testid={`convert-${p.symbol}`} onClick={() => {
+                  {!p.paper && <button type="button" className="btn-sm" title={convertTitle(p)} data-testid={`convert-${p.symbol}`} onClick={() => {
                     const to = convertTarget(p);
                     if (window.confirm(`Convert ${p.symbol} (${p.quantity}) from ${p.product ?? "INTRADAY"} to ${to}?`)) {
                       void run(`Convert ${p.symbol} → ${to}`, async () => {
@@ -839,7 +851,7 @@ export function AccountManager({
                       });
                     }
                   }}>{(p.product ?? "INTRADAY") === "INTRADAY" ? "→ Carry" : "→ Intraday"}</button>}
-                  <button type="button" className="btn-sm danger" title="Exit — full or partial, market or limit" onClick={() => setExit({ pos: { symbol: p.symbol, name: p.symbol, qty: p.quantity, avg: p.average_price, ltp: p.last_price, lot: lotOf(p.symbol), product: productOf(p) }, local: true })} data-testid={`exit-${p.symbol}`}>Exit</button>
+                  <button type="button" className="btn-sm danger" title="Exit — full or partial, market or limit" onClick={() => setExit({ pos: { symbol: p.symbol, name: p.symbol, qty: p.quantity, avg: p.average_price, ltp: p.last_price, lot: lotOf(p.symbol), product: productOf(p) }, local: true, paper: p.paper })} data-testid={`exit-${p.symbol}`}>Exit</button>
                 </>
               )}
             />
@@ -908,7 +920,7 @@ export function AccountManager({
           pos={exit.pos}
           onClose={() => setExit(null)}
           onExit={async (q, o, full) => {
-            const r = full && exit.local ? await closeFor(exit.pos.symbol)().then(() => `Closed ${exit.pos.symbol} at market`) : await orderFor(exit.pos.symbol, exit.pos.name, q, orderProduct(exit.pos.product))(o);
+            const r = full && exit.local ? await closeFor(exit.pos.symbol, exit.paper)().then(() => `Closed ${exit.pos.symbol} at market`) : await orderFor(exit.pos.symbol, exit.pos.name, q, orderProduct(exit.pos.product), exit.paper)(o);
             setMsg(`Exit ${exit.pos.symbol}: ${r}`);
             book.reload();
             return r;

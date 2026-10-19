@@ -45,11 +45,12 @@ describe("Positions panel", () => {
     await waitFor(() => expect(screen.getByTestId("am-total-pnl").textContent).toBe("120.00"));
   });
 
-  it("lists today's closed positions on request, without exit buttons", () => {
-    renderManager([pos({}), pos({ id: 2, symbol: "NSE:TCS-EQ", quantity: 0 })]);
-    expect(screen.queryByText("NSE:TCS-EQ")).toBeNull();
-    fireEvent.click(screen.getByTestId("positions-show-closed"));
-    expect(screen.getByText("NSE:TCS-EQ")).toBeTruthy();
+  it("lists running positions first and today's closed ones below, with a Real / Paper column", () => {
+    renderManager([pos({ id: 2, symbol: "NSE:TCS-EQ", quantity: 0 }), pos({}), pos({ id: 3, symbol: "NSE:INFY-EQ", paper: true })]);
+    const syms = screen.getAllByTestId(/^pos-book-/).map((e) => e.getAttribute("data-testid"));
+    expect(syms.at(-1)).toBe("pos-book-NSE:TCS-EQ");                    // closed: last
+    expect(screen.getByTestId("pos-book-NSE:INFY-EQ").textContent).toBe("PAPER");
+    expect(screen.getByTestId("pos-book-NSE:SBIN-EQ").textContent).toBe("REAL");
     expect(screen.queryByTestId("exit-NSE:TCS-EQ")).toBeNull();
     expect(screen.getByTestId("exit-NSE:SBIN-EQ")).toBeTruthy();
   });
@@ -69,7 +70,7 @@ describe("Positions panel", () => {
     fireEvent.click(screen.getByTestId("exit-NSE:SBIN-EQ"));
     fireEvent.change(screen.getByTestId("exit-qty"), { target: { value: "4" } });
     fireEvent.click(screen.getByTestId("exit-position-ok"));
-    await waitFor(() => expect(orderFor).toHaveBeenCalledWith("NSE:SBIN-EQ", "NSE:SBIN-EQ", 4, "DELIVERY"));
+    await waitFor(() => expect(orderFor).toHaveBeenCalledWith("NSE:SBIN-EQ", "NSE:SBIN-EQ", 4, "DELIVERY", undefined));
   });
 
   it("an SL that is not a price is refused, and one already through the market asks first", async () => {

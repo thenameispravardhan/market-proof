@@ -151,7 +151,7 @@ import { DrawingFloatBar, FavoritesBar, LeftToolbar, type CursorMode, type Magne
 import { AlertsPanel, DataWindow, ObjectTree, type DataRow, type GroupAction, type TreeDrop, type TreeItem } from "./ChartWidgets";
 import { AboutIndicatorDialog, InsightsDialog, ManagePanesDialog, WhatsNewDialog } from "./ChartInfoDialogs";
 import { CHART_SETTINGS_EVENT } from "./UserSettings";
-import { LEVEL_DRAG_SLOP, levelProblem, snapToTick } from "./levelDrag";
+import { LEVEL_DRAG_SLOP, levelProblem, snapLot, snapToTick } from "./levelDrag";
 import OrderLayer, { type ChartWorkingOrder, type OrderPatch } from "./OrderLayer";
 
 const IST = IST_OFFSET;
@@ -234,10 +234,16 @@ const RANGES: RangeDef[] = [
 ];
 
 /** Actions the chart asks its host (the Trade page) to perform. */
+/** Account Manager sections that live in Tools ▾ (the bottom bar keeps Positions, Orders, Trades). */
+const ACCOUNT_TABS: [string, string][] = [
+  ["allpositions", "All positions"], ["smart", "Smart orderbook"], ["holdings", "Holdings"], ["gtt", "GTT"],
+  ["funds", "Funds"], ["account", "Account"], ["basket", "Basket"], ["broker", "Fyers live"], ["log", "Notifications"],
+];
+
 export type HostAction =
   | "panel:chain" | "panel:details" | "panel:tree" | "panel:data" | "panel:alerts" | "panel:watch" | "panel:flow"
   | "panel:depth" | "panel:tape" | "panel:futures" | "panel:strategy"
-  | "bottom:positions" | "bottom:orders" | "bottom:basket" | "bottom:smart"
+  | `bottom:${string}`
   | "scalper" | "layouts" | "save" | "maximize" | "watch:add" | "privacy" | "logout" | "usersettings"
   /** Quick trade with one-click OFF: open the order window on that side. */
   | "ticket:buy" | "ticket:sell";
@@ -692,6 +698,8 @@ interface Ctx {
   area: "pane" | "price" | "time" | "drawing";
   drawingId?: string;
   confirm?: ChartOrder;
+  /** Opened from the price scale's "+": alert, orders and a line only. */
+  plus?: boolean;
 }
 
 interface Snap {
@@ -944,10 +952,11 @@ export default function ChartPanel(props: ChartPanelProps) {
   const [mainVer, setMainVer] = useState(0);
   const [dataVer, setDataVer] = useState(0);
   const [undoVer, setUndoVer] = useState(0);
-  const [qty, setQty] = useState(orderQty ?? 1);
+  const lotOf = instrument?.lot_size && instrument.lot_size > 1 ? instrument.lot_size : 1;
+  const [qty, setQty] = useState(() => snapLot(orderQty ?? lotOf, lotOf));
   useEffect(() => {
-    if (orderQty != null) setQty(orderQty);
-  }, [orderQty]);
+    if (orderQty != null) setQty(snapLot(orderQty, lotOf));
+  }, [orderQty, lotOf]);
   useEffect(() => {
     const on = () => setFullscreen(document.fullscreenElement != null);
     document.addEventListener("fullscreenchange", on);
@@ -2490,7 +2499,7 @@ export default function ChartPanel(props: ChartPanelProps) {
       const pr = param.point && inMain ? yToPrice(param.point.y) : null;
       if (param.point && pr != null) {
         window.clearTimeout(plusHideRef.current);
-        plusPriceRef.current = Math.round(pr * 100) / 100;
+        plusPriceRef.current = snapToTick(pr, tickRef.current);
         plus.style.top = `${param.point.y - 9}px`;
         if (settingsRef.current.scaleSide === "left") {
           plus.style.left = `${scaleWidth("left") + 3}px`;
@@ -2512,7 +2521,7 @@ export default function ChartPanel(props: ChartPanelProps) {
       }
     } else if (param.point && inMain) {
       const pr = yToPrice(param.point.y);
-      plusPriceRef.current = pr == null ? null : Math.round(pr * 100) / 100;
+      plusPriceRef.current = pr == null ? null : snapToTick(pr, tickRef.current);
     } else if (!param.point) {
       plusPriceRef.current = null;
     }
@@ -4657,7 +4666,7 @@ export default function ChartPanel(props: ChartPanelProps) {
   // The quick-trade BUY / SELL buttons: one-click (⚡ on) sends at market;
   // off, they open the order window on that side to review and confirm.
   const quickOrder = (side: "BUY" | "SELL") => {
-    if (instant) submitOrder({ side, type: "MARKET", price: null });
+    if (instant) submitOrder({ side, type: "MARKET", price: null, qty: snapLot(qty, qtyStep) });
     else if (onAction) onAction(side === "BUY" ? "ticket:buy" : "ticket:sell");
     else pickOrder({ side, type: "MARKET", price: null }, { x: 8, y: 52, price: lastClose() ?? 0 });
   };
@@ -4725,7 +4734,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     }
     const pr = hy <= dims.height ? yToPrice(hy) : null;
     const price = pr ?? lastClose() ?? 0;
-    setCtx({ x: hx, y: hy, price: Math.round(price * 100) / 100, time: xToTime(x), area, drawingId });
+    setCtx({ x: hx, y: hy, price: snapToTick(price, tickRef.current), time: xToTime(x), area, drawingId });   // NSE prices move in 0.05
   }
 
   function toggleDraw(mode: string): void {
@@ -5938,6 +5947,11 @@ export default function ChartPanel(props: ChartPanelProps) {
             {onAction && (
               <>
                 <div className="chart-menu-sep" />
+                <div className="chart-menu-head">Account</div>
+                {ACCOUNT_TABS.map(([k, l]) => (
+                  <button key={k} type="button" className="chart-menu-item" onClick={() => { setMenuOpen(null); onAction(`bottom:${k}`); }} data-testid={`tools-bottom-${k}`}>{l}</button>
+                ))}
+                <div className="chart-menu-sep" />
                 <div className="chart-menu-head">Fyers products</div>
                         <a className="chart-menu-item" href="https://trade.fyers.in/" target="_blank" rel="noopener noreferrer" onClick={() => setMenuOpen(null)}>FYERS Web ↗</a>
             <button type="button" className="chart-menu-item" onClick={() => { setMenuOpen(null); onAction("panel:flow"); }}>Smart Charts (order flow)</button>
@@ -6120,6 +6134,20 @@ export default function ChartPanel(props: ChartPanelProps) {
             </button>
             <button type="button" className="ticket-side-btn" onClick={() => setCtx(null)}>Cancel</button>
           </div>
+        </>
+      ) : ctx.plus ? (
+        <>
+          <button type="button" className="chart-menu-item" onClick={() => { openAlertDialog(ctx.price); setCtx(null); }} data-testid="plus-alert">⏰ Create alert for {fmtPrice(ctx.price)}</button>
+          {onChartOrder && ctxOrders(ctx.price).filter((o) => o.price != null).map((o) => (
+            <button key={`${o.side}-${o.type}`} type="button" className={`chart-menu-item ctx-${o.side.toLowerCase()}`} onClick={() => pickOrder(o, ctx)}>
+              {o.side === "BUY" ? "⌃" : "⌄"} {orderLabel(o)}
+            </button>
+          ))}
+          {onPickPrice && <button type="button" className="chart-menu-item" onClick={() => { onPickPrice(ctx.price); setCtx(null); }}>Create new order…<span className="kbd">Shift+T</span></button>}
+          <div className="chart-menu-sep" />
+          {onChartOrder && <button type="button" className="chart-menu-item" onClick={() => { setDialog({ k: "settings", tab: "trading" }); setCtx(null); }}>⬡ Trading settings…</button>}
+          <div className="chart-menu-sep" />
+          <button type="button" className="chart-menu-item" onClick={() => { addHLine(ctx.price); setCtx(null); }}>─ Draw Horizontal Line at {fmtPrice(ctx.price)}<span className="kbd">Alt+H</span></button>
         </>
       ) : ctx.area === "price" ? (
         scaleMenu(() => setCtx(null))
@@ -6330,13 +6358,15 @@ export default function ChartPanel(props: ChartPanelProps) {
                 <input
                   className="qt-qty"
                   type="number"
-                  min={1}
+                  // min = the lot: the spinner steps from min, so min 1 + step 750 gave 751, 1501
+                  min={qtyStep}
                   step={qtyStep}
                   value={qty}
                   aria-label="Quantity"
-                  title={onOrderQty ? "Quantity (the ticket's)" : "Quantity"}
-                  onChange={(e) => {
-                    const n = Math.max(1, Math.floor(Number(e.target.value) || 1));
+                  title={onOrderQty ? `Quantity (the ticket's)${qtyStep > 1 ? ` · lot ${qtyStep}` : ""}` : "Quantity"}
+                  onChange={(e) => setQty(Math.max(1, Math.floor(Number(e.target.value) || 0)))}
+                  onBlur={() => {
+                    const n = snapLot(qty, qtyStep);
                     setQty(n);
                     onOrderQty?.(n);
                   }}
@@ -6495,7 +6525,7 @@ export default function ChartPanel(props: ChartPanelProps) {
                 const pr = plusPriceRef.current;
                 if (pr == null) return;
                 const w = containerRef.current?.clientWidth ?? 600;
-                setCtx({ x: w - scaleWidth("right") - 250, y: parseFloat(plusRef.current?.style.top || "0") + 22, price: pr, time: null, area: "pane" });
+                setCtx({ x: w - scaleWidth("right") - 250, y: parseFloat(plusRef.current?.style.top || "0") + 22, price: pr, time: null, area: "pane", plus: true });
               }}
               data-testid="chart-plus"
             >

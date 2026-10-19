@@ -5,6 +5,7 @@
 // Orders go through the Trade page (risk checks, trading-mode gates); a
 // click asks for confirmation unless one-click (instant) trading is on.
 
+import { snapLot } from "./levelDrag";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { InstrumentHit } from "../../types";
 import { useLiveQuote } from "../../hooks/useQuotes";
@@ -308,7 +309,8 @@ export function DomPanel({
           min={lot}
           step={lot}
           value={qty}
-          onChange={(e) => onQty(Math.max(lot, Math.floor(Number(e.target.value) || lot)))}
+          onChange={(e) => onQty(Math.max(1, Math.floor(Number(e.target.value) || 0)))}
+          onBlur={() => onQty(snapLot(qty, lot))}
           aria-label="Quantity"
           data-testid="dom-qty"
         />
