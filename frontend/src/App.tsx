@@ -50,6 +50,15 @@ const News = lazy(() => import("./pages/News"));
 const Settings = lazy(() => import("./pages/Settings"));
 const Timing = lazy(() => import("./pages/Timing"));
 
+// Fetch every page's code while the browser is idle, so opening a page never
+// waits on a download (the lazy() calls above then resolve at once).
+const PREFETCH = [() => import("./pages/Trade"), () => import("./pages/News"), () => import("./pages/Algo"), () => import("./pages/TradeHistory"),
+  () => import("./pages/Dashboard"), () => import("./pages/Settings"), () => import("./pages/Accounts"), () => import("./pages/Rules")];
+if (typeof window !== "undefined") {
+  const idle = (cb: () => void) => ("requestIdleCallback" in window ? (window as unknown as { requestIdleCallback: (f: () => void) => void }).requestIdleCallback(cb) : setTimeout(cb, 1500));
+  window.addEventListener("load", () => idle(() => { for (const p of PREFETCH) void p().catch(() => undefined); }), { once: true });
+}
+
 // Nav grouped by the OPERATOR'S WORKFLOW, not by module:
 //   LIVE        — what is happening right now
 //   STRATEGY    — how the bot decides (in pipeline order: AI → rules →

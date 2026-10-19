@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import urlsplit
 
+from fastapi.responses import JSONResponse
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, field_validator
@@ -138,7 +139,9 @@ def items(since_id: int = 0, q: str = Query("", max_length=100), source: Optiona
         e = ext.get(r.url)
         out.append({**_row(r), "extract": {"status": e["status"], "chars": e["chars"] or 0, "error": e["error"],
                                             "fetched": e["fetched"]} if e else None})
-    return {"items": out, "max_id": max_id}
+    # Straight to JSON: FastAPI's generic encoder walked 2000 headlines field by field (~0.9 s of the
+    # News page's first load on the server; the query + tags take ~0.25 s).
+    return JSONResponse({"items": out, "max_id": max_id})
 
 
 @router.get("/stocks")

@@ -11,6 +11,7 @@ import { AllSettings } from "../components/settings/AllSettings";
 import { AuditLog } from "../components/settings/AuditLog";
 import { BreakerHistory } from "../components/settings/BreakerHistory";
 import { NewsSources } from "../components/settings/NewsSources";
+import { ServerRestart } from "../components/settings/ServerRestart";
 import { CHART_LINK_IV_KEY, chartLinkIv } from "../lib/chartLink";
 
 export default function Settings() {
@@ -22,6 +23,7 @@ export default function Settings() {
           <AllSettings />
         </div>
         <div className="page-col">
+          <ServerRestart />
           <NewsSources />
           <BreakerHistory />
           <AuditLog />

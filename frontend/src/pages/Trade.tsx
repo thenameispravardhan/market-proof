@@ -44,6 +44,7 @@ import { useLiveQuote } from "../hooks/useQuotes";
 import { tabLocal, useRouter } from "../router";
 import { withWs } from "../workspace";
 import { chartLinkParams, resolveBareHit } from "../lib/chartLink";
+import { fmtK } from "../components/trade/customSeries";
 import ChartPanel, { type ChartOrder, type ChartPosition, type HostAction } from "../components/trade/ChartPanel";
 import type { ChartWorkingOrder, OrderPatch } from "../components/trade/OrderLayer";
 import Scalper, { DRAG_MIME, splitDrag } from "../components/trade/Scalper";
@@ -478,9 +479,10 @@ function FlowPanel({ symbol }: { symbol: string | null }) {
   const buy = today.reduce((a, b) => a + b[1], 0), sell = today.reduce((a, b) => a + b[2], 0);
   let cvd = 0;
   const maxAbs = Math.max(1, ...today.map((b) => Math.abs(b[3])));
-  const fmt = (v: number) => Math.round(v).toLocaleString("en-IN");
+  // Compact (13.63L, -2.63L): full Indian digits overflowed the panel's boxes and its CVD column.
+  const fmt = (v: number) => fmtK(v);
   return (
-    <section className="trade-card" data-testid="trade-flow">
+    <section className="trade-card flow-card" data-testid="trade-flow">
       <h2>Real order flow — {symbol} {data?.key && <span className="hint">recorded as {data.key}</span>}</h2>
       {err && <div className="hint warn-text">{err}</div>}
       {note && <div className="hint">{note}</div>}
@@ -513,15 +515,16 @@ function FlowPanel({ symbol }: { symbol: string | null }) {
             <div className="quote-cell"><div className="k">DELTA</div><div className={`v ${buy >= sell ? "up" : "down"}`}>{fmt(buy - sell)}</div></div>
             <div className="quote-cell"><div className="k">BUY %</div><div className="v">{buy + sell ? ((buy / (buy + sell)) * 100).toFixed(1) : "—"}</div></div>
           </div>
-          <div style={{ maxHeight: 280, overflow: "auto" }}>
-            <table className="pending-table">
-              <thead><tr><th>Time</th><th>Buy</th><th>Sell</th><th>Delta</th><th style={{ width: "40%" }}></th><th>CVD</th></tr></thead>
+          <div className="flow-scroll">
+            <table className="pending-table flow-table">
+              <thead><tr><th>Time</th><th>Buy</th><th>Sell</th><th>Delta</th><th className="flow-bar-col"></th><th>CVD</th></tr></thead>
               <tbody>{today.map((b) => { cvd += b[3]; return (
                 <tr key={b[0]}>
                   <td>{new Date((b[0] + 19800) * 1000).toISOString().slice(11, 16)}</td>
                   <td className="up">{fmt(b[1])}</td><td className="down">{fmt(b[2])}</td>
                   <td className={b[3] >= 0 ? "up" : "down"}>{fmt(b[3])}</td>
-                  <td><div style={{ height: 8, width: `${(Math.abs(b[3]) / maxAbs) * 100}%`, background: b[3] >= 0 ? "var(--green)" : "var(--red)", marginLeft: b[3] >= 0 ? "50%" : `${50 - (Math.abs(b[3]) / maxAbs) * 50}%`, maxWidth: "50%" }} /></td>
+                  {/* centred delta bar: right of the middle for buying, left for selling (half the cell = the bar's max) */}
+                  <td className="flow-bar-col"><div style={{ height: 8, width: `${(Math.abs(b[3]) / maxAbs) * 50}%`, background: b[3] >= 0 ? "var(--green)" : "var(--red)", marginLeft: b[3] >= 0 ? "50%" : `${50 - (Math.abs(b[3]) / maxAbs) * 50}%` }} /></td>
                   <td className={cvd >= 0 ? "up" : "down"}>{fmt(cvd)}</td>
                 </tr>); })}</tbody>
             </table>

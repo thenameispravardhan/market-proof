@@ -3821,6 +3821,21 @@ export default function ChartPanel(props: ChartPanelProps) {
           e.fp.push([p, b, s]);
           fp.set(k, e);
         }
+        // An index has no trades: its flow is the FUTURE's (j.key), at futures prices ~basis away from
+        // the index candles. Each bar's rows shift by that bar's basis (index typical price − the future's
+        // volume-weighted price) so the footprint sits on the candle instead of floating above it.
+        const proxy = symbol.toUpperCase().endsWith("-INDEX");
+        if (proxy) {
+          const byT = new Map(candlesRef.current.map((c) => [c.time as number, c]));
+          for (const [k, e] of fp) {
+            const c = byT.get(k);
+            const vol = e.fp.reduce((a, [, b, s2]) => a + b + s2, 0);
+            if (!c || !vol) continue;
+            const vwap = e.fp.reduce((a, [p, b, s2]) => a + p * (b + s2), 0) / vol;
+            const shift = (c.high + c.low + c.close) / 3 - vwap;
+            e.fp = e.fp.map(([p, b, s2]) => [p + shift, b, s2]);
+          }
+        }
         // Cumulative delta restarts each session.
         let day = -1, cum = 0;
         for (const k of [...fp.keys()].sort((a, b) => a - b)) {
@@ -3830,7 +3845,7 @@ export default function ChartPanel(props: ChartPanelProps) {
           e.cd = cum;
         }
         fpRef.current = fp;
-        setFlowNote(j.recorded ? `footprint: ${j.key}` : `no ticks recorded for ${j.key} yet — add it on Algo Lab › Data`);
+        setFlowNote(j.recorded ? `footprint: ${j.key}${proxy ? " (futures flow, on the index)" : ""}` : `no ticks recorded for ${j.key} yet — add it on Algo Lab › Data`);
         setMainData();
       } catch {
         if (!stop) setFlowNote("footprint fetch failed");

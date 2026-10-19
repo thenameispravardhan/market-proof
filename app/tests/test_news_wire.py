@@ -338,3 +338,15 @@ def test_detection_lag_per_source_skips_first_poll_backlog(client, isolated_db, 
     mint = next(x["lag"] for x in st["sources"] if x["source"] == "Mint")
     assert mint == {"p50": 60.0, "p90": 90.0, "n": 3}, mint
     assert st["lag"]["n"] == 6 and st["lag"]["fastest"] == "Mint"
+
+
+def test_cnbc_awaaz_headline_is_the_english_link_slug():
+    from app.services.news_wire import parse_feed, slug_title
+
+    url = ("https://hindi.cnbctv18.com/share-market/hindustan-zinc-q2-results-profit-jumps-142-percent-"
+           "to-6412-crore-rupees-revenue-beats-estimates-read-details-199557.htm")
+    assert slug_title(url) == "Hindustan zinc q2 results profit jumps 142 percent to 6412 crore rupees revenue beats estimates"
+    body = (f"<rss><channel><item><title><![CDATA[Hindustan Zinc Q2 Results: वेदांता ग्रुप]]></title><link><![CDATA[{url}]]></link>"
+            "<description>हिंदी</description><pubDate>Mon, 19 Oct 2026 15:51:52 +0530</pubDate></item></channel></rss>").encode()
+    item = parse_feed(body, slug=True)[0]
+    assert item["title"].startswith("Hindustan zinc q2 results") and item["summary"] is None

@@ -59,7 +59,9 @@ DEFAULT_FEEDS: list[dict[str, Any]] = [
     {"source": "CNBC-TV18", "url": "https://www.cnbctv18.com/commonfeeds/v1/cne/rss/latest.xml", "group": MARKETS},
     {"source": "CNBC-TV18", "url": "https://www.cnbctv18.com/commonfeeds/v1/cne/rss/market.xml", "group": MARKETS},
     # CNBC Awaaz (Hindi): same network feed API, site code "cnh" (robots.txt allows "*"); fresh within a minute.
-    {"source": "CNBC Awaaz", "url": "https://hindi.cnbctv18.com/commonfeeds/v1/cnh/rss/latest.xml", "group": MARKETS, "every": 10},
+    # Its titles are Hindi; the link slug is an English summary, so that is the headline (slug_title).
+    {"source": "CNBC Awaaz", "url": "https://hindi.cnbctv18.com/commonfeeds/v1/cnh/rss/latest.xml", "group": MARKETS, "every": 10,
+     "slug_title": True},
     # ET and BusinessLine: their Google News sitemaps (listed in robots.txt) show a story ~1.5 min after it is
     # published; their section RSS took 8-14 min (ET) and 3-4 min (measured 2026-10-18). A sitemap is the whole site,
     # so "paths" keeps only these sections. Their other RSS feeds still run: a story they carry first is kept there.
@@ -142,7 +144,7 @@ NEW_OFF = set(SOURCES) - ORIGINAL                # every source added since ship
 # article links refuse an honest client (BSE AttachLive PDFs 503/406, ndtvprofit.com Akamai 403, ndtv.com 403 x5 on
 # 2026-10-17, which the scraper then paused), are exchange filings (NSE: XBRL / PDF) or sit behind a paywall: off.
 SCRAPE_DB = Path("data/scrape.db")
-EXTRACT_OFF = {"BSE", "NDTV Profit", "NDTV", "NSE", "MarketWatch", "Nikkei Asia"}
+EXTRACT_OFF = {"BSE", "NDTV Profit", "NDTV", "NSE", "MarketWatch", "Nikkei Asia", "CNBC Awaaz"}   # Awaaz: Hindi article text
 
 DEFAULTS: dict[str, Any] = {
     "enabled": False,        # off until the operator turns it on from the News page
@@ -249,7 +251,19 @@ def _text(e: Optional[ET.Element]) -> str:
     return " ".join("".join(e.itertext()).split()) if e is not None else ""
 
 
-def parse_feed(body: bytes, ist: bool = False, subject: bool = False) -> list[dict[str, Any]]:
+def slug_title(url: str) -> str:
+    """An English headline from a link's slug: CNBC Awaaz writes in Hindi but
+    its URLs summarise the story in English (".../hindustan-zinc-q2-results-
+    profit-jumps-142-percent-...-read-details-199557.htm")."""
+    slug = url.rstrip("/").rsplit("/", 1)[-1]
+    slug = re.sub(r"\.html?$", "", slug)
+    slug = re.sub(r"-\d{4,}$", "", slug)                 # the article id
+    slug = re.sub(r"-(read|know|see)-(details|more|here)$", "", slug)
+    words = slug.replace("-", " ").split()
+    return " ".join(words)[:1].upper() + " ".join(words)[1:] if words else ""
+
+
+def parse_feed(body: bytes, ist: bool = False, subject: bool = False, slug: bool = False) -> list[dict[str, Any]]:
     """Items of an RSS / Atom / news-sitemap document. A plain sitemap (no titles) gives []. Stdlib ElementTree
     resolves no external entities, and Python's expat caps entity expansion. subject: the feed's titles are company
     names and its descriptions end in "|SUBJECT: ..." (NSE): the headline becomes "Company: subject"."""
@@ -272,6 +286,8 @@ def parse_feed(body: bytes, ist: bool = False, subject: bool = False) -> list[di
             continue
         summary = _text(first("description", "summary"))
         summary = html.unescape(re.sub(r"<[^>]+>", " ", summary))
+        if slug:                                       # English headline from the link; the Hindi text is dropped
+            title, summary = slug_title(url) or title, ""
         if subject and "|SUBJECT:" in summary:
             summary, subj = summary.split("|SUBJECT:", 1)
             title = f"{title}: {' '.join(subj.split())}" if subj.strip() else title
@@ -397,7 +413,7 @@ class NewsWire:
         st.etag, st.modified = r.headers.get("etag"), r.headers.get("last-modified")
         # Moneycontrol's 500 KB sitemap takes ~25 ms to parse, every 10 s: off the loop the trading path shares
         items = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: parse_feed(bytes(body), ist=f.get("ist", False), subject=f.get("subject", False)))
+            None, lambda: parse_feed(bytes(body), ist=f.get("ist", False), subject=f.get("subject", False), slug=f.get("slug_title", False)))
         if not items:
             return self._failed(st, 200, "no items (not a feed?)")
         if f.get("paths"):                       # a whole-site sitemap: only the sections the feed names
