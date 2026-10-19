@@ -267,3 +267,4 @@ def test_items_name_the_stocks_an_article_names_when_its_headline_does_not(clien
     assert _short(rows["https://x.example/a"]["text_tickers"]) == ["ICICIBANK"]      # only the article names it
     assert rows["https://x.example/b"]["text_tickers"] == []                        # the headline already names one
     assert len(news_api._TEXT_STOCKS) == 1                                           # scanned once, then cached
+    assert nt.text_stocks("Jobs in the IT sector are changing. ICICI Bank shares rose.") == ["NSE:ICICIBANK-EQ"]
