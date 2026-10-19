@@ -48,7 +48,7 @@ describe("Positions panel", () => {
   it("lists running positions first and today's closed ones below, with a Real / Paper column", () => {
     renderManager([pos({ id: 2, symbol: "NSE:TCS-EQ", quantity: 0 }), pos({}), pos({ id: 3, symbol: "NSE:INFY-EQ", paper: true })]);
     const syms = screen.getAllByTestId(/^pos-book-/).map((e) => e.getAttribute("data-testid"));
-    expect(syms.at(-1)).toBe("pos-book-NSE:TCS-EQ");                    // closed: last
+    expect(syms[syms.length - 1]).toBe("pos-book-NSE:TCS-EQ");                    // closed: last
     expect(screen.getByTestId("pos-book-NSE:INFY-EQ").textContent).toBe("PAPER");
     expect(screen.getByTestId("pos-book-NSE:SBIN-EQ").textContent).toBe("REAL");
     expect(screen.queryByTestId("exit-NSE:TCS-EQ")).toBeNull();

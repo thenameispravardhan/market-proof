@@ -4,15 +4,38 @@
     {
       "name": "frontend",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev"],
+      "runtimeArgs": [
+        "run",
+        "dev"
+      ],
       "cwd": "frontend",
       "port": 5173
     },
     {
       "name": "api-testing",
       "runtimeExecutable": "python",
-      "runtimeArgs": ["-c", "import os; os.environ['TESTING']='1'; import uvicorn; uvicorn.run('app.main:app', host='127.0.0.1', port=8000)"],
+      "runtimeArgs": [
+        "-c",
+        "import os; os.environ['TESTING']='1'; import uvicorn; uvicorn.run('app.main:app', host='127.0.0.1', port=8000)"
+      ],
       "port": 8000
+    },
+    {
+      "name": "api-slm",
+      "runtimeExecutable": "python",
+      "runtimeArgs": [
+        "-c",
+        "import os; os.environ['TESTING']='1'; os.environ['LLM_SLM_ENDPOINT']='http://127.0.0.1:8001/v1/chat/completions'; os.environ['LLM_SLM_MODEL']='tradebot-slm-v3'; import uvicorn; uvicorn.run('app.main:app', host='127.0.0.1', port=8000)"
+      ],
+      "port": 8000
+    },
+    {
+      "name": "news",
+      "runtimeExecutable": "scraper/.venv/Scripts/python.exe",
+      "runtimeArgs": [
+        "scraper/news.py"
+      ],
+      "port": 8765
     }
   ]
 }
