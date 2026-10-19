@@ -255,7 +255,7 @@ def slug_title(url: str) -> str:
     """An English headline from a link's slug: CNBC Awaaz writes in Hindi but
     its URLs summarise the story in English (".../hindustan-zinc-q2-results-
     profit-jumps-142-percent-...-read-details-199557.htm")."""
-    slug = url.rstrip("/").rsplit("/", 1)[-1]
+    slug = url.split("#", 1)[0].split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]   # "#update-N" re-title rows too
     slug = re.sub(r"\.html?$", "", slug)
     slug = re.sub(r"-\d{4,}$", "", slug)                 # the article id
     slug = re.sub(r"-(read|know|see)-(details|more|here)$", "", slug)
