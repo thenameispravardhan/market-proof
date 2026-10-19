@@ -32,6 +32,7 @@ class FakeBroker:
         self.reject = reject or set()
         self.fills = fills or {}
         self.net = net if net is not None else {}
+        self.cancelled: list[str] = []
 
     async def order(self, account, symbol, side, qty, *, exit_, strategy_id, product="INTRADAY"):
         self.orders.append({"symbol": symbol, "side": side, "qty": qty, "exit": exit_, "product": product})
@@ -45,6 +46,9 @@ class FakeBroker:
 
     async def broker_net(self, account, symbol):
         return self.net.get(symbol)
+
+    async def cancel(self, account, order_id):
+        self.cancelled.append(order_id)
 
 
 def _install(monkeypatch, broker: FakeBroker, px: dict[str, float], *, account_ok=True):
@@ -73,6 +77,7 @@ def _install(monkeypatch, broker: FakeBroker, px: dict[str, float], *, account_o
     monkeypatch.setattr(rn, "_order", broker.order)
     monkeypatch.setattr(rn, "_fill_price", broker.fill_price)
     monkeypatch.setattr(rn, "_broker_net", broker.broker_net)
+    monkeypatch.setattr(rn, "_cancel", broker.cancel)
     monkeypatch.setattr(rn.data, "live_bundle", fake_bundle)
     monkeypatch.setattr(rn, "build_legs", fake_legs)
     monkeypatch.setattr(rn, "_ltp", fake_ltp)
@@ -124,6 +129,7 @@ def test_half_filled_entry_is_rolled_back(monkeypatch, isolated_db):
         ("NSE:NIFTYPE", "SELL", False),    # rejected
         ("NSE:NIFTYCE", "SELL", True),     # the filled leg is flattened
     ]
+    assert broker.cancelled == ["OID1"]    # any unfilled remainder cancelled before flattening
     with dbs.SessionLocal() as db:
         t = db.query(AlgoTrade).one()
         assert t.status == "rejected" and "rolled back" in t.note and "insufficient margin" in t.note
@@ -217,5 +223,6 @@ def test_accepted_but_unfilled_exit_keeps_the_trade_open(monkeypatch, isolated_d
     tid = _open_live_trade(_strategy())
     r = rn.AlgoRunner()
     assert asyncio.run(r._exit(_row_dict(tid), px, "STOP", T_CLOSE + 60)) is False
+    assert broker.cancelled == ["OID1"]        # cancelled first, so the retry can't double the exit
     with dbs.SessionLocal() as db:
         assert db.get(AlgoTrade, tid).status == "open"

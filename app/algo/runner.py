@@ -262,6 +262,20 @@ async def _fill_price(account: Optional[BrokerAccount], order_id: Optional[str],
     return None
 
 
+async def _cancel(account: Optional[BrokerAccount], order_id: Optional[str]) -> None:
+    """Cancel a still-working order before acting on it again: a late fill of
+    an order we gave up on would be an unmanaged (or reversed) position. A
+    cancel of an order that already filled is a harmless "no"."""
+    if account is None or not order_id:
+        return
+    from app.api.orders import _manager
+
+    try:
+        await _manager()._manual_backend_for(account).cancel_order(str(order_id))  # noqa: SLF001
+    except Exception as e:  # noqa: BLE001
+        log.warning("algo.cancel_failed", order_id=order_id, error=str(e)[:200])
+
+
 def _mtm(legs: list[dict], prices: dict[str, float]) -> Optional[float]:
     total = 0.0
     for lg in legs:
@@ -587,6 +601,7 @@ class AlgoRunner:
                     # position open. Booked only once the broker holds less.
                     after = await _broker_net(acc, lg["symbol"])
                     if after is None or (after * lg["act"] > 0 and abs(after) >= abs(held)):
+                        await _cancel(acc, oid)            # else the retry's order doubles it into a reversal
                         self._retry_at[t["id"]] = now + 30
                         await asyncio.to_thread(_update, t["id"], legs=legs, note=f"exit {oid} not filled yet"[:500])
                         self.event("error", f"EXIT NOT FILLED {lg['symbol']} ({reason}): retrying", trade_id=t["id"])
@@ -818,6 +833,7 @@ class AlgoRunner:
                         break
             if failure:
                 for lg in placed:                                   # roll back what did fill
+                    await _cancel(acc, lg.get("order_id"))          # a late fill would be unmanaged
                     qty = lg["qty"]
                     net = await _broker_net(acc, lg["symbol"])
                     if net is not None:                             # never sell what the broker doesn't hold

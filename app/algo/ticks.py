@@ -44,7 +44,8 @@ log = get_logger(__name__)
 ROOT = Path(__file__).resolve().parents[2] / "data" / "ticks"
 IST = 19800
 COMPACT_AFTER_MIN = 15 * 60 + 40
-MAX_SYMBOLS = 80
+MAX_SYMBOLS = 300        # "ALL:FUT" is ~220 futures; options / every stock would outgrow this 2-CPU box
+RETENTION_DAYS = 30      # tick files older than this are deleted after each day's compaction
 DEFAULT_SYMBOLS = ["NIFTY:FUT", "BANKNIFTY:FUT", "NSE:RELIANCE-EQ", "NSE:HDFCBANK-EQ", "NSE:ICICIBANK-EQ",
                    "NSE:SBIN-EQ", "NSE:INFY-EQ", "NSE:TCS-EQ", "NSE:AXISBANK-EQ", "NSE:KOTAKBANK-EQ",
                    "NSE:LT-EQ", "NSE:ITC-EQ", "NSE:BHARTIARTL-EQ", "NSE:BAJFINANCE-EQ"]
@@ -103,9 +104,10 @@ class TickRecorder:
         except (OSError, ValueError):
             return {"enabled": True, "symbols": list(DEFAULT_SYMBOLS)}
 
-    def save_config(self, enabled: bool, symbols: list[str]) -> dict[str, Any]:
+    def save_config(self, enabled: bool, symbols: list[str], retention_days: Optional[int] = None) -> dict[str, Any]:
         syms = list(dict.fromkeys(s.strip().upper() for s in symbols if s.strip()))[:MAX_SYMBOLS]
-        self.config = {"enabled": bool(enabled), "symbols": syms}
+        keep = int(retention_days or self.config.get("retention_days") or RETENTION_DAYS)
+        self.config = {"enabled": bool(enabled), "symbols": syms, "retention_days": max(1, min(365, keep))}
         self.root.mkdir(parents=True, exist_ok=True)
         tmp = self.root / "config.json.tmp"
         tmp.write_text(json.dumps(self.config, indent=1), encoding="utf-8")
@@ -121,7 +123,10 @@ class TickRecorder:
         from app.algo import fno
 
         out = []
-        for s in list(self.config.get("symbols", [])) + self.extra:
+        entries = list(self.config.get("symbols", [])) + self.extra
+        if "ALL:FUT" in entries:                    # every index and stock future, current month (rolls)
+            entries = [f"{n}:FUT" for n in sorted(fno.master()["futures"])] + [e for e in entries if e != "ALL:FUT"]
+        for s in entries:
             full = self._resolved.get(s)
             if full is None:
                 if s.endswith(":FUT"):
@@ -223,6 +228,7 @@ class TickRecorder:
                 if ((now + IST) % 86400) // 60 >= COMPACT_AFTER_MIN and self._compacted_day != day:
                     self._compacted_day = day
                     await asyncio.to_thread(self.compact, day)
+                    await asyncio.to_thread(self.prune, day)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 — recording must never take the bot down
@@ -300,8 +306,15 @@ class TickRecorder:
             csvp = self._raw_path(key, day, "csv")
             if csvp.exists():
                 pq = self._raw_path(key, day, "parquet")
-                con.execute(f"COPY (SELECT * FROM read_csv('{csvp.as_posix()}', header=true)) "
-                            f"TO '{pq.as_posix()}' (FORMAT parquet)")
+                # APPEND to a day already compacted: a restart after the close compacted the few
+                # late frames again and the plain COPY replaced the whole day (2026-10-14 and -19
+                # kept 1 raw row of ~29k for NIFTY-FUT).
+                src = f"SELECT * FROM read_csv('{csvp.as_posix()}', header=true)"
+                if pq.exists():
+                    src = f"SELECT * FROM read_parquet('{pq.as_posix()}') UNION ALL BY NAME {src}"
+                tmp = pq.with_suffix(".parquet.tmp")
+                con.execute(f"COPY ({src}) TO '{tmp.as_posix()}' (FORMAT parquet)")
+                tmp.replace(pq)
                 csvp.unlink()
             rows = [(t, *v) for t, v in sorted(minutes.get(key, {}).items()) if (t + IST) // 86400 == day]
             self._append(con, self.root / "flow" / key / f"{ym}.parquet", rows,
@@ -311,6 +324,28 @@ class TickRecorder:
             self._append(con, self.root / "fp" / key / f"{ym}.parquet", fps,
                          "minute BIGINT, price DOUBLE, buy DOUBLE, sell DOUBLE", "minute, price")
         log.info("ticks.compacted", day=day, symbols=len(minutes))
+
+    def prune(self, today: int) -> int:
+        """Delete tick files older than `retention_days`: raw days by date, the
+        monthly flow / footprint files once their whole month is past the cutoff."""
+        cutoff = today - int(self.config.get("retention_days") or RETENTION_DAYS)
+        gone = 0
+        for f in self.root.glob("raw/*/*.parquet"):
+            try:
+                day = calendar.timegm(time.strptime(f.stem, "%Y%m%d")) // 86400
+            except ValueError:
+                continue
+            if day < cutoff:
+                f.unlink()
+                gone += 1
+        cut_ym = time.strftime("%Y%m", time.gmtime(cutoff * 86400))
+        for f in list(self.root.glob("flow/*/*.parquet")) + list(self.root.glob("fp/*/*.parquet")):
+            if f.stem.isdigit() and len(f.stem) == 6 and f.stem < cut_ym:
+                f.unlink()
+                gone += 1
+        if gone:
+            log.info("ticks.pruned", files=gone, cutoff_day=cutoff)
+        return gone
 
     @staticmethod
     def _append(con, path: Path, rows: list[tuple], schema: str, keys: str) -> None:
@@ -389,6 +424,7 @@ class TickRecorder:
         with self._lock:
             stats = {k: dict(v) for k, v in self.stats.items()}
         return {"enabled": bool(self.config.get("enabled")), "config_symbols": self.config.get("symbols", []),
+                "retention_days": int(self.config.get("retention_days") or RETENTION_DAYS), "max_symbols": MAX_SYMBOLS,
                 "strategy_symbols": self.extra, "subscribed": self.symbols(), "today": stats,
                 "days_recorded": days, "disk_mb": round(size / 1e6, 1)}
 

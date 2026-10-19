@@ -83,7 +83,7 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
     const data = this.data;
     const o = this.opts;
     if (!data || !o || !data.visibleRange) return;
-    target.useMediaCoordinateSpace(({ context: ctx }: MediaScope) => {
+    target.useMediaCoordinateSpace(({ context: ctx, mediaSize }: MediaScope) => {
       const { from, to } = data.visibleRange!;
       const bars = data.bars;
       const bs = data.barSpacing * (data.conflationFactor || 1);
@@ -140,7 +140,7 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
         return;
       }
       if (o.mode === "footprint") {
-        this.footprint(ctx, bars, lo, hi, bs, Y);
+        this.footprint(ctx, bars, lo, hi, bs, Y, mediaSize.height);
         return;
       }
       let maxVol = 1;
@@ -207,7 +207,7 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
    *  left (red), buy on its right (green), shade ∝ the row's share of the
    *  bar's busiest row; Δ and cumulative Δ above, sell / buy totals below.
    *  A bar without recorded ticks is just the thin candle. */
-  private footprint(ctx: CanvasRenderingContext2D, bars: PaneRendererCustomData<Time, OhlcItem>["bars"], lo: number, hi: number, bs: number, Y: (p: number) => number | null): void {
+  private footprint(ctx: CanvasRenderingContext2D, bars: PaneRendererCustomData<Time, OhlcItem>["bars"], lo: number, hi: number, bs: number, Y: (p: number) => number | null, paneH: number): void {
     const o = this.opts!;
     // Row height: ≥ 14 px of price, never finer than the data's own levels.
     let pxPer = 0;
@@ -219,7 +219,11 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
     const step = niceStep(pxPer > 0 ? 14 / pxPer : 0.05);
     const bodyW = Math.max(2, Math.min(6, bs * 0.08));
     const cellW = Math.max(0, (bs * 0.94 - bodyW) / 2 - 2);
-    const text = cellW >= 24;
+    const text = cellW >= 16;
+    // The per-bar Δ / volume summary sits in a fixed band at the foot of the pane
+    // (TradingView): drawn above / below each candle it ran into its neighbours' rows.
+    const sumY = paneH - 34;
+    const fits = (t: string, w: number) => ctx.measureText(t).width <= w - 2;
     ctx.font = "10px sans-serif";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
@@ -233,7 +237,9 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
       ctx.fillRect(b.x - 0.5, yh, 1, Math.max(1, yl - yh));
       ctx.fillRect(b.x - bodyW / 2, Math.min(yo, yc), bodyW, Math.max(1, Math.abs(yc - yo)));
       if (!d.fp?.length || cellW < 4) continue;
-      const rows = footprintRows(d.fp, step);
+      // Rows stay inside the candle: ticks recorded a hair outside the bar's own high / low
+      // (or a future's flow on an index) are folded into its edge rows.
+      const rows = footprintRows(d.fp.map(([p, b2, s2]) => [Math.min(d.high, Math.max(d.low, p)), b2, s2] as [number, number, number]), step);
       const max = Math.max(1, ...rows.map((r) => Math.max(r.buy, r.sell)));
       let buy = 0, sell = 0;
       for (const r of rows) {
@@ -245,26 +251,23 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
         const cell = (x: number, v: number, c: string) => {
           ctx.fillStyle = alpha(c, 0.18 + 0.72 * (v / max));
           ctx.fillRect(x, y, cellW, h);
-          if (text && h >= 9 && v > 0) {
+          const t = fmtK(v);
+          if (text && h >= 9 && v > 0 && fits(t, cellW)) {
             ctx.fillStyle = "#FFFFFF";
-            ctx.fillText(fmtK(v), x + cellW / 2, y + h / 2);
+            ctx.fillText(t, x + cellW / 2, y + h / 2);
           }
         };
         cell(b.x - bodyW / 2 - 1 - cellW, r.sell, o.downColor);
         cell(b.x + bodyW / 2 + 1, r.buy, o.upColor);
       }
-      if (!text) continue;
       const delta = buy - sell;
+      const room = bs * 0.94;
+      const dt = fmtK(delta), vt = fmtK(buy + sell);
+      if (!fits(dt, room) || !fits(vt, room)) continue;
       ctx.fillStyle = delta >= 0 ? o.upColor : o.downColor;
-      ctx.fillText(fmtK(delta), b.x, yh - 20);
-      if (d.cd !== undefined) {
-        ctx.fillStyle = d.cd >= 0 ? o.upColor : o.downColor;
-        ctx.fillText(fmtK(d.cd), b.x, yh - 8);
-      }
-      ctx.fillStyle = o.downColor;
-      ctx.fillText(fmtK(sell), b.x, yl + 9);
-      ctx.fillStyle = o.upColor;
-      ctx.fillText(fmtK(buy), b.x, yl + 21);
+      ctx.fillText(dt, b.x, sumY);
+      ctx.fillStyle = "#9E9E9E";
+      ctx.fillText(vt, b.x, sumY + 13);
     }
   }
 }

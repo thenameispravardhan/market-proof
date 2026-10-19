@@ -389,6 +389,16 @@ def test_pullback_and_breakout_entries():
     assert engine.run(brk, {"X": bars(closes, spread=0)})["trades"][0]["entry"] == round(106 * 1.004, 2)  # stop at trigger
 
 
+def test_triggered_entry_cannot_take_target_on_its_own_bar():
+    # Pullback buy at 104.41 fills in bar 5, whose high (106.5) came at its open —
+    # before the dip. The target (105) must not be booked on that same bar.
+    d = bars([100, 101, 102, 106, 106.5, 104.0, 104.2, 105.5], spread=0)
+    spec = _cross_spec(exit_long=None, target={"type": "points", "value": 0.6},
+                       entry_order={"type": "pullback", "offset_pct": 1.5, "valid_bars": 5})
+    t = engine.run(spec, {"X": d})["trades"][0]
+    assert t["entry"] == round(106 * 0.985, 2) and t["exit_t"] > d["t"][5]
+
+
 def test_expiry_moves_back_off_a_holiday():
     from datetime import date, datetime
 
@@ -659,6 +669,16 @@ def test_tick_recorder_end_to_end(tmp_path):
     assert not list((tmp_path / "raw" / "SBIN").glob("*.csv")) and (tmp_path / "flow" / "SBIN").is_dir()
     assert again.minute_flow("SBIN", t0, t0 + 60) == flow     # now read back from parquet
     assert again.footprint("SBIN", t0, t0 + 60)[0][1] in (100.0, 100.05, 100.1)
+    # a restart after the close compacts a late frame again: the day's raw file keeps every frame
+    import duckdb
+    raw_pq = next((tmp_path / "raw" / "SBIN").glob("*.parquet"))
+    n_before = duckdb.sql(f"SELECT count(*) FROM read_parquet('{raw_pq.as_posix()}')").fetchone()[0]
+    late_frame = ticks.TickRecorder(tmp_path)
+    late_frame.on_tick("NSE:SBIN-EQ", {"ltp": 100.1, "vol_traded_today": 1600, "bid_price": 100.05, "ask_price": 100.1,
+                                        "exch_feed_time": t0 + 50})
+    late_frame.flush()
+    late_frame.compact((t0 + 19800) // 86400)
+    assert duckdb.sql(f"SELECT count(*) FROM read_parquet('{raw_pq.as_posix()}')").fetchone()[0] == n_before + 1
     m1 = {"t": [t0], "o": [100.0], "h": [100.1], "l": [99.95], "c": [100.1], "v": [500]}
     b = of.build_bars(m1, "time", 1, real=flow)
     assert b["buy_v"][0] == 400 and b["real_pct"][0] == 100.0  # the candle's split IS the recorded one
@@ -765,3 +785,25 @@ def test_atr_stop_on_an_option_premium_is_the_underlyings_atr_times_delta():
     assert abs(engine.premium_atr({14: 40.0}, priced, 24550.0, DAY0)[14] - atm) < 0.5   # IV implied from the live price
     closes = [24500, 24520, 24540, 24560, 24600, 24650, 24700] + [24700] * 30
     assert engine.run(spec, {"N": _nifty(closes)})["trades"]      # backtests instead of a ValueError
+
+
+def test_tick_retention_deletes_only_old_files(tmp_path):
+    from app.algo import ticks
+
+    rec = ticks.TickRecorder(tmp_path)
+    rec.save_config(True, ["NIFTY:FUT"], retention_days=15)
+    for rel in ("raw/NIFTY-FUT/20260901.parquet", "raw/NIFTY-FUT/20261018.parquet",
+                "flow/NIFTY-FUT/202608.parquet", "flow/NIFTY-FUT/202610.parquet", "fp/NIFTY-FUT/202609.parquet"):
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_bytes(b"x")
+    today = 1792368000 // 86400                         # 2026-10-19
+    assert rec.prune(today) == 3                        # Sep 1 raw, Aug flow, Sep footprint (cutoff Oct 4)
+    left = sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.glob("*/*/*.parquet"))
+    assert left == ["flow/NIFTY-FUT/202610.parquet", "raw/NIFTY-FUT/20261018.parquet"]
+
+
+def test_stats_median_win_and_loss():
+    t = lambda n: {"net": n, "gross": n, "charges": 0, "entry_t": 0, "exit_t": 60, "bars": 1}  # noqa: E731
+    st = engine.stats([t(100), t(200), t(9000), t(-50), t(-70), t(-5000)], 100000)
+    assert st["median_win"] == 200 and st["median_loss"] == -70       # one outlier doesn't move them
+    assert st["avg_win"] == 3100
