@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { inSession, intradayBucket, liveBucket, sessionFor } from "../components/trade/chartData";
+import { pointValue, setFx } from "../lib/contract";
 import { untradable } from "../pages/Trade";
 
 const IST = 19800;
@@ -17,12 +18,20 @@ describe("other markets on the chart", () => {
     expect(sessionFor("MCX:GOLD26DECFUT")).toEqual({ open: 540, close: 1435 });
   });
 
-  it("the ticket says why MCX, currency, crypto and indices can't be ordered", () => {
-    expect(untradable("CRYPTO:BTCUSDT", "BTCUSDT")).toMatch(/Binance's public feed/);
-    expect(untradable("MCX:GOLD26DECFUT", "GOLD")).toMatch(/orders aren't enabled/);
-    expect(untradable("NSE:USDINR26OCTFUT", "USDINR")).toMatch(/currency/);
-    expect(untradable("NSE:NIFTY50-INDEX", "NIFTY")).toMatch(/index/);
+  it("MCX, currency and crypto trade on Paper only; indices never", () => {
+    for (const sym of ["CRYPTO:BTCUSDT", "MCX:GOLD26DECFUT", "NSE:USDINR26OCTFUT"]) {
+      expect(untradable(sym, sym, false)).toMatch(/Paper account only/);
+      expect(untradable(sym, sym, true)).toBeNull();
+    }
+    expect(untradable("NSE:NIFTY50-INDEX", "NIFTY", true)).toMatch(/index/);
     expect(untradable("NSE:SBIN-EQ")).toBeNull();
-    expect(untradable("NSE:NIFTY26OCTFUT")).toBeNull();
+  });
+
+  it("values a crypto contract in rupees, everything else at 1", () => {
+    setFx({ usd_inr: 90, units: { BTCUSDT: 0.001 } });
+    expect(pointValue("CRYPTO:BTCUSDT")).toBeCloseTo(0.09);       // 0.001 BTC x Rs 90 per $1 move
+    expect(pointValue("MCX:GOLD26DECFUT")).toBe(1);               // its lot is counted in 10 g units already
+    expect(pointValue("NSE:SBIN-EQ")).toBe(1);
+    setFx(null);
   });
 });

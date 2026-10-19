@@ -5,6 +5,7 @@
 // Orders go through the Trade page (risk checks, trading-mode gates); a
 // click asks for confirmation unless one-click (instant) trading is on.
 
+import { pointValue } from "../../lib/contract";
 import { snapLot } from "./levelDrag";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { InstrumentHit } from "../../types";
@@ -205,7 +206,7 @@ export function DomPanel({
       onModify(o, p).then((m) => onMsg(m), (e) => onMsg(`Modify failed: ${e instanceof Error ? e.message : String(e)}`)));
   };
   const pos = position && position.qty !== 0 ? position : null;
-  const pnl = pos && ltp != null ? (ltp - pos.avg) * pos.qty : null;
+  const pnl = pos && ltp != null ? (ltp - pos.avg) * pos.qty * pointValue(symbol?.symbol) : null;
 
   if (!symbol) return <section className="trade-card"><div className="empty">Open a symbol to trade from its DOM.</div></section>;
   return (

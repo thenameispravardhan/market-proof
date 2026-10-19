@@ -275,8 +275,8 @@ async def lifespan(app: FastAPI):
         # Keep the index symbols streaming all session so the status-bar
         # ticker is sub-second, not REST-polled.
         always_subscribe=[idx["symbol"] for idx in _INDICES],
-        extra_symbols=lambda: _tick_recorder.symbols() + [s for s in _ws_watched() if not s.startswith("CRYPTO:")]
-        + _practice.live_symbols(),
+        extra_symbols=lambda: [s for s in _tick_recorder.symbols() + _ws_watched() + _practice.live_symbols()
+                               if not s.startswith("CRYPTO:")],
     )
     # Real order flow: every frame for a recorded symbol is classified and
     # kept (app/algo/ticks.py). Only symbols on the recorder's list.
@@ -578,7 +578,9 @@ async def lifespan(app: FastAPI):
         # Crypto pairs on screen stream from Binance's public feed (watch / chart only, never traded).
         from app.services.crypto import feed as _crypto_feed
 
-        crypto_task = asyncio.create_task(_crypto_feed.run(_ws_watched), name="crypto-feed")
+        crypto_task = asyncio.create_task(
+            _crypto_feed.run(lambda: _ws_watched() + _practice.live_symbols(), execution_manager.market_data),
+            name="crypto-feed")
 
     try:
         yield

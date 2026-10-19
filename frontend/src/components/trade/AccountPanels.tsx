@@ -10,6 +10,7 @@
 // Every order still goes through the Trade page's place / cancel / modify
 // endpoints, which keep the risk engine and the trading-mode gates.
 
+import { pointValue } from "../../lib/contract";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { InstrumentHit, PendingOrder } from "../../types";
 import { useLiveQuote } from "../../hooks/useQuotes";
@@ -994,7 +995,7 @@ export function ExitPositionDialog({
   const [err, setErr] = useState<string | null>(null);
   const q = Math.floor(Number(qty));
   const bad = !(q > 0) ? "Quantity must be more than 0" : q > abs ? `At most ${abs} — the open quantity` : pos.lot > 1 && q % pos.lot ? `Use a multiple of the lot size (${pos.lot})` : type === "LIMIT" && !(Number(price) > 0) ? "Enter a limit price" : null;
-  const pnl = live != null && pos.avg != null ? (live - pos.avg) * q * Math.sign(pos.qty) : null;
+  const pnl = live != null && pos.avg != null ? (live - pos.avg) * q * Math.sign(pos.qty) * pointValue(pos.symbol) : null;
   const submit = async () => {
     if (bad) return;
     setBusy(true);

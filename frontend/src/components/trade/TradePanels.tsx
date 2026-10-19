@@ -4,6 +4,7 @@
 // orders, trades, account, basket orders, notifications log) and the
 // named-layout manager (save / load / autosave).
 
+import { pointValue } from "../../lib/contract";
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import type { InstrumentHit, ManagedPosition, PendingOrder, Position, ProductType } from "../../types";
 import { useQueryClient } from "@tanstack/react-query";
@@ -574,7 +575,7 @@ interface ProfileResp { ok: boolean; client_id?: string | null; name?: string | 
 /** Unrealized P&L of a bot position at `ltp` (the server's mark until a tick arrives). */
 export function localPnl(p: Position, ltp: number | null | undefined): number | null {
   if (!p.quantity) return 0;
-  return ltp != null ? (ltp - p.average_price) * p.quantity : p.unrealized_pnl;
+  return ltp != null ? (ltp - p.average_price) * p.quantity * pointValue(p.symbol) : p.unrealized_pnl;
 }
 
 function LocalPnl({ p, privacy }: { p: Position; privacy: boolean }) {
