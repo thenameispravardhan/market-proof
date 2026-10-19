@@ -2270,6 +2270,11 @@ kbd {
 .ord-row.sell .pos-tag.ord, .ord-row.sell { border-color: var(--red); }
 .ord-row.sell .pos-tag.ord .side { background: var(--red); }
 .ord-row .px { color: var(--text); }
+/* the order / level's price on the price axis, moving with a drag */
+.ord-row .ord-axis { position: absolute; top: -9px; left: 100%; height: 18px; display: grid; place-items: center; font-family: var(--mono); font-size: 11px; font-weight: 700; color: #fff; background: #4a90d9; border-radius: 2px; }
+.ord-row.sell .ord-axis { background: var(--red); }
+.ord-row.lvl.tp .ord-axis { background: var(--green); color: #000; }
+.ord-row.lvl.sl .ord-axis { background: var(--red); }
 
 /* Right-click menu on the chart: orders at the clicked price (confirm step), alert, ticket. */
 .chart-ctx { position: absolute; z-index: 60; min-width: 220px; } /* above the engine's pane separators (z 50) */
@@ -2348,6 +2353,8 @@ kbd {
 
 /* "+" on the price scale + menu shortcuts */
 .chart-plus { position: absolute; z-index: 7; width: 18px; height: 18px; padding: 0; place-items: center; border: 1px solid var(--border-hi); border-radius: 50%; background: var(--bg-panel); color: var(--text); font-size: 13px; line-height: 1; cursor: pointer; }
+.plus-hold { position: absolute; z-index: 6; height: 0; border-top: 1px dashed var(--text-dim); pointer-events: none; }
+.plus-hold .plus-px { position: absolute; top: -9px; height: 18px; display: grid; place-items: center; background: var(--text); color: var(--bg-panel); font-family: var(--mono); font-size: 11px; font-weight: 700; border-radius: 2px; }
 .chart-plus:hover { background: var(--accent); border-color: var(--accent); color: var(--text-inv); }
 .chart-ctx { min-width: 280px; }
 .chart-ctx .chart-menu-item { display: flex; align-items: center; gap: 6px; }
@@ -2477,7 +2484,7 @@ kbd {
 .chart-watermark span { font-size: 28px; letter-spacing: 0.1em; }
 
 /* axis overlays */
-.chart-axis-countdown { position: absolute; z-index: 6; padding: 1px 0; text-align: center; font-family: var(--mono); font-size: 10px; color: var(--text); background: var(--bg-elev); border-radius: 2px; pointer-events: none; }
+.chart-axis-countdown { position: absolute; z-index: 6; padding: 1px 0 2px; text-align: center; white-space: pre; font-family: var(--mono); font-size: 11px; line-height: 15px; font-weight: 700; color: #fff; background: var(--bg-elev); border-radius: 2px; pointer-events: none; }
 .chart-scale-gear { position: absolute; right: 2px; bottom: 2px; z-index: 7; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 3px; background: transparent; color: var(--text-faint); font-size: 12px; cursor: pointer; opacity: 0; }
 .chart-container:hover .chart-scale-gear { opacity: 1; }
 .chart-scale-gear:hover { background: var(--bg-elev); color: var(--text); }
@@ -3207,3 +3214,18 @@ a.news-title:hover { color: var(--accent); text-decoration: underline; }
 .news-group-btns { display: flex; gap: 6px; margin-bottom: 4px; }
 .lay-ico .tv-cell { border-radius: 0; }
 .chart-menu.tools-menu { max-height: min(70vh, 560px); overflow-y: auto; overscroll-behavior: contain; min-width: 240px; }
+.am-level-input { width: 84px; padding: 1px 4px; font: inherit; font-family: var(--mono); background: var(--bg-input, var(--bg-elev)); color: var(--text); border: 1px solid var(--accent); border-radius: 3px; }
+/* DOM: inline confirm (no browser pop-up) and a clearer live-price row */
+.dom-confirm { display: flex; align-items: center; gap: 6px; margin: 4px 0; padding: 6px 8px; border: 1px solid var(--accent); border-radius: 4px; background: var(--bg-elev); font-size: 12px; }
+.dom-confirm span { flex: 1; }
+.dom-table tr.ltp td.px { background: var(--accent); color: var(--text-inv); border-radius: 2px; }
+.dom-table td.bid:hover { background: rgba(38, 166, 154, 0.18); cursor: pointer; }
+.dom-table td.ask:hover { background: rgba(239, 83, 80, 0.18); cursor: pointer; }
+.dom-table td.px { font-family: var(--mono); text-align: center; }
+/* News: two sections. News = the list, full width; Insights = the stats and panels. */
+.news-sections { margin: 4px 0 8px; }
+.news-grid.single { grid-template-columns: minmax(0, 1fr); }
+.news-more-filters { display: inline-block; position: relative; }
+.news-more-filters > summary { cursor: pointer; font-size: 12px; color: var(--text-dim); list-style: none; padding: 2px 8px; border: 1px solid var(--border); border-radius: 12px; }
+.news-more-filters[open] > summary { color: var(--text); border-color: var(--accent); }
+.news-more-filters[open] { display: inline-flex; flex-wrap: wrap; gap: 8px; align-items: center; }

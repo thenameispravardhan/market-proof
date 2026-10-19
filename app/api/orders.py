@@ -271,6 +271,8 @@ async def place_order(
 
     if not symbol:
         raise HTTPException(status_code=422, detail="symbol is required")
+    if symbol.endswith("-INDEX"):
+        raise HTTPException(status_code=422, detail=f"{symbol} is an index — it can't be traded; use its future or an option")
     if quantity <= 0:
         raise HTTPException(status_code=422, detail="quantity must be > 0")
     # Fyers v3 price requirements by type:
