@@ -268,3 +268,14 @@ def test_items_name_the_stocks_an_article_names_when_its_headline_does_not(clien
     assert rows["https://x.example/b"]["text_tickers"] == []                        # the headline already names one
     assert len(news_api._TEXT_STOCKS) == 1                                           # scanned once, then cached
     assert nt.text_stocks("Jobs in the IT sector are changing. ICICI Bank shares rose.") == ["NSE:ICICIBANK-EQ"]
+
+
+def test_sector_and_market_body_capitals_are_not_tickers(tmp_path, monkeypatch):
+    rows = [("NSE:IT-EQ", "IT ENTERPRISES LTD"), ("NSE:TCS-EQ", "TATA CONSULTANCY SERV LT"), ("BSE:NSE-A", "NSE ROADWAYS LTD"),
+            ("NSE:INFY-EQ", "INFOSYS LIMITED")]
+    (tmp_path / "NSE_CM.csv").write_text("".join(",".join(_fyers(*r)) + chr(10) for r in rows), encoding="utf-8")
+    m = InstrumentMaster(data_dir=tmp_path)
+    monkeypatch.setattr(nt, "get_master", lambda: m)
+    assert _short(nt.stocks("IT stocks drag Nifty; TCS, Infosys fall")) == ["TCS", "INFY"]
+    assert nt.stocks("What the AI boom means for Indian IT") == []
+    assert nt.text_stocks("The NSE said volumes rose. IT shares were weak.") == []

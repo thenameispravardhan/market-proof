@@ -56,6 +56,10 @@ INDEX_FREEZE = {"NIFTY": 1800, "BANKNIFTY": 900, "FINNIFTY": 1800, "MIDCPNIFTY":
 MASTER_DIR = Path(__file__).resolve().parents[2] / "data" / "scrip_master"
 FO_URLS = {"NSE_FO": "https://public.fyers.in/sym_details/NSE_FO.csv",
            "BSE_FO": "https://public.fyers.in/sym_details/BSE_FO.csv"}
+# Searchable / chartable on the Trade page, refreshed with the F&O masters, but not part of master()'s
+# lots: MCX quotes per 10 g / per barrel against a 1 kg / 100 barrel lot, a multiplier the CSV doesn't carry.
+EXTRA_URLS = {"MCX_COM": "https://public.fyers.in/sym_details/MCX_COM.csv",
+              "NSE_CD": "https://public.fyers.in/sym_details/NSE_CD.csv"}
 
 
 def fno_name(underlying: str) -> str:
@@ -263,7 +267,8 @@ async def ensure_master(max_age_h: float = 20.0) -> None:
     the app-wide instrument master too (futures become searchable)."""
     import httpx
 
-    stale = [k for k in FO_URLS if not (MASTER_DIR / f"{k}.csv").exists()
+    urls = {**FO_URLS, **EXTRA_URLS}
+    stale = [k for k in urls if not (MASTER_DIR / f"{k}.csv").exists()
              or time.time() - (MASTER_DIR / f"{k}.csv").stat().st_mtime > max_age_h * 3600]
     if not stale:
         return
@@ -271,7 +276,7 @@ async def ensure_master(max_age_h: float = 20.0) -> None:
     async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
         for k in stale:
             try:
-                r = await client.get(FO_URLS[k])
+                r = await client.get(urls[k])
                 r.raise_for_status()
                 tmp = MASTER_DIR / f"{k}.csv.tmp"
                 tmp.write_text(r.text, encoding="utf-8")

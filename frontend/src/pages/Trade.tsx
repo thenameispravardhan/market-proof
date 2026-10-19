@@ -271,7 +271,17 @@ const DOCK: { id: DockId; label: string; short: string; icon: string; hint: stri
 ];
 const DEFAULT_DOCK: DockId[] = ["watch", "trade"];
 /** Indices and India VIX (NSE:…-INDEX) have no orders: no BUY / SELL anywhere for them. */
-const tradable = (sym: string) => !sym.toUpperCase().endsWith("-INDEX");
+const CURRENCY = /^(NSE|BSE):(USDINR|EURINR|GBPINR|JPYINR|EURUSD|GBPUSD|USDJPY)/;
+/** Why a symbol can't be ordered from the ticket, or null. MCX / currency / crypto are charts and data only:
+ *  crypto can't route through Fyers, and MCX / currency P&L needs contract multipliers the master lacks. */
+export function untradable(sym: string, name = sym): string | null {
+  const s = sym.toUpperCase();
+  if (s.endsWith("-INDEX")) return `${name} is an index — it can't be bought or sold. Open its future or an option to trade.`;
+  if (s.startsWith("CRYPTO:")) return `${name} is crypto from Binance's public feed — charts, quotes and order flow only; it can't be traded here.`;
+  if (s.startsWith("MCX:") || CURRENCY.test(s)) return `${name}: MCX and currency are charts, quotes and order flow only for now — orders aren't enabled.`;
+  return null;
+}
+const tradable = (sym: string) => untradable(sym) === null;
 
 // Multi-chart layouts (TradingView-style). Click a chart to make it the
 // active one: it follows the watchlist / search and drives the ticket.
@@ -1373,7 +1383,7 @@ export default function Trade() {
     lotSize: selected && selected.lot_size > 1 ? selected.lot_size : 1,
     limit: limitNum, stop: stopNum, ltp: ltp ?? null, entry: estPrice ?? null, sl: slAbs, tp: tpAbs,
   };
-  const problem = !selected ? "Pick a symbol." : !tradable(selected.symbol) ? "An index (or India VIX) can't be traded — pick its future or an option." : !accountId ? noAccountReason
+  const problem = !selected ? "Pick a symbol." : !tradable(selected.symbol) ? untradable(selected.symbol, selected.short_name)! : !accountId ? noAccountReason
     : lotUnknown ? "Lot size unknown for this contract." : ticketProblem(check);
   const canSubmit = problem == null;
   const ticketWarn = canSubmit ? ticketWarning(check) : null;
@@ -1867,7 +1877,7 @@ export default function Trade() {
                     {!practice && <TicketModeBadge account={account} botMode={botMode} />}
                   </h2>
                   {selected && !tradable(selected.symbol) ? (
-                    <div className="hint" data-testid="ticket-index">{selected.short_name} is an index — it can't be bought or sold. Open its future or an option to trade.</div>
+                    <div className="hint" data-testid="ticket-index">{untradable(selected.symbol, selected.short_name)}</div>
                   ) : (<>
                   {!account && noAccountReason && (
                     <div className="hint warn-text" data-testid="ticket-mode-note">{noAccountReason}</div>

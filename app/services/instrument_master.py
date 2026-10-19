@@ -112,6 +112,7 @@ _SEARCH_SOURCES: dict[str, Callable[[Instrument], bool]] = {
     "BFO": lambda i: i.exchange == "BSE" and i.segment == "FO",
     "CDS": lambda i: i.exchange == "NSE" and i.segment == "CD",
     "BCD": lambda i: i.exchange == "BSE" and i.segment == "CD",
+    "CRYPTO": lambda i: i.exchange == "CRYPTO",
 }
 
 # Instrument "types" for `/api/search/symbols?types=`. EQ excludes ETFs
@@ -258,7 +259,8 @@ def _fyers_csv_row_to_instrument(row: list[str]) -> Optional[Instrument]:
     elif opt_type in ("CE", "PE"):
         return None  # options come from the live chain API
     elif expiry is not None:
-        itype, seg = "FUT", "FO"
+        # col 11 is Fyers' segment code: 20 = MCX commodity, 12 = currency (NSE_CD), 11 = equity F&O
+        itype, seg = "FUT", _SEGMENT_CODES.get((row[11] or "").strip(), "FO")
     else:
         itype, seg = "EQ", "EQ"
     return Instrument(
@@ -273,6 +275,9 @@ def _fyers_csv_row_to_instrument(row: list[str]) -> Optional[Instrument]:
         aliases=[short],
         name=(row[1] or "").strip(),
     )
+
+
+_SEGMENT_CODES = {"20": "COM", "12": "CD"}
 
 
 # Fyers publishes a daily scrip-master CSV per exchange/segment. We pull
@@ -373,6 +378,10 @@ def _seed_instruments() -> list[Instrument]:
             exchange=sym.split(":", 1)[0], segment="INDEX",
             instrument_type="IND", lot_size=1, tick_size=0.05,
         ))
+    from app.services.crypto import PAIRS, PREFIX   # watch / chart only: never traded
+
+    out += [Instrument(symbol=PREFIX + p, short_name=p, exchange="CRYPTO", segment="SPOT", instrument_type="CRYPTO",
+                       tick_size=tick, aliases=[p[:-4]], name=name) for p, (tick, name) in PAIRS.items()]
     return out
 
 
@@ -399,6 +408,7 @@ class InstrumentMaster:
         # CE/PE, expiry epoch, lot, tick), by underlying: ~90k contracts would
         # cost far more as Instruments. Search builds Instruments for hits only.
         self._options: dict[str, list[tuple[str, float, str, int, int, float]]] = {}
+        self._opt_seg: dict[str, str] = {}      # underlying -> COM / CD for MCX and currency options
         self.reload()
 
     def reload(self) -> int:
@@ -408,6 +418,7 @@ class InstrumentMaster:
         self._by_short.clear()
         self._by_underlying.clear()
         self._options = {}
+        self._opt_seg = {}
         now = datetime.now().timestamp() - 86400
         for inst in _seed_instruments():
             self._add(inst)
@@ -425,6 +436,8 @@ class InstrumentMaster:
                                     try:
                                         exp = int(row[8])
                                         if exp > now:
+                                            if (row[11] or "").strip() in _SEGMENT_CODES:
+                                                self._opt_seg[row[13].strip().upper()] = _SEGMENT_CODES[row[11].strip()]
                                             self._options.setdefault(row[13].strip().upper(), []).append((
                                                 row[9].strip(), float(row[15]), row[16].strip().upper(), exp,
                                                 int(float(row[3] or 1)), float(row[4] or 0.05)))
@@ -492,7 +505,8 @@ class InstrumentMaster:
 
     def _opt(self, underlying: str, r: tuple[str, float, str, int, int, float]) -> Instrument:
         sym, strike, typ, exp, lot, tick = r
-        return Instrument(symbol=sym, short_name=underlying, exchange=sym.split(":", 1)[0], segment="FO",
+        return Instrument(symbol=sym, short_name=underlying, exchange=sym.split(":", 1)[0],
+                          segment=self._opt_seg.get(underlying, "FO"),
                           instrument_type=typ, lot_size=lot, tick_size=tick, strike=strike,
                           expiry=datetime.fromtimestamp(exp, _IST).replace(tzinfo=None), underlying=underlying)
 
