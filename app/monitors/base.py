@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import time
+
+import httpx
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -348,7 +350,7 @@ class BaseMonitor:
                     # Success: reset backoff state.
                     self._consecutive_failures = 0
                     self._current_backoff = reset_backoff()
-                except _RetryableError as e:
+                except (_RetryableError, httpx.TransportError) as e:   # a timeout / dropped connection: retry quietly
                     self._consecutive_failures += 1
                     self._current_backoff = next_backoff(self._current_backoff)
                     # The first few retries are expected (NSE/BSE often

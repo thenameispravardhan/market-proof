@@ -87,6 +87,21 @@ from app.execution.base import (
 from app.execution.market_data import Quote
 from app.logging_config import get_logger
 
+# Symbols Fyers answered "Invalid symbol" (code -300: delisted / suspended / renamed scrips): not asked again for
+# 12 h. They were re-requested ~60 times a day each (2,765 failed history calls for 70 scrips on 2026-10-19).
+_BAD_SYMBOLS: dict[str, float] = {}
+_BAD_TTL_S = 12 * 3600
+
+
+def _known_bad(symbol: str) -> bool:
+    t = _BAD_SYMBOLS.get(symbol.upper())
+    return t is not None and time.monotonic() - t < _BAD_TTL_S
+
+
+def _note_if_bad(symbol: str, err: object) -> None:
+    if '"code":-300' in str(err).replace(" ", "") and "nvalid symbol" in str(err):
+        _BAD_SYMBOLS[symbol.upper()] = time.monotonic()
+
 log = get_logger(__name__)
 
 
@@ -1480,6 +1495,8 @@ class FyersLiveBackend:
         stop. Never raises."""
         from datetime import date, timedelta
 
+        if _known_bad(symbol):
+            return []
         today = date.today()
         start = today - timedelta(days=max(1, int(days)))
         try:
@@ -1490,6 +1507,7 @@ class FyersLiveBackend:
                 range_to=today.isoformat(),
             )
         except FyersAPIError as e:
+            _note_if_bad(symbol, e)
             log.warning("fyers.history.failed", symbol=symbol, error=str(e))
             return []
         candles = data.get("candles") or data.get("data") or []
@@ -1508,6 +1526,8 @@ class FyersLiveBackend:
         maps None to `ok: false` so the chart can offer a retry instead
         of rendering a misleading "no data". `oi=True` asks for open
         interest (a 7th value per candle, derivatives only). Never raises."""
+        if _known_bad(symbol):
+            return []                              # Fyers has no such symbol: genuinely no candles
         try:
             data = await self._client.get_history(
                 symbol,
@@ -1518,6 +1538,7 @@ class FyersLiveBackend:
                 oi_flag=1 if oi else 0,
             )
         except FyersAPIError as e:
+            _note_if_bad(symbol, e)
             log.warning("fyers.history_range.failed", symbol=symbol, error=str(e))
             return None
         # A 200 `{"s": "error"}` (rate limit, bad range) is a failed call,
