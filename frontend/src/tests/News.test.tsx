@@ -46,6 +46,7 @@ describe("News page", () => {
     expect(mark.tagName).toBe("MARK");                                 // watchlist word highlighted
     expect(screen.getByText(/wins <b>order<\/b>/)).toBeTruthy();       // markup stays text
     expect(screen.queryByText("Daily horoscope")).toBeNull();           // muted
+    fireEvent.click(screen.getByTestId("news-section-insights"));     // the poll status line lives under Insights
     expect(screen.getByText(/never sent to AI analysis/)).toBeTruthy();
   });
 

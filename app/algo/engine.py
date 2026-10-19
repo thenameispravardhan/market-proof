@@ -226,9 +226,6 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
         lv["atr_period"] = _num(lv.get("atr_period", 14), f"{key} ATR period", 1, integer=True)
         if key == "trailing":
             lv["activate"] = _num(lv.get("activate") or 0, "trail activation", 0)
-        if opt and lv["type"] == "atr" and inst["levels_on"] == "instrument":
-            raise ValueError(f"{key}: ATR levels on an option premium make no sense — "
-                             "set levels on the underlying")
         if multi and inst["levels_on"] == "instrument":
             raise ValueError("multi-leg positions can't use price levels on 'the instrument' — "
                              "use MTM ₹ stops/targets or put levels on the underlying")
@@ -625,6 +622,22 @@ def _leg_px(leg: dict, u: float, t: float, iv: float) -> float:
     return fno.bs_price(u, leg["K"], fno.years_to(leg["exp"], t), iv, leg["kind"])
 
 
+def premium_atr(atrs: dict[int, Optional[float]], leg: dict, u: float, t: float,
+                iv: Optional[float] = None) -> dict[int, Optional[float]]:
+    """ATR for levels on an OPTION premium: the underlying's ATR × |delta|
+    (how far the premium moves per point of the underlying). `iv` None =
+    implied from the leg's live price (the runner); a future / stock leg is 1:1."""
+    if leg.get("kind") not in ("CE", "PE"):
+        return atrs
+    yrs = fno.years_to(leg["exp"], t)
+    if iv is None:
+        px = float(leg.get("price") or leg.get("entry") or 0)
+        iv = _solve(lambda s: fno.bs_price(u, leg["K"], yrs, s, leg["kind"]), px, 0.01, 5.0) if px > 0 else 0.0
+    h = max(u * 0.001, 0.01)
+    dlt = abs(fno.bs_price(u + h, leg["K"], yrs, iv, leg["kind"]) - fno.bs_price(u - h, leg["K"], yrs, iv, leg["kind"])) / (2 * h)
+    return {p: (v * dlt if v else v) for p, v in atrs.items()}
+
+
 def _solve(f: Callable[[float], float], target: float, a: float, b: float) -> float:
     """u in [a, b] where f(u) crosses `target` (f continuous; endpoints straddle)."""
     fa = f(a) - target
@@ -778,7 +791,10 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         ref = "u" if inst["type"] == "equity" or inst["levels_on"] == "underlying" else 0
         rsign = sign if ref == "u" else legs[0]["act"]
         ref_entry = u if ref == "u" else legs[0]["entry"]
-        lv = entry_levels(spec, rsign, ref_entry, {p: a[sig_i] for p, a in s_["atr"].items()})
+        atrs = {p: a[sig_i] for p, a in s_["atr"].items()}
+        if ref != "u":                                   # levels on the option premium: its own ATR
+            atrs = premium_atr(atrs, legs[0], u, t, iv)
+        lv = entry_levels(spec, rsign, ref_entry, atrs)
         per_set_margin = position_margin(legs, u, pf["leverage"])
         per_set_risk = lv["sl_dist"] * legs[0]["per_set"] if lv["sl_dist"] else None
         eq = equity_now()
