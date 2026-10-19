@@ -114,3 +114,10 @@ def test_resting_order_survives_a_restart_and_prices_snap_to_the_tick(client, mo
                      status="placed", broker_order_id="PAPER-ghost"))
         db.commit()
     assert client.post("/api/orders/cancel", json={"account_id": -1, "broker_order_id": "PAPER-ghost"}).json()["ok"]
+
+
+def test_an_index_cannot_be_ordered(client, isolated_db):
+    """NIFTY 50 / India VIX are indices: no BUY / SELL, paper or real."""
+    for sym in ("NSE:NIFTY50-INDEX", "NSE:INDIAVIX-INDEX"):
+        r = client.post("/api/orders", json={"account_id": -1, "symbol": sym, "side": "BUY", "quantity": 1, "order_type": "MARKET"})
+        assert r.status_code == 422 and "index" in r.json()["detail"]

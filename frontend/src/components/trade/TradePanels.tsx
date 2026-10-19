@@ -526,6 +526,28 @@ export type BottomTab =
   | "account" | "basket" | "broker" | "log";
 
 /** Tab labels (the collapsed bar shows them too). "Trade" is the DOM, beside the Account Manager. */
+/** An SL / TP cell edited in place: click, type, Enter (or click away) saves,
+ *  Esc cancels; blank clears the level. */
+function LevelEdit({ value, label, id, onSave }: { value: number | null; label: string; id: string; onSave: (v: string) => void }) {
+  const [edit, setEdit] = useState<string | null>(null);
+  const done = useRef(false);
+  if (edit === null) {
+    return <button type="button" className="am-link" onClick={() => { done.current = false; setEdit(value != null ? String(value) : ""); }} data-testid={`level-${label}-${id}`}>{value != null ? fmt(value) : `+ ${label}`}</button>;
+  }
+  const finish = (save: boolean) => {
+    if (done.current) return;
+    done.current = true;
+    if (save) onSave(edit);
+    setEdit(null);
+  };
+  return (
+    <input className="am-level-input" autoFocus type="number" step="0.05" min={0} value={edit} placeholder={`${label} — blank clears`}
+      onChange={(e) => setEdit(e.target.value)} onBlur={() => finish(true)}
+      onKeyDown={(e) => { if (e.key === "Enter") finish(true); else if (e.key === "Escape") finish(false); }}
+      aria-label={`${label} for ${id}`} data-testid={`level-input-${label}-${id}`} />
+  );
+}
+
 type ManagedLevels = { stop_loss: number | null; target: number | null; trail_active?: boolean; breakeven_armed?: boolean; exit_failures?: number };
 
 export const BOTTOM_TABS: [BottomTab, string][] = [
@@ -698,9 +720,10 @@ export function AccountManager({
   /** Move a working order to `price` (the DOM's drag): the stop for stop
    *  orders (a stop-limit's limit keeps its offset), else the limit. */
   const modifyPrice = async (o: OrderRow, price: number): Promise<string> => {
-    if (!accountId || !o.id) throw new Error("No live Fyers account is connected.");
+    const acct = o.id?.startsWith("PAPER-") ? -1 : accountId === -1 ? null : accountId;   // the order's own book
+    if (!acct || !o.id) throw new Error("No live Fyers account is connected.");
     const stopType = o.type === "SL-M" || o.type === "STOP_LOSS";
-    const body: Record<string, unknown> = { account_id: accountId, broker_order_id: o.id, order_type: o.type };
+    const body: Record<string, unknown> = { account_id: acct, broker_order_id: o.id, order_type: o.type };
     if (stopType) body.stop_price = price;
     if (o.type === "STOP_LOSS") body.limit_price = Math.round(((o.limit ?? price) + (price - (o.stop ?? price))) * 100) / 100;
     if (!stopType) body.limit_price = price;
@@ -736,7 +759,7 @@ export function AccountManager({
         const tag = m?.trail_active ? "trailing" : m?.breakeven_armed ? "breakeven" : null;
         return (
           <>
-            <button type="button" className="am-link" onClick={() => askLevel(p, "SL", m?.stop_loss ?? null, m?.target ?? null)}>{m?.stop_loss != null ? fmt(m.stop_loss) : "+ SL"}</button>
+            <LevelEdit value={m?.stop_loss ?? null} label="SL" id={p.symbol} onSave={(v) => askLevel(p, "SL", m?.stop_loss ?? null, m?.target ?? null, v)} />
             {tag && <span className="text-dim" title={tag === "trailing" ? "The bot is trailing this stop behind the best price" : "The bot moved this stop to lock in profit"} data-testid={`sl-tag-${p.symbol}`}> · {tag}</span>}
             {m?.exit_failures ? <span className="down" title="The broker refused or timed out the bot's exit order; it keeps retrying. Exit manually if this persists." data-testid={`exit-failing-${p.symbol}`}> · exit failing</span> : null}
           </>
@@ -745,14 +768,13 @@ export function AccountManager({
     },
     {
       id: "tp", label: "TP", get: (p) => levelsOf(p)?.target ?? null,
-      render: (p) => { if (!p.quantity) return "—"; const m = levelsOf(p); return <button type="button" className="am-link" onClick={() => askLevel(p, "TP", m?.stop_loss ?? null, m?.target ?? null)}>{m?.target != null ? fmt(m.target) : "+ TP"}</button>; },
+      render: (p) => { if (!p.quantity) return "—"; const m = levelsOf(p); return <LevelEdit value={m?.target ?? null} label="TP" id={p.symbol} onSave={(v) => askLevel(p, "TP", m?.stop_loss ?? null, m?.target ?? null, v)} />; },
     },
   ];
-  function askLevel(row: Position, which: "SL" | "TP", sl: number | null, tp: number | null): void {
+  function askLevel(row: Position, which: "SL" | "TP", sl: number | null, tp: number | null, v: string): void {
     const sym = row.symbol;
     const cur = which === "SL" ? sl : tp;
-    const v = window.prompt(`${which} for ${sym} (blank clears)`, cur != null ? String(cur) : "");
-    if (v === null) return;
+    if (v.trim() === (cur != null ? String(cur) : "")) return;     // unchanged
     const n = v.trim() === "" ? null : Number(v);
     if (n !== null && !(Number.isFinite(n) && n > 0)) {
       setMsg(`${which} for ${sym} not changed: "${v}" is not a price`);
@@ -764,7 +786,10 @@ export function AccountManager({
     if (n !== null && pos && ltp != null) {
       const long = pos.quantity > 0;
       const through = which === "SL" ? (long ? n >= ltp : n <= ltp) : long ? n <= ltp : n >= ltp;
-      if (through && !window.confirm(`${which} ${fmt(n)} is already ${long === (which === "SL") ? "above" : "below"} the last price ${fmt(ltp)} — the position will exit at once. Set it anyway?`)) return;
+      if (through) {
+        setMsg(`${which} ${fmt(n)} not set: it is already ${long === (which === "SL") ? "above" : "below"} the last price ${fmt(ltp)}, so the position would exit at once`);
+        return;
+      }
     }
     void run(`Exits ${sym}`, () => levelsFor(sym, row.paper)(which === "SL" ? n : sl, which === "TP" ? n : tp));
   }

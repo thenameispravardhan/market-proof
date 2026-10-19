@@ -138,6 +138,9 @@ export function orderBucket(status: string): OrderBucket {
   return "other";
 }
 
+/** Paper (practice) orders carry the paper engine's PAPER-… ids; Fyers ids are numeric. */
+export const isPaperOrder = (r: { id: string | null }) => !!r.id && r.id.startsWith("PAPER-");
+
 export interface OrderRow {
   key: string;
   id: string | null;
@@ -453,6 +456,7 @@ export function OrdersTable({
   const m = (v: number | null) => (privacy ? "•••" : fmt(v));
   const cols: Col<OrderRow>[] = [
     { id: "symbol", label: "Symbol", get: (r) => r.symbol, fixed: true, cls: () => "sym" },
+    { id: "book", label: "Real / Paper", get: (r) => (isPaperOrder(r) ? "Paper" : "Real"), render: (r) => <span className={`badge ${isPaperOrder(r) ? "neutral" : "live"}`}>{isPaperOrder(r) ? "PAPER" : "REAL"}</span> },
     { id: "side", label: "Side", get: (r) => r.side, cls: (r) => sideCls(r.side) },
     { id: "type", label: "Type", get: (r) => (r.type === "STOP_LOSS" ? "STOP-LIMIT" : r.type) },
     { id: "product", label: "Product Type", get: (r) => r.product },

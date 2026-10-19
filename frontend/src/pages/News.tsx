@@ -37,7 +37,7 @@ interface ExtractStats { handed: number; by_status: Record<string, number>; with
 interface Status { settings: Settings; sources: SourceRow[]; known_sources: string[]; extract?: ExtractStats; lag?: Lag & { fastest: string | null }; collector: { polls: number; last_poll_at: number | null; last_poll_ms: number | null };
   watch_stocks?: Record<string, string[]>; kinds?: [string, string][]; source_groups?: [string, string[]][] }
 interface Prefs { notify: boolean; sound: boolean; compact: boolean; summaries: boolean; window: number; group: boolean; threads: boolean;
-  marketOnly: boolean; sort: "latest" | "top"; region?: "all" | "in" | "global" }
+  marketOnly: boolean; sort: "latest" | "top"; region?: "all" | "in" | "global"; section?: "news" | "insights" }
 /** A list row: a story (its reports from several outlets) and, with Prefs.threads, its stock's earlier stories. */
 interface Row { lead: Item; story: Item[]; earlier: Item[] }
 /** How a story's stock moved since it broke (/api/news/reaction): from the last whole minute before it. */
@@ -276,6 +276,7 @@ export default function News() {
     return { leadOf, storyOf, outlets };
   }, [items, mutedRe]);
 
+  const section = prefs.section ?? "news";
   const globalSrc = useMemo(() => new Set(status?.source_groups?.find(([g]) => g === "Global")?.[1] ?? []), [status?.source_groups]);
   const shown = useMemo(() => {
     const cut = prefs.window ? Date.now() - prefs.window * 3600_000 : 0;
@@ -533,7 +534,14 @@ export default function News() {
       )}
       {error && <div className="news-banner danger">Can't reach the server: {error}</div>}
 
-      {live && status && (
+      {/* Two sections: the headlines to read, and the numbers about them. */}
+      <div className="tabs news-sections" role="tablist">
+        {([["news", "News"], ["insights", "Insights"]] as const).map(([v, l]) => (
+          <button key={v} type="button" role="tab" aria-selected={section === v} className={`tab${section === v ? " active" : ""}`} onClick={() => setPrefs({ section: v })} data-testid={`news-section-${v}`}>{l}</button>
+        ))}
+      </div>
+
+      {section === "insights" && live && status && (
         <div className="news-stats" data-testid="news-stats">
           <div className="news-stat"><span>Headlines · last hour</span><b>{lastHour}</b></div>
           <div className="news-stat" title="Published → first seen, median (90th percentile) over the last 24 h; each source's first poll is left out">
@@ -552,11 +560,9 @@ export default function News() {
         </div>
       )}
 
-      <div className="news-toolbar">
+      {section === "news" && <div className="news-toolbar">
         <input ref={searchRef} type="search" placeholder="Search headlines… ( / )" value={q} onChange={(e) => setQ(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Escape") { setQ(""); e.currentTarget.blur(); } }} aria-label="Search headlines" />
-        <Toggle size="sm" on={deep} onChange={setDeep} label="In article text" disabled={!settings?.extract}
-          title={settings?.extract ? "Also search the full text the scraper extracted" : "Turn on full text in Settings"} />
         {WINDOWS.map((w) => <button key={w.v} type="button" className={`chip${prefs.window === w.v ? " on" : ""}`} onClick={() => setPrefs({ window: w.v })}>{w.l}</button>)}
         <span className="news-seg" role="group" aria-label="Order">
           <button type="button" className={`chip${prefs.sort === "latest" ? " on" : ""}`} onClick={() => setPrefs({ sort: "latest" })} title="Newest first">Latest</button>
@@ -571,24 +577,29 @@ export default function News() {
         </span>
         <Toggle size="sm" on={prefs.marketOnly} onChange={(v) => setPrefs({ marketOnly: v })} label="Market news only"
           title="Only headlines that name a listed stock or a news type (results, orders, deals...). The rest stay stored." />
-        <Toggle size="sm" on={watchOnly} onChange={setWatchOnly} label="Watchlist only" disabled={!watch.length} title={watch.length ? "" : "Add watchlist words in Settings"} />
-        <Toggle size="sm" on={multiOnly} onChange={setMultiOnly} label="2+ sources" title="Only stories two or more outlets carried" />
-        <Toggle size="sm" on={frozen} onChange={(v) => (v ? setFrozen(true) : unfreeze())} label="Pause list" />
+        <details className="news-more-filters">
+          <summary>More filters</summary>
+          <Toggle size="sm" on={deep} onChange={setDeep} label="In article text" disabled={!settings?.extract}
+            title={settings?.extract ? "Also search the full text the scraper extracted" : "Turn on full text in Settings"} />
+          <Toggle size="sm" on={watchOnly} onChange={setWatchOnly} label="Watchlist only" disabled={!watch.length} title={watch.length ? "" : "Add watchlist words in Settings"} />
+          <Toggle size="sm" on={multiOnly} onChange={setMultiOnly} label="2+ sources" title="Only stories two or more outlets carried" />
+          <Toggle size="sm" on={frozen} onChange={(v) => (v ? setFrozen(true) : unfreeze())} label="Pause list" />
+        </details>
         {stockPick && <button type="button" className="chip on" onClick={() => setStockPick(null)} title="Show every stock again">{tickerName(stockPick)} ×</button>}
         {pending.length > 0 && <button type="button" className="btn-sm primary" onClick={unfreeze}>{pending.length} new ↑</button>}
         {fresh.size > 0 && <button type="button" className="btn-sm" onClick={markSeen}
           title={sinceVisit ? `${sinceVisit} came in since your last visit; clear the NEW badges` : "Clear the NEW badges"}>Mark seen ({fresh.size})</button>}
         <button type="button" className="btn-sm" onClick={() => setShowKeys((v) => !v)} title="Keyboard shortcuts ( ? )" aria-expanded={showKeys} aria-label="Keyboard shortcuts">⌨</button>
-      </div>
+      </div>}
       {showKeys && <div className="news-keys" data-testid="news-keys">{KEYS.map(([k, d]) => <span key={k}><kbd>{k}</kbd> {d}</span>)}</div>}
 
-      {trending.length > 0 && (
+      {section === "insights" && trending.length > 0 && (
         <div className="news-chips" data-testid="news-trending">
           <span className="text-dim news-meta">Trending · 1h</span>
           {trending.map(([w, n]) => <button key={w} type="button" className={`chip${q.toLowerCase() === w ? " on" : ""}`} onClick={() => setQ(q.toLowerCase() === w ? "" : w)}>{w} <span className="mono">{n}</span></button>)}
         </div>
       )}
-      {kindOrder.length > 0 && (
+      {section === "news" && kindOrder.length > 0 && (
         <div className="news-chips" data-testid="news-kinds">
           <span className="text-dim news-meta" title="Keyword rules on the headline, not AI">Type</span>
           {kindOrder.map((k) => (
@@ -597,16 +608,16 @@ export default function News() {
           {kindPick.size > 0 && <button type="button" className="chip" onClick={() => setKindPick(new Set())}>clear</button>}
         </div>
       )}
-      <div className="news-chips">
+      {section === "news" && <div className="news-chips">
         {Object.entries(counts.bySource).sort((a, b) => b[1] - a[1]).map(([s, n]) => (
           <button key={s} type="button" className={`chip${picked.has(s) ? " on" : ""}`} onClick={() => togglePick(s)}>{s} <span className="mono">{n}</span></button>
         ))}
         {picked.size > 0 && <button type="button" className="chip" onClick={() => setPicked(new Set())}>clear</button>}
-      </div>
+      </div>}
 
-      <div className="news-grid">
+      <div className={`news-grid${section === "news" ? " single" : ""}`}>
         <div style={{ minWidth: 0 }}>
-        <div className="widget">
+        {section === "news" && <div className="widget">
           <h3>Headlines <span className="mono" style={{ marginLeft: 8, color: "var(--text-faint)" }}
             title={rows.length !== shown.length ? "Stories (one story's reports from several outlets are one row) · headlines" : ""}>
             {rows.length !== shown.length ? `${rows.length} stories · ${shown.length}` : shown.length}</span>
@@ -667,8 +678,8 @@ export default function News() {
               );
             })}
           </div>
-        </div>
-          {settings?.extract && status?.extract && (
+        </div>}
+          {section === "insights" && settings?.extract && status?.extract && (
             <div className="widget" style={{ marginTop: 12 }} data-testid="news-extract">
               <h3>Full text · your scraper</h3>
               <div className="widget-body">
@@ -685,7 +696,7 @@ export default function News() {
           )}
         </div>
 
-        <div className="news-side">
+        {section === "insights" && <div className="news-side">
           {stocksInNews.length > 0 && (
             <div className="widget" data-testid="news-stocks-panel">
               <h3>Stocks in the news</h3>
@@ -697,7 +708,7 @@ export default function News() {
                     const name = tickerName(s.sym), cp = quotes[s.sym]?.change_pct;
                     return (
                       <tr key={s.sym} className={stockPick === s.sym ? "on" : ""} title={`Latest: ${s.title}`}>
-                        <td><button type="button" className="news-stock-name" onClick={() => setStockPick(stockPick === s.sym ? null : s.sym)}
+                        <td><button type="button" className="news-stock-name" onClick={() => { setStockPick(stockPick === s.sym ? null : s.sym); if (stockPick !== s.sym) setPrefs({ section: "news" }); }}
                           title={stockPick === s.sym ? "Show every stock again" : `Only ${name}'s news`}>{name}</button>
                           {breaking.has(s.sym) && <span className="news-hot" title={`Breaking: ${breaking.get(s.sym)!.size} outlets in the last ${burstM} min`}>
                             🔥{breaking.get(s.sym)!.size}</span>}</td>
@@ -730,7 +741,7 @@ export default function News() {
               )}
             </div>
           </div>
-        </div>
+        </div>}
       </div>
 
       {showSettings && settings && status && (

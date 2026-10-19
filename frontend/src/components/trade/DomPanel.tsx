@@ -33,10 +33,12 @@ export interface DomSettings {
   zeroVol: boolean;
   volume: boolean;
   rows: number;
+  /** The live price stays in the middle row; the ladder moves under it. */
+  lock: boolean;
 }
 
 const DOM_KEY = "trade:domSettings";
-const DEFAULT_DOM: DomSettings = { between: true, zeroVol: true, volume: true, rows: 21 };
+const DEFAULT_DOM: DomSettings = { between: true, zeroVol: true, volume: true, rows: 21, lock: true };
 
 function loadDom(): DomSettings {
   try {
@@ -156,7 +158,7 @@ export function DomPanel({
   const maxQ = Math.max(1, ...bids.map((r) => r[1]), ...asks.map((r) => r[1]));
   const maxV = Math.max(1, ...vap.values());
   const mid = bestBid != null && bestAsk != null ? (bestBid + bestAsk) / 2 : ltp;
-  const center = pinned ?? (mid != null ? key(mid) : null);
+  const center = s.lock ? (ltp != null ? key(ltp) : mid != null ? key(mid) : null) : pinned ?? (mid != null ? key(mid) : null);
   const rows = center == null ? [] : ladderKeys(center, s.rows, s, {
     bestBid: bestBid != null ? key(bestBid) : null,
     bestAsk: bestAsk != null ? key(bestAsk) : null,
@@ -164,11 +166,11 @@ export function DomPanel({
     has: (k) => (vap.get(k) ?? 0) > 0 || bidAt.has(k) || askAt.has(k) || ordAt.has(k),
   });
 
-  const confirmGo = (text: string) => instant || window.confirm(`${text}?`);
-  const send = (o: ChartOrder, text: string) => {
-    if (!confirmGo(text)) return;
-    onOrder(o, qty).then((m) => onMsg(m), (e) => onMsg(`Order failed: ${e instanceof Error ? e.message : String(e)}`));
-  };
+  // No browser pop-ups: without one-click, an action waits in the confirm strip.
+  const [ask, setAsk] = useState<{ text: string; go: () => void } | null>(null);
+  const confirmThen = (text: string, go: () => void) => (instant ? go() : setAsk({ text, go }));
+  const send = (o: ChartOrder, text: string) =>
+    confirmThen(text, () => onOrder(o, qty).then((m) => onMsg(m), (e) => onMsg(`Order failed: ${e instanceof Error ? e.message : String(e)}`)));
   // TradingView's DOM: a buy below the market rests as a limit, above it as a stop
   const clickBid = (p: number) => {
     const above = bestAsk != null ? p > bestAsk : ltp != null && p > ltp;
@@ -184,8 +186,8 @@ export function DomPanel({
     if (!o) return;
     const cur = o.type === "SL-M" || o.type === "STOP_LOSS" ? o.stop : o.limit;
     if (cur != null && key(cur) === key(p)) return;
-    if (!confirmGo(`Move ${o.side} ${o.remaining ?? o.qty} to ${fmt(p)}`)) return;
-    onModify(o, p).then((m) => onMsg(m), (e) => onMsg(`Modify failed: ${e instanceof Error ? e.message : String(e)}`));
+    confirmThen(`Move ${o.side} ${o.remaining ?? o.qty} to ${fmt(p)}`, () =>
+      onModify(o, p).then((m) => onMsg(m), (e) => onMsg(`Modify failed: ${e instanceof Error ? e.message : String(e)}`)));
   };
   const pos = position && position.qty !== 0 ? position : null;
   const pnl = pos && ltp != null ? (ltp - pos.avg) * pos.qty : null;
@@ -197,7 +199,8 @@ export function DomPanel({
         <b>{symbol.short_name}, Trading</b>
         <span className="hint">{instant ? "⚡ one-click" : "clicks ask to confirm"}</span>
         <span className="grow" />
-        <button type="button" className="btn-sm" onClick={() => setPinned(null)} title="Recenter on the market" data-testid="dom-recenter">⌖</button>
+        <button type="button" className={`btn-sm${s.lock ? " active" : ""}`} onClick={() => { setS({ ...s, lock: !s.lock }); setPinned(null); }}
+          title={s.lock ? "Live price fixed in the centre — click to scroll the ladder freely" : "Fix the live price in the centre (the ladder moves under it)"} data-testid="dom-recenter">⌖ {s.lock ? "Centred" : "Free"}</button>
         <button type="button" className="btn-sm" onClick={() => { setVap(new Map()); setPinned(null); }} title="Clear the traded volume and recenter" data-testid="dom-clear">✕</button>
         <div className="chart-menu-wrap" ref={menuRef}>
           <button type="button" className="btn-sm" onClick={() => setMenu((o) => !o)} title="DOM settings" data-testid="dom-settings">…</button>
@@ -206,6 +209,7 @@ export function DomPanel({
               <label><input type="checkbox" checked={s.between} onChange={(e) => setS({ ...s, between: e.target.checked })} />Show prices between the best bid / ask</label>
               <label><input type="checkbox" checked={s.zeroVol} onChange={(e) => setS({ ...s, zeroVol: e.target.checked })} />Show zero trade volume prices</label>
               <label><input type="checkbox" checked={s.volume} onChange={(e) => setS({ ...s, volume: e.target.checked })} />Volume column</label>
+              <label><input type="checkbox" checked={s.lock} onChange={(e) => setS({ ...s, lock: e.target.checked })} data-testid="dom-lock-setting" />Keep the live price centred</label>
               <div className="chart-menu-row">
                 <span>Rows</span>
                 <select className="cform-sel" value={s.rows} onChange={(e) => setS({ ...s, rows: Number(e.target.value) })} aria-label="Rows">
@@ -222,10 +226,17 @@ export function DomPanel({
         <span>{pos ? <>Avg <b>{fmt(pos.avg)}</b> · P&amp;L <b className={(pnl ?? 0) >= 0 ? "up" : "down"}>{fmt(pnl)}</b></> : <span className="dim">flat</span>}</span>
       </div>
       <div className="dom-btns">
-        <button type="button" className="btn-sm" disabled={!pos} onClick={() => pos && confirmGo(`Flatten ${symbol.short_name} at market`) && onFlatten().then(() => onMsg(`Flattened ${symbol.short_name}`), (e) => onMsg(`Flatten failed: ${e instanceof Error ? e.message : String(e)}`))} data-testid="dom-flatten">Flatten</button>
-        <button type="button" className="btn-sm" disabled={!orders.length} onClick={() => { if (confirmGo(`Cancel all ${orders.length} working order(s) on ${symbol.short_name}`)) orders.forEach((o) => o.id && onCancel(o.id)); }} data-testid="dom-cxl-all">CXL All</button>
+        <button type="button" className="btn-sm" disabled={!pos} onClick={() => pos && confirmThen(`Flatten ${symbol.short_name} at market`, () => onFlatten().then(() => onMsg(`Flattened ${symbol.short_name}`), (e) => onMsg(`Flatten failed: ${e instanceof Error ? e.message : String(e)}`)))} data-testid="dom-flatten">Flatten</button>
+        <button type="button" className="btn-sm" disabled={!orders.length} onClick={() => confirmThen(`Cancel all ${orders.length} working order(s) on ${symbol.short_name}`, () => orders.forEach((o) => o.id && onCancel(o.id)))} data-testid="dom-cxl-all">CXL All</button>
         <button type="button" className="btn-sm" disabled={!pos} onClick={() => pos && send({ side: pos.qty > 0 ? "SELL" : "BUY", type: "MARKET", price: null, qty: Math.abs(pos.qty) * 2 }, `Reverse ${symbol.short_name}: ${pos.qty > 0 ? "SELL" : "BUY"} ${Math.abs(pos.qty) * 2} at market`)} data-testid="dom-reverse" title="Opposite side, twice the position, at market">Reverse</button>
       </div>
+      {ask && (
+        <div className="dom-confirm" data-testid="dom-confirm">
+          <span>{ask.text}?</span>
+          <button type="button" className="btn-sm primary" autoFocus onClick={() => { const g = ask.go; setAsk(null); g(); }} data-testid="dom-confirm-ok">Confirm</button>
+          <button type="button" className="btn-sm" onClick={() => setAsk(null)}>Cancel</button>
+        </div>
+      )}
       {!d ? (
         <div className="hint">Loading depth…</div>
       ) : !d.ok && rows.length === 0 ? (
@@ -234,7 +245,7 @@ export function DomPanel({
         <div
           className="dom-ladder"
           onWheel={(e) => {
-            if (center == null) return;
+            if (center == null || s.lock) return;      // centred: the market moves, not the view
             setPinned(center + (e.deltaY > 0 ? -3 : 3));
           }}
         >
@@ -259,7 +270,7 @@ export function DomPanel({
                     title={`${o.side} ${o.remaining ?? o.qty} ${o.type === "STOP_LOSS" ? "stop-limit" : o.type.toLowerCase()} — drag to another price to modify`}
                   >
                     {o.remaining ?? o.qty}{o.type !== "LIMIT" && <i>stp</i>}
-                    <button type="button" onClick={(e) => { e.stopPropagation(); if (o.id && confirmGo(`Cancel ${o.side} ${o.remaining ?? o.qty} @ ${fmt(p)}`)) onCancel(o.id); }} title="Cancel">✕</button>
+                    <button type="button" onClick={(e) => { e.stopPropagation(); if (o.id) confirmThen(`Cancel ${o.side} ${o.remaining ?? o.qty} @ ${fmt(p)}`, () => onCancel(o.id!)); }} title="Cancel">✕</button>
                   </span>
                 );
                 return (

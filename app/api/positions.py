@@ -111,6 +111,9 @@ async def update_levels(
             detail=f"no open position for symbol {symbol!r}",
         )
     _audit("positions.update_levels", symbol, result)
+    from app.services.event_bus import event_bus
+
+    await event_bus.publish("broker", {"order_id": "", "status": "levels", "symbol": symbol, "source": "levels"})   # other screens redraw now
     return {"ok": True, "managed": result}
 
 

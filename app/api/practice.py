@@ -192,6 +192,9 @@ async def modify(oid: str, body: dict[str, Any]) -> dict[str, Any]:
             if shown is not None:
                 t.price = shown
         db.commit()
+    from app.execution.paper import _announce
+
+    await _announce(oid, "modified", o.symbol)
     return {"ok": True, "practice": True, "broker_order_id": oid, "message": "modified", "rows_updated": 1}
 
 
@@ -250,7 +253,11 @@ async def set_levels(symbol: str, sl: Optional[float], tp: Optional[float]) -> d
             raise HTTPException(status_code=422, detail=f"{name} must be a positive price")
         if last is not None and (v >= last if below else v <= last):
             raise HTTPException(status_code=422, detail=f"{name} {v:g} is already hit (price {last:g})")
-    return _write_levels(symbol, sl, tp)  # type: ignore[return-value]
+    out = _write_levels(symbol, sl, tp)
+    from app.execution.paper import _announce
+
+    await _announce("", "levels", symbol)
+    return out  # type: ignore[return-value]
 
 
 async def _watch_levels() -> None:

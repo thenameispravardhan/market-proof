@@ -269,6 +269,8 @@ const DOCK: { id: DockId; label: string; short: string; icon: string; hint: stri
   { id: "alerts", label: "Alerts", short: "Alerts", icon: "🔔", hint: "Alerts manager and log" },
 ];
 const DEFAULT_DOCK: DockId[] = ["watch", "trade"];
+/** Indices and India VIX (NSE:…-INDEX) have no orders: no BUY / SELL anywhere for them. */
+const tradable = (sym: string) => !sym.toUpperCase().endsWith("-INDEX");
 
 // Multi-chart layouts (TradingView-style). Click a chart to make it the
 // active one: it follows the watchlist / search and drives the ticket.
@@ -671,7 +673,6 @@ export default function Trade() {
   useOutside(layoutPopRef, layoutOpen, () => setLayoutOpen(false));
   const [tset, setTset] = useState<TradeSet>(() => ({ ...TRADE_SET_DEFAULT, ...stored<Partial<TradeSet>>("trade:settings", {}) }));
   const changeSetting = (k: keyof TradeSet, v: boolean) => {
-    if (k === "instant" && v && !window.confirm("Turn on instant orders?\nEvery order from the chart, the '+' menu and the scalper (and its hotkeys) goes to the broker immediately — no confirm.")) return;
     const n = { ...tset, [k]: v };
     setTset(n);
     try { tabLocal.setItem("trade:settings", JSON.stringify(n)); } catch { /* best-effort */ }
@@ -940,6 +941,8 @@ export default function Trade() {
     }
   }, [chain, selectedExpiry]);
   const { data: pending } = usePendingOrders(accountId);
+  // Orders lists both books too (Real / Paper column); the chart lines stay the mode's.
+  const { data: otherPending } = usePendingOrders(practice ? account?.id ?? null : -1);
   const { data: positions } = usePositions(practice);
   // The Positions table shows BOTH books (Real / Paper column); everything else uses the mode's.
   const { data: otherPositions } = usePositions(!practice);
@@ -1017,7 +1020,7 @@ export default function Trade() {
       sl: o.stop_loss ?? null, tp: o.target ?? null, levels: practice,
     }));
   const modifyChartOrder = async (o: ChartWorkingOrder, patch: OrderPatch) => {
-    const body: Record<string, unknown> = { account_id: accountId, broker_order_id: o.id };
+    const body: Record<string, unknown> = { account_id: o.id.startsWith("PAPER-") ? -1 : accountId, broker_order_id: o.id };
     if (patch.price != null) body[o.type === "SL-M" ? "stop_price" : "limit_price"] = patch.price;
     if ("sl" in patch) body.stop_loss = patch.sl;
     if ("tp" in patch) body.target = patch.tp;
@@ -1367,7 +1370,7 @@ export default function Trade() {
     lotSize: selected && selected.lot_size > 1 ? selected.lot_size : 1,
     limit: limitNum, stop: stopNum, ltp: ltp ?? null, entry: estPrice ?? null, sl: slAbs, tp: tpAbs,
   };
-  const problem = !selected ? "Pick a symbol." : !accountId ? noAccountReason
+  const problem = !selected ? "Pick a symbol." : !tradable(selected.symbol) ? "An index (or India VIX) can't be traded — pick its future or an option." : !accountId ? noAccountReason
     : lotUnknown ? "Lot size unknown for this contract." : ticketProblem(check);
   const canSubmit = problem == null;
   const ticketWarn = canSubmit ? ticketWarning(check) : null;
@@ -1446,7 +1449,8 @@ export default function Trade() {
   const onCancel = async (brokerOrderId: string, label?: string) => {
     // "BUY 10 NSE:SBIN-EQ (2410…)": the order id alone means nothing to a person
     const what = label ? `${label} (${brokerOrderId})` : brokerOrderId;
-    if (!accountId) {
+    const cancelAcct = brokerOrderId.startsWith("PAPER-") ? -1 : practice ? account?.id ?? null : accountId;   // the order's own book
+    if (!cancelAcct) {
       // Cancels go through a live account; without one the click used to do nothing at all.
       setCancelMessage({ type: "error", text: `Not cancelled — ${what}: connect a live Fyers account to cancel orders.` });
       return;
@@ -1454,7 +1458,7 @@ export default function Trade() {
     setCancelMessage(null);
     try {
       const r = await cancelOrder.mutateAsync({
-        account_id: accountId,
+        account_id: cancelAcct,
         broker_order_id: brokerOrderId,
       });
       // ok:false means the broker didn't cancel it. The backend then
@@ -1587,11 +1591,11 @@ export default function Trade() {
                         orders={tset.showOrders ? ordersFor(h.symbol) : undefined}
                         onModifyOrder={modifyChartOrder}
                         onCancelOrder={(o) => { if (tset.instant || window.confirm(`Cancel ${o.side} ${o.qty} ${h.short_name} @ ${o.price}?`)) void onCancel(o.id, `${o.side} ${o.qty} ${h.symbol}`); }}
-                        onPickPrice={active ? onPickPrice : undefined}
+                        onPickPrice={active && tradable(h.symbol) ? onPickPrice : undefined}
                         position={tset.showPos ? positionFor(h.symbol) : null}
                         onLevels={levelsFor(h.symbol)}
                         onClosePosition={closeFor(h.symbol)}
-                        onChartOrder={active ? orderFor(h.symbol, h.short_name, Number(quantity)) : undefined}
+                        onChartOrder={active && tradable(h.symbol) ? orderFor(h.symbol, h.short_name, Number(quantity)) : undefined}
                         orderQty={active ? Number(quantity) : undefined}
                         onOrderQty={active ? (n) => setQuantity(n) : undefined}
                         toolbarSlot={active ? topSlot : undefined}
@@ -1664,7 +1668,7 @@ export default function Trade() {
               positions={bothBooks}
               managed={managed}
               onOpenSymbol={(s) => void openSymbol(s)}
-              pendingOrders={pending?.orders ?? []}
+              pendingOrders={[...(pending?.orders ?? []), ...((practice ? account?.id : true) ? otherPending?.orders ?? [] : [])]}
               onCancel={(id, label) => void onCancel(id, label)}
               cancelBusyId={cancelOrder.isPending ? cancelOrder.variables?.broker_order_id ?? null : null}
               cancelBanner={cancelMessage && (
@@ -1859,6 +1863,9 @@ export default function Trade() {
                     Ticket{" "}
                     {!practice && <TicketModeBadge account={account} botMode={botMode} />}
                   </h2>
+                  {selected && !tradable(selected.symbol) ? (
+                    <div className="hint" data-testid="ticket-index">{selected.short_name} is an index — it can't be bought or sold. Open its future or an option to trade.</div>
+                  ) : (<>
                   {!account && noAccountReason && (
                     <div className="hint warn-text" data-testid="ticket-mode-note">{noAccountReason}</div>
                   )}
@@ -2162,6 +2169,7 @@ export default function Trade() {
                       )}
                     </div>
                   )}
+                </>)}
                 </section>
               </div>
             </section>
@@ -2322,7 +2330,7 @@ export default function Trade() {
               {dockHead("dom", selected?.short_name)}
               <div className="dock-body">
                 <DomPanel
-                  symbol={selected}
+                  symbol={selected && tradable(selected.symbol) ? selected : null}
                   position={selected && openPos(selected.symbol) ? { qty: openPos(selected.symbol)!.quantity, avg: openPos(selected.symbol)!.average_price } : null}
                   orders={orderRows(null, pending?.orders ?? [], []).filter((r) => r.bucket === "working" && r.symbol === selected?.symbol)}
                   qty={Number(quantity)}

@@ -1026,6 +1026,27 @@ export default function ChartPanel(props: ChartPanelProps) {
   const posTagRefs = useRef<{ entry: HTMLDivElement | null; sl: HTMLDivElement | null; tp: HTMLDivElement | null }>({ entry: null, sl: null, tp: null });
   const levelDragRef = useRef<{ which: "sl" | "tp"; price: number } | null>(null);
   const plusRef = useRef<HTMLButtonElement | null>(null);
+  // While the pointer is ON the "+" the engine drops its crosshair: hold the
+  // price label on the axis and the dashed line ourselves (TradingView-style).
+  const plusHoldRef = useRef<HTMLDivElement | null>(null);
+  const holdPlus = (on: boolean) => {
+    const el = plusHoldRef.current, plus = plusRef.current;
+    if (!el || !plus) return;
+    const pr = plusPriceRef.current;
+    el.style.display = on && pr != null ? "block" : "none";
+    if (!on || pr == null) return;
+    el.style.top = `${parseFloat(plus.style.top || "0") + 9}px`;
+    const left = settingsRef.current.scaleSide === "left";
+    el.style.left = `${left ? scaleWidth("left") : 0}px`;
+    el.style.right = `${left ? 0 : scaleWidth("right") || 60}px`;
+    const lbl = el.querySelector<HTMLElement>(".plus-px");
+    if (lbl) {
+      lbl.textContent = fmtPrice(pr);
+      lbl.style.width = `${scaleWidth(left ? "left" : "right") || 60}px`;
+      lbl.style[left ? "right" : "left"] = "100%";
+      lbl.style[left ? "left" : "right"] = "auto";
+    }
+  };
   const plusPriceRef = useRef<number | null>(null);
   const overPlusRef = useRef(false);
   const plusHideRef = useRef<number | undefined>(undefined);
@@ -4346,10 +4367,14 @@ export default function ChartPanel(props: ChartPanelProps) {
       const hh = Math.floor(remaining / 3600);
       const mm = Math.floor((remaining % 3600) / 60);
       const ss = remaining % 60;
-      const txt = `${hh ? `${hh}:${String(mm).padStart(2, "0")}` : mm}:${String(ss).padStart(2, "0")}`;
+      // ONE label (TradingView): price on top, time to close under it, over the
+      // engine's own price label — a box below it covered the axis prices.
+      const txt = `${fmtPrice(last.close)}
+${hh ? `${hh}:${String(mm).padStart(2, "0")}` : mm}:${String(ss).padStart(2, "0")}`;
       if (el.textContent !== txt) el.textContent = txt;
       el.style.display = "block";
-      el.style.top = `${y + 10}px`;
+      el.style.top = `${y - 9}px`;
+      el.style.background = last.close >= last.open ? colorsRef.current.up : colorsRef.current.down;
       const left = s.scaleSide === "left";
       const w = scaleWidth(left ? "left" : "right") || 56;
       el.style.width = `${w}px`;
@@ -6518,20 +6543,22 @@ export default function ChartPanel(props: ChartPanelProps) {
               className="chart-plus"
               style={{ display: "none" }}
               title="Alert, orders and a line at this price"
-              onMouseEnter={() => { overPlusRef.current = true; window.clearTimeout(plusHideRef.current); }}
-              onMouseLeave={() => { overPlusRef.current = false; }}
+              onMouseEnter={() => { overPlusRef.current = true; window.clearTimeout(plusHideRef.current); holdPlus(true); }}
+              onMouseLeave={() => { overPlusRef.current = false; holdPlus(false); }}
               onMouseDown={(e) => e.stopPropagation()}
               onClick={() => {
                 const pr = plusPriceRef.current;
                 if (pr == null) return;
                 const w = containerRef.current?.clientWidth ?? 600;
                 setCtx({ x: w - scaleWidth("right") - 250, y: parseFloat(plusRef.current?.style.top || "0") + 22, price: pr, time: null, area: "pane", plus: true });
+                holdPlus(false);
               }}
               data-testid="chart-plus"
             >
               +
             </button>
           )}
+          {showPlus && <div ref={plusHoldRef} className="plus-hold" style={{ display: "none" }} data-testid="plus-hold"><span className="plus-px" /></div>}
           {ctxEl}
           {tradeFlyEl}
           {legendMenuEl}

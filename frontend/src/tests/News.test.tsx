@@ -21,7 +21,7 @@ let puts: unknown[] = [];
 
 beforeEach(() => {
   puts = [];
-  try { localStorage.removeItem("news:lastSeen"); } catch { /* storage off */ }
+  try { localStorage.removeItem("news:lastSeen"); localStorage.removeItem("news:prefs"); } catch { /* storage off */ }
   globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     if (url.includes("/api/news/settings") && init?.method === "PUT") {
@@ -102,6 +102,7 @@ describe("News page: full text from the scraper", () => {
     expect(within(reader).getByText(/Full article body/)).toBeTruthy();
     expect(within(reader).getByText(/Asha Rao/)).toBeTruthy();
     expect(within(reader).getByText("1234")).toBeTruthy();                // table rendered
+    fireEvent.click(await screen.findByTestId("news-section-insights"));   // stats / panels live under Insights
     expect(screen.getByTestId("news-extract")).toBeTruthy();              // full-text stats panel
   });
 });
@@ -126,15 +127,17 @@ describe("News page: detection lag and trends", () => {
       return json({}, 404);
     }) as unknown as typeof fetch;
     render(<News />);
+    fireEvent.click(await screen.findByTestId("news-section-insights"));   // stats / panels live under Insights
     const strip = await screen.findByTestId("news-stats");
     expect(within(strip).getByText("45s")).toBeTruthy();                  // median detection lag
     expect(within(strip).getAllByText("Mint").length).toBe(1);            // fastest source
-    expect(screen.getByText("+45s").className).toContain("fast");        // per-headline lag, colour by speed
-    expect(screen.getByText("+15m").className).toContain("slow");
-    expect(screen.queryByText("+2.0h")).toBeNull();                       // first-poll backlog: no lag chip
     const trend = screen.getByTestId("news-trending");
     expect(within(trend).getByRole("button", { name: /infosys/ })).toBeTruthy();   // appears twice in the last hour
     expect(within(trend).queryByRole("button", { name: /^rbi/ })).toBeNull();      // once: not trending
+    fireEvent.click(screen.getByTestId("news-section-news"));   // the list: per-headline lag chips
+    expect(screen.getByText("+45s").className).toContain("fast");        // per-headline lag, colour by speed
+    expect(screen.getByText("+15m").className).toContain("slow");
+    expect(screen.queryByText("+2.0h")).toBeNull();                       // first-poll backlog: no lag chip
   });
 
   it("updates live from the server's push, without polling", async () => {
@@ -297,6 +300,7 @@ describe("News page: stocks, stories, kinds and keys", () => {
 
   it("ranks the stocks in the news by stories, with their day's move, and filters the list by one", async () => {
     render(<News />);
+    fireEvent.click(await screen.findByTestId("news-section-insights"));   // stats / panels live under Insights
     const panel = await screen.findByTestId("news-stocks-panel");
     const cells = (r: Element) => [...r.querySelectorAll("td")].map((c) => c.textContent);
     const rows = [...panel.querySelectorAll("tbody tr")];
@@ -335,11 +339,14 @@ describe("News page: stocks, stories, kinds and keys", () => {
     const story = within(lead).getByTestId("news-story");
     expect(within(story).getByText(/RIL Q2 net profit/)).toBeTruthy();
     expect(within(story).getByText("+4m")).toBeTruthy();
+    fireEvent.click(await screen.findByTestId("news-section-insights"));   // stats / panels live under Insights
     const strip = screen.getByTestId("news-stats");
     const first = within(strip).getByText("First to report").parentElement!;
     expect(first.textContent).toContain("Moneycontrol1 of 1 shared stories");
     expect(first.getAttribute("title")).toContain("Moneycontrol 1");
+    fireEvent.click(screen.getByTestId("news-section-news"));   // back to the list
 
+    screen.getByText("More filters").closest("details")!.open = true;   // the extra filters fold away
     fireEvent.click(screen.getByRole("switch", { name: /2\+ sources/ }));
     expect(screen.queryByText(/TCS bags/)).toBeNull();
     expect(screen.getByText(/Reliance Q2 net profit/)).toBeTruthy();
@@ -360,6 +367,7 @@ describe("News page: stocks, stories, kinds and keys", () => {
     expect(ril.className).toContain("hit");
     const tcs = screen.getByText(/TCS bags/).closest("article")!;
     expect(tcs.className).not.toContain("hit");
+    screen.getByText("More filters").closest("details")!.open = true;   // the extra filters fold away
     fireEvent.click(screen.getByRole("switch", { name: /Watchlist only/ }));
     expect(screen.queryByText(/TCS bags/)).toBeNull();
     fireEvent.click(screen.getByTestId("news-settings-btn"));
@@ -439,8 +447,10 @@ describe("News page: stocks, stories, kinds and keys", () => {
   it("marks a stock several outlets name within minutes as breaking", async () => {
     settingsExtra = { burst_minutes: 60 };
     render(<News />);
+    fireEvent.click(await screen.findByTestId("news-section-insights"));   // stats / panels live under Insights
     const panel = await screen.findByTestId("news-stocks-panel");
     expect(within(panel).getByTitle(/Breaking: 3 outlets in the last 60 min/).textContent).toBe("🔥3");
+    fireEvent.click(screen.getByTestId("news-section-news"));   // back to the list
     expect(screen.getByText(/Retail to acquire/).closest("article")!.querySelector(".news-tk.hot")).toBeTruthy();
     expect(screen.getByText(/TCS bags/).closest("article")!.querySelector(".news-tk.hot")).toBeNull();   // one outlet
   });
@@ -452,6 +462,7 @@ describe("News page: stocks, stories, kinds and keys", () => {
         { source: "CNBC", url: "u2", custom: false, enabled: false, health: "off", last_ok: null, error: null, paused_until: null, items_in_feed: 0, hour: 0, day: 0, total: 0, last_item: null }] };
     settingsExtra = { sources: { Mint: true, BSE: true, NSE: false, CNBC: false }, extract_sources: {} };
     render(<News />);
+    fireEvent.click(await screen.findByTestId("news-section-insights"));   // stats / panels live under Insights
     expect(await screen.findByRole("button", { name: /1 more source off/ })).toBeTruthy();   // the sidebar lists what is polled
     fireEvent.click(screen.getByTestId("news-settings-btn"));
     const dlg = await screen.findByTestId("news-settings");

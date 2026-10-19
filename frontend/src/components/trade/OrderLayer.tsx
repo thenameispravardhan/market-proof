@@ -70,8 +70,9 @@ export default function OrderLayer({ orders, geo, tick, fmt, onModify, onCancel,
           el.style.right = `${g.right}px`;
           el.style.transform = `translateY(${Math.max(0, Math.min(g.height, y))}px)`;
           el.classList.toggle("off", y < 0 || y > g.height);
-          const lbl = el.querySelector<HTMLElement>(".px");
-          if (lbl && p != null) lbl.textContent = fmt(p);
+          if (p != null) for (const lbl of el.querySelectorAll<HTMLElement>(".px, .ord-axis")) lbl.textContent = fmt(p);
+          const ax = el.querySelector<HTMLElement>(".ord-axis");
+          if (ax) ax.style.width = `${g.right}px`;
         }
       }
     };
@@ -141,6 +142,7 @@ export default function OrderLayer({ orders, geo, tick, fmt, onModify, onCancel,
         return (
           <div key={o.id}>
             <div ref={ref(`${o.id}:price`)} className={`ord-row ${buy ? "buy" : "sell"}${dragKey === `${o.id}:price` ? " dragging" : ""}`} data-testid={`chart-order-${o.id}`}>
+              <span className="ord-axis" />
               <div className="pos-tag ord" onPointerDown={(e) => start(e, o, "price")} title="Drag to move the order">
                 <span className="side">{o.side} {o.qty} {o.type === "LIMIT" ? "LMT" : o.type}</span>
                 <span className="px" />
@@ -151,6 +153,7 @@ export default function OrderLayer({ orders, geo, tick, fmt, onModify, onCancel,
             </div>
             {(["tp", "sl"] as const).map((k) => (o[k] != null || dragKey === `${o.id}:${k}`) && (
               <div key={k} ref={ref(`${o.id}:${k}`)} className={`ord-row lvl ${k}`} data-testid={`chart-order-${o.id}-${k}`}>
+                <span className="ord-axis" />
                 <div className={`pos-tag lvl ${k}`} onPointerDown={(e) => start(e, o, k)} title={`Drag to move the ${k === "sl" ? "stop-loss" : "target"} (armed when the order fills)`}>
                   <span className="side">{k.toUpperCase()}</span>
                   <span className="px" />

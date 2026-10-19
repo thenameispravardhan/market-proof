@@ -74,6 +74,14 @@ from app.logging_config import get_logger
 log = get_logger(__name__)
 
 
+async def _announce(broker_order_id: str, status: str, symbol: str) -> None:
+    """Every open screen refreshes its orders / positions now, not on its next
+    5 s poll (the same `broker` event a Fyers fill sends)."""
+    from app.services.event_bus import event_bus
+
+    await event_bus.publish("broker", {"order_id": broker_order_id, "status": status, "symbol": symbol, "source": "paper"})
+
+
 def _paper_id() -> str:
     return f"PAPER-{uuid.uuid4().hex[:12]}"
 
@@ -414,6 +422,7 @@ class PaperBackend:
             q = self._md.subscribe(symbol)
             task = asyncio.create_task(self._consume(symbol, q))
             self._subs[symbol] = (q, task)
+        await _announce(oid, "placed", symbol)
         log.info(
             "paper.order_placed",
             broker_order_id=oid,
@@ -451,6 +460,7 @@ class PaperBackend:
         finally:
             self._settling.pop(broker_order_id, None)
         log.info("paper.order_cancelled", broker_order_id=broker_order_id)
+        await _announce(broker_order_id, "cancelled", o.symbol)
         if ev is not None:
             ev.set()
         return True
@@ -575,6 +585,7 @@ class PaperBackend:
             pos.last_price, pos.unrealized_pnl, stid,
         )
         self._settling.pop(broker_order_id, None)
+        await _announce(broker_order_id, "filled", sym)
         log.info(
             "paper.order_filled",
             broker_order_id=broker_order_id,
@@ -600,6 +611,7 @@ class PaperBackend:
         finally:
             self._settling.pop(broker_order_id, None)
         log.info("paper.order_expired", broker_order_id=broker_order_id, symbol=o.symbol)
+        await _announce(broker_order_id, "expired", o.symbol)
         if ev is not None:
             ev.set()
 

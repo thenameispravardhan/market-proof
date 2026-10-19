@@ -73,17 +73,21 @@ describe("Positions panel", () => {
     await waitFor(() => expect(orderFor).toHaveBeenCalledWith("NSE:SBIN-EQ", "NSE:SBIN-EQ", 4, "DELIVERY", undefined));
   });
 
-  it("an SL that is not a price is refused, and one already through the market asks first", async () => {
+  it("SL is edited in place: not a price is refused, one through the market is refused, a good one saves", async () => {
     const levelsFor = vi.fn(() => async () => {});
     renderManager([pos({})], { levelsFor });
-    vi.stubGlobal("prompt", vi.fn(() => "0"));
-    fireEvent.click(screen.getByText("+ SL"));
+    const edit = (v: string) => {
+      fireEvent.click(screen.getByText("+ SL"));
+      const input = screen.getByTestId("level-input-SL-NSE:SBIN-EQ");
+      fireEvent.change(input, { target: { value: v } });
+      fireEvent.keyDown(input, { key: "Enter" });
+    };
+    edit("0");
     expect(screen.getByText(/not a price/)).toBeTruthy();
-    vi.stubGlobal("prompt", vi.fn(() => "130"));
-    const confirm = vi.fn((_m: string) => false);
-    vi.stubGlobal("confirm", confirm);
-    fireEvent.click(screen.getByText("+ SL"));
-    expect(confirm.mock.calls[0][0]).toMatch(/above the last price/);
+    edit("130");
+    expect(screen.getByText(/above the last price/)).toBeTruthy();
     expect(levelsFor).not.toHaveBeenCalled();
+    edit("90");
+    await waitFor(() => expect(levelsFor).toHaveBeenCalledWith("NSE:SBIN-EQ", undefined));
   });
 });
