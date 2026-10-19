@@ -59,11 +59,12 @@ def backend() -> Any:
         from app.api.orders import _manager
         from app.execution.paper import PaperBackend
 
-        # ponytail: resting practice orders live in memory (a restart drops
-        # them; the pending list then expires their rows at the close)
+        # Resting practice orders live in the engine's memory; _restore_resting
+        # puts today's back after a restart (their SL / TP-on-fill is lost).
         # Fills at the touch (BUY at ask, SELL at bid), like a real market order.
         _backend = PaperBackend(market_data=_manager().market_data, session_factory=session_factory(),
                                 pending_timeout_s=8 * 3600, fill_at_touch=True)
+        _restore_resting(_backend)
         _backend.start()
     global _watcher
     if _watcher is None or _watcher.done():
@@ -71,6 +72,49 @@ def backend() -> Any:
 
         _watcher = asyncio.get_running_loop().create_task(_watch_levels(), name="practice-levels")
     return _backend
+
+
+def _restore_resting(b: Any) -> None:
+    """A restart emptied the paper engine while its rows stayed "placed": the
+    order still showed on the chart and the Orders tab, but cancel / modify
+    found nothing (2026-10-19, NIFTY 23100 PE SL-M). Today's LIMIT / SL-M
+    rows go back on the book; anything else is settled as cancelled."""
+    import asyncio
+    from datetime import datetime, timezone
+
+    from app.api.orders import _expired_day_order
+    from app.db.models import Trade
+    from app.execution.base import OrderSide, OrderType
+    from app.execution.paper import _PendingOrder
+
+    now = datetime.now(timezone.utc)
+    with session_factory()() as db:
+        for t in db.query(Trade).filter(Trade.status == "placed"):
+            ot = (t.order_type or "").upper()
+            qty = int(t.quantity) - int(t.filled_qty or 0)
+            if ot in ("LIMIT", "SL-M") and t.broker_order_id and t.price and qty > 0 and not _expired_day_order(t, now):
+                b._pending[t.broker_order_id] = _PendingOrder(  # noqa: SLF001
+                    broker_order_id=t.broker_order_id, symbol=t.symbol, side=OrderSide(t.side), quantity=qty,
+                    order_type=OrderType(ot), limit_price=t.price if ot == "LIMIT" else None,
+                    stop_price=t.price if ot == "SL-M" else None, timeout_s=b._pending_timeout_s,  # noqa: SLF001
+                    broker_account_id=b.broker_account_id)
+                b._fill_events[t.broker_order_id] = asyncio.Event()  # noqa: SLF001
+            else:
+                t.status = "cancelled"
+        db.commit()
+
+
+async def cancel(oid: str) -> bool:
+    """Cancel a resting practice order; a row the engine no longer holds is
+    settled too, so it can never be stuck "placed"."""
+    from app.db.models import Trade
+
+    if await backend().cancel_order(oid):
+        return True
+    with session_factory()() as db:
+        n = db.query(Trade).filter(Trade.broker_order_id == oid, Trade.status == "placed").update({"status": "cancelled"})
+        db.commit()
+    return bool(n)
 
 
 def live_symbols() -> list[str]:
@@ -122,6 +166,9 @@ async def modify(oid: str, body: dict[str, Any]) -> dict[str, Any]:
     o = backend()._pending.get(oid)  # noqa: SLF001 — mutate the live resting order in place
     if o is None:
         raise HTTPException(status_code=404, detail="That practice order already filled or was cancelled.")
+    from app.api.orders import snap_prices
+
+    snap_prices(body, o.symbol)
     px = {k: (float(body[k]) if body.get(k) is not None else None) for k in ("limit_price", "stop_price")}
     for k, v in px.items():
         if v is not None and v <= 0:

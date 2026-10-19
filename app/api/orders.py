@@ -243,6 +243,7 @@ async def place_order(
     if side not in ("BUY", "SELL"):
         raise HTTPException(status_code=422, detail=f"side must be BUY or SELL, got {side!r}")
 
+    snap_prices(body, symbol)
     order_type = str(body.get("order_type") or "MARKET").strip().upper()
     # The docstring (and the Fyers / Zerodha vocabulary) says SL / SL-L for a
     # stop-limit, but only "STOP_LOSS" was accepted — "SL" died as a 422
@@ -457,7 +458,7 @@ async def cancel_order(
         raise HTTPException(status_code=422, detail="broker_order_id is required")
     from app.api import practice
     if account_id == practice.PRACTICE_ACCOUNT_ID:
-        ok = await practice.backend().cancel_order(broker_order_id)
+        ok = await practice.cancel(broker_order_id)
         return {"ok": ok, "broker_order_id": broker_order_id,
                 "reason": "cancelled" if ok else "already_gone", "rows_updated": int(ok)}
     acc = _require_real_account(db, account_id)
@@ -605,6 +606,31 @@ def _opt_int_field(body: dict[str, Any], key: str) -> Optional[int]:
     return int(f)
 
 
+def snap_tick(symbol: str, price: float) -> float:
+    """`price` on the instrument's tick grid (NSE / BSE: 0.05 unless the
+    master says otherwise) — the exchange rejects 120.03; it becomes 120.05."""
+    from app.services.instrument_master import get_master
+
+    inst = get_master().get(symbol.strip().upper())
+    tick = float(getattr(inst, "tick_size", 0) or 0) or 0.05
+    return round(round(price / tick) * tick, 6)
+
+
+def snap_prices(body: dict[str, Any], symbol: Optional[str], keys: tuple[str, ...] = ("limit_price", "stop_price", "stop_loss", "target")) -> None:
+    """Snap every price field present in `body` to `symbol`'s tick, in place.
+    Non-numbers are left for the field validators to refuse."""
+    for k in keys:
+        v = body.get(k)
+        if v is None or isinstance(v, bool):
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(f) and f > 0:
+            body[k] = snap_tick(symbol or "", f)
+
+
 def _opt_price_field(body: dict[str, Any], key: str) -> Optional[float]:
     """An optional price body field: None when absent, 422 unless > 0."""
     v = body.get(key)
@@ -700,6 +726,8 @@ async def modify_order(
     from app.api import practice
     if account_id == practice.PRACTICE_ACCOUNT_ID:
         return await practice.modify(broker_order_id, body)
+    row_sym = db.execute(select(Trade.symbol).where(Trade.broker_order_id == broker_order_id)).scalars().first()
+    snap_prices(body, row_sym, ("limit_price", "stop_price"))
     quantity = _opt_int_field(body, "quantity")
     limit_price = _opt_price_field(body, "limit_price")
     stop_price = _opt_price_field(body, "stop_price")

@@ -81,3 +81,36 @@ def test_practice_limit_order_drags_and_arms_its_levels(client, monkeypatch, iso
     client.post("/api/orders/modify", json={"account_id": -1, "broker_order_id": oid, "target": None})
     assert client.get("/api/orders/pending?account_id=-1").json()["orders"][0]["target"] is None
     assert oid not in practice.PENDING_LEVELS or practice.PENDING_LEVELS[oid][2] is None
+
+
+def test_resting_order_survives_a_restart_and_prices_snap_to_the_tick(client, monkeypatch, isolated_db):
+    """2026-10-19: a deploy emptied the paper engine; the SL-M row stayed
+    "placed" and 21 cancels returned ok:false. Also 121.53 is not an NSE price."""
+    practice._backend = None
+
+    async def fake_quote(*, symbol, db):  # noqa: ARG001
+        await practice.backend()._md.publish(symbol, 100.0)
+        return {"ok": True, "last_price": 100.0}
+
+    monkeypatch.setattr("app.api.orders.get_quote", fake_quote)
+    from app.services.instrument_master import get_master
+    monkeypatch.setattr(get_master(), "get", lambda s: None)      # unknown instrument -> NSE's 0.05
+    r = client.post("/api/orders", json={"account_id": -1, "symbol": "NSE:SBIN-EQ", "side": "BUY",
+                                         "quantity": 5, "order_type": "LIMIT", "limit_price": 95.03}).json()
+    oid = r["broker_order_id"]
+    mine = lambda: next(o for o in client.get("/api/orders/pending?account_id=-1").json()["orders"] if o["broker_order_id"] == oid)  # noqa: E731
+    assert mine()["price"] == 95.05
+    practice._backend = None                                   # "restart"
+    m = client.post("/api/orders/modify", json={"account_id": -1, "broker_order_id": oid, "limit_price": 94.02})
+    assert m.status_code == 200                                # back on the book, not a ghost
+    assert mine()["price"] == 94.0
+    assert client.post("/api/orders/cancel", json={"account_id": -1, "broker_order_id": oid}).json()["ok"]
+    assert oid not in [o["broker_order_id"] for o in client.get("/api/orders/pending?account_id=-1").json()["orders"]]
+
+    # a row the engine never held (an SL-L lost in a restart) still cancels
+    from app.db.models import Trade
+    with practice.session_factory()() as db:
+        db.add(Trade(symbol="NSE:SBIN-EQ", side="BUY", quantity=1, price=99.0, order_type="STOP_LOSS",
+                     status="placed", broker_order_id="PAPER-ghost"))
+        db.commit()
+    assert client.post("/api/orders/cancel", json={"account_id": -1, "broker_order_id": "PAPER-ghost"}).json()["ok"]
