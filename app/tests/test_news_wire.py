@@ -345,9 +345,9 @@ def test_cnbc_awaaz_headline_is_the_english_link_slug():
 
     url = ("https://hindi.cnbctv18.com/share-market/hindustan-zinc-q2-results-profit-jumps-142-percent-"
            "to-6412-crore-rupees-revenue-beats-estimates-read-details-199557.htm")
-    assert slug_title(url) == "Hindustan zinc q2 results profit jumps 142 percent to 6412 crore rupees revenue beats estimates"
+    assert slug_title(url) == "Hindustan Zinc Q2 Results Profit Jumps 142 Percent to 6412 Crore Rupees Revenue Beats Estimates"
     assert slug_title(url + "#update-1") == slug_title(url)
     body = (f"<rss><channel><item><title><![CDATA[Hindustan Zinc Q2 Results: वेदांता ग्रुप]]></title><link><![CDATA[{url}]]></link>"
             "<description>हिंदी</description><pubDate>Mon, 19 Oct 2026 15:51:52 +0530</pubDate></item></channel></rss>").encode()
     item = parse_feed(body, slug=True)[0]
-    assert item["title"].startswith("Hindustan zinc q2 results") and item["summary"] is None
+    assert item["title"].startswith("Hindustan Zinc Q2 Results") and item["summary"] is None
