@@ -515,6 +515,18 @@ export const TEMPLATES: Template[] = [
     entry_long: G([C(I("CVD_DIVERGENCE", { period: 20 }, "bull"), "==", N(1)), C(I("RSI", { period: 14 }), "<", N(40))]),
     entry_short: G([C(I("CVD_DIVERGENCE", { period: 20 }, "bear"), "==", N(1)), C(I("RSI", { period: 14 }), ">", N(60))]),
     stop_loss: { type: "atr", value: 1, atr_period: 14 }, target: { type: "rr", value: 1.5 } } },
+  { name: "Order flow · absorption reversal (5m)", spec: {
+    direction: "both", timeframe: 5, instrument: { type: "equity" } as Instrument, max_bars: 12, max_trades_per_day: 3,
+    entry_long: G([C(I("FLOW_PRESSURE", { period: 20, smooth: 5, threshold: 2 }, "absorption"), "==", N(1)), C(I("RSI", { period: 14 }), "<", N(45))]),
+    entry_short: G([C(I("FLOW_PRESSURE", { period: 20, smooth: 5, threshold: 2 }, "absorption"), "==", N(-1)), C(I("RSI", { period: 14 }), ">", N(55))]),
+    stop_loss: { type: "atr", value: 1, atr_period: 14 }, target: { type: "rr", value: 1.5 } } },
+  { name: "Order flow · initiative-pressure trend (5m)", spec: {
+    direction: "both", timeframe: 5, instrument: { type: "equity" } as Instrument, max_trades_per_day: 2,
+    entry_long: G([C(I("FLOW_PRESSURE", { period: 20, smooth: 5, threshold: 2 }, "aggression"), "==", N(1)), C(I("FLOW_PRESSURE", { period: 20, smooth: 5, threshold: 2 }, "pressure"), ">", N(10)), C(I("PRICE"), ">", I("VWAP"))]),
+    entry_short: G([C(I("FLOW_PRESSURE", { period: 20, smooth: 5, threshold: 2 }, "aggression"), "==", N(-1)), C(I("FLOW_PRESSURE", { period: 20, smooth: 5, threshold: 2 }, "pressure"), "<", N(-10)), C(I("PRICE"), "<", I("VWAP"))]),
+    exit_long: G([C(I("FLOW_PRESSURE", { period: 20, smooth: 5, threshold: 2 }, "pressure"), "<", N(-10))]),
+    exit_short: G([C(I("FLOW_PRESSURE", { period: 20, smooth: 5, threshold: 2 }, "pressure"), ">", N(10))]),
+    stop_loss: { type: "atr", value: 1.2, atr_period: 14 }, target: { type: "rr", value: 2 } } },
   { name: "Order flow · value-area rejection back to POC (5m)", spec: {
     direction: "both", timeframe: 5, instrument: { type: "equity" } as Instrument, max_trades_per_day: 1,
     entry_short: G([C(I("DAILY", {}, "day_open"), ">", I("VPROFILE", {}, "prev_vah")), C(I("PRICE"), "crosses_below", I("VPROFILE", {}, "prev_vah"))]),
@@ -993,6 +1005,16 @@ function Results({ r }: { r: BtResult }) {
           <Metric label="Exposure" value={`${num(s.exposure_pct, 1)}%`} hint="share of candles with a position open" />
           <Metric label="Avg hold" value={`${num(s.avg_minutes_held, 0)} min`} />
           <Metric label="Buy & hold" value={s.buy_hold_pct === null || s.buy_hold_pct === undefined ? "—" : `${num(s.buy_hold_pct)}%`} cls={pnlCls(s.buy_hold_pct)} hint="the underlying's own move over the same window (average across symbols) — the benchmark" />
+        </div>
+        <div className="meta" style={{ marginTop: 8, color: "var(--text)" }}>Risk & confidence</div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 18 }} data-testid="algo-risk-metrics">
+          <Metric label="PSR" value={s.psr_pct == null ? "—" : `${num(s.psr_pct, 1)}%`} cls={s.psr_pct == null ? "" : s.psr_pct >= 95 ? "pnl-pos" : s.psr_pct < 50 ? "pnl-neg" : ""}
+            hint="Probabilistic Sharpe: the chance the true Sharpe is above 0, given how many days you have and their skew / fat tails. ≥ 95% is the usual bar" />
+          <Metric label="SQN" value={num(s.sqn)} cls={s.sqn == null ? "" : s.sqn >= 2 ? "pnl-pos" : s.sqn < 1 ? "pnl-neg" : ""} hint="System Quality Number: √n × mean / sd of trade P&L (n ≤ 100). 1.6–2 average, 2–3 good, > 3 excellent" />
+          <Metric label="VaR 95% (1 day)" value={s.var95 == null ? "—" : inr(s.var95)} hint="a day worse than this happened on 5% of days (historical, needs 20+ days)" />
+          <Metric label="CVaR 95%" value={s.cvar95 == null ? "—" : inr(s.cvar95)} cls={s.cvar95 == null ? "" : "pnl-neg"} hint="expected shortfall: the average of those worst 5% of days — what a bad day really costs" />
+          <Metric label="Tail ratio" value={num(s.tail_ratio)} cls={s.tail_ratio == null ? "" : s.tail_ratio >= 1 ? "pnl-pos" : "pnl-neg"} hint="best 5% day / worst 5% day. > 1 = the right tail is fatter (wins bigger than losses at the extremes)" />
+          <Metric label="Skew / ex-kurtosis" value={`${num(s.skew)} / ${num(s.excess_kurtosis)}`} hint="daily P&L shape. Negative skew = rare big losing days; kurtosis > 0 = fatter tails than a normal curve" />
         </div>
         {skipped.length > 0 && (
           <div className="meta" style={{ marginTop: 6 }}>

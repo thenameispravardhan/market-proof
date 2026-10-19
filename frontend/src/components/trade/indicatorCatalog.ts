@@ -10,6 +10,7 @@
 import {
   adx,
   atr,
+  ema,
   bollinger,
   cci,
   donchian,
@@ -155,6 +156,50 @@ export interface IndicatorDef {
 }
 
 const num = (v: InputValue | undefined, d: number) => (typeof v === "number" && Number.isFinite(v) ? v : d);
+
+// Abramowitz & Stegun 7.1.26 (|error| < 1.5e-7): the normal CDF for the bar-level buy share.
+const erf = (x: number) => {
+  const a = Math.abs(x), t = 1 / (1 + 0.3275911 * a);
+  return Math.sign(x) * (1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-a * a));
+};
+const popStd = (xs: number[]) => { const m = xs.reduce((a, b) => a + b, 0) / xs.length; return Math.sqrt(Math.max(0, xs.reduce((a, b) => a + (b - m) ** 2, 0) / xs.length)); };
+
+/** Order-flow pressure — the Algo Lab's FLOW_PRESSURE, bar for bar: buy / sell volume from recorded ticks
+ *  when there are any, else the same Bulk Volume Classification estimate the server uses. */
+export function flowPressure(c: OhlcvCandle[], flow: Map<number, [number, number, number]> | undefined, n = 20, smooth = 5, z = 2) {
+  const dp = c.map((k, i) => (i ? k.close - c[i - 1].close : k.close - k.open));
+  const delta: number[] = [], pct: number[] = [];
+  c.forEach((k, i) => {
+    const f = flow?.get(k.time);
+    let b: number, s: number;
+    if (f) [b, s] = [f[0], f[1]];
+    else {
+      const sd = i >= 19 ? popStd(dp.slice(i - 19, i + 1)) : 0;
+      const sh = sd ? 0.5 * (1 + erf(dp[i] / sd / Math.SQRT2)) : k.high > k.low ? (k.close - k.low) / (k.high - k.low) : 0.5;
+      b = (k.volume ?? 0) * sh;
+      s = (k.volume ?? 0) - b;
+    }
+    delta.push(b - s);
+    pct.push(b + s ? ((b - s) / (b + s)) * 100 : 0);
+  });
+  const dz = delta.map((x, i) => {
+    if (i < n - 1) return null;
+    const w = delta.slice(i - n + 1, i + 1), m = w.reduce((a, v) => a + v, 0) / n, sd = popStd(w);
+    return sd ? (x - m) / sd : null;
+  });
+  const absorption: number[] = [], aggression: number[] = [];
+  dz.forEach((v, i) => {
+    let a = 0, g = 0;
+    if (v != null && Math.abs(v) >= z) {
+      const side = v > 0 ? 1 : -1, k = c[i];
+      const cp = k.high > k.low ? (k.close - k.low) / (k.high - k.low) : 0.5;
+      if (side > 0 ? cp <= 0.5 : cp >= 0.5) a = -side; else g = side;   // price refused the aggressor / followed it
+    }
+    absorption.push(a);
+    aggression.push(g);
+  });
+  return { pressure: ema(pct, smooth), deltaZ: dz, absorption, aggression };
+}
 const str = (v: InputValue | undefined, d: string) => (typeof v === "string" ? v : d);
 
 function shiftArr(a: (number | null)[], by: number): (number | null)[] {
@@ -660,6 +705,37 @@ export const INDICATORS: IndicatorDef[] = [
         colors.push(f[2] >= 0 ? ctx.up : ctx.down);
       }
       return { plots: [delta, cvd], colors: [colors, null] };
+    },
+  },
+  {
+    type: "flowpressure",
+    name: "Order Flow Pressure & Absorption",
+    short: "Flow pressure",
+    category: "Volume",
+    overlay: false,
+    desc: "Who is in control: EMA of delta as % of volume (−100 all selling … +100 all buying), the delta's z-score, "
+      + "and marks where heavy aggression fails (A = absorption: sellers hit hard but the bar closed high — a floor; "
+      + "or the mirror — a ceiling) or wins (● initiative buying / selling). Recorded ticks when present, else estimated.",
+    inputs: [
+      { key: "length", label: "Z-score length", type: "int", def: 20, min: 5, max: 500 },
+      { key: "smooth", label: "Pressure smoothing", type: "int", def: 5, min: 1, max: 100 },
+      { key: "z", label: "Spike threshold (σ)", type: "float", def: 2, min: 0.5, max: 10, step: 0.1 },
+    ],
+    plots: [
+      { key: "pressure", label: "Pressure", color: "#26A69A", kind: "hist" },
+      { key: "z", label: "Delta z", color: "#FFB300", width: 1, scale: "z" },
+    ],
+    levels: [0],
+    compute: (c, inp, ctx) => {
+      const r = flowPressure(c, ctx.flow, num(inp.length, 20), num(inp.smooth, 5), num(inp.z, 2));
+      const marks: Mark[] = [];
+      r.absorption.forEach((a, i) => {
+        if (a) marks.push({ plot: 0, i, pos: a > 0 ? "below" : "above", shape: a > 0 ? "arrowUp" : "arrowDown", color: a > 0 ? ctx.up : ctx.down, text: "A",
+          title: a > 0 ? "Absorption: heavy selling, bar closed high (buyers absorbed it)" : "Absorption: heavy buying, bar closed low (sellers absorbed it)" });
+        else if (r.aggression[i]) marks.push({ plot: 0, i, pos: r.aggression[i] > 0 ? "below" : "above", shape: "circle", color: r.aggression[i] > 0 ? ctx.up : ctx.down,
+          title: r.aggression[i] > 0 ? "Initiative buying: outsized buy delta, price followed" : "Initiative selling: outsized sell delta, price followed" });
+      });
+      return { plots: [r.pressure, r.deltaZ], colors: [r.pressure.map((v) => (v == null ? null : v >= 0 ? ctx.up : ctx.down)), null], marks };
     },
   },
   ...EXTRA_INDICATORS,

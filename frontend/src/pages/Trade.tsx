@@ -2357,7 +2357,7 @@ export default function Trade() {
               {dockGrip("book")}
               {dockHead("book", selected?.short_name)}
               <div className="dock-body">
-                <BookPanel symbol={selected?.symbol ?? null} tick={selected?.tick_size ?? 0.05} tab={deskTab.book} onTab={(t) => setDeskTab((x) => ({ ...x, book: t }))} onPrice={onBookPrice} onMarket={onBookMarket} />
+                <BookPanel symbol={selected?.symbol ?? null} tick={selected?.tick_size ?? 0.05} lot={selected?.lot_size || 1} tab={deskTab.book} onTab={(t) => setDeskTab((x) => ({ ...x, book: t }))} onPrice={onBookPrice} onMarket={onBookMarket} />
               </div>
             </section>
           )}

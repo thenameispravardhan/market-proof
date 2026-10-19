@@ -110,6 +110,24 @@ def _deep(q: str) -> set[str]:
         con.close()
 
 
+_TEXT_STOCKS: dict[tuple[str, int], list[str]] = {}   # (url, text length) -> stocks its article lead names
+TEXT_STOCKS_PER_CALL = 300                              # new articles scanned per request (the rest next refresh)
+
+
+def _text_stocks(rows: list, ext: dict) -> dict[str, list[str]]:
+    """Stocks named in the article text (its first 2,000 characters, as the chart button reads it) for headlines
+    that name none themselves. Cached per article, so each one is scanned once."""
+    want = [r for r in rows if (ext.get(r.url) or {}).get("status") in ("done", "duplicate") and ext[r.url]["chars"]
+            and not nt.tag(r.title, r.summary)["tickers"]]
+    todo = [r.url for r in want if (r.url, ext[r.url]["chars"]) not in _TEXT_STOCKS][:TEXT_STOCKS_PER_CALL]
+    if todo:
+        if len(_TEXT_STOCKS) > 50_000:                  # ponytail: wholesale reset, an LRU if this ever churns
+            _TEXT_STOCKS.clear()
+        for u, e in nw.lookup(todo, nw.news_wire.scrape_db).items():
+            _TEXT_STOCKS[(u, e["chars"] or 0)] = nt.find("", None, e.get("text"))[:3]
+    return {r.url: got for r in want if (got := _TEXT_STOCKS.get((r.url, ext[r.url]["chars"])))}
+
+
 @router.get("/items")
 def items(since_id: int = 0, q: str = Query("", max_length=100), source: Optional[str] = None,
           hours: Optional[float] = Query(None, gt=0, le=24 * 90), limit: int = Query(500, ge=1, le=2000),
@@ -134,10 +152,11 @@ def items(since_id: int = 0, q: str = Query("", max_length=100), source: Optiona
         rows = db.execute(stmt.order_by(when.desc(), NewsItem.id.desc()).limit(limit)).scalars().all()
     max_id = db.execute(select(func.max(NewsItem.id))).scalar() or 0
     ext = nw.lookup([r.url for r in rows], nw.news_wire.scrape_db, text=False)
+    in_text = _text_stocks(rows, ext)
     out = []
     for r in rows:
         e = ext.get(r.url)
-        out.append({**_row(r), "extract": {"status": e["status"], "chars": e["chars"] or 0, "error": e["error"],
+        out.append({**_row(r), "text_tickers": in_text.get(r.url, []), "extract": {"status": e["status"], "chars": e["chars"] or 0, "error": e["error"],
                                             "fetched": e["fetched"]} if e else None})
     # Straight to JSON: FastAPI's generic encoder walked 2000 headlines field by field (~0.9 s of the
     # News page's first load on the server; the query + tags take ~0.25 s).

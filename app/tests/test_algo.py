@@ -807,3 +807,31 @@ def test_stats_median_win_and_loss():
     st = engine.stats([t(100), t(200), t(9000), t(-50), t(-70), t(-5000)], 100000)
     assert st["median_win"] == 200 and st["median_loss"] == -70       # one outlier doesn't move them
     assert st["avg_win"] == 3100
+
+
+def test_flow_pressure_absorption_and_aggression():
+    n = 30
+    d = bars([100.0 + (i % 3) * 0.1 for i in range(n)], spread=1.0)
+    d.update(flow=True, buy_v=[500.0 + (i % 4) * 20 for i in range(n)], sell_v=[500.0 + ((i + 2) % 4) * 20 for i in range(n)])
+    # bar 25: 3000 sold at market, yet the bar closes at its high -> buyers absorbed it (a floor)
+    d["sell_v"][25], d["h"][25], d["l"][25], d["c"][25] = 3500.0, 101.0, 99.0, 101.0
+    # bar 27: 3000 bought at market and the close follows to the high -> initiative buying
+    d["buy_v"][27], d["h"][27], d["l"][27], d["c"][27] = 3500.0, 102.0, 100.0, 102.0
+    r = ind.compute(d, "FLOW_PRESSURE", {"period": 20, "smooth": 3, "threshold": 2.0})
+    assert r["absorption"][25] == 1.0 and r["aggression"][25] == 0.0
+    assert r["aggression"][27] == 1.0 and r["absorption"][27] == 0.0
+    assert r["delta_z"][25] < -2 < 2 < r["delta_z"][27]
+    assert sum(abs(x) for x in r["absorption"][:25]) == 0               # ordinary bars flag nothing
+    assert r["pressure"][26] < 0 < r["pressure"][29]                     # the sell wave, then the buy wave
+    assert "FLOW_PRESSURE" in engine.ORDER_FLOW
+
+
+def test_stats_tail_risk_and_confidence():
+    t = lambda k, v: {"net": v, "gross": v, "charges": 0, "entry_t": k * 86400, "exit_t": k * 86400 + 60, "bars": 1}  # noqa: E731
+    pnl = [300, -100, 250, -120, 400, -90, 180, -2000, 220, 310, -80, 260, -150, 190, 330, -110, 240, 280, -95, 205]
+    st = engine.stats([t(k, v) for k, v in enumerate(pnl)], 100000)
+    assert st["var95"] == 150 and st["cvar95"] == 2000                   # 5th-percentile day; the one worst day
+    assert st["skew"] < 0 and st["excess_kurtosis"] > 3                  # one crash day: left tail, fat tails
+    assert 50 < st["psr_pct"] < 100 and st["sqn"] > 0
+    few = engine.stats([t(k, v) for k, v in enumerate(pnl[:5])], 100000)
+    assert few["var95"] is None and few["tail_ratio"] is None            # too few days to say

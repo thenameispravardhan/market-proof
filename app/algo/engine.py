@@ -322,7 +322,7 @@ def _walk_operands(spec: dict[str, Any]):
 
 # Indicators that need buy / sell flow (recorded ticks, else per-minute BVC
 # estimates). RVOL is NOT one: it only compares candle volume by time of day.
-ORDER_FLOW = {"DELTA", "CVD", "CVD_DIVERGENCE", "VPROFILE", "BAR_FLOW"}
+ORDER_FLOW = {"DELTA", "CVD", "CVD_DIVERGENCE", "VPROFILE", "BAR_FLOW", "FLOW_PRESSURE"}
 
 
 def bar_minutes(spec: dict[str, Any]) -> float:
@@ -1046,6 +1046,12 @@ def stats(trades: list[dict[str, Any]], capital: float) -> dict[str, Any]:
     mfes = [x["mfe_pct"] for x in trades if x.get("mfe_pct") is not None]
     days_span = ((trades[-1]["exit_t"] - trades[0]["entry_t"]) / 86400) if n else 0
     final = capital + net
+    from app.research import stats as rstats
+    rets = [v / capital for v in dv] if capital else []          # daily returns on starting capital
+    skew, kurt = rstats._skew_kurt(rets) if len(rets) > 2 else (None, None)   # noqa: SLF001
+    worst = sorted(dv)
+    k5 = max(1, len(worst) // 20)                                # the worst 5% of days (at least one)
+    pct = lambda q: worst[min(len(worst) - 1, int(q * len(worst)))]   # noqa: E731
     cagr = ((final / capital) ** (365 / days_span) - 1) * 100 if n and days_span >= 30 and final > 0 else None
     return {
         "trades": n, "wins": len(wins), "losses": len(losses),
@@ -1081,6 +1087,18 @@ def stats(trades: list[dict[str, Any]], capital: float) -> dict[str, Any]:
                            * 100, 2) if wins and losses and gross_loss else None,
         "recovery_factor": round(net / max_dd, 2) if max_dd > 0 else None,
         "ulcer_index": round(ulcer, 2),
+        # Van Tharp's System Quality Number: sqrt(n) x mean / sd of trade P&L (n capped at 100). >2 good, >3 excellent.
+        "sqn": round(math.sqrt(min(n, 100)) * mean_t / sd_t, 2) if n > 1 and sd_t > 0 else None,
+        # P(the true Sharpe > 0) given this many days and their skew / fat tails (Bailey & Lopez de Prado).
+        "psr_pct": round(rstats.probabilistic_sharpe(rets) * 100, 1)
+        if len(rets) > 2 and rstats.probabilistic_sharpe(rets) is not None else None,
+        "skew": round(skew, 2) if skew is not None else None,
+        "excess_kurtosis": round(kurt - 3, 2) if kurt is not None else None,
+        # historical 95% one-day Value at Risk and the average day beyond it (expected shortfall)
+        "var95": round(-pct(0.05), 2) if len(dv) >= 20 else None,
+        "cvar95": round(-sum(worst[:k5]) / k5, 2) if len(dv) >= 20 else None,
+        # size of the best 5% of days vs the worst 5%: > 1 = the right tail is fatter
+        "tail_ratio": round(abs(pct(0.95)) / abs(pct(0.05)), 2) if len(dv) >= 20 and pct(0.05) < 0 else None,
         "avg_r": round(sum(rs) / len(rs), 3) if rs else None,
         "avg_mae_pct": round(sum(maes) / len(maes), 3) if maes else None,
         "avg_mfe_pct": round(sum(mfes) / len(mfes), 3) if mfes else None,
