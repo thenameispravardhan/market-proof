@@ -317,6 +317,33 @@ describe("News page: stocks, stories, kinds and keys", () => {
     expect(JSON.parse(localStorage.getItem("news:prefs") || "{}").marketOnly).toBe(true);
   });
 
+  it("counts a stock an article names only in its text, and can leave those out", async () => {
+    const EXTRA = [...LIST, { ...mk(6, "Mint", "IT stocks rally on big deal wins", 3), text_tickers: [TCS] }];
+    const f = globalThis.fetch as unknown as (u: RequestInfo | URL, i?: RequestInit) => Promise<Response>;
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => (String(input).includes("/api/news/items")
+      ? json({ items: String(input).includes("since_id") ? [] : EXTRA, max_id: 6 }) : f(input, init))) as unknown as typeof fetch;
+    render(<News />);
+    expect((await screen.findByText(/IT stocks rally/)).closest("article")!.querySelector(".news-tk.text")!.textContent).toContain("TCS");
+    fireEvent.click(screen.getByTestId("news-section-insights"));
+    const panel = await screen.findByTestId("news-stocks-panel");
+    const tcs = () => within(panel).getByRole("button", { name: "TCS" }).closest("tr")!.querySelectorAll("td")[1];
+    expect(tcs().textContent).toBe("21");                                 // 2 stories, 1 of them from the article text
+    fireEvent.click(within(panel).getByTestId("news-text-stocks"));
+    expect(tcs().textContent).toBe("1");                                  // headlines only
+  });
+
+  it("switches insights panels and full text on and off, and remembers the panels", async () => {
+    render(<News />);
+    fireEvent.click(await screen.findByTestId("news-section-insights"));
+    expect(await screen.findByTestId("news-stocks-panel")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("news-panel-stocks"));
+    expect(screen.queryByTestId("news-stocks-panel")).toBeNull();
+    expect(JSON.parse(localStorage.getItem("news:prefs") || "{}").hidden).toEqual(["stocks"]);
+    expect(screen.getByTestId("news-extract").textContent).toMatch(/Off: headlines only/);
+    fireEvent.click(screen.getByTestId("news-extract-toggle"));
+    await waitFor(() => expect(puts[puts.length - 1]).toMatchObject({ extract: true }));
+  });
+
   it("ranks the stocks in the news by stories, with their day's move, and filters the list by one", async () => {
     render(<News />);
     fireEvent.click(await screen.findByTestId("news-section-insights"));   // stats / panels live under Insights

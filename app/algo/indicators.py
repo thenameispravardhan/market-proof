@@ -438,6 +438,33 @@ def cvd_divergence(d: dict, n: int) -> dict[str, S]:
     return {"bull": bull, "bear": bear}
 
 
+def flow_pressure(d: dict, n: int, smooth: int, z: float) -> dict[str, S]:
+    """Who is in control, and where aggression fails.
+
+    pressure   EMA (smooth) of delta as % of volume: -100 all selling .. +100 all buying
+    delta_z    this bar's delta in standard deviations of the last n bars' deltas
+    absorption +1 sellers hit hard (delta_z <= -z) yet the bar closed in its upper half:
+               passive buyers soaked it up (often a floor); -1 the mirror (a ceiling)
+    aggression +1 / -1 an outsized delta the close followed: initiative buying / selling
+    """
+    od = order_delta(d)
+    delta = od["delta"]
+    mu, sd = sma(delta, n), stdev(delta, n)
+    zs: S = [(x - m) / s if m is not None and s else None for x, m, s in zip(delta, mu, sd)]
+    absorb: S = []
+    aggr: S = []
+    for zz, h, l, c in zip(zs, d["h"], d["l"], d["c"]):
+        a = g = 0.0
+        if zz is not None and abs(zz) >= z:
+            side = 1.0 if zz > 0 else -1.0
+            cp = (c - l) / (h - l) if h > l else 0.5
+            held = cp <= 0.5 if side > 0 else cp >= 0.5      # price did not follow the aggressor
+            a, g = (-side, 0.0) if held else (0.0, side)
+        absorb.append(a)
+        aggr.append(g)
+    return {"pressure": ema(od["delta_pct"], smooth), "delta_z": zs, "absorption": absorb, "aggression": aggr}
+
+
 def _value_area(bins: dict[int, float], poc: int, lo_b: int, hi_b: int, target: float) -> tuple[int, int]:
     lo = hi = poc
     acc = bins.get(poc, 0.0)
@@ -727,6 +754,9 @@ REGISTRY: dict[str, tuple[Callable[..., Any], dict[str, Any], list[str], str]] =
     "DELTA":      (lambda d: order_delta(d), {}, ["delta", "delta_pct", "buy_volume", "sell_volume"], "Order flow"),
     "CVD":        (lambda d: cvd(d), {}, ["session", "total"], "Order flow"),
     "CVD_DIVERGENCE": (lambda d, period=20: cvd_divergence(d, period), {"period": 20}, ["bull", "bear"], "Order flow"),
+    "FLOW_PRESSURE": (lambda d, period=20, smooth=5, threshold=2.0: flow_pressure(d, period, smooth, threshold),
+                      {"period": 20, "smooth": 5, "threshold": 2.0},
+                      ["pressure", "delta_z", "absorption", "aggression"], "Order flow"),
     "VPROFILE":   (lambda d, value_area=70: volume_profile(d, value_area), {"value_area": 70},
                    ["poc", "vah", "val", "prev_poc", "prev_vah", "prev_val"], "Order flow"),
     "RVOL":       (lambda d, days=10: rvol(d, days), {"days": 10}, ["value"], "Volume"),
@@ -745,7 +775,7 @@ SOURCES = ("close", "open", "high", "low", "hl2", "hlc3", "ohlc4", "volume", "ra
 
 
 # Upper bounds for the few params that are not bar counts.
-_PARAM_MAX = {"value_area": 100, "maximum": 1.0, "start": 1.0, "increment": 1.0}
+_PARAM_MAX = {"value_area": 100, "maximum": 1.0, "start": 1.0, "increment": 1.0, "threshold": 10.0}
 MAX_PERIOD = 5000
 
 

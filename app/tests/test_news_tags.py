@@ -237,3 +237,33 @@ def test_watchlist_alert_follows_the_stock_whatever_the_headline_calls_it(isolat
             event_bus.unsubscribe("news.alert", q)
 
     asyncio.run(go())
+
+
+def test_items_name_the_stocks_an_article_names_when_its_headline_does_not(client, isolated_db, db_session, named, tmp_path, monkeypatch):
+    import importlib.util
+    import sqlite3
+    import sys
+    import types
+
+    from app.api import news as news_api
+    from app.db.models import NewsItem
+
+    if importlib.util.find_spec("trafilatura") is None:              # the scraper's extractor; unused on this path
+        monkeypatch.setitem(sys.modules, "trafilatura", types.ModuleType("trafilatura"))
+    db = tmp_path / "scrape.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE pages(url TEXT PRIMARY KEY, status TEXT, http INT, final_url TEXT, error TEXT, fetched REAL,"
+                " title TEXT, date TEXT, text TEXT, meta TEXT, tables TEXT)")
+    con.execute("INSERT INTO pages(url, status, text) VALUES('https://x.example/a', 'done', 'ICICI Bank shares rose 3% after the results.')")
+    con.execute("INSERT INTO pages(url, status, text) VALUES('https://x.example/b', 'done', 'Oil India rose too.')")
+    con.commit()
+    con.close()
+    monkeypatch.setattr(nw.news_wire, "scrape_db", db)
+    news_api._TEXT_STOCKS.clear()
+    db_session.add(NewsItem(url="https://x.example/a", source="Mint", feed="f", title="Bank stocks rally on rate-cut hopes"))
+    db_session.add(NewsItem(url="https://x.example/b", source="Mint", feed="f", title="Reliance Industries hits a record"))
+    db_session.commit()
+    rows = {r["url"]: r for r in client.get("/api/news/items").json()["items"]}
+    assert _short(rows["https://x.example/a"]["text_tickers"]) == ["ICICIBANK"]      # only the article names it
+    assert rows["https://x.example/b"]["text_tickers"] == []                        # the headline already names one
+    assert len(news_api._TEXT_STOCKS) == 1                                           # scanned once, then cached

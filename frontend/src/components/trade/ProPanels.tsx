@@ -517,10 +517,101 @@ export function StrategyPanel({ chain, base, positions, accountId }: { chain: Op
 }
 
 // ---------------------------------------------------------------------------
+// Risk desk: size a trade from a rupee risk and an ATR stop, and see what the market can move today.
+// ---------------------------------------------------------------------------
+
+/** Position size from a rupee risk and an ATR-based stop, the R-multiple targets, and the 1σ move left in the
+ *  session from realised volatility (random walk: σ_daily × √(minutes left / 375)). Pure, for the tests. */
+export function riskPlan(p: { ltp: number; atr: number; vol: number; risk: number; atrMult: number; lot: number; tick: number; long: boolean; minsLeft: number }) {
+  const tick = p.tick > 0 ? p.tick : 0.05;
+  const snap = (x: number) => Math.round(x / tick) * tick;
+  const stopDist = Math.max(tick, snap(p.atr * p.atrMult));
+  const step = Math.max(1, p.lot);
+  const qty = Math.max(0, Math.floor(p.risk / stopDist / step) * step);
+  const sgn = p.long ? 1 : -1;
+  const move = p.ltp * p.vol * Math.sqrt(Math.max(0, p.minsLeft) / (252 * 375));
+  return {
+    stopDist, qty, stop: snap(p.ltp - sgn * stopDist), targets: [1, 2, 3].map((r) => snap(p.ltp + sgn * r * stopDist)),
+    notional: qty * p.ltp, maxLoss: qty * stopDist, move, moveInStops: move / stopDist,
+  };
+}
+
+/** ATR(14) and annualised 20-day realised volatility from daily candles [t, o, h, l, c, v]. */
+export function dailyRisk(candles: number[][]): { atr: number; vol: number } | null {
+  const k = candles.filter((r) => r.length >= 5 && r[4] > 0);
+  if (k.length < 21) return null;
+  const tr = k.slice(1).map((r, i) => Math.max(r[2] - r[3], Math.abs(r[2] - k[i][4]), Math.abs(r[3] - k[i][4])));
+  const atr = tr.slice(-14).reduce((a, b) => a + b, 0) / 14;
+  const rets = k.slice(-21).slice(1).map((r, i) => Math.log(r[4] / k.slice(-21)[i][4]));
+  const m = rets.reduce((a, b) => a + b, 0) / rets.length;
+  const vol = Math.sqrt(rets.reduce((a, b) => a + (b - m) ** 2, 0) / (rets.length - 1)) * Math.sqrt(252);
+  return { atr, vol };
+}
+
+const minsLeftIST = (now = Date.now()) => {
+  const m = Math.floor(now / 60000 + 330) % 1440;            // IST minute of the day
+  return m >= 555 && m < 930 ? 930 - m : 375;                 // in session: to 15:30; otherwise a whole session
+};
+
+export function RiskPanel({ symbol, tick, lot }: { symbol: string | null; tick: number; lot: number }) {
+  const live = useLiveQuote(symbol);
+  const [d, setD] = useState<{ atr: number; vol: number } | null | string>(null);
+  const [risk, setRisk] = useState(() => { try { return Number(localStorage.getItem("risk:inr")) || 1000; } catch { return 1000; } });
+  const [mult, setMult] = useState(0.5);
+  const [long, setLong] = useState(true);
+  useEffect(() => {
+    setD(null);
+    if (!symbol) return;
+    let stop = false;
+    const now = Math.floor(Date.now() / 1000);
+    void fetch(`/api/market/history?symbol=${encodeURIComponent(symbol)}&resolution=D&from=${now - 90 * 86400}&to=${now}`)
+      .then((r) => r.json())
+      .then((j: { ok?: boolean; candles?: number[][]; reason?: string }) => { if (!stop) setD(j.ok ? dailyRisk(j.candles ?? []) ?? "under 21 daily candles" : j.reason ?? "no daily history"); })
+      .catch((e) => !stop && setD(String(e)));
+    return () => { stop = true; };
+  }, [symbol]);
+  if (!symbol) return <div className="hint">Open a symbol to size a trade.</div>;
+  if (d === null) return <div className="hint">Loading daily candles…</div>;
+  if (typeof d === "string") return <div className="hint">{d}</div>;
+  const ltp = live?.last_price;
+  if (!ltp) return <div className="hint">Waiting for a live price…</div>;
+  const p = riskPlan({ ltp, atr: d.atr, vol: d.vol, risk, atrMult: mult, lot, tick, long, minsLeft: minsLeftIST() });
+  const f = (x: number) => x.toFixed(tick < 1 ? 2 : 0);
+  const inr = (x: number) => `₹${Math.round(x).toLocaleString("en-IN")}`;
+  return (
+    <div className="risk-desk" data-testid="risk-desk">
+      <div className="dom-stats">
+        <span title="Average true range of the last 14 days">ATR 14d <b>{f(d.atr)}</b></span>
+        <span title="Annualised standard deviation of the last 20 daily log returns">Vol 20d <b>{(d.vol * 100).toFixed(1)}%</b></span>
+        <span title="1σ move left in this session (or a whole session outside market hours), from the realised volatility">1σ left <b>±{f(p.move)}</b> ({p.moveInStops.toFixed(1)} stops)</span>
+      </div>
+      <div className="risk-inputs">
+        <label>Risk ₹ <input type="number" min={1} step={100} value={risk} aria-label="Risk in rupees"
+          onChange={(e) => { const v = Math.max(1, Number(e.target.value) || 0); setRisk(v); try { localStorage.setItem("risk:inr", String(v)); } catch { /* storage off */ } }} /></label>
+        <label>Stop <select value={mult} onChange={(e) => setMult(Number(e.target.value))} aria-label="Stop as a multiple of ATR">
+          {[0.25, 0.5, 0.75, 1, 1.5, 2].map((m) => <option key={m} value={m}>{m} × ATR</option>)}</select></label>
+        <span className="seg">
+          <button type="button" className={long ? "on" : ""} onClick={() => setLong(true)}>Long</button>
+          <button type="button" className={!long ? "on" : ""} onClick={() => setLong(false)}>Short</button>
+        </span>
+      </div>
+      <table className="risk-table"><tbody>
+        <tr><td>Quantity</td><td className="mono"><b>{p.qty}</b>{lot > 1 ? ` (${p.qty / lot} lot${p.qty / lot === 1 ? "" : "s"})` : ""}</td></tr>
+        <tr><td>Stop</td><td className="mono down">{f(p.stop)} <span className="text-dim">({f(p.stopDist)} away)</span></td></tr>
+        {p.targets.map((t, i) => <tr key={i}><td>Target {i + 1}R</td><td className="mono up">{f(t)}</td></tr>)}
+        <tr><td>Notional</td><td className="mono">{inr(p.notional)}</td></tr>
+        <tr><td title="Loss if the stop fills exactly (before charges and slippage)">Loss at stop</td><td className="mono">{inr(p.maxLoss)}</td></tr>
+      </tbody></table>
+      {p.qty === 0 && <div className="hint">₹{risk} doesn't cover one {lot > 1 ? "lot" : "share"} at this stop — risk more or use a tighter stop.</div>}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Dock wrappers: two rail buttons, two tabs each (keeps the rail short).
 // ---------------------------------------------------------------------------
 
-export type DeskTab = "depth" | "tape" | "futures" | "strategy";
+export type DeskTab = "depth" | "tape" | "risk" | "futures" | "strategy";
 
 function Tabs({ tabs, tab, onTab }: { tabs: [DeskTab, string][]; tab: DeskTab; onTab: (t: DeskTab) => void }) {
   return (
@@ -532,12 +623,13 @@ function Tabs({ tabs, tab, onTab }: { tabs: [DeskTab, string][]; tab: DeskTab; o
   );
 }
 
-export function BookPanel(p: { symbol: string | null; tick: number; tab: DeskTab; onTab: (t: DeskTab) => void; onPrice: (price: number, side: "BUY" | "SELL") => void; onMarket: (side: "BUY" | "SELL") => void }) {
-  const tab = p.tab === "tape" ? "tape" : "depth";
+export function BookPanel(p: { symbol: string | null; tick: number; lot?: number; tab: DeskTab; onTab: (t: DeskTab) => void; onPrice: (price: number, side: "BUY" | "SELL") => void; onMarket: (side: "BUY" | "SELL") => void }) {
+  const tab = p.tab === "tape" || p.tab === "risk" ? p.tab : "depth";
   return (
     <>
-      <Tabs tabs={[["depth", "DOM / Depth"], ["tape", "Time & Sales"]]} tab={tab} onTab={p.onTab} />
-      {tab === "depth" ? <DepthPanel symbol={p.symbol} tick={p.tick} onPrice={p.onPrice} onMarket={p.onMarket} /> : <TapePanel symbol={p.symbol} />}
+      <Tabs tabs={[["depth", "DOM / Depth"], ["tape", "Time & Sales"], ["risk", "Risk"]]} tab={tab} onTab={p.onTab} />
+      {tab === "depth" ? <DepthPanel symbol={p.symbol} tick={p.tick} onPrice={p.onPrice} onMarket={p.onMarket} />
+        : tab === "tape" ? <TapePanel symbol={p.symbol} /> : <RiskPanel symbol={p.symbol} tick={p.tick} lot={p.lot || 1} />}
     </>
   );
 }

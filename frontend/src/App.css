@@ -3178,7 +3178,19 @@ a.news-title:hover { color: var(--accent); text-decoration: underline; }
 .news-tk { padding: 0 5px; color: var(--cyan); text-decoration: none; }
 .news-tk:hover { color: var(--accent); }
 .news-tk.on { border-color: var(--cyan); background: var(--cyan-bg); }
+.risk-desk { display: flex; flex-direction: column; gap: 6px; }
+.risk-inputs { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 12px; }
+.risk-inputs input { width: 80px; }
+.risk-table { width: 100%; font-size: 12px; border-collapse: collapse; }
+.risk-table td { padding: 2px 4px; border-bottom: 1px solid var(--border); }
+.risk-table td:last-child { text-align: right; }
 .news-tone { font-size: 10px; line-height: 1; }
+.news-tk.text { opacity: 0.75; border-style: dashed; }
+.news-widget-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.news-extract-srcs { margin-bottom: 8px; font-size: 12px; }
+.news-extract-srcs summary { cursor: pointer; color: var(--text-dim); }
+.news-stock-tools { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 6px; }
+.news-stock-tools input { flex: 1 1 110px; min-width: 0; }
 .news-tone.pos, .news-stat .pos, .news-stocks .pos { color: var(--green); }
 .news-tone.neg, .news-stat .neg, .news-stocks .neg { color: var(--red); }
 .news-figures { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin: 4px 0 6px; }
