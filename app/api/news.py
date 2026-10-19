@@ -118,13 +118,14 @@ def _text_stocks(rows: list, ext: dict) -> dict[str, list[str]]:
     """Stocks named in the article text (its first 2,000 characters, as the chart button reads it) for headlines
     that name none themselves. Cached per article, so each one is scanned once."""
     want = [r for r in rows if (ext.get(r.url) or {}).get("status") in ("done", "duplicate") and ext[r.url]["chars"]
+            and nw.SOURCE_GROUPS.get(r.source) != nw.GLOBAL   # world news: an Indian name there is a passing mention
             and not nt.tag(r.title, r.summary)["tickers"]]
     todo = [r.url for r in want if (r.url, ext[r.url]["chars"]) not in _TEXT_STOCKS][:TEXT_STOCKS_PER_CALL]
     if todo:
         if len(_TEXT_STOCKS) > 50_000:                  # ponytail: wholesale reset, an LRU if this ever churns
             _TEXT_STOCKS.clear()
         for u, e in nw.lookup(todo, nw.news_wire.scrape_db).items():
-            _TEXT_STOCKS[(u, e["chars"] or 0)] = nt.find("", None, e.get("text"))[:3]
+            _TEXT_STOCKS[(u, e["chars"] or 0)] = nt.text_stocks(e.get("text"))
     return {r.url: got for r in want if (got := _TEXT_STOCKS.get((r.url, ext[r.url]["chars"])))}
 
 

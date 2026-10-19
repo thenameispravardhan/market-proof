@@ -281,7 +281,7 @@ def _index() -> _Index:
     return ix
 
 
-def _scan(text: str, ix: _Index, lenient: bool = False) -> list[str]:
+def _scan(text: str, ix: _Index, lenient: bool = False, short_caps: bool = True) -> list[str]:
     raw = _WORD.findall(text)
     keys = [_key(w) for w in raw]
     letters = [c for c in text if c.isalpha()]
@@ -301,7 +301,7 @@ def _scan(text: str, ix: _Index, lenient: bool = False) -> list[str]:
             w, k = raw[i], keys[i]
             if k in ix.single and (lenient or w[0].isupper()):
                 hit = ix.single[k]
-            elif k in ix.caps and ((w.isupper() and not shouting) or (lenient and w.lower() not in COMMON)):
+            elif k in ix.caps and (short_caps or len(w) > 2) and ((w.isupper() and not shouting) or (lenient and w.lower() not in COMMON)):
                 hit = ix.caps[k]
         if hit and hit not in out:
             out.append(hit)
@@ -483,6 +483,16 @@ def find(title: str, summary: Optional[str] = None, text: Optional[str] = None) 
         return out[:6]
     except Exception:  # noqa: BLE001
         log.exception("news_tags.find_failed", title=title[:120])
+        return []
+
+
+def text_stocks(text: Optional[str]) -> list[str]:
+    """Stocks an article's lead (first 2,000 characters) names, for a headline that names none. Stricter than a
+    headline: a two-letter capital word is prose there ("the IT sector"), not a ticker. At most three."""
+    try:
+        return _scan(_prose((text or "")[:2000]), _index(), short_caps=False)[:3]
+    except Exception:  # noqa: BLE001
+        log.exception("news_tags.text_stocks_failed")
         return []
 
 
