@@ -23,14 +23,8 @@ data/*
 # the code or the filter has no caps on the server.
 !data/mcap.csv
 *.db
-*.db-wal
-*.db-shm
 *.sqlite
 *.sqlite3
-
-# Scraper: downloaded media/files are copies of other sites' content, never commit them
-scraper/files/
-scraper/.venv/
 
 # Local env (ignore every .env variant except the committed template)
 .env
@@ -118,5 +112,4 @@ dump_memory.py
 # Pitch decks for the submission video — presentation aids, not project code.
 pitch.html
 pitch2.html
-pitch3.html
 .claude/
