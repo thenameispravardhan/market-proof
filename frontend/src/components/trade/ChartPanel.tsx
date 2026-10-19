@@ -27,6 +27,7 @@
 // other display time zones are applied by the formatters. The same shift
 // is undone when paging older history from the API.
 
+import { pointValue } from "../../lib/contract";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import {
@@ -4179,7 +4180,7 @@ export default function ChartPanel(props: ChartPanelProps) {
         const pnlEl = el.querySelector<HTMLElement>(".pnl");
         const at = k === "entry" ? ltp : price;
         if (pnlEl && at != null) {
-          const pnl = (at - showPos.avg) * showPos.qty;
+          const pnl = (at - showPos.avg) * showPos.qty * pointValue(symbol);
           const pct = ((at - showPos.avg) / showPos.avg) * 100 * Math.sign(showPos.qty);
           const ticks = Math.round(((at - showPos.avg) / tickRef.current) * Math.sign(showPos.qty));
           const main$ = pctMode ? `${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%` : tickMode ? `${ticks >= 0 ? "+" : ""}${ticks} ticks` : money(pnl);
@@ -6659,7 +6660,9 @@ ${hh ? `${hh}:${String(mm).padStart(2, "0")}` : mm}:${String(ss).padStart(2, "0"
           )}
           {status.kind === "empty" && (
             <div className="chart-status" data-testid="chart-empty">
-              <span>no chart data for this symbol / interval</span>
+              <span>{isDerivative(symbol)
+                ? "no trades in this contract yet — weekly and far-month contracts often have none; open the near-month future"
+                : "no chart data for this symbol / interval"}</span>
               <button type="button" className="chart-retry" onClick={() => setReloadNonce((n) => n + 1)} data-testid="chart-retry">↻ Retry</button>
             </div>
           )}

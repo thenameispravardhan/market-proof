@@ -571,7 +571,9 @@ class PaperBackend:
         realised_pnl: Optional[float] = None
         if old_qty != 0 and (old_qty > 0) != (signed > 0):
             closed = min(abs(old_qty), qty)
-            realised_pnl = (float(fill_price) - old_avg) * closed * (1 if old_qty > 0 else -1)
+            from app.services.crypto import point_value
+
+            realised_pnl = (float(fill_price) - old_avg) * closed * (1 if old_qty > 0 else -1) * point_value(sym)
         # Persist the fill on the trade row.
         await asyncio.get_running_loop().run_in_executor(
             None, _update_trade_filled,

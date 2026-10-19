@@ -150,7 +150,9 @@ class Position:
 
     def mark_to_market(self, last_price: float) -> None:
         self.last_price = float(last_price)
-        self.unrealized_pnl = (float(last_price) - self.average_price) * self.quantity
+        from app.services.crypto import point_value   # 1 for Indian instruments; a crypto contract in rupees
+
+        self.unrealized_pnl = (float(last_price) - self.average_price) * self.quantity * point_value(self.symbol)
         self.updated_at = datetime.now(timezone.utc)
 
 

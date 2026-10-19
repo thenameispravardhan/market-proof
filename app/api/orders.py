@@ -99,20 +99,26 @@ async def _fyers_quote(db: Session, sym: str) -> Optional[dict[str, Any]]:
 
 
 
-# MCX / currency / crypto are on the Trade page for charts, quotes and order flow only: crypto can't be routed
-# through Fyers, and MCX / currency P&L needs each contract's multiplier (gold quotes per 10 g against a 1 kg
-# lot), which the scrip master doesn't carry, so paper fills and the app's SL / target would be mis-sized.
-UNTRADABLE_REASON = "charts and data only for now — MCX, currency and crypto orders aren't enabled"
-
-
-def tradable_market(symbol: str) -> bool:
+# MCX / currency / crypto trade on the Paper account only: crypto has no Fyers route, and live MCX / currency
+# would have to convert our quoted-unit lots (GOLD 1 lot = 100) to Fyers' lots (GOLD 1 lot = 1) first.
+def market_problem(symbol: str, quantity: int, paper: bool) -> Optional[str]:
+    """Why an MCX / currency / crypto order can't be sent, or None (also None for every other symbol)."""
+    from app.services import crypto
     from app.services.instrument_master import get_master
 
     s = symbol.strip().upper()
-    if s.startswith(("CRYPTO:", "MCX:")):
-        return False
     inst = get_master().get(s)
-    return not (inst is not None and inst.segment == "CD")
+    if not (crypto.is_crypto(s) or s.startswith("MCX:") or (inst is not None and inst.segment == "CD")):
+        return None
+    if not paper:
+        return f"{s}: MCX, currency and crypto trade on the Paper account only for now — switch the ticket to Paper"
+    if inst is None or not inst.lot_size:
+        return f"{s}: its contract size isn't on file, so paper P&L couldn't be valued — not sent"
+    if inst.lot_size > 1 and quantity % inst.lot_size:
+        return (f"quantity {quantity} isn't a whole number of lots for {s} (1 lot = {inst.lot_size}) "
+                f"— use a multiple of {inst.lot_size}")
+    return None
+
 
 def _bus_quote_is_fresh(q: Quote) -> bool:
     """True when a bus quote is recent enough to serve as-is.
@@ -289,8 +295,11 @@ async def place_order(
         raise HTTPException(status_code=422, detail="symbol is required")
     if symbol.endswith("-INDEX"):
         raise HTTPException(status_code=422, detail=f"{symbol} is an index — it can't be traded; use its future or an option")
-    if not tradable_market(symbol):
-        raise HTTPException(status_code=422, detail=f"{symbol}: {UNTRADABLE_REASON}")
+    from app.api import practice as _practice
+
+    market = market_problem(symbol, quantity, account_id == _practice.PRACTICE_ACCOUNT_ID)
+    if market:
+        raise HTTPException(status_code=422, detail=market)
     if quantity <= 0:
         raise HTTPException(status_code=422, detail="quantity must be > 0")
     # Fyers v3 price requirements by type:
@@ -1067,6 +1076,17 @@ async def get_quote(
             "source": "bus",
             "as_of": cached.timestamp.isoformat(),
         }
+
+    from app.services import crypto
+
+    if crypto.is_crypto(sym):                    # Binance REST snapshot until the live stream has the pair
+        snap = (await crypto.quotes([sym])).get(sym)
+        if snap is None:
+            return {"ok": False, "symbol": sym, "reason": "no crypto quote from Binance right now"}
+        await md.publish(sym, snap["ltp"], bid=snap["bid"], ask=snap["ask"], change=snap["change"],
+                         change_pct=snap["change_pct"], extra={"source": "binance"})
+        return {"ok": True, "symbol": sym, "last_price": snap["ltp"], "bid": snap["bid"], "ask": snap["ask"],
+                "volume": None, "source": "binance", "as_of": datetime.now(timezone.utc).isoformat()}
 
     # 1. Real-time exchange price via Fyers (preferred when connected).
     fy = await _fyers_quote(db, sym)

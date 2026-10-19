@@ -346,6 +346,14 @@ async def market_history(
     }
 
 
+@router.get("/api/market/fx")
+def market_fx() -> dict[str, Any]:
+    """What a crypto contract is worth: coins per 1 qty, and the USD/INR rate its P&L is booked at."""
+    from app.services import crypto
+
+    return {"usd_inr": crypto.USD_INR["rate"], "as_of": crypto.USD_INR["at"] or None, "units": crypto.UNIT}
+
+
 @router.get("/api/market/quotes")
 async def market_quotes(symbols: str = "") -> dict[str, Any]:
     """Watchlist: last price / change / % for up to 50 comma-separated

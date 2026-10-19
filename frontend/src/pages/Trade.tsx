@@ -274,14 +274,13 @@ const DEFAULT_DOCK: DockId[] = ["watch", "trade"];
 const CURRENCY = /^(NSE|BSE):(USDINR|EURINR|GBPINR|JPYINR|EURUSD|GBPUSD|USDJPY)/;
 /** Why a symbol can't be ordered from the ticket, or null. MCX / currency / crypto are charts and data only:
  *  crypto can't route through Fyers, and MCX / currency P&L needs contract multipliers the master lacks. */
-export function untradable(sym: string, name = sym): string | null {
+export function untradable(sym: string, name = sym, paper = false): string | null {
   const s = sym.toUpperCase();
   if (s.endsWith("-INDEX")) return `${name} is an index — it can't be bought or sold. Open its future or an option to trade.`;
-  if (s.startsWith("CRYPTO:")) return `${name} is crypto from Binance's public feed — charts, quotes and order flow only; it can't be traded here.`;
-  if (s.startsWith("MCX:") || CURRENCY.test(s)) return `${name}: MCX and currency are charts, quotes and order flow only for now — orders aren't enabled.`;
+  if (!paper && (s.startsWith("CRYPTO:") || s.startsWith("MCX:") || CURRENCY.test(s)))
+    return `${name}: MCX, currency and crypto trade on the Paper account only — switch the top bar to Paper.`;
   return null;
 }
-const tradable = (sym: string) => untradable(sym) === null;
 
 // Multi-chart layouts (TradingView-style). Click a chart to make it the
 // active one: it follows the watchlist / search and drives the ticket.
@@ -886,6 +885,7 @@ export default function Trade() {
     try { tabLocal.setItem("trade:practice", JSON.stringify(on)); } catch { /* best-effort */ }
   };
   const accountId: number | null = practice ? -1 : account?.id ?? null;
+  const tradable = (sym: string) => untradable(sym, sym, practice) === null;
   // Why this page can't place orders, in words the operator can act on.
   // The Dashboard's Fyers switch governs the bot only; this page has its own.
   const noAccountReason: string | null = account || practice ? null
@@ -1383,7 +1383,7 @@ export default function Trade() {
     lotSize: selected && selected.lot_size > 1 ? selected.lot_size : 1,
     limit: limitNum, stop: stopNum, ltp: ltp ?? null, entry: estPrice ?? null, sl: slAbs, tp: tpAbs,
   };
-  const problem = !selected ? "Pick a symbol." : !tradable(selected.symbol) ? untradable(selected.symbol, selected.short_name)! : !accountId ? noAccountReason
+  const problem = !selected ? "Pick a symbol." : !tradable(selected.symbol) ? untradable(selected.symbol, selected.short_name, practice)! : !accountId ? noAccountReason
     : lotUnknown ? "Lot size unknown for this contract." : ticketProblem(check);
   const canSubmit = problem == null;
   const ticketWarn = canSubmit ? ticketWarning(check) : null;
@@ -1877,7 +1877,7 @@ export default function Trade() {
                     {!practice && <TicketModeBadge account={account} botMode={botMode} />}
                   </h2>
                   {selected && !tradable(selected.symbol) ? (
-                    <div className="hint" data-testid="ticket-index">{untradable(selected.symbol, selected.short_name)}</div>
+                    <div className="hint" data-testid="ticket-index">{untradable(selected.symbol, selected.short_name, practice)}</div>
                   ) : (<>
                   {!account && noAccountReason && (
                     <div className="hint warn-text" data-testid="ticket-mode-note">{noAccountReason}</div>

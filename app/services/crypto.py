@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any, Callable
 
@@ -36,6 +37,37 @@ PAIRS: dict[str, tuple[float, str]] = {
     "PAXGUSDT": (0.01, "PAX Gold (1 token = 1 troy oz of gold)"),
 }
 
+# Paper contract per 1 qty, in coins (positions are whole numbers): ~$5-100 of each, so small sizes work.
+UNIT: dict[str, float] = {
+    "BTCUSDT": 0.001, "ETHUSDT": 0.01, "BNBUSDT": 0.01, "SOLUSDT": 0.1, "XRPUSDT": 10, "DOGEUSDT": 100,
+    "ADAUSDT": 10, "TRXUSDT": 100, "AVAXUSDT": 1, "LINKUSDT": 1, "DOTUSDT": 1, "LTCUSDT": 0.1, "BCHUSDT": 0.01,
+    "SHIBUSDT": 1_000_000, "NEARUSDT": 1, "UNIUSDT": 1, "SUIUSDT": 1, "PEPEUSDT": 1_000_000, "PAXGUSDT": 0.01,
+}
+# Prices are USDT; P&L is booked in rupees at this rate: the near-month NSE USDINR future, refreshed from Fyers
+# every 5 min. ponytail: seeded with its 2026-10-19 price until the first refresh lands.
+USD_INR: dict[str, float] = {"rate": 95.05, "at": 0.0}
+
+
+def point_value(symbol: str) -> float:
+    """Rupees per 1-point move per 1 qty: 1 for every Indian instrument (qty is in the quoted unit, MCX and
+    currency lots included); a crypto contract's coins x USD/INR."""
+    if not is_crypto(symbol):
+        return 1.0
+    return UNIT.get(pair(symbol), 1.0) * USD_INR["rate"]
+
+
+async def refresh_usd_inr() -> None:
+    from app.api.market import fyers_quotes
+    from app.services.instrument_master import get_master
+
+    fut = next((i for i in get_master().search("USDINR", limit=10) if i.instrument_type == "FUT"), None)
+    if fut is None:
+        return
+    q = (await fyers_quotes([fut.symbol])).get(fut.symbol.upper())
+    if q is not None and q.last_price and 50 < q.last_price < 200:
+        USD_INR.update(rate=float(q.last_price), at=time.time())
+
+
 # Fyers chart resolution -> (Binance interval, how many of them make one candle). Binance has no 2 / 10 / 20 /
 # 45 / 180-minute candles: those are built from smaller ones on the same UTC grid the chart uses for crypto.
 INTERVALS: dict[str, tuple[str, int]] = {
@@ -45,6 +77,10 @@ INTERVALS: dict[str, tuple[str, int]] = {
 }
 PAGE = 1000          # Binance's max klines per call
 MAX_PAGES = 20       # 20,000 base candles per request; the chart pages further back on its own
+STEP = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "4h": 14400, "1d": 86400}
+CACHE_PAGES = 200    # ~120 KB each: closed pages are history, they never change
+_pages: "OrderedDict[tuple[str, str, int], list[tuple]]" = OrderedDict()
+_client: httpx.AsyncClient | None = None
 
 
 def is_crypto(symbol: str | None) -> bool:
@@ -56,37 +92,52 @@ def pair(symbol: str) -> str:
 
 
 async def _get(path: str, params: dict[str, Any]) -> Any:
-    async with httpx.AsyncClient(timeout=15.0) as c:
-        r = await c.get(f"{REST}/{path}", params=params)
-        r.raise_for_status()
-        return r.json()
+    global _client
+    if _client is None or _client.is_closed:          # one kept-alive connection: no TLS handshake per page
+        _client = httpx.AsyncClient(timeout=15.0, limits=httpx.Limits(max_connections=8))
+    r = await _client.get(f"{REST}/{path}", params=params)
+    r.raise_for_status()
+    return r.json()
+
+
+async def _page(p: str, iv: str, w0: int) -> list[tuple]:
+    """One aligned window of PAGE candles from w0 (epoch s): (t, o, h, l, c, v, taker_buy). Cached once closed."""
+    key = (p, iv, w0)
+    if key in _pages:
+        _pages.move_to_end(key)
+        return _pages[key]
+    span = STEP[iv] * PAGE
+    rows = await _get("klines", {"symbol": p, "interval": iv, "startTime": w0 * 1000,
+                                 "endTime": (w0 + span) * 1000 - 1, "limit": PAGE})
+    out = [(int(r[0]) // 1000, *(float(r[i]) for i in (1, 2, 3, 4, 5, 9))) for r in rows]
+    if w0 + span < time.time() - STEP[iv]:             # every candle in it has closed
+        _pages[key] = out
+        while len(_pages) > CACHE_PAGES:
+            _pages.popitem(last=False)
+    return out
 
 
 async def klines(symbol: str, res: str, from_ts: int, to_ts: int) -> list[list[float]]:
     """[t, open, high, low, close, volume, taker_buy_volume] per candle in [from_ts, to_ts] (epoch s), oldest first.
-    Walks back from `to_ts`, so a range over MAX_PAGES drops its oldest end, never the newest."""
+    Fetched as aligned PAGE-candle windows in parallel; a range over MAX_PAGES drops its oldest end, never the newest."""
     if res not in INTERVALS:
         raise ValueError(f"{res} candles aren't available for crypto: pick minutes (1-240) or D")
     if pair(symbol) not in PAIRS:
         raise ValueError(f"{symbol} is not a listed crypto pair")
     iv, k = INTERVALS[res]
-    pages: list[list] = []
-    end = to_ts * 1000
-    for _ in range(MAX_PAGES):
-        page = await _get("klines", {"symbol": pair(symbol), "interval": iv, "endTime": end, "limit": PAGE})
-        if not page:
-            break
-        pages.append(page)
-        if page[0][0] <= from_ts * 1000 or len(page) < PAGE:
-            break
-        end = page[0][0] - 1
+    win = STEP[iv] * PAGE
+    starts = list(range(from_ts - from_ts % win, to_ts + 1, win))[-MAX_PAGES:]   # aligned windows, newest kept
+    sem = asyncio.Semaphore(8)
+
+    async def one(w0: int) -> list[tuple]:
+        async with sem:
+            return await _page(pair(symbol), iv, w0)
+    pages = await asyncio.gather(*(one(w) for w in starts))          # in parallel, not page after page
     span = 86400 if res == "D" else int(res) * 60
     out: list[list[float]] = []
-    for row in (x for p in reversed(pages) for x in p):
-        t = int(row[0]) // 1000
+    for t, o, h, l, c, v, tb in (x for p in pages for x in p):
         if t < from_ts or t > to_ts:
             continue
-        o, h, l, c, v, tb = (float(row[i]) for i in (1, 2, 3, 4, 5, 9))
         b = t - t % span if k > 1 else t
         if out and out[-1][0] == b:                    # a smaller candle of the same bucket
             last = out[-1]
@@ -99,7 +150,7 @@ async def klines(symbol: str, res: str, from_ts: int, to_ts: int) -> list[list[f
 
 
 async def quotes(symbols: list[str]) -> dict[str, dict[str, Any]]:
-    """{symbol: {ltp, change, change_pct}} for the listed pairs among `symbols`; {} on a Binance failure."""
+    """{symbol: {ltp, change, change_pct, bid, ask}} for the listed pairs among `symbols`; {} on a Binance failure."""
     want = [s for s in symbols if is_crypto(s) and pair(s) in PAIRS]
     if not want:
         return {}
@@ -109,7 +160,9 @@ async def quotes(symbols: list[str]) -> dict[str, dict[str, Any]]:
         log.warning("crypto.quotes_failed", error=str(e)[:200])
         return {}
     return {PREFIX + r["symbol"]: {"ltp": float(r["lastPrice"]), "change": float(r["priceChange"]),
-                                    "change_pct": float(r["priceChangePercent"])} for r in rows}
+                                    "change_pct": float(r["priceChangePercent"]),
+                                    "bid": float(r["bidPrice"]) if r.get("bidPrice") else None,
+                                    "ask": float(r["askPrice"]) if r.get("askPrice") else None} for r in rows}
 
 
 class Feed:
@@ -124,37 +177,51 @@ class Feed:
         self.tk: dict[str, dict[str, float]] = {}
         self.last_pub: dict[str, float] = {}
 
-    async def run(self, watched: Callable[[], list[str]]) -> None:
+    async def run(self, watched: Callable[[], list[str]], market_data: Any) -> None:
+        """Ticks go into the shared market-data cache like Fyers ticks: the chart (via its /ws relay), paper fills,
+        resting paper orders and the paper SL / target watcher all read them there."""
         import websockets
 
-        from app.services.event_bus import event_bus
+        fx_at = [0.0]
+
+        async def publish(p: dict[str, Any]) -> None:
+            await market_data.publish(p["symbol"], p["last_price"], bid=p["bid"], ask=p["ask"], volume=p["volume"],
+                                      change=p["change"], change_pct=p["change_pct"], prev_close=p["prev_close"],
+                                      extra={"source": "binance"})
+            if time.monotonic() - fx_at[0] > 300:      # crypto on screen: keep the rupee rate fresh
+                fx_at[0] = time.monotonic()
+                asyncio.get_running_loop().create_task(refresh_usd_inr())
 
         def want_now() -> frozenset[str]:
             return frozenset(pair(s).lower() for s in watched() if is_crypto(s) and pair(s) in PAIRS)
 
+        streams = lambda ps: [f"{p}@{s}" for p in sorted(ps) for s in ("aggTrade", "ticker")]  # noqa: E731
         while True:
             want = want_now()
             if not want:
-                await asyncio.sleep(2)
+                await asyncio.sleep(0.5)
                 continue
             try:
-                url = WS + "/".join(f"{p}@aggTrade/{p}@ticker" for p in sorted(want))
-                async with websockets.connect(url, open_timeout=10, ping_interval=20) as ws:
-                    self.cum = {}
-                    checked = time.monotonic()
+                async with websockets.connect(WS + "/".join(streams(want)), open_timeout=10, ping_interval=20) as ws:
+                    self.cum, n, checked = {}, 0, time.monotonic()
                     while True:
                         try:
-                            raw = await asyncio.wait_for(ws.recv(), 2)
+                            raw = await asyncio.wait_for(ws.recv(), 0.5)
                         except asyncio.TimeoutError:
                             raw = None
-                        if time.monotonic() - checked >= 2:
-                            checked = time.monotonic()
-                            if want_now() != want:
-                                break                  # pairs on screen changed: reconnect with the new set
+                        if time.monotonic() - checked >= 0.5:      # a pair opened / closed on screen: change the
+                            checked, now = time.monotonic(), want_now()   # subscription on this socket, no reconnect
+                            for method, ps in (("SUBSCRIBE", now - want), ("UNSUBSCRIBE", want - now)):
+                                if ps:
+                                    n += 1
+                                    await ws.send(json.dumps({"method": method, "params": streams(ps), "id": n}))
+                            want = now
+                            if not want:
+                                break
                         if raw:
                             payload = self.on_message(json.loads(raw))
-                            if payload:
-                                await event_bus.publish("quotes", payload)
+                            if payload and payload["last_price"] is not None:
+                                await publish(payload)
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001 — a dropped stream reconnects

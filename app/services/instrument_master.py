@@ -173,6 +173,10 @@ def _parse_expiry(s: str) -> Optional[datetime]:
 
 def _format_display(i: Instrument) -> str:
     """Human-friendly label for the search dropdown."""
+    if i.exchange == "CRYPTO":
+        from app.services.crypto import UNIT
+
+        return f"{i.short_name}  ·  1 qty = {UNIT.get(i.short_name, 1):g} {i.short_name[:-4]}"
     if i.instrument_type == "EQ":
         return f"{i.short_name}  ·  {i.exchange}:{i.segment}"
     if i.instrument_type in ("CE", "PE"):
@@ -261,6 +265,8 @@ def _fyers_csv_row_to_instrument(row: list[str]) -> Optional[Instrument]:
     elif expiry is not None:
         # col 11 is Fyers' segment code: 20 = MCX commodity, 12 = currency (NSE_CD), 11 = equity F&O
         itype, seg = "FUT", _SEGMENT_CODES.get((row[11] or "").strip(), "FO")
+        if seg in ("COM", "CD"):
+            lot = UNIT_LOTS.get(short, 0)
     else:
         itype, seg = "EQ", "EQ"
     return Instrument(
@@ -278,6 +284,15 @@ def _fyers_csv_row_to_instrument(row: list[str]) -> Optional[Instrument]:
 
 
 _SEGMENT_CODES = {"20": "COM", "12": "CD"}
+# MCX / currency: Fyers' master counts lots (GOLD lot = 1), but the price is per 10 g / per barrel / per USD.
+# Here a lot is counted in the QUOTED unit, like an NSE lot (NIFTY = 75), so P&L = price move x qty everywhere:
+# GOLD 1 kg = 100 x 10 g. A contract missing here gets lot 0: its orders are refused, never mis-sized.
+# ponytail: exchange contract specs, revised now and then; check the MCX / NSE spec sheet when one changes.
+UNIT_LOTS = {"GOLD": 100, "GOLDM": 10, "GOLDGUINEA": 1, "GOLDPETAL": 1, "SILVER": 30, "SILVERM": 5, "SILVERMIC": 1,
+             "CRUDEOIL": 100, "CRUDEOILM": 10, "NATURALGAS": 1250, "NATGASMINI": 250, "COPPER": 2500,
+             "ZINC": 5000, "ZINCMINI": 1000, "LEAD": 5000, "LEADMINI": 1000, "ALUMINIUM": 5000, "ALUMINI": 1000,
+             "USDINR": 1000, "EURINR": 1000, "GBPINR": 1000, "JPYINR": 1000}   # JPYINR quotes per 100 yen
+_WEEKLY_FUT = re.compile(r"\d{2}[A-Z]\d{2}FUT$")      # NSE:USDINR26O23FUT (weekly) vs NSE:USDINR26OCTFUT (monthly)
 
 
 # Fyers publishes a daily scrip-master CSV per exchange/segment. We pull
@@ -506,8 +521,10 @@ class InstrumentMaster:
 
     def _opt(self, underlying: str, r: tuple[str, float, str, int, int, float]) -> Instrument:
         sym, strike, typ, exp, lot, tick = r
-        return Instrument(symbol=sym, short_name=underlying, exchange=sym.split(":", 1)[0],
-                          segment=self._opt_seg.get(underlying, "FO"),
+        seg = self._opt_seg.get(underlying, "FO")
+        if seg != "FO":
+            lot = UNIT_LOTS.get(underlying, 0)
+        return Instrument(symbol=sym, short_name=underlying, exchange=sym.split(":", 1)[0], segment=seg,
                           instrument_type=typ, lot_size=lot, tick_size=tick, strike=strike,
                           expiry=datetime.fromtimestamp(exp, _IST).replace(tzinfo=None), underlying=underlying)
 
@@ -595,6 +612,14 @@ class InstrumentMaster:
             if not keep(inst):
                 continue
             exact.append(inst)
+
+        # One underlying's futures: monthly before weekly (a weekly currency contract rarely trades: no chart),
+        # nearest expiry first; the other hits keep their places.
+        futs = sorted((i for i in exact if i.instrument_type == "FUT"),
+                      key=lambda i: (bool(_WEEKLY_FUT.search(i.symbol)), i.expiry or datetime.max))
+        if futs:
+            it = iter(futs)
+            exact = [next(it) if i.instrument_type == "FUT" else i for i in exact]
 
         if len(exact) >= limit:
             return exact[:limit]
