@@ -447,7 +447,8 @@ class InstrumentMaster:
                                 inst = _fyers_csv_row_to_instrument(row)
                             else:
                                 inst = _row_to_instrument(row)
-                            if inst is not None:
+                            # "EXCH:TICKER" only: another CSV in the folder (NSE's equity list) is not a master
+                            if inst is not None and ":" in inst.symbol:
                                 self._add(inst)
                 except Exception:  # noqa: BLE001
                     # Bad file — skip; the rest of the master still works.
