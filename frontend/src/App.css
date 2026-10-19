@@ -3227,14 +3227,6 @@ a.news-title:hover { color: var(--accent); text-decoration: underline; }
 .dom-table td.ask:hover { background: rgba(239, 83, 80, 0.18); cursor: pointer; }
 .dom-table td.px { font-family: var(--mono); text-align: center; }
 /* News: two sections. News = the list, full width; Insights = the stats and panels. */
-.news-sections { margin: 4px 0 8px; }
-.news-grid.single { grid-template-columns: minmax(0, 1fr); }
-.news-more-filters { display: inline-block; position: relative; }
-.news-more-filters > summary { cursor: pointer; font-size: 12px; color: var(--text-dim); list-style: none; padding: 2px 8px; border: 1px solid var(--border); border-radius: 12px; }
-.news-more-filters[open] > summary { color: var(--text); border-color: var(--accent); }
-.news-more-filters[open] { display: inline-flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.news-chips-fold { align-self: flex-start; margin: 2px 0 4px; padding: 2px 10px; background: transparent; border: 1px solid var(--border); border-radius: 12px; color: var(--text-dim); font-size: 12px; cursor: pointer; }
-.news-chips-fold:hover { color: var(--text); border-color: var(--border-hi); }
 /* Trade page: the chart toolbar wraps onto a second row instead of scrolling
    sideways (it shares the top bar with Paper / Fyers and the layout controls). */
 .tv-topbar { flex-wrap: wrap; row-gap: 4px; }
@@ -3263,3 +3255,8 @@ a.news-title:hover { color: var(--accent); text-decoration: underline; }
 .dock-panel[data-testid="dock-dom"] .dock-body { overflow: hidden; }
 .dock-body .dom-trade { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
 .dom-trade .dom-ladder { flex: 1 1 auto; min-height: 120px; max-height: none; }
+/* News: one header row (sections left, actions right) and one folding Filters panel. */
+.news-head .news-sections { margin: 0; border-bottom: 0; }
+.news-filters { display: flex; flex-direction: column; gap: 6px; margin: 2px 0 8px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-panel); }
+.news-filters .news-chips { margin: 0; }
+.news-filters .news-keys { margin: 0; }

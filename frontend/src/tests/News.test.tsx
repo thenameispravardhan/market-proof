@@ -19,6 +19,12 @@ const ITEMS = [
 ];
 let puts: unknown[] = [];
 
+/** Open the Filters panel (types, sources, extra switches, shortcuts) once. */
+async function openFilters(): Promise<void> {
+  const b = await screen.findByTestId("news-filters-btn");
+  if (b.getAttribute("aria-expanded") !== "true") fireEvent.click(b);
+}
+
 beforeEach(() => {
   puts = [];
   try { localStorage.removeItem("news:lastSeen"); localStorage.removeItem("news:prefs"); } catch { /* storage off */ }
@@ -53,6 +59,7 @@ describe("News page", () => {
   it("filters by source chip", async () => {
     render(<News />);
     await screen.findByText("TCS board meeting");
+    await openFilters();   // types, sources and the extra switches sit in the Filters panel
     fireEvent.click(screen.getByRole("button", { name: /^BSE/ }));
     expect(screen.queryByText(/wins/)).toBeNull();
     expect(screen.getByText("TCS board meeting")).toBeTruthy();
@@ -157,6 +164,7 @@ describe("News page: fixes and trader shortcuts", () => {
   it("source chip counts leave out muted headlines, like the list does", async () => {
     render(<News />);
     await screen.findByText("TCS board meeting");
+    await openFilters();   // types, sources and the extra switches sit in the Filters panel
     expect(screen.getByRole("button", { name: /^Moneycontrol/ }).textContent).toBe("Moneycontrol 1");   // the horoscope is muted
   });
 
@@ -290,6 +298,7 @@ describe("News page: stocks, stories, kinds and keys", () => {
       ? json({ items: String(input).includes("since_id") ? [] : MIX, max_id: 23 }) : f(input, init))) as unknown as typeof fetch;
     render(<News />);
     await screen.findByText(/T20I/);
+    await openFilters();   // types, sources and the extra switches sit in the Filters panel
     expect(screen.getByRole("button", { name: "Moneycontrol 2" })).toBeTruthy();
     fireEvent.click(screen.getByRole("switch", { name: /Market news only/ }));
     expect(screen.queryByText(/T20I/)).toBeNull();
@@ -323,6 +332,7 @@ describe("News page: stocks, stories, kinds and keys", () => {
     expect(within(tcs).getByLabelText("TCS chart").getAttribute("href")).toMatch(/symbol=NSE%3ATCS-EQ.*&at=\d+/);
     expect(within(tcs).getByText("Orders")).toBeTruthy();
     expect(within(tcs).getByRole("button", { name: /chart/ })).toBeTruthy();          // tagged: can still look again
+    await openFilters();   // types, sources and the extra switches sit in the Filters panel
     const kinds = screen.getByTestId("news-kinds");
     expect([...kinds.querySelectorAll("button")].map((b) => b.textContent)).toEqual(["Results 2", "Orders 1", "Stake / M&A 1", "Markets 1"]);
     fireEvent.click(within(kinds).getByRole("button", { name: /^Orders/ }));
@@ -347,7 +357,7 @@ describe("News page: stocks, stories, kinds and keys", () => {
     expect(first.getAttribute("title")).toContain("Moneycontrol 1");
     fireEvent.click(screen.getByTestId("news-section-news"));   // back to the list
 
-    screen.getByText("More filters").closest("details")!.open = true;   // the extra filters fold away
+    await openFilters();   // the extra switches sit in the Filters panel
     fireEvent.click(screen.getByRole("switch", { name: /2\+ sources/ }));
     expect(screen.queryByText(/TCS bags/)).toBeNull();
     expect(screen.getByText(/Reliance Q2 net profit/)).toBeTruthy();
@@ -368,7 +378,7 @@ describe("News page: stocks, stories, kinds and keys", () => {
     expect(ril.className).toContain("hit");
     const tcs = screen.getByText(/TCS bags/).closest("article")!;
     expect(tcs.className).not.toContain("hit");
-    screen.getByText("More filters").closest("details")!.open = true;   // the extra filters fold away
+    await openFilters();   // the extra switches sit in the Filters panel
     fireEvent.click(screen.getByRole("switch", { name: /Watchlist only/ }));
     expect(screen.queryByText(/TCS bags/)).toBeNull();
     fireEvent.click(screen.getByTestId("news-settings-btn"));

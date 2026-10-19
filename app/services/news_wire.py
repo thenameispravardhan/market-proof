@@ -58,6 +58,8 @@ DEFAULT_FEEDS: list[dict[str, Any]] = [
     {"source": "Zee Business", "url": "https://www.zeebiz.com/latest.xml", "group": MARKETS},
     {"source": "CNBC-TV18", "url": "https://www.cnbctv18.com/commonfeeds/v1/cne/rss/latest.xml", "group": MARKETS},
     {"source": "CNBC-TV18", "url": "https://www.cnbctv18.com/commonfeeds/v1/cne/rss/market.xml", "group": MARKETS},
+    # CNBC Awaaz (Hindi): same network feed API, site code "cnh" (robots.txt allows "*"); fresh within a minute.
+    {"source": "CNBC Awaaz", "url": "https://hindi.cnbctv18.com/commonfeeds/v1/cnh/rss/latest.xml", "group": MARKETS, "every": 10},
     # ET and BusinessLine: their Google News sitemaps (listed in robots.txt) show a story ~1.5 min after it is
     # published; their section RSS took 8-14 min (ET) and 3-4 min (measured 2026-10-18). A sitemap is the whole site,
     # so "paths" keeps only these sections. Their other RSS feeds still run: a story they carry first is kept there.

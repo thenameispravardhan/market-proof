@@ -37,7 +37,7 @@ interface ExtractStats { handed: number; by_status: Record<string, number>; with
 interface Status { settings: Settings; sources: SourceRow[]; known_sources: string[]; extract?: ExtractStats; lag?: Lag & { fastest: string | null }; collector: { polls: number; last_poll_at: number | null; last_poll_ms: number | null };
   watch_stocks?: Record<string, string[]>; kinds?: [string, string][]; source_groups?: [string, string[]][] }
 interface Prefs { notify: boolean; sound: boolean; compact: boolean; summaries: boolean; window: number; group: boolean; threads: boolean;
-  marketOnly: boolean; sort: "latest" | "top"; region?: "all" | "in" | "global"; section?: "news" | "insights"; chipsHidden?: boolean }
+  marketOnly: boolean; sort: "latest" | "top"; region?: "all" | "in" | "global"; section?: "news" | "insights" }
 /** A list row: a story (its reports from several outlets) and, with Prefs.threads, its stock's earlier stories. */
 interface Row { lead: Item; story: Item[]; earlier: Item[] }
 /** How a story's stock moved since it broke (/api/news/reaction): from the last whole minute before it. */
@@ -277,6 +277,7 @@ export default function News() {
   }, [items, mutedRe]);
 
   const section = prefs.section ?? "news";
+  const nFilters = kindPick.size + picked.size + Number(deep) + Number(watchOnly) + Number(multiOnly) + Number(frozen);
   const globalSrc = useMemo(() => new Set(status?.source_groups?.find(([g]) => g === "Global")?.[1] ?? []), [status?.source_groups]);
   const shown = useMemo(() => {
     const cut = prefs.window ? Date.now() - prefs.window * 3600_000 : 0;
@@ -514,8 +515,12 @@ export default function News() {
   return (
     <div data-testid="news-page">
       <div className="news-head">
-        <h1 className="page-title" style={{ margin: 0 }}>News</h1>
-        <span className={`news-live ${live ? "on" : ""}`} title={live ? "Monitoring" : "Monitoring is off"} />
+        {/* One row: the two sections, then the page actions. */}
+        <div className="tabs news-sections" role="tablist">
+          {([["news", "News"], ["insights", "Insights"]] as const).map(([v, l]) => (
+            <button key={v} type="button" role="tab" aria-selected={section === v} className={`tab${section === v ? " active" : ""}`} onClick={() => setPrefs({ section: v })} data-testid={`news-section-${v}`}>{l}</button>
+          ))}
+        </div>
         {section === "insights" && <span className="text-dim news-meta">
           {live ? <>every {settings!.interval_s}s · {c?.polls ?? 0} polls · last {c?.last_poll_at ? ago(c.last_poll_at * 1000) : "–"} ago{c?.last_poll_ms != null ? ` (${(c.last_poll_ms / 1000).toFixed(1)}s)` : ""}</> : "monitoring is off"}
           {" · monitoring only, never sent to AI analysis"}
@@ -534,12 +539,6 @@ export default function News() {
       )}
       {error && <div className="news-banner danger">Can't reach the server: {error}</div>}
 
-      {/* Two sections: the headlines to read, and the numbers about them. */}
-      <div className="tabs news-sections" role="tablist">
-        {([["news", "News"], ["insights", "Insights"]] as const).map(([v, l]) => (
-          <button key={v} type="button" role="tab" aria-selected={section === v} className={`tab${section === v ? " active" : ""}`} onClick={() => setPrefs({ section: v })} data-testid={`news-section-${v}`}>{l}</button>
-        ))}
-      </div>
 
       {section === "insights" && live && status && (
         <div className="news-stats" data-testid="news-stats">
@@ -577,21 +576,13 @@ export default function News() {
         </span>
         <Toggle size="sm" on={prefs.marketOnly} onChange={(v) => setPrefs({ marketOnly: v })} label="Market news only"
           title="Only headlines that name a listed stock or a news type (results, orders, deals...). The rest stay stored." />
-        <details className="news-more-filters">
-          <summary>More filters</summary>
-          <Toggle size="sm" on={deep} onChange={setDeep} label="In article text" disabled={!settings?.extract}
-            title={settings?.extract ? "Also search the full text the scraper extracted" : "Turn on full text in Settings"} />
-          <Toggle size="sm" on={watchOnly} onChange={setWatchOnly} label="Watchlist only" disabled={!watch.length} title={watch.length ? "" : "Add watchlist words in Settings"} />
-          <Toggle size="sm" on={multiOnly} onChange={setMultiOnly} label="2+ sources" title="Only stories two or more outlets carried" />
-          <Toggle size="sm" on={frozen} onChange={(v) => (v ? setFrozen(true) : unfreeze())} label="Pause list" />
-        </details>
         {stockPick && <button type="button" className="chip on" onClick={() => setStockPick(null)} title="Show every stock again">{tickerName(stockPick)} ×</button>}
         {pending.length > 0 && <button type="button" className="btn-sm primary" onClick={unfreeze}>{pending.length} new ↑</button>}
         {fresh.size > 0 && <button type="button" className="btn-sm" onClick={markSeen}
           title={sinceVisit ? `${sinceVisit} came in since your last visit; clear the NEW badges` : "Clear the NEW badges"}>Mark seen ({fresh.size})</button>}
-        <button type="button" className="btn-sm" onClick={() => setShowKeys((v) => !v)} title="Keyboard shortcuts ( ? )" aria-expanded={showKeys} aria-label="Keyboard shortcuts">⌨</button>
+        <button type="button" className={`btn-sm${showKeys ? " active" : ""}`} onClick={() => setShowKeys((v) => !v)} aria-expanded={showKeys} data-testid="news-filters-btn"
+          title="More filters, news types, sources and keyboard shortcuts ( ? )">{showKeys ? "▴" : "▾"} Filters{nFilters ? ` · ${nFilters}` : ""}</button>
       </div>}
-      {showKeys && <div className="news-keys" data-testid="news-keys">{KEYS.map(([k, d]) => <span key={k}><kbd>{k}</kbd> {d}</span>)}</div>}
 
       {section === "insights" && trending.length > 0 && (
         <div className="news-chips" data-testid="news-trending">
@@ -599,13 +590,17 @@ export default function News() {
           {trending.map(([w, n]) => <button key={w} type="button" className={`chip${q.toLowerCase() === w ? " on" : ""}`} onClick={() => setQ(q.toLowerCase() === w ? "" : w)}>{w} <span className="mono">{n}</span></button>)}
         </div>
       )}
-      {section === "news" && (
-        <button type="button" className="news-chips-fold" onClick={() => setPrefs({ chipsHidden: !prefs.chipsHidden })} aria-expanded={!prefs.chipsHidden} data-testid="news-chips-fold"
-          title={prefs.chipsHidden ? "Show the Type and source filters" : "Hide the Type and source filters"}>
-          {prefs.chipsHidden ? "▾" : "▴"} Type &amp; source filters{kindPick.size + picked.size ? ` · ${kindPick.size + picked.size} picked` : ""}
-        </button>
-      )}
-      {section === "news" && !prefs.chipsHidden && kindOrder.length > 0 && (
+      {/* Filters ▾: the extra switches, news types, sources and the shortcuts, folded into one panel. */}
+      {section === "news" && showKeys && (
+        <div className="news-filters" data-testid="news-filters">
+          <div className="news-chips">
+              <Toggle size="sm" on={deep} onChange={setDeep} label="In article text" disabled={!settings?.extract}
+                title={settings?.extract ? "Also search the full text the scraper extracted" : "Turn on full text in Settings"} />
+              <Toggle size="sm" on={watchOnly} onChange={setWatchOnly} label="Watchlist only" disabled={!watch.length} title={watch.length ? "" : "Add watchlist words in Settings"} />
+              <Toggle size="sm" on={multiOnly} onChange={setMultiOnly} label="2+ sources" title="Only stories two or more outlets carried" />
+              <Toggle size="sm" on={frozen} onChange={(v) => (v ? setFrozen(true) : unfreeze())} label="Pause list" />
+          </div>
+          {kindOrder.length > 0 && (
         <div className="news-chips" data-testid="news-kinds">
           <span className="text-dim news-meta" title="Keyword rules on the headline, not AI">Type</span>
           {kindOrder.map((k) => (
@@ -613,15 +608,18 @@ export default function News() {
           ))}
           {kindPick.size > 0 && <button type="button" className="chip" onClick={() => setKindPick(new Set())}>clear</button>}
         </div>
-      )}
-      {section === "news" && !prefs.chipsHidden && <div className="news-chips">
+          )}
+          <div className="news-chips" data-testid="news-sources">
         {Object.entries(counts.bySource).sort((a, b) => b[1] - a[1]).map(([s, n]) => (
           <button key={s} type="button" className={`chip${picked.has(s) ? " on" : ""}`} onClick={() => togglePick(s)}>{s} <span className="mono">{n}</span></button>
         ))}
         {picked.size > 0 && <button type="button" className="chip" onClick={() => setPicked(new Set())}>clear</button>}
-      </div>}
+          </div>
+          <div className="news-keys" data-testid="news-keys">{KEYS.map(([k, d]) => <span key={k}><kbd>{k}</kbd> {d}</span>)}</div>
+        </div>
+      )}
 
-      <div className={`news-grid${section === "news" ? " single" : ""}`}>
+      <div className="news-grid">
         <div style={{ minWidth: 0 }}>
         {section === "news" && <div className="widget news-headlines">
           <h3>Headlines <span className="mono" style={{ marginLeft: 8, color: "var(--text-faint)" }}
@@ -702,7 +700,7 @@ export default function News() {
           )}
         </div>
 
-        {section === "insights" && <div className="news-side">
+        <div className="news-side">
           {stocksInNews.length > 0 && (
             <div className="widget" data-testid="news-stocks-panel">
               <h3>Stocks in the news</h3>
@@ -728,7 +726,7 @@ export default function News() {
               </div>
             </div>
           )}
-          <div className="widget">
+          {section === "insights" && <div className="widget">
             <h3>Sources</h3>
             <div className="widget-body">
               {bySource.filter(([, s]) => s.enabled).map(([name, s]) => (
@@ -747,7 +745,8 @@ export default function News() {
               )}
             </div>
           </div>
-        </div>}
+          }
+        </div>
       </div>
 
       {showSettings && settings && status && (
