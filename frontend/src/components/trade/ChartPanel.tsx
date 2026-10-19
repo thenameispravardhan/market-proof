@@ -991,6 +991,10 @@ export default function ChartPanel(props: ChartPanelProps) {
   const [hostEl, setHostEl] = useState<HTMLDivElement | null>(null);
   const legendRef = useRef<HTMLSpanElement | null>(null);
   const countdownRef = useRef<HTMLDivElement | null>(null);
+  const ownLabelRef = useRef(false);
+  const syncXRef = useRef(false);
+  const xLabelRef = useRef<HTMLDivElement | null>(null);          // showing another chart's crosshair (vertical line only)
+  const crossLineRef = useRef<Record<string, unknown>>({});
   /** The top toolbar scrolls sideways when narrow; arrows show what's hidden. */
   const toolbarRef = useRef<HTMLDivElement | null>(null);
   const [tbScroll, setTbScroll] = useState({ left: false, right: false });
@@ -2516,6 +2520,23 @@ export default function ChartPanel(props: ChartPanelProps) {
   function onCrosshair(param: MouseEventParams): void {
     const plus = plusRef.current;
     const inMain = (param.paneIndex ?? 0) === 0;
+    // The crosshair's price on the axis, ABOVE our live-price / order / countdown
+    // boxes (the engine draws its own label on the canvas, under them).
+    const xl = xLabelRef.current;
+    if (xl) {
+      const pr = param.point && inMain && hoveredRef.current ? yToPrice(param.point.y) : null;
+      if (pr == null || !param.point) xl.style.display = "none";
+      else {
+        const left = settingsRef.current.scaleSide === "left";
+        xl.textContent = fmtPrice(pr);
+        xl.style.display = "grid";
+        xl.style.top = `${param.point.y - 9}px`;
+        xl.style.width = `${scaleWidth(left ? "left" : "right") || 60}px`;
+        xl.style.left = left ? "0px" : "auto";
+        xl.style.right = left ? "auto" : "0px";
+        xl.style.background = String(crossLineRef.current.labelBackgroundColor ?? "#2a2e39");
+      }
+    }
     if (plus) {
       const pr = param.point && inMain ? yToPrice(param.point.y) : null;
       if (param.point && pr != null) {
@@ -2560,7 +2581,10 @@ export default function ChartPanel(props: ChartPanelProps) {
         repaintDrawings();
       }
     }
-    if (syncRef.current.crosshair) {
+    // Only the chart under the pointer publishes: a synced chart echoing its
+    // programmatic crosshair back pulled the hovered one onto candle closes
+    // (the "magnet" feel).
+    if (syncRef.current.crosshair && hoveredRef.current) {
       const t = param.time == null ? null : (param.time as number);
       cancelAnimationFrame(crossRaf.current);
       crossRaf.current = requestAnimationFrame(() => publishSync({ type: "crosshair", src: myId, time: t }));
@@ -2758,7 +2782,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     rangeRaf.current = requestAnimationFrame(() => {
       updateExtraLines();
       applyRatioLock();
-      if (syncRef.current.time && Date.now() - syncApplyRef.current > 200) {
+      if (syncRef.current.time && hoveredRef.current && Date.now() - syncApplyRef.current > 200) {   // the chart being scrolled leads
         const tr = safe(() => chartRef.current!.timeScale().getVisibleRange());
         if (tr) publishSync({ type: "range", src: myId, from: tr.from as number, to: tr.to as number });
       }
@@ -3534,7 +3558,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     const rawLabel = rawPriceLabelOn();
     const opts: Record<string, unknown> = {
       priceLineVisible: s.lastPriceLine,
-      lastValueVisible: s.lastPriceLabel && !rawLabel,
+      lastValueVisible: s.lastPriceLabel && !rawLabel && !ownLabelRef.current,   // our price + countdown box replaces it
       title: s.symbolNameLabel ? shortName : "",
       priceFormat: { type: "price", precision: prec, minMove: 10 ** -prec },
       priceLineColor: s.lastPriceColor || "",
@@ -3590,6 +3614,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     const lines = cursor === "cross";
     const chColor = s.crosshairColor || c.crosshair;
     const line = { visible: lines, color: chColor, width: s.crosshairWidth, style: s.crosshairStyle, labelBackgroundColor: light ? "#131722" : c.border };
+    crossLineRef.current = line;
     const border = s.scaleLineColor || c.border;
     safe(() =>
       chart.applyOptions({
@@ -4337,10 +4362,18 @@ export default function ChartPanel(props: ChartPanelProps) {
   // Per frame, so it moves WITH the price label instead of catching up a second later.
   useEffect(() => {
     let raf = 0;
+    // One live-price box: while ours (price + countdown) shows, the engine's own label is off.
+    const own = (on: boolean) => {
+      if (ownLabelRef.current === on) return;
+      ownLabelRef.current = on;
+      applyMainStyle();
+    };
     const frame = () => {
       raf = requestAnimationFrame(frame);
       const el = countdownRef.current;
       if (!el) return;
+      if (el.style.display === "none") own(false);
+      else own(true);
       const candles = viewRef.current;
       const s = settingsRef.current;
       if (!s.countdown || !isIntraday(ivRef.current) || candles.length === 0 || statusRef.current !== "ready" || replayRef.current.on) {
@@ -4525,9 +4558,16 @@ ${hh ? `${hh}:${String(mm).padStart(2, "0")}` : mm}:${String(ss).padStart(2, "0"
             safe(() => chart.timeScale().setVisibleRange({ from: e.from as Time, to: e.to as Time }));
           }
         } else if (e.type === "crosshair" && s.crosshair && chart && mainRef.current) {
+          if (hoveredRef.current) return;                   // the pointer is here: this chart leads
           if (e.time === null) {
             safe(() => chart.clearCrosshairPosition());
             return;
+          }
+          // TradingView: the other charts show the TIME only — a vertical line,
+          // no horizontal line or price label (another symbol's price is meaningless here).
+          if (!syncXRef.current) {
+            syncXRef.current = true;
+            safe(() => chart.applyOptions({ crosshair: { horzLine: { visible: false, labelVisible: false } } }));
           }
           const v = viewRef.current;
           if (!v.length) return;
@@ -4559,9 +4599,14 @@ ${hh ? `${hh}:${String(mm).padStart(2, "0")}` : mm}:${String(ss).padStart(2, "0"
     const enter = () => {
       hoveredRef.current = true;
       chartFocus.hover = myId;
+      if (syncXRef.current) {                              // back to the full crosshair under the pointer
+        syncXRef.current = false;
+        safe(() => chartRef.current?.applyOptions({ crosshair: { horzLine: { ...crossLineRef.current, labelVisible: true } } }));
+      }
     };
     const leave = () => {
       hoveredRef.current = false;
+      if (xLabelRef.current) xLabelRef.current.style.display = "none";
       if (chartFocus.hover === myId) chartFocus.hover = null;
       pointerRef.current = null;
       if (replayRef.current.selecting) repaintDrawings();
@@ -6558,6 +6603,7 @@ ${hh ? `${hh}:${String(mm).padStart(2, "0")}` : mm}:${String(ss).padStart(2, "0"
               +
             </button>
           )}
+          <div ref={xLabelRef} className="xhair-px" style={{ display: "none" }} data-testid="xhair-px" />
           {showPlus && <div ref={plusHoldRef} className="plus-hold" style={{ display: "none" }} data-testid="plus-hold"><span className="plus-px" /></div>}
           {ctxEl}
           {tradeFlyEl}

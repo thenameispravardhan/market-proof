@@ -6,7 +6,7 @@
 // click asks for confirmation unless one-click (instant) trading is on.
 
 import { snapLot } from "./levelDrag";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { InstrumentHit } from "../../types";
 import { useLiveQuote } from "../../hooks/useQuotes";
 import { useDepth } from "../../hooks/useDepth";
@@ -107,6 +107,21 @@ export function DomPanel({
   const [vap, setVap] = useState<Map<number, number>>(new Map());
   const [drag, setDrag] = useState<string | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  // As many rows as the ladder's height holds (the "Rows" setting is the minimum).
+  // A callback ref: the ladder only mounts once a real book arrives.
+  const [fitRows, setFitRows] = useState(0);
+  const roRef = useRef<ResizeObserver | null>(null);
+  const ladderRef = useCallback((el: HTMLDivElement | null) => {
+    roRef.current?.disconnect();
+    roRef.current = null;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => {
+      const row = el.querySelector("tbody tr")?.getBoundingClientRect().height || 22;
+      setFitRows(Math.max(0, Math.floor((el.clientHeight - 48) / row) - 1) | 1);   // header + total row; odd: the live price sits in the middle
+    });
+    ro.observe(el);
+    roRef.current = ro;
+  }, []);
   useOutside(menuRef, menu, () => setMenu(false));
   useEffect(() => {
     try {
@@ -159,7 +174,7 @@ export function DomPanel({
   const maxV = Math.max(1, ...vap.values());
   const mid = bestBid != null && bestAsk != null ? (bestBid + bestAsk) / 2 : ltp;
   const center = s.lock ? (ltp != null ? key(ltp) : mid != null ? key(mid) : null) : pinned ?? (mid != null ? key(mid) : null);
-  const rows = center == null ? [] : ladderKeys(center, s.rows, s, {
+  const rows = center == null ? [] : ladderKeys(center, Math.max(s.rows, fitRows), s, {
     bestBid: bestBid != null ? key(bestBid) : null,
     bestAsk: bestAsk != null ? key(bestAsk) : null,
     ltp: ltp != null ? key(ltp) : null,
@@ -243,6 +258,7 @@ export function DomPanel({
         <div className="hint">{d.reason ?? "Depth unavailable."}</div>
       ) : (
         <div
+          ref={ladderRef}
           className="dom-ladder"
           onWheel={(e) => {
             if (center == null || s.lock) return;      // centred: the market moves, not the view
