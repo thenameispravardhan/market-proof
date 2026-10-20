@@ -782,7 +782,7 @@ REGISTRY: dict[str, tuple[Callable[..., Any], dict[str, Any], list[str], str]] =
                    if d.get("expiry_ts") else [None] * len(d["t"]), {}, ["value"], "Time"),
     # India VIX (%), the market's 30-day implied volatility, beside any symbol:
     # "sell premium only when VIX > 14", or IV rank = VIX on the daily
-    # timeframe with the rank transform over ~250 bars.
+    # timeframe with the rank transform over ~200 bars (live keeps about a year of daily candles).
     "VIX":        (lambda d: vix_level(d), {}, ["value"], "Volatility"),
 }
 
@@ -848,7 +848,7 @@ ABOUT: dict[str, str] = {
     "DTE": "calendar days to the strategy's expiry (options: its weekly / monthly; else the monthly); "
            "expiry day = DTE < 1",
     "VIX": "India VIX %, the market's 30-day implied volatility, beside any symbol (use tf 1440 + the rank "
-           "transform for IV rank)",
+           "transform over ~200 for IV rank)",
 }
 
 

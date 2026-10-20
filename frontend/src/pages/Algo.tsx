@@ -68,7 +68,7 @@ const TRANSFORMS: [string, string, string][] = [
   ["sma", "average", "simple average of the last N bars"],
   ["zscore", "z-score", "standard deviations from its N-bar average"],
   ["abs", "absolute", "the value without its sign"],
-  ["rank", "rank 0-100", "where it sits between its lowest (0) and highest (100) of the last N bars — IV rank = VIX on daily with this over ~250"],
+  ["rank", "rank 0-100", "where it sits between its lowest (0) and highest (100) of the last N bars — IV rank = VIX on daily with this over ~200 (live keeps about a year of daily candles)"],
   ["percentile", "percentile", "% of the previous N bars that were below it — IV percentile"],
 ];
 const MATH_OPS: [string, string][] = [["-", "−"], ["+", "+"], ["*", "×"], ["/", "÷"], ["pct_diff", "% gap"]];
