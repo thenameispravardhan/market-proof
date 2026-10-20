@@ -245,6 +245,7 @@ export interface SettingsSchema {
 
 export interface GlobalSettings {
   TRADING_MODE: "paper" | "live";
+  FYERS_MCX_LIVE?: boolean;
   MAX_CAPITAL_RISK_PCT: number;
   DAILY_MAX_LOSS_PCT: number;
   MAX_CONCURRENT_POSITIONS: number;

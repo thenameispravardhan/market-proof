@@ -183,6 +183,37 @@ def _unwrap_fyers(payload: Mapping[str, Any]) -> dict[str, Any]:
         return merged
     return dict(payload)
 
+
+_QTY_KEYS = ("qty", "filledQty", "remainingQuantity", "tradedQty", "netQty", "buyQty", "sellQty", "disclosedQty")
+
+
+def fyers_in_units(row: Any) -> Any:
+    """A raw Fyers order / trade / position row with its quantities in the app's units, converted in place.
+
+    Fyers counts MCX in lots (a position's netQty 1 = 1 kg of GOLD; P&L needs its `qtyMulti_com`); the app counts
+    the quoted unit (GOLD 1 lot = 100). `instrument_master.fyers_lot` says by how much: an MCX lot while live MCX
+    is switched on, else 1 (nothing changes). Prices and rupee values (buyVal, pl…) are already per quoted unit /
+    in rupees. Done once: `_units` marks a converted row, so the REST read and the reconciler can both call it."""
+    if not isinstance(row, dict) or row.get("_units"):
+        return row
+    from app.services.instrument_master import fyers_lot
+
+    lot = fyers_lot(str(row.get("symbol") or ""))
+    if lot > 1:
+        for k in _QTY_KEYS:
+            v = row.get(k)
+            if v is None or isinstance(v, bool):
+                continue
+            try:
+                row[k] = int(round(float(v))) * lot
+            except (TypeError, ValueError):
+                pass
+        mult = row.get("qtyMulti_com")
+        if mult and int(float(mult)) not in (1, lot):   # Fyers' own P&L multiplier disagrees with the spec table
+            log.error("fyers.lot_mismatch", symbol=row.get("symbol"), ours=lot, fyers=mult)
+        row["_units"] = True
+    return row
+
 # Fyers status text (from `_status_text`) -> our internal trade status.
 _STATUS_MAP = {
     "FILLED": "filled",
@@ -204,7 +235,7 @@ async def reconcile_order_update(
     postback + polls converge). The DB work runs on TRADING_POOL; events,
     exit waiters and SL/TP arming happen back on the loop, AFTER the commit.
     """
-    order = _unwrap_fyers(payload)
+    order = fyers_in_units(_unwrap_fyers(payload))
     order_id = str(order.get("id") or order.get("order_id") or "").strip()
     status_text = _status_text(order.get("status"))
     sym = str(order.get("symbol") or "").strip().rpartition(":")[2]

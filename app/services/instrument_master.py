@@ -287,12 +287,47 @@ _SEGMENT_CODES = {"20": "COM", "12": "CD"}
 # MCX / currency: Fyers' master counts lots (GOLD lot = 1), but the price is per 10 g / per barrel / per USD.
 # Here a lot is counted in the QUOTED unit, like an NSE lot (NIFTY = 75), so P&L = price move x qty everywhere:
 # GOLD 1 kg = 100 x 10 g. A contract missing here gets lot 0: its orders are refused, never mis-sized.
+# Every value = trading unit / quotation unit from the MCX and NSE contract specs, and equals the `qtyMultiplier`
+# Fyers' own JSON master (sym_details/*_sym_master.json, 2026-10-20) gives each contract. All 31 MCX underlyings
+# and NSE's 7 currency pairs Fyers lists are here; NSE's bond / MIBOR futures are not (refused).
 # ponytail: exchange contract specs, revised now and then; check the MCX / NSE spec sheet when one changes.
-UNIT_LOTS = {"GOLD": 100, "GOLDM": 10, "GOLDGUINEA": 1, "GOLDPETAL": 1, "SILVER": 30, "SILVERM": 5, "SILVERMIC": 1,
-             "CRUDEOIL": 100, "CRUDEOILM": 10, "NATURALGAS": 1250, "NATGASMINI": 250, "COPPER": 2500,
-             "ZINC": 5000, "ZINCMINI": 1000, "LEAD": 5000, "LEADMINI": 1000, "ALUMINIUM": 5000, "ALUMINI": 1000,
-             "USDINR": 1000, "EURINR": 1000, "GBPINR": 1000, "JPYINR": 1000}   # JPYINR quotes per 100 yen
+UNIT_LOTS = {
+    # bullion: GOLD 1 kg / GOLDM 100 g / GOLDTEN 10 g per 10 g, GOLDGUINEA 8 g per 8 g, GOLDPETAL 1 g per g,
+    # SILVER 30 kg / SILVERM 5 kg / SILVERMIC 1 kg per kg, SILVER100 100 g per 10 g
+    "GOLD": 100, "GOLDM": 10, "GOLDTEN": 1, "GOLDGUINEA": 1, "GOLDPETAL": 1,
+    "SILVER": 30, "SILVERM": 5, "SILVERMIC": 1, "SILVER100": 10,
+    # energy: barrels per barrel, mmBtu per mmBtu; electricity 50 MWh per MWh
+    "CRUDEOIL": 100, "CRUDEOILM": 10, "NATURALGAS": 1250, "NATGASMINI": 250, "ELECDMBL": 50,
+    # base metals, per kg: COPPER 2.5 t, ZINC / LEAD / ALUMINIUM 5 t, the minis 1 t, NICKEL 250 kg
+    "COPPER": 2500, "ZINC": 5000, "ZINCMINI": 1000, "LEAD": 5000, "LEADMINI": 1000,
+    "ALUMINIUM": 5000, "ALUMINI": 1000, "NICKEL": 250,
+    # agri / steel: COTTON 25 bales per bale, KAPAS 4 t per 20 kg, CARDAMOM 100 kg / MENTHAOIL 360 kg per kg,
+    # COTTONOIL / SUNOIL 5 t per 10 kg, STEELREBAR 5 t per t
+    "COTTON": 25, "KAPAS": 200, "CARDAMOM": 100, "MENTHAOIL": 360, "COTTONOIL": 500, "SUNOIL": 500, "STEELREBAR": 5,
+    # MCX index futures: rupees per index point
+    "MCXBULLDEX": 30, "MCXMETLDEX": 40,
+    # NSE currency: 1000 of the base currency (JPYINR 100,000 yen, quoted per 100 yen). The cross pairs book
+    # their P&L in USD / JPY: crypto.point_value turns that into rupees.
+    "USDINR": 1000, "EURINR": 1000, "GBPINR": 1000, "JPYINR": 1000, "EURUSD": 1000, "GBPUSD": 1000, "USDJPY": 1000,
+}
 _WEEKLY_FUT = re.compile(r"\d{2}[A-Z]\d{2}FUT$")      # NSE:USDINR26O23FUT (weekly) vs NSE:USDINR26OCTFUT (monthly)
+
+
+def fyers_lot(symbol: str) -> int:
+    """How many of OUR quantity one Fyers quantity is. Fyers counts MCX in lots (its master: GOLD lot 1,
+    qtyMultiplier 100; a position's netQty 1 = one lot); this app counts the quoted unit (GOLD 1 lot = 100). With
+    live MCX switched on (Settings: FYERS_MCX_LIVE) an MCX contract converts by its UNIT_LOTS; anything else is 1
+    (NSE / BSE quantities are units on both sides), and so is everything while the switch is off. 0 = an MCX
+    contract whose size isn't on file: nothing may be sent for it."""
+    s = (symbol or "").strip().upper()
+    if not s.startswith("MCX:"):
+        return 1
+    from app.config import get_settings
+
+    if not getattr(get_settings(), "FYERS_MCX_LIVE", False):
+        return 1
+    inst = get_master().get(s)
+    return int(inst.lot_size) if inst is not None and inst.lot_size else 0
 
 
 # Fyers publishes a daily scrip-master CSV per exchange/segment. We pull

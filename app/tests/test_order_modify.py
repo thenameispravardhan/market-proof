@@ -83,7 +83,7 @@ class _ModifyStub:
         self.cancelled: list[str] = []
 
     async def modify_order(self, broker_order_id, *, quantity=None, limit_price=None,  # noqa: ANN001
-                           stop_price=None, order_type=None):
+                           stop_price=None, order_type=None, symbol=None):
         self.calls.append({
             "id": broker_order_id, "quantity": quantity, "limit_price": limit_price,
             "stop_price": stop_price, "order_type": order_type,

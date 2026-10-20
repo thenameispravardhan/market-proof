@@ -8,7 +8,9 @@ export const LEVEL_DRAG_SLOP = 3;
  *  broker doesn't reject a level like 123.47. */
 export function snapToTick(price: number, tick: number): number {
   const t = tick > 0 ? tick : 0.05;
-  const decimals = Math.max(0, Math.min(6, Math.ceil(-Math.log10(t) - 1e-9)));
+  // The tick's own decimals: 0.0025 (currency) keeps 4, 1e-8 (SHIB / PEPE) keeps 8. ceil(-log10) gave 3 and
+  // a 6 cap: 95.1225 became the off-grid 95.123 and a SHIB price rounded away.
+  const decimals = (t.toFixed(12).replace(/0+$/, "").split(".")[1] ?? "").length;
   return Number((Math.round(price / t) * t).toFixed(decimals));
 }
 
