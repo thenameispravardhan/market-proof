@@ -141,6 +141,10 @@ async def place(*, symbol: str, side: str, quantity: int, order_type: str,
         raise HTTPException(status_code=422, detail=(
             f"No live price for {symbol}: practice orders fill at the real Fyers price, "
             "so Fyers must be connected."))
+    from app.services import crypto
+
+    if crypto.point_value(symbol) != 1.0:      # crypto / cross currency: book the rupees at a fresh rate
+        await crypto.refresh_fx_if_stale()
     r = await backend().place_order(
         signal=None, symbol=symbol, side=OrderSide(side), quantity=int(quantity),
         order_type=OrderType(order_type), limit_price=limit_price, stop_price=stop_price,

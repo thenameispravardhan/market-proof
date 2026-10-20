@@ -726,7 +726,7 @@ export function AccountManager({
     const stopType = o.type === "SL-M" || o.type === "STOP_LOSS";
     const body: Record<string, unknown> = { account_id: acct, broker_order_id: o.id, order_type: o.type };
     if (stopType) body.stop_price = price;
-    if (o.type === "STOP_LOSS") body.limit_price = Math.round(((o.limit ?? price) + (price - (o.stop ?? price))) * 100) / 100;
+    if (o.type === "STOP_LOSS") body.limit_price = (o.limit ?? price) + (price - (o.stop ?? price));   // the server snaps it to the tick
     if (!stopType) body.limit_price = price;
     const r = await fetch("/api/orders/modify", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     const j = await r.json().catch(() => ({}));

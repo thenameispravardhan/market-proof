@@ -24,6 +24,7 @@
 // "I ACCEPT THE RISK" into before re-submitting.
 
 import { pointValue } from "../lib/contract";
+import { snapToTick } from "../components/trade/levelDrag";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -143,8 +144,7 @@ function detailText(j: { detail?: unknown }, status: number): string {
 
 /** A price snapped to the instrument's tick (Fyers rejects off-grid prices). */
 export function roundToTick(v: number, tick = 0.05): number {
-  const t = tick > 0 ? tick : 0.05;
-  return Math.round(Math.round(v / t) * t * 100) / 100;
+  return snapToTick(v, tick);    // to the tick's decimals: 2 dp mangled currency (0.0025) and sub-cent crypto
 }
 
 export type LevelInputMode = "price" | "pts" | "pct";
@@ -163,8 +163,8 @@ export function levelPrice(v: number, mode: LevelInputMode, ref: number | null |
   const dist = mode === "pts" ? v : (ref * v) / 100;
   const up = (side === "BUY") === (kind === "target");   // BUY target / SELL stop sit above the entry
   const raw = up ? ref + dist : ref - dist;
-  const t = tick > 0 ? tick : 0.05;
-  return raw > 0 ? Math.round(Math.round(raw / t) * t * 100) / 100 : null;
+  const px = raw > 0 ? roundToTick(raw, tick) : 0;
+  return px > 0 ? px : null;
 }
 
 export interface TicketCheck {
@@ -273,13 +273,16 @@ const DOCK: { id: DockId; label: string; short: string; icon: string; hint: stri
 const DEFAULT_DOCK: DockId[] = ["watch", "trade"];
 /** Indices and India VIX (NSE:…-INDEX) have no orders: no BUY / SELL anywhere for them. */
 const CURRENCY = /^(NSE|BSE):(USDINR|EURINR|GBPINR|JPYINR|EURUSD|GBPUSD|USDJPY)/;
-/** Why a symbol can't be ordered from the ticket, or null. MCX / currency / crypto are charts and data only:
- *  crypto can't route through Fyers, and MCX / currency P&L needs contract multipliers the master lacks. */
-export function untradable(sym: string, name = sym, paper = false): string | null {
+/** Why a symbol can't be ordered from the ticket, or null. Crypto (no Fyers route) and currency (Fyers has it in
+ *  square-off mode) trade on Paper only; MCX goes live too once Settings' FYERS_MCX_LIVE is on (`mcxLive`). */
+export function untradable(sym: string, name = sym, paper = false, mcxLive = false): string | null {
   const s = sym.toUpperCase();
   if (s.endsWith("-INDEX")) return `${name} is an index — it can't be bought or sold. Open its future or an option to trade.`;
-  if (!paper && (s.startsWith("CRYPTO:") || s.startsWith("MCX:") || CURRENCY.test(s)))
-    return `${name}: MCX, currency and crypto trade on the Paper account only — switch the top bar to Paper.`;
+  if (paper) return null;
+  if (s.startsWith("MCX:") && !mcxLive)
+    return `${name}: live MCX orders are off — switch the top bar to Paper, or turn on "Live MCX orders on Fyers" in Settings.`;
+  if (s.startsWith("CRYPTO:") || CURRENCY.test(s))
+    return `${name}: currency and crypto trade on the Paper account only — switch the top bar to Paper.`;
   return null;
 }
 
@@ -886,7 +889,8 @@ export default function Trade() {
     try { tabLocal.setItem("trade:practice", JSON.stringify(on)); } catch { /* best-effort */ }
   };
   const accountId: number | null = practice ? -1 : account?.id ?? null;
-  const tradable = (sym: string) => untradable(sym, sym, practice) === null;
+  const mcxLive = !!globalSettings?.global?.FYERS_MCX_LIVE;   // Settings: live MCX orders on Fyers
+  const tradable = (sym: string) => untradable(sym, sym, practice, mcxLive) === null;
   // Why this page can't place orders, in words the operator can act on.
   // The Dashboard's Fyers switch governs the bot only; this page has its own.
   const noAccountReason: string | null = account || practice ? null
@@ -1384,7 +1388,7 @@ export default function Trade() {
     lotSize: selected && selected.lot_size > 1 ? selected.lot_size : 1,
     limit: limitNum, stop: stopNum, ltp: ltp ?? null, entry: estPrice ?? null, sl: slAbs, tp: tpAbs,
   };
-  const problem = !selected ? "Pick a symbol." : !tradable(selected.symbol) ? untradable(selected.symbol, selected.short_name, practice)! : !accountId ? noAccountReason
+  const problem = !selected ? "Pick a symbol." : !tradable(selected.symbol) ? untradable(selected.symbol, selected.short_name, practice, mcxLive)! : !accountId ? noAccountReason
     : lotUnknown ? "Lot size unknown for this contract." : ticketProblem(check);
   const canSubmit = problem == null;
   const ticketWarn = canSubmit ? ticketWarning(check) : null;
@@ -1878,7 +1882,7 @@ export default function Trade() {
                     {!practice && <TicketModeBadge account={account} botMode={botMode} />}
                   </h2>
                   {selected && !tradable(selected.symbol) ? (
-                    <div className="hint" data-testid="ticket-index">{untradable(selected.symbol, selected.short_name, practice)}</div>
+                    <div className="hint" data-testid="ticket-index">{untradable(selected.symbol, selected.short_name, practice, mcxLive)}</div>
                   ) : (<>
                   {!account && noAccountReason && (
                     <div className="hint warn-text" data-testid="ticket-mode-note">{noAccountReason}</div>

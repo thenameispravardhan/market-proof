@@ -250,7 +250,7 @@ GROUPS: list[dict[str, Any]] = [
         "id": "mode",
         "title": "Trading mode",
         "note": "Paper or live. Switching to live requires typing LIVE on the Dashboard.",
-        "prefixes": ["TRADING_MODE"],
+        "prefixes": ["TRADING_MODE", "FYERS_MCX_LIVE"],
     },
 ]
 
@@ -322,6 +322,7 @@ LABELS: dict[str, str] = {
     "AI_ANALYSIS_ENABLED": "AI news analysis",
     "PRE_LLM_FILTER_ENABLED": "Pre-AI noise filter",
     "SEND_EXTRACTED_TEXT": "Send extracted PDF text to AI",
+    "FYERS_MCX_LIVE": "Live MCX orders on Fyers (lots converted; switch only while flat in MCX)",
     "NEWS_AGE_FROM_RECEIPT": "Measure news age from receipt",
     "ENTRY_MAX_DRIFT_PCT": "Max entry drift against the signal (%)",
     "SCALE_OUT_R": "Scale-out at (R)",

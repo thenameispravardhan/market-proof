@@ -99,10 +99,13 @@ async def _fyers_quote(db: Session, sym: str) -> Optional[dict[str, Any]]:
 
 
 
-# MCX / currency / crypto trade on the Paper account only: crypto has no Fyers route, and live MCX / currency
-# would have to convert our quoted-unit lots (GOLD 1 lot = 100) to Fyers' lots (GOLD 1 lot = 1) first.
+# MCX / currency / crypto trade on the Paper account. Crypto has no Fyers route; Fyers has currency derivatives in
+# square-off mode (RBI rules, support.fyers.in); MCX goes live only with Settings' FYERS_MCX_LIVE on, which
+# converts our quoted-unit lots (GOLD 1 lot = 100) to Fyers' lots (GOLD 1 lot = 1) on every live path
+# (instrument_master.fyers_lot).
 def market_problem(symbol: str, quantity: int, paper: bool) -> Optional[str]:
     """Why an MCX / currency / crypto order can't be sent, or None (also None for every other symbol)."""
+    from app.config import get_settings
     from app.services import crypto
     from app.services.instrument_master import get_master
 
@@ -110,10 +113,13 @@ def market_problem(symbol: str, quantity: int, paper: bool) -> Optional[str]:
     inst = get_master().get(s)
     if not (crypto.is_crypto(s) or s.startswith("MCX:") or (inst is not None and inst.segment == "CD")):
         return None
-    if not paper:
-        return f"{s}: MCX, currency and crypto trade on the Paper account only for now — switch the ticket to Paper"
+    if not paper and not (s.startswith("MCX:") and get_settings().FYERS_MCX_LIVE):
+        if s.startswith("MCX:"):
+            return (f"{s}: live MCX orders are off — switch on 'Live MCX orders on Fyers' in Settings "
+                    "(Trading mode), or switch the ticket to Paper")
+        return f"{s}: currency and crypto trade on the Paper account only — switch the ticket to Paper"
     if inst is None or not inst.lot_size:
-        return f"{s}: its contract size isn't on file, so paper P&L couldn't be valued — not sent"
+        return f"{s}: its contract size isn't on file, so its quantity couldn't be sized — not sent"
     if inst.lot_size > 1 and quantity % inst.lot_size:
         return (f"quantity {quantity} isn't a whole number of lots for {s} (1 lot = {inst.lot_size}) "
                 f"— use a multiple of {inst.lot_size}")
@@ -642,7 +648,7 @@ def snap_tick(symbol: str, price: float) -> float:
 
     inst = get_master().get(symbol.strip().upper())
     tick = float(getattr(inst, "tick_size", 0) or 0) or 0.05
-    return round(round(price / tick) * tick, 6)
+    return round(round(price / tick) * tick, 10)    # 10, not 6: SHIB / PEPE tick 1e-8
 
 
 def snap_prices(body: dict[str, Any], symbol: Optional[str], keys: tuple[str, ...] = ("limit_price", "stop_price", "stop_loss", "target")) -> None:
@@ -846,6 +852,7 @@ async def modify_order(
             limit_price=limit_price,
             stop_price=stop_price,
             order_type=order_type,
+            symbol=row_sym,   # its tick, and Fyers' lots for MCX
         )
     except FyersBlockedError as e:
         log.warning(
@@ -958,6 +965,14 @@ def _expired_day_order(trade: Trade, now: datetime) -> bool:
     if created.tzinfo is None:
         created = created.replace(tzinfo=timezone.utc)
     exch = (trade.symbol or "").split(":", 1)[0].upper() if ":" in (trade.symbol or "") else ""
+    if exch == "CRYPTO":    # 24/7, no session close: a resting order lives as long as the practice engine keeps one
+        return now - created > timedelta(hours=8)
+    if exch in ("NSE", "BSE"):     # currency trades NSE:USDINR…, but its session runs to 17:00
+        from app.services.instrument_master import get_master
+
+        inst = get_master().get((trade.symbol or "").upper())
+        if inst is not None and inst.segment == "CD":
+            exch = "CDS"
     hh, mm = _CLOSE_IST.get(exch, _CLOSE_DEFAULT)
     local = now.astimezone(_IST)
     close = local.replace(hour=hh, minute=mm, second=0, microsecond=0)

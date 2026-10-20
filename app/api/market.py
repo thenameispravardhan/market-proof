@@ -347,11 +347,14 @@ async def market_history(
 
 
 @router.get("/api/market/fx")
-def market_fx() -> dict[str, Any]:
-    """What a crypto contract is worth: coins per 1 qty, and the USD/INR rate its P&L is booked at."""
+async def market_fx() -> dict[str, Any]:
+    """What a crypto contract is worth: coins per 1 qty, and the USD/INR rate its P&L is booked at; `cross`:
+    rupees per 1-point move of NSE's cross-currency pairs (EURUSD / GBPUSD: USD/INR, USDJPY: JPY/INR)."""
     from app.services import crypto
 
-    return {"usd_inr": crypto.USD_INR["rate"], "as_of": crypto.USD_INR["at"] or None, "units": crypto.UNIT}
+    await crypto.refresh_fx_if_stale()
+    return {"usd_inr": crypto.USD_INR["rate"], "as_of": crypto.USD_INR["at"] or None, "units": crypto.UNIT,
+            "cross": {p: box["rate"] for p, box in crypto.CROSS.items()}}
 
 
 @router.get("/api/market/quotes")
@@ -433,6 +436,10 @@ async def broker_book() -> dict[str, Any]:
             "realized": _num(p.get("realized_profit")),
             "unrealized": _num(p.get("unrealized_profit")),
             "pl": _num(p.get("pl")),
+            # Rupees per point per net_qty: an MCX row Fyers counts in lots (qtyMulti_com, GOLD 100) unless
+            # live MCX already converted its qty to units; 1 for everything else.
+            "multiplier": (_num(p.get("qtyMulti_com")) or 1.0)
+            if str(p.get("symbol") or "").upper().startswith("MCX:") and not p.get("_units") else 1.0,
         }
         for p in raw["positions"]
     ]
