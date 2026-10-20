@@ -153,6 +153,53 @@ def bs_price(spot: float, strike: float, t_years: float, iv: float, right: str, 
     return max(p, intrinsic * disc, 0.05)
 
 
+def bs_greeks(spot: float, strike: float, t_years: float, iv: float, right: str,
+              r: float = RISK_FREE) -> dict[str, float]:
+    """The Greeks of ONE option unit:
+
+    delta (per point), gamma (delta change per point), theta (premium per
+    calendar day), vega (premium per 1 vol point), rho (premium per 1% rate),
+    vanna (delta change per 1 vol point), charm (delta change per day that
+    passes), vomma (vega change per 1 vol point), speed (gamma change per
+    point) and prob_itm (risk-neutral chance it expires in the money).
+    At expiry: delta 0 / ±1, the rest 0."""
+    sgn = 1 if right == "CE" else -1
+    if t_years <= 0 or iv <= 0 or spot <= 0:
+        itm = spot > strike if right == "CE" else spot < strike
+        return {"delta": sgn * float(itm), "gamma": 0.0, "theta": 0.0, "vega": 0.0, "rho": 0.0, "vanna": 0.0,
+                "charm": 0.0, "vomma": 0.0, "speed": 0.0, "prob_itm": float(itm)}
+    rt = math.sqrt(t_years)
+    d1 = (math.log(spot / strike) + (r + iv * iv / 2) * t_years) / (iv * rt)
+    d2 = d1 - iv * rt
+    pdf = math.exp(-d1 * d1 / 2) / math.sqrt(2 * math.pi)
+    disc = strike * math.exp(-r * t_years)
+    gamma = pdf / (spot * iv * rt)
+    vega = spot * pdf * rt
+    return {"delta": _ncdf(d1) - (right == "PE"),
+            "gamma": gamma,
+            "theta": (-spot * pdf * iv / (2 * rt) - sgn * r * disc * _ncdf(sgn * d2)) / 365,
+            "vega": vega / 100,
+            "rho": sgn * t_years * disc * _ncdf(sgn * d2) / 100,
+            "vanna": -pdf * d2 / iv / 100,
+            # the same for a call and a put: their deltas differ by a constant
+            "charm": -pdf * (2 * r * t_years - d2 * iv * rt) / (2 * t_years * iv * rt) / 365,
+            "vomma": vega * d1 * d2 / iv / 10000,
+            "speed": -gamma / spot * (d1 / (iv * rt) + 1),
+            "prob_itm": _ncdf(sgn * d2)}
+
+
+def implied_vol(price: float, spot: float, strike: float, t_years: float, right: str) -> float:
+    """The IV (decimal) at which Black-Scholes gives `price`; bisection on 1%-500%."""
+    lo, hi = 0.01, 5.0
+    for _ in range(50):
+        mid = (lo + hi) / 2
+        if bs_price(spot, strike, t_years, mid, right) < price:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
 def label_date(ts: float) -> str:
     return datetime.fromtimestamp(ts, IST).strftime("%d%b%y").upper()
 
@@ -196,6 +243,88 @@ def strike_for_premium(spot: float, step: float, right: str, target: float, pric
     atm = round(spot / step) * step
     cands = [atm + k * step for k in range(-40, 41) if atm + k * step > 0]
     return min(cands, key=lambda k: abs(price_at(k) - target))
+
+
+def strike_for_delta(spot: float, step: float, right: str, target: float, delta_at) -> float:
+    """The strike (ATM +/- 40 steps) whose |delta| is closest to `target` (0.25 = a 25-delta option)."""
+    atm = round(spot / step) * step
+    cands = [atm + k * step for k in range(-40, 41) if atm + k * step > 0]
+    return min(cands, key=lambda k: (abs(abs(delta_at(k)) - target), abs(k - atm)))
+
+
+# ---- margin for writing options / futures -------------------------------------
+#
+# Selling an option needs far more money than buying one. A buyer can lose at
+# most the premium, so the premium is all that is blocked. A writer's loss is
+# open-ended, so the exchange blocks SPAN (the worst loss over a grid of price
+# and volatility moves) plus an exposure margin on the contract value — around
+# ₹1-1.5 lakh per NIFTY lot for a naked ATM sell against a few thousand for the
+# same option bought. Bought wings cap the worst loss, which is why an iron
+# condor needs a fraction of a strangle's margin. This is an ESTIMATE of that
+# method, not NSE's risk-parameter file: the broker's margin calculator decides.
+
+SCAN_PCT = {"index": 6.0, "stock": 13.0}       # price scan range, % of the underlying
+EXPOSURE_PCT = {"index": 2.0, "stock": 3.5}    # exposure margin, % of contract value
+EXPIRY_DAY_ELM = 2.0       # SEBI, Nov 2024: extra 2% on short index options on their expiry day
+VOL_SCAN = 0.04            # volatility scan: IV up / down 4 points
+# (fraction of the scan range, share of the loss counted): 7 price moves x 2 vols, plus the two
+# extreme moves (2x the range) counted at 35% — the case that matters for deep OTM shorts.
+SPAN_MOVES = [(k / 3, 1.0) for k in range(-3, 4)] + [(-2.0, 0.35), (2.0, 0.35)]
+
+
+def asset_class(name: str) -> str:
+    return "index" if name in INDEX_LOTS else "stock"
+
+
+def span_margin(legs: list[dict[str, Any]], spot: float, t: float, *, name: str, iv: Optional[float] = None,
+                price_key: str = "price", qty_key: str = "qty", scan_pct: Optional[float] = None,
+                exposure_pct: Optional[float] = None) -> dict[str, float]:
+    """Funds blocked by one position of CE / PE / FUT legs on one underlying.
+
+    {span, exposure, premium, total}: span = worst scenario loss of the whole
+    position (legs offset each other: a bought wing's gain covers the short's
+    loss); exposure on every short option and future; premium = what bought
+    options cost. A bought option's own fall in value is never counted twice —
+    its premium already pays for it. `iv` None = each leg's IV implied from its
+    `price_key` (live quotes); a number = every leg priced at it (backtests)."""
+    cls = asset_class(name)
+    scan = (SCAN_PCT[cls] if scan_pct is None else scan_pct) / 100
+    expo = (EXPOSURE_PCT[cls] if exposure_pct is None else exposure_pct) / 100
+    day = int(t + 19800) // 86400
+    priced = []
+    exposure = premium = 0.0
+    for lg in legs:
+        q = abs(lg[qty_key])
+        if lg["kind"] == "FUT":
+            priced.append((lg, q, None, None))
+            exposure += expo * spot * q
+            continue
+        yrs = years_to(lg["exp"], t)
+        px = float(lg.get(price_key) or 0)
+        v = iv if iv is not None else (implied_vol(px, spot, lg["K"], yrs, lg["kind"]) if px > 0 else 0.15)
+        priced.append((lg, q, yrs, v))
+        if lg["act"] > 0:
+            premium += px * q
+        else:
+            exposure += expo * spot * q
+            if cls == "index" and int(lg["exp"] + 19800) // 86400 == day:
+                exposure += EXPIRY_DAY_ELM / 100 * spot * q
+    worst = 0.0
+    if any(lg["act"] < 0 or lg["kind"] == "FUT" for lg, *_ in priced):
+        for move, weight in SPAN_MOVES:
+            s1 = spot * (1 + move * scan)
+            for dv in (-VOL_SCAN, VOL_SCAN):
+                pnl = 0.0
+                for lg, q, yrs, v in priced:
+                    if lg["kind"] == "FUT":
+                        pnl += lg["act"] * (s1 - spot) * q
+                        continue
+                    now = bs_price(spot, lg["K"], yrs, v, lg["kind"])
+                    chg = lg["act"] * (bs_price(s1, lg["K"], yrs, max(0.01, v + dv), lg["kind"]) - now) * q
+                    pnl += chg if lg["act"] < 0 else max(0.0, chg)
+                worst = max(worst, -pnl * weight)
+    return {"span": round(worst, 2), "exposure": round(exposure, 2), "premium": round(premium, 2),
+            "total": round(worst + exposure + premium, 2), "scan_pct": scan * 100, "exposure_pct": expo * 100}
 
 
 # ---- F&O master ----------------------------------------------------------------

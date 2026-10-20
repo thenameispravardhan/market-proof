@@ -120,12 +120,16 @@ async def assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str
     notes: list[dict] = []
     wants_vix = inst["iv"]["source"] == "vix" or (
         inst["iv"]["source"] == "auto" and any(fno.fno_name(x) in fno.INDEX_LOTS for x in spec["symbols"]))
-    if inst["type"] == "option" and wants_vix:
+    vix_tfs = engine.vix_timeframes(spec)            # the VIX indicator, at these timeframes
+    vix_htf: dict[int, dict] = {}
+    if (inst["type"] == "option" and wants_vix) or vix_tfs:
         try:
             await ensure(VIX, first, end)
             vix = await asyncio.to_thread(load, store_key(VIX), base_tf, first, end)
+            for tf in vix_tfs - {base_tf}:
+                vix_htf[tf] = await asyncio.to_thread(load, store_key(VIX), tf, first, end)
         except Exception as e:  # noqa: BLE001
-            notes.append({"symbol": VIX, "note": f"VIX unavailable, using realised vol: {e}"[:200]})
+            notes.append({"symbol": VIX, "note": f"VIX unavailable ({'conditions on VIX stay false' if vix_tfs else 'using realised vol'}): {e}"[:200]})
     out: dict[str, dict] = {}
     for fy in spec["symbols"]:
         try:
@@ -158,6 +162,9 @@ async def assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str
             bars["htf"] = {tf: await asyncio.to_thread(load, info["key"], tf, first, end) for tf in htfs}
             if vix and vix["t"]:
                 bars["vix"] = vix
+            for tf, v in vix_htf.items():
+                if v and v["t"] and bars["htf"].get(tf):
+                    bars["htf"][tf]["vix"] = v
             name = fno.fno_name(fy)
             bars["meta"] = {"symbol": fy, "name": name, "exch": fno.exchange_of(fy), "bar_size": size}
             if inst["type"] != "equity":
@@ -309,6 +316,16 @@ async def live_bundle(spec: dict[str, Any], fy: str, now: float) -> dict[str, An
         d = await recent_bars(fy, spec["timeframe"], bars=wb + 60, now=now)
     d["tf_min"] = spec["timeframe"]
     d["htf"] = {tf: await recent_bars(fy, tf, bars=wb + 5, now=now) for tf in engine.cond_timeframes(spec)}
+    for tf in engine.vix_timeframes(spec):         # India VIX beside the symbol, as the backtest loads it
+        try:
+            v = await recent_bars(VIX, tf, bars=wb + (60 if tf == spec["timeframe"] else 5), now=now)
+        except Exception as e:  # noqa: BLE001 — without VIX its conditions stay false, never guessed
+            log.warning("algo.vix_unavailable", tf=tf, error=str(e)[:200])
+            continue
+        if tf == spec["timeframe"]:
+            d["vix"] = v
+        elif d["htf"].get(tf):
+            d["htf"][tf]["vix"] = v
     name = fno.fno_name(fy)
     d["meta"] = {"symbol": fy, "name": name, "exch": fno.exchange_of(fy)}
     if spec["instrument"]["type"] != "equity":
