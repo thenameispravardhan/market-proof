@@ -963,3 +963,57 @@ def test_runner_paper_scale_out_then_target(monkeypatch, isolated_db):
         rows = db.query(AlgoTrade).order_by(AlgoTrade.id).all()
         assert [(x.status, x.exit_reason) for x in rows] == [("closed", "TARGET"), ("closed", "SCALE_OUT_1")]
         assert rows[0].gross_pnl == pytest.approx(5 * 6.5)
+
+
+def test_angle_transform_is_atr_scaled_degrees():
+    d = bars([100.0 + i for i in range(300)], spread=0)         # +1 a bar, true range 1 -> ATR 1 (once warmed up)
+    ang = engine.series(d, {"ind": "PRICE", "params": {}, "xf": "angle", "xn": 1}, {})
+    assert abs(ang[-1] - 45.0) < 1e-3                           # one ATR per bar = 45 degrees
+    flat = engine.series(bars([100.0] * 40, spread=1), {"ind": "PRICE", "params": {}, "xf": "angle", "xn": 3}, {})
+    assert flat[-1] == 0.0
+    ch = engine.series(d, {"ind": "PRICE", "params": {}, "xf": "pct_change", "xn": 2}, {})
+    assert abs(ch[-1] - 2 / 397 * 100) < 1e-9
+
+
+def test_between_held_within_negate_and_math_operands():
+    d = bars([10, 11, 12, 13, 14, 15, 14, 13, 12, 11], spread=0)
+    P = {"ind": "PRICE", "params": {}}
+    ev = lambda c: engine._cond(d, c, {})  # noqa: E731
+    assert ev({"left": P, "op": "between", "right": {"value": 15}, "right2": {"value": 12}}) == \
+        [False, False, True, True, True, True, True, True, True, False]       # bounds in either order
+    assert ev({"left": P, "op": "outside", "right": {"value": 12}, "right2": {"value": 14}}) == \
+        [True, True, False, False, False, True, False, False, False, True]
+    assert ev({"left": P, "op": ">", "right": {"value": 11}, "for_bars": 3})[:5] == [False, False, False, False, True]
+    within = ev({"left": P, "op": "crosses_above", "right": {"value": 12.5}, "within_bars": 3})
+    assert within[3:7] == [True, True, True, False]                          # the cross at bar 3, two bars on
+    assert ev({"left": P, "op": ">", "right": {"value": 13}, "negate": True})[4] is False
+    spread = {"math": "pct_diff", "a": P, "b": {"value": 10}}
+    assert abs(engine.series(d, spread, {})[5] - 50.0) < 1e-9                # 15 is 50% above 10
+
+
+def test_ema_cross_at_an_angle_between_30_and_45_degrees_builds_and_runs():
+    E = lambda p: {"ind": "EMA", "params": {"period": p}}  # noqa: E731
+    cross = {"left": E(9), "op": "crosses_above", "right": E(21)}
+
+    def spec(lo, hi):
+        conds = [cross] + ([{"left": {**E(9), "xf": "angle", "xn": 3}, "op": "between",
+                             "right": {"value": lo}, "right2": {"value": hi}}] if lo is not None else [])
+        return engine.normalize({
+            "symbols": ["NSE:TEST-EQ"], "timeframe": 5, "direction": "long",
+            "entry_long": {"logic": "AND", "conditions": conds},
+            "exit_long": {"logic": "AND", "conditions": [{"left": E(9), "op": "crosses_below", "right": E(21)}]},
+            "stop_loss": None, "target": None, "costs": {"slippage_pct": 0, "charges": False}})
+    closes = [100 - 0.3 * i for i in range(40)] + [88 + 0.6 * i for i in range(30)] + [106 - 0.5 * i for i in range(30)]
+    d = bars(closes, spread=0.2)
+    sig = engine.evaluate(d, spec(None, None)["entry_long"], {})
+    i = sig.index(True)                                          # the plain crossover
+    a = engine.series(d, {**E(9), "xf": "angle", "xn": 3}, {})[i]
+    assert engine.run(spec(None, None), {"X": d})["stats"]["trades"] == 1
+    assert engine.run(spec(a - 5, a + 5), {"X": d})["stats"]["trades"] == 1    # crossed inside the band: taken
+    assert engine.run(spec(a + 5, a + 15), {"X": d})["stats"]["trades"] == 0   # too shallow for it: skipped
+    with pytest.raises(ValueError, match="low and a high"):
+        engine.normalize({**spec(None, None), "entry_long": {"logic": "AND", "conditions": [
+            {"left": E(9), "op": "between", "right": {"value": 30}}]}})
+    with pytest.raises(ValueError, match="unknown transform"):
+        engine.normalize({**spec(None, None), "entry_long": {"logic": "AND", "conditions": [
+            {"left": {**E(9), "xf": "curvature"}, "op": ">", "right": {"value": 0}}]}})

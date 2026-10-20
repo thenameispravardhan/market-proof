@@ -44,8 +44,29 @@ type Operand = {
   mult?: number;
   add?: number;
   value?: number;
+  /** Reshape the series: its angle / slope / change … over `xn` bars. */
+  xf?: string;
+  xn?: number;
+  /** A combined value: a <math> b. */
+  math?: string;
+  a?: Operand;
+  b?: Operand;
 };
-type Cond = { left: Operand; op: string; right?: Operand };
+type Cond = { left: Operand; op: string; right?: Operand; right2?: Operand; for_bars?: number; within_bars?: number; negate?: boolean };
+
+const TRANSFORMS: [string, string, string][] = [
+  ["", "value", ""],
+  ["angle", "angle °", "degrees of the line's rise over N bars, measured against ATR(14): one ATR per bar = 45°, so it means the same on any symbol or zoom"],
+  ["slope", "slope / bar", "average change per bar over N bars"],
+  ["change", "change", "change over N bars"],
+  ["pct_change", "% change", "percent change over N bars"],
+  ["highest", "highest", "highest value of the last N bars"],
+  ["lowest", "lowest", "lowest value of the last N bars"],
+  ["sma", "average", "simple average of the last N bars"],
+  ["zscore", "z-score", "standard deviations from its N-bar average"],
+  ["abs", "absolute", "the value without its sign"],
+];
+const MATH_OPS: [string, string][] = [["-", "−"], ["+", "+"], ["*", "×"], ["/", "÷"], ["pct_diff", "% gap"]];
 type Group = { logic: "AND" | "OR"; conditions: (Cond | Group)[] };
 type Level = { type: string; value: number; atr_period?: number; activate?: number } | null;
 // Partial exit: close qty_pct % of the ENTRY size at this level (rr = R multiples of the stop).
@@ -518,6 +539,19 @@ export const TEMPLATES: Template[] = [
     entry_short: G([C(I("PRICE"), "crosses_below", I("ORB", { minutes: 15 }, "low"))]),
     stop_loss: { type: "pct", value: 0.4 }, target: { type: "rr", value: 2 },
     sizing: { mode: "lots", value: 1 }, portfolio: { capital: 300000, leverage: 6, max_positions: 1, compounding: true } } },
+  { name: "EMA 9 × 21 cross at a 30–45° angle (5m)", spec: {
+    direction: "both", timeframe: 5, instrument: { type: "equity" } as Instrument,
+    entry_long: G([C(I("EMA", { period: 9 }), "crosses_above", I("EMA", { period: 21 })),
+      { left: { ...I("EMA", { period: 9 }), xf: "angle", xn: 3 }, op: "between", right: N(30), right2: N(45) }]),
+    entry_short: G([C(I("EMA", { period: 9 }), "crosses_below", I("EMA", { period: 21 })),
+      { left: { ...I("EMA", { period: 9 }), xf: "angle", xn: 3 }, op: "between", right: N(-45), right2: N(-30) }]),
+    stop_loss: { type: "atr", value: 1.5, atr_period: 14 }, target: { type: "rr", value: 2 } } },
+  { name: "Spread · EMA 9 more than 0.3% above EMA 21, held 3 bars (15m)", spec: {
+    direction: "long", timeframe: 15, instrument: { type: "equity" } as Instrument,
+    entry_long: G([{ left: { math: "pct_diff", a: I("EMA", { period: 9 }), b: I("EMA", { period: 21 }) }, op: ">", right: N(0.3), for_bars: 3 },
+      { left: I("RSI", { period: 14 }), op: "crosses_above", right: N(50), within_bars: 3 }]),
+    exit_long: G([C(I("EMA", { period: 9 }), "crosses_below", I("EMA", { period: 21 }))]),
+    stop_loss: { type: "atr", value: 1.5, atr_period: 14 }, target: null } },
   // ---- order flow (delta estimated per minute from 1-minute candles) ----
   { name: "Order flow · delta-confirmed EMA cross on volume candles", spec: {
     direction: "both", bars: { type: "volume", per_day: 60 }, timeframe: 1, instrument: { type: "equity" } as Instrument,
@@ -708,15 +742,47 @@ function SymbolPicker({ value, onChange }: { value: string[]; onChange: (v: stri
 // builder widgets
 // ---------------------------------------------------------------------------
 
-function OperandEditor({ v, onChange, cat, baseTf, allowNumber = true }: { v: Operand; onChange: (o: Operand) => void; cat: Catalog; baseTf: number; allowNumber?: boolean }) {
+function TransformEditor({ v, onChange }: { v: Operand; onChange: (o: Operand) => void }) {
+  const t = TRANSFORMS.find((x) => x[0] === (v.xf ?? "")) ?? TRANSFORMS[0];
+  return (
+    <label className="meta" title={t[2] || "use the value itself, or reshape it: its angle, slope, change, highest … over N bars"}>
+      as
+      <select value={v.xf ?? ""} data-testid="operand-xf" onChange={(e) => {
+        const n = { ...v };
+        if (e.target.value) { n.xf = e.target.value; n.xn = v.xn ?? 3; } else { delete n.xf; delete n.xn; }
+        onChange(n);
+      }}>
+        {TRANSFORMS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+      </select>
+      {v.xf && v.xf !== "abs" && <>over <NumInput width={36} value={v.xn ?? 3} onChange={(n) => onChange({ ...v, xn: Math.max(1, Math.floor(n ?? 1)) })} /> bars</>}
+    </label>
+  );
+}
+
+function OperandEditor({ v, onChange, cat, baseTf, allowNumber = true, depth = 0 }: { v: Operand; onChange: (o: Operand) => void; cat: Catalog; baseTf: number; allowNumber?: boolean; depth?: number }) {
   const def = v.ind ? cat.indicators.find((d) => d.name === v.ind) : undefined;
   const groups = useMemo(() => Array.from(new Set(cat.indicators.map((d) => d.group))), [cat]);
   const [math, setMath] = useState((v.mult !== undefined && v.mult !== 1) || !!v.add);
   const tfs = cat.cond_timeframes.filter((t) => t === 1440 || (t > baseTf && t % baseTf === 0));
+  if (v.math) {
+    return (
+      <span className="algo-operand algo-combined" data-testid="operand-math">
+        (<OperandEditor v={v.a ?? I("EMA", { period: 9 })} cat={cat} baseTf={baseTf} depth={depth + 1} onChange={(a) => onChange({ ...v, a })} />
+        <select value={v.math} onChange={(e) => onChange({ ...v, math: e.target.value })} title="% gap = how far the first is from the second, in % of the second">
+          {MATH_OPS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+        </select>
+        <OperandEditor v={v.b ?? I("EMA", { period: 21 })} cat={cat} baseTf={baseTf} depth={depth + 1} onChange={(b) => onChange({ ...v, b })} />)
+        <TransformEditor v={v} onChange={onChange} />
+        <button type="button" className="btn-sm ghost" title="back to a single value" onClick={() => onChange(v.a ?? I("PRICE"))}>✕</button>
+      </span>
+    );
+  }
   return (
     <span className="algo-operand">
-      <select value={v.ind ?? "#"} onChange={(e) => onChange(e.target.value === "#" ? { value: 0 } : I(e.target.value))}>
+      <select value={v.ind ?? "#"} onChange={(e) => onChange(e.target.value === "#" ? { value: 0 }
+        : e.target.value === "@math" ? { math: "-", a: v.ind ? { ...v } : I("EMA", { period: 9 }), b: I("EMA", { period: 21 }) } : I(e.target.value))}>
         {allowNumber && <option value="#">Number</option>}
+        {depth < 2 && <option value="@math">ƒ Combine two values (A − B, A ÷ B, % gap…)</option>}
         {groups.map((g) => (
           <optgroup key={g} label={g}>
             {cat.indicators.filter((d) => d.group === g).map((d) => <option key={d.name} value={d.name}>{d.name}</option>)}
@@ -755,6 +821,7 @@ function OperandEditor({ v, onChange, cat, baseTf, allowNumber = true }: { v: Op
           ago <NumInput width={36} value={v.offset ?? 0} onChange={(n) => onChange({ ...v, offset: Math.max(0, Math.floor(n ?? 0)) })} />
         </label>
       )}
+      {def && <TransformEditor v={v} onChange={onChange} />}
       {def && (math ? (
         <>
           <label className="meta" title="multiply, e.g. 1.02 = 2% above">× <NumInput width={52} value={v.mult ?? 1} onChange={(n) => onChange({ ...v, mult: n ?? 1 })} /></label>
@@ -768,17 +835,28 @@ function OperandEditor({ v, onChange, cat, baseTf, allowNumber = true }: { v: Op
 const OP_LABEL: Record<string, string> = {
   crosses_above: "crosses above", crosses_below: "crosses below", crosses: "crosses",
   rising: "is rising for (bars)", falling: "is falling for (bars)",
+  between: "is between", outside: "is outside",
 };
 
 function CondEditor({ c, onChange, cat, baseTf }: { c: Cond; onChange: (c: Cond) => void; cat: Catalog; baseTf: number }) {
   const trend = c.op === "rising" || c.op === "falling";
+  const range = c.op === "between" || c.op === "outside";
+  const [more, setMore] = useState(!!(c.for_bars || c.within_bars || c.negate));
+  const setMod = (k: "for_bars" | "within_bars", n: number | null) => {
+    const x = { ...c };
+    if (n && n > 1) x[k] = Math.floor(n); else delete x[k];
+    onChange(x);
+  };
   return (
     <span className="algo-operand" style={{ gap: 8 }}>
+      {c.negate && <b className="meta" title="the condition must be false">NOT</b>}
       <OperandEditor v={c.left} cat={cat} baseTf={baseTf} allowNumber={false} onChange={(left) => onChange({ ...c, left })} />
       <select value={c.op} onChange={(e) => {
         const op = e.target.value;
         const t = op === "rising" || op === "falling";
-        onChange({ ...c, op, right: t ? N(Math.max(1, c.right?.value ?? 1)) : c.right?.ind || c.right?.value !== undefined ? c.right : N(0) });
+        const x: Cond = { ...c, op, right: t ? N(Math.max(1, c.right?.value ?? 1)) : c.right?.ind || c.right?.value !== undefined ? c.right : N(0) };
+        if (op === "between" || op === "outside") x.right2 = c.right2 ?? N(0); else delete x.right2;   // the high bound is part of the rule
+        onChange(x);
       }}>
         {cat.operators.map((o) => <option key={o} value={o}>{OP_LABEL[o] ?? o}</option>)}
       </select>
@@ -787,6 +865,17 @@ function CondEditor({ c, onChange, cat, baseTf }: { c: Cond; onChange: (c: Cond)
       ) : (
         <OperandEditor v={c.right ?? N(0)} cat={cat} baseTf={baseTf} onChange={(right) => onChange({ ...c, right })} />
       )}
+      {range && <>
+        <span className="meta">and</span>
+        <OperandEditor v={c.right2 ?? N(0)} cat={cat} baseTf={baseTf} onChange={(right2) => onChange({ ...c, right2 })} />
+      </>}
+      {more ? (
+        <span className="algo-operand" data-testid="cond-modifiers">
+          <label className="meta" title="true only when it has held this many bars in a row (2+)">held <NumInput width={36} value={c.for_bars ?? 0} onChange={(n) => setMod("for_bars", n)} /> bars</label>
+          <label className="meta" title="true if it happened at least once in the last N bars (2+), e.g. a crossover 3 bars ago still counts">within last <NumInput width={36} value={c.within_bars ?? 0} onChange={(n) => setMod("within_bars", n)} /> bars</label>
+          <label className="meta" title="the condition must be FALSE"><input type="checkbox" checked={!!c.negate} onChange={(e) => { const x = { ...c }; if (e.target.checked) x.negate = true; else delete x.negate; onChange(x); }} /> NOT</label>
+        </span>
+      ) : <button type="button" className="btn-sm ghost" title="held for N bars, happened within the last N bars, NOT" onClick={() => setMore(true)} data-testid="cond-more">⋯</button>}
     </span>
   );
 }

@@ -45,7 +45,13 @@ SESSION_CLOSE_S = 15 * 3600 + 30 * 60
 TIMEFRAMES = (1, 2, 3, 5, 10, 15, 20, 30, 45, 60, 120)
 COND_TIMEFRAMES = TIMEFRAMES + (1440,)          # 1440 = daily, conditions only
 OPS = (">", "<", ">=", "<=", "==", "!=", "crosses_above", "crosses_below", "crosses",
-       "rising", "falling")
+       "rising", "falling", "between", "outside")
+# An operand's series reshaped before it is compared: its angle, slope, change, … over `xn` bars.
+# angle: degrees of the line's rise over xn bars against ATR(14) of the strategy's candles — a move of one
+# ATR per bar is 45°, so the number means the same on any symbol, price level or chart zoom.
+MAX_LOOKBACK = 500
+TRANSFORMS = ("angle", "slope", "change", "pct_change", "highest", "lowest", "sma", "zscore", "abs")
+MATH = ("+", "-", "*", "/", "pct_diff")
 INSTRUMENTS = ("equity", "future", "option")
 SIZING = ("qty", "lots", "amount", "pct_equity", "risk", "risk_pct")
 STRIKE_MODES = ("ATM", "ITM", "OTM", "PREMIUM")
@@ -319,33 +325,65 @@ def _check_group(g: dict[str, Any], base_tf: int, depth: int = 0) -> None:
             continue
         if c.get("op") not in OPS:
             raise ValueError(f"unknown operator {c.get('op')!r}")
-        for side in ("left", "right"):
+        for k in ("for_bars", "within_bars"):
+            if c.get(k) not in (None, "", 0):
+                c[k] = _num(c[k], k.replace("_", " "), 1, integer=True)
+                if c[k] > 500:
+                    raise ValueError(f"{k.replace('_', ' ')} must be at most 500")
+        if c.get("negate") is not None:
+            c["negate"] = bool(c["negate"])
+        sides = ("left", "right", "right2") if c["op"] in ("between", "outside") else ("left", "right")
+        for side in sides:
             o = c.get(side)
-            if not isinstance(o, dict) or ("ind" not in o and "value" not in o):
+            if not isinstance(o, dict) or ("ind" not in o and "value" not in o and "math" not in o):
                 if side == "right" and c["op"] in ("rising", "falling"):
                     continue
-                raise ValueError(f"condition {side} operand missing")
-            if "ind" not in o:
-                o["value"] = _num(o["value"], f"{side} number", -1e15)
-            if "ind" in o:
-                if o["ind"] not in ind.REGISTRY:
-                    raise ValueError(f"unknown indicator {o['ind']!r}")
-                outs = ind.REGISTRY[o["ind"]][2]
-                if o.get("field") and o["field"] not in outs:
-                    raise ValueError(f"{o['ind']} has no field {o['field']!r} (one of {outs})")
-                tf = int(o.get("tf") or 0)
-                if tf and (tf not in COND_TIMEFRAMES or (tf != 1440 and tf % base_tf)):
-                    raise ValueError(f"{o['ind']}: condition timeframe {tf} must be daily or a multiple "
-                                     f"of the strategy's {base_tf}m")
-                for k in ("mult", "add"):
-                    if o.get(k) not in (None, ""):
-                        o[k] = _num(o[k], k, -1e12)
-                # params are checked (and stored normalized) here, so a bad
-                # length fails on save instead of at the first live bar
-                o["params"] = {k: v for k, v in ind.normalize_params(o["ind"], o.get("params")).items()
-                               if k in (o.get("params") or {})}
-                if o.get("offset") not in (None, ""):
-                    o["offset"] = _num(o["offset"], f"{o['ind']} offset (bars ago)", 0, integer=True)
+                raise ValueError(f"condition {side} operand missing"
+                                 + (" (between / outside need a low and a high)" if side == "right2" else ""))
+            _check_operand(o, side, base_tf)
+
+
+def _check_operand(o: dict[str, Any], side: str, base_tf: int, depth: int = 0) -> None:
+    if o.get("xf") not in (None, ""):
+        if o["xf"] not in TRANSFORMS:
+            raise ValueError(f"unknown transform {o['xf']!r} (one of {TRANSFORMS})")
+        o["xn"] = _num(o.get("xn") or 1, f"{o['xf']} bars", 1, integer=True)
+        if o["xn"] > MAX_LOOKBACK:
+            raise ValueError(f"{o['xf']} bars must be at most {MAX_LOOKBACK}")
+    if "math" in o:
+        if depth >= 3:
+            raise ValueError("combined values nest at most 3 deep")
+        if o["math"] not in MATH:
+            raise ValueError(f"unknown combination {o['math']!r} (one of {MATH})")
+        for k in ("a", "b"):
+            if not isinstance(o.get(k), dict):
+                raise ValueError(f"combined value is missing its {'first' if k == 'a' else 'second'} part")
+            _check_operand(o[k], side, base_tf, depth + 1)
+        for k in ("mult", "add"):
+            if o.get(k) not in (None, ""):
+                o[k] = _num(o[k], k, -1e12)
+        return
+    if "ind" not in o:
+        o["value"] = _num(o["value"], f"{side} number", -1e15)
+    if "ind" in o:
+        if o["ind"] not in ind.REGISTRY:
+            raise ValueError(f"unknown indicator {o['ind']!r}")
+        outs = ind.REGISTRY[o["ind"]][2]
+        if o.get("field") and o["field"] not in outs:
+            raise ValueError(f"{o['ind']} has no field {o['field']!r} (one of {outs})")
+        tf = int(o.get("tf") or 0)
+        if tf and (tf not in COND_TIMEFRAMES or (tf != 1440 and tf % base_tf)):
+            raise ValueError(f"{o['ind']}: condition timeframe {tf} must be daily or a multiple "
+                             f"of the strategy's {base_tf}m")
+        for k in ("mult", "add"):
+            if o.get(k) not in (None, ""):
+                o[k] = _num(o[k], k, -1e12)
+        # params are checked (and stored normalized) here, so a bad
+        # length fails on save instead of at the first live bar
+        o["params"] = {k: v for k, v in ind.normalize_params(o["ind"], o.get("params")).items()
+                       if k in (o.get("params") or {})}
+        if o.get("offset") not in (None, ""):
+            o["offset"] = _num(o["offset"], f"{o['ind']} offset (bars ago)", 0, integer=True)
 
 
 def _walk_operands(spec: dict[str, Any]):
@@ -354,9 +392,15 @@ def _walk_operands(spec: dict[str, Any]):
             if "conditions" in c:
                 yield from walk(c)
             else:
-                for o in (c.get("left"), c.get("right")):
-                    if isinstance(o, dict) and "ind" in o:
-                        yield o
+                for o in (c.get("left"), c.get("right"), c.get("right2")):
+                    yield from leaves(o)
+
+    def leaves(o):
+        if isinstance(o, dict) and "math" in o:
+            yield from leaves(o.get("a"))
+            yield from leaves(o.get("b"))
+        elif isinstance(o, dict) and "ind" in o:
+            yield o
     for k in ("entry_long", "exit_long", "entry_short", "exit_short"):
         yield from walk(spec.get(k))
 
@@ -390,7 +434,26 @@ def warmup_bars(spec: dict[str, Any]) -> int:
             if isinstance(v, (int, float)) and not isinstance(v, bool):
                 longest = max(longest, int(v))
         longest = max(longest, int(o.get("offset") or 0))
+    for xn in _transform_lengths(spec):
+        longest = max(longest, xn)
     return min(1000, 3 * longest + 5)
+
+
+def _transform_lengths(spec: dict[str, Any]):
+    def walk(g):
+        for c in (g or {}).get("conditions", []):
+            if "conditions" in c:
+                yield from walk(c)
+                continue
+            yield int(c.get("for_bars") or 0) + int(c.get("within_bars") or 0)
+            stack = [c.get("left"), c.get("right"), c.get("right2")]
+            while stack:
+                o = stack.pop()
+                if isinstance(o, dict):
+                    yield int(o.get("xn") or 0) if o.get("xf") else 0
+                    stack += [o.get("a"), o.get("b")]
+    for k in ("entry_long", "exit_long", "entry_short", "exit_short"):
+        yield from walk(spec.get(k))
 
 
 # ---- signals ---------------------------------------------------------------
@@ -417,8 +480,60 @@ def _align(d: dict, h: dict, s: ind.S, cache: dict) -> ind.S:
     return [s[j] if j >= 0 else None for j in cache[key]]
 
 
+def _combine(how: str, a: ind.S, b: ind.S) -> ind.S:
+    def f(x, y):
+        if x is None or y is None:
+            return None
+        if how == "+":
+            return x + y
+        if how == "-":
+            return x - y
+        if how == "*":
+            return x * y
+        if how == "/":
+            return x / y if y else None
+        return (x - y) / y * 100 if y else None          # pct_diff: how far a is from b, in % of b
+    return [f(x, y) for x, y in zip(a, b)]
+
+
+def _transform(d: dict, s: ind.S, how: str, n: int, cache: dict) -> ind.S:
+    if how == "abs":
+        return [None if v is None else abs(v) for v in s]
+    if how in ("highest", "lowest", "sma", "zscore"):
+        lo = next((i for i, v in enumerate(s) if v is not None), len(s))
+        if any(v is None for v in s[lo:]):              # a gap mid-series: no window reaches across it
+            return [None] * len(s)
+        fn = {"highest": ind.highest, "lowest": ind.lowest, "sma": ind.sma, "zscore": ind.zscore}[how]
+        return fn(s, n)
+    prev = ind.shift(s, n)
+    if how == "angle":
+        key = ("atr14", id(d))
+        if key not in cache:
+            cache[key] = ind.atr(d, 14)
+        atr = cache[key]
+        return [None if x is None or y is None or not a else math.degrees(math.atan((x - y) / (n * a)))
+                for x, y, a in zip(s, prev, atr)]
+    if how == "slope":
+        return [None if x is None or y is None else (x - y) / n for x, y in zip(s, prev)]
+    if how == "change":
+        return [None if x is None or y is None else x - y for x, y in zip(s, prev)]
+    return [None if x is None or y is None or not y else (x - y) / y * 100 for x, y in zip(s, prev)]   # pct_change
+
+
+def _shape(d: dict, op: dict[str, Any], s: ind.S, cache: dict) -> ind.S:
+    if op.get("xf"):
+        s = _transform(d, s, op["xf"], int(op.get("xn") or 1), cache)
+    mult = float(op.get("mult") if op.get("mult") not in (None, "") else 1)
+    add = float(op.get("add") or 0)
+    if mult != 1 or add:
+        s = [None if v is None else v * mult + add for v in s]
+    return s
+
+
 def series(d: dict, op: dict[str, Any], cache: dict) -> ind.S:
     n = len(d["c"])
+    if "math" in op:
+        return _shape(d, op, _combine(op["math"], series(d, op["a"], cache), series(d, op["b"], cache)), cache)
     if "ind" not in op:
         return [float(op["value"])] * n
     tf = int(op.get("tf") or 0)
@@ -435,14 +550,32 @@ def series(d: dict, op: dict[str, Any], cache: dict) -> ind.S:
     s = ind.shift(s, int(op.get("offset") or 0))
     if src is not d:
         s = _align(d, src, s, cache)
-    mult = float(op.get("mult") if op.get("mult") not in (None, "") else 1)
-    add = float(op.get("add") or 0)
-    if mult != 1 or add:
-        s = [None if v is None else v * mult + add for v in s]
-    return s
+    return _shape(d, op, s, cache)
 
 
 def _cond(d: dict, c: dict[str, Any], cache: dict) -> list[bool]:
+    """A condition per bar, then its modifiers: held for N bars in a row, or true at least once in the
+    last N bars, then NOT."""
+    raw = _cond_raw(d, c, cache)
+    k = int(c.get("for_bars") or 0)
+    if k > 1:
+        run, out = 0, []
+        for v in raw:
+            run = run + 1 if v else 0
+            out.append(run >= k)
+        raw = out
+    w = int(c.get("within_bars") or 0)
+    if w > 1:
+        last, out = -10**9, []
+        for i, v in enumerate(raw):
+            if v:
+                last = i
+            out.append(i - last < w)
+        raw = out
+    return [not v for v in raw] if c.get("negate") else raw
+
+
+def _cond_raw(d: dict, c: dict[str, Any], cache: dict) -> list[bool]:
     op = c["op"]
     a = series(d, c["left"], cache)
     n = len(a)
@@ -452,6 +585,13 @@ def _cond(d: dict, c: dict[str, Any], cache: dict) -> list[bool]:
         return [i >= k and a[i] is not None and a[i - k] is not None and sgn * (a[i] - a[i - k]) > 0
                 for i in range(n)]
     b = series(d, c["right"], cache)
+    if op in ("between", "outside"):
+        b2 = series(d, c["right2"], cache)
+        inside = [x is not None and y is not None and z is not None and min(y, z) <= x <= max(y, z)
+                  for x, y, z in zip(a, b, b2)]
+        if op == "between":
+            return inside
+        return [not v and None not in (x, y, z) for v, x, y, z in zip(inside, a, b, b2)]
     if op.startswith("cross"):
         out = [False] * n
         for i in range(1, n):
