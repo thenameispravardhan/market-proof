@@ -240,27 +240,103 @@ def test_live_scale_out_closes_part_of_each_leg_once(monkeypatch, isolated_db):
         assert (part.status, part.exit_reason, part.note) == ("closed", "SCALE_OUT_1", f"partial exit of #{tid}")
         assert [(lg["qty"], lg["exit"]) for lg in part.legs] == [(65, 129.0), (65, 70.5)]   # broker fills
 
-    # second position: the PE partial is refused -> PE stays 130, CE is halved, level done, nothing re-sent
-    broker.orders.clear()
 
-    async def refuse_pe(account, symbol, side, qty, *, exit_, strategy_id, product="INTRADAY"):
-        broker.orders.append({"symbol": symbol, "qty": qty})
-        return (False, None, "RMS reject") if symbol == "NSE:NIFTYPE" else (True, f"OID{len(broker.orders)}", "ok")
-
-    monkeypatch.setattr(rn, "_order", refuse_pe)
-    tid2 = _open_live_trade(rows[0].strategy_id)
+def _scaled_trade(strategy_id: int, sets: int, levels: list) -> int:
+    tid = _open_live_trade(strategy_id)
     with dbs.SessionLocal() as db:
-        t = db.get(AlgoTrade, tid2)
-        t.legs = [{**lg, "qty": 130} for lg in t.legs]
-        t.scale = {"left": 2, "levels": [[24600.0, 1]], "done": 0}
+        t = db.get(AlgoTrade, tid)
+        t.legs = [{**lg, "qty": 65 * sets, "qty0": 65 * sets} for lg in t.legs]
+        t.scale = {"left": sets, "sets": sets, "levels": levels, "done": 0}
         db.commit()
-    asyncio.run(r._manage([_row_dict(tid2)], {}, T_CLOSE + 60, 10 * 60, DAY0 - 33300))
-    asyncio.run(r._manage([_row_dict(tid2)], {}, T_CLOSE + 61, 10 * 60, DAY0 - 33300))   # next tick: level is spent
-    assert [o["symbol"] for o in broker.orders] == ["NSE:NIFTYPE", "NSE:NIFTYCE"]     # one attempt each, ever
+    return tid
+
+
+def _refusing(broker: FakeBroker, symbol: str):
+    async def order(account, sym, side, qty, *, exit_, strategy_id, product="INTRADAY"):
+        broker.orders.append({"symbol": sym, "qty": qty})
+        return (False, None, "RMS reject") if sym == symbol else (True, f"OID{len(broker.orders)}", "ok")
+    return order
+
+
+PX = {"NSE:NIFTY50-INDEX": 24620.0, "NSE:NIFTYCE": 130.0, "NSE:NIFTYPE": 70.0}
+
+
+def test_scale_out_never_sells_the_hedge_when_the_short_buy_back_fails(monkeypatch, isolated_db):
+    """Written PE buy-back refused -> the CE hedge is NOT reduced (no naked short), the level is spent."""
+    broker = FakeBroker(net={"NSE:NIFTYCE": 130, "NSE:NIFTYPE": -130})
+    _install(monkeypatch, broker, PX)
+    monkeypatch.setattr(rn, "_order", _refusing(broker, "NSE:NIFTYPE"))
+    tid = _scaled_trade(_strategy(), 2, [[24600.0, 1]])
+    r = rn.AlgoRunner()
+    asyncio.run(r._manage([_row_dict(tid)], {}, T_CLOSE + 60, 10 * 60, DAY0 - 33300))
+    asyncio.run(r._manage([_row_dict(tid)], {}, T_CLOSE + 61, 10 * 60, DAY0 - 33300))   # next tick: level is spent
+    assert [o["symbol"] for o in broker.orders] == ["NSE:NIFTYPE"]                     # one attempt, no hedge sale
     with dbs.SessionLocal() as db:
-        t = db.get(AlgoTrade, tid2)
-        assert [lg["qty"] for lg in t.legs] == [65, 130] and t.scale == {"left": 1, "levels": [], "done": 1}
-        assert t.status == "open"
+        t = db.get(AlgoTrade, tid)
+        assert [lg["qty"] for lg in t.legs] == [130, 130] and t.scale["levels"] == [] and t.status == "open"
+
+
+def test_scale_out_after_a_failed_step_still_closes_whole_lots(monkeypatch, isolated_db):
+    broker = FakeBroker(net={"NSE:NIFTYCE": 195, "NSE:NIFTYPE": -195}, fills={"NSE:NIFTYCE": 129.0, "NSE:NIFTYPE": 70.5})
+    _install(monkeypatch, broker, PX)
+    monkeypatch.setattr(rn, "_order", _refusing(broker, "NSE:NIFTYCE"))     # step 1: short bought back, the CE sale fails
+    tid = _scaled_trade(_strategy(), 3, [[24600.0, 1], [24610.0, 1]])
+    r = rn.AlgoRunner()
+    asyncio.run(r._scale_out(_row_dict(tid), PX, T_CLOSE + 60))
+    broker.net = {"NSE:NIFTYCE": 195, "NSE:NIFTYPE": -130}
+    monkeypatch.setattr(rn, "_order", broker.order)
+    asyncio.run(r._scale_out(_row_dict(tid), PX, T_CLOSE + 120))           # past the failed step's retry back-off
+    assert [o["qty"] for o in broker.orders] == [65, 65, 65, 65]       # every partial a whole lot
+    with dbs.SessionLocal() as db:
+        assert [lg["qty"] for lg in db.get(AlgoTrade, tid).legs] == [130, 65]   # CE kept its unsold lot: over-hedged, never naked
+
+
+def test_scale_out_is_never_resent_and_never_double_booked(monkeypatch, isolated_db):
+    """The level is committed before any order: a failure after the orders
+    doesn't resend it. An exit (manual square-off) during an in-flight
+    scale-out waits, then books only what is left."""
+    broker = FakeBroker(net={"NSE:NIFTYCE": 130, "NSE:NIFTYPE": -130}, fills={"NSE:NIFTYCE": 129.0, "NSE:NIFTYPE": 70.5})
+    _install(monkeypatch, broker, PX)
+    sid = _strategy()
+    tid = _scaled_trade(sid, 2, [[24600.0, 1]])
+    r = rn.AlgoRunner()
+
+    def boom(*a, **k):
+        raise RuntimeError("db locked")
+
+    real_split = rn._split
+    monkeypatch.setattr(rn, "_split", boom)
+    with pytest.raises(RuntimeError):
+        asyncio.run(r._scale_out(_row_dict(tid), PX, T_CLOSE + 60))
+    monkeypatch.setattr(rn, "_split", real_split)
+    n = len(broker.orders)
+    asyncio.run(r._manage([_row_dict(tid)], {}, T_CLOSE + 61, 10 * 60, DAY0 - 33300))
+    assert len(broker.orders) == n                                     # not re-sent
+
+    tid2 = _scaled_trade(sid, 2, [[24600.0, 1]])
+    slow_order = broker.order
+
+    async def slow(*a, **k):
+        await asyncio.sleep(0.05)
+        return await slow_order(*a, **k)
+
+    monkeypatch.setattr(rn, "_order", slow)
+
+    async def race():
+        scale = asyncio.ensure_future(r._scale_out(_row_dict(tid2), PX, T_CLOSE + 70))
+        await asyncio.sleep(0.01)
+        manual = await r._exit(_row_dict(tid2), PX, "MANUAL", T_CLOSE + 70)   # stale dict: full size
+        await scale
+        return manual
+
+    assert asyncio.run(race()) is False                                # busy: refused, not interleaved
+    broker.net = {"NSE:NIFTYCE": 65, "NSE:NIFTYPE": -65}
+    assert asyncio.run(r._exit(_row_dict(tid2), PX, "MANUAL", T_CLOSE + 80)) is True
+    with dbs.SessionLocal() as db:
+        rows = db.query(AlgoTrade).filter(AlgoTrade.id >= tid2).all()
+        main = next(x for x in rows if x.id == tid2)
+        assert main.status == "closed" and [lg["qty"] for lg in main.legs] == [65, 65]   # only the remainder
+        assert sum(1 for x in rows if x.note == f"partial exit of #{tid2}") == 1
 
 
 def test_accepted_but_unfilled_exit_keeps_the_trade_open(monkeypatch, isolated_db):
