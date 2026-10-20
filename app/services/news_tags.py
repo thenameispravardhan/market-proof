@@ -11,6 +11,12 @@ the analyzer or the AI. Precision first, because a wrong tag sends the operator 
   "Supreme Court" is not Supreme Industries, "A Bright Idea" is not Vodafone Idea.
 - A name several companies share goes to the largest only when it is 10x the next (data/mcap.csv). Otherwise it
   tags nothing, and still stops a shorter, wronger match: "Reliance Group" never tags RELIANCE.
+- Every listing's name counts (NSE's is often cut short, "STRLNG & WIL REN ENE", BSE's is not), and the usual
+  abbreviations read the same both ways ("Corporation" = "Corp", "Infrastructure" = "Infra").
+- A name that is someone else's channel, fund, event or research desk is not the news: "Zee Business estimate",
+  "SBI Small Cap", "NDTV World Summit", "Motilal Oswal's research report on X", "Motilal Oswal maintains Buy".
+
+Measured on hand-labelled headlines and article leads from the live News page: app/tests/test_news_tags_eval.py.
 """
 from __future__ import annotations
 
@@ -47,10 +53,54 @@ COMMON = {"apex", "bright", "clean", "crest", "crown", "data", "deep", "delta", 
 # Words a name's start needs more than: "Indian Energy" is no company until "Exchange" follows it.
 _PLAIN = {w.upper() for w in COMMON} | {"INDIAN", "NATIONAL", "NEW", "FIRST", "UNITED", "GENERAL", "STATE",
                                         "CENTRAL", "ASIAN", "INTERNATIONAL", "BHARAT", "HINDUSTAN", "TAMIL", "UTTAR",
-                                        "WEST", "SOUTH", "NORTH", "EAST", "WORLD", "DIGITAL", "SHRI", "SRI", "JAI"}
-# Phrases that are a company's name with "of India" cut, or its start, but mean something else in a headline.
+                                        "WEST", "SOUTH", "NORTH", "EAST", "WORLD", "DIGITAL", "SHRI", "SRI", "JAI",
+                                        "INTL"}
+# Phrases that are a company's name with "of India" cut, or its start, but mean something else in a headline; and
+# channels, desks and arms quoted for someone else's news ("told Zee Business", "Kotak Securities' head of research").
 _GENERIC = ("Central Bank", "New India", "Life Insurance", "General Insurance", "Indian Railway", "Indian Railways",
-            "Indian Bank Association", "State Government", "Union Government", "National Stock", "Dalal Street")
+            "Indian Bank Association", "State Government", "Union Government", "National Stock", "Dalal Street",
+            "Reserve Bank", "Reserve Bank of India", "Multi Commodity Exchange", "Zee Business", "Zee News",
+            "NDTV Profit", "Kotak Securities", "Kotak Institutional Equities", "HDFC Securities", "Axis Securities",
+            "SBI Securities", "Nuvama Institutional Equities", "Nuvama Wealth", "Motilal Oswal Wealth",
+            "Motilal Oswal AMC", "Motilal Oswal Mutual Fund", "IIFL Securities", "LKP Securities", "Tata Trusts",
+            "National Stock Exchange", "Bombay Stock Exchange", "Uday Kotak", "Jammu and Kashmir", "Andhra Pradesh",
+            "Madhya Pradesh", "Uttar Pradesh", "Himachal Pradesh", "Arunachal Pradesh", "West Bengal", "Tamil Nadu")
+# Brokers and rating agencies: in an article they are quoted ("said X, head of research at Motilal Oswal"), not
+# reported on. In prose they never count; a headline still tags them ("Motilal Oswal Q2 profit jumps").
+_QUOTED = frozenset({"MOTILALOFS", "EMKAY", "IIFLCAPS", "NUVAMA", "JMFINANCIL", "ANANDRATHI", "GEOJITFSL",
+                     "CHOICEIN", "SMCGLOBAL", "ARIHANTCAP", "LKPSEC", "RELIGARE", "CRISIL", "ICRA", "CARERATING"})
+# Words right after a name that make it someone else's: a fund, an insurer it part-owns, an event, a channel's
+# poll, a broker's report. One or two words, as _key spells them.
+_TAILS = frozenset({"METLIFE", "MF", "MUTUAL", "MUTUALFUND", "SMALLCAP", "MIDCAP", "LARGECAP", "FLEXICAP",
+                    "MULTICAP", "BLUECHIP", "CONCLAVE", "SUMMIT", "WORLDSUMMIT", "FOUNDATION", "ESTIMATE", "POLL",
+                    "RESEARCHREPORT", "ETF", "AMC", "SMALLCAPFUND"})
+# A broker's verb on someone else's stock: "PNB Q2: Motilal Oswal maintains Buy" is PNB's news.
+_RATES = frozenset({"MAINTAINS", "RETAINS", "REITERATES", "UPGRADES", "DOWNGRADES", "INITIATES", "ASSIGNS"})
+# Spellings the master never uses, read the same: both sides of a match go through _key.
+_CANON = {"COMPANY": "CO", "CORPORATION": "CORP", "INDUSTRIES": "IND", "INDS": "IND", "TECHNOLOGIES": "TECH",
+          "TECHNOLOGY": "TECH", "LABORATORIES": "LABS", "LABORATORY": "LABS", "PHARMACEUTICALS": "PHARMA",
+          "PHARMACEUTICAL": "PHARMA", "ENGINEERING": "ENGG", "INTERNATIONAL": "INTL", "COMMUNICATIONS": "COMM",
+          "COMMUNICATION": "COMM", "FERTILISERS": "FERT", "FERTILIZERS": "FERT", "CHEMICALS": "CHEM",
+          "SERVICES": "SERV", "INFRASTRUCTURE": "INFRA", "ELECTRICALS": "ELEC", "MANUFACTURING": "MFG"}
+# A capital-letter ticker in prose (a summary, an article) is often an abbreviation ("GTV", "AGI", "MRP"): there it
+# counts only for a company this big (Rs crore, data/mcap.csv) or written as a ticker, "NSE: KROSS". In a headline
+# the bar is lower; a listing with no market cap counts only when NSE lists it (a new listing). Either way, capitals
+# in brackets that spell the words before them are those words, abbreviated: "input tax credit (ITC)".
+# ponytail: two fixed bars, tune them against app/tests/test_news_tags_eval.py if the misses move.
+_CAPS_MCAP = {False: 1_000, True: 5_000}
+_TICKER_MARK = re.compile(r"\b(?:NSE|BSE)\s?[:-]\s?$")
+# Fyers lists funds and bonds as equities; they are never a headline's company.
+_NOT_COMPANY = re.compile(r"\bETF\b|\bFUND\b|MUTUAL|%|\bBEES\b|\bINDEX\b")
+# Text around an article's story: "Also Read: <another story>", trending-stock widgets, sign-up pleas.
+_JUNK_LINE = re.compile(
+    r"^\W*(?:also\s+read|read\s+(?:more|also)|also\s+(?:see|watch|check)|watch\s*[:|]|check\s+out|related\s*(?:[:|]|"
+    r"news|stories|articles)|recommended|top\s+trending|trending\s+(?:stocks|news|topics)|disclaimer|what's moving|"
+    r"subscribe|download\s+the|follow\s+us|catch\s+all|listen\s+to\s+this|you\s+may\s+also|more\s+from|must\s+read|"
+    r"don't\s+miss|first\s+published|published\s+(?:on|at)|updated\s+(?:on|at))", re.I)
+_JUNK_TAIL = re.compile(r"\b(?:also\s+read|read\s+(?:more|also))\s*[:|-].*$", re.I)
+_BULLET = re.compile(r"^\s*[-•*]\s+")              # "- US Suspends Infosys, TCS ... From Green Card Programme": a link
+_LEAD = 2000                                      # an article's lead: later paragraphs name peers and brokers
+_OPENING = 300                                    # a name this early in the lead is the story's, even once
 # Aliases that are everyday words, read in prose (a summary, an article) only past a sentence's first word:
 # "Persistent rain is forecast" names no company.
 _OPENER = re.compile(r"(^|[.!?][\"'’”]?\s+)(Persistent|Eternal|Mankind)\b")
@@ -146,7 +196,18 @@ ALIASES: dict[str, tuple[str, ...]] = {
     "Jindal Steel": ("JINDALSTEL",), "Vedanta": ("VEDL",), "Hindustan Zinc": ("HINDZINC",),
     "Hindustan Copper": ("HINDCOPPER",), "Nalco": ("NATIONALUM",), "NALCO": ("NATIONALUM",), "NMDC": ("NMDC",),
     "NLC": ("NLCINDIA",), "NLC India": ("NLCINDIA",), "GMR Airports": ("GMRAIRPORT",), "DLF": ("DLF",),
+    # short names, brands and spellings headlines use that no master name spells
+    "D-Mart": ("DMART",), "Voda Idea": ("IDEA",), "Vodafone-Idea": ("IDEA",), "TechM": ("TECHM",),
+    "CSB": ("CSBBANK",), "RInfra": ("RELINFRA",), "R-Infra": ("RELINFRA",), "R Infra": ("RELINFRA",),
+    "LTIMindtree": ("LTM", "LTIM"), "LTI Mindtree": ("LTM", "LTIM"), "ixigo": ("IXIGO",),
+    "Nazara": ("NAZARA",), "AceVector": ("ACEVECTOR",), "Snapdeal": ("ACEVECTOR",), "FirstCry": ("FIRSTCRY",),
+    "Puravankara": ("PURVA",), "Shree Renuka": ("RENUKA",), "Renuka Sugars": ("RENUKA",), "Lodha": ("LODHA",),
+    "Macrotech": ("LODHA",), "Ather": ("ATHERENERG",), "Delhivery": ("DELHIVERY",), "Mamaearth": ("HONASA",),
+    "Blinkit": ("ETERNAL",), "Instamart": ("SWIGGY",), "Tanishq": ("TITAN",), "Zudio": ("TRENT",),
+    "Max Healthcare": ("MAXHEALTH",), "Max Financial": ("MFSL",), "Pine Labs": ("PINELABS",),
+    "Hitachi Energy India": ("POWERINDIA",), "Bajaj Hindusthan": ("BAJAJHIND",), "Gallant Ispat": ("GALLANTT",),
 }
+_LOWER = {"IXIGO"}                                  # brands written in lower case: "ixigo swings to profit"
 
 
 # Capital words that are a sector, a market body or a macro term in news, whatever ticker shares them:
@@ -156,14 +217,15 @@ _NOT_TICKERS = frozenset({"IT", "AI", "EV", "EVS", "US", "UK", "EU", "PM", "MD",
                           "SME", "MSME", "PSU", "PSUS", "FMCG", "NBFC", "NBFCS", "ETF", "ETFS", "OMC", "OMCS"})
 
 
-def _key(word: str) -> str:
-    """One word as the index spells it: capitals, no possessive, letters/digits/& only; "and" is "&"."""
+def _key(word: str, canon: bool = True) -> str:
+    """One word as the index spells it: capitals, no possessive, letters/digits/& only; "and" is "&"; with canon,
+    the master's abbreviation ("Corporation" -> "CORP")."""
     w = _NONKEY.sub("", _POSSESSIVE.sub("", word.upper()))
-    return "&" if w == "AND" else w
+    return "&" if w == "AND" else _CANON.get(w, w) if canon else w
 
 
-def _words(text: str) -> list[str]:
-    return [k for k in map(_key, _WORD.findall(text)) if k]
+def _words(text: str, canon: bool = True) -> list[str]:
+    return [k for k in (_key(w, canon) for w in _WORD.findall(text)) if k]
 
 
 def _cuts(ticker: str, words: list[str]) -> bool:
@@ -201,7 +263,9 @@ class _Index:
     multi: dict[str, Optional[str]] = field(default_factory=dict)    # "TATASTEEL" -> symbol; None claims the words
     single: dict[str, Optional[str]] = field(default_factory=dict)   # one-word ALIASES
     caps: dict[str, str] = field(default_factory=dict)               # one-word tickers, matched when in ALL CAPS
+    solo: dict[str, str] = field(default_factory=dict)               # a name's own first word: "Kross shares"
     prefixes: set[str] = field(default_factory=set)                  # every start of a multi key: when to stop
+    big: dict[str, Optional[float]] = field(default_factory=dict)    # caps symbol -> mcap (None: unknown)
 
 
 _cache: dict[str, _Index] = {}
@@ -240,42 +304,65 @@ def _index() -> _Index:
     if any(i.name for i in eq):
         eq = [i for i in eq if i.name]
     listings: dict[str, Instrument] = {}             # short name -> its best listing: NSE first, then the -EQ series
+    names: dict[str, set[str]] = {}                  # short name -> every listing's name (NSE's is often cut short)
     for inst in eq:
         cur = listings.get(inst.short_name)
         if cur is None or _rank(inst) < _rank(cur):
             listings[inst.short_name] = inst
+        names.setdefault(inst.short_name, set()).add(inst.name)
     ix = _Index(sig=sig)
     cand: dict[str, set[str]] = {}
     pref: dict[str, set[str]] = {}                   # the first 2+ words of a name: a cut name's start still matches
+    first: dict[str, set[str]] = {}                  # a name's first word, for "Kross shares"
     for short, inst in listings.items():
-        tk = "".join(_words(short))                  # BAJAJ-AUTO -> BAJAJAUTO, M&M stays
+        if any(_NOT_COMPANY.search(n.upper()) for n in names[short]):
+            continue                                 # an ETF / a fund / a bond
+        tk = "".join(_words(short, canon=False))     # BAJAJ-AUTO -> BAJAJAUTO, M&M stays
         if not tk:
             continue
         if re.fullmatch(r"[A-Z0-9&]+", short) and len(short) >= 2 and short not in _NOT_CAPS:
             ix.caps[tk] = inst.symbol
-        variants = [w for w in _names(inst.name) if w]
-        full = variants[0] if variants else []
-        if len(full) == 1:                           # "Kamdhenu Ltd": the suffix makes a one-word name a company
-            for sfx in ("LTD", "LIMITED"):
-                cand.setdefault(full[0] + sfx, set()).add(short)
-        named = len(full) >= 2 and not (full[-1] in _SERIES and "".join(full[:-1]) == tk)
-        if named:
-            for w in variants:
-                if len(w) >= 2 and w[-1] not in _CONNECT:
-                    cand.setdefault("".join(w), set()).add(short)
-            if _cuts(tk, full):
-                cand.setdefault(tk, set()).add(short)
-            # "Himadri Speciality" for "HIMADRI SPECIALITY CHEM": a start led by a real word ("8.58% HUDCO", "P B M
-            # Polytex", "Shri Krishna ..." are no company's start in a headline)
-            if full[0].isalpha() and full[0] not in _PLAIN and all(len(w) > 1 for w in full[:2]):
-                for n in range(2, len(full)):
-                    if full[n - 1] not in _CONNECT:
-                        pref.setdefault("".join(full[:n]), set()).add(short)
-        else:                                        # the seed and old CSVs have no names: any 2+ words that spell it
-            cand.setdefault(tk, set()).add(short)
+            cap = mcap.lookup(short)
+            ix.big[tk] = cap if cap is not None or inst.exchange == "NSE" else 0.0
+        for name in sorted(names[short]):
+            variants = [w for w in _names(name) if w]
+            full = variants[0] if variants else []
+            if len(full) == 1:                       # "Kamdhenu Ltd": the suffix makes a one-word name a company
+                for sfx in ("LTD", "LIMITED"):
+                    cand.setdefault(full[0] + sfx, set()).add(short)
+            # a one-word name of its own ("KROSS LIMITED"), not an Indian arm's ("ABBOTT INDIA": "Abbott shares" is
+            # mostly the US stock) and not the start of a longer one ("Health share" is no HEALTH X PLATFORM)
+            if len(full) == 1 and full[0].isalpha() and len(full[0]) >= 4 and full[0] not in _PLAIN:
+                first.setdefault(full[0], set()).add(short)
+            named = len(full) >= 2 and not (full[-1] in _SERIES and "".join(full[:-1]) == tk)
+            if named:
+                for w in variants:
+                    if len(w) >= 2 and w[-1] not in _CONNECT:
+                        cand.setdefault("".join(w), set()).add(short)
+                # SUNPHARMA = "Sun Pharma"; not when both words are everyday ones ("North East India" is no EASTINDIA)
+                if _cuts(tk, full) and not (full[0] in _PLAIN and full[1] in _PLAIN):
+                    cand.setdefault(tk, set()).add(short)
+                # "Himadri Speciality" for "HIMADRI SPECIALITY CHEM": a start led by a real word ("8.58% HUDCO", "P B
+                # M Polytex", "Shri Krishna ..." are no company's start in a headline)
+                if full[0].isalpha() and full[0] not in _PLAIN and all(len(w) > 1 for w in full[:2] if w != "&"):
+                    for n in range(2, len(full)):
+                        if full[n - 1] not in _CONNECT:
+                            pref.setdefault("".join(full[:n]), set()).add(short)
+                # Fyers cuts a name at 30 characters, often inside its last word ("Silver Pearl Hospitality & Lux")
+                cut = full[:-1]
+                while len(name) >= 28 and cut and cut[-1] in _CONNECT:
+                    cut = cut[:-1]
+                if len(name) >= 28 and len(cut) >= 3:
+                    cand.setdefault("".join(cut), set()).add(short)
+            else:                                    # the seed and old CSVs have no names: any 2+ words that spell it
+                cand.setdefault("".join(_words(short)), set()).add(short)
     for k, shorts in [*pref.items(), *cand.items()]:  # a whole name wins over another name's start
         best = _pick(shorts)
         ix.multi[k] = listings[best].symbol if best else None
+    for w, shorts in first.items():                  # one company's first word, and a listed one of some size
+        s = next(iter(shorts))
+        if len(shorts) == 1 and w.lower() not in COMMON and ((mcap.lookup(s) or 0) >= 500 or listings[s].exchange == "NSE"):
+            ix.solo[w] = listings[s].symbol
     for g in _GENERIC:
         ix.multi["".join(_words(g))] = None
     for alias, tickers in ALIASES.items():
@@ -288,13 +375,40 @@ def _index() -> _Index:
     return ix
 
 
-def _scan(text: str, ix: _Index, lenient: bool = False, short_caps: bool = True) -> list[str]:
-    raw = _WORD.findall(text)
+_SHARES = frozenset({"SHARES", "SHARE", "STOCK", "SCRIP"})
+
+
+def _fund(after: list[str]) -> bool:
+    """The name opens a fund's: "Motilal Oswal Active Momentum Fund" (capitalised words up to "Fund")."""
+    for w in after:
+        if not w[0].isupper():
+            return False
+        if _key(w) == "FUND":
+            return True
+    return False
+
+
+def _spelled(ticker: str, before: list[str], gap: str) -> bool:
+    """Capitals in brackets that are the initials of the words before them: "gross transaction value (GTV)",
+    "Kothari Industrial Corporation Ltd (KICL)". Those words were the mention; the brackets add none."""
+    if not gap.endswith("("):
+        return False
+    initials = "".join(w[0].upper() for w in before if _key(w, canon=False) not in _CONNECT and w.lower() != "and")
+    return initials.endswith(ticker)
+
+
+def _hits(text: str, ix: _Index, lenient: bool = False, short_caps: bool = True,
+          prose: bool = False) -> list[tuple[str, int]]:
+    """Every listed company the text names, in reading order, as (symbol, character offset); repeats kept."""
+    ms = list(_WORD.finditer(text))
+    raw = [m[0] for m in ms]
     keys = [_key(w) for w in raw]
+    plain = [_key(w, canon=False) for w in raw]      # a ticker or a one-word name, as written
     letters = [c for c in text if c.isalpha()]
     shouting = len(letters) > 12 and sum(c.isupper() for c in letters) > 0.7 * len(letters)
     cap = lambda w: w[0].isupper() or w[0].isdigit() or _key(w) in _CONNECT or w.lower() == "and"   # noqa: E731
-    out: list[str] = []
+    out: list[tuple[str, int, bool]] = []
+    end = 0                                          # where the last hit's words end
     i = 0
     while i < len(raw):
         n, hit, k = 1, None, ""
@@ -302,18 +416,45 @@ def _scan(text: str, ix: _Index, lenient: bool = False, short_caps: bool = True)
             k += keys[j]
             if k not in ix.prefixes:
                 break
-            if j > i and k in ix.multi and (lenient or all(map(cap, raw[i:j + 1]))):
+            if j > i and k in ix.multi and (lenient or (cap(raw[i]) and keys[i] not in _CONNECT
+                                                        and all(map(cap, raw[i:j + 1])))):
                 n, hit = j - i + 1, ix.multi[k]
         if n == 1:
-            w, k = raw[i], keys[i]
-            if k in ix.single and (lenient or w[0].isupper()):
+            w, k, p = raw[i], keys[i], plain[i]
+            if k in ix.single and (lenient or w[0].isupper() or k in _LOWER):
                 hit = ix.single[k]
-            elif (k in ix.caps and k not in _NOT_TICKERS and (short_caps or len(w) > 2)
+            elif (p in ix.caps and p not in _NOT_TICKERS and (short_caps or len(w) > 2)
                   and ((w.isupper() and not shouting) or (lenient and w.lower() not in COMMON))):
-                hit = ix.caps[k]
-        if hit and hit not in out:
-            out.append(hit)
+                big = ix.big.get(p)
+                marked = bool(_TICKER_MARK.search(text[max(0, ms[i].start() - 6):ms[i].start()]))
+                if (lenient or marked or (big is None and not prose) or (big or 0) >= _CAPS_MCAP[prose]) \
+                        and not _spelled(p, raw[max(0, i - 8):i], text[max(0, ms[i].start() - 2):ms[i].start()]):
+                    hit = ix.caps[p]
+            elif (p in ix.solo and w[0].isupper() and not shouting
+                  and ((i + 1 < len(raw) and plain[i + 1] in _SHARES) or (i >= 2 and plain[i - 2] == "SHARES"
+                                                                         and plain[i - 1] == "OF"))):
+                hit = ix.solo[p]                    # "Kross shares rally", "shares of Kross"
+        after = keys[i + n:i + n + 2]
+        if hit and (after[:1] and after[0] in _TAILS or "".join(after) in _TAILS or _fund(raw[i + n:i + n + 4])):
+            hit = None                               # "SBI Small Cap", "PNB MetLife", "Motilal Oswal Active Momentum Fund"
+        if hit and prose and hit.split(":")[-1].rsplit("-", 1)[0] in _QUOTED:
+            hit = None
+        if hit and out and out[-1][0] == hit and text[end:ms[i].start()].strip() == "(":
+            hit = None                               # "Larsen & Toubro (L&T)" names it once
+        if hit:
+            out.append((hit, ms[i].start(), bool(after) and after[0] in _RATES))
+            end = ms[i + n - 1].end()
         i += n
+    if any(not rated for _, _, rated in out):        # "Motilal Oswal maintains Buy" on another named stock
+        out = [h for h in out if not h[2]]
+    return [(s, at) for s, at, _ in out]
+
+
+def _scan(text: str, ix: _Index, lenient: bool = False, short_caps: bool = True, prose: bool = False) -> list[str]:
+    out: list[str] = []
+    for s, _ in _hits(text, ix, lenient, short_caps, prose):
+        if s not in out:
+            out.append(s)
     return out
 
 
@@ -455,12 +596,35 @@ def figures(text: Optional[str], limit: int = 8) -> list[str]:
 def _tag(title: str, summary: str, sig: tuple) -> tuple[tuple[str, ...], tuple[str, ...], int]:
     ix = _cache["ix"]
     m = _BROKER.match(title)
-    found = _scan(m[1] if m else title, ix)[:MAX_STOCKS] or _scan(_prose(summary), ix)[:2]
+    found = _scan(m[1] if m else title, ix)[:MAX_STOCKS] or _scan(_prose(summary), ix, prose=True)[:2]
     return tuple(found), tuple(kinds(title)), tone(title)
 
 
 def _prose(text: str) -> str:
     return _OPENER.sub(lambda m: m[1] + m[2].lower(), text)
+
+
+def _lead(text: Optional[str]) -> str:
+    """An article's lead without what surrounds the story ("Also Read: ...", trending-stock widgets, sign-up
+    pleas): its first _LEAD characters."""
+    lines = (_JUNK_TAIL.sub("", ln) for ln in (text or "")[:4 * _LEAD].splitlines()
+             if not _JUNK_LINE.match(ln) and not (_BULLET.match(ln) and _titled(ln)))
+    return _prose("\n".join(ln for ln in lines if ln.strip())[:_LEAD])
+
+
+def _titled(line: str) -> bool:
+    """Most longer words capitalised: a headline (of a linked story), not a sentence."""
+    ws = [w for w in _WORD.findall(line) if len(w) > 3]
+    return len(ws) >= 4 and sum(w[0].isupper() for w in ws) >= 0.7 * len(ws)
+
+
+def _lead_stocks(text: Optional[str], ix: _Index) -> list[str]:
+    """The stocks an article's lead is about: named in its opening, or named twice. A peer or a broker named once
+    further down is a passing mention. In order of first mention."""
+    seen: dict[str, list[int]] = {}
+    for s, at in _hits(_lead(text), ix, short_caps=False, prose=True):
+        seen.setdefault(s, []).append(at)
+    return [s for s, ats in seen.items() if ats[0] < _OPENING or len(ats) > 1]
 
 
 def tag(title: str, summary: Optional[str] = None) -> dict[str, list[str]]:
@@ -485,9 +649,9 @@ def find(title: str, summary: Optional[str] = None, text: Optional[str] = None) 
     try:
         ix = _index()
         m = _BROKER.match(title)
-        out: list[str] = []
-        for part in (m[1] if m else title, _prose(summary or ""), _prose((text or "")[:2000])):
-            out += [s for s in _scan(part, ix) if s not in out]
+        out = _scan(m[1] if m else title, ix)
+        for got in (_scan(_prose(summary or ""), ix, prose=True), _lead_stocks(text, ix)):
+            out += [s for s in got if s not in out]
         return out[:6]
     except Exception:  # noqa: BLE001
         log.exception("news_tags.find_failed", title=title[:120])
@@ -495,10 +659,11 @@ def find(title: str, summary: Optional[str] = None, text: Optional[str] = None) 
 
 
 def text_stocks(text: Optional[str]) -> list[str]:
-    """Stocks an article's lead (first 2,000 characters) names, for a headline that names none. Stricter than a
-    headline: a two-letter capital word is prose there ("the IT sector"), not a ticker. At most three."""
+    """Stocks an article's lead (first 2,000 characters, widgets dropped) is about, for a headline that names none.
+    Stricter than a headline: a two-letter capital word is prose there ("the IT sector"), not a ticker, and a name
+    met once past the opening is a passing mention. At most three."""
     try:
-        return _scan(_prose((text or "")[:2000]), _index(), short_caps=False)[:3]
+        return _lead_stocks(text, _index())[:3]
     except Exception:  # noqa: BLE001
         log.exception("news_tags.text_stocks_failed")
         return []
