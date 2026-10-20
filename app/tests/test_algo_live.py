@@ -350,3 +350,136 @@ def test_accepted_but_unfilled_exit_keeps_the_trade_open(monkeypatch, isolated_d
     assert broker.cancelled == ["OID1"]        # cancelled first, so the retry can't double the exit
     with dbs.SessionLocal() as db:
         assert db.get(AlgoTrade, tid).status == "open"
+
+
+# ---- per-leg stops, entry / exit rules on the option position ----
+
+def _strangle_strategy(on_leg_stop=None, **spec_kw) -> tuple[int, dict]:
+    legs = [{"right": "CE", "action": "SELL", "strike": "OTM", "steps": 2, "lots": 1, "sl_pct": 30},
+            {"right": "PE", "action": "SELL", "strike": "OTM", "steps": 2, "lots": 1, "sl_pct": 30}]
+    spec = _opt_spec(direction="long", sizing={"mode": "lots", "value": 1}, **spec_kw,
+                     instrument={"type": "option", "levels_on": "underlying", "legs_long": legs,
+                                 **({"on_leg_stop": on_leg_stop} if on_leg_stop else {})})
+    with dbs.SessionLocal() as db:
+        acc = BrokerAccount(name="live", broker="fyers", paper_mode=False, enabled=True, access_token="t")
+        db.add(acc)
+        db.flush()
+        s = AlgoStrategy(name="live-strangle", spec=spec, enabled=True, mode="live", account_id=acc.id)
+        db.add(s)
+        db.commit()
+        return s.id, spec
+
+
+def _short_strangle_trade(strategy_id: int) -> int:
+    with dbs.SessionLocal() as db:
+        t = AlgoTrade(strategy_id=strategy_id, symbol="NSE:NIFTY50-INDEX", side="BUY", quantity=65,
+                      mode="live", status="open", entry_price=24570.0,
+                      entry_at=rn._utc(T_CLOSE).replace(tzinfo=None), ref="u", ref_sign=1,
+                      legs=[{"symbol": "NSE:NIFTYCE", "kind": "CE", "act": -1, "qty": 65, "entry": 100.0, "label": "CE",
+                             "per_set": 65, "sl": 130.0},
+                            {"symbol": "NSE:NIFTYPE", "kind": "PE", "act": -1, "qty": 65, "entry": 90.0, "label": "PE",
+                             "per_set": 65, "sl": 117.0}])
+        db.add(t)
+        db.commit()
+        return t.id
+
+
+def _manage_at(r: rn.AlgoRunner, sid: int, spec: dict, tid: int, px: dict) -> None:
+    now = T_CLOSE + 120
+    mins = int((now + rn.IST) % 86400) // 60
+    asyncio.run(r._manage([_row_dict(tid)], {sid: {"spec": spec}}, now, mins, now - (now + rn.IST) % 86400))
+
+
+def test_live_leg_stop_closes_that_leg_then_the_rest_at_cost(monkeypatch, isolated_db):
+    """The put's own stop buys back only the put; with on_leg_stop=cost the
+    call's stop moves to its entry, and when the call returns there it exits
+    too — one closed position with both legs' fills."""
+    px = {"NSE:NIFTY50-INDEX": 24400.0, "NSE:NIFTYCE": 95.0, "NSE:NIFTYPE": 120.0}
+    broker = FakeBroker(net={"NSE:NIFTYCE": -65, "NSE:NIFTYPE": -65}, fills={"NSE:NIFTYPE": 120.5, "NSE:NIFTYCE": 101.0})
+    _install(monkeypatch, broker, px)
+    sid, spec = _strangle_strategy("cost")
+    tid = _short_strangle_trade(sid)
+    r = rn.AlgoRunner()
+    _manage_at(r, sid, spec, tid, px)
+    assert [(o["symbol"], o["side"], o["qty"], o["exit"]) for o in broker.orders] == [("NSE:NIFTYPE", "BUY", 65, True)]
+    row = _row_dict(tid)
+    assert row["status"] == "open"
+    ce, pe = row["legs"]
+    assert (pe["exit"], pe["exit_reason"]) == (120.5, "LEG_SL") and "exit" not in ce
+    assert ce["sl"] == 100.0 and ce["at_cost"] is True                  # moved to cost
+    px.update({"NSE:NIFTYCE": 101.0})
+    _manage_at(r, sid, spec, tid, px)
+    assert [o["symbol"] for o in broker.orders] == ["NSE:NIFTYPE", "NSE:NIFTYCE"]
+    with dbs.SessionLocal() as db:
+        t = db.get(AlgoTrade, tid)
+        assert t.status == "closed" and t.exit_reason == "LEG_COST"
+        assert t.gross_pnl == pytest.approx(-(101.0 - 100.0) * 65 - (120.5 - 90.0) * 65)
+
+
+def test_live_leg_stop_can_exit_every_leg(monkeypatch, isolated_db):
+    px = {"NSE:NIFTY50-INDEX": 24400.0, "NSE:NIFTYCE": 95.0, "NSE:NIFTYPE": 120.0}
+    broker = FakeBroker(net={"NSE:NIFTYCE": -65, "NSE:NIFTYPE": -65}, fills={"NSE:NIFTYPE": 120.0, "NSE:NIFTYCE": 95.0})
+    _install(monkeypatch, broker, px)
+    sid, spec = _strangle_strategy("all")
+    tid = _short_strangle_trade(sid)
+    _manage_at(rn.AlgoRunner(), sid, spec, tid, px)
+    assert sorted(o["symbol"] for o in broker.orders) == ["NSE:NIFTYCE", "NSE:NIFTYPE"]
+    with dbs.SessionLocal() as db:
+        assert db.get(AlgoTrade, tid).exit_reason == "LEG_SL"
+
+
+def _legs_with_contracts(px: dict):
+    async def legs(spec_, sym, side, u, now):
+        exp = T_CLOSE + 5 * 86400
+        return [{"symbol": "NSE:NIFTYCE", "kind": "CE", "act": -1, "per_set": 65, "label": "CE", "K": 24700, "exp": exp,
+                 "price": px["NSE:NIFTYCE"], "sl_pct": 30},
+                {"symbol": "NSE:NIFTYPE", "kind": "PE", "act": -1, "per_set": 65, "label": "PE", "K": 24400, "exp": exp,
+                 "price": px["NSE:NIFTYPE"], "sl_pct": 30}]
+    return legs
+
+
+def test_live_entry_rules_use_live_premiums(monkeypatch, isolated_db):
+    px = {"NSE:NIFTY50-INDEX": 24570.0, "NSE:NIFTYCE": 60.0, "NSE:NIFTYPE": 55.0}
+    broker = FakeBroker(fills={"NSE:NIFTYCE": 60.0, "NSE:NIFTYPE": 55.0})
+    _install(monkeypatch, broker, px)
+    monkeypatch.setattr(rn, "build_legs", _legs_with_contracts(px))
+    _strangle_strategy(position_rules={"entry": [{"metric": "credit", "op": ">=", "value": 10000}]})
+    r = rn.AlgoRunner()
+    asyncio.run(r.tick(T_CLOSE))
+    assert broker.orders == []                                          # (60 + 55) x 65 = ₹7,475 < ₹10,000
+    assert any("entry rule credit >= 10000 not met" in e["msg"] for e in r.events)
+
+
+def test_live_entry_sets_each_legs_stop_from_its_fill(monkeypatch, isolated_db):
+    px = {"NSE:NIFTY50-INDEX": 24570.0, "NSE:NIFTYCE": 60.0, "NSE:NIFTYPE": 55.0}
+    broker = FakeBroker(fills={"NSE:NIFTYCE": 62.0, "NSE:NIFTYPE": 54.0})
+    _install(monkeypatch, broker, px)
+    monkeypatch.setattr(rn, "build_legs", _legs_with_contracts(px))
+    _strangle_strategy(position_rules={"entry": [{"metric": "abs_delta", "op": "<=", "value": 0.5}]})
+    asyncio.run(rn.AlgoRunner().tick(T_CLOSE))
+    with dbs.SessionLocal() as db:
+        t = db.query(AlgoTrade).one()
+        assert t.status == "open"
+        assert [(lg["entry"], lg["sl"], lg["per_set"]) for lg in t.legs] == [
+            (62.0, pytest.approx(80.6), 65), (54.0, pytest.approx(70.2), 65)]    # +30% of each fill
+
+
+def test_live_exit_rule_on_the_bar_close(monkeypatch, isolated_db):
+    px = {"NSE:NIFTY50-INDEX": 24570.0, "NSE:NIFTYCE": 60.0, "NSE:NIFTYPE": 55.0}
+    broker = FakeBroker(net={"NSE:NIFTYCE": -65, "NSE:NIFTYPE": -65}, fills={"NSE:NIFTYCE": 60.0, "NSE:NIFTYPE": 55.0})
+    _install(monkeypatch, broker, px)
+    sid, spec = _strangle_strategy(position_rules={"exit": [{"metric": "pnl_pct", "op": ">=", "value": 20}]})
+    exp = T_CLOSE + 5 * 86400
+    with dbs.SessionLocal() as db:
+        db.add(AlgoTrade(strategy_id=sid, symbol="NSE:NIFTY50-INDEX", side="BUY", quantity=65, mode="live", status="open",
+                         entry_price=24570.0, entry_at=rn._utc(T_CLOSE - 3600).replace(tzinfo=None), ref="u", ref_sign=1,
+                         legs=[{"symbol": "NSE:NIFTYCE", "kind": "CE", "act": -1, "qty": 65, "entry": 80.0, "label": "CE",
+                                "K": 24700, "exp": exp, "per_set": 65},
+                               {"symbol": "NSE:NIFTYPE", "kind": "PE", "act": -1, "qty": 65, "entry": 70.0, "label": "PE",
+                                "K": 24400, "exp": exp, "per_set": 65}]))
+        db.commit()
+    r = rn.AlgoRunner()
+    asyncio.run(r.tick(T_CLOSE))                                        # premiums 150 -> 115: 23% of the credit kept
+    with dbs.SessionLocal() as db:
+        t = db.query(AlgoTrade).one()
+        assert t.status == "closed" and t.exit_reason == "RULE_PNL_PCT"

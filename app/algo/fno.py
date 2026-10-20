@@ -155,21 +155,37 @@ def bs_price(spot: float, strike: float, t_years: float, iv: float, right: str, 
 
 def bs_greeks(spot: float, strike: float, t_years: float, iv: float, right: str,
               r: float = RISK_FREE) -> dict[str, float]:
-    """delta, gamma (per point), theta (premium per calendar day) and vega
-    (premium per 1 vol point) of ONE option unit. At expiry: delta 0 / ±1."""
+    """The Greeks of ONE option unit:
+
+    delta (per point), gamma (delta change per point), theta (premium per
+    calendar day), vega (premium per 1 vol point), rho (premium per 1% rate),
+    vanna (delta change per 1 vol point), charm (delta change per day that
+    passes), vomma (vega change per 1 vol point), speed (gamma change per
+    point) and prob_itm (risk-neutral chance it expires in the money).
+    At expiry: delta 0 / ±1, the rest 0."""
     sgn = 1 if right == "CE" else -1
     if t_years <= 0 or iv <= 0 or spot <= 0:
         itm = spot > strike if right == "CE" else spot < strike
-        return {"delta": sgn * float(itm), "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+        return {"delta": sgn * float(itm), "gamma": 0.0, "theta": 0.0, "vega": 0.0, "rho": 0.0, "vanna": 0.0,
+                "charm": 0.0, "vomma": 0.0, "speed": 0.0, "prob_itm": float(itm)}
     rt = math.sqrt(t_years)
     d1 = (math.log(spot / strike) + (r + iv * iv / 2) * t_years) / (iv * rt)
     d2 = d1 - iv * rt
     pdf = math.exp(-d1 * d1 / 2) / math.sqrt(2 * math.pi)
-    carry = r * strike * math.exp(-r * t_years) * _ncdf(sgn * d2)
+    disc = strike * math.exp(-r * t_years)
+    gamma = pdf / (spot * iv * rt)
+    vega = spot * pdf * rt
     return {"delta": _ncdf(d1) - (right == "PE"),
-            "gamma": pdf / (spot * iv * rt),
-            "theta": (-spot * pdf * iv / (2 * rt) - sgn * carry) / 365,
-            "vega": spot * pdf * rt / 100}
+            "gamma": gamma,
+            "theta": (-spot * pdf * iv / (2 * rt) - sgn * r * disc * _ncdf(sgn * d2)) / 365,
+            "vega": vega / 100,
+            "rho": sgn * t_years * disc * _ncdf(sgn * d2) / 100,
+            "vanna": -pdf * d2 / iv / 100,
+            # the same for a call and a put: their deltas differ by a constant
+            "charm": -pdf * (2 * r * t_years - d2 * iv * rt) / (2 * t_years * iv * rt) / 365,
+            "vomma": vega * d1 * d2 / iv / 10000,
+            "speed": -gamma / spot * (d1 / (iv * rt) + 1),
+            "prob_itm": _ncdf(sgn * d2)}
 
 
 def implied_vol(price: float, spot: float, strike: float, t_years: float, right: str) -> float:

@@ -78,13 +78,14 @@ def preview(spec: dict[str, Any], side: str, spot: float, t: float, iv: float,
     else:
         pop = 1.0 if _pnl(legs, spot, t1, iv) > 0 else 0.0
 
-    rows, net = [], {"delta": 0.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+    greek_keys = ("delta", "gamma", "theta", "vega", "rho", "vanna", "charm", "vomma", "speed")
+    rows, net = [], {k: 0.0 for k in greek_keys}
     mg = spec.get("margin") or {}
     span_kw = {"name": meta["name"], "iv": iv, "scan_pct": mg.get("scan_pct"), "exposure_pct": mg.get("exposure_pct")}
     for lg in legs:
-        g = ({"delta": 1.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0} if lg["kind"] in ("EQ", "FUT")
+        g = ({**{k: 0.0 for k in greek_keys}, "delta": 1.0, "prob_itm": None} if lg["kind"] in ("EQ", "FUT")
              else fno.bs_greeks(spot, lg["K"], fno.years_to(lg["exp"], t), iv, lg["kind"]))
-        pos = {k: v * lg["act"] * lg["qty"] for k, v in g.items()}
+        pos = {k: g[k] * lg["act"] * lg["qty"] for k in greek_keys}
         for k in net:
             net[k] += pos[k]
         alone = (fno.span_margin([lg], spot, t, **span_kw)["total"] if lg["kind"] != "EQ"
@@ -93,6 +94,14 @@ def preview(spec: dict[str, Any], side: str, spot: float, t: float, iv: float,
                      "strike": lg.get("K"), "expiry": lg.get("exp"), "qty": lg["qty"],
                      "dte": round((lg["exp"] - t) / 86400, 2) if lg.get("exp") else None,
                      "price": round(lg["price"], 2), "delta": round(g["delta"], 3),
+                     "prob_itm_pct": round(g["prob_itm"] * 100, 1) if g["prob_itm"] is not None else None,
+                     # elasticity: % the premium moves for a 1% move of the underlying
+                     "lambda": round(g["delta"] * spot / lg["price"], 2) if lg["kind"] in ("CE", "PE") and lg["price"] else None,
+                     "rho": round(pos["rho"], 2), "vanna": round(pos["vanna"], 4), "charm": round(pos["charm"], 4),
+                     "vomma": round(pos["vomma"], 2),
+                     # its own stop / target, as premium prices (fno levels from the entry)
+                     "sl_px": round(lg["price"] * (1 - lg["act"] * lg["sl_pct"] / 100), 2) if lg.get("sl_pct") else None,
+                     "tg_px": round(lg["price"] * (1 + lg["act"] * lg["tg_pct"] / 100), 2) if lg.get("tg_pct") else None,
                      "pos_delta": round(pos["delta"], 2), "theta": round(pos["theta"], 2),
                      "vega": round(pos["vega"], 2), "gamma": round(pos["gamma"], 5),
                      "margin_alone": round(alone, 2),
@@ -110,13 +119,23 @@ def preview(spec: dict[str, Any], side: str, spot: float, t: float, iv: float,
     naked = sum(r["margin_alone"] for r in rows)
     credit = sum(-lg["act"] * lg["price"] * lg["qty"] for lg in opts)
     capital = capital if capital is not None else spec["portfolio"]["capital"]
+    for lg in legs:
+        lg["entry"] = lg["price"]
+    pm = engine.position_metrics(legs, spot, t, int(meta.get("lot") or 1), lambda lg: lg["price"], iv) if opts else None
+    rules = [{"rule": engine.rule_label(r), "metric": r["metric"],
+              "value": None if pm is None or pm.get(r["metric"]) is None else round(pm[r["metric"]], 4),
+              "ok": pm is not None and engine._rule_true(r, pm)}       # noqa: SLF001
+             for r in (spec.get("position_rules") or {}).get("entry", [])]
     return {
         "spot": round(spot, 2), "iv_pct": round(iv * 100, 2), "lot": meta.get("lot"), "side": side,
         "first_expiry": t1 if opts else None, "dte": round((t1 - t) / 86400, 2) if opts else None,
         "legs": rows, "curve": curve, "breakevens": bes,
         "max_profit": max_profit, "max_loss": max_loss, "pop_pct": round(pop * 100, 1),
         "expected_move": round(sd, 2) if opts else None,
-        "greeks": {k: round(v, 5 if k == "gamma" else 2) for k, v in net.items()},
+        "greeks": {k: round(v, 7 if k == "speed" else 5 if k in ("gamma", "vanna", "charm") else 2) for k, v in net.items()},
+        # the same numbers the position rules use (per set: delta / gamma in lots, theta / vega in ₹)
+        "position": {k: (round(v, 4) if v is not None else None) for k, v in pm.items()} if pm else None,
+        "entry_rules": rules,
         "premium": {"net": round(credit, 2), "kind": "credit" if credit > 0 else "debit" if credit < 0 else "none"},
         "margin": {"model": mg.get("model") or "leverage", "used": round(used, 2),
                    "span": {**span, "total": round(span_total, 2)}, "leverage": round(lev_total, 2),

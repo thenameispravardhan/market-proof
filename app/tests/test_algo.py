@@ -1163,3 +1163,242 @@ def test_payoff_endpoint(client, monkeypatch):
     assert r["margin"]["span"]["total"] < r["margin"]["leverage"]
     assert client.post("/api/algo/payoff", json={"spec": spec, "spot": 25000, "side": "SELL"}).json()["legs"][0]["side"] == "BUY"
     assert client.post("/api/algo/payoff", json={"spec": {**spec, "symbols": []}}).status_code == 422
+    ruled = {**spec, "position_rules": {"entry": [{"metric": "credit", "op": ">=", "value": 10**7}]}}
+    r = client.post("/api/algo/payoff", json={"spec": ruled, "spot": 25000}).json()
+    assert r["entry_rules"] == [{"rule": "credit >= 10000000", "metric": "credit", "value": r["position"]["credit"], "ok": False}]
+
+
+# ---- option Greeks: full Greeks, leg stops, MTM % of premium, position rules, VIX, rank ----
+
+def test_every_greek_matches_a_numerical_derivative():
+    from app.algo import fno
+
+    S, K, T, v, r0 = 25000.0, 25200.0, 7 / 365, 0.13, fno.RISK_FREE
+    dt, dv, h = 1 / 365 / 240, 1e-4, 1.0
+    for right in ("CE", "PE"):
+        g = fno.bs_greeks(S, K, T, v, right)
+        p = lambda s=S, t=T, vv=v, r=r0: fno.bs_price(s, K, t, vv, right, r)  # noqa: E731
+        G = lambda s=S, t=T, vv=v: fno.bs_greeks(s, K, t, vv, right)  # noqa: E731
+        num = {"delta": (p(S + h) - p(S - h)) / 2 / h,
+               "gamma": (p(S + h) - 2 * p() + p(S - h)) / h / h,
+               "theta": (p(t=T - dt) - p(t=T + dt)) / 2 / dt / 365,
+               "vega": (p(vv=v + dv) - p(vv=v - dv)) / 2 / dv / 100,
+               "rho": (p(r=r0 + 1e-5) - p(r=r0 - 1e-5)) / 2e-5 / 100,
+               "vanna": (G(vv=v + dv)["delta"] - G(vv=v - dv)["delta"]) / 2 / dv / 100,
+               "charm": (G(t=T - dt)["delta"] - G(t=T + dt)["delta"]) / 2 / dt / 365,
+               "vomma": (G(vv=v + dv)["vega"] - G(vv=v - dv)["vega"]) / 2 / dv / 100,
+               "speed": (G(s=S + h)["gamma"] - G(s=S - h)["gamma"]) / 2 / h}
+        for k, x in num.items():
+            assert g[k] == pytest.approx(x, rel=2e-3, abs=1e-9), (right, k)
+        assert 0 < g["prob_itm"] < 1
+    assert fno.bs_greeks(S, K, 0, v, "PE") == {"delta": -1.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0, "rho": 0.0,
+                                                "vanna": 0.0, "charm": 0.0, "vomma": 0.0, "speed": 0.0, "prob_itm": 1.0}
+
+
+def test_rank_and_percentile_transforms():
+    d = bars([1.0, 2, 3, 4, 5, 3, 1])
+    P = {"ind": "PRICE", "params": {}}
+    assert engine.series(d, {**P, "xf": "rank", "xn": 3}, {}) == [None, None, 100.0, 100.0, 100.0, 0.0, 0.0]
+    assert engine.series(d, {**P, "xf": "percentile", "xn": 3}, {}) == [None, None, None, 100.0, 100.0, 0.0, 0.0]
+    assert engine.series(bars([2.0, 2, 2]), {**P, "xf": "rank", "xn": 2}, {})[-1] == 50.0      # flat: mid-range
+
+
+_RISE_FALL = [24500, 24520, 24540, 24560] + [24560 + 40 * k for k in range(1, 10)] + [24900 - 60 * k for k in range(1, 10)]
+
+
+def _strangle(on=None, **leg_kw):
+    legs = [{"right": "CE", "action": "SELL", "strike": "OTM", "steps": 2, "lots": 1, **leg_kw},
+            {"right": "PE", "action": "SELL", "strike": "OTM", "steps": 2, "lots": 1, **leg_kw}]
+    return {"type": "option", "expiry_kind": "weekly", "levels_on": "underlying", "legs_long": legs,
+            "iv": {"source": "fixed", "value": 14}, **({"on_leg_stop": on} if on else {})}
+
+
+def test_leg_stops_close_one_leg_and_can_move_the_rest_to_cost_or_exit_all():
+    out = {}
+    for on in ("leg", "cost", "all"):
+        t = engine.run(_opt_spec(instrument=_strangle(on, sl_pct=30)), {"N": _nifty(_RISE_FALL)})["trades"]
+        assert len(t) == 1                                              # one position, every leg in it
+        out[on] = t[0]
+    ce, pe = out["leg"]["legs"]
+    assert ce["reason"] == "LEG_SL" and ce["exit"] == pytest.approx(ce["entry"] * 1.3, abs=0.02)   # +30% of premium
+    assert pe["reason"] == "LEG_SL" and pe["exit"] == pytest.approx(pe["entry"] * 1.3, abs=0.02)   # later, on the fall
+    ce, pe = out["cost"]["legs"]
+    assert ce["reason"] == "LEG_SL" and pe["reason"] == "LEG_COST" and pe["exit"] == pytest.approx(pe["entry"], abs=0.02)
+    assert out["cost"]["reason"] == "LEG_COST" and out["cost"]["net"] > out["leg"]["net"]          # cost stop saved money
+    ce, pe = out["all"]["legs"]
+    assert out["all"]["reason"] == "LEG_SL" and "reason" not in pe and pe["exit"] < pe["entry"]     # the put still in profit
+    g = out["leg"]["greeks"]
+    assert g["credit"] > 0 and g["theta"] > 0 and g["vega"] < 0 and abs(g["delta"]) < 0.2 and g["iv"] == 14.0
+    with pytest.raises(ValueError, match="option legs"):
+        _opt_spec(instrument={"type": "option", "levels_on": "underlying", "legs_long": [
+            {"right": "FUT", "action": "BUY", "lots": 1, "sl_pct": 10}]})
+    with pytest.raises(ValueError, match="can't be combined"):
+        _opt_spec(instrument=_strangle(sl_pct=30), stop_loss={"type": "points", "value": 50},
+                  scale_out=[{"type": "rr", "value": 1, "qty_pct": 50}])
+    with pytest.raises(ValueError, match="on a leg's stop"):
+        _opt_spec(instrument=_strangle("hedge", sl_pct=30))
+
+
+def test_leg_target_closes_only_that_leg():
+    rise = _RISE_FALL[:13]
+    t = engine.run(_opt_spec(instrument=_strangle(tg_pct=60)), {"N": _nifty(rise)})["trades"][0]
+    ce, pe = t["legs"]
+    assert "reason" not in ce and pe["reason"] == "LEG_TARGET" and pe["exit"] == pytest.approx(pe["entry"] * 0.4, abs=0.02)
+    assert t["reason"] == "END"                                        # the call ran on to the end of the data
+    both = engine.run(_opt_spec(instrument=_strangle(tg_pct=60)), {"N": _nifty(_RISE_FALL)})["trades"][0]
+    assert [lg["reason"] for lg in both["legs"]] == ["LEG_TARGET", "LEG_TARGET"] and both["reason"] == "LEG_TARGET"
+
+
+def test_mtm_stop_and_target_as_a_percent_of_the_credit():
+    spec = _opt_spec(instrument=_strangle(), mtm={"stop_pct": 50}, sizing={"mode": "lots", "value": 1})
+    t = engine.run(spec, {"N": _nifty(_RISE_FALL)})["trades"][0]
+    credit = sum(lg["entry"] * lg["qty"] for lg in t["legs"])
+    assert t["reason"] == "MTM_SL" and t["gross"] == pytest.approx(-0.5 * credit, rel=0.01)   # lost half the credit
+    flat = [24500, 24520, 24540, 24560] + [24560] * 40                  # time decay only
+    spec = _opt_spec(instrument=_strangle(), mtm={"target_pct": 5}, sizing={"mode": "lots", "value": 1})
+    t = engine.run(spec, {"N": _nifty(flat)})["trades"][0]
+    credit = sum(lg["entry"] * lg["qty"] for lg in t["legs"])
+    assert t["reason"] == "MTM_TARGET" and t["gross"] == pytest.approx(0.05 * credit, rel=0.01)
+    assert engine.mtm_limits({"stop": 500, "target": None, "stop_pct": 100}, [
+        {"kind": "CE", "act": -1, "entry": 10.0, "qty": 65}]) == (500, None)        # the tighter of ₹ and %
+    with pytest.raises(ValueError, match="needs option legs"):
+        _cross_spec(mtm={"stop_pct": 50})
+    assert "stop_pct" not in _opt_spec(instrument=_strangle())["mtm"]              # off = left out
+
+
+def test_position_rules_filter_entries_and_exit_on_delta():
+    data = lambda: {"N": _nifty(_RISE_FALL)}  # noqa: E731
+    rich = _opt_spec(instrument=_strangle(), position_rules={"entry": [{"metric": "credit", "op": ">=", "value": 10**6}]})
+    r = engine.run(rich, data())
+    assert r["trades"] == [] and r["stats"]["skipped"]["entry_rules"] == 1
+    lean = _opt_spec(instrument=_strangle(), position_rules={"entry": [{"metric": "abs_delta", "op": "<=", "value": 0.2}],
+                                                             "exit": [{"metric": "abs_delta", "op": ">", "value": 0.25}]})
+    t = engine.run(lean, data())["trades"][0]
+    assert t["reason"] == "RULE_ABS_DELTA"
+    with pytest.raises(ValueError, match="metric is one of"):
+        _opt_spec(instrument=_strangle(), position_rules={"exit": [{"metric": "beta", "op": ">", "value": 1}]})
+    with pytest.raises(ValueError, match="need an option instrument"):
+        _cross_spec(position_rules={"exit": [{"metric": "delta", "op": ">", "value": 1}]})
+    assert "position_rules" not in _opt_spec(instrument=_strangle(), position_rules={"entry": [], "exit": []})
+
+
+def test_position_metrics_per_set():
+    from app.algo import fno
+
+    t, exp, u = DAY0, DAY0 + 6 * 86400, 25000.0
+    legs = [{"kind": "CE", "act": -1, "K": 25000, "exp": exp, "qty": 130, "per_set": 65, "entry": 200.0},
+            {"kind": "PE", "act": -1, "K": 25000, "exp": exp, "qty": 130, "per_set": 65, "entry": 180.0}]
+    px = {"CE": 150.0, "PE": 170.0}
+    m = engine.position_metrics(legs, u, t, 65, lambda lg: px[lg["kind"]], None)
+    assert m["credit"] == pytest.approx((150 + 170) * 65)                # per set, at today's prices
+    assert m["pnl_pct"] == pytest.approx(((200 - 150) + (180 - 170)) / (200 + 180) * 100)
+    ivs = [fno.implied_vol(px[k], u, 25000, fno.years_to(exp, t), k) for k in ("CE", "PE")]
+    assert m["iv"] == pytest.approx(sum(ivs) / 2 * 100) and m["dte"] == pytest.approx(6.0)
+    assert m["theta"] > 0 and m["vega"] < 0 and m["gamma"] < 0
+    closed = [{**legs[0], "exit": 120.0}, legs[1]]
+    m2 = engine.position_metrics(closed, u, t, 65, lambda lg: px[lg["kind"]], None)
+    assert m2["credit"] == pytest.approx(170 * 65) and m2["pnl_pct"] == pytest.approx((80 + 10) / 380 * 100)
+    assert engine.position_metrics(legs, u, t, 65, lambda lg: None, None)["delta"] is None   # no price: no guess
+
+
+def test_vix_indicator_sees_only_closed_vix_candles():
+    d = bars([100.0] * 6, tf=300)
+    d["vix"] = bars([14.0, 15, 16, 17, 18, 19], tf=300)
+    d["htf"] = {15: bars([100.0, 100], tf=900)}
+    d["htf"][15]["vix"] = bars([20.0, 21], tf=900)
+    d["tf_min"] = 5
+    assert engine.series(d, {"ind": "VIX", "params": {}}, {}) == [14.0, 15, 16, 17, 18, 19]
+    assert engine.series(d, {"ind": "VIX", "params": {}, "tf": 15}, {}) == [None, None, 20.0, 20.0, 20.0, 21.0]
+    assert engine.series(bars([1.0, 2]), {"ind": "VIX", "params": {}}, {}) == [None, None]      # not loaded: never true
+    spec = _cross_spec(entry_long={"logic": "AND", "conditions": [
+        {"left": {"ind": "VIX", "tf": 1440, "xf": "rank", "xn": 200}, "op": ">", "right": {"value": 50}}]})
+    assert engine.vix_timeframes(spec) == {1440} and engine.vix_timeframes(_cross_spec()) == set()
+
+
+# ---- the Algo guide: every example imports, the reference covers everything ----
+
+def test_every_json_example_in_the_guide_is_a_valid_strategy():
+    import json
+    import re
+
+    from app.algo import guide
+
+    text = guide.text()
+    blocks = re.findall(r"```json\n(.*?)\n```", text, re.S)
+    assert len(blocks) >= 10
+    for b in blocks:
+        obj = json.loads(b)                                   # plain ```json blocks must be real JSON
+        spec = engine.normalize(obj["spec"])                  # …and a strategy the importer accepts
+        assert obj["name"] and spec["symbols"]
+    for c in ind.catalog():
+        assert f"| `{c['name']}` |" in text and c["about"], c["name"]
+    for word in (*engine.OPS, *engine.TRANSFORMS, *engine.POSITION_METRICS, *engine.STRIKE_MODES):
+        assert f"`{word}`" in text, word
+
+
+def test_guide_endpoint(client):
+    r = client.get("/api/algo/guide")
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/markdown")
+    assert r.text.startswith("# Algo Lab guide") and "| `VIX` |" in r.text
+
+
+def _sessions(days: int, start_px: float, seed: int = 3) -> list[tuple[int, float, float, float, float, int]]:
+    """1-minute candles 09:15-15:29 IST on `days` weekdays from 2025-01-01: a seeded random walk."""
+    import random
+
+    rnd = random.Random(seed)
+    rows, px, day, done = [], start_px, 0, 0
+    t0 = 1735689600 - 19800                                   # 2025-01-01 00:00 IST
+    while done < days:
+        d0 = t0 + day * 86400
+        day += 1
+        if ((d0 + 19800) // 86400 + 3) % 7 >= 5:              # weekend
+            continue
+        done += 1
+        for m in range(375):
+            o = px
+            px = max(1.0, px * (1 + rnd.gauss(0, 0.0007)))
+            hi, lo = max(o, px) * (1 + abs(rnd.gauss(0, 0.0002))), min(o, px) * (1 - abs(rnd.gauss(0, 0.0002)))
+            rows.append((d0 + 33300 + m * 60, o, hi, lo, px, 1000 + rnd.randrange(500)))
+    return rows
+
+
+def _agg(rows: list, tf_min: int) -> dict:
+    """Candles of `tf_min` from 1-minute rows, bucketed the way data.load does (1440 = daily at IST midnight)."""
+    from app.algo import data as data_mod
+
+    out: dict[int, list] = {}
+    for t, o, h, lo, c, v in rows:
+        day0 = t - (t + 19800) % 86400
+        b = day0 if tf_min == 1440 else day0 + 33300 + ((t - day0 - 33300) // (tf_min * 60)) * tf_min * 60
+        r = out.get(b)
+        out[b] = [b, o, h, lo, c, v] if r is None else [b, r[1], max(r[2], h), min(r[3], lo), c, r[5] + v]
+    return data_mod.bars_from([out[k] for k in sorted(out)], tf_min * 60)
+
+
+def test_every_guide_example_backtests_on_synthetic_candles():
+    import json
+    import re
+
+    from app.algo import fno, guide
+
+    vix = _sessions(40, 14.0, seed=11)
+    for b in re.findall(r"```json\n(.*?)\n```", guide.text(), re.S):
+        spec = engine.normalize(json.loads(b)["spec"])
+        data = {}
+        for k, sym in enumerate(spec["symbols"]):
+            name = fno.fno_name(sym)
+            m1 = _sessions(40, 24000.0 if name in fno.INDEX_LOTS else 1500.0, seed=k)
+            d = _agg(m1, spec["timeframe"])
+            d["tf_min"] = spec["timeframe"]
+            d["htf"] = {tf: _agg(m1, tf) for tf in engine.cond_timeframes(spec)}
+            for tf in engine.vix_timeframes(spec):
+                if tf == spec["timeframe"]:
+                    d["vix"] = _agg(vix, tf)
+                else:
+                    d["htf"][tf]["vix"] = _agg(vix, tf)
+            d["meta"] = {"symbol": sym, "name": name, "exch": fno.exchange_of(sym), "lot": fno.lot_size(name),
+                         "step": fno.default_step(name, d["c"][-1])}
+            data[sym] = d
+        res = engine.run(spec, data, trade_from=data[spec["symbols"][0]]["t"][0] + 5 * 86400)
+        assert res["stats"]["trades"] > 0, json.loads(b)["name"]          # an example that can never fire teaches nothing
