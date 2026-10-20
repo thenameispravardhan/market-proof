@@ -92,7 +92,7 @@ export function useApiJson<T>(url: string | null, every = 0, onOrders = true): {
 }
 
 export interface BrokerOrder { id: string; symbol: string; side: string; type: string; product: string | null; qty: number; filled: number; remaining: number; limit_price: number | null; stop_price: number | null; traded_price: number | null; status: string; message: string; time: string | null; source: string | null; ours: boolean }
-export interface BrokerPosition { symbol: string; product: string | null; net_qty: number; avg_price: number | null; buy_qty: number; buy_avg: number | null; sell_qty: number; sell_avg: number | null; ltp: number | null; realized: number | null; unrealized: number | null; pl: number | null }
+export interface BrokerPosition { symbol: string; product: string | null; net_qty: number; avg_price: number | null; buy_qty: number; buy_avg: number | null; sell_qty: number; sell_avg: number | null; ltp: number | null; realized: number | null; unrealized: number | null; pl: number | null; multiplier?: number }
 export interface BrokerBook { ok: boolean; reason?: string; orders: BrokerOrder[]; positions: BrokerPosition[]; errors?: string[] }
 
 /** A row of the bot's own trade history (`/api/trades`). */
@@ -723,10 +723,11 @@ export function GttPanel({ data, accountId, privacy, onDone }: { data: GttResp |
 // All positions (the whole Fyers account: day + carry-forward)
 // ---------------------------------------------------------------------------
 
-/** Live P&L: realized + (live LTP − avg) × net qty; the Fyers figure until a tick arrives. */
+/** Live P&L: realized + (live LTP − avg) × net qty × multiplier (an MCX lot counted by Fyers: GOLD 100); the
+ *  Fyers figure until a tick arrives. */
 export function livePnl(p: BrokerPosition, ltp: number | null | undefined): number | null {
   if (ltp == null || p.net_qty === 0 || p.avg_price == null) return p.pl;
-  return (p.realized ?? 0) + (ltp - p.avg_price) * p.net_qty;
+  return (p.realized ?? 0) + (ltp - p.avg_price) * p.net_qty * (p.multiplier ?? 1);
 }
 
 function LivePositionPnl({ p, privacy }: { p: BrokerPosition; privacy: boolean }) {

@@ -189,15 +189,25 @@ def _master_chain(underlying: str, expiry: Optional[str], reason: str) -> dict[s
 async def _lots_for(symbols: list[str]) -> dict[str, Optional[int]]:
     """Lot per symbol: 1 for cash, the contract's lot for NSE/BSE F&O (Fyers
     F&O scrip master), None when it isn't known — the order endpoint refuses
-    such an order rather than guess. Fetches the master once if it's missing."""
+    such an order rather than guess. Fetches the master once if it's missing.
+    MCX / currency: the instrument master's lot in the quoted unit (GOLD 100,
+    USDINR 1000), the size their orders are checked against. (This answered 1
+    for MCX and None for currency, and the Trade page put that on the ticket.)"""
     from app.algo import fno
+    from app.services.instrument_master import get_master
 
     if any(fno.is_derivative(s) for s in symbols) and not fno.master_loaded():
         try:
             await fno.ensure_master()
         except Exception as e:  # noqa: BLE001
             log.warning("options.lot_master_refresh_failed", error=str(e)[:200])
-    return {s: (fno.contract_lot(s) if fno.is_derivative(s) else 1) for s in symbols}
+
+    def lot(s: str) -> Optional[int]:
+        inst = get_master().get(s)
+        if inst is not None and inst.segment in ("COM", "CD"):
+            return inst.lot_size or None
+        return fno.contract_lot(s) if fno.is_derivative(s) else 1
+    return {s: lot(s) for s in symbols}
 
 
 @router.get("/lot")

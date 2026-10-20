@@ -46,26 +46,58 @@ UNIT: dict[str, float] = {
 # Prices are USDT; P&L is booked in rupees at this rate: the near-month NSE USDINR future, refreshed from Fyers
 # every 5 min. ponytail: seeded with its 2026-10-19 price until the first refresh lands.
 USD_INR: dict[str, float] = {"rate": 95.05, "at": 0.0}
+# Rupees per 1 yen (NSE JPYINR quotes per 100 yen), for USDJPY's P&L. Same refresh, same seed caveat.
+JPY_INR: dict[str, float] = {"rate": 0.61, "at": 0.0}
+# NSE's cross-currency pairs settle in rupees, but a 1-point move is worth 1 unit of the QUOTE currency per unit
+# of qty (EURUSD: $1 per EUR), so their P&L converts like crypto's: pair -> the rate that turns it into rupees.
+CROSS: dict[str, dict[str, float]] = {"EURUSD": USD_INR, "GBPUSD": USD_INR, "USDJPY": JPY_INR}
+FX_MAX_AGE_S = 300
+
+
+def cross_pair(symbol: str) -> str | None:
+    """"EURUSD" for an NSE / BSE EURUSD future or option, else None."""
+    s = (symbol or "").strip().upper()
+    if not s.startswith(("NSE:", "BSE:")):
+        return None
+    t = s.split(":", 1)[1]
+    return next((p for p in CROSS if t.startswith(p)), None)
 
 
 def point_value(symbol: str) -> float:
     """Rupees per 1-point move per 1 qty: 1 for every Indian instrument (qty is in the quoted unit, MCX and
-    currency lots included); a crypto contract's coins x USD/INR."""
+    currency lots included) except NSE's cross-currency pairs (x USD/INR or JPY/INR); a crypto contract's coins x
+    USD/INR."""
     if not is_crypto(symbol):
-        return 1.0
+        cp = cross_pair(symbol)
+        return CROSS[cp]["rate"] if cp else 1.0
     return UNIT.get(pair(symbol), 1.0) * USD_INR["rate"]
 
 
 async def refresh_usd_inr() -> None:
+    """USD/INR and JPY/INR from the near-month NSE futures, through Fyers (never another price source)."""
     from app.api.market import fyers_quotes
     from app.services.instrument_master import get_master
 
-    fut = next((i for i in get_master().search("USDINR", limit=10) if i.instrument_type == "FUT"), None)
-    if fut is None:
+    futs = {name: next((i for i in get_master().search(name, limit=10) if i.instrument_type == "FUT"), None)
+            for name in ("USDINR", "JPYINR")}
+    syms = [f.symbol for f in futs.values() if f is not None]
+    if not syms:
         return
-    q = (await fyers_quotes([fut.symbol])).get(fut.symbol.upper())
-    if q is not None and q.last_price and 50 < q.last_price < 200:
-        USD_INR.update(rate=float(q.last_price), at=time.time())
+    qs = await fyers_quotes(syms)
+    for name, box, scale in (("USDINR", USD_INR, 1.0), ("JPYINR", JPY_INR, 0.01)):   # JPYINR is per 100 yen
+        q = qs.get(futs[name].symbol.upper()) if futs[name] is not None else None
+        if q is not None and q.last_price and 20 < q.last_price < 200:
+            box.update(rate=float(q.last_price) * scale, at=time.time())
+
+
+async def refresh_fx_if_stale() -> None:
+    """Before a paper fill books rupees at these rates: refresh them when older than FX_MAX_AGE_S. A failed
+    refresh keeps the last rate (never blocks the order)."""
+    if time.time() - USD_INR["at"] > FX_MAX_AGE_S:
+        try:
+            await asyncio.wait_for(refresh_usd_inr(), 5.0)
+        except Exception as e:  # noqa: BLE001
+            log.warning("crypto.fx_refresh_failed", error=str(e)[:200])
 
 
 # Fyers chart resolution -> (Binance interval, how many of them make one candle). Binance has no 2 / 10 / 20 /

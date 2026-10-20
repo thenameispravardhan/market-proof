@@ -85,7 +85,9 @@ from app.execution.base import (
     safe_float,
 )
 from app.execution.market_data import Quote
+from app.execution.order_reconcile import fyers_in_units
 from app.logging_config import get_logger
+from app.services.instrument_master import fyers_lot
 
 # Symbols Fyers answered "Invalid symbol" (code -300: delisted / suspended / renamed scrips): not asked again for
 # 12 h. They were re-requested ~60 times a day each (2,765 failed history calls for 70 scrips on 2026-10-19).
@@ -919,10 +921,15 @@ class FyersLiveBackend:
 
         broker_symbol = resolve_fyers_symbol(symbol) or symbol
         lp, sp = _on_tick(broker_symbol, lp), _on_tick(broker_symbol, sp)
+        # Fyers counts MCX in lots, the app in the quoted unit (1 with live MCX off / for NSE and BSE).
+        lot = fyers_lot(broker_symbol)
+        if lot == 0 or int(quantity) % lot:
+            return _reject(f"{broker_symbol}: quantity {int(quantity)} isn't a whole number of lots"
+                           + (f" (1 lot = {lot})" if lot else " (contract size not on file)"))
 
         payload = {
             "symbol": broker_symbol,
-            "qty": int(quantity),
+            "qty": int(quantity) // lot,
             "type": fyers_type,
             "side": _fyers_side(side),
             "productType": fyers_product,
@@ -1126,6 +1133,7 @@ class FyersLiveBackend:
         limit_price: Optional[float] = None,
         stop_price: Optional[float] = None,
         order_type: Optional[OrderType | str] = None,
+        symbol: Optional[str] = None,
     ) -> tuple[bool, str]:
         """Modify a PENDING order in place (v3 PATCH /orders/sync).
 
@@ -1137,6 +1145,11 @@ class FyersLiveBackend:
         (FyersBlockedError) is re-raised — the broker never saw the request,
         so it isn't a "no" — and the API maps it to 503; any other broker
         error comes back as `(False, <error>)`.
+
+        `symbol` (the order's contract) snaps prices to its tick and, with
+        live MCX on, converts a new quantity to Fyers' lots; when it isn't
+        given then, the order book is asked — a quantity is never sent
+        unconverted for a contract it can't name.
         """
         if not broker_order_id:
             return False, "broker_order_id is required"
@@ -1144,7 +1157,21 @@ class FyersLiveBackend:
         if quantity is not None:
             if int(quantity) <= 0:
                 return False, "quantity must be > 0"
-            payload["qty"] = int(quantity)
+            from app.config import get_settings
+
+            if symbol is None and getattr(get_settings(), "FYERS_MCX_LIVE", False):
+                st = await self.get_order_status(str(broker_order_id))
+                raw = st.raw if isinstance(st.raw, dict) and str(st.raw.get("id") or "") == str(broker_order_id) else {}
+                symbol = str(raw.get("symbol") or "") or None
+                if symbol is None:
+                    return False, "couldn't tell which contract this order is for, so its quantity wasn't changed"
+            from app.execution.symbols import resolve_fyers_symbol
+
+            lot = fyers_lot(resolve_fyers_symbol(symbol or "") or symbol or "")
+            if lot == 0 or int(quantity) % lot:
+                return False, f"quantity {int(quantity)} isn't a whole number of lots" + (f" (1 lot = {lot})" if lot else "")
+            payload["qty"] = int(quantity) // lot
+        tick_sym = symbol if symbol and ":" in symbol else "NSE:"
         if order_type is not None:
             try:
                 ot = order_type if isinstance(order_type, OrderType) else OrderType(str(order_type).upper())
@@ -1159,14 +1186,14 @@ class FyersLiveBackend:
                 return False, f"{ot.value} order requires a limit price > 0"
             if needs_stop and sp <= 0:
                 return False, f"{ot.value} order requires a stop/trigger price > 0"
-            payload.update({"type": fyers_type, "limitPrice": _on_tick("NSE:", lp), "stopPrice": _on_tick("NSE:", sp)})
+            payload.update({"type": fyers_type, "limitPrice": _on_tick(tick_sym, lp), "stopPrice": _on_tick(tick_sym, sp)})
         else:
             # Off-grid prices are rejected: a modify used to send the raw
             # trailed / buffered stop and silently keep the old order.
             if limit_price is not None:
-                payload["limitPrice"] = _on_tick("NSE:", float(limit_price))
+                payload["limitPrice"] = _on_tick(tick_sym, float(limit_price))
             if stop_price is not None:
-                payload["stopPrice"] = _on_tick("NSE:", float(stop_price))
+                payload["stopPrice"] = _on_tick(tick_sym, float(stop_price))
         if len(payload) == 1:
             return False, "nothing to modify"
         try:
@@ -1202,6 +1229,7 @@ class FyersLiveBackend:
         out: list[Position] = []
         for entry in positions_data:
             try:
+                entry = fyers_in_units(dict(entry))     # MCX lots -> our quoted-unit qty (live MCX on)
                 sym = str(entry.get("symbol") or "")
                 if not sym:
                     continue
@@ -1234,10 +1262,13 @@ class FyersLiveBackend:
     async def convert_position(self, symbol: str, side: int, qty: int, from_product: str, to_product: str) -> None:
         """Convert an open position between products. Raises FyersAPIError on rejection."""
         fy = {"INTRADAY": "INTRADAY", "DELIVERY": "CNC", "MARGIN": "MARGIN"}
+        lot = fyers_lot(symbol)
+        if lot == 0 or int(qty) % lot:
+            raise FyersAPIError(f"{symbol}: {int(qty)} isn't a whole number of lots, so it wasn't converted")
         # A 200 with `s: error` is a refusal too; without the check the API
         # recorded a conversion Fyers never made.
         _ensure_ok(await self._client.convert_position({
-            "symbol": symbol, "positionSide": 1 if side > 0 else -1, "convertQty": int(qty),
+            "symbol": symbol, "positionSide": 1 if side > 0 else -1, "convertQty": int(qty) // lot,
             "convertFrom": fy[from_product], "convertTo": fy[to_product], "overnight": 0,
         }), "convert position")
 
@@ -1249,9 +1280,9 @@ class FyersLiveBackend:
             self._client.get_orderbook(), self._client.get_positions(), return_exceptions=True,
         )
         errors = [str(x) for x in (orders, positions) if isinstance(x, BaseException)]
-        return {
-            "orders": (orders.get("orderBook") or []) if isinstance(orders, dict) else [],
-            "positions": (positions.get("netPositions") or []) if isinstance(positions, dict) else [],
+        return {   # quantities in our units (MCX lots converted while live MCX is on)
+            "orders": [fyers_in_units(dict(o)) for o in (orders.get("orderBook") or [])] if isinstance(orders, dict) else [],
+            "positions": [fyers_in_units(dict(p)) for p in (positions.get("netPositions") or [])] if isinstance(positions, dict) else [],
             "errors": errors,
         }
 
@@ -1388,6 +1419,7 @@ class FyersLiveBackend:
                 state=OrderState.PENDING,
                 raw=data,
             )
+        match = fyers_in_units(dict(match))     # filled / raw qty in our units (MCX lots, live MCX on)
         status = str(match.get("status") or "PENDING")
         # The v3 order book reports fills as `filledQty` (the REST book, the
         # order socket and the reconciler all read that key). `tradedQty`
