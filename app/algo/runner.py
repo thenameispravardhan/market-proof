@@ -5,6 +5,7 @@ Every 5 seconds during the session:
     stop / target / trailing (with activation) / breakeven on their reference
     price, the MTM (rupee) stop / target / trail on the whole position, the
     time stop, and the strategy's square-off time — exits never wait for a bar;
+    scale-out levels close part of the position (booked as its own row);
   * per strategy, the day's realised + open P&L is checked against the daily
     max loss / max profit, which flatten the strategy and stop it for the day;
   * each enabled strategy whose timeframe just closed a bar fetches its last
@@ -38,7 +39,7 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 from app.algo import data, engine, fno
 from app.algo import indicators
@@ -100,11 +101,15 @@ def _row(t: AlgoTrade) -> dict[str, Any]:
     return r
 
 
+PARTIAL_NOTE = "partial exit of #"     # rows split off a position by a scale-out
+
+
 def _trades_today(strategy_id: int, symbol: str, day_start: float) -> int:
     with db_session.SessionLocal() as db:
         return db.execute(select(func.count()).select_from(AlgoTrade).where(
             AlgoTrade.strategy_id == strategy_id, AlgoTrade.symbol == symbol,
-            AlgoTrade.status != "rejected", AlgoTrade.entry_at >= _naive(day_start))).scalar_one()
+            AlgoTrade.status != "rejected", AlgoTrade.entry_at >= _naive(day_start),
+            or_(AlgoTrade.note.is_(None), ~AlgoTrade.note.startswith(PARTIAL_NOTE)))).scalar_one()
 
 
 def _last_exit(strategy_id: int, symbol: str) -> Optional[float]:
@@ -142,6 +147,19 @@ def _update(trade_id: int, **fields: Any) -> None:
             for k, v in fields.items():
                 setattr(t, k, v)
             db.commit()
+
+
+def _split(trade_id: int, closed: Optional[dict[str, Any]], **open_fields: Any) -> None:
+    """A scale-out in one commit: the closed part as its own row, the open row shrunk."""
+    with db_session.SessionLocal() as db:
+        t = db.get(AlgoTrade, trade_id)
+        if t is None:
+            return
+        if closed:
+            db.add(AlgoTrade(**closed))
+        for k, v in open_fields.items():
+            setattr(t, k, v)
+        db.commit()
 
 
 def _account(account_id: Optional[int]) -> tuple[Optional[BrokerAccount], Optional[str]]:
@@ -473,6 +491,8 @@ class AlgoRunner:
             reason = await self._check(t, spec, prices, now)
             if reason:
                 await self._exit(t, prices, reason, now)
+            elif t.get("scale") and t["scale"]["levels"]:
+                await self._scale_out(t, prices, now)
         day = int((now + IST) // 86400)
         for sid in {t["strategy_id"] for t in trades}:
             s = by_id.get(sid)
@@ -578,38 +598,110 @@ class AlgoRunner:
                 self.event("error", f"{t['symbol']}: no price for {lg['symbol']} — exit ({reason}) retried",
                            trade_id=t["id"])
                 return False
-            if t["mode"] == "live":
-                acc, why = await asyncio.to_thread(_account, await asyncio.to_thread(_strategy_account, t["strategy_id"]))
-                net = await _broker_net(acc, lg["symbol"]) if acc is not None else None
-                held = net if net is not None and (net > 0) == (lg["act"] > 0) else 0
-                if acc is not None and net is not None and held == 0:
-                    lg["exit"], lg["external"] = px, True       # already flat at the broker: no order
-                    continue
-                ok, oid, msg = (False, None, why or "positions unavailable") if acc is None or net is None \
-                    else await _order(acc, lg["symbol"], "SELL" if lg["act"] > 0 else "BUY",
-                                      min(lg["qty"], abs(held)), exit_=True, strategy_id=t["strategy_id"],
-                                      product=lg.get("product", "INTRADAY"))
-                if not ok:
-                    self._retry_at[t["id"]] = now + 30
-                    await asyncio.to_thread(_update, t["id"], legs=legs, note=f"exit failed: {msg}"[:500])
-                    self.event("error", f"EXIT FAILED {lg['symbol']} ({reason}): {msg}", trade_id=t["id"])
-                    return False
-                lg["exit_order_id"] = oid
-                fill = await _fill_price(acc, oid)         # the broker's average, when it reports one
-                if fill is None:
-                    # Accepted is not filled: a reject after the ack leaves the
-                    # position open. Booked only once the broker holds less.
-                    after = await _broker_net(acc, lg["symbol"])
-                    if after is None or (after * lg["act"] > 0 and abs(after) >= abs(held)):
-                        await _cancel(acc, oid)            # else the retry's order doubles it into a reversal
-                        self._retry_at[t["id"]] = now + 30
-                        await asyncio.to_thread(_update, t["id"], legs=legs, note=f"exit {oid} not filled yet"[:500])
-                        self.event("error", f"EXIT NOT FILLED {lg['symbol']} ({reason}): retrying", trade_id=t["id"])
-                        return False
-                px = fill or px
-            lg["exit"] = px
+            r = await self._close_leg(t, lg, lg["qty"], px, reason)
+            if r is None:
+                self._retry_at[t["id"]] = now + 30
+                return False
+            lg["exit"] = r["px"]
+            if r["oid"]:
+                lg["exit_order_id"] = r["oid"]
+            if r["external"]:
+                lg["external"] = True                   # already flat at the broker: no order was sent
         await self._book(t, reason, now)
         return True
+
+    async def _close_leg(self, t: dict, lg: dict, qty: int, px: float, reason: str) -> Optional[dict[str, Any]]:
+        """Exit `qty` of one leg — paper: at `px`; live: a MARKET order, never
+        for more than the broker holds. {"px", "qty", "oid", "external"}
+        (external = the broker no longer holds it: no order sent), or None when
+        it failed — the trade note and an event say why, nothing is booked."""
+        if t["mode"] != "live":
+            return {"px": px, "qty": qty, "oid": None, "external": False}
+        acc, why = await asyncio.to_thread(_account, await asyncio.to_thread(_strategy_account, t["strategy_id"]))
+        net = await _broker_net(acc, lg["symbol"]) if acc is not None else None
+        held = net if net is not None and (net > 0) == (lg["act"] > 0) else 0
+        if acc is not None and net is not None and held == 0:
+            return {"px": px, "qty": 0, "oid": None, "external": True}
+        ok, oid, msg = (False, None, why or "positions unavailable") if acc is None or net is None \
+            else await _order(acc, lg["symbol"], "SELL" if lg["act"] > 0 else "BUY",
+                              min(qty, abs(held)), exit_=True, strategy_id=t["strategy_id"],
+                              product=lg.get("product", "INTRADAY"))
+        if not ok:
+            await asyncio.to_thread(_update, t["id"], legs=t["legs"], note=f"exit failed: {msg}"[:500])
+            self.event("error", f"EXIT FAILED {lg['symbol']} ({reason}): {msg}", trade_id=t["id"])
+            return None
+        fill = await _fill_price(acc, oid)         # the broker's average, when it reports one
+        if fill is None:
+            # Accepted is not filled: a reject after the ack leaves the
+            # position open. Booked only once the broker holds less.
+            after = await _broker_net(acc, lg["symbol"])
+            if after is None or (after * lg["act"] > 0 and abs(after) >= abs(held)):
+                await _cancel(acc, oid)            # else the retry's order doubles it into a reversal
+                await asyncio.to_thread(_update, t["id"], legs=t["legs"], note=f"exit {oid} not filled yet"[:500])
+                self.event("error", f"EXIT NOT FILLED {lg['symbol']} ({reason})", trade_id=t["id"])
+                return None
+        return {"px": fill or px, "qty": min(qty, abs(held)), "oid": oid, "external": False}
+
+    async def _scale_out(self, t: dict, prices: dict[str, float], now: float) -> None:
+        """Take the next scale-out level once the reference price reaches it:
+        close that many sets of every leg, book them as their own closed row
+        and shrink the open one. One attempt per level — a leg whose order
+        fails stays whole in the open position (never re-sent, so never closed
+        twice); the final exit takes whatever is left."""
+        sc = t["scale"]
+        lvl, n = sc["levels"][0]
+        sign = t["ref_sign"] or (1 if t["side"] == "BUY" else -1)
+        ref_px = prices.get((t["symbol"] if t["ref"] == "u" else t["legs"][0]["symbol"]).upper())
+        if ref_px is None or sign * (ref_px - lvl) < 0 or self._retry_at.get(t["id"], 0) > now:
+            return
+        k, left = sc["done"] + 1, sc["left"]
+        reason = f"SCALE_OUT_{k}"
+        if n >= left:                                   # the last sets: an ordinary full exit
+            await self._exit(t, prices, reason, now)
+            return
+        legs = t["legs"]
+        done: dict[int, dict] = {}
+        want = 0
+        for j in sorted(range(len(legs)), key=lambda j: legs[j]["act"]):     # written legs first
+            lg = legs[j]
+            q = lg["qty"] * n // left
+            px = prices.get(lg["symbol"].upper())
+            if lg.get("exit") is not None or q <= 0:
+                continue
+            want += 1
+            r = await self._close_leg(t, lg, q, px, reason) if px is not None else None
+            if r is None or not r["qty"]:
+                continue
+            lg["qty"] -= r["qty"]
+            done[j] = {**{x: lg[x] for x in ("symbol", "kind", "act", "entry", "label", "K", "exp", "product") if x in lg},
+                       "qty": r["qty"], "exit": r["px"], **({"exit_order_id": r["oid"]} if r["oid"] else {})}
+        part = [done[j] for j in sorted(done)]
+        t["scale"] = {"left": left - n, "levels": sc["levels"][1:], "done": k}
+        closed, gross, ch = None, 0.0, 0.0
+        if part:
+            for p in part:
+                g, c = engine.leg_pnl(p["act"], p["qty"], p["entry"], p["exit"], p["kind"], True)
+                gross, ch = gross + g, ch + c
+            closed = dict(
+                strategy_id=t["strategy_id"], symbol=t["symbol"], side=t["side"], quantity=part[0]["qty"],
+                mode=t["mode"], status="closed", entry_at=t["entry_at"], entry_price=t["entry_price"],
+                stop_loss=t["stop_loss"], target=t["target"], exit_at=_utc(now), exit_price=round(part[0]["exit"], 2),
+                exit_reason=reason, gross_pnl=round(gross, 2), charges=round(ch, 2), net_pnl=round(gross - ch, 2),
+                instrument=t.get("instrument"), legs=part, ref=t["ref"], ref_sign=t["ref_sign"],
+                margin=round((t["margin"] or 0) * n / left, 2), u_entry=t.get("u_entry"), version=t.get("version"),
+                entry_order_id=t.get("entry_order_id"), note=f"{PARTIAL_NOTE}{t['id']}",
+                exit_order_id=",".join(str(p["exit_order_id"]) for p in part if p.get("exit_order_id"))[:64] or None)
+            t["margin"] = round((t["margin"] or 0) * (left - n) / left, 2)
+        await asyncio.to_thread(_split, t["id"], closed, legs=legs, quantity=legs[0]["qty"], scale=t["scale"],
+                                margin=t["margin"])
+        if part:
+            self.event("exit", f"{reason} {t.get('instrument') or t['symbol']}: {n} of {left} set(s) closed, "
+                               f"net ₹{gross - ch:.2f}", trade_id=t["id"], strategy_id=t["strategy_id"])
+            _notify_exit({"symbol": t.get("instrument") or t["symbol"], "reason": reason, "quantity": part[0]["qty"],
+                          "entry": part[0]["entry"], "exit": part[0]["exit"], "pnl": round(gross - ch, 2)})
+        if len(part) < want:
+            self.event("error", f"{reason} {t['symbol']}: {want - len(part)} leg(s) not reduced — they stay in the "
+                                "open position for its final exit", trade_id=t["id"], strategy_id=t["strategy_id"])
 
     async def _book(self, t: dict, reason: str, now: float) -> None:
         gross = ch = 0.0
@@ -697,7 +789,7 @@ class AlgoRunner:
             return
         close_min = int((indicators.close_time(d, len(d["t"]) - 1) + IST) % 86400) // 60
         start, end, _ = engine.session_window(spec)
-        if not start <= close_min <= end:
+        if not start <= close_min <= end or not engine.day_allowed(spec, now):
             return
         side = "BUY" if sig["entry_long"][-1] else "SELL" if sig["entry_short"][-1] else None
         if side is None:
@@ -850,6 +942,7 @@ class AlgoRunner:
                 return
         ref_entry = u if ref == "u" else legs[0]["entry"]
         lv = engine.entry_levels(spec, rsign, ref_entry, atr_vals)
+        plan = engine.scale_plan(lv["so"], sets)
         label = " + ".join(lg["label"] for lg in legs)[:160]
         tid = await asyncio.to_thread(
             _insert, strategy_id=s["id"], symbol=sym, side=side, quantity=legs[0]["qty"], mode=s["mode"],
@@ -858,7 +951,7 @@ class AlgoRunner:
             trail_dist=lv["trd"], trail_activate=lv["tra"], breakeven=lv["be"], best_price=ref_entry,
             legs=_clean(legs), ref=ref, ref_sign=rsign, margin=round(per_set_margin * sets, 2),
             instrument=label, u_entry=u, entry_order_id=",".join(order_ids)[:64] or None,
-            version=s.get("version"))
+            version=s.get("version"), scale={"left": sets, "levels": plan, "done": 0} if plan else None)
         self.event("entry", f"{s['name']} v{s.get('version', 1)}: {side} → {label} x{sets} set(s) ({s['mode']})",
                    trade_id=tid, strategy_id=s["id"])
         _notify_entry({"side": side, "symbol": label, "quantity": legs[0]["qty"], "entry": round(legs[0]["entry"], 2),

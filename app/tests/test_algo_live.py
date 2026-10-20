@@ -215,6 +215,54 @@ def test_unknown_broker_position_never_guesses_flat(monkeypatch, isolated_db):
         assert db.get(AlgoTrade, tid).status == "open"
 
 
+def test_live_scale_out_closes_part_of_each_leg_once(monkeypatch, isolated_db):
+    """A scale-out sends partial exits (written leg first), books them as their
+    own closed row and shrinks the open one. A leg whose order fails stays
+    whole in the open position and the level is never re-sent."""
+    px = {"NSE:NIFTY50-INDEX": 24620.0, "NSE:NIFTYCE": 130.0, "NSE:NIFTYPE": 70.0}
+    broker = FakeBroker(net={"NSE:NIFTYCE": 130, "NSE:NIFTYPE": -130}, fills={"NSE:NIFTYCE": 129.0, "NSE:NIFTYPE": 70.5})
+    _install(monkeypatch, broker, px)
+    tid = _open_live_trade(_strategy())
+    with dbs.SessionLocal() as db:
+        t = db.get(AlgoTrade, tid)
+        t.legs = [{**lg, "qty": 130} for lg in t.legs]
+        t.scale = {"left": 2, "levels": [[24600.0, 1]], "done": 0}
+        db.commit()
+    r = rn.AlgoRunner()
+    asyncio.run(r._scale_out(_row_dict(tid), px, T_CLOSE + 60))
+    assert [(o["symbol"], o["side"], o["qty"], o["exit"]) for o in broker.orders] == [
+        ("NSE:NIFTYPE", "BUY", 65, True), ("NSE:NIFTYCE", "SELL", 65, True)]
+    with dbs.SessionLocal() as db:
+        rows = db.query(AlgoTrade).order_by(AlgoTrade.id).all()
+        assert [lg["qty"] for lg in rows[0].legs] == [65, 65] and rows[0].status == "open"
+        assert rows[0].scale == {"left": 1, "levels": [], "done": 1}
+        part = rows[1]
+        assert (part.status, part.exit_reason, part.note) == ("closed", "SCALE_OUT_1", f"partial exit of #{tid}")
+        assert [(lg["qty"], lg["exit"]) for lg in part.legs] == [(65, 129.0), (65, 70.5)]   # broker fills
+
+    # second position: the PE partial is refused -> PE stays 130, CE is halved, level done, nothing re-sent
+    broker.orders.clear()
+
+    async def refuse_pe(account, symbol, side, qty, *, exit_, strategy_id, product="INTRADAY"):
+        broker.orders.append({"symbol": symbol, "qty": qty})
+        return (False, None, "RMS reject") if symbol == "NSE:NIFTYPE" else (True, f"OID{len(broker.orders)}", "ok")
+
+    monkeypatch.setattr(rn, "_order", refuse_pe)
+    tid2 = _open_live_trade(rows[0].strategy_id)
+    with dbs.SessionLocal() as db:
+        t = db.get(AlgoTrade, tid2)
+        t.legs = [{**lg, "qty": 130} for lg in t.legs]
+        t.scale = {"left": 2, "levels": [[24600.0, 1]], "done": 0}
+        db.commit()
+    asyncio.run(r._manage([_row_dict(tid2)], {}, T_CLOSE + 60, 10 * 60, DAY0 - 33300))
+    asyncio.run(r._manage([_row_dict(tid2)], {}, T_CLOSE + 61, 10 * 60, DAY0 - 33300))   # next tick: level is spent
+    assert [o["symbol"] for o in broker.orders] == ["NSE:NIFTYPE", "NSE:NIFTYCE"]     # one attempt each, ever
+    with dbs.SessionLocal() as db:
+        t = db.get(AlgoTrade, tid2)
+        assert [lg["qty"] for lg in t.legs] == [65, 130] and t.scale == {"left": 1, "levels": [], "done": 1}
+        assert t.status == "open"
+
+
 def test_accepted_but_unfilled_exit_keeps_the_trade_open(monkeypatch, isolated_db):
     """Fyers accepting the exit is not a fill: still held at the broker -> retried, not booked."""
     px = {"NSE:NIFTYCE": 120.0, "NSE:NIFTYPE": 80.0}

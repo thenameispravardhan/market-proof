@@ -16,6 +16,8 @@ Execution model, shared with the live runner:
   * entries fill at the NEXT bar's open (live: the LTP right after close);
   * stop / target / trailing / breakeven are checked inside each bar, the
     stop first when a bar spans both (the conservative assumption);
+  * scale-out levels close a % of the entry size, filled like a target; each
+    part is its own trade and the rest keeps its stop / trail / target;
   * MTM (rupee) stop / target / trail work on the whole position — the way
     to manage a multi-leg option position;
   * daily max loss / max profit flatten the strategy and stop it for the day;
@@ -84,6 +86,13 @@ DEFAULT_SPEC: dict[str, Any] = {
                   "max_position_pct": None},                       # cap one position's margin at X% of equity
     "costs": {"slippage_pct": 0.02, "charges": True},
 }
+# Optional, absent = off, and left out of a normalized spec when off — so a
+# spec saved before they existed normalizes to exactly what it was:
+#   "scale_out": [{"type": pct|points|atr|rr, "value", "atr_period", "qty_pct"}]
+#       partial exits: at each level close qty_pct % of the ENTRY size;
+#   "session": {"days": [1..7]} — entries only on these weekdays (1 = Mon).
+OPTIONAL_KEYS = ("scale_out",)
+SCALE_KINDS = ("pct", "points", "atr", "rr")
 
 
 CARRY = 24 * 60   # square-off minute meaning "never" (no clock minute reaches it)
@@ -98,6 +107,12 @@ def session_window(spec: dict[str, Any]) -> tuple[int, int, int]:
     start = _hhmm(sess["start"]) if sess.get("start") else 9 * 60 + 15
     end = _hhmm(sess["end"]) if sess.get("end") else min(sq, 15 * 60 + 29)
     return start, end, sq
+
+
+def day_allowed(spec: dict[str, Any], t: float) -> bool:
+    """Entries on this IST weekday? (session.days, 1 = Mon; absent = every day)"""
+    days = spec["session"].get("days")
+    return not days or ((int(t) + IST) // 86400 + 3) % 7 + 1 in days
 
 
 def entry_trigger(spec: dict[str, Any], side: str, close: float) -> Optional[float]:
@@ -145,7 +160,7 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
         if k in ("session", "costs", "sizing", "portfolio", "mtm", "daily", "instrument", "entry_order", "bars") \
                 and isinstance(v, dict):
             s[k] = {**s[k], **v}
-        elif k in s or k == "name":
+        elif k in s or k == "name" or k in OPTIONAL_KEYS:
             s[k] = v
     s["symbols"] = list(dict.fromkeys(str(x).strip().upper() for x in s["symbols"] if str(x).strip()))
     if not s["symbols"]:
@@ -170,6 +185,15 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
     start, end, sq = session_window(s)
     if not 9 * 60 + 15 <= start <= end <= min(sq, 15 * 60 + 29):
         raise ValueError("session must satisfy 09:15 <= start <= end <= square_off <= 15:29")
+    days = s["session"].pop("days", None)
+    if days:
+        try:
+            days = sorted({int(x) for x in days})
+        except (TypeError, ValueError):
+            raise ValueError("trading days are weekday numbers 1 (Mon) to 7 (Sun)") from None
+        if not set(days) <= set(range(1, 8)):
+            raise ValueError("trading days are weekday numbers 1 (Mon) to 7 (Sun)")
+        s["session"]["days"] = days
     eo = s["entry_order"]
     if eo.get("type") not in ("market", "pullback", "breakout"):
         raise ValueError("entry order is market, pullback or breakout")
@@ -232,6 +256,23 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
                              "use MTM ₹ stops/targets or put levels on the underlying")
     if s["target"] and s["target"]["type"] == "rr" and not s["stop_loss"]:
         raise ValueError("an R:R target needs a stop loss")
+    so = copy.deepcopy(s.pop("scale_out", None) or [])
+    if so:
+        if not isinstance(so, list) or len(so) > 5:
+            raise ValueError("scale-out takes at most 5 steps")
+        for st in so:
+            if not isinstance(st, dict) or st.get("type") not in SCALE_KINDS:
+                raise ValueError(f"scale-out: type must be one of {SCALE_KINDS}")
+            st["value"] = _num(st.get("value"), "scale-out level", 1e-9)
+            st["atr_period"] = _num(st.get("atr_period", 14), "scale-out ATR period", 1, integer=True)
+            st["qty_pct"] = _num(st.get("qty_pct"), "scale-out % of the position", 1e-9)
+            if st["type"] == "rr" and not s["stop_loss"]:
+                raise ValueError("a scale-out at an R multiple needs a stop loss")
+        if sum(st["qty_pct"] for st in so) > 100 + 1e-9:
+            raise ValueError("scale-out steps close more than 100% of the position")
+        if multi and inst["levels_on"] == "instrument":
+            raise ValueError("multi-leg positions can't scale out on 'the instrument' — put levels on the underlying")
+        s["scale_out"] = so
 
     for k in ("stop", "target", "trail_start", "trail_gap"):
         s["mtm"][k] = _num(s["mtm"].get(k), f"MTM {k}", 1e-9, allow_none=True)
@@ -472,15 +513,28 @@ def entry_levels(spec: dict, sign: int, ref: float, atr_vals: dict[int, Optional
     sl_lv, tg_lv, tr_lv = spec["stop_loss"], spec["target"], spec["trailing"]
     sl_d = g(sl_lv)
     tg_d = (sl_d * tg_lv["value"] if sl_d else None) if tg_lv and tg_lv["type"] == "rr" else g(tg_lv)
+    so = []                                      # scale-out distances, nearest first
+    for st in spec.get("scale_out") or []:
+        dd = (sl_d * st["value"] if sl_d else None) if st["type"] == "rr" else g(st)
+        if dd:
+            so.append((dd, st["qty_pct"]))
     return {"sl": ref - sign * sl_d if sl_d else None,
             "tg": ref + sign * tg_d if tg_d else None,
             "trd": g(tr_lv), "tra": g(tr_lv, "activate") or 0.0,
-            "be": g(spec["breakeven"]), "sl_dist": sl_d}
+            "be": g(spec["breakeven"]), "sl_dist": sl_d,
+            "so": [(ref + sign * dd, pct) for dd, pct in sorted(so)]}
+
+
+def scale_plan(levels: list[tuple[float, float]], sets: int) -> list[list[float]]:
+    """Scale-out levels as [price, sets to close], nearest first. Each step is
+    a % of the ENTRY size rounded down to whole sets (shares / lots): a step
+    worth less than one set is skipped — half a lot can't be sold."""
+    return [[px, n] for px, pct in levels if (n := int(sets * pct / 100 + 1e-9)) > 0]
 
 
 def atr_periods(spec: dict) -> set[int]:
-    return {lv["atr_period"] for lv in (spec["stop_loss"], spec["target"], spec["trailing"], spec["breakeven"])
-            if lv and lv["type"] == "atr"}
+    return {lv["atr_period"] for lv in (spec["stop_loss"], spec["target"], spec["trailing"], spec["breakeven"],
+                                        *(spec.get("scale_out") or [])) if lv and lv["type"] == "atr"}
 
 
 SEGMENT = {"EQ": "eq", "FUT": "fut", "CE": "opt", "PE": "opt"}
@@ -704,32 +758,42 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
     def ref_at(pos: dict, u: float, t: float, iv: float) -> float:
         return u if pos["ref"] == "u" else _leg_px(pos["legs"][0], u, t, iv)
 
-    def close(sym: str, u: float, t: float, reason: str, i: int, slipped: bool = True) -> None:
+    def close(sym: str, u: float, t: float, reason: str, i: int, slipped: bool = True,
+              sets: Optional[int] = None) -> None:
+        """Close the position — or, with `sets` below its size, that many sets
+        of it (a scale-out: booked as its own trade, the rest stays open)."""
         nonlocal realized, used_margin, open_n, day_realized
         s_ = st[sym]
         pos, d = s_["pos"], s_["d"]
+        n = pos["sets"] if sets is None else min(sets, pos["sets"])
+        part = n < pos["sets"]
         iv = d.get("iv", [0.0] * len(d["t"]))[i] if inst["type"] == "option" else 0.0
         gross = chg = 0.0
         legs_out = []
         for l in pos["legs"]:
+            q = l["qty"] * n // pos["sets"]          # qty = per_set x sets, so this is exact
             px = _leg_px(l, u, t, iv)
             if slipped:
                 px = px * (1 - slip) if l["act"] > 0 else px * (1 + slip)
-            g, ch = leg_pnl(l["act"], l["qty"], l["entry"], px, l["kind"], with_ch)
+            g, ch = leg_pnl(l["act"], q, l["entry"], px, l["kind"], with_ch)
             gross, chg = gross + g, chg + ch
-            legs_out.append({"label": l["label"], "side": "BUY" if l["act"] > 0 else "SELL", "qty": l["qty"],
+            legs_out.append({"label": l["label"], "side": "BUY" if l["act"] > 0 else "SELL", "qty": q,
                              "entry": round(l["entry"], 2), "exit": round(px, 2)})
+            if part:
+                l["qty"] -= q
         net = gross - chg
+        margin = pos["margin"] * n / pos["sets"]
+        risk = pos["risk"] * n / pos["sets"] if pos["risk"] else None
         single = len(pos["legs"]) == 1
         trades.append({
             "symbol": sym, "instrument": " + ".join(l["label"] for l in legs_out), "side": pos["side"],
-            "qty": pos["legs"][0]["qty"], "lots": pos["sets"],
+            "qty": legs_out[0]["qty"], "lots": n,
             "entry_t": pos["t"], "exit_t": t,
             "entry": legs_out[0]["entry"] if single else round(pos["u0"], 2),
             "exit": legs_out[0]["exit"] if single else round(u, 2),
             "u_entry": round(pos["u0"], 2), "u_exit": round(u, 2),
             "reason": reason, "gross": round(gross, 2), "charges": round(chg, 2), "net": round(net, 2),
-            "bars": i - pos["i"], "margin": round(pos["margin"], 2), "legs": legs_out,
+            "bars": i - pos["i"], "margin": round(margin, 2), "legs": legs_out,
             "stop": pos["sl"], "target": pos["tg"],
             # excursions on the reference price, in % of entry: how far it went
             # against / for you before the exit — the data to tune stops with.
@@ -737,12 +801,18 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
             if pos["ref_entry"] else None,
             "mfe_pct": round(pos["sign"] * (pos["best"] - pos["ref_entry"]) / pos["ref_entry"] * 100, 3)
             if pos["ref_entry"] else None,
-            "r": round(net / pos["risk"], 2) if pos["risk"] else None,
+            "r": round(net / risk, 2) if risk else None,
             "minutes": round((t - pos["t"]) / 60),
         })
         realized += net
         day_realized += net
-        used_margin -= pos["margin"]
+        used_margin -= margin
+        if part:
+            pos["sets"] -= n
+            pos["margin"] -= margin
+            if risk:
+                pos["risk"] -= risk
+            return
         open_n -= 1
         open_syms.discard(sym)
         s_["pos"] = None
@@ -820,7 +890,8 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                      "risk": lv["sl_dist"] * legs[0]["per_set"] * sets
                      if lv["sl_dist"] and (ref != "u" or inst["type"] != "option") else None,
                      "t": t, "i": i, "day": (t + IST) // 86400, "u0": u, "sets": sets, "margin": margin,
-                     "exit_pending": None, "mid_bar": u_fill is not None}
+                     "exit_pending": None, "mid_bar": u_fill is not None,
+                     "so": scale_plan(lv["so"], sets), "so_k": 0}
         used_margin += margin
         open_n += 1
         open_syms.add(sym)
@@ -849,6 +920,21 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                 return close(sym, o, t, why, i)
             if sgn * (f(u_adv) - stop) <= 0:
                 return close(sym, _solve(f, stop, o, u_adv), t, why, i)
+        while pos["so"] and fav_ok:                 # scale-out levels, nearest first, filled like a target
+            lvl, n = pos["so"][0]
+            u_fav = max((h, l), key=lambda u: sgn * f(u))
+            if later and sgn * (f(o) - lvl) >= 0:
+                u_x = o
+            elif sgn * (f(u_fav) - lvl) >= 0:
+                u_x = _solve(f, lvl, o, u_fav)
+            else:
+                break
+            pos["so"].pop(0)
+            pos["so_k"] += 1
+            why = f"SCALE_OUT_{pos['so_k']}"
+            if n >= pos["sets"]:
+                return close(sym, u_x, t, why, i, slipped=False)
+            close(sym, u_x, t, why, i, slipped=False, sets=n)
         if pos["tg"] is not None and fav_ok:
             ro = f(o)
             u_fav = max((h, l), key=lambda u: sgn * f(u))
@@ -955,7 +1041,8 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         if (s_["pos"] is None and s_["pending"] is None and i + 1 < len(d["t"]) and i >= s_["cool"]
                 and halted != day and (trade_from is None or t >= trade_from)):
             close_mod = ((ind.close_time(d, i) + IST) % 86400) // 60
-            if start <= close_mod <= end and s_["per_day"].get(day, 0) < spec["max_trades_per_day"]:
+            if start <= close_mod <= end and s_["per_day"].get(day, 0) < spec["max_trades_per_day"] \
+                    and day_allowed(spec, t):
                 side = "BUY" if s_["sig"]["entry_long"][i] else "SELL" if s_["sig"]["entry_short"][i] else None
                 if side:
                     s_["pending"] = {"side": side, "day": day, "i": i,
@@ -1203,23 +1290,13 @@ def optimize(spec: dict, data: dict[str, dict], grid: list[dict[str, Any]], metr
     in-sample trades and each row carries its out-of-sample result — the
     walk-forward check that a winner was found, not fitted.
     """
-    if metric not in METRICS:
-        raise ValueError(f"metric must be one of {METRICS}")
-    if not grid:
-        raise ValueError("add at least one parameter range")
-    axes = [(g["path"], list(g["values"])) for g in grid]
-    combos = list(itertools.product(*(v for _, v in axes)))
-    if not combos or len(combos) > MAX_COMBOS:
-        raise ValueError(f"{len(combos)} combinations — keep it between 1 and {MAX_COMBOS}")
+    axes, combos = _grid(grid, metric)
     caches: dict[str, dict] = {}
     rows = []
     daily_by_combo: list[dict[int, float]] = []
     capital = 0.0
     for combo in combos:
-        s = copy.deepcopy(spec)
-        for (path, _), v in zip(axes, combo):
-            set_path(s, path, v)
-        s = normalize(s)
+        s = _variant(spec, axes, combo)
         capital = float(s["portfolio"]["capital"])
         res = run(s, data, caches, trade_from, oos_from)
         full = res["stats"]
@@ -1246,7 +1323,91 @@ def optimize(spec: dict, data: dict[str, dict], grid: list[dict[str, Any]], metr
         r.pop("_daily", None)
     return {"combos": len(combos), "ranked": ok[:100],
             "too_few_trades": len(rows) - len(ok), "metric": metric,
-            "overfitting": over}
+            "overfitting": over,
+            # every combo, for the parameter heatmap (a plateau vs a lone spike)
+            "all": [{"params": r["params"], "value": r[metric], "trades": r["trades"]} for r in rows]}
+
+
+def _grid(grid: list[dict[str, Any]], metric: str) -> tuple[list[tuple[str, list]], list[tuple]]:
+    if metric not in METRICS:
+        raise ValueError(f"metric must be one of {METRICS}")
+    if not grid:
+        raise ValueError("add at least one parameter range")
+    axes = [(g["path"], list(g["values"])) for g in grid]
+    combos = list(itertools.product(*(v for _, v in axes)))
+    if not combos or len(combos) > MAX_COMBOS:
+        raise ValueError(f"{len(combos)} combinations — keep it between 1 and {MAX_COMBOS}")
+    return axes, combos
+
+
+def _variant(spec: dict, axes: list[tuple[str, list]], combo: tuple) -> dict:
+    s = copy.deepcopy(spec)
+    for (path, _), v in zip(axes, combo):
+        set_path(s, path, v)
+    return normalize(s)
+
+
+def walk_forward(spec: dict, data: dict[str, dict], grid: list[dict[str, Any]], metric: str = "net_pnl",
+                 min_trades: int = 5, trade_from: Optional[int] = None, windows: int = 4,
+                 is_mult: float = 3.0, anchored: bool = False) -> dict[str, Any]:
+    """Rolling walk-forward optimisation (backtest only).
+
+    The range is cut into `is_mult + windows` equal slices. For each of the
+    last `windows` slices the grid is ranked on the `is_mult` slices before it
+    (anchored: on everything before it) and the winner then trades that slice
+    unseen. The stitched out-of-sample slices are the honest estimate of
+    "re-optimise every period, trade the winner". Walk-forward efficiency =
+    out-of-sample P&L per day / in-sample P&L per day.
+
+    ponytail: each combo runs once over the whole range and its trades are
+    sliced by entry time, so compounding / free capital carry across slices
+    per combo, not along the stitched path; re-run per slice if that matters.
+    """
+    windows, is_mult = int(windows), float(is_mult)
+    if not 2 <= windows <= 12:
+        raise ValueError("walk-forward takes 2-12 out-of-sample windows")
+    if not 0.5 <= is_mult <= 10:
+        raise ValueError("in-sample length must be 0.5-10x an out-of-sample window")
+    axes, combos = _grid(grid, metric)
+    caches: dict[str, dict] = {}
+    runs, capital = [], 0.0
+    for combo in combos:
+        s = _variant(spec, axes, combo)
+        capital = float(s["portfolio"]["capital"])
+        runs.append(({p: v for (p, _), v in zip(axes, combo)}, run(s, data, caches, trade_from)["trades"]))
+    t0 = trade_from if trade_from is not None else min(d["t"][0] for d in data.values())
+    t1 = max(d["t"][-1] for d in data.values()) + 1
+    span = (t1 - t0) / (is_mult + windows)
+    folds, oos_trades, is_net, is_s = [], [], 0.0, 0.0
+    for k in range(windows):
+        o0 = t0 + (is_mult + k) * span
+        o1 = t1 if k == windows - 1 else o0 + span
+        i0 = t0 if anchored else o0 - is_mult * span
+        best = None
+        for params, trades in runs:
+            ins = [x for x in trades if i0 <= x["entry_t"] < o0]
+            if len(ins) < min_trades:
+                continue
+            st_ = stats(ins, capital)
+            key = (st_[metric] is not None, st_[metric] or 0)
+            if best is None or key > best[0]:
+                best = (key, params, st_, trades)
+        fold: dict[str, Any] = {"is_from": int(i0), "oos_from": int(o0), "oos_to": int(o1),
+                                "params": None, "is": None, "oos": None}
+        if best:
+            outs = [x for x in best[3] if o0 <= x["entry_t"] < o1]
+            oos_trades += outs
+            fold.update({"params": best[1], "is": summary(best[2]), "is_value": best[2][metric],
+                         "oos": summary(stats(outs, capital))})
+            is_net += best[2]["net_pnl"]
+            is_s += o0 - i0
+        folds.append(fold)
+    total = stats(oos_trades, capital)
+    oos_s = sum(f["oos_to"] - f["oos_from"] for f in folds if f["params"])
+    wfe = (total["net_pnl"] / oos_s) / (is_net / is_s) * 100 if oos_s and is_s and is_net > 0 else None
+    return {"combos": len(combos), "metric": metric, "windows": windows, "anchored": anchored, "folds": folds,
+            "oos": {**summary(total), "max_drawdown": total["max_drawdown"], "equity": total["equity"]},
+            "wfe_pct": round(wfe, 1) if wfe is not None else None}
 
 
 def overfitting_stats(daily: list[dict[int, float]], capital: float, *, n_trials: int) -> Optional[dict[str, Any]]:
