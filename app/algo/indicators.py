@@ -670,6 +670,17 @@ def clock(d: dict) -> dict[str, S]:
     return {"hhmm": out_t, "weekday": out_d}
 
 
+def vix_level(d: dict) -> S:
+    """India VIX on each bar: the last VIX candle that had CLOSED by the bar's
+    close (the loader attaches VIX candles of the same timeframe as `vix`)."""
+    v = d.get("vix")
+    if not v or not v.get("t"):
+        return [None] * len(d["t"])
+    from app.algo import engine
+
+    return engine._align(d, v, v["c"], {})  # noqa: SLF001 — the engine's no-lookahead alignment
+
+
 # ---- registry --------------------------------------------------------------
 # name -> (fn(d, **params) -> list | {field: list}, default params, outputs, group)
 # The UI builds its pickers from this, so adding an indicator is one line here.
@@ -769,9 +780,76 @@ REGISTRY: dict[str, tuple[Callable[..., Any], dict[str, Any], list[str], str]] =
     # is DTE < 1. The engine attaches `expiry_ts` before signals run.
     "DTE":        (lambda d: [(e - t) / 86400 for e, t in zip(d["expiry_ts"], d["t"])]
                    if d.get("expiry_ts") else [None] * len(d["t"]), {}, ["value"], "Time"),
+    # India VIX (%), the market's 30-day implied volatility, beside any symbol:
+    # "sell premium only when VIX > 14", or IV rank = VIX on the daily
+    # timeframe with the rank transform over ~250 bars.
+    "VIX":        (lambda d: vix_level(d), {}, ["value"], "Volatility"),
 }
 
 SOURCES = ("close", "open", "high", "low", "hl2", "hlc3", "ohlc4", "volume", "range")
+
+# One line per indicator — the builder's tooltips and the Algo guide's reference.
+ABOUT: dict[str, str] = {
+    "PRICE": "the candle's price: close / open / high / low / hl2 / hlc3 / ohlc4, or its volume or range (high - low)",
+    "SMA": "simple moving average of `source` over `period` candles",
+    "EMA": "exponential moving average (reacts faster than SMA)",
+    "WMA": "linearly weighted moving average",
+    "HMA": "Hull moving average (smooth and fast)",
+    "DEMA": "double exponential moving average",
+    "TEMA": "triple exponential moving average",
+    "RMA": "Wilder's running average (the one RSI / ATR use)",
+    "VWMA": "volume-weighted moving average of the close",
+    "VWAP": "session VWAP (resets every day at the open)",
+    "SUPERTREND": "SuperTrend line (`value`) and `direction` (+1 uptrend, -1 downtrend)",
+    "PSAR": "parabolic SAR stop-and-reverse level",
+    "ADX": "trend strength `adx` (above ~25 = trending) and the +DI / -DI lines",
+    "AROON": "Aroon up / down (100 = the extreme was this candle) and their difference",
+    "ICHIMOKU": "Ichimoku tenkan, kijun and the two cloud spans",
+    "MACD": "MACD line, its signal line and the histogram (macd - signal)",
+    "RSI": "relative strength index 0-100 (70 overbought, 30 oversold)",
+    "STOCH": "stochastic %K and %D, 0-100",
+    "STOCHRSI": "stochastic of RSI, %K and %D, 0-100",
+    "CCI": "commodity channel index (±100 = stretched)",
+    "WILLR": "Williams %R, -100 (at the low) to 0 (at the high)",
+    "MFI": "money flow index 0-100 (a volume-weighted RSI)",
+    "ROC": "rate of change, % over `period` candles",
+    "MOMENTUM": "price change over `period` candles, in points",
+    "TRIX": "1-candle % change of a triple-smoothed EMA",
+    "BBANDS": "Bollinger bands; `width` = band width in % of the middle, `percent_b` 0 at the lower band, 1 at the upper",
+    "KELTNER": "Keltner channel: EMA ± multiplier x ATR",
+    "DONCHIAN": "highest high / lowest low of `period` candles and their midpoint",
+    "ATR": "average true range in points (Wilder)",
+    "STDDEV": "standard deviation of `source` over `period` candles",
+    "ZSCORE": "how many standard deviations `source` is from its `period` average",
+    "HV": "historical volatility, annualised %, of this timeframe's closes over `period` candles",
+    "LINREG": "least-squares line: its end `value` and its slope in % of price per candle (`slope_pct`)",
+    "HIGHEST": "highest `source` of the last `period` candles (this one included)",
+    "LOWEST": "lowest `source` of the last `period` candles (this one included)",
+    "OBV": "on-balance volume",
+    "CMF": "Chaikin money flow, -1 to +1",
+    "VOLUME_SMA": "average volume of `period` candles",
+    "DAILY": "previous session's OHLC (prev_*), classic pivots r1-r3 / s1-s3, CPR (tc / bc), today's running "
+             "open / high / low so far, and the opening gap % vs the previous close",
+    "ORB": "opening range: high / low of the first `minutes` of the session (empty until that range is complete)",
+    "HEIKIN_ASHI": "Heikin-Ashi candle values",
+    "CANDLE": "candle patterns, each 1 (yes) or 0: green, red, doji, hammer, shooting_star, bullish / bearish "
+              "engulfing, inside_bar, outside_bar, nr7 (narrowest range of 7)",
+    "DELTA": "order flow: buy - sell volume of the candle, delta as % of volume, buy and sell volume "
+             "(recorded ticks, else estimated from 1-minute candles)",
+    "CVD": "cumulative delta: per session (resets at the open) and running total",
+    "CVD_DIVERGENCE": "1 when price makes a new `period` low that cumulative delta doesn't (bull) / a high it "
+                      "doesn't confirm (bear), else 0",
+    "FLOW_PRESSURE": "pressure -100..+100 (smoothed delta % of volume), delta_z, absorption (+1 floor / -1 "
+                     "ceiling) and aggression (+1 / -1)",
+    "VPROFILE": "session volume profile: POC, value-area high / low (`value_area`%) and the previous session's",
+    "RVOL": "relative volume so far today vs the same time of day over `days` sessions (2 = twice usual)",
+    "BAR_FLOW": "the candle's own point of control and VWAP from its ticks (hlc3 without recorded flow)",
+    "TIME": "the candle's START time as HHMM in IST (930 = 09:30) and `weekday` 1 (Mon) - 7 (Sun)",
+    "DTE": "calendar days to the strategy's expiry (options: its weekly / monthly; else the monthly); "
+           "expiry day = DTE < 1",
+    "VIX": "India VIX %, the market's 30-day implied volatility, beside any symbol (use tf 1440 + the rank "
+           "transform for IV rank)",
+}
 
 
 # Upper bounds for the few params that are not bar counts.
@@ -825,5 +903,5 @@ def compute(d: dict, name: str, params: dict[str, Any]) -> dict[str, S]:
 
 
 def catalog() -> list[dict[str, Any]]:
-    return [{"name": n, "params": dflt, "outputs": outs, "group": g}
+    return [{"name": n, "params": dflt, "outputs": outs, "group": g, "about": ABOUT.get(n, "")}
             for n, (_, dflt, outs, g) in REGISTRY.items()]
