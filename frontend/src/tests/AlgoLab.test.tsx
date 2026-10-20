@@ -25,7 +25,7 @@ const DEFAULTS = {
 };
 const CATALOG = {
   indicators: [{ name: "PRICE", params: {}, outputs: ["value"], group: "price" }, { name: "EMA", params: { period: 20 }, outputs: ["value"], group: "trend" }],
-  operators: [">", "<", "crosses_above", "crosses_below"], timeframes: [1, 5, 15, 60, 1440], cond_timeframes: [15, 60, 1440],
+  operators: [">", "<", "crosses_above", "crosses_below", "between", "outside"], timeframes: [1, 5, 15, 60, 1440], cond_timeframes: [15, 60, 1440],
   sources: ["close"], metrics: ["net_pnl"], sizing: ["qty", "lots", "amount", "pct_equity", "risk", "risk_pct"], defaults: DEFAULTS, max_range_days: 1098,
 };
 const LIVE_STRATEGY = {
@@ -145,6 +145,24 @@ describe("Algo Lab", () => {
     const body = JSON.parse(String(calls.find((c) => c.url.includes("/api/algo/backtest"))!.init!.body));
     expect(body.spec.scale_out).toEqual([{ type: "rr", value: 1, qty_pct: 50, atr_period: 14 }]);
     expect(body.spec.session.days).toEqual([2, 3, 4, 5]);
+  });
+
+  it("builds an angle range and condition modifiers", async () => {
+    mount();
+    await screen.findByDisplayValue(/EMA 9\/21/);
+    fireEvent.change(screen.getAllByTestId("operand-xf")[0], { target: { value: "angle" } });     // EMA 9 as its angle
+    const opSel = screen.getAllByDisplayValue("crosses above")[0] as HTMLSelectElement;
+    fireEvent.change(opSel, { target: { value: "between" } });
+    fireEvent.click(screen.getAllByTestId("cond-more")[0]);
+    fireEvent.click(within(screen.getAllByTestId("cond-modifiers")[0]).getByLabelText("NOT"));
+    fireEvent.click(screen.getByText("▶ Run backtest"));
+    await waitFor(() => expect(calls.some((c) => c.url.includes("/api/algo/backtest"))).toBe(true));
+    const body = JSON.parse(String(calls.find((c) => c.url.includes("/api/algo/backtest"))!.init!.body));
+    const c0 = body.spec.entry_long.conditions[0];
+    expect(c0.left).toMatchObject({ ind: "EMA", xf: "angle", xn: 3 });
+    expect(c0.op).toBe("between");
+    expect(c0.right2).toEqual({ value: 0 });            // the high bound appears with between
+    expect(c0.negate).toBe(true);
   });
 
   it("weekday picker: all five = every day (null), and never empty", () => {
