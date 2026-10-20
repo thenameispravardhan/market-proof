@@ -1,9 +1,9 @@
 // Algo Lab workflow tests — unsaved-change tracking, stale backtest notice,
 // out-of-sample rounding and the LIVE switch-on confirmation.
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import Algo from "../pages/Algo";
+import Algo, { nextDays } from "../pages/Algo";
 
 vi.mock("lightweight-charts", () => ({
   createChart: vi.fn(() => ({ addSeries: vi.fn(() => ({ setData: vi.fn() })), panes: vi.fn(() => []), timeScale: vi.fn(() => ({ setVisibleLogicalRange: vi.fn() })), remove: vi.fn() })),
@@ -37,6 +37,24 @@ const BT = {
   trades: [], trades_total: 0, notes: [], elapsed_s: 0.1, chart: { symbol: "NSE:SBIN-EQ", candles: [], trades: [] }, spec: DEFAULTS,
 };
 
+const P1 = "entry_long.conditions.0.left.params.period";
+const P2 = "entry_long.conditions.0.right.params.period";
+const OPT = {
+  combos: 4, ranked: [], too_few_trades: 1, metric: "net_pnl", notes: [], elapsed_s: 0.2, oos_from: null, overfitting: null,
+  all: [
+    { params: { [P1]: 9, [P2]: 21 }, value: 1200, trades: 30 }, { params: { [P1]: 9, [P2]: 26 }, value: -300, trades: 25 },
+    { params: { [P1]: 11, [P2]: 21 }, value: 800, trades: 28 }, { params: { [P1]: 11, [P2]: 26 }, value: 50, trades: 2 },
+  ],
+};
+const WF = {
+  combos: 25, metric: "net_pnl", windows: 2, anchored: false, wfe_pct: 62.5, elapsed_s: 0.4, notes: [], oos_from: null,
+  folds: [
+    { is_from: 1735689600, oos_from: 1738368000, oos_to: 1739577600, params: { [P1]: 9, [P2]: 21 }, is: null, is_value: 900, oos: { trades: 12, net_pnl: 400, profit_factor: 1.4 } },
+    { is_from: 1736899200, oos_from: 1739577600, oos_to: 1740787200, params: null, is: null, oos: null },
+  ],
+  oos: { trades: 12, win_rate: 50, net_pnl: 400, profit_factor: 1.4, sharpe: 1.1, max_drawdown: 150, max_drawdown_pct: 0.2, equity: [[1738400000, 100100], [1738500000, 100400]] },
+};
+
 const json = (body: unknown) => Promise.resolve(new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } }));
 let calls: { url: string; init?: RequestInit }[] = [];
 
@@ -49,6 +67,7 @@ function route(url: string, init?: RequestInit) {
   if (url.includes("/api/broker-accounts")) return json({ accounts: [] });
   if (url.includes("/api/algo/instrument")) return json({ symbol: "NSE:SBIN-EQ", name: "SBIN", fno: false, lot: null, weekly: false, futures: [], coverage: null });
   if (url.includes("/api/algo/backtest")) return json(BT);
+  if (url.includes("/api/algo/optimize")) return json(JSON.parse(String(init?.body)).walk_forward ? WF : OPT);
   if (url.includes("/api/search/symbols")) return json({ hits: [] });
   return json({});
 }
@@ -114,5 +133,47 @@ describe("Algo Lab", () => {
     confirm.mockReturnValue(true);
     fireEvent.click(sw);
     await waitFor(() => expect(calls.some((c) => c.init?.method === "PUT" && String(c.init.body).includes('"enabled":true'))).toBe(true));
+  });
+
+  it("sends scale-out steps and entry weekdays with the backtest", async () => {
+    mount();
+    await screen.findByDisplayValue(/EMA 9\/21/);
+    fireEvent.click(within(screen.getByTestId("scale-out")).getByText("+ step"));       // the template has a stop: an R step
+    fireEvent.click(within(screen.getByTestId("algo-days")).getByLabelText("Mon"));     // untick Monday
+    fireEvent.click(screen.getByText("▶ Run backtest"));
+    await waitFor(() => expect(calls.some((c) => c.url.includes("/api/algo/backtest"))).toBe(true));
+    const body = JSON.parse(String(calls.find((c) => c.url.includes("/api/algo/backtest"))!.init!.body));
+    expect(body.spec.scale_out).toEqual([{ type: "rr", value: 1, qty_pct: 50, atr_period: 14 }]);
+    expect(body.spec.session.days).toEqual([2, 3, 4, 5]);
+  });
+
+  it("weekday picker: all five = every day (null), and never empty", () => {
+    expect(nextDays(null, 1, false)).toEqual([2, 3, 4, 5]);
+    expect(nextDays([2, 3, 4, 5], 1, true)).toBeNull();
+    expect(nextDays([3], 3, false)).toEqual([3]);
+  });
+
+  it("draws a heatmap for two swept parameters and runs a walk-forward", async () => {
+    mount();
+    await screen.findByDisplayValue(/EMA 9\/21/);
+    fireEvent.click(screen.getByRole("button", { name: "Optimise" }));
+    fireEvent.click(screen.getByText("+ parameter"));
+    fireEvent.click(screen.getByText("+ parameter"));
+    fireEvent.click(screen.getByText("Run optimisation"));
+    const heat = await screen.findByTestId("opt-heatmap");
+    expect(within(heat).getByText("1200")).toBeTruthy();
+    expect(within(heat).getAllByText("·").length).toBe(1);                              // the 2-trade combo is not ranked
+    fireEvent.click(within(heat).getByText("800"));
+    expect(await screen.findByText(/Optimiser values applied/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Optimise" }));
+    fireEvent.change(screen.getByDisplayValue("one out-of-sample split"), { target: { value: "wf" } });
+    fireEvent.click(screen.getByText("Run optimisation"));
+    const wf = await screen.findByTestId("walk-forward");
+    const body = JSON.parse(String(calls.filter((c) => c.url.includes("/api/algo/optimize")).pop()!.init!.body));
+    expect(body.walk_forward).toEqual({ windows: 4, is_mult: 3, anchored: false });
+    expect(body.oos_pct).toBeUndefined();
+    expect(within(wf).getByText("63%")).toBeTruthy();                                   // WF efficiency
+    expect(within(wf).getByText(/not traded/)).toBeTruthy();                            // the empty window says so
   });
 });

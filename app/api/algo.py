@@ -2,7 +2,8 @@
 
     GET    /api/algo/indicators            catalog for the builder (indicators, operators, defaults)
     POST   /api/algo/backtest              {spec, start, end, chart_symbol?}
-    POST   /api/algo/optimize              {spec, start, end, grid:[{path, values}], metric, min_trades}
+    POST   /api/algo/optimize              {spec, start, end, grid:[{path, values}], metric, min_trades,
+                                            walk_forward?: {windows, is_mult, anchored}}
     GET    /api/algo/data?symbol=          what the candle store holds for a symbol
     POST   /api/algo/data/download         {symbols, days} — fill the store from Fyers
     GET    /api/algo/strategies            saved strategies + live P&L
@@ -222,15 +223,21 @@ async def optimize(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         combos *= max(1, len(g.get("values") or []))
     _guard(spec, start, end, combos)
     pct = _oos_pct(body)
+    wf = body.get("walk_forward")         # {windows, is_mult, anchored}: rolling walk-forward instead of one split
     async with _heavy:
         t0 = time.monotonic()
         bars, notes, trade_from = await _assemble(spec, start, end)
-        oos_from = _oos_from(bars, trade_from, pct)
+        oos_from = None if wf else _oos_from(bars, trade_from, pct)
         try:
-            res = await asyncio.to_thread(engine.optimize, spec, bars, grid,
-                                          str(body.get("metric") or "net_pnl"), int(body.get("min_trades") or 5),
-                                          trade_from, oos_from)
-        except (ValueError, KeyError, IndexError, TypeError, ZeroDivisionError) as e:
+            metric, min_trades = str(body.get("metric") or "net_pnl"), int(body.get("min_trades") or 5)
+            if wf:
+                res = await asyncio.to_thread(engine.walk_forward, spec, bars, grid, metric, min_trades, trade_from,
+                                              int(wf.get("windows") or 4), float(wf.get("is_mult") or 3),
+                                              bool(wf.get("anchored")))
+            else:
+                res = await asyncio.to_thread(engine.optimize, spec, bars, grid, metric, min_trades,
+                                              trade_from, oos_from)
+        except (ValueError, KeyError, IndexError, TypeError, ZeroDivisionError, AttributeError) as e:
             raise HTTPException(422, detail=f"optimize: {e}")
     return {**res, "notes": notes, "elapsed_s": round(time.monotonic() - t0, 2), "oos_from": oos_from}
 

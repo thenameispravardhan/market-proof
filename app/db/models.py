@@ -731,6 +731,8 @@ class AlgoTrade(Base):
     margin: Mapped[Optional[float]] = mapped_column(Float)
     u_entry: Mapped[Optional[float]] = mapped_column(Float)
     version: Mapped[Optional[int]] = mapped_column(Integer)    # strategy version that opened it
+    # scale-out plan {"left": sets open, "levels": [[ref price, sets to close], ...], "done": n}
+    scale: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
 
 
 
