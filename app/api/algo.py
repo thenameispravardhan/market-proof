@@ -2,6 +2,7 @@
 
     GET    /api/algo/indicators            catalog for the builder (indicators, operators, defaults)
     POST   /api/algo/backtest              {spec, start, end, chart_symbol?}
+    POST   /api/algo/payoff               {spec, side?, spot?, iv_pct?} — payoff, Greeks, funds required
     POST   /api/algo/optimize              {spec, start, end, grid:[{path, values}], metric, min_trades,
                                             walk_forward?: {windows, is_mult, anchored}}
     GET    /api/algo/data?symbol=          what the candle store holds for a symbol
@@ -260,6 +261,82 @@ async def instrument_info(symbol: str) -> dict[str, Any]:
             "futures": [{"symbol": s_, "expiry": e} for e, s_ in fno.master()["futures"].get(name, [])
                         if e >= time.time()][:3],
             "coverage": data.coverage(data.store_key(fy))}
+
+
+def _last_closes(fy: str, days: int = 40) -> list[float]:
+    """Daily closes the candle store holds for a symbol, oldest first (empty when none)."""
+    cov = data.coverage(data.store_key(fy))
+    if not cov:
+        return []
+    d = data.load(data.store_key(fy), 1440, int(cov["last"]) - days * DAY, int(cov["last"]) + DAY)
+    return list(d["c"]) if d else []
+
+
+@router.post("/payoff")
+async def payoff(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Payoff curves, Greeks, breakevens and funds required for ONE set of the
+    builder's legs on its first symbol: {spec, side?: BUY|SELL, spot?, iv_pct?}.
+    Spot defaults to the last stored close, IV to India VIX (indices) or 20-day
+    realised vol — the backtest's own pricing inputs."""
+    import math
+
+    from app.algo import fno
+    from app.algo import payoff as po
+
+    raw = dict(body.get("spec") or {})
+    if not raw.get("symbols"):
+        raise HTTPException(422, detail="add a symbol first")
+    # Only the instrument / margin / portfolio matter here: a builder with no
+    # conditions or stops yet still gets its preview.
+    dummy = {"logic": "AND", "conditions": [{"left": {"value": 1}, "op": ">", "right": {"value": 0}}]}
+    stub = {k: raw[k] for k in ("symbols", "instrument", "portfolio", "margin") if k in raw}
+    try:
+        spec = engine.normalize({**stub, "direction": "both", "entry_long": dummy, "entry_short": dummy,
+                                 "stop_loss": None, "target": None, "sizing": {"mode": "lots", "value": 1}})
+    except (ValueError, TypeError, KeyError) as e:
+        raise HTTPException(422, detail=str(e))
+    side = "SELL" if str(body.get("side") or "BUY").upper() == "SELL" else "BUY"
+    fy = data.fyers_symbol(spec["symbols"][0])
+    name = fno.fno_name(fy)
+    try:
+        await fno.ensure_master()
+    except Exception as e:  # noqa: BLE001 — fallback lots still give a preview
+        log.warning("algo.fno_master_unavailable", error=str(e)[:200])
+    closes = await asyncio.to_thread(_last_closes, fy)
+    try:
+        spot = float(body["spot"]) if body.get("spot") else (closes[-1] if closes else None)
+    except (TypeError, ValueError):
+        raise HTTPException(422, detail="spot must be a number") from None
+    if not spot or spot <= 0:
+        raise HTTPException(422, detail=f"no candles stored for {fy} — download its data or type a spot price")
+    iv_src, iv = "input", None
+    if body.get("iv_pct"):
+        try:
+            iv = float(body["iv_pct"]) / 100
+        except (TypeError, ValueError):
+            raise HTTPException(422, detail="IV % must be a number") from None
+    elif spec["instrument"]["iv"]["source"] == "fixed":
+        iv, iv_src = spec["instrument"]["iv"]["value"] / 100, "fixed"
+    else:
+        if name in fno.INDEX_LOTS and spec["instrument"]["iv"]["source"] in ("auto", "vix"):
+            vix = await asyncio.to_thread(_last_closes, data.VIX, 10)
+            if vix:
+                iv, iv_src = vix[-1] / 100, "India VIX"
+        if iv is None and len(closes) > 6:
+            rets = [math.log(b / a) for a, b in zip(closes, closes[1:])][-20:]
+            m = sum(rets) / len(rets)
+            iv = max(0.05, math.sqrt(sum((r - m) ** 2 for r in rets) / (len(rets) - 1)) * math.sqrt(252))
+            iv_src = "20-day realised vol"
+        if iv is None:
+            iv, iv_src = (0.15 if name in fno.INDEX_LOTS else 0.30), "default"
+    if not 0.01 <= iv <= 5:
+        raise HTTPException(422, detail="IV must be 1-500%")
+    meta = {"symbol": fy, "name": name, "exch": fno.exchange_of(fy), "lot": fno.lot_size(name)}
+    try:
+        res = await asyncio.to_thread(po.preview, spec, side, spot, time.time(), iv, meta)
+    except (ValueError, KeyError, ZeroDivisionError) as e:
+        raise HTTPException(422, detail=f"payoff: {e}")
+    return {**res, "symbol": fy, "iv_source": iv_src, "spot_source": "input" if body.get("spot") else "last close"}
 
 
 # ---- real tick recording (app/algo/ticks.py) --------------------------------

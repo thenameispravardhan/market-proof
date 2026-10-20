@@ -12,8 +12,11 @@
 // confirm "LIVE".
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Area, AreaChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Legend, Line, LineChart, ReferenceArea, ReferenceLine,
+  ResponsiveContainer, Scatter, ScatterChart, Tooltip, XAxis, YAxis, ZAxis,
+} from "recharts";
 import {
   CandlestickSeries,
   ColorType,
@@ -71,7 +74,10 @@ type Group = { logic: "AND" | "OR"; conditions: (Cond | Group)[] };
 type Level = { type: string; value: number; atr_period?: number; activate?: number } | null;
 // Partial exit: close qty_pct % of the ENTRY size at this level (rr = R multiples of the stop).
 type ScaleStep = { type: string; value: number; atr_period?: number; qty_pct: number };
-type Leg = { right: "CE" | "PE" | "FUT"; action: "BUY" | "SELL"; strike: string; steps: number; premium: number; lots: number };
+// delta: with strike "DELTA", the strike nearest that |delta|. expiry: the leg's own expiry (calendars); absent = the instrument's.
+type Leg = { right: "CE" | "PE" | "FUT"; action: "BUY" | "SELL"; strike: string; steps: number; premium: number; lots: number; delta?: number; expiry?: "current" | "next" };
+// span: F&O blocks an exchange-style SPAN + exposure estimate; absent = notional / leverage.
+type Margin = { model: "span" | "leverage"; scan_pct?: number | null; exposure_pct?: number | null };
 type Instrument = {
   type: "equity" | "future" | "option";
   expiry: "current" | "next";
@@ -96,6 +102,7 @@ type Spec = {
   trailing: Level;
   breakeven: Level;
   scale_out?: ScaleStep[];        // absent / empty = off (the server leaves it out when off)
+  margin?: Margin;                // absent = leverage model
   mtm: { stop: number | null; target: number | null; trail_start: number | null; trail_gap: number | null };
   daily: { max_loss: number | null; max_profit: number | null };
   session: { start: string | null; end: string | null; square_off: string | null; days?: number[] | null };
@@ -205,6 +212,8 @@ const A = (o: Operand, ago: number): Operand => ({ ...o, offset: ago });
 const C = (left: Operand, op: string, right?: Operand): Cond => ({ left, op, right });
 const G = (conditions: (Cond | Group)[], logic: "AND" | "OR" = "AND"): Group => ({ logic, conditions });
 const L = (right: Leg["right"], action: "BUY" | "SELL", strike = "ATM", steps = 0, lots = 1, premium = 100): Leg => ({ right, action, strike, steps, premium, lots });
+// A leg at a target |delta| (0.2 = the 20-delta strike), optionally on its own expiry.
+const D = (right: "CE" | "PE", action: "BUY" | "SELL", delta: number, lots = 1, expiry?: Leg["expiry"]): Leg => ({ ...L(right, action, "DELTA", 0, lots), delta, ...(expiry ? { expiry } : {}) });
 const clone = <T,>(x: T): T => JSON.parse(JSON.stringify(x)) as T;
 const inr = (v: number | null | undefined, dp = 0) =>
   v === null || v === undefined || Number.isNaN(v) ? "—" : `₹${v.toLocaleString("en-IN", { maximumFractionDigits: dp, minimumFractionDigits: dp })}`;
@@ -266,7 +275,7 @@ export function sizingSummary(spec: Pick<Spec, "sizing" | "portfolio" | "daily">
 const tfLabel = (t: number) => (t === 1440 ? "daily" : t >= 60 ? `${t / 60}h` : `${t}m`);
 const SECTIONS = ["instrument", "session", "sizing", "portfolio", "mtm", "daily", "costs", "entry_order", "bars"] as const;
 const barLabel = (sp: Spec) => (!sp.bars || sp.bars.type === "time" ? tfLabel(sp.timeframe) : `${sp.bars.type} ~${sp.bars.per_day}/day`);
-const STRIKES = ["ATM", ...Array.from({ length: 20 }, (_, k) => `ITM${k + 1}`), ...Array.from({ length: 20 }, (_, k) => `OTM${k + 1}`), "PREMIUM"];
+const STRIKES = ["ATM", ...Array.from({ length: 20 }, (_, k) => `ITM${k + 1}`), ...Array.from({ length: 20 }, (_, k) => `OTM${k + 1}`), "PREMIUM", "DELTA"];
 const strikeKey = (lg: Leg) => (lg.strike === "ITM" || lg.strike === "OTM" ? `${lg.strike}${Math.max(1, lg.steps)}` : lg.strike);
 const SESSION_DEFAULT = { start: "09:20", end: "15:00", square_off: "15:15" } as const;
 
@@ -356,6 +365,7 @@ function numericPaths(spec: Spec, cat: Catalog): { path: string; label: string; 
     (["legs_long", "legs_short"] as const).forEach((side) => spec.instrument[side].forEach((lg, i) => {
       if (lg.strike === "ITM" || lg.strike === "OTM") out.push({ path: `instrument.${side}.${i}.steps`, label: `${side} leg ${i + 1} ${lg.right} strikes ${lg.strike}`, value: lg.steps });
       if (lg.strike === "PREMIUM") out.push({ path: `instrument.${side}.${i}.premium`, label: `${side} leg ${i + 1} ${lg.right} target premium`, value: lg.premium });
+      if (lg.strike === "DELTA") out.push({ path: `instrument.${side}.${i}.delta`, label: `${side} leg ${i + 1} ${lg.action} ${lg.right} target delta`, value: lg.delta ?? 0.3 });
       if (spec.instrument[side].length > 1) out.push({ path: `instrument.${side}.${i}.lots`, label: `${side} leg ${i + 1} ${lg.action} ${lg.right} lots (0 = off: hedged vs unhedged)`, value: lg.lots });
     }));
   }
@@ -430,6 +440,18 @@ export const TEMPLATES: Template[] = [
     entry_long: G([C(I("TIME", {}, "hhmm"), ">=", N(930)), C(I("DTE"), "<", N(1))]), max_trades_per_day: 1,
     stop_loss: null, target: null, mtm: { stop: 2500, target: null, trail_start: 1500, trail_gap: 800 },
     sizing: { mode: "lots", value: 1 }, portfolio: { capital: 300000, leverage: 8, max_positions: 1, compounding: false } } },
+  { name: "NIFTY options · 20-delta short strangle, SPAN margin (Tue–Thu)", symbols: ["NSE:NIFTY50-INDEX"], spec: {
+    direction: "long", timeframe: 5, session: { start: "09:30", end: "09:35", square_off: "15:15", days: [2, 3, 4] },
+    instrument: { type: "option", expiry: "current", expiry_kind: "weekly", legs_long: [D("CE", "SELL", 0.2), D("PE", "SELL", 0.2)], legs_short: [L("PE", "BUY")], levels_on: "underlying", iv: { source: "auto", value: 15 } },
+    entry_long: G([C(I("TIME", {}, "hhmm"), ">=", N(930))]), max_trades_per_day: 1,
+    stop_loss: null, target: null, mtm: { stop: 4000, target: null, trail_start: 2500, trail_gap: 1200 },
+    margin: { model: "span" }, sizing: { mode: "lots", value: 1 }, portfolio: { capital: 300000, leverage: 1, max_positions: 1, compounding: false } } },
+  { name: "NIFTY options · 16Δ iron condor (hedged: a fraction of the strangle's margin)", symbols: ["NSE:NIFTY50-INDEX"], spec: {
+    direction: "long", timeframe: 5, session: { start: "09:30", end: "09:35", square_off: "15:15" },
+    instrument: { type: "option", expiry: "current", expiry_kind: "weekly", legs_long: [D("CE", "SELL", 0.16), D("PE", "SELL", 0.16), D("CE", "BUY", 0.05), D("PE", "BUY", 0.05)], legs_short: [L("PE", "BUY")], levels_on: "underlying", iv: { source: "auto", value: 15 } },
+    entry_long: G([C(I("TIME", {}, "hhmm"), ">=", N(930))]), max_trades_per_day: 1,
+    stop_loss: null, target: null, mtm: { stop: 3000, target: 2500, trail_start: null, trail_gap: null },
+    margin: { model: "span" }, sizing: { mode: "pct_equity", value: 90 }, portfolio: { capital: 300000, leverage: 1, max_positions: 1, compounding: true } } },
   { name: "BANKNIFTY futures · EMA cross + daily trend", symbols: ["NSE:NIFTYBANK-INDEX"], spec: {
     direction: "both", timeframe: 15,
     instrument: { type: "future", expiry: "current", expiry_kind: "monthly", legs_long: [], legs_short: [], levels_on: "instrument", iv: { source: "auto", value: 15 } },
@@ -627,6 +649,14 @@ const LEG_PRESETS: { name: string; long: Leg[]; short: Leg[] }[] = [
   { name: "Short straddle", long: [L("CE", "SELL"), L("PE", "SELL")], short: [L("CE", "SELL"), L("PE", "SELL")] },
   { name: "Short strangle (3 OTM)", long: [L("CE", "SELL", "OTM", 3), L("PE", "SELL", "OTM", 3)], short: [L("CE", "SELL", "OTM", 3), L("PE", "SELL", "OTM", 3)] },
   { name: "Iron fly (hedged straddle)", long: [L("CE", "SELL"), L("PE", "SELL"), L("CE", "BUY", "OTM", 4), L("PE", "BUY", "OTM", 4)], short: [L("CE", "SELL"), L("PE", "SELL"), L("CE", "BUY", "OTM", 4), L("PE", "BUY", "OTM", 4)] },
+  { name: "Short strangle (20Δ)", long: [D("CE", "SELL", 0.2), D("PE", "SELL", 0.2)], short: [D("CE", "SELL", 0.2), D("PE", "SELL", 0.2)] },
+  { name: "Bull put / bear call credit spread", long: [L("PE", "SELL", "OTM", 1), L("PE", "BUY", "OTM", 5)], short: [L("CE", "SELL", "OTM", 1), L("CE", "BUY", "OTM", 5)] },
+  { name: "Long straddle / strangle", long: [L("CE", "BUY"), L("PE", "BUY")], short: [L("CE", "BUY", "OTM", 3), L("PE", "BUY", "OTM", 3)] },
+  { name: "Iron condor (16Δ short, 5Δ wings)", long: [D("CE", "SELL", 0.16), D("PE", "SELL", 0.16), D("CE", "BUY", 0.05), D("PE", "BUY", 0.05)], short: [D("CE", "SELL", 0.16), D("PE", "SELL", 0.16), D("CE", "BUY", 0.05), D("PE", "BUY", 0.05)] },
+  { name: "Ratio spread 1×2", long: [L("CE", "BUY"), L("CE", "SELL", "OTM", 4, 2)], short: [L("PE", "BUY"), L("PE", "SELL", "OTM", 4, 2)] },
+  { name: "Butterfly", long: [L("CE", "BUY", "ITM", 4), L("CE", "SELL", "ATM", 0, 2), L("CE", "BUY", "OTM", 4)], short: [L("PE", "BUY", "ITM", 4), L("PE", "SELL", "ATM", 0, 2), L("PE", "BUY", "OTM", 4)] },
+  { name: "Calendar (sell this expiry, buy next)", long: [L("CE", "SELL"), { ...L("CE", "BUY"), expiry: "next" }], short: [L("PE", "SELL"), { ...L("PE", "BUY"), expiry: "next" }] },
+  { name: "Jade lizard", long: [L("PE", "SELL", "OTM", 2), L("CE", "SELL", "OTM", 2), L("CE", "BUY", "OTM", 5)], short: [L("CE", "SELL", "OTM", 2), L("PE", "SELL", "OTM", 2), L("PE", "BUY", "OTM", 5)] },
   { name: "Iron condor (hedged strangle)", long: [L("CE", "SELL", "OTM", 2), L("PE", "SELL", "OTM", 2), L("CE", "BUY", "OTM", 4), L("PE", "BUY", "OTM", 4)], short: [L("CE", "SELL", "OTM", 2), L("PE", "SELL", "OTM", 2), L("CE", "BUY", "OTM", 4), L("PE", "BUY", "OTM", 4)] },
   // Hedged futures: the future carries the view, the option caps the loss / pays for itself.
   { name: "Protective put / call (FUT + option)", long: [L("FUT", "BUY"), L("PE", "BUY")], short: [L("FUT", "SELL"), L("CE", "BUY")] },
@@ -986,17 +1016,354 @@ function LegsEditor({ legs, onChange, title }: { legs: Leg[]; onChange: (l: Leg[
           </select>
           {lg.right !== "FUT" && <select value={strikeKey(lg)} title="strikes are counted in the underlying's strike steps" onChange={(e) => {
             const m = e.target.value.match(/^(ITM|OTM)(\d+)$/);
-            set(i, m ? { strike: m[1], steps: Number(m[2]) } : { strike: e.target.value, steps: 0 });
+            set(i, m ? { strike: m[1], steps: Number(m[2]) } : { strike: e.target.value, steps: 0, ...(e.target.value === "DELTA" ? { delta: lg.delta ?? 0.3 } : {}) });
           }}>
-            {STRIKES.map((k) => <option key={k} value={k}>{k === "PREMIUM" ? "closest to premium ₹" : k.replace(/(\d+)$/, " $1")}</option>)}
+            {STRIKES.map((k) => <option key={k} value={k}>{k === "PREMIUM" ? "closest to premium ₹" : k === "DELTA" ? "closest to delta Δ" : k.replace(/(\d+)$/, " $1")}</option>)}
           </select>}
           {lg.right !== "FUT" && lg.strike === "PREMIUM" && <label className="meta">₹<NumInput width={56} value={lg.premium} onChange={(n) => set(i, { premium: n ?? 100 })} /></label>}
+          {lg.right !== "FUT" && lg.strike === "DELTA" && <label className="meta" title="|delta| of the strike to pick: 0.5 ≈ ATM, 0.2 = a typical short-strangle strike, 0.05 = a far wing">Δ<NumInput width={44} value={lg.delta ?? 0.3} onChange={(n) => set(i, { delta: Math.min(0.99, Math.max(0.01, n ?? 0.3)) })} /></label>}
+          {lg.right !== "FUT" && <select value={lg.expiry ?? ""} title="this leg's own expiry — sell this week, buy next week = a calendar" data-testid="leg-expiry" onChange={(e) => {
+            const { expiry: _old, ...rest } = lg;
+            onChange(legs.map((x, j) => (j === i ? (e.target.value ? { ...rest, expiry: e.target.value as Leg["expiry"] } : rest) : x)));
+          }}>
+            <option value="">strategy expiry</option><option value="current">current expiry</option><option value="next">next expiry</option>
+          </select>}
           <label className="meta" title="0 = leg off (the optimiser can sweep a hedge on / off)">lots <NumInput width={40} value={lg.lots} onChange={(n) => set(i, { lots: Math.max(0, Math.floor(n ?? 1)) })} /></label>
           <button type="button" className="btn-sm danger" onClick={() => onChange(legs.filter((_, j) => j !== i))}>✕</button>
         </div>
       ))}
       <div><button type="button" className="btn-sm" onClick={() => onChange([...legs, L("CE", "BUY")])}>+ leg</button></div>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// payoff & funds required (POST /api/algo/payoff)
+// ---------------------------------------------------------------------------
+
+type PayLeg = {
+  label: string; kind: string; side: string; strike: number | null; expiry: number | null; qty: number; dte: number | null;
+  price: number; delta: number; pos_delta: number; theta: number; vega: number; gamma: number;
+  margin_alone: number; margin_if_bought: number | null; margin_if_sold: number | null;
+};
+export type Payoff = {
+  symbol: string; spot: number; spot_source: string; iv_pct: number; iv_source: string; lot: number | null; side: string;
+  dte: number | null; first_expiry: number | null; legs: PayLeg[]; curve: { spot: number; expiry: number; now: number; mid: number }[];
+  breakevens: number[]; max_profit: number | null; max_loss: number | null; pop_pct: number; expected_move: number | null;
+  greeks: { delta: number; gamma: number; theta: number; vega: number }; premium: { net: number; kind: string };
+  margin: { model: string; used: number; span: { span: number; exposure: number; premium: number; total: number; scan_pct: number | null; exposure_pct: number | null }; leverage: number;
+    leverage_x: number; naked: number; hedge_benefit: number; sets_affordable: number | null; capital: number };
+  return_on_margin_pct: number | null;
+};
+
+const lakh = (v: number) => (Math.abs(v) >= 100000 ? `₹${(v / 100000).toFixed(2)} L` : inr(v));
+
+/** Where the funds go: SPAN | exposure | premium paid, each as a share of the total. */
+function FundsBar({ m }: { m: Payoff["margin"] }) {
+  const parts: [string, number, string, string][] = [
+    ["SPAN (worst scenario loss)", m.span.span, "var(--red)", "the biggest loss over ±price and ±volatility moves — what the exchange holds against a writer"],
+    ["exposure", m.span.exposure, "var(--amber)", "a flat % of contract value on every short option / future, on top of SPAN"],
+    ["premium paid", m.span.premium, "var(--accent)", "bought options cost their premium up front — the most a buyer can lose"],
+  ];
+  const tot = parts.reduce((a, p) => a + p[1], 0);
+  if (!tot) return null;
+  return (
+    <div data-testid="funds-bar">
+      <div style={{ display: "flex", height: 14, borderRadius: 4, overflow: "hidden", gap: 2, background: "var(--border-soft)" }}>
+        {parts.filter((p) => p[1] > 0).map(([k, v, col, hint]) => (
+          <div key={k} title={`${k}: ${inr(v)} — ${hint}`} style={{ width: `${(v / tot) * 100}%`, background: col, minWidth: 3 }} />
+        ))}
+      </div>
+      <div className="meta" style={{ display: "flex", gap: 12, flexWrap: "wrap", marginTop: 4 }}>
+        {parts.filter((p) => p[1] > 0).map(([k, v, col]) => (
+          <span key={k}><span style={{ display: "inline-block", width: 8, height: 8, borderRadius: 2, background: col, marginRight: 4 }} />{k} {lakh(v)}</span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function PayoffPanel({ spec, onSpan }: { spec: Spec; onSpan: () => void }) {
+  const both = spec.direction === "both";
+  const [side, setSide] = useState<"BUY" | "SELL">(spec.direction === "short" ? "SELL" : "BUY");
+  const [spot, setSpot] = useState<number | null>(null);
+  const [iv, setIv] = useState<number | null>(null);
+  const [show, setShow] = useState({ expiry: true, now: true, mid: false });
+  const sideNow = spec.direction === "long" ? "BUY" : spec.direction === "short" ? "SELL" : side;
+  const body = JSON.stringify({ spec: { symbols: spec.symbols, instrument: spec.instrument, portfolio: spec.portfolio, ...(spec.margin ? { margin: spec.margin } : {}) },
+    side: sideNow, ...(spot ? { spot } : {}), ...(iv ? { iv_pct: iv } : {}) });
+  const [key, setKey] = useState(body);
+  useEffect(() => { const h = setTimeout(() => setKey(body), 350); return () => clearTimeout(h); }, [body]);
+  const q = useQuery({
+    queryKey: ["algo", "payoff", key], enabled: spec.symbols.length > 0, placeholderData: keepPreviousData, staleTime: 60000,
+    queryFn: () => api.post<Payoff>("/api/algo/payoff", JSON.parse(key)),
+  });
+  const p = q.data;
+  const writes = (spec.direction !== "short" ? spec.instrument.legs_long : []).concat(spec.direction !== "long" ? spec.instrument.legs_short : [])
+    .some((lg) => lg.lots && lg.action === "SELL") || spec.instrument.type === "future";
+  const fmtK = (v: number) => (Math.abs(v) >= 1000 ? `${(v / 1000).toFixed(Math.abs(v) >= 10000 ? 0 : 1)}k` : v.toFixed(0));
+  return (
+    <div className="widget widget-wide" style={{ marginBottom: 12 }} data-testid="payoff-panel">
+      <h3>Payoff & funds required
+        {p && <span className="meta">{shortSym(p.symbol)} · spot {p.spot.toLocaleString("en-IN")} ({p.spot_source}) · IV {num(p.iv_pct, 1)}% ({p.iv_source}){p.dte !== null ? ` · ${num(p.dte, 1)} days to expiry` : ""} · 1 set{p.lot ? `, lot ${p.lot}` : ""}</span>}
+      </h3>
+      <div className="algo-operand" style={{ gap: 12 }}>
+        {both && (
+          <div className="seg">
+            {(["BUY", "SELL"] as const).map((s_) => (
+              <button type="button" key={s_} className={side === s_ ? "on" : ""} onClick={() => setSide(s_)}>{s_ === "BUY" ? "LONG-signal legs" : "SHORT-signal legs"}</button>
+            ))}
+          </div>
+        )}
+        <label className="meta" title="what-if: price the position at another spot">spot <NumInput width={80} allowEmpty placeholder="last close" value={spot} onChange={setSpot} /></label>
+        <label className="meta" title="what-if: implied volatility %; empty = the backtest's IV source">IV % <NumInput width={48} allowEmpty placeholder="auto" value={iv} onChange={setIv} /></label>
+        {(["expiry", "now", "mid"] as const).map((k) => (
+          <label key={k} className="meta"><input type="checkbox" checked={show[k]} onChange={(e) => setShow({ ...show, [k]: e.target.checked })} />
+            {{ expiry: "at expiry", now: "today (T+0)", mid: "halfway" }[k]}</label>
+        ))}
+        {q.isFetching && <span className="meta">updating…</span>}
+      </div>
+      {q.error && <div className="meta pnl-neg" style={{ marginTop: 6 }}>{errMsg(q.error)}</div>}
+      {p && (
+        <>
+          {writes && p.margin.model !== "span" && p.margin.leverage > 1.5 * p.margin.span.total && (
+            <div className="meta" style={{ marginTop: 8, color: "var(--amber)" }} data-testid="margin-warning">
+              ⚠ At leverage ×{p.margin.leverage_x}, writing blocks {lakh(p.margin.leverage)} per set — the contract's value ÷ leverage. Brokers block SPAN + exposure,
+              about {lakh(p.margin.span.total)} here, so backtests size this far too small (or skip it for “no capital”).{" "}
+              <button type="button" className="btn-sm" onClick={onSpan}>use the SPAN estimate</button>
+            </div>
+          )}
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 18, marginTop: 10 }}>
+            <Metric label={`Funds required${p.margin.model === "span" ? " (SPAN est.)" : ` (×${p.margin.leverage_x})`}`} value={lakh(p.margin.used)}
+              hint="what one set blocks under this strategy's margin model — the backtest sizes with this number" />
+            <Metric label={p.premium.kind === "credit" ? "Premium received" : "Premium paid"} value={inr(Math.abs(p.premium.net))} cls={p.premium.kind === "credit" ? "pnl-pos" : p.premium.kind === "debit" ? "pnl-neg" : ""}
+              hint="net option premium at entry: credit = you collect it (a writer's maximum gain), debit = you pay it" />
+            <Metric label="Max profit" value={p.max_profit === null ? "unlimited" : inr(p.max_profit)} cls="pnl-pos" hint="at the first expiry, over any price" />
+            <Metric label="Max loss" value={p.max_loss === null ? "unlimited" : inr(p.max_loss)} cls="pnl-neg" hint="at the first expiry; 'unlimited' = a naked short call side (or short future) with no cap" />
+            <Metric label="Breakeven" value={p.breakevens.length ? p.breakevens.map((b) => b.toFixed(0)).join(" / ") : "—"} hint="underlying prices where the expiry P&L crosses zero" />
+            <Metric label="Chance of profit" value={`${num(p.pop_pct, 1)}%`} hint="probability the expiry P&L is above zero, lognormal at this IV — selling wins often, but small; buying wins rarely, but big" />
+            <Metric label="Return on funds" value={p.return_on_margin_pct === null ? "—" : `${num(p.return_on_margin_pct, 1)}%`} hint="max profit / funds required" />
+            <Metric label="Sets from capital" value={p.margin.sets_affordable === null ? "—" : String(p.margin.sets_affordable)} cls={p.margin.sets_affordable === 0 ? "pnl-neg" : ""}
+              hint={`how many sets ${inr(p.margin.capital)} of capital can hold at once`} />
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 18, marginTop: 8 }} data-testid="payoff-greeks">
+            <Metric label="Δ delta" value={num(p.greeks.delta, 1)} hint="₹ gained per 1-point rise of the underlying (position)" />
+            <Metric label="Γ gamma" value={num(p.greeks.gamma, 4)} hint="how fast delta changes per point. Negative = a writer: moves hurt more the further they go" />
+            <Metric label="Θ theta / day" value={inr(p.greeks.theta)} cls={pnlCls(p.greeks.theta)} hint="₹ the position earns (+) or bleeds (−) per day from time decay alone" />
+            <Metric label="ν vega / vol pt" value={inr(p.greeks.vega)} cls={pnlCls(p.greeks.vega)} hint="₹ per 1-point rise in implied volatility" />
+            {p.expected_move !== null && <Metric label="Expected move ±1σ" value={`±${p.expected_move.toFixed(0)}`} hint="one standard deviation of the underlying to the first expiry at this IV (shaded on the chart)" />}
+          </div>
+          <ResponsiveContainer width="100%" height={260}>
+            <LineChart data={p.curve} margin={{ top: 8, right: 16, left: 0, bottom: 0 }}>
+              <CartesianGrid stroke="var(--border-soft)" />
+              <XAxis dataKey="spot" type="number" domain={["dataMin", "dataMax"]} tick={{ fontSize: 10, fill: "var(--text-dim)" }} tickFormatter={(v: number) => v.toFixed(0)} />
+              <YAxis tick={{ fontSize: 10, fill: "var(--text-dim)" }} width={60} tickFormatter={fmtK} />
+              <Tooltip contentStyle={{ background: "var(--bg-panel)", border: "1px solid var(--border)" }} labelFormatter={(v: number) => `underlying ${Number(v).toFixed(0)}`} formatter={(v: number) => inr(v)} />
+              <Legend wrapperStyle={{ fontSize: 11 }} />
+              {p.expected_move !== null && <ReferenceArea x1={p.spot - p.expected_move} x2={p.spot + p.expected_move} fill="var(--accent)" fillOpacity={0.06} />}
+              <ReferenceLine y={0} stroke="var(--text-faint)" />
+              <ReferenceLine x={p.spot} stroke="var(--text-dim)" strokeDasharray="3 3" label={{ value: "spot", fontSize: 10, fill: "var(--text-dim)", position: "insideTopLeft" }} />
+              {p.breakevens.map((b) => <ReferenceLine key={b} x={b} stroke="var(--amber)" strokeDasharray="2 4" />)}
+              {show.expiry && <Line type="linear" dataKey="expiry" name="at expiry" stroke="var(--accent)" strokeWidth={2} dot={false} isAnimationActive={false} />}
+              {show.now && <Line type="monotone" dataKey="now" name="today (T+0)" stroke="var(--cyan)" strokeWidth={1.5} strokeDasharray="5 3" dot={false} isAnimationActive={false} />}
+              {show.mid && <Line type="monotone" dataKey="mid" name="halfway to expiry" stroke="var(--text-dim)" strokeWidth={1.5} strokeDasharray="2 3" dot={false} isAnimationActive={false} />}
+            </LineChart>
+          </ResponsiveContainer>
+          <div className="algo-quad" style={{ marginTop: 8, marginBottom: 0 }}>
+            <div>
+              <div className="meta" style={{ color: "var(--text)", marginBottom: 4 }}>Where the funds go <span className="meta">(SPAN + exposure estimate)</span></div>
+              <FundsBar m={p.margin} />
+              <div className="algo-scroll" style={{ marginTop: 6 }}><table><tbody>
+                <tr><td>SPAN + exposure estimate</td><td className="mono">{inr(p.margin.span.total)}</td></tr>
+                <tr><td>Notional ÷ leverage ×{p.margin.leverage_x}</td><td className="mono">{inr(p.margin.leverage)}</td></tr>
+                <tr><td title="every leg margined on its own, no offsets">Each leg on its own</td><td className="mono">{inr(p.margin.naked)}</td></tr>
+                <tr><td title="what the legs offsetting each other saves — bought wings cap a writer's worst loss">Hedge benefit</td><td className="mono pnl-pos">{inr(p.margin.hedge_benefit)}</td></tr>
+              </tbody></table></div>
+            </div>
+            <div className="meta" style={{ lineHeight: 1.5 }}>
+              <b style={{ color: "var(--text)" }}>Why selling needs more money than buying.</b> A buyer can lose only the premium, so the premium is all that is blocked.
+              A writer collects the premium but the loss has no floor, so the exchange holds SPAN — the worst loss if the underlying jumps
+              {" "}±{num(p.margin.span.scan_pct ?? 6, 1)}% or IV moves 4 points —
+              plus {num(p.margin.span.exposure_pct ?? 2, 1)}% exposure on the contract value (and +2% on expiry day for index shorts). Buying a far wing caps that worst loss, which is why a hedged
+              spread or iron condor needs a fraction of a naked strangle's margin. These are estimates of the exchange method; your broker's calculator is final.
+            </div>
+          </div>
+          <div className="algo-scroll" style={{ marginTop: 8 }}>
+            <table data-testid="payoff-legs">
+              <thead><tr><th>Leg</th><th>Side</th><th>Qty</th><th>Price</th><th title="per unit">Δ</th><th title="₹ per point, whole leg">pos Δ</th><th title="₹ per day">θ / day</th><th title="₹ per vol point">vega</th>
+                <th title="this contract bought on its own: its premium">if bought</th><th title="this contract written on its own: SPAN + exposure">if sold</th></tr></thead>
+              <tbody>{p.legs.map((lg, i) => (
+                <tr key={i}><td>{lg.label}{lg.dte !== null ? <span className="meta"> · {num(lg.dte, 1)}d</span> : null}</td>
+                  <td><span className={`badge ${lg.side === "BUY" ? "buy" : "sell"}`}>{lg.side}</span></td>
+                  <td className="mono">{lg.qty}</td><td className="mono">{lg.price.toFixed(2)}</td><td className="mono">{lg.delta.toFixed(2)}</td>
+                  <td className="mono">{lg.pos_delta.toFixed(1)}</td><td className={`mono ${pnlCls(lg.theta)}`}>{lg.theta.toFixed(0)}</td><td className="mono">{lg.vega.toFixed(0)}</td>
+                  <td className="mono">{lg.margin_if_bought === null ? "—" : inr(lg.margin_if_bought)}</td>
+                  <td className="mono">{lg.margin_if_sold === null ? inr(lg.margin_alone) : inr(lg.margin_if_sold)}</td></tr>))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// trade analytics — distribution, timing, excursions, capital in use
+// ---------------------------------------------------------------------------
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** Net P&L of the trades in `bins` equal-width buckets. */
+export function pnlHistogram(nets: number[], bins = 20): { mid: number; label: string; count: number }[] {
+  if (!nets.length) return [];
+  const lo = Math.min(...nets), hi = Math.max(...nets);
+  if (lo === hi) return [{ mid: lo, label: lo.toFixed(0), count: nets.length }];
+  const w = (hi - lo) / bins;
+  const out = Array.from({ length: bins }, (_, k) => ({ mid: lo + w * (k + 0.5), label: (lo + w * (k + 0.5)).toFixed(0), count: 0 }));
+  nets.forEach((v) => { out[Math.min(bins - 1, Math.floor((v - lo) / w))].count += 1; });
+  return out;
+}
+
+/** Margin blocked over time: each exit row frees its part, each position takes its whole margin at entry. */
+export function capitalInUse(trades: Pick<BtTrade, "entry_t" | "exit_t" | "margin">[]): { t: number; used: number }[] {
+  const ev: [number, number][] = [];
+  trades.forEach((x) => { ev.push([x.entry_t, x.margin]); ev.push([x.exit_t, -x.margin]); });
+  ev.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  let used = 0;
+  const out: { t: number; used: number }[] = [];
+  ev.forEach(([t, d]) => {
+    used = Math.max(0, used + d);
+    if (out.length && out[out.length - 1].t === t) out[out.length - 1].used = used;
+    else out.push({ t, used });
+  });
+  return out;
+}
+
+function TradeAnalytics({ r }: { r: BtResult }) {
+  const s = r.stats;
+  const capital = Number(r.spec?.portfolio?.capital ?? 0);
+  const hist = useMemo(() => pnlHistogram(r.trades.map((t) => t.net)), [r.trades]);
+  const hours = useMemo(() => {
+    const by: Record<number, { hour: string; net: number; n: number }> = {};
+    r.trades.forEach((t) => {
+      const h = Math.floor(((t.entry_t + IST_S) % 86400) / 3600);
+      by[h] = by[h] ?? { hour: `${String(h).padStart(2, "0")}:00`, net: 0, n: 0 };
+      by[h].net += t.net; by[h].n += 1;
+    });
+    return Object.keys(by).map(Number).sort((a, b) => a - b).map((h) => ({ ...by[h], net: Math.round(by[h].net) }));
+  }, [r.trades]);
+  const exc = useMemo(() => {
+    const pts = r.trades.filter((t) => t.mae_pct !== null && t.mfe_pct !== null).slice(-1500);
+    return { win: pts.filter((t) => t.net > 0).map((t) => ({ mae: t.mae_pct, mfe: t.mfe_pct, net: t.net })),
+      loss: pts.filter((t) => t.net <= 0).map((t) => ({ mae: t.mae_pct, mfe: t.mfe_pct, net: t.net })) };
+  }, [r.trades]);
+  const cap = useMemo(() => {
+    const pts = capitalInUse(r.trades);
+    const step = Math.max(1, Math.ceil(pts.length / 800));
+    const peak = pts.reduce((a, p) => Math.max(a, p.used), 0);
+    const avg = r.trades.length ? r.trades.reduce((a, t) => a + t.margin, 0) / r.trades.length : 0;
+    return { pts: pts.filter((_, i) => i % step === 0 || i === pts.length - 1).map((p) => ({ t: ist(p.t), used: Math.round(p.used) })), peak, avg };
+  }, [r.trades]);
+  const years = useMemo(() => {
+    const m = s.monthly ?? {};
+    const ys = Array.from(new Set(Object.keys(m).map((k) => k.slice(0, 4)))).sort();
+    const maxAbs = Math.max(1, ...Object.values(m).map((v) => Math.abs(v as number)));
+    return { ys, m: m as Record<string, number>, maxAbs };
+  }, [s.monthly]);
+  if (!r.trades.length) return null;
+  const tip = { contentStyle: { background: "var(--bg-panel)", border: "1px solid var(--border)" } };
+  const heat = (v: number | undefined) => (v === undefined ? "transparent"
+    : `color-mix(in srgb, ${v >= 0 ? "var(--green)" : "var(--red)"} ${Math.round(12 + (Math.abs(v) / years.maxAbs) * 58)}%, transparent)`);
+  return (
+    <>
+      <div className="widget widget-wide" style={{ marginBottom: 12 }} data-testid="capital-in-use">
+        <h3>Capital in use <span className="meta">margin blocked by open positions · the money the strategy actually needs</span></h3>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 18 }}>
+          <Metric label="Peak in use" value={`${lakh(cap.peak)}${capital ? ` (${num((cap.peak / capital) * 100, 0)}%)` : ""}`} hint="the most margin blocked at one moment — size the account for this, not the average" />
+          <Metric label="Avg per position" value={lakh(cap.avg)} hint="average margin a position blocked at entry" />
+          <Metric label="Return on peak capital" value={cap.peak ? `${num((s.net_pnl / cap.peak) * 100, 1)}%` : "—"} cls={pnlCls(s.net_pnl)} hint="net P&L / peak margin in use — how hard the money that was actually needed worked" />
+        </div>
+        {cap.pts.length > 1 && (
+          <ResponsiveContainer width="100%" height={120}>
+            <AreaChart data={cap.pts}>
+              <XAxis dataKey="t" tick={{ fontSize: 10, fill: "var(--text-dim)" }} minTickGap={80} />
+              <YAxis tick={{ fontSize: 10, fill: "var(--text-dim)" }} width={70} tickFormatter={(v: number) => lakh(v)} />
+              <Tooltip {...tip} formatter={(v: number) => inr(v)} />
+              {capital > 0 && <ReferenceLine y={capital} stroke="var(--text-faint)" strokeDasharray="4 3" label={{ value: "capital", fontSize: 10, fill: "var(--text-dim)", position: "insideTopRight" }} />}
+              <Area type="stepAfter" dataKey="used" name="margin in use" stroke="var(--accent)" fill="var(--accent)" fillOpacity={0.15} isAnimationActive={false} />
+            </AreaChart>
+          </ResponsiveContainer>
+        )}
+      </div>
+      <div className="algo-quad">
+        <div className="widget" data-testid="pnl-histogram">
+          <h3>P&L distribution <span className="meta">trades per net-P&L bucket</span></h3>
+          <ResponsiveContainer width="100%" height={200}>
+            <BarChart data={hist} barCategoryGap={2}>
+              <CartesianGrid stroke="var(--border-soft)" vertical={false} />
+              <XAxis dataKey="label" tick={{ fontSize: 10, fill: "var(--text-dim)" }} minTickGap={24} />
+              <YAxis tick={{ fontSize: 10, fill: "var(--text-dim)" }} width={36} allowDecimals={false} />
+              <Tooltip {...tip} labelFormatter={(v: string) => `≈ ₹${v}`} formatter={(v: number) => [v, "trades"]} />
+              <ReferenceLine x={hist.reduce((a, h) => (Math.abs(h.mid) < Math.abs(a.mid) ? h : a), hist[0])?.label} stroke="var(--text-faint)" />
+              <Bar dataKey="count" radius={[4, 4, 0, 0]} isAnimationActive={false}>
+                {hist.map((h, i) => <Cell key={i} fill={h.mid >= 0 ? "var(--green)" : "var(--red)"} />)}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+          <div className="meta">A seller's shape: many small wins and a few large losses on the left. A buyer's: the reverse.</div>
+        </div>
+        <div className="widget" data-testid="pnl-by-hour">
+          <h3>P&L by entry hour <span className="meta">IST</span></h3>
+          <ResponsiveContainer width="100%" height={200}>
+            <BarChart data={hours}>
+              <CartesianGrid stroke="var(--border-soft)" vertical={false} />
+              <XAxis dataKey="hour" tick={{ fontSize: 10, fill: "var(--text-dim)" }} />
+              <YAxis tick={{ fontSize: 10, fill: "var(--text-dim)" }} width={60} tickFormatter={(v: number) => lakh(v)} />
+              <Tooltip {...tip} formatter={(v: number, _n: string, it: { payload?: { n: number } }) => [`${inr(v)} · ${it.payload?.n ?? 0} trades`, "net"]} />
+              <ReferenceLine y={0} stroke="var(--text-faint)" />
+              <Bar dataKey="net" radius={[4, 4, 0, 0]} isAnimationActive={false}>
+                {hours.map((h, i) => <Cell key={i} fill={h.net >= 0 ? "var(--green)" : "var(--red)"} />)}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+        <div className="widget" data-testid="mae-mfe">
+          <h3>Excursions <span className="meta">how far each trade went against (MAE) / for (MFE) you, % of entry</span></h3>
+          <ResponsiveContainer width="100%" height={200}>
+            <ScatterChart margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
+              <CartesianGrid stroke="var(--border-soft)" />
+              <XAxis dataKey="mae" type="number" name="MAE %" tick={{ fontSize: 10, fill: "var(--text-dim)" }} tickFormatter={(v: number) => `${v.toFixed(1)}%`} />
+              <YAxis dataKey="mfe" type="number" name="MFE %" tick={{ fontSize: 10, fill: "var(--text-dim)" }} width={44} tickFormatter={(v: number) => `${v.toFixed(1)}%`} />
+              <ZAxis range={[28, 28]} />
+              <Tooltip {...tip} formatter={(v: number, n: string) => [n === "net" ? inr(v) : `${v.toFixed(2)}%`, n]} />
+              <Legend wrapperStyle={{ fontSize: 11 }} />
+              <Scatter name="winners" data={exc.win} fill="var(--green)" fillOpacity={0.7} isAnimationActive={false} />
+              <Scatter name="losers" data={exc.loss} fill="var(--red)" fillOpacity={0.7} isAnimationActive={false} />
+            </ScatterChart>
+          </ResponsiveContainer>
+          <div className="meta">Winners that first went far against you = a stop tighter than that would have cut them. Losers with a big MFE = profit given back: try a trail or target.</div>
+        </div>
+      </div>
+      <div className="widget widget-wide" style={{ marginBottom: 12 }} data-testid="month-heatmap">
+        <h3>Monthly returns <span className="meta">net ₹ · darker = bigger</span></h3>
+        <div className="algo-scroll"><table>
+          <thead><tr><th></th>{MONTHS.map((m) => <th key={m}>{m}</th>)}<th>Year</th></tr></thead>
+          <tbody>{years.ys.map((y) => {
+            const tot = MONTHS.reduce((a, _, k) => a + (years.m[`${y}-${String(k + 1).padStart(2, "0")}`] ?? 0), 0);
+            return (
+              <tr key={y}><td className="mono">{y}</td>
+                {MONTHS.map((_, k) => {
+                  const v = years.m[`${y}-${String(k + 1).padStart(2, "0")}`];
+                  return <td key={k} className="mono" title={v === undefined ? "no trades" : inr(v)} style={{ background: heat(v), textAlign: "right", fontSize: 11 }}>
+                    {v === undefined ? "" : Math.abs(v) >= 1000 ? `${(v / 1000).toFixed(1)}k` : v.toFixed(0)}</td>;
+                })}
+                <td className={`mono ${pnlCls(tot)}`} style={{ textAlign: "right" }}>{inr(tot)}</td></tr>
+            );
+          })}</tbody>
+        </table></div>
+      </div>
+    </>
   );
 }
 
@@ -1234,6 +1601,7 @@ function Results({ r }: { r: BtResult }) {
           </ResponsiveContainer>
         )}
       </div>
+      <TradeAnalytics r={r} />
       <div className="widget widget-wide" style={{ marginBottom: 12 }}>
         <h3>{r.chart.symbol} <span className="meta">last {r.chart.candles.length} {barLabel(r.spec)} candles of the underlying · ▲▼ entries, ● exits{r.chart.candles.some((k) => k[6] !== null && k[6] !== undefined) ? " · volume coloured by delta, cumulative delta below" : ""}</span></h3>
         <TradeChart chart={r.chart} />
@@ -2199,11 +2567,29 @@ export default function Algo() {
                     </select>
                     {inst.iv.source === "fixed" && <NumInput width={48} value={inst.iv.value} onChange={(n) => updInst({ iv: { ...inst.iv, value: n ?? 15 } })} />}
                   </label>
-                  <span className="meta">Strikes ATM/ITM/OTM are counted in the underlying's strike steps. Multi-leg positions exit together — use MTM ₹ stops.</span>
+                  <span className="meta">Strikes ATM/ITM/OTM are counted in the underlying's strike steps; Δ strikes pick the nearest delta. Multi-leg positions exit together — use MTM ₹ stops.</span>
                 </div>
               </>
             )}
+            {fno && (
+              <div className="algo-operand" style={{ gap: 10, marginTop: 8 }} data-testid="margin-model">
+                <label className="meta" title="how much capital a futures / written-option position blocks — decides how many sets the backtest and the runner can afford">margin
+                  <select value={spec.margin?.model ?? "leverage"} onChange={(e) => upd({ margin: e.target.value === "span" ? { model: "span", scan_pct: null, exposure_pct: null } : undefined })}>
+                    <option value="leverage">contract value ÷ leverage ×{spec.portfolio.leverage}</option>
+                    <option value="span">SPAN + exposure (exchange-style estimate)</option>
+                  </select>
+                </label>
+                {spec.margin?.model === "span" && (
+                  <>
+                    <label className="meta" title="worst-case price move SPAN scans, % of the underlying (empty = 6% index, 13% stock)">price scan <NumInput width={44} allowEmpty placeholder="auto" value={spec.margin.scan_pct ?? null} onChange={(n) => upd({ margin: { ...spec.margin!, scan_pct: n } })} />%</label>
+                    <label className="meta" title="exposure margin on short options and futures, % of contract value (empty = 2% index, 3.5% stock)">exposure <NumInput width={44} allowEmpty placeholder="auto" value={spec.margin.exposure_pct ?? null} onChange={(n) => upd({ margin: { ...spec.margin!, exposure_pct: n } })} />%</label>
+                    <span className="meta">bought options still need their full premium; hedged spreads get the offset</span>
+                  </>
+                )}
+              </div>
+            )}
           </div>
+          {fno && spec.symbols.length > 0 && <PayoffPanel spec={spec} onSpan={() => upd({ margin: { model: "span", scan_pct: null, exposure_pct: null } })} />}
 
           <div className="widget widget-wide" style={{ marginBottom: 12 }}>
             <h3>Entry & exit conditions <span className="meta">evaluated on each completed {barLabel(spec)} candle of the underlying</span></h3>
@@ -2318,7 +2704,7 @@ export default function Algo() {
               <label className="meta">capital ₹ <NumInput width={100} value={spec.portfolio.capital} onChange={(n) => upd({ portfolio: { ...spec.portfolio, capital: n ?? 100000 } })} /></label>
               <label className="meta">max open <NumInput width={40} value={spec.portfolio.max_positions} onChange={(n) => upd({ portfolio: { ...spec.portfolio, max_positions: Math.max(1, Math.floor(n ?? 1)) } })} /> positions</label>
               <label className="meta" title="no single position may block more than this share of equity (empty = no cap)">max <NumInput width={40} allowEmpty placeholder="off" value={spec.portfolio.max_position_pct ?? null} onChange={(n) => upd({ portfolio: { ...spec.portfolio, max_position_pct: n } })} />% per position</label>
-              <label className="meta" title="intraday margin multiplier: equity MIS ≈ 5, futures / written options ≈ 6–9. Bought options always need the full premium.">leverage × <NumInput width={40} value={spec.portfolio.leverage} onChange={(n) => upd({ portfolio: { ...spec.portfolio, leverage: n ?? 1 } })} /></label>
+              <label className="meta" title="intraday margin multiplier: equity MIS ≈ 5, futures / written options ≈ 6–9 — or pick the SPAN + exposure margin under What to trade. Bought options always need the full premium.">leverage × <NumInput width={40} value={spec.portfolio.leverage} onChange={(n) => upd({ portfolio: { ...spec.portfolio, leverage: n ?? 1 } })} /></label>
               <label className="meta"><input type="checkbox" checked={spec.portfolio.compounding} onChange={(e) => upd({ portfolio: { ...spec.portfolio, compounding: e.target.checked } })} /> compound profits</label>
             </div>
             <div className="algo-operand" style={{ gap: 14, marginTop: 8 }}>

@@ -54,7 +54,8 @@ TRANSFORMS = ("angle", "slope", "change", "pct_change", "highest", "lowest", "sm
 MATH = ("+", "-", "*", "/", "pct_diff")
 INSTRUMENTS = ("equity", "future", "option")
 SIZING = ("qty", "lots", "amount", "pct_equity", "risk", "risk_pct")
-STRIKE_MODES = ("ATM", "ITM", "OTM", "PREMIUM")
+STRIKE_MODES = ("ATM", "ITM", "OTM", "PREMIUM", "DELTA")
+MARGIN_MODELS = ("leverage", "span")
 
 DEFAULT_SPEC: dict[str, Any] = {
     "symbols": [],
@@ -96,8 +97,13 @@ DEFAULT_SPEC: dict[str, Any] = {
 # spec saved before they existed normalizes to exactly what it was:
 #   "scale_out": [{"type": pct|points|atr|rr, "value", "atr_period", "qty_pct"}]
 #       partial exits: at each level close qty_pct % of the ENTRY size;
-#   "session": {"days": [1..7]} — entries only on these weekdays (1 = Mon).
-OPTIONAL_KEYS = ("scale_out",)
+#   "session": {"days": [1..7]} — entries only on these weekdays (1 = Mon);
+#   "margin": {"model": "span", "scan_pct", "exposure_pct"} — F&O blocks an
+#       exchange-style SPAN + exposure estimate (fno.span_margin) instead of
+#       notional / leverage; scan / exposure None = the index / stock defaults;
+#   on a leg: "expiry": current|next (its own expiry: calendars / diagonals),
+#       "delta": 0.01-0.99 with strike "DELTA" (the strike nearest that |delta|).
+OPTIONAL_KEYS = ("scale_out", "margin")
 SCALE_KINDS = ("pct", "points", "atr", "rr")
 
 
@@ -236,6 +242,16 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
             if lg.get("strike", "ATM") not in STRIKE_MODES:
                 raise ValueError(f"strike must be one of {STRIKE_MODES}")
             lg["strike"] = lg.get("strike", "ATM")
+            if lg["strike"] == "DELTA":
+                lg["delta"] = _num(lg.get("delta", 0.3), "target delta", 0.01)
+                if lg["delta"] > 0.99:
+                    raise ValueError("target delta is 0.01-0.99 (0.25 = a 25-delta option)")
+            else:
+                lg.pop("delta", None)
+            if lg.get("expiry") in (None, ""):
+                lg.pop("expiry", None)
+            elif lg["expiry"] not in ("current", "next") or lg["right"] == "FUT":
+                raise ValueError("a leg's own expiry is current or next (option legs only)")
             lg["steps"] = _num(lg.get("steps", 0), "strike steps", 0, integer=True)
             lg["premium"] = _num(lg.get("premium", 100), "target premium", 0.05)
             # 0 lots = leg switched off, so the optimiser can sweep a hedge on / off.
@@ -279,6 +295,16 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
         if multi and inst["levels_on"] == "instrument":
             raise ValueError("multi-leg positions can't scale out on 'the instrument' — put levels on the underlying")
         s["scale_out"] = so
+    mg = s.pop("margin", None)
+    if mg:
+        if not isinstance(mg, dict) or mg.get("model", "leverage") not in MARGIN_MODELS:
+            raise ValueError(f"margin model is one of {MARGIN_MODELS}")
+        if mg.get("model", "leverage") == "span":
+            s["margin"] = {"model": "span"}
+            for k, label in (("scan_pct", "SPAN price scan %"), ("exposure_pct", "exposure margin %")):
+                s["margin"][k] = _num(mg.get(k), label, 0, allow_none=True)
+                if s["margin"][k] is not None and s["margin"][k] > 50:
+                    raise ValueError(f"{label} must be at most 50")
 
     for k in ("stop", "target", "trail_start", "trail_gap"):
         s["mtm"][k] = _num(s["mtm"].get(k), f"MTM {k}", 1e-9, allow_none=True)
@@ -736,14 +762,27 @@ def leg_margin(kind: str, act: int, price: float, underlying: float, qty: int, l
 
 
 def position_margin(legs: list[dict], underlying: float, leverage: float, price_key: str = "entry",
-                    qty_key: str = "per_set") -> float:
-    """Capital a position blocks. Written calls and written puts on the same
+                    qty_key: str = "per_set", model: Optional[dict] = None, t: Optional[float] = None,
+                    iv: Optional[float] = None, name: str = "") -> float:
+    """Capital a position blocks.
+
+    model {"model": "span"} (the spec's "margin"): F&O legs block the
+    exchange-style SPAN + exposure estimate (fno.span_margin — bought wings
+    cut it, premium paid on top), cash legs notional / leverage. `iv` None =
+    implied from each leg's price (live).
+
+    Otherwise (leverage model): written calls and written puts on the same
     underlying offset (only one side can lose at expiry, as SPAN treats a short
     straddle/strangle), so the writing margin is the larger side's; premium for
     bought options and notional/leverage for futures and cash are added on top.
-
-    ponytail: bought wings don't reduce the writing margin (real SPAN would
-    give an iron fly a smaller one) — conservative, so sizing errs small."""
+    ponytail: bought wings don't reduce the writing margin there — the span
+    model is the one that credits a hedge."""
+    if (model or {}).get("model") == "span" and any(lg["kind"] != "EQ" for lg in legs):
+        fo = [lg for lg in legs if lg["kind"] != "EQ"]
+        m = fno.span_margin(fo, underlying, t if t is not None else 0.0, name=name, iv=iv, price_key=price_key,
+                            qty_key=qty_key, scan_pct=model.get("scan_pct"), exposure_pct=model.get("exposure_pct"))
+        return m["total"] + sum(leg_margin("EQ", lg["act"], lg[price_key], underlying, lg[qty_key], leverage)
+                                for lg in legs if lg["kind"] == "EQ")
     side = {"CE": 0.0, "PE": 0.0}
     rest = 0.0
     for lg in legs:
@@ -822,6 +861,48 @@ def prepare(d: dict, spec: dict) -> None:
         d["iv"] = [x / 100 if x else h for x, h in zip(v, hv)]
     else:
         d["iv"] = hv
+
+
+def sim_legs(spec: dict, side: str, meta: dict, u: float, t: float, iv: float,
+             tdays: Optional[frozenset] = None) -> list[dict[str, Any]]:
+    """The legs a backtest opens for one set on a `side` signal: the symbol,
+    its future, or the option legs with their strikes and expiries resolved
+    (Black-Scholes at `iv` for PREMIUM / DELTA strikes). No prices or qty yet."""
+    inst = spec["instrument"]
+    sym = meta.get("symbol", "")
+    sign = 1 if side == "BUY" else -1
+    lot = int(meta.get("lot") or 1) if inst["type"] != "equity" else 1
+    if inst["type"] == "equity":
+        return [{"kind": "EQ", "act": sign, "label": sym, "per_set": 1}]
+    if inst["type"] == "future":
+        exp = fno.expiry_after(meta["name"], meta["exch"], "monthly", inst["expiry"], t, tdays)
+        return [{"kind": "FUT", "act": sign, "exp": exp, "per_set": lot,
+                 "label": f"{meta['name']} FUT {fno.label_date(exp)}"}]
+    legs: list[dict[str, Any]] = []
+    step = float(meta.get("step") or fno.default_step(meta["name"], u))
+    for cfg in inst["legs_long" if side == "BUY" else "legs_short"]:
+        if not cfg["lots"]:
+            continue
+        if cfg["right"] == "FUT":          # priced on spot, like a future-type strategy
+            exp = fno.expiry_after(meta["name"], meta["exch"], "monthly", inst["expiry"], t, tdays)
+            legs.append({"kind": "FUT", "act": 1 if cfg["action"] == "BUY" else -1, "exp": exp,
+                         "per_set": lot * cfg["lots"], "label": f"{meta['name']} FUT {fno.label_date(exp)}"})
+            continue
+        exp = fno.expiry_after(meta["name"], meta["exch"], inst["expiry_kind"], cfg.get("expiry") or inst["expiry"],
+                               t, tdays)
+        tyrs = fno.years_to(exp, t)
+        if cfg["strike"] == "PREMIUM":
+            k_ = fno.strike_for_premium(u, step, cfg["right"], cfg["premium"],
+                                        lambda k: fno.bs_price(u, k, tyrs, iv, cfg["right"]))
+        elif cfg["strike"] == "DELTA":
+            k_ = fno.strike_for_delta(u, step, cfg["right"], cfg["delta"],
+                                      lambda k: fno.bs_greeks(u, k, tyrs, iv, cfg["right"])["delta"])
+        else:
+            k_ = fno.pick_strike(u, step, cfg["right"], cfg["strike"], cfg["steps"])
+        legs.append({"kind": cfg["right"], "act": 1 if cfg["action"] == "BUY" else -1, "K": k_, "exp": exp,
+                     "per_set": lot * cfg["lots"],
+                     "label": f"{meta['name']} {fno.label_date(exp)} {k_:g} {cfg['right']}"})
+    return legs
 
 
 def _leg_px(leg: dict, u: float, t: float, iv: float) -> float:
@@ -983,34 +1064,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         tdays = d.get("trading_days")
         iv = d["iv"][i] if inst["type"] == "option" else 0.0
         sign = 1 if side == "BUY" else -1
-        lot = int(meta.get("lot") or 1) if inst["type"] != "equity" else 1
-        legs: list[dict[str, Any]] = []
-        if inst["type"] == "equity":
-            legs.append({"kind": "EQ", "act": sign, "label": sym, "per_set": 1})
-        elif inst["type"] == "future":
-            exp = fno.expiry_after(meta["name"], meta["exch"], "monthly", inst["expiry"], t, tdays)
-            legs.append({"kind": "FUT", "act": sign, "exp": exp, "per_set": lot,
-                         "label": f"{meta['name']} FUT {fno.label_date(exp)}"})
-        else:
-            step = float(meta.get("step") or fno.default_step(meta["name"], u))
-            for cfg in inst["legs_long" if side == "BUY" else "legs_short"]:
-                if not cfg["lots"]:
-                    continue
-                if cfg["right"] == "FUT":          # priced on spot, like a future-type strategy
-                    exp = fno.expiry_after(meta["name"], meta["exch"], "monthly", inst["expiry"], t, tdays)
-                    legs.append({"kind": "FUT", "act": 1 if cfg["action"] == "BUY" else -1, "exp": exp,
-                                 "per_set": lot * cfg["lots"], "label": f"{meta['name']} FUT {fno.label_date(exp)}"})
-                    continue
-                exp = fno.expiry_after(meta["name"], meta["exch"], inst["expiry_kind"], inst["expiry"], t, tdays)
-                tyrs = fno.years_to(exp, t)
-                if cfg["strike"] == "PREMIUM":
-                    k_ = fno.strike_for_premium(u, step, cfg["right"], cfg["premium"],
-                                                lambda k: fno.bs_price(u, k, tyrs, iv, cfg["right"]))
-                else:
-                    k_ = fno.pick_strike(u, step, cfg["right"], cfg["strike"], cfg["steps"])
-                legs.append({"kind": cfg["right"], "act": 1 if cfg["action"] == "BUY" else -1, "K": k_, "exp": exp,
-                             "per_set": lot * cfg["lots"],
-                             "label": f"{meta['name']} {fno.label_date(exp)} {k_:g} {cfg['right']}"})
+        legs = sim_legs(spec, side, meta, u, t, iv, tdays)
         for l in legs:
             raw = _leg_px(l, u, t, iv)
             l["entry"] = raw * (1 + slip) if l["act"] > 0 else raw * (1 - slip)
@@ -1021,7 +1075,8 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         if ref != "u":                                   # levels on the option premium: its own ATR
             atrs = premium_atr(atrs, legs[0], u, t, iv)
         lv = entry_levels(spec, rsign, ref_entry, atrs)
-        per_set_margin = position_margin(legs, u, pf["leverage"])
+        per_set_margin = position_margin(legs, u, pf["leverage"], model=spec.get("margin"), t=t,
+                                         iv=iv if inst["type"] == "option" else None, name=meta["name"])
         per_set_risk = lv["sl_dist"] * legs[0]["per_set"] if lv["sl_dist"] else None
         eq = equity_now()
         # Losses always come out of the account, compounding or not: once the

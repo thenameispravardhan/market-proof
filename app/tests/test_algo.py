@@ -1017,3 +1017,149 @@ def test_ema_cross_at_an_angle_between_30_and_45_degrees_builds_and_runs():
     with pytest.raises(ValueError, match="unknown transform"):
         engine.normalize({**spec(None, None), "entry_long": {"logic": "AND", "conditions": [
             {"left": {**E(9), "xf": "curvature"}, "op": ">", "right": {"value": 0}}]}})
+
+
+# ---- option selling: SPAN-style margin, delta strikes, own-expiry legs, payoff ----
+
+def _leg(kind, act, K, price, exp, qty=65):
+    return {"kind": kind, "act": act, "K": K, "price": price, "exp": exp, "qty": qty}
+
+
+def test_writing_an_option_blocks_span_plus_exposure_buying_only_the_premium():
+    from app.algo import fno
+
+    t, exp, s = DAY0, DAY0 + 6 * 86400, 25000.0
+    px = lambda k, r: fno.bs_price(s, k, fno.years_to(exp, t), 0.13, r)  # noqa: E731
+    m = lambda legs: fno.span_margin(legs, s, t, name="NIFTY", iv=0.13)  # noqa: E731
+    bought = m([_leg("CE", 1, 25000, px(25000, "CE"), exp)])
+    sold = m([_leg("CE", -1, 25000, px(25000, "CE"), exp)])
+    assert bought["total"] == bought["premium"] == pytest.approx(px(25000, "CE") * 65, abs=0.01)
+    assert sold["exposure"] == pytest.approx(0.02 * s * 65) and sold["total"] > 6 * bought["total"]
+    strangle = [_leg("CE", -1, 25500, px(25500, "CE"), exp), _leg("PE", -1, 24500, px(24500, "PE"), exp)]
+    condor = strangle + [_leg("CE", 1, 25800, px(25800, "CE"), exp), _leg("PE", 1, 24200, px(24200, "PE"), exp)]
+    assert m(condor)["span"] < m(strangle)["span"] / 2                 # the wings cap the worst loss
+    straddle = m([_leg("CE", -1, 25000, px(25000, "CE"), exp), _leg("PE", -1, 25000, px(25000, "PE"), exp)])
+    assert straddle["span"] < sold["span"]                             # only one side can lose
+    fut = m([{"kind": "FUT", "act": 1, "qty": 65, "price": s}])
+    assert fut["total"] == pytest.approx(0.08 * s * 65)                # 6% scan + 2% exposure
+    # expiry day: SEBI's extra 2% on short index options; IV implied from the quote when not given
+    on_expiry = fno.span_margin([_leg("CE", -1, 25000, 120.0, DAY0 + 5 * 3600)], s, DAY0, name="NIFTY")
+    assert on_expiry["exposure"] == pytest.approx(0.04 * s * 65)
+    assert fno.implied_vol(px(25000, "CE"), s, 25000, fno.years_to(exp, t), "CE") == pytest.approx(0.13, abs=1e-4)
+
+
+def test_span_margin_model_lets_a_short_straddle_trade_where_notional_cannot():
+    closes = [24500, 24520, 24540, 24560] + [24560] * 8
+    legs = [{"right": "CE", "action": "SELL", "lots": 1}, {"right": "PE", "action": "SELL", "lots": 1}]
+    base = dict(instrument={"type": "option", "expiry_kind": "weekly", "iv": {"source": "fixed", "value": 14},
+                            "legs_long": legs, "levels_on": "underlying"},
+                portfolio={"capital": 300_000, "leverage": 1}, sizing={"mode": "lots", "value": 1})
+    lev = engine.run(_opt_spec(**base), {"N": _nifty(closes)})
+    assert lev["trades"] == [] and lev["stats"]["skipped"]["no_capital"] == 1   # 2 x notional ≈ ₹32 lakh
+    spec = _opt_spec(**base, margin={"model": "span"})
+    t = engine.run(spec, {"N": _nifty(closes)})["trades"][0]
+    assert 100_000 < t["margin"] < 300_000 and len(t["legs"]) == 2
+    assert "margin" not in _opt_spec(**base, margin={"model": "leverage"})     # leverage = the default: left out
+    with pytest.raises(ValueError, match="margin model"):
+        _opt_spec(**base, margin={"model": "var"})
+
+
+def test_delta_strikes_and_a_leg_on_its_own_expiry():
+    from app.algo import fno
+
+    closes = [24500, 24520, 24540, 24560, 24600, 24650, 24700] + [24700] * 10
+    spec = _opt_spec(instrument={"type": "option", "expiry_kind": "weekly", "levels_on": "underlying",
+                                 "iv": {"source": "fixed", "value": 14}, "legs_long": [
+                                     {"right": "CE", "action": "SELL", "strike": "DELTA", "delta": 0.2, "lots": 1},
+                                     {"right": "CE", "action": "BUY", "strike": "ATM", "expiry": "next", "lots": 1}]},
+                     margin={"model": "span"})
+    t = engine.run(spec, {"N": _nifty(closes)})["trades"][0]
+    short, long_ = t["legs"]
+    k = float(short["label"].split()[2])
+    dlt = fno.bs_greeks(24560, k, fno.years_to(fno.expiry_after("NIFTY", "NSE", "weekly", "current", DAY0), DAY0 + 1500),
+                        0.14, "CE")["delta"]
+    assert k > 24600 and abs(dlt - 0.2) < 0.06                          # an OTM call near 20 delta
+    assert short["label"].split()[1] == "02JAN25" and long_["label"].split()[1] == "09JAN25"   # a calendar
+    with pytest.raises(ValueError, match="target delta"):
+        _opt_spec(instrument={"type": "option", "legs_long": [{"right": "CE", "action": "SELL", "strike": "DELTA",
+                                                                "delta": 1.5, "lots": 1}]})
+    with pytest.raises(ValueError, match="own expiry"):
+        _opt_spec(instrument={"type": "option", "legs_long": [{"right": "CE", "action": "SELL", "expiry": "far",
+                                                                "lots": 1}]})
+    plain = _opt_spec()
+    assert all("delta" not in lg and "expiry" not in lg for lg in plain["instrument"]["legs_long"])
+
+
+def test_live_delta_strike_and_next_expiry_leg_from_the_chain(monkeypatch):
+    import asyncio
+
+    from app.algo import fno
+    from app.algo import runner as rn
+
+    now, e1, e2 = 1790000000, 1790000000 + 5 * 86400, 1790000000 + 12 * 86400
+
+    def chain(exp):
+        yrs = fno.years_to(exp, now)
+        return {"spot": 24537, "expiries": [{"ts": str(e1)}, {"ts": str(e2)}],
+                "strikes": [{"strike": k, "ce": {"symbol": f"NSE:N{exp}X{k}CE", "ltp": fno.bs_price(24537, k, yrs, 0.14, "CE")}}
+                            for k in range(24000, 25100, 50)]}
+
+    asked = []
+
+    class B:
+        async def get_option_chain(self, sym, strikecount=10, timestamp=""):
+            asked.append(timestamp)
+            return chain(int(timestamp) if timestamp else e1)
+
+    monkeypatch.setattr(rn.data, "_backend", lambda: B())
+    spec = _opt_spec(instrument={"type": "option", "levels_on": "underlying", "legs_long": [
+        {"right": "CE", "action": "SELL", "strike": "DELTA", "delta": 0.25, "lots": 1},
+        {"right": "CE", "action": "BUY", "strike": "ATM", "expiry": "next", "lots": 1}]})
+    legs = asyncio.run(rn.build_legs(spec, "NSE:NIFTY50-INDEX", "BUY", 24537, now))
+    want = fno.strike_for_delta(24537, 50, "CE", 0.25,
+                                lambda k: fno.bs_greeks(24537, k, fno.years_to(e1, now), 0.14, "CE")["delta"])
+    assert legs[0]["K"] == want and legs[0]["exp"] == e1 and legs[1]["exp"] == e2 and legs[1]["K"] == 24550
+    assert asked == ["", str(e2)]                                       # each chain fetched once
+
+
+def test_payoff_preview_of_a_bull_call_spread():
+    from app.algo import payoff
+
+    dummy = {"logic": "AND", "conditions": [{"left": {"value": 1}, "op": ">", "right": {"value": 0}}]}
+    spec = engine.normalize({
+        "symbols": ["NSE:NIFTY50-INDEX"], "direction": "long", "entry_long": dummy, "stop_loss": None, "target": None,
+        "margin": {"model": "span"},
+        "instrument": {"type": "option", "levels_on": "underlying", "legs_long": [
+            {"right": "CE", "action": "BUY", "strike": "ATM", "lots": 1},
+            {"right": "CE", "action": "SELL", "strike": "OTM", "steps": 4, "lots": 1}]}})
+    meta = {"symbol": "NSE:NIFTY50-INDEX", "name": "NIFTY", "exch": "NSE", "lot": 65, "step": 50}
+    r = payoff.preview(spec, "BUY", 25000, DAY0, 0.13, meta)
+    debit = -r["premium"]["net"]
+    assert r["premium"]["kind"] == "debit" and len(r["legs"]) == 2
+    assert r["max_loss"] == pytest.approx(-debit, rel=0.02)              # lose the debit below 25000
+    assert r["max_profit"] == pytest.approx(200 * 65 - debit, rel=0.02)  # the 200-point width minus it
+    assert len(r["breakevens"]) == 1 and 25000 < r["breakevens"][0] < 25200
+    assert 0 < r["pop_pct"] < 100 and r["greeks"]["delta"] > 0 and r["greeks"]["theta"] < 0
+    m = r["margin"]
+    assert m["model"] == "span" and m["used"] == m["span"]["total"] < m["naked"] and m["hedge_benefit"] > 0
+    assert r["legs"][1]["margin_if_sold"] > 5 * r["legs"][1]["margin_if_bought"]   # writing costs far more
+    assert r["curve"][0]["expiry"] == pytest.approx(-debit, rel=0.02)
+
+
+def test_payoff_endpoint(client, monkeypatch):
+    from app.algo import fno
+
+    async def no_download(max_age_h=20.0):
+        return None
+
+    monkeypatch.setattr(fno, "ensure_master", no_download)
+    spec = {"symbols": ["NSE:NIFTY50-INDEX"], "instrument": {
+        "type": "option", "levels_on": "underlying", "iv": {"source": "fixed", "value": 12},
+        "legs_long": [{"right": "CE", "action": "SELL", "lots": 1}, {"right": "PE", "action": "SELL", "lots": 1}],
+        "legs_short": [{"right": "PE", "action": "BUY", "lots": 1}]}}
+    r = client.post("/api/algo/payoff", json={"spec": spec, "spot": 25000}).json()
+    assert r["iv_pct"] == 12 and r["iv_source"] == "fixed" and r["premium"]["kind"] == "credit"
+    assert r["max_loss"] is None and len(r["breakevens"]) == 2         # a naked straddle: unlimited risk
+    assert r["margin"]["span"]["total"] < r["margin"]["leverage"]
+    assert client.post("/api/algo/payoff", json={"spec": spec, "spot": 25000, "side": "SELL"}).json()["legs"][0]["side"] == "BUY"
+    assert client.post("/api/algo/payoff", json={"spec": {**spec, "symbols": []}}).status_code == 422

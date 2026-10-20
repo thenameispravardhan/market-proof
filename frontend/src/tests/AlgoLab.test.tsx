@@ -3,7 +3,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import Algo, { nextDays } from "../pages/Algo";
+import Algo, { TEMPLATES, capitalInUse, nextDays, pnlHistogram } from "../pages/Algo";
 
 vi.mock("lightweight-charts", () => ({
   createChart: vi.fn(() => ({ addSeries: vi.fn(() => ({ setData: vi.fn() })), panes: vi.fn(() => []), timeScale: vi.fn(() => ({ setVisibleLogicalRange: vi.fn() })), remove: vi.fn() })),
@@ -37,6 +37,17 @@ const BT = {
   trades: [], trades_total: 0, notes: [], elapsed_s: 0.1, chart: { symbol: "NSE:SBIN-EQ", candles: [], trades: [] }, spec: DEFAULTS,
 };
 
+let btReply: unknown = BT;
+const PAYOFF = {
+  symbol: "NSE:NIFTY50-INDEX", spot: 25000, spot_source: "last close", iv_pct: 13, iv_source: "India VIX", lot: 65, side: "BUY", dte: 6.5, first_expiry: 1790000000,
+  legs: [{ label: "NIFTY 27OCT26 25000 CE", kind: "CE", side: "SELL", strike: 25000, expiry: 1790000000, qty: 65, dte: 6.5, price: 190, delta: 0.53, pos_delta: -34.5, theta: 980, vega: -890, gamma: -0.06, margin_alone: 120000, margin_if_bought: 12350, margin_if_sold: 120000 }],
+  curve: [{ spot: 24000, expiry: -52650, now: -40000, mid: -45000 }, { spot: 25000, expiry: 12350, now: 0, mid: 6000 }, { spot: 26000, expiry: 12350, now: 9000, mid: 11000 }],
+  breakevens: [24810], max_profit: 24700, max_loss: null, pop_pct: 56.1, expected_move: 450,
+  greeks: { delta: -4.5, gamma: -0.13, theta: 1980, vega: -2010 }, premium: { net: 24700, kind: "credit" },
+  margin: { model: "leverage", used: 406250, span: { span: 88000, exposure: 75000, premium: 0, total: 163000, scan_pct: 6, exposure_pct: 2 }, leverage: 406250, leverage_x: 8, naked: 270000, hedge_benefit: 107000, sets_affordable: 0, capital: 300000 },
+  return_on_margin_pct: 6.1,
+};
+
 const P1 = "entry_long.conditions.0.left.params.period";
 const P2 = "entry_long.conditions.0.right.params.period";
 const OPT = {
@@ -66,7 +77,8 @@ function route(url: string, init?: RequestInit) {
   if (url.includes("/api/algo/trades")) return json({ trades: [] });
   if (url.includes("/api/broker-accounts")) return json({ accounts: [] });
   if (url.includes("/api/algo/instrument")) return json({ symbol: "NSE:SBIN-EQ", name: "SBIN", fno: false, lot: null, weekly: false, futures: [], coverage: null });
-  if (url.includes("/api/algo/backtest")) return json(BT);
+  if (url.includes("/api/algo/backtest")) return json(btReply);
+  if (url.includes("/api/algo/payoff")) return json(PAYOFF);
   if (url.includes("/api/algo/optimize")) return json(JSON.parse(String(init?.body)).walk_forward ? WF : OPT);
   if (url.includes("/api/search/symbols")) return json({ hits: [] });
   return json({});
@@ -81,6 +93,7 @@ describe("Algo Lab", () => {
   let originalFetch: typeof fetch;
   beforeEach(() => {
     calls = [];
+    btReply = BT;
     localStorage.clear();
     sessionStorage.clear();
     originalFetch = globalThis.fetch;
@@ -193,5 +206,62 @@ describe("Algo Lab", () => {
     expect(body.oos_pct).toBeUndefined();
     expect(within(wf).getByText("63%")).toBeTruthy();                                   // WF efficiency
     expect(within(wf).getByText(/not traded/)).toBeTruthy();                            // the empty window says so
+  });
+  it("previews payoff and funds for option legs, and switches a writer to the SPAN margin estimate", async () => {
+    mount();
+    await screen.findByDisplayValue(/EMA 9\/21/);
+    const k = TEMPLATES.findIndex((t) => t.name.includes("9:20 short straddle"));
+    fireEvent.change(screen.getByDisplayValue("— load a template —"), { target: { value: String(k) } });
+    const panel = await screen.findByTestId("payoff-panel");
+    expect(await within(panel).findByText("unlimited")).toBeTruthy();                   // naked straddle: max loss
+    expect(within(panel).getByText("₹4.06 L")).toBeTruthy();                             // funds at the leverage model
+    expect(within(screen.getByTestId("payoff-legs")).getByText("NIFTY 27OCT26 25000 CE")).toBeTruthy();
+    const req = JSON.parse(String(calls.filter((c) => c.url.includes("/api/algo/payoff")).pop()!.init!.body));
+    expect(req.side).toBe("BUY");
+    expect(req.spec.instrument.legs_long.map((l: { action: string }) => l.action)).toEqual(["SELL", "SELL"]);
+    fireEvent.click(within(await screen.findByTestId("margin-warning")).getByText("use the SPAN estimate"));
+    expect((within(screen.getByTestId("margin-model")).getByRole("combobox") as HTMLSelectElement).value).toBe("span");
+    fireEvent.click(screen.getByText("▶ Run backtest"));
+    await waitFor(() => expect(calls.some((c) => c.url.includes("/api/algo/backtest"))).toBe(true));
+    const body = JSON.parse(String(calls.find((c) => c.url.includes("/api/algo/backtest"))!.init!.body));
+    expect(body.spec.margin).toEqual({ model: "span", scan_pct: null, exposure_pct: null });
+  });
+
+  it("sends delta strikes and a leg's own expiry", async () => {
+    mount();
+    await screen.findByDisplayValue(/EMA 9\/21/);
+    const k = TEMPLATES.findIndex((t) => t.name.includes("20-delta short strangle"));
+    fireEvent.change(screen.getByDisplayValue("— load a template —"), { target: { value: String(k) } });
+    await screen.findByTestId("payoff-panel");
+    fireEvent.change(screen.getAllByTestId("leg-expiry")[0], { target: { value: "next" } });
+    fireEvent.click(screen.getByText("▶ Run backtest"));
+    await waitFor(() => expect(calls.some((c) => c.url.includes("/api/algo/backtest"))).toBe(true));
+    const body = JSON.parse(String(calls.find((c) => c.url.includes("/api/algo/backtest"))!.init!.body));
+    expect(body.spec.instrument.legs_long).toEqual([
+      { right: "CE", action: "SELL", strike: "DELTA", steps: 0, premium: 100, lots: 1, delta: 0.2, expiry: "next" },
+      { right: "PE", action: "SELL", strike: "DELTA", steps: 0, premium: 100, lots: 1, delta: 0.2 }]);
+    expect(body.spec.margin).toEqual({ model: "span" });
+  });
+
+  it("draws trade analytics: capital in use, distribution, hours, excursions, month heatmap", async () => {
+    const tr = (entry_t: number, exit_t: number, net: number, margin: number) => ({
+      symbol: "NSE:SBIN-EQ", instrument: "NSE:SBIN-EQ", side: "BUY", qty: 1, lots: 1, entry_t, entry: 100, exit_t, exit: 101, u_entry: 100, u_exit: 101,
+      reason: "TARGET", gross: net, charges: 0, net, bars: 2, margin, legs: [], mae_pct: -0.4, mfe_pct: 1.2, r: null, minutes: 10 });
+    btReply = { ...BT, trades: [tr(1735704000, 1735707600, 500, 40000), tr(1735705000, 1735706000, -200, 30000)], trades_total: 2,
+      stats: { ...BT.stats, net_pnl: 300, monthly: { "2025-01": 300 } } };
+    mount();
+    await screen.findByDisplayValue(/EMA 9\/21/);
+    fireEvent.click(screen.getByText("▶ Run backtest"));
+    const cap = await screen.findByTestId("capital-in-use");
+    expect(within(cap).getByText(/70,000/)).toBeTruthy();                               // both open at once
+    expect(screen.getByTestId("pnl-histogram")).toBeTruthy();
+    expect(screen.getByTestId("mae-mfe")).toBeTruthy();
+    expect(within(screen.getByTestId("month-heatmap")).getByText("2025")).toBeTruthy();
+  });
+
+  it("analytics helpers: histogram buckets and margin in use over time", () => {
+    const h = pnlHistogram([-100, -50, 0, 50, 100], 4);
+    expect(h.map((b) => b.count)).toEqual([1, 1, 1, 2]);
+    expect(capitalInUse([{ entry_t: 1, exit_t: 5, margin: 10 }, { entry_t: 2, exit_t: 3, margin: 5 }]).map((p) => p.used)).toEqual([10, 15, 10, 0]);
   });
 });
