@@ -200,7 +200,7 @@ Combined values take `mult` / `add` / `xf` too and nest 3 deep.
 | `highest` / `lowest` / `sma` | highest / lowest / average of the last xn values |
 | `zscore` | standard deviations from its xn-candle average |
 | `abs` | without its sign |
-| `rank` | 0-100: where the value sits between its lowest (0) and highest (100) of the last xn — **IV rank** = VIX on `tf: 1440` with `rank` over ~250 |
+| `rank` | 0-100: where the value sits between its lowest (0) and highest (100) of the last xn — **IV rank** = VIX on `tf: 1440` with `rank` over ~200 (live trading keeps about a year of daily candles, so stay at or below ~200 daily bars) |
 | `percentile` | % of the previous xn values that were below it — **IV percentile** |
 
 ### 4.5 Useful condition patterns
@@ -209,7 +209,7 @@ Combined values take `mult` / `add` / `xf` too and nest 3 deep.
   (TIME is the candle's START time in IST, HHMM).
 * Expiry day only: `{"left": {"ind": "DTE"}, "op": "<", "right": {"value": 1}}`.
 * VIX filter: `{"left": {"ind": "VIX"}, "op": ">", "right": {"value": 14}}`.
-* IV rank above 50: `{"left": {"ind": "VIX", "tf": 1440, "xf": "rank", "xn": 250}, "op": ">", "right": {"value": 50}}`.
+* IV rank above 50: `{"left": {"ind": "VIX", "tf": 1440, "xf": "rank", "xn": 200}, "op": ">", "right": {"value": 50}}`.
 * Candle pattern: `{"left": {"ind": "CANDLE", "field": "bullish_engulfing"}, "op": "==", "right": {"value": 1}}`.
 * Daily trend filter: `{"left": {"ind": "PRICE"}, "op": ">", "right": {"ind": "EMA", "params": {"period": 20}, "tf": 1440}}`.
 * Gap up: `{"left": {"ind": "DAILY", "field": "gap_pct"}, "op": ">", "right": {"value": 0.8}}`.
