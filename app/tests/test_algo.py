@@ -835,3 +835,131 @@ def test_stats_tail_risk_and_confidence():
     assert 50 < st["psr_pct"] < 100 and st["sqn"] > 0
     few = engine.stats([t(k, v) for k, v in enumerate(pnl[:5])], 100000)
     assert few["var95"] is None and few["tail_ratio"] is None            # too few days to say
+
+
+# ---- flexibility: scale-out, weekday filter, walk-forward, heatmap -----------
+
+def test_old_specs_normalize_unchanged():
+    """New options are absent from a normalized spec unless switched on, so a
+    spec saved before them re-normalizes to exactly itself (no spurious version)."""
+    old = _cross_spec()
+    assert "scale_out" not in old and "days" not in old["session"]
+    assert engine.normalize(old) == old
+    assert _cross_spec(scale_out=[], session={**old["session"], "days": []}) == old
+    with pytest.raises(ValueError, match="more than 100%"):
+        _cross_spec(stop_loss={"type": "points", "value": 2},
+                    scale_out=[{"type": "rr", "value": 1, "qty_pct": 60}, {"type": "rr", "value": 2, "qty_pct": 50}])
+    with pytest.raises(ValueError, match="needs a stop loss"):
+        _cross_spec(scale_out=[{"type": "rr", "value": 1, "qty_pct": 50}])
+    with pytest.raises(ValueError, match="weekday"):
+        _cross_spec(session={**old["session"], "days": [0, 9]})
+
+
+def test_scale_out_books_partials_then_target_takes_the_rest():
+    closes = [100, 101, 102, 106, 108.5, 110, 113, 113, 113]
+    spec = _cross_spec(exit_long=None, sizing={"mode": "qty", "value": 10},
+                       stop_loss={"type": "points", "value": 2}, target={"type": "rr", "value": 3},
+                       scale_out=[{"type": "rr", "value": 1, "qty_pct": 50}])
+    tr = engine.run(spec, {"X": bars(closes, spread=0)})["trades"]
+    assert [(t["reason"], t["qty"]) for t in tr] == [("SCALE_OUT_1", 5), ("TARGET", 5)]
+    # 1R = 108 is passed on the entry bar, which (like a target) can't claim it: the
+    # next bar opens through it at 108.5. 3R = 112 is touched inside a later bar.
+    assert tr[0]["exit"] == pytest.approx(108.5) and tr[1]["exit"] == pytest.approx(112)
+    assert [t["gross"] for t in tr] == [12.5, 30.0] and [t["r"] for t in tr] == [1.25, 3.0]
+    # a step worth less than one set (half of one share / one lot) is skipped, not rounded up
+    assert engine.scale_plan([(108.0, 50)], 1) == []
+    assert engine.scale_plan([(108.0, 50), (110.0, 50)], 3) == [[108.0, 1], [110.0, 1]]
+    # without the scale-out the same trade is one full exit
+    plain = engine.run(_cross_spec(exit_long=None, sizing={"mode": "qty", "value": 10},
+                                   stop_loss={"type": "points", "value": 2}, target={"type": "rr", "value": 3}),
+                       {"X": bars(closes, spread=0)})["trades"]
+    assert [(t["reason"], t["qty"]) for t in plain] == [("TARGET", 10)]
+
+
+def test_weekday_filter_blocks_entries_on_other_days():
+    closes = [100, 101, 102, 106, 108, 110, 104, 102, 101]          # DAY0 = Wed 2025-01-01
+    sess = {"start": "09:15", "end": "15:00", "square_off": "15:15"}
+    assert engine.run(_cross_spec(session={**sess, "days": [1, 2]}), {"X": bars(closes, spread=0)})["trades"] == []
+    assert len(engine.run(_cross_spec(session={**sess, "days": [3]}), {"X": bars(closes, spread=0)})["trades"]) == 1
+    assert engine.day_allowed(_cross_spec(session={**sess, "days": [3]}), DAY0)
+    assert not engine.day_allowed(_cross_spec(session={**sess, "days": [4, 5]}), DAY0)
+
+
+def _days(n_days: int):
+    """n sessions of 75 x 5m bars, a saw-tooth that crosses 105 every day."""
+    t, c = [], []
+    for k in range(n_days):
+        for i in range(75):
+            t.append(DAY0 + k * 86400 + i * 300)
+            c.append(100 + (i % 25) * 0.5)
+    d = bars(c, spread=0.2)
+    d["t"] = t
+    return d
+
+
+def test_walk_forward_ranks_in_sample_and_trades_unseen_windows():
+    d = _days(24)
+    spec = _cross_spec(exit_long=None, target={"type": "pct", "value": 1}, stop_loss={"type": "pct", "value": 1})
+    grid = [{"path": "entry_long.conditions.0.right.value", "values": [104, 105, 106]}]
+    wf = engine.walk_forward(spec, {"X": d}, grid, "net_pnl", min_trades=1, windows=3, is_mult=2)
+    assert wf["combos"] == 3 and len(wf["folds"]) == 3
+    for f in wf["folds"]:
+        assert f["is_from"] < f["oos_from"] < f["oos_to"]
+        assert f["params"]["entry_long.conditions.0.right.value"] in (104, 105, 106)
+    assert wf["oos"]["trades"] == sum(f["oos"]["trades"] for f in wf["folds"]) > 0
+    assert wf["oos"]["equity"][0][0] >= wf["folds"][0]["oos_from"]           # nothing from in-sample leaks in
+    anch = engine.walk_forward(spec, {"X": d}, grid, min_trades=1, windows=3, is_mult=2, anchored=True)
+    assert len({f["is_from"] for f in anch["folds"]}) == 1                     # in-sample always from the start
+    with pytest.raises(ValueError, match="2-12"):
+        engine.walk_forward(spec, {"X": d}, grid, windows=1)
+    opt = engine.optimize(spec, {"X": d}, grid, min_trades=1)
+    assert len(opt["all"]) == 3 and {tuple(r["params"].values())[0] for r in opt["all"]} == {104, 105, 106}
+
+
+def test_runner_paper_scale_out_then_target(monkeypatch, isolated_db):
+    """Paper runner: the scale-out closes half as its own row, the rest runs to
+    the target, and the partial row doesn't count as another trade of the day."""
+    import asyncio
+
+    from app.algo import runner as rn
+    from app.db import session as dbs
+    from app.db.models import AlgoStrategy, AlgoTrade
+
+    spec = _cross_spec(exit_long=None, sizing={"mode": "qty", "value": 10},
+                       stop_loss={"type": "points", "value": 2}, target={"type": "points", "value": 6},
+                       scale_out=[{"type": "rr", "value": 1, "qty_pct": 50}])
+    with dbs.SessionLocal() as db:
+        db.add(AlgoStrategy(name="so", spec=spec, enabled=True, mode="paper"))
+        db.commit()
+    ltp = {"px": 106.5}
+
+    async def fake_bars(sym, tf, bars=400, now=None):
+        d = globals()["bars"]([100, 101, 102, 106], spread=0)
+        keep = [i for i, t in enumerate(d["t"]) if t + 300 <= now]
+        return {k: ([v[i] for i in keep] if isinstance(v, list) else v) for k, v in d.items()}
+
+    async def fake_ltp(symbols):
+        return {s.upper(): ltp["px"] for s in symbols}
+
+    monkeypatch.setattr(rn.data, "recent_bars", fake_bars)
+    monkeypatch.setattr(rn, "_ltp", fake_ltp)
+    r = rn.AlgoRunner()
+    t_close = DAY0 + 4 * 300 + 4
+    asyncio.run(r.tick(t_close))
+    with dbs.SessionLocal() as db:
+        assert db.query(AlgoTrade).one().scale == {"left": 10, "sets": 10, "levels": [[108.5, 5]], "done": 0}
+    ltp["px"] = 109.0
+    asyncio.run(r.tick(t_close + 5))
+    with dbs.SessionLocal() as db:
+        rows = db.query(AlgoTrade).order_by(AlgoTrade.id).all()
+        assert [(x.status, x.exit_reason, x.legs[0]["qty"]) for x in rows] == [
+            ("open", None, 5), ("closed", "SCALE_OUT_1", 5)]
+        assert rows[1].gross_pnl == pytest.approx(12.5) and rows[0].scale["done"] == 1
+        sid = rows[0].strategy_id
+    assert rn._trades_today(sid, "NSE:TEST-EQ", DAY0 - 33300) == 1
+    ltp["px"] = 113.0
+    asyncio.run(r.tick(t_close + 10))
+    with dbs.SessionLocal() as db:
+        rows = db.query(AlgoTrade).order_by(AlgoTrade.id).all()
+        assert [(x.status, x.exit_reason) for x in rows] == [("closed", "TARGET"), ("closed", "SCALE_OUT_1")]
+        assert rows[0].gross_pnl == pytest.approx(5 * 6.5)
