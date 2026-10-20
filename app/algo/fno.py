@@ -383,8 +383,11 @@ def lot_error(symbol: str, quantity: int) -> Optional[str]:
         return None
     lot = contract_lot(symbol)
     if lot is None:
-        if len(name) == 6 and name.endswith("INR"):
-            return None                # currency F&O (USDINR…): not in the equity F&O master
+        from app.services.instrument_master import get_master
+
+        inst = get_master().get((symbol or "").strip().upper())
+        if (inst is not None and inst.segment == "CD") or (len(name) == 6 and name.endswith("INR")):
+            return None                # currency F&O (USDINR, EURUSD…): not in the equity F&O master
         why = ("isn't in the F&O scrip master" if master_loaded()
                else "is unknown — the NSE/BSE F&O scrip master isn't downloaded yet")
         return (f"lot size for {symbol} {why}, so the order wasn't sent "

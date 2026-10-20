@@ -227,8 +227,13 @@ def _product(spec: dict, lg: dict) -> str:
 async def _order(account: BrokerAccount, symbol: str, side: str, qty: int, *, exit_: bool,
                  strategy_id: int, product: str = "INTRADAY") -> tuple[bool, Optional[str], str]:
     """(ok, broker order id, message) — one MARKET order."""
-    from app.api.orders import _manager
+    from app.api.orders import _manager, market_problem
 
+    # The Trade page's market gate: crypto / currency never reach Fyers, MCX only with live MCX on and in whole
+    # lots (this path skipped it: an MCX "equity" leg of 1 went out as 1 Fyers lot = 100 of ours).
+    problem = market_problem(symbol, int(qty), paper=False)
+    if problem:
+        return False, None, problem
     try:
         r = await _manager().place_manual_order(
             account=account, symbol=symbol, side=side, quantity=int(qty), order_type="MARKET",

@@ -29,6 +29,12 @@ class Settings(BaseSettings):
 
     # ---------- Trading core ----------
     TRADING_MODE: Literal["paper", "live"] = "paper"
+    # Live MCX orders from the Trade page (Settings toggle). OFF (default) = the old behaviour: MCX trades on the
+    # Paper account only and Fyers quantities are passed through as sent. ON = MCX may be sent to Fyers, and every
+    # live path converts our quoted-unit quantity (GOLD 1 lot = 100) to Fyers' lots (GOLD 1 lot = 1) and back:
+    # order place / modify, position convert, the app's SL / target exits, positions, order book and fills.
+    # Switch it only while flat in MCX. Currency stays paper-only (Fyers has it in square-off mode).
+    FYERS_MCX_LIVE: bool = False
 
     # ---------- DeepSeek ----------
     DEEPSEEK_API_KEY: str = ""

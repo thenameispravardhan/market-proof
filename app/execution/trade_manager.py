@@ -1684,7 +1684,8 @@ class TradeManager:
                     return
                 ok = False
                 if hasattr(backend, "modify_order"):
-                    ok, msg = await backend.modify_order(mp.broker_stop_id, quantity=abs(int(mp.quantity)), stop_price=trigger)
+                    ok, msg = await backend.modify_order(mp.broker_stop_id, quantity=abs(int(mp.quantity)), stop_price=trigger,
+                                                         symbol=mp.symbol)
                 if ok:
                     await loop.run_in_executor(None, _update_backstop_row, self._session_factory,
                                                mp.broker_stop_id, abs(int(mp.quantity)), trigger)
