@@ -351,21 +351,32 @@ async def build_legs(spec: dict, sym: str, side: str, u: float, now: float) -> l
         return [{"symbol": fs, "kind": "FUT", "act": sign, "per_set": lot_of(fs), "label": fs.split(":")[-1], "price": px}]
     backend = data._backend()
     cfgs = inst["legs_long" if side == "BUY" else "legs_short"]
-    count = min(50, max([c["steps"] for c in cfgs] + [0]) + 3 if all(c["strike"] != "PREMIUM" for c in cfgs) else 30)
-    chain = await backend.get_option_chain(sym, strikecount=count)
-    exp = _pick_expiry([int(e["ts"]) for e in chain.get("expiries") or [] if str(e.get("ts")).isdigit()],
-                       inst["expiry_kind"], name, inst["expiry"])
-    if exp is None:
-        raise ValueError(f"no {inst['expiry']} {inst['expiry_kind']} expiry listed for {name}")
-    listed = sorted(int(e["ts"]) for e in chain.get("expiries") or [] if str(e.get("ts")).isdigit())
-    if listed and exp != listed[0]:
-        chain = await backend.get_option_chain(sym, strikecount=count, timestamp=str(exp))
-    rows = [r for r in chain.get("strikes") or [] if r.get("strike")]
-    if not rows:
-        raise ValueError(f"empty option chain for {name}")
-    strikes = sorted(r["strike"] for r in rows)
-    step = min((b - a for a, b in zip(strikes, strikes[1:]) if b > a), default=fno.default_step(name, u))
-    spot = chain.get("spot") or u
+    count = min(50, max([c["steps"] for c in cfgs] + [0]) + 3) \
+        if all(c["strike"] not in ("PREMIUM", "DELTA") for c in cfgs) else 30
+    chains: dict[str, tuple[int, list[dict], float, float]] = {}
+    nearest: list[dict] = []
+
+    async def chain_for(which: str) -> tuple[int, list[dict], float, float]:
+        """(expiry, strike rows, strike step, spot) of the current / next expiry's chain, fetched once."""
+        if which in chains:
+            return chains[which]
+        if not nearest:
+            nearest.append(await backend.get_option_chain(sym, strikecount=count))
+        chain = nearest[0]
+        listed = sorted(int(e["ts"]) for e in chain.get("expiries") or [] if str(e.get("ts")).isdigit())
+        exp = _pick_expiry(listed, inst["expiry_kind"], name, which)
+        if exp is None:
+            raise ValueError(f"no {which} {inst['expiry_kind']} expiry listed for {name}")
+        if listed and exp != listed[0]:
+            chain = await backend.get_option_chain(sym, strikecount=count, timestamp=str(exp))
+        rows = [r for r in chain.get("strikes") or [] if r.get("strike")]
+        if not rows:
+            raise ValueError(f"empty option chain for {name}")
+        strikes = sorted(r["strike"] for r in rows)
+        step = min((b - a for a, b in zip(strikes, strikes[1:]) if b > a), default=fno.default_step(name, u))
+        chains[which] = (exp, rows, step, chain.get("spot") or nearest[0].get("spot") or u)
+        return chains[which]
+
     legs = []
     for c in cfgs:
         if not c["lots"]:
@@ -378,12 +389,19 @@ async def build_legs(spec: dict, sym: str, side: str, u: float, now: float) -> l
                          "per_set": lot_of(fs) * c["lots"], "label": fs.split(":")[-1],
                          "price": (await _ltp([fs])).get(fs)})
             continue
+        exp, rows, step, spot = await chain_for(c.get("expiry") or inst["expiry"])
         key = c["right"].lower()
-        if c["strike"] == "PREMIUM":
+        if c["strike"] in ("PREMIUM", "DELTA"):
             cands = [r for r in rows if (r.get(key) or {}).get("ltp")]
             if not cands:
                 raise ValueError(f"no {c['right']} premiums in the chain")
-            row = min(cands, key=lambda r: abs(r[key]["ltp"] - c["premium"]))
+            if c["strike"] == "PREMIUM":
+                row = min(cands, key=lambda r: abs(r[key]["ltp"] - c["premium"]))
+            else:                       # |delta| from each strike's own implied vol
+                yrs = fno.years_to(exp, now)
+                dlt = lambda r: abs(fno.bs_greeks(spot, r["strike"], yrs, fno.implied_vol(  # noqa: E731
+                    r[key]["ltp"], spot, r["strike"], yrs, c["right"]), c["right"])["delta"])
+                row = min(cands, key=lambda r: abs(dlt(r) - c["delta"]))
         else:
             k_ = fno.pick_strike(spot, step, c["right"], c["strike"], c["steps"])
             row = min(rows, key=lambda r: abs(r["strike"] - k_))
@@ -932,7 +950,8 @@ class AlgoRunner:
             atr_vals = engine.premium_atr(atr_vals, legs[0], u, time.time())
         # Sizing on the quoted prices (the stop distance only needs the shape).
         pre = engine.entry_levels(spec, rsign, u if ref == "u" else legs[0]["price"], atr_vals)
-        per_set_margin = engine.position_margin(legs, u, pf["leverage"], price_key="price")
+        per_set_margin = engine.position_margin(legs, u, pf["leverage"], price_key="price", model=spec.get("margin"),
+                                                t=now, name=fno.fno_name(sym))
         equity = pf["capital"] + (book["realized"] if pf["compounding"] else 0.0)
         sets = engine.units(spec, equity, per_set_margin,
                             pre["sl_dist"] * legs[0]["per_set"] if pre["sl_dist"] else None)
