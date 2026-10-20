@@ -18,8 +18,13 @@ Execution model, shared with the live runner:
     stop first when a bar spans both (the conservative assumption);
   * scale-out levels close a % of the entry size, filled like a target; each
     part is its own trade and the rest keeps its stop / trail / target;
-  * MTM (rupee) stop / target / trail work on the whole position — the way
-    to manage a multi-leg option position;
+  * MTM (rupee, or % of the entry premium) stop / target / trail work on the
+    whole position — the way to manage a multi-leg option position;
+  * a leg's own stop / target (% of its premium) closes just that leg inside
+    the bar; its fill stays in the position, which can then move the other
+    legs' stops to cost or exit them all;
+  * position rules on the option position's Greeks / premium filter entries
+    (checked on the legs about to be opened) and exit on a candle's close;
   * daily max loss / max profit flatten the strategy and stop it for the day;
   * everything is flat by `square_off`; with square-off switched off the
     position carries forward (overnight) until an exit rule closes it.
@@ -50,7 +55,10 @@ OPS = (">", "<", ">=", "<=", "==", "!=", "crosses_above", "crosses_below", "cros
 # angle: degrees of the line's rise over xn bars against ATR(14) of the strategy's candles — a move of one
 # ATR per bar is 45°, so the number means the same on any symbol, price level or chart zoom.
 MAX_LOOKBACK = 500
-TRANSFORMS = ("angle", "slope", "change", "pct_change", "highest", "lowest", "sma", "zscore", "abs")
+# rank: where the value sits in its N-bar range, 0 = the lowest, 100 = the highest (IV rank on VIX);
+# percentile: % of the previous N bars that were below it (IV percentile).
+TRANSFORMS = ("angle", "slope", "change", "pct_change", "highest", "lowest", "sma", "zscore", "abs",
+              "rank", "percentile")
 MATH = ("+", "-", "*", "/", "pct_diff")
 INSTRUMENTS = ("equity", "future", "option")
 SIZING = ("qty", "lots", "amount", "pct_equity", "risk", "risk_pct")
@@ -102,8 +110,25 @@ DEFAULT_SPEC: dict[str, Any] = {
 #       exchange-style SPAN + exposure estimate (fno.span_margin) instead of
 #       notional / leverage; scan / exposure None = the index / stock defaults;
 #   on a leg: "expiry": current|next (its own expiry: calendars / diagonals),
-#       "delta": 0.01-0.99 with strike "DELTA" (the strike nearest that |delta|).
-OPTIONAL_KEYS = ("scale_out", "margin")
+#       "delta": 0.01-0.99 with strike "DELTA" (the strike nearest that |delta|),
+#       "sl_pct" / "tg_pct": that leg's own stop / target, % of its entry premium;
+#   "instrument": {"on_leg_stop": "cost" | "all"} — when a leg's stop hits, move
+#       the other legs' stops to their entry price, or exit every leg (absent =
+#       only that leg exits);
+#   "mtm": {"stop_pct", "target_pct"} — position stop / target as % of the
+#       net premium at entry (50 = half the credit); the tighter of this and ₹;
+#   "position_rules": {"entry": [rule], "exit": [rule]}, rule = {"metric", "op",
+#       "value"} on the option position's Greeks / premium (POSITION_METRICS):
+#       entries only when every entry rule holds, exit when any exit rule does.
+OPTIONAL_KEYS = ("scale_out", "margin", "position_rules")
+# Per set (one set = the legs at their configured lots): delta in lots of the
+# underlying (1 = one lot of the future), gamma = delta change for a 1% move,
+# theta ₹ per day, vega ₹ per vol point, credit ₹ (net premium received; a
+# debit is negative); pnl_pct = P&L as % of the entry premium; dte = days to
+# the nearest open leg's expiry; iv = the open legs' average IV %.
+POSITION_METRICS = ("delta", "abs_delta", "gamma", "theta", "vega", "credit", "pnl_pct", "dte", "iv")
+RULE_OPS = (">", "<", ">=", "<=")
+LEG_STOP_ACTIONS = ("leg", "cost", "all")
 SCALE_KINDS = ("pct", "points", "atr", "rr")
 
 
@@ -252,6 +277,15 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
                 lg.pop("expiry", None)
             elif lg["expiry"] not in ("current", "next") or lg["right"] == "FUT":
                 raise ValueError("a leg's own expiry is current or next (option legs only)")
+            for k, label in (("sl_pct", "leg stop %"), ("tg_pct", "leg target %")):
+                if lg.get(k) in (None, "", 0):
+                    lg.pop(k, None)
+                elif lg["right"] == "FUT":
+                    raise ValueError("a leg's own stop / target is for option legs (FUT legs use the position's)")
+                else:
+                    lg[k] = _num(lg[k], label, 1e-9)
+                    if lg[k] > 1000:
+                        raise ValueError(f"{label} must be at most 1000")
             lg["steps"] = _num(lg.get("steps", 0), "strike steps", 0, integer=True)
             lg["premium"] = _num(lg.get("premium", 100), "target premium", 0.05)
             # 0 lots = leg switched off, so the optimiser can sweep a hedge on / off.
@@ -260,6 +294,12 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
         if opt and used and not active:
             raise ValueError(f"options need at least one leg with lots in {key}")
         multi = multi or (opt and used and len(active) > 1)
+    leg_stops = opt and any(lg.get("sl_pct") or lg.get("tg_pct")
+                            for key in ("legs_long", "legs_short") for lg in inst.get(key) or [])
+    if inst.get("on_leg_stop") in (None, "", "leg"):
+        inst.pop("on_leg_stop", None)
+    elif inst["on_leg_stop"] not in LEG_STOP_ACTIONS:
+        raise ValueError(f"on a leg's stop: one of {LEG_STOP_ACTIONS}")
 
     for key, kinds in (("stop_loss", ("pct", "points", "atr")), ("target", ("pct", "points", "atr", "rr")),
                        ("trailing", ("pct", "points", "atr")), ("breakeven", ("pct", "points", "atr"))):
@@ -294,6 +334,8 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("scale-out steps close more than 100% of the position")
         if multi and inst["levels_on"] == "instrument":
             raise ValueError("multi-leg positions can't scale out on 'the instrument' — put levels on the underlying")
+        if leg_stops:
+            raise ValueError("scale-out and per-leg stops / targets can't be combined — use one or the other")
         s["scale_out"] = so
     mg = s.pop("margin", None)
     if mg:
@@ -308,6 +350,32 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
 
     for k in ("stop", "target", "trail_start", "trail_gap"):
         s["mtm"][k] = _num(s["mtm"].get(k), f"MTM {k}", 1e-9, allow_none=True)
+    for k, label in (("stop_pct", "MTM stop % of premium"), ("target_pct", "MTM target % of premium")):
+        v = _num(s["mtm"].pop(k, None), label, 1e-9, allow_none=True)
+        if v is not None:
+            if not opt:
+                raise ValueError(f"{label} needs option legs (it is a share of their premium)")
+            s["mtm"][k] = v
+    pr = s.pop("position_rules", None) or {}
+    if not isinstance(pr, dict):
+        raise ValueError("position_rules is {entry: [...], exit: [...]}")
+    rules = {}
+    for k in ("entry", "exit"):
+        lst = copy.deepcopy(pr.get(k) or [])
+        if not isinstance(lst, list) or len(lst) > 10:
+            raise ValueError(f"position_rules.{k} takes at most 10 rules")
+        for r in lst:
+            if not isinstance(r, dict) or r.get("metric") not in POSITION_METRICS:
+                raise ValueError(f"position rule metric is one of {POSITION_METRICS}")
+            if r.get("op") not in RULE_OPS:
+                raise ValueError(f"position rule op is one of {RULE_OPS}")
+            r["value"] = _num(r.get("value"), f"{r['metric']} rule value", -1e12)
+        if lst:
+            rules[k] = lst
+    if rules:
+        if not opt:
+            raise ValueError("position rules (Greeks / premium) need an option instrument")
+        s["position_rules"] = rules
     if (s["mtm"]["trail_start"] is None) != (s["mtm"]["trail_gap"] is None):
         raise ValueError("MTM trailing needs both a start and a gap")
     for k in ("max_loss", "max_profit"):
@@ -436,6 +504,12 @@ def _walk_operands(spec: dict[str, Any]):
 ORDER_FLOW = {"DELTA", "CVD", "CVD_DIVERGENCE", "VPROFILE", "BAR_FLOW", "FLOW_PRESSURE"}
 
 
+def vix_timeframes(spec: dict[str, Any]) -> set[int]:
+    """Timeframes (minutes) at which conditions read India VIX — the loaders
+    attach VIX candles to those bars."""
+    return {int(o.get("tf") or 0) or spec["timeframe"] for o in _walk_operands(spec) if o["ind"] == "VIX"}
+
+
 def bar_minutes(spec: dict[str, Any]) -> float:
     """Typical candle length in minutes — for turning 'N bars' into time live."""
     return spec["timeframe"] if spec["bars"]["type"] == "time" else 375 / spec["bars"]["per_day"]
@@ -522,9 +596,36 @@ def _combine(how: str, a: ind.S, b: ind.S) -> ind.S:
     return [f(x, y) for x, y in zip(a, b)]
 
 
+def _rank(s: ind.S, n: int, how: str) -> ind.S:
+    """rank: 0-100 position of each value between the lowest and highest of
+    the last n (itself included; 50 when flat). percentile: % of the previous
+    n values strictly below it. A gap mid-series yields no values, as above."""
+    import bisect
+
+    lo = next((i for i, v in enumerate(s) if v is not None), len(s))
+    if any(v is None for v in s[lo:]):
+        return [None] * len(s)
+    out: ind.S = [None] * len(s)
+    if how == "rank":
+        hi_, lo_ = ind.highest(s, n), ind.lowest(s, n)
+        for i in range(lo, len(s)):
+            if hi_[i] is not None and lo_[i] is not None:
+                out[i] = 50.0 if hi_[i] == lo_[i] else (s[i] - lo_[i]) / (hi_[i] - lo_[i]) * 100
+        return out
+    window: list[float] = []                 # the previous n values, sorted
+    for i in range(lo, len(s)):
+        if len(window) == n:
+            out[i] = bisect.bisect_left(window, s[i]) / n * 100
+            del window[bisect.bisect_left(window, s[i - n])]
+        bisect.insort(window, s[i])
+    return out
+
+
 def _transform(d: dict, s: ind.S, how: str, n: int, cache: dict) -> ind.S:
     if how == "abs":
         return [None if v is None else abs(v) for v in s]
+    if how in ("rank", "percentile"):
+        return _rank(s, n, how)
     if how in ("highest", "lowest", "sma", "zscore"):
         lo = next((i for i, v in enumerate(s) if v is not None), len(s))
         if any(v is None for v in s[lo:]):              # a gap mid-series: no window reaches across it
@@ -728,6 +829,109 @@ def charges(buy_value: float, sell_value: float, segment: str = "eq") -> float:
     return round(brokerage + stt + exch + sebi + 0.18 * (brokerage + exch + sebi) + stamp, 2)
 
 
+# ---- option positions: premium, Greeks, rules (shared with the live runner) ---
+
+def premium_base(legs: list[dict]) -> float:
+    """|net option premium| at entry (credit or debit, rupees): what the MTM %
+    stop / target and the premium P&L % are measured against."""
+    return abs(sum(lg["act"] * lg["entry"] * lg["qty"] for lg in legs if lg["kind"] in ("CE", "PE")))
+
+
+def mtm_limits(m: dict, legs: list[dict]) -> tuple[Optional[float], Optional[float]]:
+    """Rupee MTM stop and target of a position: the tighter of the ₹ value and
+    the % of entry premium (each None when neither is set)."""
+    base = premium_base(legs)
+    stop = [x for x in (m.get("stop"), base * m["stop_pct"] / 100 if m.get("stop_pct") and base else None) if x]
+    tgt = [x for x in (m.get("target"), base * m["target_pct"] / 100 if m.get("target_pct") and base else None) if x]
+    return (min(stop) if stop else None), (min(tgt) if tgt else None)
+
+
+def position_metrics(legs: list[dict], u: float, t: float, lot: int, px: Callable[[dict], Optional[float]],
+                     iv: Optional[float] = None) -> dict[str, Optional[float]]:
+    """POSITION_METRICS of a position, per set. `px(leg)` is a leg's current
+    price (a closed leg's own exit); `iv` the IV every leg is priced at
+    (backtests) or None = each leg's IV implied from its price (live).
+
+    Closed legs (with an "exit") count only towards pnl_pct. Every value is
+    None when a price is missing — a rule never fires on a guess."""
+    sets = max(1e-9, legs[0]["qty"] / legs[0]["per_set"]) if legs and legs[0].get("per_set") else 1.0
+    lot = lot or 1
+    out = {k: 0.0 for k in ("delta", "gamma", "theta", "vega", "credit")}
+    pnl, ivs, dtes = 0.0, [], []
+    for lg in legs:
+        p = lg["exit"] if lg.get("exit") is not None else px(lg)
+        if p is None:
+            return {k: None for k in POSITION_METRICS}
+        pnl += lg["act"] * (p - lg["entry"]) * lg["qty"]
+        if lg.get("exit") is not None:
+            continue
+        if lg["kind"] in ("CE", "PE"):
+            yrs = fno.years_to(lg["exp"], t)
+            v = iv if iv is not None else fno.implied_vol(p, u, lg["K"], yrs, lg["kind"])
+            g = fno.bs_greeks(u, lg["K"], yrs, v, lg["kind"])
+            ivs.append(v)
+            dtes.append((lg["exp"] - t) / 86400)
+            out["credit"] -= lg["act"] * p * lg["qty"]
+        else:
+            g = {"delta": 1.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+        w = lg["act"] * lg["qty"]
+        out["delta"] += w * g["delta"] / lot
+        out["gamma"] += w * g["gamma"] * u / 100 / lot
+        out["theta"] += w * g["theta"]
+        out["vega"] += w * g["vega"]
+    out = {k: v / sets for k, v in out.items()}
+    base = premium_base(legs)
+    out.update(abs_delta=abs(out["delta"]), pnl_pct=pnl / base * 100 if base else None,
+               dte=min(dtes) if dtes else None, iv=sum(ivs) / len(ivs) * 100 if ivs else None)
+    return out
+
+
+def _rule_true(r: dict, m: dict) -> bool:
+    v = m.get(r["metric"])
+    if v is None:
+        return False
+    return {">": v > r["value"], "<": v < r["value"], ">=": v >= r["value"], "<=": v <= r["value"]}[r["op"]]
+
+
+def rule_label(r: dict) -> str:
+    return f"{r['metric']} {r['op']} {r['value']:.10g}"
+
+
+def entry_rules_fail(spec: dict, m: dict) -> Optional[dict]:
+    """The first entry rule this position does NOT meet, or None (all met / none set)."""
+    return next((r for r in (spec.get("position_rules") or {}).get("entry", []) if not _rule_true(r, m)), None)
+
+
+def exit_rule_hit(spec: dict, m: dict) -> Optional[dict]:
+    """The first exit rule this position meets, or None."""
+    return next((r for r in (spec.get("position_rules") or {}).get("exit", []) if _rule_true(r, m)), None)
+
+
+def leg_levels(legs: list[dict]) -> None:
+    """A leg's own stop / target as premium prices, from its entry (in place)."""
+    for lg in legs:
+        if lg.get("sl_pct"):
+            lg["sl"] = lg["entry"] * (1 - lg["act"] * lg["sl_pct"] / 100)
+        if lg.get("tg_pct"):
+            lg["tg"] = lg["entry"] * (1 + lg["act"] * lg["tg_pct"] / 100)
+
+
+def leg_hit(lg: dict, p: float) -> Optional[str]:
+    """SL / COST / TARGET when an open leg's premium `p` has reached its level."""
+    if lg.get("sl") is not None and -lg["act"] * (p - lg["sl"]) >= 0:
+        return "COST" if lg.get("at_cost") else "SL"
+    if lg.get("tg") is not None and lg["act"] * (p - lg["tg"]) >= 0:
+        return "TARGET"
+    return None
+
+
+def legs_to_cost(legs: list[dict]) -> None:
+    """After a leg's stop: every other open option leg's stop moves to its entry price."""
+    for lg in legs:
+        if lg.get("exit") is None and lg["kind"] in ("CE", "PE"):
+            lg["sl"], lg["at_cost"] = lg["entry"], True
+
+
 def _brokerage(value: float, segment: str) -> float:
     if not value:
         return 0.0
@@ -901,11 +1105,14 @@ def sim_legs(spec: dict, side: str, meta: dict, u: float, t: float, iv: float,
             k_ = fno.pick_strike(u, step, cfg["right"], cfg["strike"], cfg["steps"])
         legs.append({"kind": cfg["right"], "act": 1 if cfg["action"] == "BUY" else -1, "K": k_, "exp": exp,
                      "per_set": lot * cfg["lots"],
-                     "label": f"{meta['name']} {fno.label_date(exp)} {k_:g} {cfg['right']}"})
+                     "label": f"{meta['name']} {fno.label_date(exp)} {k_:g} {cfg['right']}",
+                     **{k: cfg[k] for k in ("sl_pct", "tg_pct") if cfg.get(k)}})
     return legs
 
 
 def _leg_px(leg: dict, u: float, t: float, iv: float) -> float:
+    if leg.get("exit") is not None:          # closed early by its own stop / target: its fill is final
+        return leg["exit"]
     if leg["kind"] in ("EQ", "FUT"):
         return u
     return fno.bs_price(u, leg["K"], fno.years_to(leg["exp"], t), iv, leg["kind"])
@@ -976,7 +1183,9 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
 
     events = sorted(((t, k, i) for k, sym in enumerate(syms) for i, t in enumerate(data[sym]["t"])))
     trades: list[dict[str, Any]] = []
-    skipped = {"no_capital": 0, "max_positions": 0, "daily_halt": 0, "entry_expired": 0}
+    skipped = {"no_capital": 0, "max_positions": 0, "daily_halt": 0, "entry_expired": 0, "entry_rules": 0}
+    exit_rules = (spec.get("position_rules") or {}).get("exit")
+    on_leg_stop = inst.get("on_leg_stop", "leg")
     realized = 0.0
     used_margin = 0.0
     open_n = 0
@@ -1007,12 +1216,13 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         for l in pos["legs"]:
             q = l["qty"] * n // pos["sets"]          # qty = per_set x sets, so this is exact
             px = _leg_px(l, u, t, iv)
-            if slipped:
+            if slipped and l.get("exit") is None:
                 px = px * (1 - slip) if l["act"] > 0 else px * (1 + slip)
             g, ch = leg_pnl(l["act"], q, l["entry"], px, l["kind"], with_ch, l["qty0"])
             gross, chg = gross + g, chg + ch
             legs_out.append({"label": l["label"], "side": "BUY" if l["act"] > 0 else "SELL", "qty": q,
-                             "entry": round(l["entry"], 2), "exit": round(px, 2)})
+                             "entry": round(l["entry"], 2), "exit": round(px, 2),
+                             **({"reason": l["exit_reason"]} if l.get("exit_reason") else {})})
             if part:
                 l["qty"] -= q
         net = gross - chg
@@ -1037,6 +1247,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
             if pos["ref_entry"] else None,
             "r": round(net / risk, 2) if risk else None,
             "minutes": round((t - pos["t"]) / 60),
+            **({"greeks": pos["greeks0"]} if pos.get("greeks0") else {}),
         })
         realized += net
         day_realized += net
@@ -1068,6 +1279,15 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         for l in legs:
             raw = _leg_px(l, u, t, iv)
             l["entry"] = raw * (1 + slip) if l["act"] > 0 else raw * (1 - slip)
+        greeks0 = None
+        if inst["type"] == "option":
+            one = [{**l, "qty": l["per_set"]} for l in legs]
+            m0 = position_metrics(one, u, t, int(meta.get("lot") or 1), lambda l: l["entry"], iv)
+            if entry_rules_fail(spec, m0):
+                return "entry_rules"
+            greeks0 = {k: round(m0[k], 4 if k in ("delta", "gamma") else 2)
+                       for k in ("delta", "gamma", "theta", "vega", "credit", "iv", "dte") if m0[k] is not None}
+            leg_levels(legs)
         ref = "u" if inst["type"] == "equity" or inst["levels_on"] == "underlying" else 0
         rsign = sign if ref == "u" else legs[0]["act"]
         ref_entry = u if ref == "u" else legs[0]["entry"]
@@ -1101,15 +1321,68 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                      if lv["sl_dist"] and (ref != "u" or inst["type"] != "option") else None,
                      "t": t, "i": i, "day": (t + IST) // 86400, "u0": u, "sets": sets, "margin": margin,
                      "exit_pending": None, "mid_bar": u_fill is not None,
-                     "so": scale_plan(lv["so"], sets), "so_k": 0}
+                     "so": scale_plan(lv["so"], sets), "so_k": 0, "greeks0": greeks0,
+                     "leg_rules": any(l.get("sl") is not None or l.get("tg") is not None for l in legs)}
         used_margin += margin
         open_n += 1
         open_syms.add(sym)
         s_["per_day"][(t + IST) // 86400] = s_["per_day"].get((t + IST) // 86400, 0) + 1
         return None
 
+    def leg_events(sym: str, i: int) -> bool:
+        """Each leg's own stop / target inside bar i. The bar is walked open ->
+        low -> high -> close (open -> high -> low -> close on a red candle); on
+        each stretch the underlying moves one way, so every leg's premium does
+        too, and the first level crossed fills first. A leg stop can move the
+        other legs' stops to cost or exit them all. True when nothing is left."""
+        s_ = st[sym]
+        pos, d = s_["pos"], s_["d"]
+        o, h, l, c, t = d["o"][i], d["h"][i], d["l"][i], d["c"][i], d["t"][i]
+        iv = d["iv"][i]
+        later = i > pos["i"]
+        fav_ok = later or not pos.get("mid_bar")
+        path = [o if later else pos["u0"]] + ([l, h, c] if c >= o else [h, l, c])
+        for a, b in zip(path, path[1:]):
+            while True:
+                hit = None
+                for lg in pos["legs"]:
+                    if lg.get("exit") is not None or lg["kind"] not in ("CE", "PE"):
+                        continue
+                    f = lambda u, lg=lg: _leg_px(lg, u, t, iv)  # noqa: E731
+                    for why, lvl, way in (("SL", lg.get("sl"), -lg["act"]), ("TARGET", lg.get("tg"), lg["act"])):
+                        if lvl is None or (why == "TARGET" and not fav_ok):
+                            continue
+                        if way * (f(a) - lvl) >= 0:
+                            u_x = a
+                        elif way * (f(b) - lvl) >= 0:
+                            u_x = _solve(f, lvl, a, b)
+                        else:
+                            continue
+                        if hit is None or abs(u_x - a) < abs(hit[0] - a):
+                            hit = (u_x, lg, why)
+                if hit is None:
+                    break
+                u_x, lg, why = hit
+                px = _leg_px(lg, u_x, t, iv)
+                if why == "SL":                      # a stop fills against you, like the position's
+                    px = px * (1 - slip) if lg["act"] > 0 else px * (1 + slip)
+                reason = "LEG_TARGET" if why == "TARGET" else "LEG_COST" if lg.get("at_cost") else "LEG_SL"
+                lg["exit"], lg["exit_reason"] = px, reason
+                if why == "SL" and on_leg_stop == "all":
+                    close(sym, u_x, t, reason, i)
+                    return True
+                if why == "SL" and on_leg_stop == "cost":
+                    legs_to_cost(pos["legs"])
+                if all(x.get("exit") is not None for x in pos["legs"]):
+                    close(sym, u_x, t, reason, i)
+                    return True
+                a = u_x
+        return False
+
     def check_intrabar(sym: str, i: int) -> None:
         s_ = st[sym]
+        if s_["pos"]["leg_rules"] and leg_events(sym, i):
+            return
         pos, d = s_["pos"], s_["d"]
         o, h, l, c, t = d["o"][i], d["h"][i], d["l"][i], d["c"][i], d["t"][i]
         iv = d["iv"][i] if inst["type"] == "option" else 0.0
@@ -1154,11 +1427,12 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                 return close(sym, o, t, "TARGET", i, slipped=False)
             if sgn * (f(u_fav) - pos["tg"]) >= 0:
                 return close(sym, _solve(f, pos["tg"], o, u_fav), t, "TARGET", i, slipped=False)
-        if mtm_rules["stop"] or mtm_rules["target"] or mtm_rules["trail_start"]:
+        m_stop, m_target = mtm_limits(mtm_rules, pos["legs"])
+        if m_stop or m_target or mtm_rules["trail_start"]:
             m = lambda u: mtm(pos, u, t, iv)  # noqa: E731
             pts = sorted((o, h, l, c), key=m)
             lo_u, hi_u = pts[0], pts[-1]
-            floor = -mtm_rules["stop"] if mtm_rules["stop"] else None
+            floor = -m_stop if m_stop else None
             if mtm_rules["trail_start"] and pos["peak"] is not None and pos["peak"] >= mtm_rules["trail_start"]:
                 tfloor = pos["peak"] - mtm_rules["trail_gap"]
                 if floor is None or tfloor > floor:
@@ -1169,8 +1443,8 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                 why = "MTM_SL"
             if floor is not None and m(lo_u) <= floor:
                 return close(sym, o if m(o) <= floor else _solve(m, floor, o, lo_u), t, why, i)
-            if mtm_rules["target"] and fav_ok and m(hi_u) >= mtm_rules["target"]:
-                u_x = o if m(o) >= mtm_rules["target"] else _solve(m, mtm_rules["target"], o, hi_u)
+            if m_target and fav_ok and m(hi_u) >= m_target:
+                u_x = o if m(o) >= m_target else _solve(m, m_target, o, hi_u)
                 return close(sym, u_x, t, "MTM_TARGET", i, slipped=False)
 
     for t, k, i in events:
@@ -1234,6 +1508,13 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                 pos["exit_pending"] = "SIGNAL"
             elif spec["max_bars"] and i - pos["i"] + 1 >= spec["max_bars"]:
                 pos["exit_pending"] = "TIME_STOP"
+            elif exit_rules:                 # Greeks / premium rules, on the candle's close like a signal
+                tc = ind.close_time(d, i)
+                pm = position_metrics(pos["legs"], d["c"][i], tc, int(d["meta"].get("lot") or 1),
+                                      lambda l: _leg_px(l, d["c"][i], tc, iv), iv)
+                r_ = exit_rule_hit(spec, pm)
+                if r_:
+                    pos["exit_pending"] = f"RULE_{r_['metric'].upper()}"
         s_["u"] = (d["c"][i], i)
         if (daily["max_loss"] or daily["max_profit"]) and halted != day:
             day_pnl = day_realized

@@ -411,7 +411,8 @@ async def build_legs(spec: dict, sym: str, side: str, u: float, now: float) -> l
         legs.append({"symbol": leg["symbol"].upper(), "kind": c["right"], "act": 1 if c["action"] == "BUY" else -1,
                      "per_set": lot_of(leg["symbol"], leg.get("lot_size")) * c["lots"],
                      "label": leg["symbol"].split(":")[-1],
-                     "price": leg.get("ltp"), "K": row["strike"], "exp": exp})
+                     "price": leg.get("ltp"), "K": row["strike"], "exp": exp,
+                     **{k: c[k] for k in ("sl_pct", "tg_pct") if c.get(k)}})
     return legs
 
 
@@ -518,7 +519,11 @@ class AlgoRunner:
             if mins >= sq:
                 await self._exit(t, prices, "SQUARE_OFF", now)
                 continue
-            reason = await self._check(t, spec, prices, now)
+            reason = None
+            if any(lg.get("exit") is None and (lg.get("sl") is not None or lg.get("tg") is not None)
+                   for lg in t["legs"]):
+                reason = await self._leg_exits(t, spec, prices, now)
+            reason = reason or await self._check(t, spec, prices, now)
             if reason:
                 await self._exit(t, prices, reason, now)
             elif t.get("scale") and t["scale"]["levels"]:
@@ -576,14 +581,15 @@ class AlgoRunner:
         m = _mtm(legs, prices)
         if spec and m is not None and not reason:
             r = spec["mtm"]
+            m_stop, m_target = engine.mtm_limits(r, legs)      # ₹, or the tighter % of entry premium
             peak = m if t["mtm_peak"] is None else max(t["mtm_peak"], m)
             if peak != t["mtm_peak"]:
                 changed["mtm_peak"] = t["mtm_peak"] = peak
-            if r["stop"] and m <= -r["stop"]:
+            if m_stop and m <= -m_stop:
                 reason = "MTM_SL"
             elif r["trail_start"] and peak >= r["trail_start"] and m <= peak - r["trail_gap"]:
                 reason = "MTM_TRAIL"
-            elif r["target"] and m >= r["target"]:
+            elif m_target and m >= m_target:
                 reason = "MTM_TARGET"
         if spec and not reason and spec["max_bars"]:
             if now >= _epoch(t["entry_at"]) + spec["max_bars"] * engine.bar_minutes(spec) * 60:
@@ -591,6 +597,53 @@ class AlgoRunner:
         if changed:
             await asyncio.to_thread(_update, t["id"], **{k: v for k, v in changed.items()})
         return reason
+
+    async def _leg_exits(self, t: dict, spec: Optional[dict], prices: dict[str, float], now: float) -> Optional[str]:
+        """Each leg's own stop / target: a leg whose premium reached its level is
+        closed on its own; the rest of the position stays open (a stop can move
+        the other legs' stops to cost). Closed legs keep their fill in the open
+        trade, so its MTM and the final booking include them. Returns a reason
+        when the whole position should now exit: every leg is done, or the
+        strategy exits all legs on a leg's stop."""
+        if self._retry_at.get(t["id"], 0) > now or t["id"] in self._busy:
+            return None
+        on = (spec["instrument"].get("on_leg_stop") if spec else None) or "leg"
+        self._busy.add(t["id"])
+        try:
+            fresh = await asyncio.to_thread(_fresh, t["id"])
+            if fresh is None or fresh["status"] != "open":
+                return None
+            t.update(fresh)
+            hits = [(lg, why) for lg in t["legs"] if lg.get("exit") is None
+                    and (px := prices.get(lg["symbol"].upper())) is not None and (why := engine.leg_hit(lg, px))]
+            if not hits:
+                return None
+            if on == "all" and any(why != "TARGET" for _, why in hits):
+                return "LEG_SL"
+            last = None
+            for lg, why in sorted(hits, key=lambda h: h[0]["act"]):          # written legs first
+                reason = f"LEG_{why}"
+                r = await self._close_leg(t, lg, lg["qty"], prices[lg["symbol"].upper()], reason)
+                if r is None:
+                    self._retry_at[t["id"]] = now + 30
+                    break
+                lg["exit"], lg["exit_reason"] = r["px"], reason
+                if r["oid"]:
+                    lg["exit_order_id"] = r["oid"]
+                if r["external"]:
+                    lg["external"] = True
+                if why != "TARGET" and on == "cost":
+                    engine.legs_to_cost(t["legs"])
+                last = reason
+                self.event("exit", f"{reason} {lg.get('label') or lg['symbol']} @ {r['px']:.2f} — the rest of "
+                                   f"{t.get('instrument') or t['symbol']} stays open", trade_id=t["id"],
+                           strategy_id=t["strategy_id"])
+            await asyncio.to_thread(_update, t["id"], legs=t["legs"])
+        finally:
+            self._busy.discard(t["id"])
+        if all(lg.get("exit") is not None for lg in t["legs"]):
+            return last or "LEG_SL"
+        return None
 
     async def _last_close(self, symbol: str) -> Optional[float]:
         try:
@@ -855,6 +908,16 @@ class AlgoRunner:
             if sig["exit_long" if mine["side"] == "BUY" else "exit_short"][-1]:
                 prices = await _ltp([lg["symbol"] for lg in mine["legs"]])
                 await self._exit(mine, prices, "SIGNAL", now)
+            elif spec["instrument"]["type"] == "option" and (spec.get("position_rules") or {}).get("exit"):
+                prices = await _ltp([lg["symbol"] for lg in mine["legs"]] + [sym])
+                m = engine.position_metrics(mine["legs"], prices.get(sym.upper()) or d["c"][-1], now,
+                                            fno.known_lot(fno.fno_name(sym)) or 1,
+                                            lambda lg: prices.get(lg["symbol"].upper()))
+                hit = engine.exit_rule_hit(spec, m)
+                if hit:
+                    self.event("exit", f"{s['name']}: {sym} exit rule {engine.rule_label(hit)} "
+                                       f"({hit['metric']} = {m[hit['metric']]:.3f})", strategy_id=s["id"])
+                    await self._exit(mine, prices, f"RULE_{hit['metric'].upper()}", now)
             return
         close_min = int((indicators.close_time(d, len(d["t"]) - 1) + IST) % 86400) // 60
         start, end, _ = engine.session_window(spec)
@@ -941,6 +1004,15 @@ class AlgoRunner:
             self.event("error", f"{s['name']}: {side} {sym} skipped — no live price for "
                                 f"{', '.join(lg['symbol'] for lg in legs if not lg.get('price'))}", strategy_id=s["id"])
             return
+        if inst["type"] == "option" and (spec.get("position_rules") or {}).get("entry"):
+            one = [{**lg, "qty": lg["per_set"], "entry": lg["price"]} for lg in legs]
+            m0 = engine.position_metrics(one, u, now, fno.known_lot(fno.fno_name(sym)) or 1, lambda lg: lg["price"])
+            miss = engine.entry_rules_fail(spec, m0)
+            if miss:
+                got = m0.get(miss["metric"])
+                self.event("info", f"{s['name']}: {side} {sym} skipped — entry rule {engine.rule_label(miss)} not met "
+                                   f"({miss['metric']} = {'n/a' if got is None else f'{got:.3f}'})", strategy_id=s["id"])
+                return
         ref = "u" if inst["type"] == "equity" or inst["levels_on"] == "underlying" else "0"
         sign = 1 if side == "BUY" else -1
         rsign = sign if ref == "u" else legs[0]["act"]
@@ -1011,6 +1083,7 @@ class AlgoRunner:
                 self.event("error", f"{s['name']}: LIVE {side} {sym} rejected: {failure}", strategy_id=s["id"])
                 return
         ref_entry = u if ref == "u" else legs[0]["entry"]
+        engine.leg_levels(legs)                        # each leg's own stop / target, on its fill
         lv = engine.entry_levels(spec, rsign, ref_entry, atr_vals)
         plan = engine.scale_plan(lv["so"], sets)
         label = " + ".join(lg["label"] for lg in legs)[:160]
@@ -1032,7 +1105,7 @@ class AlgoRunner:
     async def sync(self, strategies: list[dict], days: int = 5) -> dict[str, Any]:
         """Top up the 1-minute store for every symbol any strategy trades."""
         syms = sorted({x for s in strategies for x in s["spec"]["symbols"]})
-        if any(s["spec"]["instrument"]["type"] == "option" for s in strategies):
+        if any(s["spec"]["instrument"]["type"] == "option" or engine.vix_timeframes(s["spec"]) for s in strategies):
             syms.append(data.VIX)
         now = int(time.time())
         ok, failed = 0, []
@@ -1048,5 +1121,6 @@ class AlgoRunner:
 
 
 def _clean(legs: list[dict]) -> list[dict]:
-    keep = ("symbol", "kind", "act", "qty", "qty0", "entry", "label", "K", "exp", "order_id", "product")
+    keep = ("symbol", "kind", "act", "qty", "qty0", "entry", "label", "K", "exp", "order_id", "product",
+            "per_set", "sl", "tg")
     return [{k: lg[k] for k in keep if k in lg} for lg in legs]

@@ -1,6 +1,7 @@
 """`/api/algo` — indicator strategies: backtest, optimise, automate, data.
 
     GET    /api/algo/indicators            catalog for the builder (indicators, operators, defaults)
+    GET    /api/algo/guide                 the Algo Lab guide (markdown text): give it to an AI to write a strategy
     POST   /api/algo/backtest              {spec, start, end, chart_symbol?}
     POST   /api/algo/payoff               {spec, side?, spot?, iv_pct?} — payoff, Greeks, funds required
     POST   /api/algo/optimize              {spec, start, end, grid:[{path, values}], metric, min_trades,
@@ -27,6 +28,7 @@ from datetime import date, datetime, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
+from fastapi.responses import PlainTextResponse
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -171,7 +173,18 @@ async def _assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[st
 def indicators() -> dict[str, Any]:
     return {"indicators": ind.catalog(), "operators": engine.OPS, "timeframes": engine.TIMEFRAMES,
             "cond_timeframes": engine.COND_TIMEFRAMES, "sources": ind.SOURCES, "metrics": engine.METRICS,
-            "sizing": engine.SIZING, "defaults": engine.DEFAULT_SPEC, "max_range_days": MAX_RANGE_DAYS}
+            "sizing": engine.SIZING, "defaults": engine.DEFAULT_SPEC, "max_range_days": MAX_RANGE_DAYS,
+            "position_metrics": engine.POSITION_METRICS}
+
+
+@router.get("/guide")
+def guide() -> PlainTextResponse:
+    """Everything the builder and backtest can do, plus a generated reference
+    of every indicator and allowed value — a text an AI can turn into
+    importable strategy JSON."""
+    from app.algo import guide as g
+
+    return PlainTextResponse(g.text(), media_type="text/markdown; charset=utf-8")
 
 
 @router.post("/validate")
@@ -289,7 +302,7 @@ async def payoff(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     # Only the instrument / margin / portfolio matter here: a builder with no
     # conditions or stops yet still gets its preview.
     dummy = {"logic": "AND", "conditions": [{"left": {"value": 1}, "op": ">", "right": {"value": 0}}]}
-    stub = {k: raw[k] for k in ("symbols", "instrument", "portfolio", "margin") if k in raw}
+    stub = {k: raw[k] for k in ("symbols", "instrument", "portfolio", "margin", "position_rules") if k in raw}
     try:
         spec = engine.normalize({**stub, "direction": "both", "entry_long": dummy, "entry_short": dummy,
                                  "stop_loss": None, "target": None, "sizing": {"mode": "lots", "value": 1}})

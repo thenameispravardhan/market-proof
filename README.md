@@ -680,6 +680,7 @@ Query; realtime via WebSocket hooks.
 | **Research** | decision funnel by block reason, confidence calibration per model (AUC, ECE, monthly drift), cost-aware replay, shadow SLM vs live model, pre-registered evaluation window, audit-chain check, per-signal "why" card |
 | **Prompts** | LLM template editor with version history and restore |
 | **Rules** | the operator's rule builder + dry-run |
+| **Algo Lab** | indicator-strategy builder, backtester, optimiser and paper / live automations: equity, futures and multi-leg options (ATM / ITM / OTM / premium / delta strikes, calendars), per-leg stops with move-to-cost, MTM in ₹ or % of premium, entry / exit rules on the position's Greeks, SPAN-style margin for option selling, a payoff & funds preview with every Greek. **⬇ Algo guide** downloads [`app/algo/guide.md`](app/algo/guide.md) + a generated reference — hand it to any AI, describe a strategy, paste the JSON back with **📋 paste JSON** |
 | **Strategies / Accounts / Notifications / Webhooks / Trade History / Settings** | configuration and audit |
 
 The chart panel is a full TradingView-style implementation on lightweight-charts:
@@ -862,7 +863,8 @@ A section we think should be mandatory.
 app/
 ├── analyzer/          fast track · hybrid · DeepSeek client · slm_adapter ·
 │                      rules engine · PDF extract + cache · prompts · schemas
-├── algo/              Algo Lab: indicator engine, backtests, optimiser (DSR/PBO), live runner
+├── algo/              Algo Lab: indicator engine, backtests, optimiser (DSR/PBO), live runner,
+│                      option pricing / Greeks / SPAN margin, payoff preview, guide.md (for AIs)
 ├── api/               30 REST + WebSocket routers (the control plane)
 ├── db/                24 tables, session/engine, migrations, index guard
 ├── execution/         paper + Fyers backends, entry state machine, trade manager,

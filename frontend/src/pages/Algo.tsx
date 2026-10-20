@@ -68,6 +68,8 @@ const TRANSFORMS: [string, string, string][] = [
   ["sma", "average", "simple average of the last N bars"],
   ["zscore", "z-score", "standard deviations from its N-bar average"],
   ["abs", "absolute", "the value without its sign"],
+  ["rank", "rank 0-100", "where it sits between its lowest (0) and highest (100) of the last N bars — IV rank = VIX on daily with this over ~250"],
+  ["percentile", "percentile", "% of the previous N bars that were below it — IV percentile"],
 ];
 const MATH_OPS: [string, string][] = [["-", "−"], ["+", "+"], ["*", "×"], ["/", "÷"], ["pct_diff", "% gap"]];
 type Group = { logic: "AND" | "OR"; conditions: (Cond | Group)[] };
@@ -75,7 +77,10 @@ type Level = { type: string; value: number; atr_period?: number; activate?: numb
 // Partial exit: close qty_pct % of the ENTRY size at this level (rr = R multiples of the stop).
 type ScaleStep = { type: string; value: number; atr_period?: number; qty_pct: number };
 // delta: with strike "DELTA", the strike nearest that |delta|. expiry: the leg's own expiry (calendars); absent = the instrument's.
-type Leg = { right: "CE" | "PE" | "FUT"; action: "BUY" | "SELL"; strike: string; steps: number; premium: number; lots: number; delta?: number; expiry?: "current" | "next" };
+// sl_pct / tg_pct: the leg's own stop / target, % of its entry premium (absent = off).
+type Leg = { right: "CE" | "PE" | "FUT"; action: "BUY" | "SELL"; strike: string; steps: number; premium: number; lots: number; delta?: number; expiry?: "current" | "next"; sl_pct?: number; tg_pct?: number };
+// A rule on the option position's Greeks / premium (per set): entry = all must hold, exit = any.
+type Rule = { metric: string; op: string; value: number };
 // span: F&O blocks an exchange-style SPAN + exposure estimate; absent = notional / leverage.
 type Margin = { model: "span" | "leverage"; scan_pct?: number | null; exposure_pct?: number | null };
 type Instrument = {
@@ -86,6 +91,7 @@ type Instrument = {
   legs_short: Leg[];
   levels_on: "instrument" | "underlying";
   iv: { source: string; value: number };
+  on_leg_stop?: "leg" | "cost" | "all";   // when a leg's own stop hits (absent = only that leg exits)
 };
 type Spec = {
   symbols: string[];
@@ -103,7 +109,8 @@ type Spec = {
   breakeven: Level;
   scale_out?: ScaleStep[];        // absent / empty = off (the server leaves it out when off)
   margin?: Margin;                // absent = leverage model
-  mtm: { stop: number | null; target: number | null; trail_start: number | null; trail_gap: number | null };
+  position_rules?: { entry?: Rule[]; exit?: Rule[] };   // absent = none
+  mtm: { stop: number | null; target: number | null; trail_start: number | null; trail_gap: number | null; stop_pct?: number | null; target_pct?: number | null };
   daily: { max_loss: number | null; max_profit: number | null };
   session: { start: string | null; end: string | null; square_off: string | null; days?: number[] | null };
   entry_order: { type: string; offset_pct: number; valid_bars: number };
@@ -114,7 +121,7 @@ type Spec = {
   portfolio: { capital: number; leverage: number; max_positions: number; compounding: boolean; max_position_pct?: number | null };
   costs: { slippage_pct: number; charges: boolean };
 };
-type IndicatorDef = { name: string; params: Record<string, number | string>; outputs: string[]; group: string };
+type IndicatorDef = { name: string; params: Record<string, number | string>; outputs: string[]; group: string; about?: string };
 type Catalog = {
   indicators: IndicatorDef[];
   operators: string[];
@@ -126,12 +133,14 @@ type Catalog = {
   defaults: Spec;
   max_range_days: number;
 };
-type BtLeg = { label: string; side: string; qty: number; entry: number; exit: number };
+type BtLeg = { label: string; side: string; qty: number; entry: number; exit: number; reason?: string };
+// Option position at entry, per set: delta / gamma in lots, theta / vega / credit in ₹, iv %, dte days.
+type EntryGreeks = { delta?: number; gamma?: number; theta?: number; vega?: number; credit?: number; iv?: number; dte?: number };
 type BtTrade = {
   symbol: string; instrument: string; side: string; qty: number; lots: number; entry_t: number; entry: number;
   exit_t: number; exit: number; u_entry: number; u_exit: number; reason: string; gross: number; charges: number;
   net: number; bars: number; margin: number; legs: BtLeg[];
-  mae_pct: number | null; mfe_pct: number | null; r: number | null; minutes: number;
+  mae_pct: number | null; mfe_pct: number | null; r: number | null; minutes: number; greeks?: EntryGreeks;
 };
 type Summary = Record<string, number | null>;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -361,11 +370,19 @@ function numericPaths(spec: Spec, cat: Catalog): { path: string; label: string; 
     const v = spec.mtm[k];
     if (v) out.push({ path: `mtm.${k}`, label: `MTM ${k.replace("_", " ")} ₹`, value: v });
   });
+  (["stop_pct", "target_pct"] as const).forEach((k) => {
+    const v = spec.mtm[k];
+    if (v) out.push({ path: `mtm.${k}`, label: `MTM ${k === "stop_pct" ? "stop" : "target"} % of premium`, value: v });
+  });
+  (["entry", "exit"] as const).forEach((k) => (spec.position_rules?.[k] ?? []).forEach((r, i) =>
+    out.push({ path: `position_rules.${k}.${i}.value`, label: `${k} rule ${i + 1}: ${r.metric} ${r.op}`, value: r.value })));
   if (spec.instrument.type === "option") {
     (["legs_long", "legs_short"] as const).forEach((side) => spec.instrument[side].forEach((lg, i) => {
       if (lg.strike === "ITM" || lg.strike === "OTM") out.push({ path: `instrument.${side}.${i}.steps`, label: `${side} leg ${i + 1} ${lg.right} strikes ${lg.strike}`, value: lg.steps });
       if (lg.strike === "PREMIUM") out.push({ path: `instrument.${side}.${i}.premium`, label: `${side} leg ${i + 1} ${lg.right} target premium`, value: lg.premium });
       if (lg.strike === "DELTA") out.push({ path: `instrument.${side}.${i}.delta`, label: `${side} leg ${i + 1} ${lg.action} ${lg.right} target delta`, value: lg.delta ?? 0.3 });
+      if (lg.sl_pct) out.push({ path: `instrument.${side}.${i}.sl_pct`, label: `${side} leg ${i + 1} ${lg.right} stop % of premium`, value: lg.sl_pct });
+      if (lg.tg_pct) out.push({ path: `instrument.${side}.${i}.tg_pct`, label: `${side} leg ${i + 1} ${lg.right} target % of premium`, value: lg.tg_pct });
       if (spec.instrument[side].length > 1) out.push({ path: `instrument.${side}.${i}.lots`, label: `${side} leg ${i + 1} ${lg.action} ${lg.right} lots (0 = off: hedged vs unhedged)`, value: lg.lots });
     }));
   }
@@ -451,7 +468,16 @@ export const TEMPLATES: Template[] = [
     instrument: { type: "option", expiry: "current", expiry_kind: "weekly", legs_long: [D("CE", "SELL", 0.16), D("PE", "SELL", 0.16), D("CE", "BUY", 0.05), D("PE", "BUY", 0.05)], legs_short: [L("PE", "BUY")], levels_on: "underlying", iv: { source: "auto", value: 15 } },
     entry_long: G([C(I("TIME", {}, "hhmm"), ">=", N(930))]), max_trades_per_day: 1,
     stop_loss: null, target: null, mtm: { stop: 3000, target: 2500, trail_start: null, trail_gap: null },
+    position_rules: { entry: [{ metric: "abs_delta", op: "<=", value: 0.1 }], exit: [{ metric: "abs_delta", op: ">", value: 0.35 }] },
     margin: { model: "span" }, sizing: { mode: "pct_equity", value: 90 }, portfolio: { capital: 300000, leverage: 1, max_positions: 1, compounding: true } } },
+  { name: "NIFTY options · 20Δ strangle, 30% stop per leg → other leg to cost, keep half the credit", symbols: ["NSE:NIFTY50-INDEX"], spec: {
+    direction: "long", timeframe: 5, session: { start: "09:30", end: "09:35", square_off: "15:15" },
+    instrument: { type: "option", expiry: "current", expiry_kind: "weekly", on_leg_stop: "cost", levels_on: "underlying", iv: { source: "auto", value: 15 },
+      legs_long: [{ ...D("CE", "SELL", 0.2), sl_pct: 30 }, { ...D("PE", "SELL", 0.2), sl_pct: 30 }], legs_short: [L("PE", "BUY")] },
+    entry_long: G([C(I("TIME", {}, "hhmm"), ">=", N(930)), C(I("VIX"), ">", N(11))]), max_trades_per_day: 1,
+    stop_loss: null, target: null, mtm: { stop: null, target: null, trail_start: null, trail_gap: null, target_pct: 50, stop_pct: 100 },
+    position_rules: { entry: [{ metric: "credit", op: ">=", value: 1500 }] },
+    margin: { model: "span" }, sizing: { mode: "lots", value: 1 }, portfolio: { capital: 300000, leverage: 1, max_positions: 1, compounding: false } } },
   { name: "BANKNIFTY futures · EMA cross + daily trend", symbols: ["NSE:NIFTYBANK-INDEX"], spec: {
     direction: "both", timeframe: 15,
     instrument: { type: "future", expiry: "current", expiry_kind: "monthly", legs_long: [], legs_short: [], levels_on: "instrument", iv: { source: "auto", value: 15 } },
@@ -809,13 +835,13 @@ function OperandEditor({ v, onChange, cat, baseTf, allowNumber = true, depth = 0
   }
   return (
     <span className="algo-operand">
-      <select value={v.ind ?? "#"} onChange={(e) => onChange(e.target.value === "#" ? { value: 0 }
+      <select value={v.ind ?? "#"} title={def?.about || undefined} onChange={(e) => onChange(e.target.value === "#" ? { value: 0 }
         : e.target.value === "@math" ? { math: "-", a: v.ind ? { ...v } : I("EMA", { period: 9 }), b: I("EMA", { period: 21 }) } : I(e.target.value))}>
         {allowNumber && <option value="#">Number</option>}
         {depth < 2 && <option value="@math">ƒ Combine two values (A − B, A ÷ B, % gap…)</option>}
         {groups.map((g) => (
           <optgroup key={g} label={g}>
-            {cat.indicators.filter((d) => d.group === g).map((d) => <option key={d.name} value={d.name}>{d.name}</option>)}
+            {cat.indicators.filter((d) => d.group === g).map((d) => <option key={d.name} value={d.name} title={d.about}>{d.name}</option>)}
           </optgroup>
         ))}
       </select>
@@ -1029,6 +1055,17 @@ function LegsEditor({ legs, onChange, title }: { legs: Leg[]; onChange: (l: Leg[
             <option value="">strategy expiry</option><option value="current">current expiry</option><option value="next">next expiry</option>
           </select>}
           <label className="meta" title="0 = leg off (the optimiser can sweep a hedge on / off)">lots <NumInput width={40} value={lg.lots} onChange={(n) => set(i, { lots: Math.max(0, Math.floor(n ?? 1)) })} /></label>
+          {lg.right !== "FUT" && (["sl_pct", "tg_pct"] as const).map((k) => (
+            <label key={k} className="meta" data-testid={`leg-${k}`}
+              title={k === "sl_pct"
+                ? `this leg's own stop: exit it when its premium ${lg.action === "SELL" ? "rises" : "falls"} this % from entry (the other legs stay unless “when a leg's stop hits” says otherwise)`
+                : `this leg's own target: exit it when its premium ${lg.action === "SELL" ? "falls" : "rises"} this % from entry`}>
+              {k === "sl_pct" ? "SL" : "TG"}<NumInput width={40} allowEmpty placeholder="off" value={lg[k] ?? null} onChange={(n) => {
+                const { [k]: _old, ...rest } = lg;
+                onChange(legs.map((x, j) => (j === i ? (n && n > 0 ? { ...rest, [k]: n } : rest) : x)));
+              }} />%
+            </label>
+          ))}
           <button type="button" className="btn-sm danger" onClick={() => onChange(legs.filter((_, j) => j !== i))}>✕</button>
         </div>
       ))}
@@ -1045,12 +1082,17 @@ type PayLeg = {
   label: string; kind: string; side: string; strike: number | null; expiry: number | null; qty: number; dte: number | null;
   price: number; delta: number; pos_delta: number; theta: number; vega: number; gamma: number;
   margin_alone: number; margin_if_bought: number | null; margin_if_sold: number | null;
+  prob_itm_pct?: number | null; lambda?: number | null; rho?: number; vanna?: number; charm?: number; vomma?: number;
+  sl_px?: number | null; tg_px?: number | null;
 };
 export type Payoff = {
   symbol: string; spot: number; spot_source: string; iv_pct: number; iv_source: string; lot: number | null; side: string;
   dte: number | null; first_expiry: number | null; legs: PayLeg[]; curve: { spot: number; expiry: number; now: number; mid: number }[];
   breakevens: number[]; max_profit: number | null; max_loss: number | null; pop_pct: number; expected_move: number | null;
-  greeks: { delta: number; gamma: number; theta: number; vega: number }; premium: { net: number; kind: string };
+  greeks: { delta: number; gamma: number; theta: number; vega: number; rho?: number; vanna?: number; charm?: number; vomma?: number; speed?: number };
+  premium: { net: number; kind: string };
+  position?: Record<string, number | null> | null;
+  entry_rules?: { rule: string; metric: string; value: number | null; ok: boolean }[];
   margin: { model: string; used: number; span: { span: number; exposure: number; premium: number; total: number; scan_pct: number | null; exposure_pct: number | null }; leverage: number;
     leverage_x: number; naked: number; hedge_benefit: number; sets_affordable: number | null; capital: number };
   return_on_margin_pct: number | null;
@@ -1090,7 +1132,8 @@ function PayoffPanel({ spec, onSpan }: { spec: Spec; onSpan: () => void }) {
   const [iv, setIv] = useState<number | null>(null);
   const [show, setShow] = useState({ expiry: true, now: true, mid: false });
   const sideNow = spec.direction === "long" ? "BUY" : spec.direction === "short" ? "SELL" : side;
-  const body = JSON.stringify({ spec: { symbols: spec.symbols, instrument: spec.instrument, portfolio: spec.portfolio, ...(spec.margin ? { margin: spec.margin } : {}) },
+  const body = JSON.stringify({ spec: { symbols: spec.symbols, instrument: spec.instrument, portfolio: spec.portfolio, ...(spec.margin ? { margin: spec.margin } : {}),
+    ...(spec.position_rules ? { position_rules: spec.position_rules } : {}) },
     side: sideNow, ...(spot ? { spot } : {}), ...(iv ? { iv_pct: iv } : {}) });
   const [key, setKey] = useState(body);
   useEffect(() => { const h = setTimeout(() => setKey(body), 350); return () => clearTimeout(h); }, [body]);
@@ -1153,6 +1196,22 @@ function PayoffPanel({ spec, onSpan }: { spec: Spec; onSpan: () => void }) {
             <Metric label="ν vega / vol pt" value={inr(p.greeks.vega)} cls={pnlCls(p.greeks.vega)} hint="₹ per 1-point rise in implied volatility" />
             {p.expected_move !== null && <Metric label="Expected move ±1σ" value={`±${p.expected_move.toFixed(0)}`} hint="one standard deviation of the underlying to the first expiry at this IV (shaded on the chart)" />}
           </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 18, marginTop: 8 }} data-testid="payoff-greeks-more">
+            <Metric label="ρ rho / 1% rate" value={inr(p.greeks.rho ?? 0)} hint="₹ per 1% rise in interest rates" />
+            <Metric label="vanna" value={num(p.greeks.vanna ?? 0, 3)} hint="how much delta (₹ per point) changes for a 1-point rise in IV — why a short strangle's delta drifts when volatility jumps" />
+            <Metric label="charm / day" value={num(p.greeks.charm ?? 0, 3)} hint="how much delta (₹ per point) changes per day that passes, with the price unchanged — delta decay into expiry" />
+            <Metric label="vomma" value={inr(p.greeks.vomma ?? 0)} hint="how much vega (₹) changes for a 1-point rise in IV" />
+            <Metric label="speed" value={(p.greeks.speed ?? 0).toExponential(2)} hint="how much gamma changes per point — how fast the gamma risk grows as price moves" />
+            {p.position && <Metric label="per set: delta / gamma (lots)" value={`${num(p.position.delta, 2)} / ${num(p.position.gamma, 3)}`}
+              hint="the units the Greeks rules use: delta in lots of the underlying (1 = one lot of the future), gamma = delta change for a 1% move" />}
+          </div>
+          {(p.entry_rules ?? []).length > 0 && (
+            <div className="meta" style={{ marginTop: 6 }} data-testid="payoff-entry-rules">
+              Entry rules at this spot: {p.entry_rules!.map((r) => (
+                <span key={r.rule} className={r.ok ? "pnl-pos" : "pnl-neg"} style={{ marginRight: 10 }}>
+                  {r.ok ? "✓" : "✗"} {r.rule} <span className="meta">(now {r.value === null ? "n/a" : num(r.value, 3)})</span></span>))}
+            </div>
+          )}
           <ResponsiveContainer width="100%" height={260}>
             <LineChart data={p.curve} margin={{ top: 8, right: 16, left: 0, bottom: 0 }}>
               <CartesianGrid stroke="var(--border-soft)" />
@@ -1191,12 +1250,16 @@ function PayoffPanel({ spec, onSpan }: { spec: Spec; onSpan: () => void }) {
           <div className="algo-scroll" style={{ marginTop: 8 }}>
             <table data-testid="payoff-legs">
               <thead><tr><th>Leg</th><th>Side</th><th>Qty</th><th>Price</th><th title="per unit">Δ</th><th title="₹ per point, whole leg">pos Δ</th><th title="₹ per day">θ / day</th><th title="₹ per vol point">vega</th>
+                <th title="risk-neutral chance it expires in the money">P(ITM)</th><th title="leverage: % the premium moves for a 1% move of the underlying">λ</th>
+                <th title="this leg's own stop / target, as premium prices">SL / TG</th>
                 <th title="this contract bought on its own: its premium">if bought</th><th title="this contract written on its own: SPAN + exposure">if sold</th></tr></thead>
               <tbody>{p.legs.map((lg, i) => (
                 <tr key={i}><td>{lg.label}{lg.dte !== null ? <span className="meta"> · {num(lg.dte, 1)}d</span> : null}</td>
                   <td><span className={`badge ${lg.side === "BUY" ? "buy" : "sell"}`}>{lg.side}</span></td>
                   <td className="mono">{lg.qty}</td><td className="mono">{lg.price.toFixed(2)}</td><td className="mono">{lg.delta.toFixed(2)}</td>
                   <td className="mono">{lg.pos_delta.toFixed(1)}</td><td className={`mono ${pnlCls(lg.theta)}`}>{lg.theta.toFixed(0)}</td><td className="mono">{lg.vega.toFixed(0)}</td>
+                  <td className="mono">{lg.prob_itm_pct == null ? "—" : `${lg.prob_itm_pct.toFixed(0)}%`}</td><td className="mono">{lg.lambda == null ? "—" : lg.lambda.toFixed(1)}</td>
+                  <td className="mono">{lg.sl_px == null && lg.tg_px == null ? "—" : `${lg.sl_px == null ? "—" : lg.sl_px.toFixed(1)} / ${lg.tg_px == null ? "—" : lg.tg_px.toFixed(1)}`}</td>
                   <td className="mono">{lg.margin_if_bought === null ? "—" : inr(lg.margin_if_bought)}</td>
                   <td className="mono">{lg.margin_if_sold === null ? inr(lg.margin_alone) : inr(lg.margin_if_sold)}</td></tr>))}
               </tbody>
@@ -1367,6 +1430,66 @@ function TradeAnalytics({ r }: { r: BtResult }) {
   );
 }
 
+// Position rules: what each metric means (per set = the legs at their configured lots).
+export const RULE_METRICS: Record<string, [string, string]> = {
+  delta: ["delta (lots)", "net delta per set in lots of the underlying: 1 = like holding one lot of the future, − = bearish"],
+  abs_delta: ["|delta| (lots)", "how far the position is from delta-neutral, per set — the usual adjustment / exit trigger"],
+  gamma: ["gamma", "how much delta (lots) changes for a 1% move of the underlying, per set. Negative = a seller: moves hurt faster"],
+  theta: ["theta ₹/day", "₹ the position earns (+) or loses (−) per day from time decay, per set"],
+  vega: ["vega ₹/vol pt", "₹ per 1-point rise in implied volatility, per set"],
+  credit: ["credit ₹", "net premium per set: received (+) or paid (−). At entry = what the legs collect"],
+  pnl_pct: ["P&L % of premium", "P&L as % of the premium at entry: 50 = half the credit kept, −100 = lost as much as the credit"],
+  dte: ["days to expiry", "calendar days to the nearest open leg's expiry"],
+  iv: ["IV %", "average implied volatility of the open legs"],
+};
+
+function RulesEditor({ rules, onChange, kind }: { rules: Rule[]; onChange: (r: Rule[]) => void; kind: "entry" | "exit" }) {
+  const set = (i: number, p: Partial<Rule>) => onChange(rules.map((x, j) => (j === i ? { ...x, ...p } : x)));
+  return (
+    <div style={{ display: "grid", gap: 4 }} data-testid={`rules-${kind}`}>
+      <div className="meta">{kind === "entry" ? "Enter only if ALL of these hold (checked on the legs about to be opened)" : "Exit when ANY of these holds (checked on each candle's close)"}</div>
+      {rules.map((r, i) => (
+        <div key={i} className="algo-operand">
+          <select value={r.metric} title={RULE_METRICS[r.metric]?.[1]} onChange={(e) => set(i, { metric: e.target.value })}>
+            {Object.entries(RULE_METRICS).map(([k, [lab, hint]]) => <option key={k} value={k} title={hint}>{lab}</option>)}
+          </select>
+          <select value={r.op} onChange={(e) => set(i, { op: e.target.value })}>
+            {[">", "<", ">=", "<="].map((o) => <option key={o} value={o}>{o}</option>)}
+          </select>
+          <NumInput width={64} signed value={r.value} onChange={(n) => set(i, { value: n ?? 0 })} />
+          <button type="button" className="btn-sm danger" onClick={() => onChange(rules.filter((_, j) => j !== i))}>✕</button>
+        </div>
+      ))}
+      <div><button type="button" className="btn-sm" onClick={() => onChange([...rules, kind === "entry"
+        ? { metric: "abs_delta", op: "<=", value: 0.1 } : { metric: "abs_delta", op: ">", value: 0.35 }])}>+ {kind} rule</button></div>
+    </div>
+  );
+}
+
+/** A remembered on / off switch for this browser (falls back to `initial` when storage is unavailable). */
+function useFlag(key: string, initial: boolean): [boolean, (v: boolean) => void] {
+  const [v, setV] = useState(() => {
+    try { const x = localStorage.getItem(key); return x === null ? initial : x === "1"; } catch { return initial; }
+  });
+  return [v, (nv: boolean) => { setV(nv); try { localStorage.setItem(key, nv ? "1" : "0"); } catch { /* private mode */ } }];
+}
+
+/** Text an AI (or a file) gave us -> {name?, spec}. Accepts a ```json block, text around the JSON,
+ *  {name, spec} or a bare spec. Throws with a readable reason. */
+export function parseStrategyJson(text: string): { name?: string; spec: Partial<Spec> } {
+  let t = text.trim();
+  const fence = t.match(/```(?:json|jsonc)?\s*([\s\S]*?)```/i);
+  if (fence) t = fence[1].trim();
+  const a = t.indexOf("{"), b = t.lastIndexOf("}");
+  if (a < 0 || b <= a) throw new Error("no JSON object found — paste the {\"name\": …, \"spec\": {…}} the AI wrote");
+  let obj: unknown;
+  try { obj = JSON.parse(t.slice(a, b + 1)); } catch (e) { throw new Error(`not valid JSON: ${errMsg(e)}`); }
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) throw new Error("expected a JSON object");
+  const o = obj as { name?: unknown; spec?: unknown };
+  if (o.spec && typeof o.spec === "object") return { name: typeof o.name === "string" ? o.name : undefined, spec: o.spec as Partial<Spec> };
+  return { name: typeof o.name === "string" ? o.name : undefined, spec: obj as Partial<Spec> };
+}
+
 function Metric({ label, value, cls, hint }: { label: string; value: string; cls?: string; hint?: string }) {
   return (
     <div style={{ minWidth: 112 }} title={hint}>
@@ -1454,10 +1577,14 @@ function TradeChart({ chart }: { chart: BtResult["chart"] }) {
   return <div ref={ref} style={{ height: (chart.candles.some((k) => k[5]) ? 440 : 380) + extra * 75, width: "100%" }} />;
 }
 
-function tradesCsv(trades: BtTrade[]): string {
-  const head = ["symbol", "instrument", "side", "qty", "lots", "entry_time", "entry", "exit_time", "exit", "underlying_entry", "underlying_exit", "reason", "bars", "minutes", "mae_pct", "mfe_pct", "r_multiple", "gross", "charges", "net"];
+const legLine = (l: BtLeg) => `${l.side} ${l.qty} ${l.label}: ${l.entry} → ${l.exit}${l.reason ? ` (${l.reason})` : ""}`;
+
+export function tradesCsv(trades: BtTrade[]): string {
+  const head = ["symbol", "instrument", "side", "qty", "lots", "entry_time", "entry", "exit_time", "exit", "underlying_entry", "underlying_exit", "reason", "bars", "minutes", "mae_pct", "mfe_pct", "r_multiple", "gross", "charges", "net",
+    "entry_iv_pct", "entry_delta_lots", "entry_theta", "entry_vega", "entry_credit", "legs"];
   const iso = (t: number) => new Date((t + IST_S) * 1000).toISOString().replace("T", " ").slice(0, 16);
-  const rows = trades.map((t) => [t.symbol, t.instrument, t.side, t.qty, t.lots, iso(t.entry_t), t.entry, iso(t.exit_t), t.exit, t.u_entry, t.u_exit, t.reason, t.bars, t.minutes, t.mae_pct ?? "", t.mfe_pct ?? "", t.r ?? "", t.gross, t.charges, t.net]);
+  const rows = trades.map((t) => [t.symbol, t.instrument, t.side, t.qty, t.lots, iso(t.entry_t), t.entry, iso(t.exit_t), t.exit, t.u_entry, t.u_exit, t.reason, t.bars, t.minutes, t.mae_pct ?? "", t.mfe_pct ?? "", t.r ?? "", t.gross, t.charges, t.net,
+    t.greeks?.iv ?? "", t.greeks?.delta ?? "", t.greeks?.theta ?? "", t.greeks?.vega ?? "", t.greeks?.credit ?? "", t.legs.map(legLine).join(" | ")]);
   return [head, ...rows].map((r) => r.map((x) => `"${String(x).replace(/"/g, '""')}"`).join(",")).join("\n");
 }
 
@@ -1475,6 +1602,7 @@ function Results({ r }: { r: BtResult }) {
   const [showAll, setShowAll] = useState(false);
   const trades = useMemo(() => [...r.trades].reverse().slice(0, showAll ? 3000 : 200), [r.trades, showAll]);
   const multiLeg = r.trades.some((t) => t.legs.length > 1);
+  const withGreeks = r.trades.some((t) => t.greeks);
   const skipped = Object.entries(s.skipped ?? {}).filter(([, v]) => v > 0);
   return (
     <>
@@ -1644,15 +1772,20 @@ function Results({ r }: { r: BtResult }) {
         </h3>
         <div style={{ maxHeight: 420, overflow: "auto" }}>
           <table>
-            <thead><tr><th>Instrument</th><th>Signal</th><th>Qty</th><th>Entry (IST)</th><th>Entry</th><th>Exit (IST)</th><th>Exit</th><th>Reason</th><th>Bars</th><th title="max adverse / favourable excursion, % of entry">MAE / MFE %</th><th title="net / initial stop risk">R</th><th>Charges</th><th>Net</th></tr></thead>
+            <thead><tr><th>Instrument</th><th>Signal</th><th>Qty</th><th>Entry (IST)</th><th>Entry</th><th>Exit (IST)</th><th>Exit</th><th>Reason</th><th>Bars</th><th title="max adverse / favourable excursion, % of entry">MAE / MFE %</th><th title="net / initial stop risk">R</th>
+              {withGreeks && <><th title="IV the legs were priced at, at entry">IV%</th><th title="net delta per set at entry, in lots">Δ</th><th title="₹ per day per set at entry">Θ/day</th><th title="net premium per set at entry: + received, − paid">credit</th></>}
+              <th>Charges</th><th>Net</th></tr></thead>
             <tbody>{trades.map((t, i) => (
-              <tr key={i} title={t.legs.map((l) => `${l.side} ${l.qty} ${l.label}: ${l.entry} → ${l.exit}`).join("\n")}>
+              <tr key={i} title={t.legs.map(legLine).join("\n")}>
                 <td>{t.instrument.length > 46 ? `${t.legs.length} legs · ${shortSym(t.symbol)}` : t.instrument.replace(/^NSE:/, "")}</td>
                 <td><span className={`badge ${t.side === "BUY" ? "buy" : "sell"}`}>{t.side === "BUY" ? "LONG" : "SHORT"}</span></td>
                 <td className="mono">{t.qty}</td><td className="mono">{ist(t.entry_t)}</td><td className="mono">{t.entry.toFixed(2)}</td>
                 <td className="mono">{ist(t.exit_t)}</td><td className="mono">{t.exit.toFixed(2)}</td><td>{t.reason}</td>
                 <td className="mono">{t.bars}</td><td className="mono">{num(t.mae_pct, 2)} / {num(t.mfe_pct, 2)}</td>
-                <td className={`mono ${pnlCls(t.r)}`}>{num(t.r, 2)}</td><td className="mono">{t.charges.toFixed(0)}</td><td className={`mono ${pnlCls(t.net)}`}>{t.net.toFixed(0)}</td></tr>))}
+                <td className={`mono ${pnlCls(t.r)}`}>{num(t.r, 2)}</td>
+                {withGreeks && <><td className="mono">{num(t.greeks?.iv, 1)}</td><td className="mono">{num(t.greeks?.delta, 2)}</td>
+                  <td className={`mono ${pnlCls(t.greeks?.theta)}`}>{num(t.greeks?.theta, 0)}</td><td className="mono">{num(t.greeks?.credit, 0)}</td></>}
+                <td className="mono">{t.charges.toFixed(0)}</td><td className={`mono ${pnlCls(t.net)}`}>{t.net.toFixed(0)}</td></tr>))}
             </tbody>
           </table>
         </div>
@@ -2267,6 +2400,8 @@ export default function Algo() {
   const [baseline, setBaseline] = useState<string | null>(null);
   const [btKey, setBtKey] = useState<string | null>(null);   // the inputs the shown backtest ran with
   const fileRef = useRef<HTMLInputElement>(null);
+  const [presetsOpen, setPresetsOpen] = useFlag("algo.presets.open", false);
+  const [paste, setPaste] = useState<{ text: string; error: string | null; parsed: { name?: string; spec: Partial<Spec> } | null } | null>(null);
 
   // Restore the draft (or start from the server defaults + the first template).
   useEffect(() => {
@@ -2343,6 +2478,23 @@ export default function Algo() {
   const dirty = baseline !== draftKey(spec, name);
   const stale = !!bt.data && btKey !== JSON.stringify({ spec, range, oosPct });
   const okToReplace = () => !dirty || window.confirm("The builder has unsaved changes. Replace them?");
+  // Check an imported strategy with the server (the same checks a save runs) and load the
+  // normalized result. Throws the server's reason when it isn't valid (strict); false = the
+  // operator kept their unsaved builder instead.
+  const importStrategy = async (p: { name?: string; spec: Partial<Spec> }, fallbackName: string, strict = false): Promise<boolean> => {
+    let checked: Spec | null = null;
+    try {
+      checked = (await api.post<{ ok: boolean; spec: Spec }>("/api/algo/validate", { spec: p.spec })).spec;
+    } catch (e) {
+      if (strict) throw e;
+      setMsg(`Imported, but it needs fixing before it can run: ${errMsg(e)}`);
+    }
+    if (!okToReplace()) return false;
+    load(withDefaults(c.defaults, checked ?? p.spec), p.name ?? fallbackName, null, null, false);
+    bt.reset();
+    if (checked) setMsg(`Imported “${p.name ?? fallbackName}” — checked, ready to backtest. Save it to keep it.`);
+    return true;
+  };
   // Put a strategy into the builder; `clean` = it matches what is saved (or is a fresh template).
   const load = (next: Spec, nm: string, ed: number | null, vw: number | null, clean = true) => {
     setSpec(next); setName(nm); setEditing(ed); setViewing(vw); setBaseline(clean ? draftKey(next, nm) : null);
@@ -2359,6 +2511,19 @@ export default function Algo() {
   const fno = inst.type !== "equity";
   const multi = inst.type === "option" && ((showLong && inst.legs_long.filter((l) => l.lots).length > 1) || (showShort && inst.legs_short.filter((l) => l.lots).length > 1));
   const sizingModes = c.sizing.filter((m) => (fno ? m !== "qty" : m !== "lots"));
+  const opt = inst.type === "option";
+  const legStops = opt && [...(showLong ? inst.legs_long : []), ...(showShort ? inst.legs_short : [])].some((l) => l.sl_pct || l.tg_pct);
+  const rules = spec.position_rules ?? {};
+  const setRules = (k: "entry" | "exit", r: Rule[]) => {
+    const next = { ...rules, [k]: r };
+    if (!next.entry?.length) delete next.entry;
+    if (!next.exit?.length) delete next.exit;
+    upd({ position_rules: next.entry || next.exit ? next : undefined });
+  };
+  const setMtmPct = (k: "stop_pct" | "target_pct", v: number | null) => {
+    const { [k]: _old, ...rest } = spec.mtm;
+    upd({ mtm: v && v > 0 ? { ...rest, [k]: v } : rest });
+  };
   const SIZE_LABEL: Record<string, string> = {
     qty: "fixed shares", lots: "fixed lots", amount: "₹ capital per trade", pct_equity: "% of equity per trade",
     risk: "₹ risk per trade (needs stop)", risk_pct: "% of equity at risk (needs stop)",
@@ -2401,6 +2566,15 @@ export default function Algo() {
           bt.reset(); setTab("builder");
           setMsg("New algo — pick symbols, add entry conditions, then backtest and save.");
         }}>＋ New algo</button>
+        <button type="button" className="btn-sm" style={{ marginLeft: 8 }} data-testid="algo-guide"
+          title="everything the builder and backtest can do, with the strategy JSON and worked examples — give it to an AI, describe your idea, then paste its JSON here (📋 paste JSON)"
+          onClick={async () => {
+            try {
+              const res = await fetch("/api/algo/guide");
+              if (!res.ok) throw new Error(`HTTP ${res.status}`);
+              download("algo-lab-guide.txt", await res.text(), "text/plain");
+            } catch (e) { setMsg(`Guide download failed: ${errMsg(e)}`); }
+          }}>⬇ Algo guide (for AI)</button>
       </div>
       <div className="tabs">
         {(["builder", "optimize", "compare", "automations", "data"] as Tab[]).map((t) => (
@@ -2435,19 +2609,38 @@ export default function Algo() {
               <span style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
                 <button type="button" className="btn-sm" onClick={() => download(`${name.replace(/[^\w-]+/g, "_")}.json`, JSON.stringify({ name, spec: tidy(spec) }, null, 2))}>⬇ export</button>
                 <button type="button" className="btn-sm" onClick={() => fileRef.current?.click()}>⬆ import</button>
+                <button type="button" className="btn-sm" data-testid="paste-json" title="paste the strategy JSON an AI wrote from the Algo guide"
+                  onClick={() => setPaste(paste ? null : { text: "", error: null, parsed: null })}>📋 paste JSON</button>
                 <input ref={fileRef} type="file" accept="application/json,.json" style={{ display: "none" }} onChange={async (e) => {
                   const f = e.target.files?.[0];
                   e.target.value = "";
                   if (!f) return;
                   try {
-                    const j = JSON.parse(await f.text()) as { name?: string; spec?: Partial<Spec> } & Partial<Spec>;
-                    if (!okToReplace()) return;
-                    load(withDefaults(c.defaults, j.spec ?? j), j.name ?? f.name.replace(/\.json$/, ""), null, null, false);
-                    bt.reset(); setMsg("Imported — save it to keep it.");
+                    await importStrategy(parseStrategyJson(await f.text()), f.name.replace(/\.json$/, ""));
                   } catch (err) { setMsg(`Import failed: ${errMsg(err)}`); }
                 }} />
               </span>
             </h3>
+            {paste && (
+              <div className="algo-paste" data-testid="paste-panel" style={{ display: "grid", gap: 6, marginBottom: 10 }}>
+                <span className="meta">Paste the JSON an AI wrote from the <b>Algo guide</b> (⬇ beside ＋ New algo) — a ```json block or text around it is fine.</span>
+                <textarea rows={8} value={paste.text} placeholder='{"name": "…", "spec": {"symbols": ["NSE:NIFTY50-INDEX"], …}}'
+                  style={{ fontFamily: "var(--mono, monospace)", fontSize: 12, width: "100%" }}
+                  onChange={(e) => setPaste({ text: e.target.value, error: null, parsed: null })} />
+                <div className="algo-operand" style={{ gap: 6 }}>
+                  <button type="button" className="primary" disabled={!paste.text.trim()} onClick={async () => {
+                    let parsed;
+                    try { parsed = parseStrategyJson(paste.text); } catch (e) { setPaste({ ...paste, error: errMsg(e), parsed: null }); return; }
+                    try { if (await importStrategy(parsed, "Imported strategy", true)) setPaste(null); }
+                    catch (e) { setPaste({ ...paste, error: errMsg(e), parsed }); }
+                  }}>Import</button>
+                  {paste.error && paste.parsed && <button type="button" className="btn-sm" title="load it as it is and fix it in the builder"
+                    onClick={() => { const p = paste.parsed!; if (!okToReplace()) return; load(withDefaults(c.defaults, p.spec), p.name ?? "Imported strategy", null, null, false); bt.reset(); setPaste(null); setMsg("Loaded as written — fix what the check flagged, then backtest."); }}>load anyway</button>}
+                  <button type="button" className="btn-sm ghost" onClick={() => setPaste(null)}>cancel</button>
+                </div>
+                {paste.error && <div className="pnl-neg meta" data-testid="paste-error">✗ {paste.error}{paste.parsed ? " — paste this message back to the AI and ask it to fix the JSON." : ""}</div>}
+              </div>
+            )}
             <div className="algo-fields">
               <label className="algo-field"><span className="meta">name</span><input value={name} onChange={(e) => setName(e.target.value)} /></label>
               <label className="algo-field"><span className="meta">template</span>
@@ -2547,8 +2740,10 @@ export default function Algo() {
             {inst.type === "option" && (
               <>
                 <div className="algo-operand" style={{ gap: 8, marginTop: 8 }}>
-                  <span className="meta">preset</span>
-                  {LEG_PRESETS.map((p) => (
+                  <button type="button" className="btn-sm ghost" data-testid="presets-toggle" aria-expanded={presetsOpen}
+                    title={presetsOpen ? "hide the ready-made leg setups" : "show ready-made leg setups (straddles, condors, spreads …)"}
+                    onClick={() => setPresetsOpen(!presetsOpen)}>{presetsOpen ? "▾" : "▸"} presets ({LEG_PRESETS.length})</button>
+                  {presetsOpen && LEG_PRESETS.map((p) => (
                     <button key={p.name} type="button" className="btn-sm ghost" onClick={() => updInst({
                       legs_long: clone(p.long), legs_short: clone(p.short),
                       levels_on: p.long.length > 1 ? "underlying" : inst.levels_on,
@@ -2559,6 +2754,21 @@ export default function Algo() {
                   {showLong && <LegsEditor title="On a LONG / bullish signal" legs={inst.legs_long} onChange={(legs_long) => updInst({ legs_long })} />}
                   {showShort && <LegsEditor title="On a SHORT / bearish signal" legs={inst.legs_short} onChange={(legs_short) => updInst({ legs_short })} />}
                 </div>
+                {legStops && (
+                  <div className="algo-operand" style={{ gap: 8, marginTop: 8 }}>
+                    <label className="meta" title="what the other legs do when one leg's own stop (SL %) hits; a leg's target only ever closes that leg" data-testid="on-leg-stop">when a leg's stop hits
+                      <select value={inst.on_leg_stop ?? "leg"} onChange={(e) => {
+                        const { on_leg_stop: _old, ...rest } = inst;
+                        upd({ instrument: e.target.value === "leg" ? rest : { ...rest, on_leg_stop: e.target.value as Instrument["on_leg_stop"] } });
+                      }}>
+                        <option value="leg">only that leg exits</option>
+                        <option value="cost">move the other legs' stops to cost</option>
+                        <option value="all">exit every leg</option>
+                      </select>
+                    </label>
+                    {(spec.scale_out ?? []).length > 0 && <span className="meta pnl-neg">per-leg stops can't be combined with scale-out — remove one</span>}
+                  </div>
+                )}
                 <div className="algo-operand" style={{ gap: 8, marginTop: 8 }}>
                   <label className="meta" title="backtests only — live trades use real premiums">backtest IV
                     <select value={inst.iv.source} onChange={(e) => updInst({ iv: { ...inst.iv, source: e.target.value } })}>
@@ -2629,7 +2839,22 @@ export default function Algo() {
               <Rupee label="target" value={spec.mtm.target} onChange={(v) => upd({ mtm: { ...spec.mtm, target: v } })} hint="exit when the position's P&L reaches +₹X" />
               <Rupee label="trail after" value={spec.mtm.trail_start} onChange={(v) => upd({ mtm: { ...spec.mtm, trail_start: v } })} hint="once P&L has reached ₹X…" />
               <Rupee label="by" value={spec.mtm.trail_gap} onChange={(v) => upd({ mtm: { ...spec.mtm, trail_gap: v } })} hint="…exit if it gives back ₹Y from its peak" />
+              {opt && (
+                <>
+                  <label className="meta" data-testid="mtm-stop-pct" title="exit when the loss reaches this % of the net premium at entry (100 = lost as much as the credit). With a ₹ stop too, the tighter applies">stop <NumInput width={44} allowEmpty placeholder="off" value={spec.mtm.stop_pct ?? null} onChange={(v) => setMtmPct("stop_pct", v)} />% of premium</label>
+                  <label className="meta" data-testid="mtm-target-pct" title="exit when the profit reaches this % of the net premium at entry (50 = half the credit kept)">target <NumInput width={44} allowEmpty placeholder="off" value={spec.mtm.target_pct ?? null} onChange={(v) => setMtmPct("target_pct", v)} />% of premium</label>
+                </>
+              )}
             </div>
+            {opt && (
+              <div style={{ marginTop: 10 }}>
+                <div className="meta" style={{ color: "var(--text)", marginBottom: 4 }}>Option Greeks & premium rules <span className="meta">— per set; live uses implied volatility from real prices</span></div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(340px, 1fr))", gap: 12 }}>
+                  <RulesEditor kind="entry" rules={rules.entry ?? []} onChange={(r) => setRules("entry", r)} />
+                  <RulesEditor kind="exit" rules={rules.exit ?? []} onChange={(r) => setRules("exit", r)} />
+                </div>
+              </div>
+            )}
             <div className="algo-operand" style={{ gap: 14, marginTop: 8 }}>
               <span className="meta" style={{ color: "var(--text)" }}>Per day:</span>
               <Rupee label="max loss" value={spec.daily.max_loss} onChange={(v) => upd({ daily: { ...spec.daily, max_loss: v } })} hint="realised + open P&L for the day; hit it and everything is flattened, no more entries today" />
