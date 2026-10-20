@@ -947,7 +947,7 @@ def test_runner_paper_scale_out_then_target(monkeypatch, isolated_db):
     t_close = DAY0 + 4 * 300 + 4
     asyncio.run(r.tick(t_close))
     with dbs.SessionLocal() as db:
-        assert db.query(AlgoTrade).one().scale == {"left": 10, "levels": [[108.5, 5]], "done": 0}
+        assert db.query(AlgoTrade).one().scale == {"left": 10, "sets": 10, "levels": [[108.5, 5]], "done": 0}
     ltp["px"] = 109.0
     asyncio.run(r.tick(t_close + 5))
     with dbs.SessionLocal() as db:

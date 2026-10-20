@@ -149,11 +149,17 @@ def _update(trade_id: int, **fields: Any) -> None:
             db.commit()
 
 
+def _fresh(trade_id: int) -> Optional[dict[str, Any]]:
+    with db_session.SessionLocal() as db:
+        t = db.get(AlgoTrade, trade_id)
+        return _row(t) if t is not None else None
+
+
 def _split(trade_id: int, closed: Optional[dict[str, Any]], **open_fields: Any) -> None:
     """A scale-out in one commit: the closed part as its own row, the open row shrunk."""
     with db_session.SessionLocal() as db:
         t = db.get(AlgoTrade, trade_id)
-        if t is None:
+        if t is None or t.status != "open":
             return
         if closed:
             db.add(AlgoTrade(**closed))
@@ -415,6 +421,7 @@ class AlgoRunner:
         # within a few bars anyway); persist them if that ever costs a trade.
         self._armed: dict[tuple[int, str], dict[str, Any]] = {}
         self._last_tc: dict[tuple[int, str], int] = {}   # volume/turnover: last candle close acted on
+        self._busy: set[int] = set()     # trades with an exit / scale-out in flight
 
     def event(self, level: str, msg: str, **kw: Any) -> None:
         self.events.appendleft({"t": time.time(), "level": level, "msg": msg, **kw})
@@ -585,8 +592,20 @@ class AlgoRunner:
     async def _exit(self, t: dict, prices: dict[str, float], reason: str, now: float) -> bool:
         """Close every remaining leg. Partial progress (a leg that filled) is
         saved, so a retry only touches what is still open."""
-        if self._retry_at.get(t["id"], 0) > now:
+        if self._retry_at.get(t["id"], 0) > now or t["id"] in self._busy:
             return False
+        self._busy.add(t["id"])
+        try:
+            fresh = await asyncio.to_thread(_fresh, t["id"])
+            if fresh is not None and fresh["status"] != "open":
+                return True                             # already closed (e.g. by a concurrent exit)
+            if fresh is not None:
+                t.update(fresh)                         # the DB's legs: a scale-out may have shrunk them
+            return await self._exit_legs(t, prices, reason, now)
+        finally:
+            self._busy.discard(t["id"])
+
+    async def _exit_legs(self, t: dict, prices: dict[str, float], reason: str, now: float) -> bool:
         legs = t["legs"]
         todo = sorted([lg for lg in legs if lg.get("exit") is None], key=lambda lg: lg["act"])  # written legs first
         for lg in todo:
@@ -645,42 +664,67 @@ class AlgoRunner:
     async def _scale_out(self, t: dict, prices: dict[str, float], now: float) -> None:
         """Take the next scale-out level once the reference price reaches it:
         close that many sets of every leg, book them as their own closed row
-        and shrink the open one. One attempt per level — a leg whose order
-        fails stays whole in the open position (never re-sent, so never closed
-        twice); the final exit takes whatever is left."""
+        and shrink the open one.
+
+        Safety: the level is committed as taken BEFORE any order, so a crash
+        or error later can never re-send it; written legs go first and the
+        first leg that can't be reduced stops the step — a hedge is never sold
+        while the short it protects is still on. What isn't reduced stays in
+        the open position for its final exit. A per-trade lock keeps a manual
+        square-off (or any exit) from running in the middle of it."""
         sc = t["scale"]
         lvl, n = sc["levels"][0]
         sign = t["ref_sign"] or (1 if t["side"] == "BUY" else -1)
         ref_px = prices.get((t["symbol"] if t["ref"] == "u" else t["legs"][0]["symbol"]).upper())
-        if ref_px is None or sign * (ref_px - lvl) < 0 or self._retry_at.get(t["id"], 0) > now:
+        if ref_px is None or sign * (ref_px - lvl) < 0 or self._retry_at.get(t["id"], 0) > now \
+                or t["id"] in self._busy:
             return
         k, left = sc["done"] + 1, sc["left"]
         reason = f"SCALE_OUT_{k}"
         if n >= left:                                   # the last sets: an ordinary full exit
             await self._exit(t, prices, reason, now)
             return
+        self._busy.add(t["id"])
+        try:
+            await self._scale_part(t, prices, now, reason, n, left, k)
+        finally:
+            self._busy.discard(t["id"])
+
+    async def _scale_part(self, t: dict, prices: dict[str, float], now: float, reason: str,
+                          n: int, left: int, k: int) -> None:
+        fresh = await asyncio.to_thread(_fresh, t["id"])
+        if fresh is None or fresh["status"] != "open" or fresh["scale"] != t["scale"]:
+            return                                      # closed, or this level was taken meanwhile
+        t.update(fresh)
+        sc = t["scale"]
+        t["scale"] = {**sc, "left": left - n, "levels": sc["levels"][1:], "done": k}
+        await asyncio.to_thread(_update, t["id"], scale=t["scale"])        # taken: never re-sent
         legs = t["legs"]
+        sets0 = sc.get("sets") or left
+        # Whole sets of the ENTRY size, so a leg left over-sized by an earlier
+        # failed step still closes in whole lots.
+        q_of = lambda lg: min(lg["qty"], (lg.get("qty0") or lg["qty"]) // sets0 * n)  # noqa: E731
+        todo = [j for j in sorted(range(len(legs)), key=lambda j: legs[j]["act"])   # written legs first
+                if legs[j].get("exit") is None and q_of(legs[j]) > 0]
         done: dict[int, dict] = {}
-        want = 0
-        for j in sorted(range(len(legs)), key=lambda j: legs[j]["act"]):     # written legs first
+        for j in todo:
             lg = legs[j]
-            q = lg["qty"] * n // left
             px = prices.get(lg["symbol"].upper())
-            if lg.get("exit") is not None or q <= 0:
-                continue
-            want += 1
-            r = await self._close_leg(t, lg, q, px, reason) if px is not None else None
-            if r is None or not r["qty"]:
-                continue
+            r = await self._close_leg(t, lg, q_of(lg), px, reason) if px is not None else None
+            if r is None:
+                break                                   # stop: never reduce a hedge past its short
+            if not r["qty"]:
+                continue                                # the broker no longer holds it
+            lg.setdefault("qty0", lg["qty"])
             lg["qty"] -= r["qty"]
-            done[j] = {**{x: lg[x] for x in ("symbol", "kind", "act", "entry", "label", "K", "exp", "product") if x in lg},
+            done[j] = {**{x: lg[x] for x in ("symbol", "kind", "act", "entry", "label", "K", "exp", "product", "qty0")
+                          if x in lg},
                        "qty": r["qty"], "exit": r["px"], **({"exit_order_id": r["oid"]} if r["oid"] else {})}
         part = [done[j] for j in sorted(done)]
-        t["scale"] = {"left": left - n, "levels": sc["levels"][1:], "done": k}
         closed, gross, ch = None, 0.0, 0.0
         if part:
             for p in part:
-                g, c = engine.leg_pnl(p["act"], p["qty"], p["entry"], p["exit"], p["kind"], True)
+                g, c = engine.leg_pnl(p["act"], p["qty"], p["entry"], p["exit"], p["kind"], True, p.get("qty0"))
                 gross, ch = gross + g, ch + c
             closed = dict(
                 strategy_id=t["strategy_id"], symbol=t["symbol"], side=t["side"], quantity=part[0]["qty"],
@@ -692,21 +736,23 @@ class AlgoRunner:
                 entry_order_id=t.get("entry_order_id"), note=f"{PARTIAL_NOTE}{t['id']}",
                 exit_order_id=",".join(str(p["exit_order_id"]) for p in part if p.get("exit_order_id"))[:64] or None)
             t["margin"] = round((t["margin"] or 0) * (left - n) / left, 2)
-        await asyncio.to_thread(_split, t["id"], closed, legs=legs, quantity=legs[0]["qty"], scale=t["scale"],
-                                margin=t["margin"])
+            if t.get("mtm_peak") is not None:           # the MTM trail follows what is still open
+                t["mtm_peak"] = t["mtm_peak"] * (left - n) / left
+        await asyncio.to_thread(_split, t["id"], closed, legs=legs, quantity=legs[0]["qty"],
+                                margin=t["margin"], mtm_peak=t.get("mtm_peak"))
         if part:
             self.event("exit", f"{reason} {t.get('instrument') or t['symbol']}: {n} of {left} set(s) closed, "
                                f"net ₹{gross - ch:.2f}", trade_id=t["id"], strategy_id=t["strategy_id"])
             _notify_exit({"symbol": t.get("instrument") or t["symbol"], "reason": reason, "quantity": part[0]["qty"],
                           "entry": part[0]["entry"], "exit": part[0]["exit"], "pnl": round(gross - ch, 2)})
-        if len(part) < want:
-            self.event("error", f"{reason} {t['symbol']}: {want - len(part)} leg(s) not reduced — they stay in the "
-                                "open position for its final exit", trade_id=t["id"], strategy_id=t["strategy_id"])
+        if len(part) < len(todo):
+            self.event("error", f"{reason} {t['symbol']}: {len(todo) - len(part)} leg(s) not reduced — they stay in "
+                                "the open position for its final exit", trade_id=t["id"], strategy_id=t["strategy_id"])
 
     async def _book(self, t: dict, reason: str, now: float) -> None:
         gross = ch = 0.0
         for lg in t["legs"]:
-            g, c = engine.leg_pnl(lg["act"], lg["qty"], lg["entry"], lg["exit"], lg["kind"], True)
+            g, c = engine.leg_pnl(lg["act"], lg["qty"], lg["entry"], lg["exit"], lg["kind"], True, lg.get("qty0"))
             gross, ch = gross + g, ch + c
         if all(lg.get("external") for lg in t["legs"]) and reason not in ("STALE_SESSION",):
             reason = "CLOSED_EXTERNAL"
@@ -892,7 +938,7 @@ class AlgoRunner:
                                 f"(needs ₹{per_set_margin:,.0f} per set)", strategy_id=s["id"])
             return
         for lg in legs:
-            lg["qty"] = lg["per_set"] * sets
+            lg["qty"] = lg["qty0"] = lg["per_set"] * sets
             lg["entry"] = lg["price"]
         order_ids: list[str] = []
         if s["mode"] == "live":
@@ -951,7 +997,7 @@ class AlgoRunner:
             trail_dist=lv["trd"], trail_activate=lv["tra"], breakeven=lv["be"], best_price=ref_entry,
             legs=_clean(legs), ref=ref, ref_sign=rsign, margin=round(per_set_margin * sets, 2),
             instrument=label, u_entry=u, entry_order_id=",".join(order_ids)[:64] or None,
-            version=s.get("version"), scale={"left": sets, "levels": plan, "done": 0} if plan else None)
+            version=s.get("version"), scale={"left": sets, "sets": sets, "levels": plan, "done": 0} if plan else None)
         self.event("entry", f"{s['name']} v{s.get('version', 1)}: {side} → {label} x{sets} set(s) ({s['mode']})",
                    trade_id=tid, strategy_id=s["id"])
         _notify_entry({"side": side, "symbol": label, "quantity": legs[0]["qty"], "entry": round(legs[0]["entry"], 2),
@@ -978,5 +1024,5 @@ class AlgoRunner:
 
 
 def _clean(legs: list[dict]) -> list[dict]:
-    keep = ("symbol", "kind", "act", "qty", "entry", "label", "K", "exp", "order_id", "product")
+    keep = ("symbol", "kind", "act", "qty", "qty0", "entry", "label", "K", "exp", "order_id", "product")
     return [{k: lg[k] for k in keep if k in lg} for lg in legs]

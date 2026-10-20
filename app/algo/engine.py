@@ -562,10 +562,23 @@ def charges(buy_value: float, sell_value: float, segment: str = "eq") -> float:
     return round(brokerage + stt + exch + sebi + 0.18 * (brokerage + exch + sebi) + stamp, 2)
 
 
-def leg_pnl(act: int, qty: int, entry: float, exit_: float, kind: str, with_charges: bool) -> tuple[float, float]:
+def _brokerage(value: float, segment: str) -> float:
+    if not value:
+        return 0.0
+    return 20.0 if segment == "opt" else min(20.0, 0.0003 * value)
+
+
+def leg_pnl(act: int, qty: int, entry: float, exit_: float, kind: str, with_charges: bool,
+            qty0: Optional[int] = None) -> tuple[float, float]:
+    """`qty0` = the leg's size at entry when this is one part of a scaled-out
+    position: the entry was ONE order, so each part carries its pro-rata share
+    of that order's brokerage instead of a whole order's."""
     gross = (exit_ - entry) * qty * act
     buy, sell = (entry, exit_) if act > 0 else (exit_, entry)
-    ch = charges(buy * qty, sell * qty, SEGMENT.get(kind, "eq")) if with_charges else 0.0
+    seg = SEGMENT.get(kind, "eq")
+    ch = charges(buy * qty, sell * qty, seg) if with_charges else 0.0
+    if with_charges and qty0 and qty0 != qty:
+        ch = round(ch + 1.18 * (_brokerage(entry * qty0, seg) * qty / qty0 - _brokerage(entry * qty, seg)), 2)
     return gross, ch
 
 
@@ -775,7 +788,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
             px = _leg_px(l, u, t, iv)
             if slipped:
                 px = px * (1 - slip) if l["act"] > 0 else px * (1 + slip)
-            g, ch = leg_pnl(l["act"], q, l["entry"], px, l["kind"], with_ch)
+            g, ch = leg_pnl(l["act"], q, l["entry"], px, l["kind"], with_ch, l["qty0"])
             gross, chg = gross + g, chg + ch
             legs_out.append({"label": l["label"], "side": "BUY" if l["act"] > 0 else "SELL", "qty": q,
                              "entry": round(l["entry"], 2), "exit": round(px, 2)})
@@ -808,6 +821,8 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         day_realized += net
         used_margin -= margin
         if part:
+            if pos["peak"] is not None:            # the MTM trail follows what is still open
+                pos["peak"] *= (pos["sets"] - n) / pos["sets"]
             pos["sets"] -= n
             pos["margin"] -= margin
             if risk:
@@ -881,7 +896,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         if sets < 1:
             return "no_capital"
         for l in legs:
-            l["qty"] = l["per_set"] * sets
+            l["qty"] = l["qty0"] = l["per_set"] * sets
         margin = per_set_margin * sets
         s_["pos"] = {"side": side, "legs": legs, "ref": ref, "sign": rsign, "ref_entry": ref_entry,
                      "sl": lv["sl"], "tg": lv["tg"], "trd": lv["trd"], "tra": lv["tra"], "be": lv["be"],
@@ -922,6 +937,8 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                 return close(sym, _solve(f, stop, o, u_adv), t, why, i)
         while pos["so"] and fav_ok:                 # scale-out levels, nearest first, filled like a target
             lvl, n = pos["so"][0]
+            if pos["tg"] is not None and sgn * (lvl - pos["tg"]) >= 0:
+                break                               # at / past the target: the target takes it all (as live)
             u_fav = max((h, l), key=lambda u: sgn * f(u))
             if later and sgn * (f(o) - lvl) >= 0:
                 u_x = o
@@ -1073,7 +1090,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
             | {"bars": n_live, "buy_hold_pct": round(hold, 2) if hold is not None else None}
     out = stats(trades, pf["capital"])
     out["skipped"] = skipped
-    out["exposure_pct"] = round(sum(x["bars"] + 1 for x in trades) / live_bars * 100, 2) if live_bars else 0.0
+    out["exposure_pct"] = round(sum(x["bars"] + 1 for x in positions(trades)) / live_bars * 100, 2) if live_bars else 0.0
     out["buy_hold_pct"] = round(sum(holds) / len(holds), 2) if holds else None
     if oos_from:
         out["in_sample"] = summary(stats([x for x in trades if x["entry_t"] < oos_from], pf["capital"]))
@@ -1084,15 +1101,40 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
 
 # ---- stats -----------------------------------------------------------------
 
+def positions(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Scale-out parts merged back into the one position they came from (same
+    symbol + entry time — a symbol holds one position at a time): per-trade
+    metrics count positions, not exit rows. R is lot-weighted (each part's
+    risk is its share of the position's), excursions are the position's."""
+    by: dict[tuple, list[dict]] = {}
+    for x in trades:
+        by.setdefault((x.get("symbol"), x["entry_t"]), []).append(x)
+    out = []
+    for parts in by.values():
+        if len(parts) == 1 or not any(str(x.get("reason", "")).startswith("SCALE_OUT") for x in parts):
+            out.extend(parts)
+            continue
+        parts.sort(key=lambda x: x["exit_t"])
+        lots = sum(x.get("lots") or 1 for x in parts)
+        rs = [(x["r"], x.get("lots") or 1) for x in parts if x.get("r") is not None]
+        m = {**parts[-1], **{k: round(sum(x[k] for x in parts), 2) for k in ("net", "gross", "charges")},
+             "qty": sum(x.get("qty") or 0 for x in parts), "lots": lots,
+             "r": round(sum(r * w for r, w in rs) / sum(w for _, w in rs), 2) if len(rs) == len(parts) else None,
+             "reason": "+".join(x["reason"] for x in parts)}
+        out.append(m)
+    return sorted(out, key=lambda x: x["exit_t"])
+
+
 def stats(trades: list[dict[str, Any]], capital: float) -> dict[str, Any]:
-    trades = sorted(trades, key=lambda x: x["exit_t"])
+    rows = sorted(trades, key=lambda x: x["exit_t"])     # exit rows: P&L lands when each part closes
+    trades = positions(rows)                             # positions: what per-trade metrics count
     n = len(trades)
     nets = [x["net"] for x in trades]
     wins = [v for v in nets if v > 0]
     losses = [v for v in nets if v <= 0]
     eq, peak, max_dd, max_dd_pct = capital, capital, 0.0, 0.0
     curve = []
-    for x in trades:
+    for x in rows:
         eq += x["net"]
         peak = max(peak, eq)
         max_dd = max(max_dd, peak - eq)
@@ -1101,7 +1143,7 @@ def stats(trades: list[dict[str, Any]], capital: float) -> dict[str, Any]:
     daily: dict[int, float] = {}
     monthly: dict[str, float] = {}
     weekday: dict[int, list[float]] = {}
-    for x in trades:
+    for x in rows:
         k = (x["exit_t"] + IST) // 86400
         daily[k] = daily.get(k, 0.0) + x["net"]
         ym = _ym(k)
@@ -1219,7 +1261,7 @@ def monte_carlo(trades: list[dict[str, Any]], capital: float, runs: int = 1000, 
     """
     import random
 
-    nets = [x["net"] for x in trades]
+    nets = [x["net"] for x in positions(trades)]
     n = len(nets)
     if n < 10:
         return None
@@ -1295,8 +1337,11 @@ def optimize(spec: dict, data: dict[str, dict], grid: list[dict[str, Any]], metr
     rows = []
     daily_by_combo: list[dict[int, float]] = []
     capital = 0.0
+    invalid: list[str] = []
     for combo in combos:
-        s = _variant(spec, axes, combo)
+        s = _variant(spec, axes, combo, invalid)
+        if s is None:
+            continue
         capital = float(s["portfolio"]["capital"])
         res = run(s, data, caches, trade_from, oos_from)
         full = res["stats"]
@@ -1316,13 +1361,15 @@ def optimize(spec: dict, data: dict[str, dict], grid: list[dict[str, Any]], metr
                      "oos": full.get("out_of_sample")})
     for r, d in zip(rows, daily_by_combo):
         r["_daily"] = d
+    if not rows:
+        raise ValueError(f"no valid combination: {invalid[0]}")
     ok = [r for r in rows if r["trades"] >= min_trades]
     ok.sort(key=lambda r: (r[metric] is not None, r[metric] or 0), reverse=True)
     over = overfitting_stats([r["_daily"] for r in ok], capital, n_trials=len(combos))
     for r in rows:
         r.pop("_daily", None)
     return {"combos": len(combos), "ranked": ok[:100],
-            "too_few_trades": len(rows) - len(ok), "metric": metric,
+            "too_few_trades": len(rows) - len(ok), "metric": metric, "invalid": len(invalid),
             "overfitting": over,
             # every combo, for the parameter heatmap (a plateau vs a lone spike)
             "all": [{"params": r["params"], "value": r[metric], "trades": r["trades"]} for r in rows]}
@@ -1340,11 +1387,18 @@ def _grid(grid: list[dict[str, Any]], metric: str) -> tuple[list[tuple[str, list
     return axes, combos
 
 
-def _variant(spec: dict, axes: list[tuple[str, list]], combo: tuple) -> dict:
+def _variant(spec: dict, axes: list[tuple[str, list]], combo: tuple, invalid: list[str]) -> Optional[dict]:
+    """The spec with this combo's values, or None (reason appended to `invalid`)
+    when the combo itself is not a valid strategy (e.g. scale-out steps past
+    100%): one bad corner of a grid must not sink the whole sweep."""
     s = copy.deepcopy(spec)
     for (path, _), v in zip(axes, combo):
         set_path(s, path, v)
-    return normalize(s)
+    try:
+        return normalize(s)
+    except ValueError as e:
+        invalid.append(str(e))
+        return None
 
 
 def walk_forward(spec: dict, data: dict[str, dict], grid: list[dict[str, Any]], metric: str = "net_pnl",
@@ -1370,11 +1424,15 @@ def walk_forward(spec: dict, data: dict[str, dict], grid: list[dict[str, Any]], 
         raise ValueError("in-sample length must be 0.5-10x an out-of-sample window")
     axes, combos = _grid(grid, metric)
     caches: dict[str, dict] = {}
-    runs, capital = [], 0.0
+    runs, capital, invalid = [], 0.0, []
     for combo in combos:
-        s = _variant(spec, axes, combo)
+        s = _variant(spec, axes, combo, invalid)
+        if s is None:
+            continue
         capital = float(s["portfolio"]["capital"])
         runs.append(({p: v for (p, _), v in zip(axes, combo)}, run(s, data, caches, trade_from)["trades"]))
+    if not runs:
+        raise ValueError(f"no valid combination: {invalid[0]}")
     t0 = trade_from if trade_from is not None else min(d["t"][0] for d in data.values())
     t1 = max(d["t"][-1] for d in data.values()) + 1
     span = (t1 - t0) / (is_mult + windows)
@@ -1385,7 +1443,8 @@ def walk_forward(spec: dict, data: dict[str, dict], grid: list[dict[str, Any]], 
         i0 = t0 if anchored else o0 - is_mult * span
         best = None
         for params, trades in runs:
-            ins = [x for x in trades if i0 <= x["entry_t"] < o0]
+            # in-sample = entered AND exited before the window: no P&L from inside it
+            ins = [x for x in trades if i0 <= x["entry_t"] and x["exit_t"] < o0]
             if len(ins) < min_trades:
                 continue
             st_ = stats(ins, capital)
@@ -1405,7 +1464,8 @@ def walk_forward(spec: dict, data: dict[str, dict], grid: list[dict[str, Any]], 
     total = stats(oos_trades, capital)
     oos_s = sum(f["oos_to"] - f["oos_from"] for f in folds if f["params"])
     wfe = (total["net_pnl"] / oos_s) / (is_net / is_s) * 100 if oos_s and is_s and is_net > 0 else None
-    return {"combos": len(combos), "metric": metric, "windows": windows, "anchored": anchored, "folds": folds,
+    return {"combos": len(combos), "invalid": len(invalid), "metric": metric, "windows": windows,
+            "anchored": anchored, "folds": folds,
             "oos": {**summary(total), "max_drawdown": total["max_drawdown"], "equity": total["equity"]},
             "wfe_pct": round(wfe, 1) if wfe is not None else None}
 

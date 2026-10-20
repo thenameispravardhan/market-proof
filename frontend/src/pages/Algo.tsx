@@ -276,10 +276,10 @@ async function longPost<T>(url: string, body: unknown): Promise<T> {
 function setPath(obj: unknown, path: string, value: unknown) {
   const keys = path.split(".");
   let o = obj as Record<string, unknown>;
-  for (const k of keys.slice(0, -1)) {
-    if (o[k] === undefined || o[k] === null) o[k] = {};
+  keys.slice(0, -1).forEach((k, i) => {
+    if (o[k] === undefined || o[k] === null) o[k] = /^\d+$/.test(keys[i + 1]) ? [] : {};   // scale_out.0.value: a list
     o = o[k] as Record<string, unknown>;
-  }
+  });
   o[keys[keys.length - 1]] = value;
 }
 
@@ -1329,7 +1329,9 @@ function Optimizer({ spec, cat, range, onApply }: { spec: Spec; cat: Catalog; ra
   const run = useMutation({
     mutationFn: () => longPost<OptResult | WfResult>("/api/algo/optimize", {
       spec: tidy(spec), ...range, metric, min_trades: minTrades,
-      ...(mode === "wf" ? { walk_forward: wf } : { oos_pct: oosParam(oos) }),
+      // clamped here, not per keystroke (typing "10" passes through "1")
+      ...(mode === "wf" ? { walk_forward: { ...wf, windows: Math.max(2, Math.min(12, wf.windows)), is_mult: Math.max(0.5, Math.min(10, wf.is_mult)) } }
+        : { oos_pct: oosParam(oos) }),
       grid: axes.map((a) => ({ path: a.path, values: values(a) })),
     }),
   });
@@ -1373,8 +1375,8 @@ function Optimizer({ spec, cat, range, onApply }: { spec: Spec; cat: Catalog; ra
             <label className="meta" title="the last X% of the range is held out: ranking uses only the earlier part, and each row shows how it did afterwards. 5–80, 0 = off">hold out last <NumInput width={36} value={oos} onChange={(n) => setOos(Math.max(0, Math.min(80, Math.floor(n ?? 0))))} />% as out-of-sample</label>
           ) : (
             <>
-              <label className="meta" title="out-of-sample windows (2–12), each traded with the winner of the in-sample window before it">windows <NumInput width={36} value={wf.windows} onChange={(n) => setWf({ ...wf, windows: Math.max(2, Math.min(12, Math.floor(n ?? 4))) })} /></label>
-              <label className="meta" title="in-sample length in out-of-sample windows (0.5–10): 3 = rank on 3 windows of history, trade the 4th">in-sample × <NumInput width={36} value={wf.is_mult} onChange={(n) => setWf({ ...wf, is_mult: Math.max(0.5, Math.min(10, n ?? 3)) })} /></label>
+              <label className="meta" title="out-of-sample windows (2–12), each traded with the winner of the in-sample window before it">windows <NumInput width={36} value={wf.windows} onChange={(n) => setWf({ ...wf, windows: Math.floor(n ?? 4) })} /></label>
+              <label className="meta" title="in-sample length in out-of-sample windows (0.5–10): 3 = rank on 3 windows of history, trade the 4th">in-sample × <NumInput width={36} value={wf.is_mult} onChange={(n) => setWf({ ...wf, is_mult: n ?? 3 })} /></label>
               <label className="meta" title="anchored: every in-sample window starts at the beginning of the range (grows); rolling: a fixed-length window that slides"><input type="checkbox" checked={wf.anchored} onChange={(e) => setWf({ ...wf, anchored: e.target.checked })} /> anchored</label>
             </>
           )}
