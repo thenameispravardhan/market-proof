@@ -48,6 +48,8 @@ type Operand = {
 type Cond = { left: Operand; op: string; right?: Operand };
 type Group = { logic: "AND" | "OR"; conditions: (Cond | Group)[] };
 type Level = { type: string; value: number; atr_period?: number; activate?: number } | null;
+// Partial exit: close qty_pct % of the ENTRY size at this level (rr = R multiples of the stop).
+type ScaleStep = { type: string; value: number; atr_period?: number; qty_pct: number };
 type Leg = { right: "CE" | "PE" | "FUT"; action: "BUY" | "SELL"; strike: string; steps: number; premium: number; lots: number };
 type Instrument = {
   type: "equity" | "future" | "option";
@@ -72,9 +74,10 @@ type Spec = {
   target: Level;
   trailing: Level;
   breakeven: Level;
+  scale_out?: ScaleStep[];        // absent / empty = off (the server leaves it out when off)
   mtm: { stop: number | null; target: number | null; trail_start: number | null; trail_gap: number | null };
   daily: { max_loss: number | null; max_profit: number | null };
-  session: { start: string | null; end: string | null; square_off: string | null };
+  session: { start: string | null; end: string | null; square_off: string | null; days?: number[] | null };
   entry_order: { type: string; offset_pct: number; valid_bars: number };
   max_trades_per_day: number;
   cooldown_bars: number;
@@ -130,7 +133,14 @@ type Overfitting = {
   deflated_sharpe?: { dsr: number | null; n_trials: number; sharpe_per_period: number; benchmark_sharpe: number } | null;
   pbo?: { pbo: number; splits: number; n_configs: number } | null;
 } | null;
-type OptResult = { combos: number; ranked: OptRow[]; too_few_trades: number; metric: string; notes: { symbol: string; note: string }[]; elapsed_s: number; oos_from: number | null; overfitting?: Overfitting };
+type HeatCell = { params: Record<string, number>; value: number | null; trades: number };
+type OptResult = { combos: number; ranked: OptRow[]; too_few_trades: number; metric: string; notes: { symbol: string; note: string }[]; elapsed_s: number; oos_from: number | null; overfitting?: Overfitting; all?: HeatCell[] };
+type WfFold = { is_from: number; oos_from: number; oos_to: number; params: Record<string, number> | null; is: Summary | null; is_value?: number | null; oos: Summary | null };
+type WfResult = {
+  combos: number; metric: string; windows: number; anchored: boolean; folds: WfFold[]; wfe_pct: number | null; elapsed_s: number;
+  oos: { trades: number; win_rate: number; net_pnl: number; profit_factor: number | null; sharpe: number | null; max_drawdown: number; max_drawdown_pct: number; equity: [number, number][] };
+};
+const isWf = (r: OptResult | WfResult): r is WfResult => (r as WfResult).folds !== undefined;
 
 // One line under the optimiser table: is the winner better than the best of
 // N lucky draws (Deflated Sharpe), and how often does the in-sample winner
@@ -313,6 +323,10 @@ function numericPaths(spec: Spec, cat: Catalog): { path: string; label: string; 
     if (lv) out.push({ path: `${k}.value`, label: `${k.replace("_", " ")} (${lv.type})`, value: lv.value });
   });
   if (spec.trailing?.activate) out.push({ path: "trailing.activate", label: "trailing activation", value: spec.trailing.activate });
+  (spec.scale_out ?? []).forEach((st, i) => {
+    out.push({ path: `scale_out.${i}.value`, label: `scale-out ${i + 1} level (${st.type})`, value: st.value });
+    out.push({ path: `scale_out.${i}.qty_pct`, label: `scale-out ${i + 1} % closed`, value: st.qty_pct });
+  });
   (["stop", "target", "trail_start", "trail_gap"] as const).forEach((k) => {
     const v = spec.mtm[k];
     if (v) out.push({ path: `mtm.${k}`, label: `MTM ${k.replace("_", " ")} ₹`, value: v });
@@ -560,6 +574,15 @@ export const TEMPLATES: Template[] = [
     entry_long: G([C(I("DELTA", {}, "delta_pct"), ">", N(25)), C(I("RVOL", { days: 10 }), ">", N(1.3)), C(I("PRICE"), ">", I("VWAP"))]),
     entry_short: G([C(I("DELTA", {}, "delta_pct"), "<", N(-25)), C(I("RVOL", { days: 10 }), ">", N(1.3)), C(I("PRICE"), "<", I("VWAP"))]),
     stop_loss: { type: "pct", value: 25 }, target: { type: "pct", value: 50 }, max_trades_per_day: 3, sizing: { mode: "lots", value: 1 } } },
+  // ---- trade management ----
+  { name: "Equity · EMA trend, scale out ½ at 1R, stop to cost, rest to 3R (Tue–Thu)", spec: {
+    direction: "both", instrument: { type: "equity" } as Instrument,
+    session: { start: "09:30", end: "14:30", square_off: "15:15", days: [2, 3, 4] },
+    entry_long: G([C(I("EMA", { period: 9 }), "crosses_above", I("EMA", { period: 21 })), C(I("PRICE"), ">", I("VWAP"))]),
+    entry_short: G([C(I("EMA", { period: 9 }), "crosses_below", I("EMA", { period: 21 })), C(I("PRICE"), "<", I("VWAP"))]),
+    stop_loss: { type: "atr", value: 1.5, atr_period: 14 }, target: { type: "rr", value: 3 },
+    scale_out: [{ type: "rr", value: 1, qty_pct: 50, atr_period: 14 }], breakeven: { type: "atr", value: 1.5, atr_period: 14 },
+    sizing: { mode: "risk_pct", value: 0.5 } } },
 ];
 
 const LEG_PRESETS: { name: string; long: Leg[]; short: Leg[] }[] = [
@@ -809,6 +832,48 @@ function LevelEditor({ label, v, onChange, kinds, activate = false, hint }: { la
       {v && activate && <>after <NumInput width={52} value={v.activate ?? 0} title="start trailing only once this far in profit (same unit); 0 = at once" onChange={(n) => onChange({ ...v, activate: n ?? 0 })} /> profit</>}
     </label>
   );
+}
+
+const SCALE_KIND: Record<string, string> = { rr: "× risk (R)", pct: "% of price", points: "points", atr: "× ATR" };
+
+/** Partial exits: close part of the position at each level; the rest keeps its stop / trail / target. */
+function ScaleOutEditor({ steps, onChange, hasStop }: { steps: ScaleStep[]; onChange: (s: ScaleStep[]) => void; hasStop: boolean }) {
+  const set = (i: number, p: Partial<ScaleStep>) => onChange(steps.map((x, j) => (j === i ? { ...x, ...p } : x)));
+  const total = steps.reduce((a, s) => a + (s.qty_pct || 0), 0);
+  return (
+    <div className="algo-operand" style={{ gap: 10, marginTop: 8 }} data-testid="scale-out">
+      <span className="meta" style={{ color: "var(--text)" }}
+        title="Partial exits, measured like the target. Each step closes that % of the size you entered with, rounded down to whole shares / lots (a step under one lot is skipped). The rest keeps its stop, trailing and target. Each partial is its own trade row (SCALE_OUT_1, _2 …), in backtests and live.">
+        Scale out:</span>
+      {steps.map((s, i) => (
+        <span key={i} className="algo-operand">
+          <label className="meta">close <NumInput width={40} value={s.qty_pct} onChange={(n) => set(i, { qty_pct: n ?? 0 })} />% at</label>
+          <NumInput width={48} value={s.value} onChange={(n) => set(i, { value: n ?? 0 })} />
+          <select value={s.type} onChange={(e) => set(i, { type: e.target.value })}>
+            {Object.entries(SCALE_KIND).map(([k, l]) => <option key={k} value={k} disabled={k === "rr" && !hasStop}>{l}</option>)}
+          </select>
+          {s.type === "atr" && <label className="meta">ATR <NumInput width={40} value={s.atr_period ?? 14} onChange={(n) => set(i, { atr_period: Math.max(1, Math.floor(n ?? 14)) })} /></label>}
+          <button type="button" className="btn-sm danger" aria-label={`remove scale-out step ${i + 1}`} onClick={() => onChange(steps.filter((_, j) => j !== i))}>✕</button>
+        </span>
+      ))}
+      {steps.length < 5 && (
+        <button type="button" className="btn-sm" onClick={() => onChange([...steps, { type: hasStop ? "rr" : "pct", value: steps.length + 1, qty_pct: 50, atr_period: 14 }])}>+ step</button>
+      )}
+      {!steps.length && <span className="meta">off — the whole position exits together</span>}
+      {total > 100 && <span className="meta pnl-neg">steps close {total}% — at most 100%</span>}
+      {steps.some((s) => s.type === "rr") && !hasStop && <span className="meta pnl-neg">R steps need a stop loss</span>}
+    </div>
+  );
+}
+
+const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri"];
+
+/** Entry days. null = every day; never empty (the last ticked day can't be unticked). */
+export function nextDays(cur: number[] | null | undefined, day: number, on: boolean): number[] | null {
+  const base = cur && cur.length ? cur : [1, 2, 3, 4, 5];
+  const next = on ? Array.from(new Set([...base, day])).sort((a, b) => a - b) : base.filter((d) => d !== day);
+  if (!next.length) return base;
+  return [1, 2, 3, 4, 5].every((d) => next.includes(d)) && next.length === 5 ? null : next;
 }
 
 function Rupee({ label, value, onChange, hint }: { label: string; value: number | null; onChange: (v: number | null) => void; hint?: string }) {
@@ -1143,12 +1208,115 @@ function Results({ r }: { r: BtResult }) {
 // tabs
 // ---------------------------------------------------------------------------
 
+const istDay = (e: number) =>
+  new Date(e * 1000).toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", year: "2-digit" });
+
+/** Two swept parameters as a grid coloured by the metric: a broad plateau is a
+ *  real edge; one bright cell among dark neighbours is a fitted fluke. */
+function Heatmap({ cells, metric, minTrades, label, onApply }: {
+  cells: HeatCell[]; metric: string; minTrades: number; label: (p: string) => string; onApply: (p: Record<string, number>) => void;
+}) {
+  const [ya, xa] = Object.keys(cells[0].params);
+  const uniq = (k: string) => Array.from(new Set(cells.map((c) => c.params[k]))).sort((a, b) => a - b);
+  const xs = uniq(xa);
+  const ys = uniq(ya);
+  const at = new Map(cells.map((c) => [`${c.params[ya]}|${c.params[xa]}`, c]));
+  const ranked = (c?: HeatCell) => !!c && c.value !== null && c.trades >= minTrades;
+  const vals = cells.filter(ranked).map((c) => c.value as number);
+  const lo = vals.length ? Math.min(...vals) : 0;
+  const hi = vals.length ? Math.max(...vals) : 0;
+  const span = Math.max(Math.abs(lo), Math.abs(hi)) || 1;
+  // diverging around 0 when the metric went negative somewhere, else shaded low -> high
+  const bg = (v: number) => (lo < 0
+    ? v >= 0 ? `rgba(0,215,135,${0.12 + 0.6 * (v / span)})` : `rgba(255,56,56,${0.12 + 0.6 * (-v / span)})`
+    : `rgba(0,215,135,${0.08 + 0.64 * ((v - lo) / (hi - lo || 1))})`);
+  return (
+    <div className="algo-scroll" style={{ marginBottom: 10 }} data-testid="opt-heatmap">
+      <div className="meta" style={{ marginBottom: 4 }}>{metric} by {label(ya)} (rows) × {label(xa)} (columns) — look for a broad bright area, not one bright cell. Click a cell to apply it; · = too few trades.</div>
+      <table>
+        <thead><tr><th></th>{xs.map((x) => <th key={x} className="mono">{x}</th>)}</tr></thead>
+        <tbody>{ys.map((y) => (
+          <tr key={y}><th className="mono">{y}</th>{xs.map((x) => {
+            const c = at.get(`${y}|${x}`);
+            const v = c && ranked(c) ? (c.value as number) : null;
+            return (
+              <td key={x} className="mono" style={{ textAlign: "center", background: v === null ? undefined : bg(v), cursor: v === null ? undefined : "pointer" }}
+                title={c ? `${c.trades} trades` : ""} onClick={() => { if (c && v !== null) onApply(c.params); }}>
+                {v === null ? "·" : num(v, Math.abs(v) >= 100 ? 0 : 2)}
+              </td>
+            );
+          })}</tr>))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/** Rolling walk-forward: each window traded with the winner of the in-sample window before it. */
+function WalkForward({ r, label, onApply }: { r: WfResult; label: (p: string) => string; onApply: (p: Record<string, number>) => void }) {
+  const keys = Object.keys(r.folds.find((f) => f.params)?.params ?? {});
+  const eq = useMemo(() => r.oos.equity.map(([t, v]) => ({ t: ist(t), v })), [r]);
+  return (
+    <div data-testid="walk-forward">
+      <div className="meta" style={{ marginBottom: 6 }}>
+        {r.combos} combos × {r.windows} {r.anchored ? "anchored" : "rolling"} windows in {r.elapsed_s}s. Each window was traded with the combo that ranked best on {r.metric} in
+        the in-sample period before it — the stitched windows never influenced their own parameters.
+      </div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 18, marginBottom: 8 }}>
+        <Metric label="Out-of-sample net" value={inr(r.oos.net_pnl)} cls={pnlCls(r.oos.net_pnl)} hint="every window's unseen trades, stitched" />
+        <Metric label="OOS trades" value={String(r.oos.trades)} />
+        <Metric label="OOS win rate" value={`${num(r.oos.win_rate, 1)}%`} />
+        <Metric label="OOS profit factor" value={num(r.oos.profit_factor)} />
+        <Metric label="OOS Sharpe" value={num(r.oos.sharpe)} />
+        <Metric label="OOS max DD" value={`${inr(r.oos.max_drawdown)} (${num(r.oos.max_drawdown_pct, 1)}%)`} cls="pnl-neg" />
+        <Metric label="WF efficiency" value={r.wfe_pct === null ? "—" : `${num(r.wfe_pct, 0)}%`} cls={r.wfe_pct === null ? "" : r.wfe_pct >= 50 ? "pnl-pos" : "pnl-neg"}
+          hint="out-of-sample P&L per day ÷ in-sample P&L per day. Around 50%+ is usually called robust; near 0 or negative = the optimiser fitted noise" />
+      </div>
+      {eq.length > 1 && (
+        <ResponsiveContainer width="100%" height={200}>
+          <LineChart data={eq}>
+            <CartesianGrid stroke="var(--border-soft)" />
+            <XAxis dataKey="t" tick={{ fontSize: 10, fill: "var(--text-dim)" }} minTickGap={60} />
+            <YAxis tick={{ fontSize: 10, fill: "var(--text-dim)" }} domain={["auto", "auto"]} width={70} />
+            <Tooltip contentStyle={{ background: "var(--bg-panel)", border: "1px solid var(--border)" }} formatter={(v: number) => inr(v)} />
+            <Line type="monotone" dataKey="v" stroke="var(--accent)" dot={false} strokeWidth={1.5} isAnimationActive={false} name="out-of-sample equity" />
+          </LineChart>
+        </ResponsiveContainer>
+      )}
+      <div className="algo-scroll">
+        <table>
+          <thead><tr><th>#</th><th>Ranked on</th><th>Traded unseen</th>{keys.map((k) => <th key={k} title={k}>{label(k)}</th>)}<th>IS {r.metric}</th><th>OOS trades</th><th>OOS PF</th><th>OOS net</th><th></th></tr></thead>
+          <tbody>{r.folds.map((f, i) => (
+            <tr key={i}>
+              <td>{i + 1}</td>
+              <td className="mono">{istDay(f.is_from)} → {istDay(f.oos_from)}</td>
+              <td className="mono">{istDay(f.oos_from)} → {istDay(f.oos_to - 1)}</td>
+              {f.params ? (
+                <>
+                  {keys.map((k) => <td key={k} className="mono">{f.params![k]}</td>)}
+                  <td className="mono">{num(f.is_value)}</td><td className="mono">{f.oos?.trades ?? "—"}</td><td className="mono">{num(f.oos?.profit_factor)}</td>
+                  <td className={`mono ${pnlCls(f.oos?.net_pnl)}`}>{inr(f.oos?.net_pnl)}</td>
+                  <td><button type="button" className="btn-sm" onClick={() => onApply(f.params!)}>apply</button></td>
+                </>
+              ) : <td colSpan={keys.length + 5} className="meta">no combo had enough in-sample trades — not traded</td>}
+            </tr>))}
+          </tbody>
+        </table>
+      </div>
+      <div className="meta">Parameters that jump from window to window are a warning sign; stable ones that keep earning unseen are the real thing. The last window's winner is what you would trade next.</div>
+    </div>
+  );
+}
+
 function Optimizer({ spec, cat, range, onApply }: { spec: Spec; cat: Catalog; range: { start: string; end: string }; onApply: (params: Record<string, number>) => void }) {
   const paths = useMemo(() => numericPaths(spec, cat), [spec, cat]);
   const [axes, setAxes] = useState<{ path: string; from: number; to: number; step: number }[]>([]);
   const [metric, setMetric] = useState("net_pnl");
   const [minTrades, setMinTrades] = useState(10);
   const [oos, setOos] = useState(30);
+  // "wf" = rolling walk-forward: re-rank on each in-sample window, trade the next window unseen.
+  const [mode, setMode] = useState<"rank" | "wf">("rank");
+  const [wf, setWf] = useState({ windows: 4, is_mult: 3, anchored: false });
   const values = (a: { from: number; to: number; step: number }) => {
     const out: number[] = [];
     if (a.step <= 0) return [a.from];
@@ -1159,11 +1327,15 @@ function Optimizer({ spec, cat, range, onApply }: { spec: Spec; cat: Catalog; ra
   // The builder can change under the grid (a condition removed, a stop switched off) — those axes can't run.
   const missing = axes.filter((a) => !paths.some((p) => p.path === a.path)).length;
   const run = useMutation({
-    mutationFn: () => longPost<OptResult>("/api/algo/optimize", {
-      spec: tidy(spec), ...range, metric, min_trades: minTrades, oos_pct: oosParam(oos),
+    mutationFn: () => longPost<OptResult | WfResult>("/api/algo/optimize", {
+      spec: tidy(spec), ...range, metric, min_trades: minTrades,
+      ...(mode === "wf" ? { walk_forward: wf } : { oos_pct: oosParam(oos) }),
       grid: axes.map((a) => ({ path: a.path, values: values(a) })),
     }),
   });
+  const opt = run.data && !isWf(run.data) ? run.data : null;
+  const wfr = run.data && isWf(run.data) ? run.data : null;
+  const heat = opt?.all && opt.all.length && Object.keys(opt.all[0].params).length === 2 ? opt.all : null;
   const label = (p: string) => paths.find((x) => x.path === p)?.label ?? p;
   const axisFor = (p: { path: string; value: number }) => ({ path: p.path, from: p.value, to: p.value ? p.value * 2 : 10, step: p.value >= 4 ? Math.round(p.value / 4) : p.value ? p.value / 4 : 1 });
   return (
@@ -1192,7 +1364,20 @@ function Optimizer({ spec, cat, range, onApply }: { spec: Spec; cat: Catalog; ra
             if (p) setAxes([...axes, axisFor(p)]);
           }}>+ parameter</button>
           <label className="meta">rank by <select value={metric} onChange={(e) => setMetric(e.target.value)}>{cat.metrics.map((m) => <option key={m}>{m}</option>)}</select></label>
-          <label className="meta" title="the last X% of the range is held out: ranking uses only the earlier part, and each row shows how it did afterwards (walk-forward). 5–80, 0 = off">hold out last <NumInput width={36} value={oos} onChange={(n) => setOos(Math.max(0, Math.min(80, Math.floor(n ?? 0))))} />% as out-of-sample</label>
+          <label className="meta" title="one split: rank on the earlier part, check the held-out end. Walk-forward: cut the range into windows, re-rank on each in-sample window and trade the next one unseen — the stitched unseen windows are what re-optimising would really have earned">check
+            <select value={mode} onChange={(e) => setMode(e.target.value as "rank" | "wf")}>
+              <option value="rank">one out-of-sample split</option><option value="wf">rolling walk-forward</option>
+            </select>
+          </label>
+          {mode === "rank" ? (
+            <label className="meta" title="the last X% of the range is held out: ranking uses only the earlier part, and each row shows how it did afterwards. 5–80, 0 = off">hold out last <NumInput width={36} value={oos} onChange={(n) => setOos(Math.max(0, Math.min(80, Math.floor(n ?? 0))))} />% as out-of-sample</label>
+          ) : (
+            <>
+              <label className="meta" title="out-of-sample windows (2–12), each traded with the winner of the in-sample window before it">windows <NumInput width={36} value={wf.windows} onChange={(n) => setWf({ ...wf, windows: Math.max(2, Math.min(12, Math.floor(n ?? 4))) })} /></label>
+              <label className="meta" title="in-sample length in out-of-sample windows (0.5–10): 3 = rank on 3 windows of history, trade the 4th">in-sample × <NumInput width={36} value={wf.is_mult} onChange={(n) => setWf({ ...wf, is_mult: Math.max(0.5, Math.min(10, n ?? 3)) })} /></label>
+              <label className="meta" title="anchored: every in-sample window starts at the beginning of the range (grows); rolling: a fixed-length window that slides"><input type="checkbox" checked={wf.anchored} onChange={(e) => setWf({ ...wf, anchored: e.target.checked })} /> anchored</label>
+            </>
+          )}
           <label className="meta" title="combos with fewer trades are not ranked — a 1-trade 100% win rate means nothing">min trades <NumInput width={52} value={minTrades} onChange={(n) => setMinTrades(Math.max(1, Math.floor(n ?? 1)))} /></label>
           <span className="meta">{combos} combinations (max 400)</span>
           <button type="button" className="primary" disabled={!combos || combos > 400 || missing > 0 || run.isPending} onClick={() => run.mutate()}>{run.isPending ? "Optimising…" : "Run optimisation"}</button>
@@ -1201,22 +1386,24 @@ function Optimizer({ spec, cat, range, onApply }: { spec: Spec; cat: Catalog; ra
         {missing > 0 && <div className="meta pnl-neg">{missing} parameter{missing > 1 ? "s are" : " is"} no longer in the builder's strategy — remove {missing > 1 ? "them" : "it"} (✕) to run.</div>}
       </div>
       {run.error && <div className="pnl-neg">{errMsg(run.error)}</div>}
-      {run.data && (
+      {wfr && <WalkForward r={wfr} label={label} onApply={onApply} />}
+      {opt && (
         <>
-          {overfittingLine(run.data.overfitting) && (
-            <div className="meta" style={{ marginBottom: 6 }} data-testid="overfitting-line">{overfittingLine(run.data.overfitting)}</div>
+          {overfittingLine(opt.overfitting) && (
+            <div className="meta" style={{ marginBottom: 6 }} data-testid="overfitting-line">{overfittingLine(opt.overfitting)}</div>
           )}
-          <div className="meta" style={{ marginBottom: 6 }}>{run.data.combos} combos in {run.data.elapsed_s}s · {run.data.too_few_trades} skipped for too few trades.{run.data.oos_from ? ` Ranked on the in-sample period only (before ${ist(run.data.oos_from)}); trust rows whose OOS columns hold up.` : " Beware overfitting — hold out an out-of-sample % to check."}</div>
+          <div className="meta" style={{ marginBottom: 6 }}>{opt.combos} combos in {opt.elapsed_s}s · {opt.too_few_trades} skipped for too few trades.{opt.oos_from ? ` Ranked on the in-sample period only (before ${ist(opt.oos_from)}); trust rows whose OOS columns hold up.` : " Beware overfitting — hold out an out-of-sample % or run a walk-forward to check."}</div>
+          {heat && <Heatmap cells={heat} metric={opt.metric} minTrades={minTrades} label={label} onApply={onApply} />}
           <div style={{ maxHeight: 480, overflow: "auto" }}>
             <table>
-              <thead><tr><th></th>{axes.map((a) => <th key={a.path} title={a.path}>{label(a.path)}</th>)}<th>Trades</th><th>Win %</th><th>PF</th><th>Sharpe</th><th>t</th><th>Max DD</th><th>Net</th>{run.data.oos_from ? <><th title="out-of-sample">OOS trades</th><th title="out-of-sample">OOS PF</th><th title="out-of-sample">OOS net</th></> : null}</tr></thead>
-              <tbody>{run.data.ranked.map((r, i) => (
+              <thead><tr><th></th>{axes.map((a) => <th key={a.path} title={a.path}>{label(a.path)}</th>)}<th>Trades</th><th>Win %</th><th>PF</th><th>Sharpe</th><th>t</th><th>Max DD</th><th>Net</th>{opt.oos_from ? <><th title="out-of-sample">OOS trades</th><th title="out-of-sample">OOS PF</th><th title="out-of-sample">OOS net</th></> : null}</tr></thead>
+              <tbody>{opt.ranked.map((r, i) => (
                 <tr key={i}>
                   <td><button type="button" className="btn-sm" onClick={() => onApply(r.params)}>apply</button></td>
                   {axes.map((a) => <td key={a.path} className="mono">{r.params[a.path]}</td>)}
                   <td className="mono">{r.trades}</td><td className="mono">{num(r.win_rate, 1)}</td><td className="mono">{num(r.profit_factor)}</td>
                   <td className="mono">{num(r.sharpe)}</td><td className="mono">{num(r.t_stat)}</td><td className="mono">{inr(r.max_drawdown)}</td><td className={`mono ${pnlCls(r.net_pnl)}`}>{inr(r.net_pnl)}</td>
-                  {run.data!.oos_from ? <><td className="mono">{r.oos?.trades ?? "—"}</td><td className="mono">{num(r.oos?.profit_factor)}</td>
+                  {opt.oos_from ? <><td className="mono">{r.oos?.trades ?? "—"}</td><td className="mono">{num(r.oos?.profit_factor)}</td>
                     <td className={`mono ${pnlCls(r.oos?.net_pnl)}`}>{inr(r.oos?.net_pnl)}</td></> : null}
                 </tr>))}
               </tbody>
@@ -1958,6 +2145,7 @@ export default function Algo() {
               <LevelEditor label="move stop to cost after" v={spec.breakeven} kinds={levelKinds} onChange={(l) => upd({ breakeven: l })}
                 hint="once the trade is this far in profit, the stop moves to the entry price" />
             </div>
+            <ScaleOutEditor steps={spec.scale_out ?? []} hasStop={!!spec.stop_loss} onChange={(scale_out) => upd({ scale_out })} />
             <div className="algo-operand" style={{ gap: 14, marginTop: 8 }}>
               <span className="meta" style={{ color: "var(--text)" }}>Position MTM:</span>
               <Rupee label="stop" value={spec.mtm.stop} onChange={(v) => upd({ mtm: { ...spec.mtm, stop: v } })} hint="exit when the position's P&L falls to −₹X" />
@@ -1987,6 +2175,17 @@ export default function Algo() {
                   </label>
                 );
               })}
+              <span className="meta" title="new entries only on the ticked weekdays; open positions are still managed and squared off every day" data-testid="algo-days">
+                entry days{" "}
+                {WEEKDAYS.map((d, k) => {
+                  const on = !spec.session.days || !spec.session.days.length || spec.session.days.includes(k + 1);
+                  return (
+                    <label key={d} style={{ marginRight: 4 }}>
+                      <input type="checkbox" checked={on} onChange={(e) => upd({ session: { ...spec.session, days: nextDays(spec.session.days, k + 1, e.target.checked) } })} />{d}
+                    </label>
+                  );
+                })}
+              </span>
             </div>
             <div className="algo-operand" style={{ gap: 10, marginTop: 8 }}>
               <label className="meta" title="market: fill at the next candle's open. pullback: wait for a better price (limit-style). breakout: wait for price to run further in the trade's direction (stop-style).">entry order
