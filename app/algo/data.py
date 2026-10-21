@@ -91,7 +91,7 @@ def real_flow(fy: str, start: int, end: int) -> dict[int, tuple[float, float]]:
     from app.algo import ticks
 
     try:
-        return ticks.recorder().minute_flow(ticks.flow_key(fy), start, end)
+        return ticks.store().minute_flow(ticks.flow_key(fy), start, end)
     except Exception as e:  # noqa: BLE001 — real flow is an upgrade, never a blocker
         log.warning("algo.real_flow_failed", symbol=fy, error=str(e)[:200])
         return {}

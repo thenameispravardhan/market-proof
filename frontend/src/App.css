@@ -2111,6 +2111,8 @@ kbd {
    full-width rule above would stack every select on its own line. */
 .algo select, .algo input:not([type="checkbox"]) { width: auto; padding: 3px 6px; }
 .algo label.meta { display: inline-flex; gap: 4px; align-items: center; white-space: nowrap; }
+.flow-universe { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; padding: 8px 10px; border: 1px solid var(--border); }
+.algo .flow-universe input[type="checkbox"] { width: auto; margin: 0; }
 .algo .widget { padding: 10px 12px; gap: 8px; overflow: visible; resize: none; }
 .algo .widget h3 { flex: none; justify-content: flex-start; }
 .algo th, .algo td { padding: 3px 8px; white-space: nowrap; text-align: left; }
@@ -2504,6 +2506,18 @@ kbd {
 .chart-replay button:hover { border-color: #2962ff; }
 .chart-replay select { width: auto; padding: 1px 4px; font-size: 11px; }
 .chart-replay b { color: #2962ff; text-transform: uppercase; letter-spacing: 0.06em; }
+/* footprint settings (order flow chart type) */
+.fp-bar { position: absolute; top: 8px; right: 72px; z-index: 9; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  max-width: calc(100% - 160px); padding: 3px 6px; background: var(--bg-elev); border: 1px solid var(--border-hi); border-radius: 6px; font-size: 11px; color: var(--text); }
+.fp-bar:not(.open) { padding: 0; border: 0; background: transparent; }
+.fp-bar .fp-chip { padding: 2px 8px; font-size: 11px; border-radius: 4px; }
+.fp-bar label { display: inline-flex; align-items: center; gap: 4px; color: var(--text-dim); white-space: nowrap; }
+.fp-bar select { width: auto; padding: 1px 4px; font-size: 11px; }
+.fp-bar .fp-seg { display: inline-flex; gap: 2px; }
+.fp-bar .fp-seg button { padding: 2px 8px; font-size: 11px; }
+.fp-bar .fp-seg button.on { border-color: var(--accent); color: var(--accent); }
+.fp-bar .fp-check input { width: auto; margin: 0; }
+.fp-bar .fp-stats { display: inline-flex; gap: 6px; flex-wrap: wrap; padding-left: 6px; border-left: 1px solid var(--border); }
 /* replay trading (ReplayTrader.tsx): the toolbar grows a ticket and the trade lists */
 .chart-replay { flex-direction: column; align-items: stretch; width: max-content; max-width: calc(100% - 16px); }
 .replay-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }

@@ -1,0 +1,312 @@
+// footprint — order-flow analytics for the chart, as pure functions.
+//
+// The recorder stores, per minute, buy (lifted the ask) and sell (hit the bid)
+// volume at every traded price. A footprint bar groups those into rows of N
+// ticks and reads them the way ATAS / Sierra / TradingView do:
+//   * diagonal imbalance — buying at a row against selling one row BELOW it
+//     (an aggressive buyer lifts the ask, which sits a tick above the bid the
+//     seller hits); selling at a row against buying one row ABOVE it. A side
+//     wins at `ratio` x (300% by default) the other, with at least `minVol`;
+//   * stacked imbalances — `stacked` or more in a row on one side: a zone the
+//     chart extends to the right until price trades back into it;
+//   * POC (the row with the most volume) and the value area (the rows around
+//     it holding `vaPct`% of the bar's volume);
+//   * an unfinished auction — both sides traded at the bar's extreme row: the
+//     auction never found the price where one side stopped.
+// Plus the plumbing: mapping the server's base-resolution rows onto the chart's
+// candles (a 4-minute or weekly chart is built from 1-minute / daily rows) and
+// the index-vs-future basis.
+
+export type FootprintMode = "bidask" | "delta" | "volume";
+export type StatRow = "vol" | "delta" | "dpct" | "cvd" | "dmin" | "dmax" | "trades" | "oi";
+
+export interface FootprintSettings {
+  mode: FootprintMode;
+  /** Ticks per row; 0 = auto (rows at least 14 px tall). */
+  rowTicks: number;
+  /** Diagonal imbalance ratio (3 = 300%); 0 = off. */
+  imbalance: number;
+  /** An imbalance needs at least this much volume on the winning side. */
+  imbalanceMin: number;
+  /** Consecutive imbalances that make a zone; 0 = off. */
+  stacked: number;
+  poc: boolean;
+  va: boolean;
+  vaPct: number;
+  stats: StatRow[];
+  prints: boolean;
+  unfinished: boolean;
+}
+
+export const DEFAULT_FOOTPRINT: FootprintSettings = {
+  mode: "bidask",
+  rowTicks: 0,
+  imbalance: 3,
+  imbalanceMin: 0,
+  stacked: 3,
+  poc: true,
+  va: true,
+  vaPct: 70,
+  stats: ["vol", "delta", "dpct", "cvd"],
+  prints: true,
+  unfinished: true,
+};
+
+export const STAT_LABEL: Record<StatRow, string> = {
+  vol: "Volume", delta: "Delta", dpct: "Delta %", cvd: "CVD", dmin: "Min Δ", dmax: "Max Δ", trades: "Trades", oi: "OI Δ",
+};
+/** Height of one statistics-table row at the pane's foot, in px. */
+export const STAT_ROW_PX = 14;
+
+export function fpSettings(raw: Partial<FootprintSettings> | undefined): FootprintSettings {
+  const s = { ...DEFAULT_FOOTPRINT, ...(raw ?? {}) };
+  return { ...s, stats: Array.isArray(s.stats) ? s.stats.filter((x) => x in STAT_LABEL) : DEFAULT_FOOTPRINT.stats };
+}
+
+export interface FpRow {
+  p: number;
+  buy: number;
+  sell: number;
+}
+
+export interface FpBarStats {
+  vol: number;
+  delta: number;
+  trades: number;
+  dlo: number;
+  dhi: number;
+  oi: number | null;
+  oiChg: number | null;
+  cvd: number;
+}
+
+export interface Analysis {
+  rows: FpRow[];
+  total: number;
+  delta: number;
+  maxVol: number;
+  maxSide: number;
+  maxAbsDelta: number;
+  poc: number | null;
+  vah: number | null;
+  val: number | null;
+  buyImb: Set<number>;
+  sellImb: Set<number>;
+  zones: { lo: number; hi: number; side: 1 | -1 }[];
+  unfinishedHigh: boolean;
+  unfinishedLow: boolean;
+}
+
+const round6 = (x: number) => Math.round(x * 1e6) / 1e6;
+
+/** The price grid's tick: the smallest gap between traded prices, as a multiple of 0.05 (NSE's tick). */
+export function inferTick(prices: number[], fallback = 0.05): number {
+  const ps = [...new Set(prices.map(round6))].sort((a, b) => a - b);
+  let best = Infinity;
+  for (let i = 1; i < ps.length; i++) {
+    const d = round6(ps[i] - ps[i - 1]);
+    if (d > 0 && d < best) best = d;
+  }
+  if (!Number.isFinite(best)) return fallback;
+  return best < fallback ? fallback : round6(Math.max(fallback, Math.round(best / fallback) * fallback));
+}
+
+const NICE = [1, 2, 4, 5, 10, 20, 25, 40, 50, 100, 200, 250, 500, 1000, 2000, 2500, 5000, 10000];
+
+/** A row height in price: `rowTicks` ticks, or (auto) the fewest nice tick
+ *  multiples that keep a row at least `minPx` tall. */
+export function rowStep(tick: number, pxPerPrice: number, rowTicks = 0, minPx = 14): number {
+  if (rowTicks > 0) return round6(tick * rowTicks);
+  if (!(pxPerPrice > 0)) return tick;
+  const k = NICE.find((m) => m * tick * pxPerPrice >= minPx) ?? NICE[NICE.length - 1];
+  return round6(tick * k);
+}
+
+/** Group [price, buy, sell] levels into rows of `step` (each row = its low edge), lowest first. */
+export function groupRows(levels: [number, number, number][], step: number): FpRow[] {
+  const rows = new Map<number, FpRow>();
+  for (const [price, buy, sell] of levels) {
+    const p = round6(Math.floor(price / step + 1e-7) * step);
+    const r = rows.get(p) ?? { p, buy: 0, sell: 0 };
+    r.buy += buy;
+    r.sell += sell;
+    rows.set(p, r);
+  }
+  return [...rows.values()].sort((a, b) => a.p - b.p);
+}
+
+/** Everything a footprint bar shows (see the module comment). Rows are contiguous
+ *  in price for the diagonal comparison: a missing row counts as zero volume. */
+export function analyze(rows: FpRow[], step: number, s: Pick<FootprintSettings, "imbalance" | "imbalanceMin" | "stacked" | "vaPct">): Analysis {
+  const out: Analysis = {
+    rows, total: 0, delta: 0, maxVol: 0, maxSide: 0, maxAbsDelta: 0, poc: null, vah: null, val: null,
+    buyImb: new Set(), sellImb: new Set(), zones: [], unfinishedHigh: false, unfinishedLow: false,
+  };
+  if (!rows.length) return out;
+  const at = new Map(rows.map((r) => [r.p, r]));
+  let pocVol = -1;
+  for (const r of rows) {
+    const v = r.buy + r.sell;
+    out.total += v;
+    out.delta += r.buy - r.sell;
+    out.maxVol = Math.max(out.maxVol, v);
+    out.maxSide = Math.max(out.maxSide, r.buy, r.sell);
+    out.maxAbsDelta = Math.max(out.maxAbsDelta, Math.abs(r.buy - r.sell));
+    if (v > pocVol) {
+      pocVol = v;
+      out.poc = r.p;
+    }
+  }
+  // value area: grow from the POC towards the heavier neighbour until vaPct% is inside
+  const idx = rows.findIndex((r) => r.p === out.poc);
+  let lo = idx, hi = idx, inside = pocVol;
+  const target = (out.total * s.vaPct) / 100;
+  while (inside < target && (lo > 0 || hi < rows.length - 1)) {
+    const up = hi < rows.length - 1 ? rows[hi + 1].buy + rows[hi + 1].sell : -1;
+    const dn = lo > 0 ? rows[lo - 1].buy + rows[lo - 1].sell : -1;
+    if (up >= dn) inside += rows[++hi].buy + rows[hi].sell;
+    else inside += rows[--lo].buy + rows[lo].sell;
+  }
+  out.val = rows[lo].p;
+  out.vah = rows[hi].p;
+  const top = rows[rows.length - 1], bottom = rows[0];
+  out.unfinishedHigh = top.buy > 0 && top.sell > 0;
+  out.unfinishedLow = bottom.buy > 0 && bottom.sell > 0;
+  if (s.imbalance > 0) {
+    for (const r of rows) {
+      // the extreme rows have no neighbour on that side; a gap inside the bar is zero volume
+      if (r !== bottom && r.buy > 0 && r.buy >= s.imbalanceMin && r.buy >= s.imbalance * (at.get(round6(r.p - step))?.sell ?? 0)) out.buyImb.add(r.p);
+      if (r !== top && r.sell > 0 && r.sell >= s.imbalanceMin && r.sell >= s.imbalance * (at.get(round6(r.p + step))?.buy ?? 0)) out.sellImb.add(r.p);
+    }
+    if (s.stacked > 1) {
+      for (const [set, side] of [[out.buyImb, 1], [out.sellImb, -1]] as const) {
+        let run: number[] = [];
+        const flush = () => {
+          if (run.length >= s.stacked) out.zones.push({ lo: run[0], hi: round6(run[run.length - 1] + step), side });
+          run = [];
+        };
+        for (const r of rows) {
+          if (set.has(r.p) && (!run.length || round6(run[run.length - 1] + step) === r.p)) run.push(r.p);
+          else {
+            flush();
+            if (set.has(r.p)) run.push(r.p);
+          }
+        }
+        flush();
+      }
+    }
+  }
+  return out;
+}
+
+// ---- server rows -> chart candles ----------------------------------------------
+
+/** One chart candle's order flow, summed from the server's base-resolution bars. */
+export interface FlowBar {
+  buy: number;
+  sell: number;
+  delta: number;
+  trades: number;
+  unk: number;
+  oi: number | null;
+  close: number | null;
+  /** Lowest / highest running delta inside the candle (from its start). */
+  dlo: number;
+  dhi: number;
+}
+
+/** Index of the candle holding chart time `t` (the last one starting at or before it), or -1. */
+export function candleAt(times: number[], t: number): number {
+  let lo = 0, hi = times.length - 1, hit = -1;
+  while (lo <= hi) {
+    const m = (lo + hi) >> 1;
+    if (times[m] <= t) {
+      hit = m;
+      lo = m + 1;
+    } else hi = m - 1;
+  }
+  return hit;
+}
+
+/** Fold /api/algo/ticks/flow bars ([t, buy, sell, delta, trades, unk, oi, close, dlo, dhi], epoch t)
+ *  into the chart's candles (chart time = epoch + `shift`). */
+export function flowByCandle(times: number[], bars: number[][], shift: number): Map<number, FlowBar> {
+  const out = new Map<number, FlowBar>();
+  for (const b of bars) {
+    const i = candleAt(times, b[0] + shift);
+    if (i < 0) continue;
+    const key = times[i];
+    const buy = b[1] ?? 0, sell = b[2] ?? 0, delta = b[3] ?? buy - sell;
+    const trades = b[4] ?? 0, unk = b[5] ?? 0, oi = b[6] ?? null, close = b[7] ?? null;
+    const dlo = b[8] ?? Math.min(0, delta), dhi = b[9] ?? Math.max(0, delta);
+    const cur = out.get(key);
+    if (!cur) {
+      out.set(key, { buy, sell, delta, trades, unk, oi, close, dlo, dhi });
+      continue;
+    }
+    // a later sub-bar: its running extremes start from where the candle's delta stood
+    cur.dlo = Math.min(cur.dlo, cur.delta + dlo);
+    cur.dhi = Math.max(cur.dhi, cur.delta + dhi);
+    cur.buy += buy;
+    cur.sell += sell;
+    cur.delta += delta;
+    cur.trades += trades;
+    cur.unk += unk;
+    if (oi != null) cur.oi = oi;
+    if (close != null) cur.close = close;
+  }
+  return out;
+}
+
+/** Footprint rows ([t, price, buy, sell]) per chart candle: price -> [buy, sell]. */
+export function footprintByCandle(times: number[], rows: number[][], shift: number): Map<number, Map<number, [number, number]>> {
+  const out = new Map<number, Map<number, [number, number]>>();
+  for (const [t, p, b, s] of rows) {
+    const i = candleAt(times, t + shift);
+    if (i < 0) continue;
+    const m = out.get(times[i]) ?? new Map<number, [number, number]>();
+    const cur = m.get(p);
+    if (cur) {
+      cur[0] += b;
+      cur[1] += s;
+    } else m.set(p, [b, s]);
+    out.set(times[i], m);
+  }
+  return out;
+}
+
+/** Session-cumulative delta per candle (restarts each day, chart time). */
+export function sessionCvd(times: number[], flow: Map<number, FlowBar>): Map<number, number> {
+  const out = new Map<number, number>();
+  let day = -1, run = 0;
+  for (const t of times) {
+    const d = Math.floor(t / 86400);
+    if (d !== day) {
+      day = d;
+      run = 0;
+    }
+    const f = flow.get(t);
+    if (f) run += f.delta;
+    out.set(t, run);
+  }
+  return out;
+}
+
+/** An index's flow is its future's, at futures prices: the futures-minus-index
+ *  basis per session (median over the session's candles), to shift footprint
+ *  rows onto the index candles. Steady across a day, unlike a per-bar shift. */
+export function sessionBasis(candles: { time: number; close: number }[], flow: Map<number, FlowBar>): Map<number, number> {
+  const per = new Map<number, number[]>();
+  for (const c of candles) {
+    const f = flow.get(c.time);
+    if (!f || f.close == null) continue;
+    const d = Math.floor(c.time / 86400);
+    per.set(d, [...(per.get(d) ?? []), f.close - c.close]);
+  }
+  const out = new Map<number, number>();
+  for (const [d, xs] of per) {
+    xs.sort((a, b) => a - b);
+    out.set(d, xs[Math.floor(xs.length / 2)]);
+  }
+  return out;
+}

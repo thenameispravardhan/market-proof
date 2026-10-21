@@ -66,7 +66,7 @@ export interface InputDef {
 
 /** How a plot is drawn. "marks" is an invisible anchor that carries the
  *  indicator's markers (patterns, fractals, divergences). */
-export type PlotKind = "line" | "hist" | "points" | "step" | "area" | "columns" | "circles" | "marks";
+export type PlotKind = "line" | "hist" | "points" | "step" | "area" | "columns" | "circles" | "marks" | "candles";
 export const PLOT_KINDS: { v: PlotKind; l: string }[] = [
   { v: "line", l: "Line" },
   { v: "step", l: "Step line" },
@@ -90,12 +90,16 @@ export interface PlotDef {
 export type Category = "Moving averages" | "Bands & channels" | "Trend" | "Oscillators" | "Volume" | "Volatility" | "Statistics";
 export const CATEGORIES: Category[] = ["Moving averages", "Bands & channels", "Trend", "Oscillators", "Volume", "Volatility", "Statistics"];
 
+/** One candle's recorded flow: [buy, sell, delta, then optionally trades, unk (no aggressor),
+ *  open interest, last trade, the lowest / highest running delta inside the candle]. */
+export type FlowTuple = [number, number, number, ...(number | null)[]];
+
 export interface ComputeCtx {
   interval: string;
   up: string; // theme up / down colors for histogram bars
   down: string;
-  /** Real order flow per chart time: [buy, sell, delta]. */
-  flow?: Map<number, [number, number, number]>;
+  /** Real order flow per chart time: [buy, sell, delta, trades, unk, oi, close, delta low, delta high]. */
+  flow?: Map<number, FlowTuple>;
   /** Another symbol's closes by chart time (two-symbol indicators). */
   other?: (symbol: string) => Map<number, number> | undefined;
 }
@@ -119,6 +123,8 @@ export interface ComputeResult {
   /** Bars to shift each plot by (+ = into the future). */
   shifts?: number[];
   marks?: Mark[];
+  /** A "candles" plot's [open, high, low, close] per bar (its plot values are the closes). */
+  candles?: Record<number, ([number, number, number, number] | null)[]>;
 }
 
 /** Shaded area between two plots (or a plot and a fixed level). With
@@ -166,7 +172,7 @@ const popStd = (xs: number[]) => { const m = xs.reduce((a, b) => a + b, 0) / xs.
 
 /** Order-flow pressure — the Algo Lab's FLOW_PRESSURE, bar for bar: buy / sell volume from recorded ticks
  *  when there are any, else the same Bulk Volume Classification estimate the server uses. */
-export function flowPressure(c: OhlcvCandle[], flow: Map<number, [number, number, number]> | undefined, n = 20, smooth = 5, z = 2) {
+export function flowPressure(c: OhlcvCandle[], flow: Map<number, FlowTuple> | undefined, n = 20, smooth = 5, z = 2) {
   const dp = c.map((k, i) => (i ? k.close - c[i - 1].close : k.close - k.open));
   const delta: number[] = [], pct: number[] = [];
   c.forEach((k, i) => {
@@ -705,6 +711,44 @@ export const INDICATORS: IndicatorDef[] = [
         colors.push(f[2] >= 0 ? ctx.up : ctx.down);
       }
       return { plots: [delta, cvd], colors: [colors, null] };
+    },
+  },
+  {
+    type: "cvd",
+    name: "Cumulative Volume Delta (recorded ticks)",
+    short: "CVD",
+    category: "Volume",
+    overlay: false,
+    desc: "Buy − sell volume added up candle by candle, drawn as candles: each opens where the running delta stood, "
+      + "its wicks reach the lowest / highest delta inside the candle. A rising CVD under a falling price is buying "
+      + "the price ignores (absorption); a new price high without a new CVD high is a buyer who stopped. "
+      + "Resets each session (or runs on). From the tick recorder.",
+    inputs: [{ key: "reset", label: "Reset", type: "select", def: "session", options: ["session", "none"] }],
+    plots: [{ key: "cvd", label: "CVD", color: "#26C6DA", kind: "candles" }],
+    compute: (c, inp, ctx) => {
+      const reset = str(inp.reset, "session") === "session";
+      const close: (number | null)[] = [];
+      const ohlc: ([number, number, number, number] | null)[] = [];
+      let run = 0, day = -1;
+      for (const k of c) {
+        const d = Math.floor(k.time / 86400);
+        if (reset && d !== day) {
+          run = 0;
+          day = d;
+        }
+        const f = ctx.flow?.get(k.time);
+        if (!f) {
+          close.push(null);
+          ohlc.push(null);
+          continue;
+        }
+        const o = run;
+        run += f[2];
+        const lo = o + (f[7] ?? Math.min(0, f[2])), hi = o + (f[8] ?? Math.max(0, f[2]));
+        ohlc.push([o, Math.max(hi, o, run), Math.min(lo, o, run), run]);
+        close.push(run);
+      }
+      return { plots: [close], candles: { 0: ohlc } };
     },
   },
   {
