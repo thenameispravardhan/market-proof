@@ -3,6 +3,7 @@
 // bars, HLC area, Kagi lines, Point & figure columns, and the order-flow
 // footprint (sell | buy volume per price beside a thin candle, Fyers-style).
 
+import { analyze, fpSettings, groupRows, rowStep, STAT_LABEL, STAT_ROW_PX, type FootprintSettings, type FpBarStats, type StatRow } from "./footprint";
 import type {
   CustomData,
   CustomSeriesOptions,
@@ -28,6 +29,10 @@ export interface OhlcItem extends CustomData<Time> {
   fp?: [number, number, number][];
   /** Session-cumulative delta up to and including this bar. */
   cd?: number;
+  /** The bar's order-flow statistics (the table at the pane's foot). */
+  st?: FpBarStats;
+  /** Big prints: [price, qty, side]. */
+  prints?: [number, number, number][];
 }
 
 /** 1 / 2 / 2.5 / 5 × 10^k at or above `x`: a readable footprint row height in price. */
@@ -39,15 +44,7 @@ export function niceStep(x: number): number {
 
 /** Group a bar's per-price buy / sell into rows of `step`, lowest first. */
 export function footprintRows(fp: [number, number, number][], step: number): { p: number; buy: number; sell: number }[] {
-  const rows = new Map<number, { p: number; buy: number; sell: number }>();
-  for (const [price, buy, sell] of fp) {
-    const p = Math.round(Math.floor(price / step + 1e-9) * step * 1e6) / 1e6;
-    const r = rows.get(p) ?? { p, buy: 0, sell: 0 };
-    r.buy += buy;
-    r.sell += sell;
-    rows.set(p, r);
-  }
-  return [...rows.values()].sort((a, b) => a.p - b.p);
+  return groupRows(fp, step);
 }
 
 export const fmtK = (v: number): string => {
@@ -61,6 +58,11 @@ export interface ShapeSeriesOptions extends CustomSeriesOptions {
   downColor: string;
   /** Point & figure box size. */
   box: number;
+  /** Footprint: its settings, the instrument's tick and colours. */
+  fp?: Partial<FootprintSettings>;
+  tick?: number;
+  textColor?: string;
+  pocColor?: string;
 }
 
 interface MediaScope {
@@ -68,11 +70,15 @@ interface MediaScope {
   mediaSize: { width: number; height: number };
 }
 
-function alpha(hex: string, a: number): string {
-  const m = /^#([0-9a-f]{6})$/i.exec((hex || "").trim());
-  if (!m) return hex;
-  const h = m[1];
-  return `rgba(${parseInt(h.slice(0, 2), 16)},${parseInt(h.slice(2, 4), 16)},${parseInt(h.slice(4, 6), 16)},${a})`;
+function alpha(color: string, a: number): string {
+  const c = (color || "").trim();
+  const m = /^#([0-9a-f]{6})$/i.exec(c);
+  if (m) {
+    const h = m[1];
+    return `rgba(${parseInt(h.slice(0, 2), 16)},${parseInt(h.slice(2, 4), 16)},${parseInt(h.slice(4, 6), 16)},${a})`;
+  }
+  const r = /^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)/i.exec(c);
+  return r ? `rgba(${r[1]},${r[2]},${r[3]},${a})` : c;
 }
 
 class ShapeRenderer implements ICustomSeriesPaneRenderer {
@@ -140,7 +146,7 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
         return;
       }
       if (o.mode === "footprint") {
-        this.footprint(ctx, bars, lo, hi, bs, Y, mediaSize.height);
+        this.footprint(ctx, bars, lo, hi, bs, Y, mediaSize.width, mediaSize.height);
         return;
       }
       let maxVol = 1;
@@ -203,73 +209,251 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
     });
   }
 
-  /** Order-flow footprint: a thin candle, sell volume per price row on its
-   *  left (red), buy on its right (green), shade ∝ the row's share of the
-   *  bar's busiest row; Δ and cumulative Δ above, sell / buy totals below.
-   *  A bar without recorded ticks is just the thin candle. */
-  private footprint(ctx: CanvasRenderingContext2D, bars: PaneRendererCustomData<Time, OhlcItem>["bars"], lo: number, hi: number, bs: number, Y: (p: number) => number | null, paneH: number): void {
+  /** Order-flow footprint, the ATAS / TradingView way: a thin candle on the left
+   *  of each bar, its traded volume per price row beside it (bid × ask, delta or
+   *  volume), diagonal imbalances in bold, the POC boxed, the value area as a bar
+   *  at the cells' left edge, stacked-imbalance zones extended to the right until
+   *  price trades back into them, big prints as bubbles and a statistics table
+   *  (volume, delta, delta %, CVD …) along the foot of the pane. */
+  private footprint(ctx: CanvasRenderingContext2D, bars: PaneRendererCustomData<Time, OhlcItem>["bars"], lo: number, hi: number, bs: number, Y: (p: number) => number | null, paneW: number, paneH: number): void {
     const o = this.opts!;
-    // Row height: ≥ 14 px of price, never finer than the data's own levels.
+    const fs = fpSettings(o.fp);
+    const tick = o.tick && o.tick > 0 ? o.tick : 0.05;
+    const up = o.upColor, down = o.downColor, text = o.textColor || "#D1D4DC", poc = o.pocColor || "#FFB300";
     let pxPer = 0;
     for (let i = lo; i < hi && !pxPer; i++) {
       const d = bars[i].originalData;
       const a = Y(d.high), b = Y(d.low);
       if (a !== null && b !== null && d.high > d.low) pxPer = Math.abs(b - a) / (d.high - d.low);
     }
-    const step = niceStep(pxPer > 0 ? 14 / pxPer : 0.05);
-    const bodyW = Math.max(2, Math.min(6, bs * 0.08));
-    const cellW = Math.max(0, (bs * 0.94 - bodyW) / 2 - 2);
-    const text = cellW >= 16;
-    // The per-bar Δ / volume summary sits in a fixed band at the foot of the pane
-    // (TradingView): drawn above / below each candle it ran into its neighbours' rows.
-    const sumY = paneH - 34;
-    const fits = (t: string, w: number) => ctx.measureText(t).width <= w - 2;
-    ctx.font = "10px sans-serif";
-    ctx.textAlign = "center";
+    const step = rowStep(tick, pxPer, fs.rowTicks);
+    const half = Math.max(1, bs * 0.47);
+    const statH = STAT_ROW_PX;
+    const statsTop = fs.stats.length && bs >= 2 ? paneH - fs.stats.length * statH - 2 : paneH;
+    const fits = (t: string, w: number) => ctx.measureText(t).width <= w - 3;
     ctx.textBaseline = "middle";
+    // statistics: one pass for the scale of each row (cell shade ∝ the visible max)
+    const maxVis: Record<string, number> = {};
     for (let i = lo; i < hi; i++) {
+      const st = bars[i].originalData.st;
+      if (!st) continue;
+      for (const k of fs.stats) maxVis[k] = Math.max(maxVis[k] ?? 0, Math.abs(statValue(k, st)));
+    }
+    const zones: { lo: number; hi: number; side: 1 | -1; x: number; i: number }[] = [];
+    const bubbles: { x: number; y: number; q: number; side: number }[] = [];
+    let maxPrint = 0;
+    const first = Math.max(0, lo - 150);              // zones that started off-screen still reach in
+    for (let i = first; i < hi; i++) {
       const b = bars[i];
       const d = b.originalData;
+      const visible = i >= lo;
       const yh = Y(d.high), yl = Y(d.low), yo = Y(d.open), yc = Y(d.close);
       if (yh === null || yl === null || yo === null || yc === null) continue;
-      const color = d.close >= d.open ? o.upColor : o.downColor;
-      ctx.fillStyle = color;
-      ctx.fillRect(b.x - 0.5, yh, 1, Math.max(1, yl - yh));
-      ctx.fillRect(b.x - bodyW / 2, Math.min(yo, yc), bodyW, Math.max(1, Math.abs(yc - yo)));
-      if (!d.fp?.length || cellW < 4) continue;
-      // Rows stay inside the candle: ticks recorded a hair outside the bar's own high / low
-      // (or a future's flow on an index) are folded into its edge rows.
-      const rows = footprintRows(d.fp.map(([p, b2, s2]) => [Math.min(d.high, Math.max(d.low, p)), b2, s2] as [number, number, number]), step);
-      const max = Math.max(1, ...rows.map((r) => Math.max(r.buy, r.sell)));
-      let buy = 0, sell = 0;
-      for (const r of rows) {
-        buy += r.buy;
-        sell += r.sell;
-        const yt = Y(r.p + step), yb = Y(r.p);
-        if (yt === null || yb === null) continue;
-        const y = Math.min(yt, yb) + 0.5, h = Math.max(1, Math.abs(yb - yt) - 1);
-        const cell = (x: number, v: number, c: string) => {
-          ctx.fillStyle = alpha(c, 0.18 + 0.72 * (v / max));
-          ctx.fillRect(x, y, cellW, h);
-          const t = fmtK(v);
-          if (text && h >= 9 && v > 0 && fits(t, cellW)) {
-            ctx.fillStyle = "#FFFFFF";
-            ctx.fillText(t, x + cellW / 2, y + h / 2);
-          }
-        };
-        cell(b.x - bodyW / 2 - 1 - cellW, r.sell, o.downColor);
-        cell(b.x + bodyW / 2 + 1, r.buy, o.upColor);
+      const left = b.x - half, right = b.x + half;
+      const candleX = bs >= 24 ? left + 3 : b.x;
+      const color = d.close >= d.open ? up : down;
+      if (visible) {
+        ctx.fillStyle = color;
+        ctx.fillRect(candleX - 0.5, yh, 1, Math.max(1, yl - yh));
+        const bodyW = bs >= 24 ? 3 : Math.max(1, Math.min(6, bs * 0.6));
+        ctx.fillRect(candleX - bodyW / 2, Math.min(yo, yc), bodyW, Math.max(1, Math.abs(yc - yo)));
       }
-      const delta = buy - sell;
-      const room = bs * 0.94;
-      const dt = fmtK(delta), vt = fmtK(buy + sell);
-      if (!fits(dt, room) || !fits(vt, room)) continue;
-      ctx.fillStyle = delta >= 0 ? o.upColor : o.downColor;
-      ctx.fillText(dt, b.x, sumY);
-      ctx.fillStyle = "#9E9E9E";
-      ctx.fillText(vt, b.x, sumY + 13);
+      if (!d.fp?.length) {
+        if (visible) this.statsCells(ctx, d, b.x, half, statsTop, statH, fs, maxVis, up, down, text);
+        continue;
+      }
+      const levels = d.fp.map(([p, b2, s2]) => [Math.min(d.high, Math.max(d.low, p)), b2, s2] as [number, number, number]);
+      const a = analyze(groupRows(levels, step), step, fs);
+      for (const z of a.zones) zones.push({ ...z, x: right, i });
+      if (!visible) continue;
+      const cx0 = bs >= 24 ? left + 8 : left, cx1 = right - 1;
+      const cw = cx1 - cx0;
+      if (cw >= 6) {
+        const rowPx = Math.abs((Y(a.rows[0].p + step) ?? 0) - (Y(a.rows[0].p) ?? 0));
+        const font = rowPx >= 13 ? 11 : rowPx >= 10 ? 10 : 9;
+        ctx.font = `${font}px sans-serif`;
+        const showText = rowPx >= 9;
+        for (const r of a.rows) {
+          const yt = Y(r.p + step), yb = Y(r.p);
+          if (yt === null || yb === null) continue;
+          const y = Math.min(yt, yb) + 0.5, h = Math.max(1, Math.abs(yb - yt) - 1);
+          const delta = r.buy - r.sell, vol = r.buy + r.sell;
+          const buyImb = a.buyImb.has(r.p), sellImb = a.sellImb.has(r.p);
+          if (fs.mode === "bidask") {
+            const w2 = cw / 2;
+            ctx.fillStyle = alpha(down, 0.1 + 0.55 * (r.sell / Math.max(1, a.maxSide)));
+            ctx.fillRect(cx0, y, w2 - 0.5, h);
+            ctx.fillStyle = alpha(up, 0.1 + 0.55 * (r.buy / Math.max(1, a.maxSide)));
+            ctx.fillRect(cx0 + w2 + 0.5, y, w2 - 0.5, h);
+            if (sellImb) this.edge(ctx, cx0, y, w2 - 0.5, h, down);
+            if (buyImb) this.edge(ctx, cx0 + w2 + 0.5, y, w2 - 0.5, h, up);
+            if (showText) {
+              const ts = fmtCell(r.sell), tb = fmtCell(r.buy);
+              if (fits(ts, w2) && fits(tb, w2)) {
+                ctx.textAlign = "right";
+                ctx.font = `${sellImb ? "bold " : ""}${font}px sans-serif`;
+                ctx.fillStyle = sellImb ? brighten(down) : text;
+                ctx.fillText(ts, cx0 + w2 - 3, y + h / 2);
+                ctx.textAlign = "left";
+                ctx.font = `${buyImb ? "bold " : ""}${font}px sans-serif`;
+                ctx.fillStyle = buyImb ? brighten(up) : text;
+                ctx.fillText(tb, cx0 + w2 + 3, y + h / 2);
+              }
+            }
+          } else if (fs.mode === "delta") {
+            ctx.fillStyle = alpha(delta >= 0 ? up : down, 0.12 + 0.7 * (Math.abs(delta) / Math.max(1, a.maxAbsDelta)));
+            ctx.fillRect(cx0, y, cw, h);
+            if (buyImb || sellImb) this.edge(ctx, cx0, y, cw, h, buyImb ? up : down);
+            const t = fmtCell(delta);
+            if (showText && fits(t, cw)) {
+              ctx.textAlign = "center";
+              ctx.fillStyle = text;
+              ctx.fillText(t, cx0 + cw / 2, y + h / 2);
+            }
+          } else {
+            const w = Math.max(1, cw * (vol / Math.max(1, a.maxVol)));
+            ctx.fillStyle = alpha(delta >= 0 ? up : down, 0.35);
+            ctx.fillRect(cx0, y, w, h);
+            const t = fmtCell(vol);
+            if (showText && fits(t, cw)) {
+              ctx.textAlign = "left";
+              ctx.fillStyle = text;
+              ctx.fillText(t, cx0 + 3, y + h / 2);
+            }
+          }
+          if (fs.poc && r.p === a.poc) {
+            ctx.strokeStyle = poc;
+            ctx.lineWidth = 1;
+            ctx.strokeRect(cx0 + 0.5, y, cw - 1, h);
+          }
+        }
+        if (fs.va && a.vah !== null && a.val !== null) {
+          const ya = Y(a.vah + step), yb = Y(a.val);
+          if (ya !== null && yb !== null) {
+            ctx.fillStyle = alpha(poc, 0.8);
+            ctx.fillRect(cx0 - 3, Math.min(ya, yb), 2, Math.abs(yb - ya));
+          }
+        }
+        if (fs.unfinished) {
+          ctx.fillStyle = text;
+          if (a.unfinishedHigh) this.dot(ctx, cx0 + cw / 2, (Y(a.rows[a.rows.length - 1].p + step) ?? yh) - 5);
+          if (a.unfinishedLow) this.dot(ctx, cx0 + cw / 2, (Y(a.rows[0].p) ?? yl) + 5);
+        }
+      }
+      if (fs.prints) {
+        for (const [p, q, side] of d.prints ?? []) {
+          const y = Y(p);
+          if (y === null) continue;
+          bubbles.push({ x: b.x, y, q, side });
+          maxPrint = Math.max(maxPrint, q);
+        }
+      }
+      this.statsCells(ctx, d, b.x, half, statsTop, statH, fs, maxVis, up, down, text);
+    }
+    // stacked imbalance zones: from their bar to the first later bar that trades back into them
+    for (const z of zones) {
+      const ya = Y(z.hi), yb = Y(z.lo);
+      if (ya === null || yb === null) continue;
+      let x1 = bars[hi - 1] ? bars[hi - 1].x + half : z.x;
+      for (let j = z.i + 1; j < hi; j++) {
+        const d = bars[j].originalData;
+        if (d.low < z.hi && d.high > z.lo) {
+          x1 = bars[j].x - half;
+          break;
+        }
+      }
+      if (x1 <= z.x) continue;
+      ctx.fillStyle = alpha(z.side > 0 ? up : down, 0.16);
+      ctx.fillRect(z.x, Math.min(ya, yb), x1 - z.x, Math.max(1, Math.abs(yb - ya)));
+      ctx.fillStyle = alpha(z.side > 0 ? up : down, 0.7);
+      ctx.fillRect(z.x, z.side > 0 ? Math.max(ya, yb) - 1 : Math.min(ya, yb), x1 - z.x, 1);
+    }
+    for (const bb of bubbles) {
+      const r = 3 + 11 * Math.sqrt(bb.q / Math.max(1, maxPrint));
+      ctx.beginPath();
+      ctx.arc(bb.x, bb.y, r, 0, Math.PI * 2);
+      ctx.fillStyle = alpha(bb.side >= 0 ? up : down, 0.35);
+      ctx.fill();
+      ctx.strokeStyle = alpha(bb.side >= 0 ? up : down, 0.9);
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+    // the statistics table's row names, on the pane's left edge
+    if (statsTop < paneH && fs.stats.length) {
+      ctx.font = "10px sans-serif";
+      ctx.textAlign = "left";
+      fs.stats.forEach((k, n) => {
+        const y = statsTop + n * statH;
+        const label = STAT_LABEL[k];
+        const w = ctx.measureText(label).width + 8;
+        ctx.fillStyle = "rgba(0,0,0,0.55)";
+        ctx.fillRect(0, y, w, statH - 1);
+        ctx.fillStyle = text;
+        ctx.fillText(label, 4, y + statH / 2);
+      });
+      ctx.fillStyle = "rgba(128,128,128,0.25)";
+      ctx.fillRect(0, statsTop - 1, paneW, 1);
     }
   }
+
+  private statsCells(ctx: CanvasRenderingContext2D, d: OhlcItem, x: number, half: number, top: number, h: number,
+    fs: FootprintSettings, maxVis: Record<string, number>, up: string, down: string, text: string): void {
+    const st = d.st;
+    if (!st || !fs.stats.length) return;
+    ctx.font = "10px sans-serif";
+    ctx.textAlign = "center";
+    fs.stats.forEach((k, n) => {
+      const v = statValue(k, st);
+      const y = top + n * h;
+      const signed = k !== "vol" && k !== "trades";
+      const base = !signed ? "#5C6BC0" : v >= 0 ? up : down;
+      ctx.fillStyle = alpha(base, 0.12 + 0.5 * (Math.abs(v) / Math.max(1e-9, maxVis[k] ?? 1)));
+      ctx.fillRect(x - half + 0.5, y, half * 2 - 1, h - 1);
+      const t = k === "dpct" ? `${v.toFixed(0)}%` : k === "oi" && st.oiChg == null ? "" : fmtCell(v);
+      if (t && ctx.measureText(t).width <= half * 2 - 4) {
+        ctx.fillStyle = text;
+        ctx.fillText(t, x, y + h / 2);
+      }
+    });
+  }
+
+  private edge(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, c: string): void {
+    ctx.strokeStyle = c;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x + 0.5, y + 0.5, Math.max(0, w - 1), Math.max(0, h - 1));
+  }
+
+  private dot(ctx: CanvasRenderingContext2D, x: number, y: number): void {
+    ctx.beginPath();
+    ctx.arc(x, y, 2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function statValue(k: StatRow, st: FpBarStats): number {
+  switch (k) {
+    case "vol": return st.vol;
+    case "delta": return st.delta;
+    case "dpct": return st.vol ? (st.delta / st.vol) * 100 : 0;
+    case "cvd": return st.cvd;
+    case "dmin": return st.dlo;
+    case "dmax": return st.dhi;
+    case "trades": return st.trades;
+    case "oi": return st.oiChg ?? 0;
+  }
+}
+
+/** Cell text: whole numbers below 10k, then K / L / Cr. */
+function fmtCell(v: number): string {
+  return Math.abs(v) < 10000 ? String(Math.round(v)) : fmtK(v);
+}
+
+/** A colour lifted for text on its own tint. */
+function brighten(hex: string): string {
+  const m = /^#([0-9a-f]{6})$/i.exec((hex || "").trim());
+  if (!m) return hex;
+  const c = [0, 2, 4].map((i) => Math.min(255, Math.round(parseInt(m[1].slice(i, i + 2), 16) * 1.25 + 30)));
+  return `rgb(${c[0]},${c[1]},${c[2]})`;
 }
 
 export class ShapeSeries implements ICustomSeriesPaneView<Time, OhlcItem, ShapeSeriesOptions> {

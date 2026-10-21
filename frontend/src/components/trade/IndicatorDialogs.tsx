@@ -377,7 +377,7 @@ export function IndicatorSettings({
                 <span className="cform-ctl">
                   <ColorInput value={st.color} fallback={p.color} onChange={(c) => setPlot(i, { color: c || p.color })} title={`${p.label} color`} />
                   {!marks && (
-                    <Sel value={kind} options={PLOT_KINDS} onChange={(k) => setPlot(i, { kind: k === (p.kind ?? "line") ? undefined : k })} ariaLabel={`${p.label} plot type`} />
+                    <Sel value={kind} options={p.kind === "candles" ? [{ v: "candles" as const, l: "Candles" }, ...PLOT_KINDS] : PLOT_KINDS} onChange={(k) => setPlot(i, { kind: k === (p.kind ?? "line") ? undefined : k })} ariaLabel={`${p.label} plot type`} />
                   )}
                   {!bar && !marks && (
                     <Sel value={st.width} options={[1, 2, 3, 4].map((w) => ({ v: w, l: `${w}px` }))} onChange={(w) => setPlot(i, { width: w })} ariaLabel={`${p.label} thickness`} />
