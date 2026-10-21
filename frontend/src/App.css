@@ -1144,6 +1144,9 @@ button.ghost:hover { border-color: var(--accent); }
   font-family: inherit;
 }
 .tab:hover { color: var(--text); background: var(--bg-surface); }
+/* Algo page: the tabs and the two actions beside them share one size. */
+.algo-tabs { align-items: center; flex-wrap: wrap; }
+.algo-tabs > button { height: 30px; padding: 0 14px; font-size: 11px; letter-spacing: 0.06em; line-height: 1; display: inline-flex; align-items: center; white-space: nowrap; }
 .tab.active {
   color: var(--accent);
   background: var(--bg-panel);
@@ -2501,6 +2504,33 @@ kbd {
 .chart-replay button:hover { border-color: #2962ff; }
 .chart-replay select { width: auto; padding: 1px 4px; font-size: 11px; }
 .chart-replay b { color: #2962ff; text-transform: uppercase; letter-spacing: 0.06em; }
+/* replay trading (ReplayTrader.tsx): the toolbar grows a ticket and the trade lists */
+.chart-replay { flex-direction: column; align-items: stretch; width: max-content; max-width: calc(100% - 16px); }
+.replay-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.rtrade { display: flex; flex-direction: column; gap: 4px; padding-top: 5px; border-top: 1px solid var(--border); min-width: 0; }
+.rtrade-ticket { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.rtrade .rt-num { width: 52px; padding: 1px 4px; font-size: 11px; }
+.rtrade .rt-lvl { width: 64px; }
+.rtrade .rt-lots { display: inline-flex; align-items: center; gap: 3px; color: var(--text-dim); }
+.chart-replay .rt-buy { background: #2962ff; border-color: #2962ff; color: #fff; font-weight: 700; }
+.chart-replay .rt-sell { background: var(--red); border-color: var(--red); color: #fff; font-weight: 700; }
+.chart-replay .rt-buy:hover, .chart-replay .rt-sell:hover { filter: brightness(1.15); color: #fff; }
+.rt-note, .rt-msg { font-size: 10.5px; color: var(--text-dim); }
+.rt-msg { color: var(--amber); }
+.rt-model { color: var(--amber); }
+.rt-real { color: var(--green); }
+.rt-sum { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-family: var(--mono); }
+.rtrade .up { color: var(--green); }
+.rtrade .down { color: var(--red); }
+.rt-tabs { margin-left: auto; display: inline-flex; gap: 3px; }
+.chart-replay .rt-tabs button.on { border-color: #2962ff; color: #2962ff; }
+.rt-list { max-height: 180px; overflow: auto; }
+.rt-list table { width: 100%; border-collapse: collapse; font-size: 10.5px; }
+.rt-list th, .rt-list td { padding: 2px 6px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--border-soft); }
+.rt-list th { color: var(--text-dim); font-weight: 600; position: sticky; top: 0; background: var(--bg-elev); }
+.rt-list td button { padding: 0 6px; }
+.rt-stats { display: flex; align-items: center; gap: 6px; padding: 2px 0 4px; flex-wrap: wrap; }
+.rt-stats button:first-of-type { margin-left: auto; }
 .chart-toast { display: flex; align-items: flex-start; gap: 8px; pointer-events: auto; }
 .chart-toast span { flex: 1; }
 .chart-toast .chart-menu-x { flex-shrink: 0; width: 18px; height: 18px; display: grid; place-items: center; padding: 0; border-radius: 3px; color: var(--amber); font-size: 12px; opacity: 0.85; cursor: pointer; }
