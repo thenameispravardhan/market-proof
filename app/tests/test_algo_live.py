@@ -483,3 +483,37 @@ def test_live_exit_rule_on_the_bar_close(monkeypatch, isolated_db):
     with dbs.SessionLocal() as db:
         t = db.query(AlgoTrade).one()
         assert t.status == "closed" and t.exit_reason == "RULE_PNL_PCT"
+
+
+def test_a_tick_through_the_target_exits_without_waiting_for_the_sweep(monkeypatch, isolated_db):
+    """The 1 s sweep still reads the old price; a streamed tick past the
+    target closes the position on that tick, and the runner log names the
+    strategy whose target it was."""
+    px = {"NSE:NIFTY50-INDEX": 24570.0, "NSE:NIFTYCE": 100.0, "NSE:NIFTYPE": 90.0}
+    broker = FakeBroker(net={"NSE:NIFTYCE": 65, "NSE:NIFTYPE": -65},
+                        fills={"NSE:NIFTYCE": 130.0, "NSE:NIFTYPE": 70.0})
+    _install(monkeypatch, broker, px)
+    sid = _strategy()
+    tid = _open_live_trade(sid)
+    with dbs.SessionLocal() as db:
+        db.get(AlgoStrategy, sid).enabled = False        # exits only: no new signals in this test
+        db.get(AlgoTrade, tid).target = 24600.0
+        db.commit()
+    r = rn.AlgoRunner()
+    now = T_CLOSE + 60
+    asyncio.run(r.tick(now))
+    assert _row_dict(tid)["status"] == "open"
+    assert {"NSE:NIFTY50-INDEX", "NSE:NIFTYCE", "NSE:NIFTYPE"} <= r._watch
+
+    r.on_quote(SimpleNamespace(symbol="NSE:RELIANCE-EQ", last_price=1.0, extra={}))   # not held: ignored
+    r.on_quote(SimpleNamespace(symbol="NSE:NIFTYCE", last_price=999.0, extra={"simulated": True}))  # paper fake
+    assert not r._dirty
+    for sym, p in {"NSE:NIFTY50-INDEX": 24610.0, "NSE:NIFTYCE": 130.0, "NSE:NIFTYPE": 70.0}.items():
+        r.on_quote(SimpleNamespace(symbol=sym, last_price=p, extra={}))
+    r._live_px = {k: (p, now) for k, (p, _) in r._live_px.items()}   # received "now" on the test clock
+    asyncio.run(r.on_ticks(now + 0.3))
+
+    t = _row_dict(tid)
+    assert t["status"] == "closed" and t["exit_reason"] == "TARGET"
+    assert r.last_tick_exit == now + 0.3
+    assert any(e["msg"].startswith("live-spread: TARGET") and e.get("strategy_id") == sid for e in r.events)

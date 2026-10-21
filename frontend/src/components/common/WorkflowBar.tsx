@@ -6,10 +6,10 @@
 //
 // Each chip carries a status dot (ok / warn / err / off) and a one-word
 // detail, and clicking it jumps to the page that controls that stage.
-// The bar renders on EVERY page, so the operator always sees where the
-// pipeline is healthy and where it is switched off — e.g. the AI master
-// toggle silently OFF (which once cost 3,386 skipped filings) now shows
-// as a red chip on every screen.
+// The bar renders on the Dashboard only (other pages need the vertical
+// room), so the operator sees there where the pipeline is healthy and where
+// it is switched off — e.g. the AI master toggle silently OFF (which once
+// cost 3,386 skipped filings) shows as a red chip.
 //
 // Data comes from existing polling hooks only — no new backend load
 // beyond what the Dashboard already generates.
