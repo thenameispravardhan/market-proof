@@ -36,10 +36,3 @@ export function toggleTheme(): AppTheme {
   setTheme(next);
   return next;
 }
-
-/** The Trade page's TradingView skin (tvskin.css) on <html>; the charts re-read their colours. */
-export function setSkin(on: boolean): void {
-  if (typeof document === "undefined") return;
-  document.documentElement.classList.toggle("tv-skin", on);
-  window.dispatchEvent(new Event(THEME_EVENT));
-}
