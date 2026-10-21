@@ -43,6 +43,7 @@ import {
   LineSeries,
   LineStyle,
   PriceScaleMode,
+  type AutoscaleInfo,
   type IChartApi,
   type IPriceLine,
   type ISeriesApi,
@@ -109,6 +110,7 @@ import {
   type IndicatorInstance,
   type Mark,
   type PlotKind,
+  type FlowTuple,
 } from "./indicatorCatalog";
 import { symbolInputs, volumeProfileRows } from "./indicatorMore";
 import { FillPrimitive, paintOiProfile, paintProfile, type FillBand, type OiStrike } from "./indicatorRender";
@@ -135,6 +137,7 @@ import {
   type ToolGroupId,
 } from "./drawings";
 import { ShapeSeries, type ShapeMode } from "./customSeries";
+import { candleAt, flowByCandle, footprintByCandle, fpSettings, sessionBasis, sessionCvd, STAT_LABEL, STAT_ROW_PX, type FlowBar, type FootprintSettings, type StatRow } from "./footprint";
 import { beep, evaluate, migrateAlert, newAlert, type AlertItem } from "./alerts";
 import { chartFocus, drawingClipboard, indicatorClipboard, NO_SYNC, publishSync, pushLog, subscribeSync, type SyncFlags } from "./chartSync";
 import { LIGHT, brickInputs, loadSettings, saveSettings, type BrickKind, type ChartSettings } from "./chartSettings";
@@ -195,6 +198,12 @@ export const CHART_KINDS: { id: ChartKind; label: string; icon: string }[] = [
 ];
 
 const BRICK_KINDS = new Set<ChartKind>(["renko", "linebreak", "kagi", "pnf", "range"]);
+/** Indicators that read recorded order flow (they switch the flow loader on). */
+const FLOW_TYPES = new Set(["flow", "flowpressure", "cvd"]);
+/** Indicators whose values are share counts: shown as 18.6K / 1.2M rather than 18600.00. */
+const VOLUME_TYPES = new Set(["volume", "obv", "flow", "oi", "cvd"]);
+/** Candles of footprint detail loaded (the latest): enough to scroll, light to refresh. */
+const FOOTPRINT_BARS = 400;
 const CUSTOM_MODE: Partial<Record<ChartKind, ShapeMode>> = {
   volcandles: "volcandles",
   hlcbars: "hlc",
@@ -944,6 +953,8 @@ export default function ChartPanel(props: ChartPanelProps) {
   const [tradeFly, setTradeFly] = useState<{ x: number; y: number } | null>(null);
   const [levelDrag, setLevelDrag] = useState<"sl" | "tp" | null>(null);
   const [replay, setReplayState] = useState({ on: false, selecting: false, playing: false, speed: 1, idx: 0 });
+  /** The footprint settings bar is expanded. */
+  const [fpOpen, setFpOpen] = useState(false);
   /** Fills / exits of the replay's simulated trades, drawn as bar marks. */
   const [replayMarks, setReplayMarks] = useState<ReplayMark[]>([]);
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
@@ -1101,9 +1112,12 @@ export default function ChartPanel(props: ChartPanelProps) {
   const prevLtpRef = useRef<number | null>(null);
   const prevVolRef = useRef<number | null>(null);
   const toastSeqRef = useRef(0);
-  const flowRef = useRef<Map<number, [number, number, number]>>(new Map());
-  /** Footprint per bar (chart time): per-price [price, buy, sell] + session cumulative delta. */
-  const fpRef = useRef<Map<number, { fp: [number, number, number][]; cd: number }>>(new Map());
+  /** Recorded order flow per candle (chart time): [buy, sell, delta, trades, unk, oi, close, dlo, dhi]. */
+  const flowRef = useRef<Map<number, FlowTuple>>(new Map());
+  /** Session-cumulative delta per candle. */
+  const cvdRef = useRef<Map<number, number>>(new Map());
+  /** Footprint per candle: [price, buy, sell] levels and big prints [price, qty, side]. */
+  const fpRef = useRef<Map<number, { fp: [number, number, number][]; prints: [number, number, number][] }>>(new Map());
   /** Bar spacing from before the footprint widened it; restored on leaving. */
   const fpSpacingRef = useRef<number | null>(null);
   const markersRef = useRef<{ detach: () => void; setMarkers: (m: never[]) => void } | null>(null);
@@ -1789,7 +1803,7 @@ export default function ChartPanel(props: ChartPanelProps) {
           .map((p, k) => {
             if (p.kind === "marks" || !inst.plots[k]?.visible || indHasDataRef.current.get(uid)?.[k] === false) return "";
             const v = vals[k]?.[i];
-            const txt = v == null ? "∅" : inst.type === "volume" || inst.type === "obv" || inst.type === "flow" || inst.type === "oi" ? fmtVol(v) : fmtNum(v, prec);
+            const txt = v == null ? "∅" : VOLUME_TYPES.has(inst.type) ? fmtVol(v) : fmtNum(v, prec);
             return `<b style="color:${inst.plots[k].color}">${txt}</b>`;
           })
           .join(" ") +
@@ -1875,7 +1889,16 @@ export default function ChartPanel(props: ChartPanelProps) {
     const col = colorsRef.current;
     if (LINE_KINDS.has(k)) return { time: c.time, value: c.close };
     if (k === "columns") return { time: c.time, value: c.close, color: c.close >= (prev?.close ?? c.open) ? col.up : col.down };
-    if (k === "footprint") return { time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume, ...fpRef.current.get(c.time) };
+    if (k === "footprint") {
+      const f = fpRef.current.get(c.time);
+      const fl = flowRef.current.get(c.time);
+      const prevOi = prev ? flowRef.current.get(prev.time)?.[5] ?? null : null;
+      const st = fl ? {
+        vol: fl[0] + fl[1], delta: fl[2], trades: fl[3] ?? 0, dlo: fl[7] ?? Math.min(0, fl[2]), dhi: fl[8] ?? Math.max(0, fl[2]),
+        oi: fl[5] ?? null, oiChg: fl[5] != null && prevOi != null ? fl[5] - prevOi : null, cvd: cvdRef.current.get(c.time) ?? 0,
+      } : undefined;
+      return { time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume, fp: f?.fp, prints: f?.prints, st };
+    }
     if (CUSTOM_MODE[k]) return { time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume, flag: c.flag };
     const base = { time: c.time, open: c.open, high: c.high, low: c.low, close: c.close };
     if (k === "hollow") {
@@ -2022,7 +2045,7 @@ export default function ChartPanel(props: ChartPanelProps) {
           priceLineVisible: false,
           title: kind !== "marks" && s.indNameLabels ? (def.plots.length > 1 ? `${def.short} ${pd.label}` : def.short) : "",
           priceScaleId: scaleId,
-          priceFormat: inst.type === "volume" ? { type: "volume" } : { type: "price", precision: prec, minMove: 10 ** -prec },
+          priceFormat: inst.type === "volume" || inst.type === "cvd" ? { type: "volume" } : { type: "price", precision: prec, minMove: 10 ** -prec },
           ...((scalePriceOnlyRef.current && def.overlay && !def.ownScale) || kind === "marks" ? { autoscaleInfoProvider: () => null } : {}),
         };
         const lineCommon = {
@@ -2032,7 +2055,12 @@ export default function ChartPanel(props: ChartPanelProps) {
           crosshairMarkerVisible: false,
         };
         let series: ISeriesApi<SeriesType> | undefined;
-        if (kind === "hist" || kind === "columns") {
+        if (kind === "candles") {
+          const cols = colorsRef.current;
+          series = safe(() => chart.addSeries(CandlestickSeries, {
+            ...common, upColor: cols.up, downColor: cols.down, borderVisible: false, wickUpColor: cols.up, wickDownColor: cols.down,
+          }, p) as ISeriesApi<SeriesType>);
+        } else if (kind === "hist" || kind === "columns") {
           series = safe(() => chart.addSeries(HistogramSeries, { ...common, color: st.color }, p) as ISeriesApi<SeriesType>);
         } else if (kind === "area") {
           series = safe(() =>
@@ -2229,6 +2257,7 @@ export default function ChartPanel(props: ChartPanelProps) {
         const kind = inst.plots[e.plot]?.kind ?? def.plots[e.plot]?.kind ?? "line";
         const data: Record<string, unknown>[] = [];
         let started = false;
+        const ohlc = kind === "candles" ? res.candles?.[e.plot] : undefined;
         for (let i = 0; i < vals.length; i++) {
           const j = i + sh;
           if (j < 0) continue;
@@ -2240,6 +2269,11 @@ export default function ChartPanel(props: ChartPanelProps) {
             continue;
           }
           started = true;
+          const k4 = ohlc?.[i];
+          if (ohlc) {
+            if (k4) data.push({ time: t, open: k4[0], high: k4[1], low: k4[2], close: k4[3] });
+            continue;
+          }
           data.push(colors && colors[i] ? { time: t, value: v, color: colors[i] } : { time: t, value: v });
         }
         safe(() => e.series.setData(data as never));
@@ -3566,6 +3600,18 @@ export default function ChartPanel(props: ChartPanelProps) {
       bottomLineColor: c.down, bottomFillColor1: withAlpha(c.down, 0.03, c.down), bottomFillColor2: withAlpha(c.down, 0.25, c.down), lineWidth: 2,
     });
     else if (k === "columns") Object.assign(opts, { color: c.up });
+    else if (k === "footprint") {
+      const fp = fpSettings(s.footprint);
+      // autoscale keeps the lowest cells above the statistics table at the pane's foot
+      const below = fp.stats.length ? fp.stats.length * STAT_ROW_PX + 6 : 0;
+      Object.assign(opts, {
+        upColor: c.up, downColor: c.down, fp, tick: tickRef.current, textColor: c.text,
+        autoscaleInfoProvider: (orig: () => AutoscaleInfo | null) => {
+          const r = orig();
+          return r && { ...r, margins: { above: r.margins?.above ?? 0, below: Math.max(r.margins?.below ?? 0, below) } };
+        },
+      });
+    }
     else if (CUSTOM_MODE[k]) Object.assign(opts, { upColor: c.up, downColor: c.down });
     safe(() => main.applyOptions(opts));
   }
@@ -3749,100 +3795,102 @@ export default function ChartPanel(props: ChartPanelProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 4b) Real order flow from the tick recorder, polled while it is on.
-  const flowOn = indicators.some((i) => i.type === "flow" && i.visible);
+  // 4b) Recorded order flow (app/algo/ticks.py) for the flow indicators and the
+  //     footprint: the whole loaded range once a minute, the last two candles
+  //     every 3 s (the forming bar moves like a live footprint). The server's
+  //     base-resolution rows fold into this chart's candles, so a 4-minute or a
+  //     weekly chart gets every bar's flow, not just the ones whose start lines up.
+  const flowOn = indicators.some((i) => FLOW_TYPES.has(i.type) && i.visible);
+  const flowWanted = flowOn || chartKind === "footprint";
   useEffect(() => {
-    if (!flowOn) {
-      flowRef.current = new Map();
+    flowRef.current = new Map();
+    cvdRef.current = new Map();
+    fpRef.current = new Map();
+    if (!flowWanted) {
       setFlowNote("");
       return;
     }
     let stop = false;
+    let lastFull = 0;
+    let firstT = 0;
     const load = async () => {
       const c = candlesRef.current;
+      if (!c.length || statusRef.current !== "ready") return;
       const now = Math.floor(Date.now() / 1000);
-      const from = c.length ? c[0].time - IST : now - 5 * 86400;
+      const fpOn = kindRef.current === "footprint";
+      const full = Date.now() - lastFull > 60_000 || c[0].time !== firstT;
+      const times = c.map((k) => k.time as number);
       const res = fetchPlan(ivRef.current).res;
+      const resolution = /^\d+$/.test(res) || res === "D" ? res : "1";        // seconds charts read minute flow
+      const get = async (from: number, footprint: boolean) => {
+        const q = new URLSearchParams({ symbol, resolution, from: String(from), to: String(now + 60) });
+        if (footprint) { q.set("footprint", "true"); q.set("prints", "true"); }
+        const r = await fetch(`/api/algo/ticks/flow?${q.toString()}`);
+        if (!r.ok) throw new Error(String(r.status));
+        return r.json() as Promise<{ key: string; recorded: boolean; bars?: number[][]; footprint?: number[][]; prints?: number[][] }>;
+      };
       try {
-        const r = await fetch(`/api/algo/ticks/flow?symbol=${encodeURIComponent(symbol)}&resolution=${res}&from=${from}&to=${now + 60}`);
-        const j = await r.json();
+        const start = full ? 0 : Math.max(0, c.length - 2);
+        const j = await get(times[start] - IST, fpOn && !full);
+        const fj = fpOn && full ? await get(times[Math.max(0, c.length - FOOTPRINT_BARS)] - IST, true) : fpOn ? j : null;
         if (stop) return;
-        flowRef.current = new Map((j.bars ?? []).map((b: number[]) => [b[0] + IST, [b[1], b[2], b[3]] as [number, number, number]]));
-        setFlowNote(j.recorded ? `real flow: ${j.key}` : `no ticks recorded for ${j.key} yet — add it on Algo Lab › Data`);
+        const fresh = flowByCandle(times, j.bars ?? [], IST);
+        if (full) flowRef.current = new Map();
+        for (const t of times.slice(start)) flowRef.current.delete(t);
+        for (const [t, f] of fresh) flowRef.current.set(t, [f.buy, f.sell, f.delta, f.trades, f.unk, f.oi, f.close, f.dlo, f.dhi]);
+        cvdRef.current = sessionCvd(times, new Map([...flowRef.current].map(([t, f]) => [t, { delta: f[2] } as FlowBar])));
+        if (fj) {
+          // An index has no trades: its flow is the FUTURE's, at futures prices — each session's rows
+          // shift by that session's basis (futures − index, the median over its candles), snapped to the tick.
+          const proxy = symbol.toUpperCase().endsWith("-INDEX");
+          const basis = proxy
+            ? sessionBasis(c.map((k) => ({ time: k.time as number, close: k.close })),
+              new Map([...flowRef.current].map(([t, f]) => [t, { close: f[6] ?? null } as FlowBar])))
+            : null;
+          const tick = tickRef.current;
+          const shift = (t: number, p: number) => {
+            const b = basis?.get(Math.floor(t / 86400));
+            return b == null ? p : Math.round((p - b) / tick) * tick;
+          };
+          const fpBy = footprintByCandle(times, fj.footprint ?? [], IST);
+          const prints = new Map<number, [number, number, number][]>();
+          for (const [ts, p, q, sd] of fj.prints ?? []) {
+            const i = candleAt(times, ts + IST);
+            if (i >= 0) prints.set(times[i], [...(prints.get(times[i]) ?? []), [shift(times[i], p), q, sd]]);
+          }
+          if (full) fpRef.current = new Map();
+          const from = full ? Math.max(0, c.length - FOOTPRINT_BARS) : start;
+          for (const t of times.slice(from)) {
+            const m = fpBy.get(t);
+            if (!m) {
+              fpRef.current.delete(t);
+              continue;
+            }
+            fpRef.current.set(t, { fp: [...m].map(([p, [b, sl]]) => [shift(t, p), b, sl] as [number, number, number]), prints: prints.get(t) ?? [] });
+          }
+          setFlowNote(j.recorded ? `order flow: ${j.key}${proxy ? " (the future's flow, shifted onto the index by the basis)" : ""}`
+            : `no order flow recorded for ${j.key} yet — Algo Lab › Data records it`);
+        } else {
+          setFlowNote(j.recorded ? `order flow: ${j.key}` : `no order flow recorded for ${j.key} yet — Algo Lab › Data records it`);
+        }
+        if (full) {
+          lastFull = Date.now();
+          firstT = times[0];
+        }
+        if (kindRef.current === "footprint") setMainData();
         refreshIndicatorData();
       } catch {
         if (!stop) setFlowNote("order-flow fetch failed");
       }
     };
     void load();
-    const id = setInterval(load, 15000);
+    const id = setInterval(load, 3000);
     return () => {
       stop = true;
       clearInterval(id);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [flowOn, symbol, iv, reloadNonce]);
-
-  // 4b') Footprint chart type: per-price buy / sell per bar from the tick
-  //      recorder, polled while it's the chart type.
-  useEffect(() => {
-    fpRef.current = new Map();
-    if (chartKind !== "footprint") return;
-    let stop = false;
-    const load = async () => {
-      const c = candlesRef.current;
-      const now = Math.floor(Date.now() / 1000);
-      const from = c.length ? c[0].time - IST : now - 5 * 86400;
-      const res = fetchPlan(ivRef.current).res;
-      try {
-        const r = await fetch(`/api/algo/ticks/flow?symbol=${encodeURIComponent(symbol)}&resolution=${res}&from=${from}&to=${now + 60}&footprint=true`);
-        const j = await r.json();
-        if (stop) return;
-        const fp = new Map<number, { fp: [number, number, number][]; cd: number }>();
-        for (const [t, p, b, s] of (j.footprint ?? []) as number[][]) {
-          const k = t + IST;
-          const e = fp.get(k) ?? { fp: [], cd: 0 };
-          e.fp.push([p, b, s]);
-          fp.set(k, e);
-        }
-        // An index has no trades: its flow is the FUTURE's (j.key), at futures prices ~basis away from
-        // the index candles. Each bar's rows shift by that bar's basis (index typical price − the future's
-        // volume-weighted price) so the footprint sits on the candle instead of floating above it.
-        const proxy = symbol.toUpperCase().endsWith("-INDEX");
-        if (proxy) {
-          const byT = new Map(candlesRef.current.map((c) => [c.time as number, c]));
-          for (const [k, e] of fp) {
-            const c = byT.get(k);
-            const vol = e.fp.reduce((a, [, b, s2]) => a + b + s2, 0);
-            if (!c || !vol) continue;
-            const vwap = e.fp.reduce((a, [p, b, s2]) => a + p * (b + s2), 0) / vol;
-            const shift = (c.high + c.low + c.close) / 3 - vwap;
-            e.fp = e.fp.map(([p, b, s2]) => [p + shift, b, s2]);
-          }
-        }
-        // Cumulative delta restarts each session.
-        let day = -1, cum = 0;
-        for (const k of [...fp.keys()].sort((a, b) => a - b)) {
-          const e = fp.get(k)!;
-          if (Math.floor(k / 86400) !== day) { day = Math.floor(k / 86400); cum = 0; }
-          cum += e.fp.reduce((a, [, b, s]) => a + b - s, 0);
-          e.cd = cum;
-        }
-        fpRef.current = fp;
-        setFlowNote(j.recorded ? `footprint: ${j.key}${proxy ? " (futures flow, on the index)" : ""}` : `no ticks recorded for ${j.key} yet — add it on Algo Lab › Data`);
-        setMainData();
-      } catch {
-        if (!stop) setFlowNote("footprint fetch failed");
-      }
-    };
-    void load();
-    const id = setInterval(load, 15000);
-    return () => {
-      stop = true;
-      clearInterval(id);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chartKind, symbol, iv, reloadNonce]);
+  }, [flowWanted, chartKind, symbol, iv, reloadNonce]);
 
   // 4c) Corporate events (dividends / splits / earnings / bonus) from the
   //     filed announcements.
@@ -4921,7 +4969,7 @@ ${hh ? `${hh}:${String(mm).padStart(2, "0")}` : mm}:${String(ss).padStart(2, "0"
       def.plots.forEach((pd, k) => {
         const val = vals?.[k]?.[i];
         if (pd.kind === "marks" || !inst.plots[k]?.visible || val == null) return;
-        parts.push([inst.type === "volume" ? fmtVol(val) : fmtNum(val, prec), inst.plots[k].color]);
+        parts.push([VOLUME_TYPES.has(inst.type) ? fmtVol(val) : fmtNum(val, prec), inst.plots[k].color]);
       });
       line(parts);
       if (y > head + canvas.height * 0.45) break;
@@ -5439,7 +5487,7 @@ ${hh ? `${hh}:${String(mm).padStart(2, "0")}` : mm}:${String(ss).padStart(2, "0"
             ...def.plots.filter((p, k) => p.kind !== "marks" && indHasDataRef.current.get(inst.uid)?.[k] !== false).map((p) => {
               const k = def.plots.indexOf(p);
               const x = vals[k]?.[i];
-              return { label: p.label, value: x == null ? "∅" : inst.type === "volume" || inst.type === "obv" || inst.type === "oi" ? fmtVol(x) : fmtNum(x, inst.precision ?? 2), color: inst.plots[k]?.color };
+              return { label: p.label, value: x == null ? "∅" : VOLUME_TYPES.has(inst.type) ? fmtVol(x) : fmtNum(x, inst.precision ?? 2), color: inst.plots[k]?.color };
             }),
             ...marks.map((m) => ({ label: "Signal", value: m.title ?? m.text ?? "●", color: m.color })),
           ],
@@ -6478,7 +6526,7 @@ ${hh ? `${hh}:${String(mm).padStart(2, "0")}` : mm}:${String(ss).padStart(2, "0"
                     <span className="lg-acts"><button type="button" title="Clear the strategy's marks" onClick={() => setStrat(null)}>✕</button></span>
                   </div>
                 )}
-                {(flowOn || chartKind === "footprint") && flowNote && <div className="lg-row hint">{flowNote}</div>}
+                {flowWanted && flowNote && <div className="lg-row hint" data-testid="chart-flow-note">{flowNote}</div>}
               </>
             )}
             {/* Always-visible arrow: with many indicators the legend covers the chart — ⌃ hides them, ⌄ N brings them back. */}
@@ -6666,6 +6714,49 @@ ${hh ? `${hh}:${String(mm).padStart(2, "0")}` : mm}:${String(ss).padStart(2, "0"
               {selDrawing.locked || lockAll ? "locked — unlock to move" : "drag to move, drag a handle to resize, Ctrl+drag clones, double-click edits, Delete removes"}
             </div>
           )}
+          {chartKind === "footprint" && (() => {
+            const fs = fpSettings(settings.footprint);
+            const setFs = (patch: Partial<FootprintSettings>) => changeSettings({ ...settings, footprint: { ...fs, ...patch } });
+            return (
+              <div className={`fp-bar chart-overlay-ui${fpOpen ? " open" : ""}`} data-testid="fp-bar" onMouseDown={(e) => e.stopPropagation()}>
+                <button type="button" className="fp-chip" onClick={() => setFpOpen(!fpOpen)} title="Footprint settings" data-testid="fp-toggle">Footprint ⚙</button>
+                {fpOpen && (
+                  <>
+                    <span className="fp-seg" role="group" aria-label="Footprint style">
+                      {([["bidask", "Bid × Ask"], ["delta", "Delta"], ["volume", "Volume"]] as const).map(([m, l]) => (
+                        <button key={m} type="button" className={fs.mode === m ? "on" : ""} onClick={() => setFs({ mode: m })} data-testid={`fp-mode-${m}`}>{l}</button>
+                      ))}
+                    </span>
+                    <label title="Ticks per row (Auto keeps rows readable at any zoom)">Row
+                      <select value={fs.rowTicks} onChange={(e) => setFs({ rowTicks: Number(e.target.value) })} aria-label="Row size">
+                        {[0, 1, 2, 5, 10, 20, 50, 100].map((n) => <option key={n} value={n}>{n ? `${n} tick${n > 1 ? "s" : ""}` : "Auto"}</option>)}
+                      </select>
+                    </label>
+                    <label title="Diagonal imbalance: buying at a row vs selling one row below (and the mirror) at least this many times over">Imbalance
+                      <select value={fs.imbalance} onChange={(e) => setFs({ imbalance: Number(e.target.value) })} aria-label="Imbalance ratio" data-testid="fp-imbalance">
+                        {[0, 1.5, 2, 2.5, 3, 4, 5].map((n) => <option key={n} value={n}>{n ? `${n * 100}%` : "Off"}</option>)}
+                      </select>
+                    </label>
+                    <label title="Imbalances in a row that make a zone (extended until price trades back into it)">Stacked
+                      <select value={fs.stacked} onChange={(e) => setFs({ stacked: Number(e.target.value) })} aria-label="Stacked imbalances">
+                        {[0, 2, 3, 4, 5].map((n) => <option key={n} value={n}>{n || "Off"}</option>)}
+                      </select>
+                    </label>
+                    {([["poc", "POC"], ["va", "Value area"], ["prints", "Big prints"], ["unfinished", "Unfinished auctions"]] as const).map(([k, l]) => (
+                      <label key={k} className="fp-check"><input type="checkbox" checked={fs[k]} onChange={(e) => setFs({ [k]: e.target.checked })} />{l}</label>
+                    ))}
+                    <span className="fp-stats" title="The statistics table at the foot of the chart">
+                      {(Object.keys(STAT_LABEL) as StatRow[]).map((k) => (
+                        <label key={k} className="fp-check"><input type="checkbox" checked={fs.stats.includes(k)}
+                          onChange={(e) => setFs({ stats: e.target.checked ? (Object.keys(STAT_LABEL) as StatRow[]).filter((x) => x === k || fs.stats.includes(x)) : fs.stats.filter((x) => x !== k) })}
+                          data-testid={`fp-stat-${k}`} />{STAT_LABEL[k]}</label>
+                      ))}
+                    </span>
+                  </>
+                )}
+              </div>
+            );
+          })()}
           {replay.on && !replay.selecting && (
             <div className="chart-replay chart-overlay-ui" data-testid="chart-replay" onMouseDown={(e) => e.stopPropagation()}>
               <div className="replay-row">

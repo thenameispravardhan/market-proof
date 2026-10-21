@@ -265,34 +265,19 @@ async def lifespan(app: FastAPI):
     # time. No-op until a live Fyers account is connected.
     from app.api.market import INDICES as _INDICES
 
-    from app.algo.ticks import recorder as _get_recorder
     from app.api import practice as _practice
     from app.api.ws import watched_symbols as _ws_watched
 
-    _tick_recorder = _get_recorder()
     fyers_stream = FyersStreamManager(
         market_data=execution_manager.market_data,
         quote_feed=quote_feed,
         # Keep the index symbols streaming all session so the status-bar
         # ticker is sub-second, not REST-polled.
         always_subscribe=[idx["symbol"] for idx in _INDICES],
-        extra_symbols=lambda: [s for s in _tick_recorder.symbols() + _ws_watched() + _practice.live_symbols()
-                               if not s.startswith("CRYPTO:")],
+        extra_symbols=lambda: [s for s in _ws_watched() + _practice.live_symbols() if not s.startswith("CRYPTO:")],
     )
-    # Real order flow: every frame for a recorded symbol is classified and
-    # kept (app/algo/ticks.py). Only symbols on the recorder's list.
-    _rec_ids: dict[str, float] = {"ts": 0.0}
-    _rec_set: set[str] = set()
-
-    def _record_tick(full: str, msg: dict, recv: float) -> None:
-        if recv - _rec_ids["ts"] > 30:          # refresh the cheap membership set
-            _rec_set.clear()
-            _rec_set.update(s.upper() for s in _tick_recorder.symbols())
-            _rec_ids["ts"] = recv
-        if full.upper() in _rec_set:
-            _tick_recorder.on_tick(full, msg, recv)
-
-    fyers_stream.tick_listeners.append(_record_tick)
+    # Real order flow is recorded by its own process (app/algo/flowd.py, its own
+    # Fyers socket): thousands of symbols there can't slow this feed down.
 
     # Bridge every market-data tick onto the /ws event bus so the dashboard
     # gets sub-second price pushes instead of polling REST. Publishing to a
@@ -548,7 +533,10 @@ async def lifespan(app: FastAPI):
         from app.algo.runner import AlgoRunner
 
         app.state.algo_runner = AlgoRunner()
-        tick_task = asyncio.create_task(_tick_recorder.run(), name="tick-recorder")
+        from app.algo.flowd import Supervisor as _FlowSupervisor
+
+        app.state.flow_supervisor = _FlowSupervisor()
+        tick_task = asyncio.create_task(app.state.flow_supervisor.run(), name="flow-collector")
         algo_task = asyncio.create_task(app.state.algo_runner.run(), name="algo-runner")
         app.state.algo_task = algo_task
 
@@ -596,6 +584,8 @@ async def lifespan(app: FastAPI):
                         await _t
                     except (asyncio.CancelledError, Exception):  # noqa: BLE001
                         pass
+            if getattr(app.state, "flow_supervisor", None) is not None:
+                await app.state.flow_supervisor.stop()
             # Stop the producers first so consumers drain cleanly.
             await monitor_manager.stop()
             analyzer_service.stop()
