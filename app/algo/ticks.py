@@ -347,7 +347,9 @@ class TickRecorder:
         s[4] += unk
         s[5] = exch_ts
         self.frames += 1
-        if len(self.lag) < 2000:
+        if q > 0 and len(self.lag) < 2000:
+            # only a trade's stamp is fresh: a quote-only frame or a subscribe snapshot
+            # carries the contract's last update (hours old for a quiet option)
             self.lag.append(recv_ts - exch_ts)
         if key in self.raw_keys:
             self._raw.setdefault(key, []).append((recv_ts, exch_ts, ltp, vol, dv, side, bid, ask, bsz, asz, tbq, tsq,

@@ -6742,8 +6742,10 @@ ${hh ? `${hh}:${String(mm).padStart(2, "0")}` : mm}:${String(ss).padStart(2, "0"
                         {[0, 2, 3, 4, 5].map((n) => <option key={n} value={n}>{n || "Off"}</option>)}
                       </select>
                     </label>
-                    {([["poc", "POC"], ["va", "Value area"], ["prints", "Big prints"], ["unfinished", "Unfinished auctions"]] as const).map(([k, l]) => (
-                      <label key={k} className="fp-check"><input type="checkbox" checked={fs[k]} onChange={(e) => setFs({ [k]: e.target.checked })} />{l}</label>
+                    {([["poc", "POC", ""], ["va", "Value area", ""], ["prints", "Big prints", ""], ["unfinished", "Unfinished auctions", ""],
+                      ["profile", "Profile", "Volume profile of the visible bars on the right, with its POC line"],
+                      ["signals", "Signals", "A = absorption (heavy aggression at the high / low that price rejected), D = delta divergence (new high on negative delta, new low on positive)"]] as const).map(([k, l, tip]) => (
+                      <label key={k} className="fp-check" title={tip || undefined}><input type="checkbox" checked={fs[k]} onChange={(e) => setFs({ [k]: e.target.checked })} data-testid={`fp-opt-${k}`} />{l}</label>
                     ))}
                     <span className="fp-stats" title="The statistics table at the foot of the chart">
                       {(Object.keys(STAT_LABEL) as StatRow[]).map((k) => (

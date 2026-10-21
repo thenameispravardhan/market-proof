@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  analyze, candleAt, DEFAULT_FOOTPRINT, flowByCandle, footprintByCandle, fpSettings, groupRows, inferTick, rowStep,
+  analyze, barSignals, candleAt, cellLayout, DEFAULT_FOOTPRINT, flowByCandle, footprintByCandle, fpSettings, groupRows, inferTick, rowStep,
   sessionBasis, sessionCvd, type FlowBar,
 } from "../components/trade/footprint";
 import { INDICATOR_BY_TYPE, type FlowTuple } from "../components/trade/indicatorCatalog";
@@ -57,6 +57,35 @@ describe("footprint analytics", () => {
     const basis = sessionBasis([{ time: 0, close: 25000 }, { time: 300, close: 25010 }, { time: 600, close: 25020 }],
       new Map([[0, { close: 25060 }], [300, { close: 25065 }], [600, { close: 25090 }]] as [number, FlowBar][]));
     expect(basis.get(0)).toBe(60);                                         // the session's median, not each bar's
+  });
+
+  it("lays the rows out to fill the candle exactly, never past its high or low", () => {
+    // 100.00-100.20 on screen from y=100 (high) to y=200 (low): five 0.05 rows of 20 px
+    const g = cellLayout(100.0, 100.2, 0.05, 100, 200, 12);
+    expect(g.n).toBe(5);
+    expect(g.box(100.2)).toEqual([100, 120]);                             // the high's row starts at the high
+    expect(g.box(100.0)).toEqual([180, 200]);                             // the low's row ends at the low
+    expect(g.rowOf(100.37)).toBe(100.2);                                  // a print outside the bar sits on its extreme
+    const grouped = cellLayout(100.0, 100.2, 0.1, 100, 200, 12);          // two-tick rows: 100.0, 100.1, 100.2
+    expect(grouped.n).toBe(3);
+    expect(grouped.box(100.2)[0]).toBe(100);
+    expect(grouped.box(100.0)[1]).toBe(200);
+    const flat = cellLayout(50, 50, 0.05, 300, 300, 12);                  // one traded price: one row around it
+    expect(flat.box(50)).toEqual([294, 306]);
+  });
+
+  it("flags absorption at an extreme and delta divergence", () => {
+    // buyers hammer the high (100.2) but the bar closes near its low
+    const rows = groupRows([[100.0, 10, 12], [100.05, 9, 10], [100.1, 11, 9], [100.15, 10, 10], [100.2, 90, 20]], 0.05);
+    const a = analyze(rows, 0.05, S);
+    const sg = barSignals(a, { open: 100.1, high: 100.2, low: 100.0, close: 100.05 }, { high: 100.15, low: 100.0 });
+    expect(sg.absorbHigh).toBe(true);
+    expect(sg.absorbLow).toBe(false);
+    expect(sg.divBear).toBe(false);                                       // delta is positive here
+    const neg = analyze(groupRows([[100.0, 5, 40], [100.1, 5, 40], [100.2, 10, 30]], 0.1), 0.1, S);
+    expect(barSignals(neg, { open: 100.1, high: 100.2, low: 100.0, close: 100.1 }, { high: 100.15, low: 99.9 }).divBear).toBe(true);
+    const flatClose = barSignals(a, { open: 100.1, high: 100.2, low: 100.0, close: 100.18 }, null);
+    expect(flatClose.absorbHigh).toBe(false);                             // it closed up there: no rejection
   });
 
   it("keeps saved settings valid", () => {
