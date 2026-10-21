@@ -36,6 +36,10 @@ export interface FootprintSettings {
   stats: StatRow[];
   prints: boolean;
   unfinished: boolean;
+  /** Volume profile of the visible bars on the pane's right edge, with its POC line. */
+  profile: boolean;
+  /** Absorption and delta-divergence markers. */
+  signals: boolean;
 }
 
 export const DEFAULT_FOOTPRINT: FootprintSettings = {
@@ -50,6 +54,8 @@ export const DEFAULT_FOOTPRINT: FootprintSettings = {
   stats: ["vol", "delta", "dpct", "cvd"],
   prints: true,
   unfinished: true,
+  profile: true,
+  signals: true,
 };
 
 export const STAT_LABEL: Record<StatRow, string> = {
@@ -195,6 +201,68 @@ export function analyze(rows: FpRow[], step: number, s: Pick<FootprintSettings, 
         flush();
       }
     }
+  }
+  return out;
+}
+
+/** The bar's rows laid out to fill its candle exactly, like ATAS / TradingView:
+ *  the row holding the low sits on the candle's low, the row holding the high
+ *  on its high, the rest split the span evenly. A bar that traded one price
+ *  gets one row of `flatPx` around it. Returns [top, bottom] in pixels for a
+ *  row's price (its low edge on the step grid). */
+export function cellLayout(low: number, high: number, step: number, yHigh: number, yLow: number, flatPx: number):
+  { n: number; rowPx: number; box: (p: number) => [number, number]; rowOf: (price: number) => number } {
+  const rowOf = (price: number) => round6(Math.floor(Math.min(high, Math.max(low, price)) / step + 1e-7) * step);
+  const rLo = rowOf(low), rHi = rowOf(high);
+  const n = Math.max(1, Math.round((rHi - rLo) / step) + 1);
+  let top = Math.min(yHigh, yLow), bot = Math.max(yHigh, yLow);
+  if (bot - top < n) {                        // a flat (or sub-pixel) candle: rows of their own size around it
+    const mid = (top + bot) / 2, h = Math.max(bot - top, n * Math.max(1, flatPx));
+    top = mid - h / 2;
+    bot = mid + h / 2;
+  }
+  const rowPx = (bot - top) / n;
+  return {
+    n, rowPx, rowOf,
+    box: (p: number) => {
+      const k = Math.min(n - 1, Math.max(0, Math.round((p - rLo) / step)));
+      return [bot - (k + 1) * rowPx, bot - k * rowPx];
+    },
+  };
+}
+
+export interface BarSignals {
+  /** Heavy aggressive buying at the high, and the bar still closed in its lower part: sellers absorbed it. */
+  absorbHigh: boolean;
+  /** Heavy aggressive selling at the low, closed in its upper part: buyers absorbed it. */
+  absorbLow: boolean;
+  /** A higher high on negative delta. */
+  divBear: boolean;
+  /** A lower low on positive delta. */
+  divBull: boolean;
+}
+
+/** What a footprint bar says beyond its numbers. Absorption: the extreme row
+ *  holds at least `heavy` x the bar's median row volume, its aggressor pushed
+ *  into the extreme, and the close sits in the opposite 40% of the range.
+ *  Divergence: price made a new extreme past the previous bar while the bar's
+ *  delta went the other way. */
+export function barSignals(a: Analysis, bar: { open: number; high: number; low: number; close: number },
+  prev: { high: number; low: number } | null, heavy = 2.5): BarSignals {
+  const out: BarSignals = { absorbHigh: false, absorbLow: false, divBear: false, divBull: false };
+  if (!a.rows.length || a.total <= 0) return out;
+  const range = bar.high - bar.low;
+  if (a.rows.length >= 3 && range > 0) {
+    const vols = a.rows.map((r) => r.buy + r.sell).filter((v) => v > 0).sort((x, y) => x - y);
+    const med = vols[Math.floor(vols.length / 2)] ?? 0;
+    const top = a.rows[a.rows.length - 1], bottom = a.rows[0];
+    const pos = (bar.close - bar.low) / range;
+    out.absorbHigh = top.buy + top.sell >= heavy * med && top.buy > top.sell && pos <= 0.4;
+    out.absorbLow = bottom.buy + bottom.sell >= heavy * med && bottom.sell > bottom.buy && pos >= 0.6;
+  }
+  if (prev) {
+    out.divBear = bar.high > prev.high && a.delta < 0;
+    out.divBull = bar.low < prev.low && a.delta > 0;
   }
   return out;
 }

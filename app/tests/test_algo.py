@@ -1334,3 +1334,25 @@ def test_every_guide_example_backtests_on_synthetic_candles():
             data[sym] = d
         res = engine.run(spec, data, trade_from=data[spec["symbols"][0]]["t"][0] + 5 * 86400)
         assert res["stats"]["trades"] > 0, json.loads(b)["name"]          # an example that can never fire teaches nothing
+
+
+def test_prices_sit_on_the_005_grid_and_slippage_rounds_against_you():
+    assert engine.snap(100.03, 0.05) == 100.05 and engine.snap(100.02, 0.05) == 100.0
+    assert engine.snap(100.01, 0.05, 1) == 100.05 and engine.snap(100.04, 0.05, -1) == 100.0
+    assert engine.snap(808.15, 0.05, 1) == 808.15                      # already on the grid: unchanged
+    assert engine.snap(0.01, 0.05, -1) == 0.05                         # never below one tick
+    assert engine.tick_for("NSE:SBIN-EQ") == 0.05 and engine.tick_for("BSE:SENSEX-INDEX") == 0.05
+    assert engine.tick_for("MCX:CRUDEOIL26NOVFUT") is None             # its own tick: left alone
+
+    closes = [100.0, 101.0, 106.13, 107.21, 109.37, 103.11, 99.0]
+    spec = _cross_spec(exit_long=None, stop_loss={"type": "pct", "value": 1.3}, target={"type": "pct", "value": 2.7},
+                       costs={"slippage_pct": 0.07, "charges": False})
+    t = engine.run(spec, {"NSE:TEST-EQ": bars(closes, spread=0)})["trades"][0]
+
+    def on_grid(x):
+        return abs(x / 0.05 - round(x / 0.05)) < 1e-6
+
+    assert all(on_grid(x) for x in (t["entry"], t["exit"], t["stop"], t["target"])), t
+    assert t["entry"] == 106.25                                        # 106.13 + 0.07% = 106.204 -> up to 106.25
+    off = engine.run(spec, {"MCX:TEST": bars(closes, spread=0)})["trades"][0]
+    assert off["entry"] == round(106.13 * 1.0007, 2)                   # not NSE / BSE: no grid
