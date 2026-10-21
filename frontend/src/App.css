@@ -2229,7 +2229,7 @@ kbd {
 .chart-body { display: flex; gap: 6px; min-height: 0; }
 .chart-body .chart-container { flex: 1; min-width: 0; }
 .chart-tools { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 2px 0 2px 2px; overflow-x: hidden; overflow-y: auto; scrollbar-width: none; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-surface); }
-.chart-tool { flex-shrink: 0; width: 28px; height: 28px; display: grid; place-items: center; overflow: hidden; background: transparent; border: 0; border-radius: 3px; color: var(--text-dim); font-size: 14px; line-height: 1; font-variant-emoji: text; cursor: pointer; }
+.chart-tool { flex-shrink: 0; width: 28px; height: 28px; padding: 0; display: grid; place-items: center; overflow: hidden; background: transparent; border: 0; border-radius: 3px; color: var(--text-dim); font-size: 14px; line-height: 1; font-variant-emoji: text; cursor: pointer; }
 .chart-tool:hover:not(:disabled) { background: var(--bg-elev); color: var(--text); }
 .chart-tool.on { background: var(--accent); color: var(--text-inv); }
 .chart-tool:disabled { opacity: 0.35; cursor: default; }
@@ -2410,8 +2410,8 @@ kbd {
 
 /* drawing strip */
 /* group = 28px tool + an 8px lane for the flyout arrow, so the arrow never sits on the icon */
-.dtb-group { position: relative; display: flex; flex-shrink: 0; padding-right: 8px; }
-.dtb-more { position: absolute; right: 0; top: 7px; width: 8px; height: 14px; padding: 0; border: 0; background: transparent; color: var(--text-faint); font-size: 10px; line-height: 1; cursor: pointer; opacity: 0.35; }
+.dtb-group { position: relative; display: flex; flex-shrink: 0; padding-right: 11px; }   /* the › gets its own lane beside the button */
+.dtb-more { position: absolute; right: 0; top: 50%; transform: translateY(-50%); width: 10px; height: 16px; padding: 0; border: 0; background: transparent; color: var(--text-faint); font-size: 10px; line-height: 1; cursor: pointer; opacity: 0.35; }
 .dtb-group:hover .dtb-more { opacity: 1; }
 .dtb-more:hover { color: var(--accent); }
 .chart-tools .grow { min-height: 4px; }
@@ -3335,7 +3335,8 @@ a.news-title:hover { color: var(--accent); text-decoration: underline; }
 
 /* line icons (components/trade/tvIcons.tsx) inside the drawing strip, its flyouts and the right panel bar */
 .tv-ico { display: block; }
-.chart-tool .tv-ico { width: 22px; height: 22px; }
+.chart-tool .tv-ico { width: 20px; height: 20px; }
+@media (max-height: 860px) { .chart-tool .tv-ico { width: 18px; height: 18px; } }
 .dtb-fly-item .ico { display: grid; place-items: center; width: 20px; }
 .dtb-fly-item .ico .tv-ico { width: 20px; height: 20px; }
 .fav-bar .chart-tool .tv-ico { width: 20px; height: 20px; }
