@@ -3,7 +3,7 @@
 // bars, HLC area, Kagi lines, Point & figure columns, and the order-flow
 // footprint (sell | buy volume per price beside a thin candle, Fyers-style).
 
-import { analyze, fpSettings, groupRows, rowStep, STAT_LABEL, STAT_ROW_PX, type FootprintSettings, type FpBarStats, type StatRow } from "./footprint";
+import { analyze, barSignals, cellLayout, fpSettings, groupRows, rowStep, STAT_LABEL, STAT_ROW_PX, type FootprintSettings, type FpBarStats, type StatRow } from "./footprint";
 import type {
   CustomData,
   CustomSeriesOptions,
@@ -211,10 +211,12 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
 
   /** Order-flow footprint, the ATAS / TradingView way: a thin candle on the left
    *  of each bar, its traded volume per price row beside it (bid × ask, delta or
-   *  volume), diagonal imbalances in bold, the POC boxed, the value area as a bar
-   *  at the cells' left edge, stacked-imbalance zones extended to the right until
-   *  price trades back into them, big prints as bubbles and a statistics table
-   *  (volume, delta, delta %, CVD …) along the foot of the pane. */
+   *  volume) filling the candle's high-low exactly, diagonal imbalances in bold,
+   *  the POC boxed, the value area as a bar at the cells' left edge,
+   *  stacked-imbalance zones extended to the right until price trades back into
+   *  them, absorption / delta-divergence markers, big prints as bubbles, the
+   *  visible bars' volume profile on the right and a statistics table (volume,
+   *  delta, delta %, CVD …) along the foot of the pane. */
   private footprint(ctx: CanvasRenderingContext2D, bars: PaneRendererCustomData<Time, OhlcItem>["bars"], lo: number, hi: number, bs: number, Y: (p: number) => number | null, paneW: number, paneH: number): void {
     const o = this.opts!;
     const fs = fpSettings(o.fp);
@@ -239,9 +241,13 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
       if (!st) continue;
       for (const k of fs.stats) maxVis[k] = Math.max(maxVis[k] ?? 0, Math.abs(statValue(k, st)));
     }
-    const zones: { lo: number; hi: number; side: 1 | -1; x: number; i: number }[] = [];
+    const clamp = (d: OhlcItem) => (d.fp ?? []).map(([p, b2, s2]) => [Math.min(d.high, Math.max(d.low, p)), b2, s2] as [number, number, number]);
+    if (fs.profile) this.profile(ctx, bars, lo, hi, step, tick, Y, paneW, up, down, poc, fs.vaPct, clamp);
+    const zones: { y0: number; y1: number; lo: number; hi: number; side: 1 | -1; x: number; i: number }[] = [];
     const bubbles: { x: number; y: number; q: number; side: number }[] = [];
+    const marks: { x: number; y: number; side: 1 | -1; label: string }[] = [];
     let maxPrint = 0;
+    const flatPx = Math.max(6, Math.min(16, step * pxPer || 12));
     const first = Math.max(0, lo - 150);              // zones that started off-screen still reach in
     for (let i = first; i < hi; i++) {
       const b = bars[i];
@@ -262,21 +268,19 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
         if (visible) this.statsCells(ctx, d, b.x, half, statsTop, statH, fs, maxVis, up, down, text);
         continue;
       }
-      const levels = d.fp.map(([p, b2, s2]) => [Math.min(d.high, Math.max(d.low, p)), b2, s2] as [number, number, number]);
-      const a = analyze(groupRows(levels, step), step, fs);
-      for (const z of a.zones) zones.push({ ...z, x: right, i });
+      const a = analyze(groupRows(clamp(d), step), step, fs);
+      const g = cellLayout(d.low, d.high, step, yh, yl, flatPx);
+      for (const z of a.zones) zones.push({ ...z, y0: g.box(round6(z.hi - step))[0], y1: g.box(z.lo)[1], x: right, i });
       if (!visible) continue;
       const cx0 = bs >= 24 ? left + 8 : left, cx1 = right - 1;
       const cw = cx1 - cx0;
       if (cw >= 6) {
-        const rowPx = Math.abs((Y(a.rows[0].p + step) ?? 0) - (Y(a.rows[0].p) ?? 0));
-        const font = rowPx >= 13 ? 11 : rowPx >= 10 ? 10 : 9;
+        const font = g.rowPx >= 13 ? 11 : g.rowPx >= 10 ? 10 : 9;
         ctx.font = `${font}px sans-serif`;
-        const showText = rowPx >= 9;
+        const showText = g.rowPx >= 9;
         for (const r of a.rows) {
-          const yt = Y(r.p + step), yb = Y(r.p);
-          if (yt === null || yb === null) continue;
-          const y = Math.min(yt, yb) + 0.5, h = Math.max(1, Math.abs(yb - yt) - 1);
+          const [yt, yb] = g.box(r.p);
+          const y = yt + 0.5, h = Math.max(1, yb - yt - 1);
           const delta = r.buy - r.sell, vol = r.buy + r.sell;
           const buyImb = a.buyImb.has(r.p), sellImb = a.sellImb.has(r.p);
           if (fs.mode === "bidask") {
@@ -328,23 +332,29 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
           }
         }
         if (fs.va && a.vah !== null && a.val !== null) {
-          const ya = Y(a.vah + step), yb = Y(a.val);
-          if (ya !== null && yb !== null) {
-            ctx.fillStyle = alpha(poc, 0.8);
-            ctx.fillRect(cx0 - 3, Math.min(ya, yb), 2, Math.abs(yb - ya));
-          }
+          const ya = g.box(a.vah)[0], yb = g.box(a.val)[1];
+          ctx.fillStyle = alpha(poc, 0.8);
+          ctx.fillRect(cx0 - 3, ya, 2, yb - ya);
         }
-        if (fs.unfinished) {
+        if (fs.unfinished) {                          // inside the extreme row, at its right edge
           ctx.fillStyle = text;
-          if (a.unfinishedHigh) this.dot(ctx, cx0 + cw / 2, (Y(a.rows[a.rows.length - 1].p + step) ?? yh) - 5);
-          if (a.unfinishedLow) this.dot(ctx, cx0 + cw / 2, (Y(a.rows[0].p) ?? yl) + 5);
+          if (a.unfinishedHigh) this.dot(ctx, cx1 - 3, g.box(a.rows[a.rows.length - 1].p)[0] + 3);
+          if (a.unfinishedLow) this.dot(ctx, cx1 - 3, g.box(a.rows[0].p)[1] - 3);
         }
+      }
+      if (fs.signals) {
+        const prev = i > 0 ? bars[i - 1].originalData : null;
+        const sg = barSignals(a, d, prev && prev.high > 0 ? prev : null);
+        const top = Math.min(yh, yl), bottom = Math.max(yh, yl);
+        const bear = [sg.absorbHigh && "A", sg.divBear && "D"].filter(Boolean).join("");
+        const bull = [sg.absorbLow && "A", sg.divBull && "D"].filter(Boolean).join("");
+        if (bear) marks.push({ x: b.x, y: top - 8, side: -1, label: bear });
+        if (bull) marks.push({ x: b.x, y: bottom + 8, side: 1, label: bull });
       }
       if (fs.prints) {
         for (const [p, q, side] of d.prints ?? []) {
-          const y = Y(p);
-          if (y === null) continue;
-          bubbles.push({ x: b.x, y, q, side });
+          const [yt, yb] = g.box(g.rowOf(p));
+          bubbles.push({ x: b.x, y: (yt + yb) / 2, q, side });
           maxPrint = Math.max(maxPrint, q);
         }
       }
@@ -352,8 +362,6 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
     }
     // stacked imbalance zones: from their bar to the first later bar that trades back into them
     for (const z of zones) {
-      const ya = Y(z.hi), yb = Y(z.lo);
-      if (ya === null || yb === null) continue;
       let x1 = bars[hi - 1] ? bars[hi - 1].x + half : z.x;
       for (let j = z.i + 1; j < hi; j++) {
         const d = bars[j].originalData;
@@ -364,9 +372,9 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
       }
       if (x1 <= z.x) continue;
       ctx.fillStyle = alpha(z.side > 0 ? up : down, 0.16);
-      ctx.fillRect(z.x, Math.min(ya, yb), x1 - z.x, Math.max(1, Math.abs(yb - ya)));
+      ctx.fillRect(z.x, z.y0, x1 - z.x, Math.max(1, z.y1 - z.y0));
       ctx.fillStyle = alpha(z.side > 0 ? up : down, 0.7);
-      ctx.fillRect(z.x, z.side > 0 ? Math.max(ya, yb) - 1 : Math.min(ya, yb), x1 - z.x, 1);
+      ctx.fillRect(z.x, z.side > 0 ? z.y1 - 1 : z.y0, x1 - z.x, 1);
     }
     for (const bb of bubbles) {
       const r = 3 + 11 * Math.sqrt(bb.q / Math.max(1, maxPrint));
@@ -377,6 +385,26 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
       ctx.strokeStyle = alpha(bb.side >= 0 ? up : down, 0.9);
       ctx.lineWidth = 1;
       ctx.stroke();
+    }
+    // absorption (A) / divergence (D): bearish above the bar, bullish below
+    ctx.font = "bold 9px sans-serif";
+    ctx.textAlign = "center";
+    for (const m of marks) {
+      const c = m.side > 0 ? up : down;
+      const w = 7 + 6 * m.label.length;
+      ctx.fillStyle = alpha(c, 0.9);
+      ctx.beginPath();
+      if (m.side < 0) {                            // a tag pointing down at the high
+        ctx.moveTo(m.x - w / 2, m.y - 6); ctx.lineTo(m.x + w / 2, m.y - 6); ctx.lineTo(m.x + w / 2, m.y + 2);
+        ctx.lineTo(m.x + 3, m.y + 2); ctx.lineTo(m.x, m.y + 5); ctx.lineTo(m.x - 3, m.y + 2); ctx.lineTo(m.x - w / 2, m.y + 2);
+      } else {
+        ctx.moveTo(m.x - w / 2, m.y + 6); ctx.lineTo(m.x + w / 2, m.y + 6); ctx.lineTo(m.x + w / 2, m.y - 2);
+        ctx.lineTo(m.x + 3, m.y - 2); ctx.lineTo(m.x, m.y - 5); ctx.lineTo(m.x - 3, m.y - 2); ctx.lineTo(m.x - w / 2, m.y - 2);
+      }
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = "#fff";
+      ctx.fillText(m.label, m.x, m.side < 0 ? m.y - 2 : m.y + 2);
     }
     // the statistics table's row names, on the pane's left edge
     if (statsTop < paneH && fs.stats.length) {
@@ -394,6 +422,52 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
       ctx.fillStyle = "rgba(128,128,128,0.25)";
       ctx.fillRect(0, statsTop - 1, paneW, 1);
     }
+  }
+
+  /** The visible bars' volume profile against the pane's right edge (buy part
+   *  on the inside, sell on the outside), its value area a shade stronger and
+   *  a dashed POC line across the pane, labelled with its price. */
+  private profile(ctx: CanvasRenderingContext2D, bars: PaneRendererCustomData<Time, OhlcItem>["bars"], lo: number, hi: number,
+    step: number, tick: number, Y: (p: number) => number | null, paneW: number, up: string, down: string,
+    poc: string, vaPct: number, clamp: (d: OhlcItem) => [number, number, number][]): void {
+    const levels: [number, number, number][] = [];
+    for (let i = lo; i < hi; i++) levels.push(...clamp(bars[i].originalData));
+    if (!levels.length) return;
+    const a = analyze(groupRows(levels, step), step, { imbalance: 0, imbalanceMin: 0, stacked: 0, vaPct });
+    if (!a.maxVol) return;
+    const maxW = Math.min(170, paneW * 0.16);
+    const xr = paneW - 1;
+    for (const r of a.rows) {
+      const ya = Y(r.p + step - tick / 2), yb = Y(r.p - tick / 2);
+      if (ya === null || yb === null) continue;
+      const y = Math.min(ya, yb) + 0.5, h = Math.max(1, Math.abs(yb - ya) - 1);
+      const vol = r.buy + r.sell;
+      const w = maxW * (vol / a.maxVol), wb = w * (r.buy / Math.max(1e-9, vol));
+      const inVa = a.val !== null && a.vah !== null && r.p >= a.val && r.p <= a.vah;
+      const k = r.p === a.poc ? 0.75 : inVa ? 0.42 : 0.22;
+      ctx.fillStyle = alpha(down, k);
+      ctx.fillRect(xr - w, y, w - wb, h);
+      ctx.fillStyle = alpha(up, k);
+      ctx.fillRect(xr - wb, y, wb, h);
+    }
+    if (a.poc === null) return;
+    const yp = Y(a.poc + (step - tick) / 2);
+    if (yp === null) return;
+    ctx.save();
+    ctx.strokeStyle = alpha(poc, 0.65);
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(0, Math.round(yp) + 0.5);
+    ctx.lineTo(xr, Math.round(yp) + 0.5);
+    ctx.stroke();
+    ctx.restore();
+    ctx.font = "10px sans-serif";
+    ctx.textAlign = "right";
+    ctx.textBaseline = "bottom";
+    ctx.fillStyle = poc;
+    ctx.fillText(`VPOC ${a.poc.toFixed(2)}`, xr - maxW - 4, yp - 2);
+    ctx.textBaseline = "middle";
   }
 
   private statsCells(ctx: CanvasRenderingContext2D, d: OhlcItem, x: number, half: number, top: number, h: number,
@@ -429,6 +503,8 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
     ctx.fill();
   }
 }
+
+const round6 = (x: number) => Math.round(x * 1e6) / 1e6;
 
 function statValue(k: StatRow, st: FpBarStats): number {
   switch (k) {
