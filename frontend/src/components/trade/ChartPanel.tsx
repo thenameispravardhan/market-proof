@@ -982,9 +982,9 @@ export default function ChartPanel(props: ChartPanelProps) {
   }, []);
 
   // the app skin changes the CSS variables the chart colours come from
-  const [skin, setSkin] = useState(getTheme);
+  const [skin, setSkin] = useState(0);
   useEffect(() => {
-    const on = () => setSkin(getTheme());
+    const on = () => setSkin((v) => v + 1);       // dark / light, or the Trade page's TradingView skin
     window.addEventListener(THEME_EVENT, on);
     return () => window.removeEventListener(THEME_EVENT, on);
   }, []);

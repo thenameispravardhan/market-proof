@@ -25,7 +25,7 @@
 
 import { pointValue } from "../lib/contract";
 import { snapToTick } from "../components/trade/levelDrag";
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   useBrokerAccounts,
@@ -59,6 +59,8 @@ import { BookPanel, FnoPanel, type DeskTab } from "../components/trade/ProPanels
 import { loadUserPrefs, UserSettingsDialog, type UserPrefs } from "../components/trade/UserSettings";
 import type { SyncFlags } from "../components/trade/chartSync";
 import { useOutside } from "../components/trade/chartUi";
+import { TvIcon } from "../components/trade/tvIcons";
+import { setSkin } from "../lib/theme";
 import { expiryIso, optionRoot } from "../lib/options";
 import type {
   BrokerAccount,
@@ -614,6 +616,11 @@ function TimelinePanel({ symbol }: { symbol: string | null }) {
 const eqKey = (s: string) => { const [ex, name] = s.toUpperCase().includes(":") ? s.toUpperCase().split(":") : ["NSE", s.toUpperCase()]; return `${ex}:${name.replace(/-(EQ|BE)$/, "")}`; };
 
 export default function Trade() {
+  // The TradingView skin (tvskin.css) is on while this page is: palette, font and chrome.
+  useLayoutEffect(() => {
+    setSkin(true);
+    return () => setSkin(false);
+  }, []);
   const [bottomTab, setBottomTab] = useState<BottomTab>(() => { const t = stored<BottomTab>("trade:bottomTab", "orders"); return t === "trade" ? "positions" : t; });   // the DOM tab moved to the right dock
   const [bottomOpen, setBottomOpen] = useState(() => stored("trade:bottomOpen", false));
   const openBottom = (tab: BottomTab | null) => {
@@ -2446,7 +2453,7 @@ export default function Trade() {
             onClick={() => toggleDock(d.id)}
             data-testid={`rail-${d.id}`}
           >
-            <span className="ico">{d.icon}</span>
+            <span className="ico"><TvIcon name={d.id} fallback={d.icon} size={26} /></span>
             <span className="lbl">{d.short}</span>
           </button>
         ))}
