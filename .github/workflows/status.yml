@@ -1,0 +1,75 @@
+# Read-only look at the Lightsail server: the service, the order-flow collector
+# (status.json, plan, recent log), memory and disk. Changes nothing.
+#
+# Manual only (Actions > Server status > Run workflow). Uses the Deploy
+# workflow's secrets (DEPLOY_HOST, DEPLOY_SSH_KEY, DEPLOY_KNOWN_HOSTS).
+# Log lines are redacted of anything token-shaped before they're printed.
+name: Server status
+
+on:
+  workflow_dispatch:
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: SSH key and host key
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/deploy && chmod 600 ~/.ssh/deploy
+          if [ -n "$KNOWN" ]; then
+            printf '%s\n' "$KNOWN" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan -T 15 "$HOST" > ~/.ssh/known_hosts 2>/dev/null
+          fi
+      - name: Status
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          LOGIN: ${{ vars.DEPLOY_USER || 'ubuntu' }}
+          DIR: ${{ vars.DEPLOY_DIR || '~/tradebot' }}
+        run: |
+          ssh -i ~/.ssh/deploy -o StrictHostKeyChecking=yes -o ConnectTimeout=20 "$LOGIN@$HOST" bash -s -- "$DIR" <<'EOF'
+          cd "$1" || exit 1
+          redact() { sed -E 's/[A-Za-z0-9_.-]{40,}/<redacted>/g'; }
+          echo "== $(TZ=Asia/Kolkata date '+%a %d %b %H:%M IST') · $(git log --oneline -1)"
+          echo "== service: $(systemctl is-active tradebot) · cpus $(nproc) · load $(cut -d' ' -f1-3 /proc/loadavg)"
+          free -m | head -2
+          df -h . | tail -1
+          echo "== processes"
+          ps -eo pid,ni,pcpu,rss,etime,args --sort=-rss | grep -E "uvicorn|app.algo.flowd" | grep -v grep | cut -c1-120
+          echo "== collector"
+          .venv/bin/python - <<'PY'
+          import json, time
+          from pathlib import Path
+          root = Path("data/ticks")
+          def rd(n):
+              try:
+                  return json.loads((root / n).read_text())
+              except Exception as e:  # noqa: BLE001
+                  return {"_missing": str(e)[:80]}
+          cfg, st, plan = rd("config.json"), rd("status.json"), rd("plan.json")
+          print("config:", {k: cfg.get(k) for k in ("enabled", "budget", "retention_days", "raw_days", "min_free_gb")})
+          hb = st.get("heartbeat")
+          print("state:", st.get("state"), "· heartbeat", f"{time.time() - hb:.0f}s ago" if hb else None,
+                "· pid", st.get("pid"), "· fps", st.get("fps"), "· cpu%", st.get("cpu_pct"), "· lag p95", st.get("lag_p95"))
+          s = st.get("stream") or {}
+          print("stream:", {k: s.get(k) for k in ("connected", "reason", "subscribed", "record_only", "received",
+                                                   "rejected_count", "limit_error", "limit_hits")})
+          print("budget:", st.get("budget"), "· disk:", st.get("disk"))
+          print("today:", st.get("today"))
+          print("plan:", {k: plan.get(k) for k in ("used", "budget", "classes", "dropped", "no_price")})
+          lists = (plan.get("lists") or {})
+          print("lists:", {k: (v.get("n"), v.get("source")) for k, v in lists.items()})
+          days = sorted(p.name for p in (root / "days").iterdir()) if (root / "days").is_dir() else []
+          print("stored days:", len(days), days[:1], days[-1:])
+          for e in (st.get("errors") or [])[-5:]:
+              print("error:", e[:200])
+          PY
+          echo "== collector.log (last 25)"
+          tail -n 25 data/ticks/collector.log 2>/dev/null | cut -c1-300 | redact
+          EOF
