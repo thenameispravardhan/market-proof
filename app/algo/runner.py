@@ -660,7 +660,7 @@ class AlgoRunner:
                 changed["best_price"] = best
             gain = sign * (best - t["entry_price"])
             if t["trail_dist"] and gain >= (t["trail_activate"] or 0):
-                nt = best - sign * t["trail_dist"]
+                nt = engine.snap(best - sign * t["trail_dist"], engine.tick_for(t["symbol"]))
                 old = t["trail_stop"]
                 trail = nt if old is None else (max(old, nt) if sign > 0 else min(old, nt))
                 if trail != old:
@@ -1039,7 +1039,7 @@ class AlgoRunner:
             last = await asyncio.to_thread(_last_exit, s["id"], sym)
             if last and now < last + spec["cooldown_bars"] * engine.bar_minutes(spec) * 60:
                 return
-        level = engine.entry_trigger(spec, side, d["c"][-1])
+        level = engine.entry_trigger(spec, side, d["c"][-1], engine.tick_for(sym))
         if level is not None:
             eo = spec["entry_order"]
             self._armed[(s["id"], sym)] = {"side": side, "level": level, "kind": eo["type"], "d": d,
@@ -1128,7 +1128,8 @@ class AlgoRunner:
         if ref != "u":                                   # levels on the option premium: its own ATR
             atr_vals = engine.premium_atr(atr_vals, legs[0], u, time.time())
         # Sizing on the quoted prices (the stop distance only needs the shape).
-        pre = engine.entry_levels(spec, rsign, u if ref == "u" else legs[0]["price"], atr_vals)
+        tick = engine.tick_for(sym)
+        pre = engine.entry_levels(spec, rsign, u if ref == "u" else legs[0]["price"], atr_vals, tick)
         per_set_margin = engine.position_margin(legs, u, pf["leverage"], price_key="price", model=spec.get("margin"),
                                                 t=now, name=fno.fno_name(sym))
         equity = pf["capital"] + (book["realized"] if pf["compounding"] else 0.0)
@@ -1190,8 +1191,8 @@ class AlgoRunner:
                 self.event("error", f"{s['name']}: LIVE {side} {sym} rejected: {failure}", strategy_id=s["id"])
                 return
         ref_entry = u if ref == "u" else legs[0]["entry"]
-        engine.leg_levels(legs)                        # each leg's own stop / target, on its fill
-        lv = engine.entry_levels(spec, rsign, ref_entry, atr_vals)
+        engine.leg_levels(legs, tick)                  # each leg's own stop / target, on its fill
+        lv = engine.entry_levels(spec, rsign, ref_entry, atr_vals, tick)
         plan = engine.scale_plan(lv["so"], sets)
         label = " + ".join(lg["label"] for lg in legs)[:160]
         tid = await asyncio.to_thread(
