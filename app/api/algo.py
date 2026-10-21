@@ -13,7 +13,7 @@
     PUT    /api/algo/strategies/{id}       {name?, spec?, enabled?, mode?, account_id?, confirm?}
     DELETE /api/algo/strategies/{id}
     POST   /api/algo/strategies/{id}/squareoff
-    GET    /api/algo/trades?strategy_id=&limit=
+    GET    /api/algo/trades?strategy_id=&strategy_ids=1,2&limit=
     GET    /api/algo/status                runner heartbeat, events, open positions
     POST   /api/algo/sync                  download today's candles for every strategy symbol now
 
@@ -644,13 +644,15 @@ async def square_off(sid: int, request: Request, db: Session = Depends(get_db)) 
 
 
 @router.get("/trades")
-def list_trades(strategy_id: Optional[int] = None, limit: int = Query(300, ge=1, le=5000),
-                db: Session = Depends(get_db)) -> dict[str, Any]:
+def list_trades(strategy_id: Optional[int] = None, strategy_ids: Optional[str] = None,
+                limit: int = Query(300, ge=1, le=5000), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """`strategy_ids`: comma-separated, for the trades of several strategies at once."""
     from app.algo.runner import _row
 
     q = select(AlgoTrade).order_by(AlgoTrade.id.desc()).limit(limit)
-    if strategy_id:
-        q = q.where(AlgoTrade.strategy_id == strategy_id)
+    ids = {int(x) for x in (strategy_ids or "").split(",") if x.strip().isdigit()} | ({strategy_id} if strategy_id else set())
+    if ids:
+        q = q.where(AlgoTrade.strategy_id.in_(ids))
     rows = []
     for t in db.execute(q).scalars():
         r = _row(t)
@@ -676,6 +678,7 @@ async def status(request: Request, db: Session = Depends(get_db)) -> dict[str, A
         t["entry_at"] = t["entry_at"].isoformat()
     return {"running": getattr(request.app.state, "algo_task", None) is not None,
             "last_tick": r.last_tick, "last_sync": r.last_sync, "events": list(r.events)[:150],
+            "ticks": {"seen": r.ticks_seen, "last_exit_check": r.last_tick_exit, "watching": len(r._watch)},
             "open": open_rows}
 
 

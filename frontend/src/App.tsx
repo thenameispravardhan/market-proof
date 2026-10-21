@@ -389,7 +389,7 @@ export default function App() {
       </nav>
 
       <main className="content" data-page={tab}>
-        {tab !== "trade" && <WorkflowBar tab={tab} navigate={navigate} />}
+        {tab === "dashboard" && <WorkflowBar tab={tab} navigate={navigate} />}
         <div className="content-scroll">
           <Suspense fallback={<div className="empty loading">Loading…</div>}>
             <PageContent tab={tab} />

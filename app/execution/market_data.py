@@ -75,6 +75,18 @@ class MarketDataBus:
         self._subs: dict[str, set[asyncio.Queue[Quote]]] = {}
         self._lock = asyncio.Lock()
         self._sink: Optional[QuoteSink] = None
+        self._listeners: list[Callable[[Quote], None]] = []
+
+    def add_tick_listener(self, cb: Callable[[Quote], None]) -> None:
+        """Register a synchronous callback fired on EVERY published quote,
+        for any symbol (the algo runner's tick-driven exits). It must be
+        cheap and never block: it runs inside the publisher."""
+        if cb not in self._listeners:
+            self._listeners.append(cb)
+
+    def remove_tick_listener(self, cb: Callable[[Quote], None]) -> None:
+        if cb in self._listeners:
+            self._listeners.remove(cb)
 
     def set_quote_sink(self, sink: Optional[QuoteSink]) -> None:
         """Register an async callback fired once per published quote.
@@ -132,6 +144,11 @@ class MarketDataBus:
                 # Slow consumer — drop. Better to drop a tick than
                 # block the publisher.
                 pass
+        for cb in list(self._listeners):
+            try:
+                cb(q)
+            except Exception:  # noqa: BLE001 — a listener must never stall the feed
+                log.debug("market_data.listener_failed", symbol=symbol)
         # Fan the tick out to the /ws bridge (if wired). Outside the lock
         # and isolated so a sink hiccup never affects the local subscribers
         # above (order fills, P&L marks) that must always see the tick.

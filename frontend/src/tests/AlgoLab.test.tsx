@@ -154,6 +154,37 @@ describe("Algo Lab", () => {
     await waitFor(() => expect(calls.some((c) => c.init?.method === "PUT" && String(c.init.body).includes('"enabled":true'))).toBe(true));
   });
 
+  it("names each trade's strategy and filters trades + log to the ticked strategies", async () => {
+    const OTHER = { ...LIVE_STRATEGY, id: 8, name: "Paper two", mode: "paper" };
+    const trade = (id: number, sid: number) => ({ id, strategy_id: sid, symbol: "NSE:SBIN-EQ", instrument: "SBIN", side: "BUY", quantity: 1, mode: "paper",
+      status: "closed", entry_at: "2026-10-21T04:00:00", entry_price: 800, stop_loss: null, target: null, trail_stop: null, exit_at: "2026-10-21T05:00:00",
+      exit_price: 810, exit_reason: "TARGET", net_pnl: 10, charges: 0, note: null, legs: null, version: 3 });
+    globalThis.fetch = vi.fn((u: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(u);
+      calls.push({ url, init });
+      if (url.includes("/api/algo/strategies")) return json({ strategies: [LIVE_STRATEGY, OTHER] });
+      if (url.includes("/api/algo/trades")) return json({ trades: url.includes("strategy_ids=8") ? [trade(2, 8)] : [trade(1, 7), trade(2, 8)] });
+      if (url.includes("/api/algo/status")) return json({ running: true, last_tick: null, last_sync: null, open: [],
+        ticks: { seen: 42, last_exit_check: null, watching: 2 },
+        events: [{ t: 1, level: "exit", msg: "Live one v1: TARGET SBIN net ₹10", strategy_id: 7 }, { t: 1, level: "exit", msg: "Paper two v3: TARGET SBIN net ₹10", strategy_id: 8 }] });
+      return route(url, init);
+    }) as typeof fetch;
+    mount();
+    await screen.findByDisplayValue(/EMA 9\/21/);
+    fireEvent.click(screen.getByText("Automations"));
+    expect((await screen.findByTestId("algo-trade-strategy-1")).textContent).toBe("Live one v3");
+    expect(screen.getByTestId("algo-trade-strategy-2").textContent).toBe("Paper two v3");
+    expect(screen.getByTestId("algo-log-panel").textContent).toContain("Live one v1: TARGET");
+    fireEvent.click(screen.getByTestId("algo-sel-8"));
+    await waitFor(() => expect(screen.queryByTestId("algo-trade-strategy-1")).toBeNull());
+    expect(calls.some((c) => c.url.includes("strategy_ids=8"))).toBe(true);
+    expect(screen.getByTestId("algo-log-panel").textContent).not.toContain("Live one v1");
+    fireEvent.click(screen.getByTestId("algo-sel-7"));             // both ticked
+    await waitFor(() => expect(calls.some((c) => c.url.includes("strategy_ids=7,8"))).toBe(true));
+    fireEvent.click(screen.getByText("show all"));
+    await waitFor(() => expect(screen.getByTestId("algo-log-panel").textContent).toContain("Live one v1"));
+  });
+
   it("sends scale-out steps and entry weekdays with the backtest", async () => {
     mount();
     await screen.findByDisplayValue(/EMA 9\/21/);
