@@ -11,8 +11,9 @@
 // Coordinates: points are {time, price} where `time` is chart time
 // (IST-shifted epoch seconds — the same convention as the candle data), so
 // drawings survive timeframe switches and reloads. ChartPanel supplies the
-// projections (timeToX interpolates fractional logical positions so a 5m
-// anchor lands correctly on a 1D chart). Screen-anchored tools (anchored
+// projections: clicks snap to bar times, and a time maps to the bar that
+// contains it, or the next bar if it falls in a session gap (chartData
+// timeToBar — the TradingView rule). Screen-anchored tools (anchored
 // text / note) keep a pane-relative position instead.
 
 import type {

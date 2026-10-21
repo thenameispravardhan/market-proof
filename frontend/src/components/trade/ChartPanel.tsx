@@ -62,6 +62,7 @@ import type { HistoryResponse, InstrumentHit, SearchResponse } from "../../types
 import {
   aggregate,
   autoBox,
+  barTime,
   fetchPlan,
   formatClock,
   formatDate,
@@ -87,6 +88,7 @@ import {
   sameInstrument,
   sessionFor,
   TIMEZONES,
+  timeToBar,
   wallClock,
   zoneOffsetLabel,
   IST_OFFSET,
@@ -1183,19 +1185,12 @@ export default function ChartPanel(props: ChartPanelProps) {
 
   /** Chart-time → fractional bar index of the displayed series. */
   function timeToLogical(t: number): number | null {
-    const c = viewRef.current;
-    const n = c.length;
-    if (n === 0) return null;
-    if (t <= c[0].time) return (t - c[0].time) / barInterval();
-    if (t >= c[n - 1].time) return n - 1 + (t - c[n - 1].time) / barInterval();
-    let lo = 0;
-    let hi = n - 1;
-    while (lo + 1 < hi) {
-      const mid = (lo + hi) >> 1;
-      if (c[mid].time <= t) lo = mid;
-      else hi = mid;
-    }
-    return lo + (t - c[lo].time) / (c[hi].time - c[lo].time);
+    return timeToBar(viewRef.current, t, barInterval());
+  }
+
+  /** Inverse of timeToLogical. */
+  function logicalToTime(l: number): number | null {
+    return barTime(viewRef.current, l, barInterval());
   }
 
   /** Chart-time → x pixel. Interpolates fractional logical positions so
@@ -1207,18 +1202,13 @@ export default function ChartPanel(props: ChartPanelProps) {
     return safe(() => chart.timeScale().logicalToCoordinate(l as Logical) as number | null, null) ?? null;
   }
 
-  /** x pixel → chart-time (fractional between bars, extrapolated at edges). */
-  function xToTime(x: number): number | null {
+  /** x pixel → chart-time, snapped to the nearest bar like TradingView
+   *  anchors (`exact` keeps the sub-bar position — freehand strokes). */
+  function xToTime(x: number, exact = false): number | null {
     const chart = chartRef.current;
-    const c = viewRef.current;
-    if (!chart || c.length === 0) return null;
+    if (!chart) return null;
     const l = safe(() => chart.timeScale().coordinateToLogical(x) as number | null, null) ?? null;
-    if (l === null) return null;
-    const n = c.length;
-    const i = Math.floor(l);
-    if (i < 0) return c[0].time + l * barInterval();
-    if (i >= n - 1) return c[n - 1].time + (l - (n - 1)) * barInterval();
-    return c[i].time + (l - i) * (c[i + 1].time - c[i].time);
+    return l === null ? null : logicalToTime(exact ? l : Math.round(l));
   }
 
   function priceToY(p: number): number | null {
@@ -2475,17 +2465,6 @@ export default function ChartPanel(props: ChartPanelProps) {
   const shiftRef = useRef(false);
   const crossRaf = useRef(0);
 
-  /** Inverse of timeToLogical. */
-  function logicalToTime(l: number): number | null {
-    const c = viewRef.current;
-    const n = c.length;
-    if (n === 0) return null;
-    if (l <= 0) return c[0].time + l * barInterval();
-    if (l >= n - 1) return c[n - 1].time + (l - (n - 1)) * barInterval();
-    const i = Math.floor(l);
-    return c[i].time + (l - i) * (c[i + 1].time - c[i].time);
-  }
-
   /** Magnet: snap a point to the nearest O/H/L/C of its bar. */
   function snapPoint(time: number, price: number, y: number): DrawingPoint {
     const m = magnetRef.current;
@@ -2946,7 +2925,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     if (fh) {
       const pt = paneCoords(e, true);
       if (!pt || Math.hypot(pt.x - fh.last.x, pt.y - fh.last.y) < 3) return;
-      const t = xToTime(pt.x), p = yToPrice(pt.y);
+      const t = xToTime(pt.x, true), p = yToPrice(pt.y);
       if (t === null || p === null) return;
       fh.points.push({ time: t, price: p });
       fh.last = pt;
