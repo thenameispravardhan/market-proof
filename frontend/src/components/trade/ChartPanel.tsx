@@ -156,6 +156,8 @@ import { AboutIndicatorDialog, InsightsDialog, ManagePanesDialog, WhatsNewDialog
 import { CHART_SETTINGS_EVENT } from "./UserSettings";
 import { LEVEL_DRAG_SLOP, levelProblem, snapLot, snapToTick } from "./levelDrag";
 import OrderLayer, { type ChartWorkingOrder, type OrderPatch } from "./OrderLayer";
+import ReplayTrader from "./ReplayTrader";
+import type { ReplayMark } from "./replayBook";
 
 const IST = IST_OFFSET;
 
@@ -942,6 +944,8 @@ export default function ChartPanel(props: ChartPanelProps) {
   const [tradeFly, setTradeFly] = useState<{ x: number; y: number } | null>(null);
   const [levelDrag, setLevelDrag] = useState<"sl" | "tp" | null>(null);
   const [replay, setReplayState] = useState({ on: false, selecting: false, playing: false, speed: 1, idx: 0 });
+  /** Fills / exits of the replay's simulated trades, drawn as bar marks. */
+  const [replayMarks, setReplayMarks] = useState<ReplayMark[]>([]);
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const [paneRects, setPaneRects] = useState<{ i: number; top: number; height: number }[]>([]);
   /** Width of a visible left price axis — the legends start right of it. */
@@ -3969,6 +3973,17 @@ export default function ChartPanel(props: ChartPanelProps) {
         text: settings.executionLabels ? `${buy ? "B" : "S"} ${x.qty} @ ${fmtNum(x.price, 2)}` : "",
       });
     }
+    for (const m of replayMarks) {
+      if (m.time < times[0]) continue;
+      const buy = m.side === "BUY";
+      ms.push({
+        time: snapT(m.time) as UTCTimestamp,
+        position: buy ? "belowBar" : "aboveBar",
+        color: m.exit ? ((m.pnl ?? 0) >= 0 ? col.up : col.down) : buy ? "#2962FF" : col.down,
+        shape: m.exit ? "circle" : buy ? "arrowUp" : "arrowDown",
+        text: m.text,
+      });
+    }
     const evColor: Record<ChartEvent["kind"], string> = { D: "#F23645", S: "#2962FF", E: "#FF9800", B: "#9C27B0" };
     for (const ev of events) {
       if (ev.time < times[0]) continue;
@@ -3980,7 +3995,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     ms.sort((a, b) => a.time - b.time);
     markersRef.current = (safe(() => createSeriesMarkers(main, ms as never[])) as unknown as typeof markersRef.current) ?? null;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [strat, events, executions, settings.showMarks, settings.executionLabels, entry, mainVer, dataVer]);
+  }, [strat, events, executions, replayMarks, settings.showMarks, settings.executionLabels, entry, mainVer, dataVer]);
 
   async function runStrategy(s: StrategyItem): Promise<void> {
     const c = candlesRef.current;
@@ -6653,15 +6668,30 @@ ${hh ? `${hh}:${String(mm).padStart(2, "0")}` : mm}:${String(ss).padStart(2, "0"
           )}
           {replay.on && !replay.selecting && (
             <div className="chart-replay chart-overlay-ui" data-testid="chart-replay" onMouseDown={(e) => e.stopPropagation()}>
-              <b>Replay</b>
-              <button type="button" onClick={() => setReplay({ ...replay, selecting: true, playing: false })} title="Select a new start bar">⇤ start</button>
-              <button type="button" onClick={() => setReplay({ ...replay, playing: !replay.playing })} title={replay.playing ? "Pause" : "Play"} data-testid="replay-play">{replay.playing ? "⏸" : "▶"}</button>
-              <button type="button" onClick={() => stepReplay(1)} title="Step forward" data-testid="replay-step">⏭</button>
-              <select value={replay.speed} onChange={(e) => setReplay({ ...replay, speed: Number(e.target.value) })} aria-label="Replay speed">
-                {[0.5, 1, 2, 3, 5, 10].map((s) => <option key={s} value={s}>{s}×</option>)}
-              </select>
-              <span className="hint">{replay.idx + 1} / {candlesRef.current.length}</span>
-              <button type="button" onClick={stopReplay} title="Jump to real-time and exit replay" data-testid="replay-exit">⇥ real-time</button>
+              <div className="replay-row">
+                <b>Replay</b>
+                <button type="button" onClick={() => setReplay({ ...replay, selecting: true, playing: false })} title="Select a new start bar (closes open replay trades)">⇤ start</button>
+                <button type="button" onClick={() => setReplay({ ...replay, playing: !replay.playing })} title={replay.playing ? "Pause" : "Play"} data-testid="replay-play">{replay.playing ? "⏸" : "▶"}</button>
+                <button type="button" onClick={() => stepReplay(1)} title="Step forward" data-testid="replay-step">⏭</button>
+                <select value={replay.speed} onChange={(e) => setReplay({ ...replay, speed: Number(e.target.value) })} aria-label="Replay speed">
+                  {[0.5, 1, 2, 3, 5, 10].map((s) => <option key={s} value={s}>{s}×</option>)}
+                </select>
+                <span className="hint">{replay.idx + 1} / {candlesRef.current.length}</span>
+                <button type="button" onClick={stopReplay} title="Jump to real-time and exit replay (closes open replay trades)" data-testid="replay-exit">⇥ real-time</button>
+              </div>
+              <ReplayTrader
+                symbol={symbol}
+                shortName={shortName}
+                lot={lotOf}
+                candles={() => candlesRef.current}
+                idx={replay.idx}
+                barSeconds={intervalSeconds(iv)}
+                resolution={plan.res}
+                fno={/^(NSE|BSE):.+-(EQ|INDEX)$/i.test(symbol)}
+                playing={replay.playing}
+                onMarks={setReplayMarks}
+                fmt={fmtPrice}
+              />
             </div>
           )}
           {textDraft && (

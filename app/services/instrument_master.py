@@ -544,6 +544,10 @@ class InstrumentMaster:
     def count(self) -> int:
         return len(self._by_symbol)
 
+    def options_of(self, underlying: str) -> list[tuple[str, float, str, int, int, float]]:
+        """Listed option contracts of one underlying: (symbol, strike, CE/PE, expiry epoch, lot, tick)."""
+        return self._options.get((underlying or "").strip().upper(), [])
+
     def get(self, symbol: str) -> Optional[Instrument]:
         hit = self._by_symbol.get(symbol)
         if hit is None and symbol.endswith(("CE", "PE")) and ":" in symbol:
