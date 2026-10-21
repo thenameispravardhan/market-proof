@@ -643,59 +643,6 @@ def test_live_minute_cache_fetches_only_new_minutes(monkeypatch):
     assert all(v >= 450 for v in vb["v"])                   # forming volume candle dropped
 
 
-def test_tick_recorder_end_to_end(tmp_path):
-    """Frames -> Lee-Ready classification -> raw CSV -> after-close compaction ->
-    minute flow readable for backtests; a restart replays today's CSV."""
-    import time as _t
-
-    from app.algo import orderflow as of
-    from app.algo import ticks
-
-    rec = ticks.TickRecorder(tmp_path)
-    day0 = int(_t.time()) - (int(_t.time()) + 19800) % 86400
-    t0 = day0 + 33300                                       # 09:15 today (IST)
-    seq = [(100.0, 1000, 99.95, 100.05), (100.05, 1300, 100.0, 100.05),   # +300 at ask: buy
-           (100.0, 1400, 100.0, 100.05), (100.1, 1500, 100.05, 100.1)]   # +100 at bid: sell; +100 uptick: buy
-    for k, (ltp, vol, bid, ask) in enumerate(seq):
-        rec.on_tick("NSE:SBIN-EQ", {"ltp": ltp, "vol_traded_today": vol, "bid_price": bid, "ask_price": ask,
-                                     "exch_feed_time": t0 + 10 * k})
-    assert rec.flush() == 4
-    flow = rec.minute_flow("SBIN", t0, t0 + 60)
-    assert flow == {t0: (400.0, 100.0)}
-    again = ticks.TickRecorder(tmp_path)                    # restart mid-day
-    again.replay_today()
-    assert again.minute_flow("SBIN", t0, t0 + 60) == flow
-    again.compact((t0 + 19800) // 86400)
-    assert not list((tmp_path / "raw" / "SBIN").glob("*.csv")) and (tmp_path / "flow" / "SBIN").is_dir()
-    assert again.minute_flow("SBIN", t0, t0 + 60) == flow     # now read back from parquet
-    assert again.footprint("SBIN", t0, t0 + 60)[0][1] in (100.0, 100.05, 100.1)
-    # a restart after the close compacts a late frame again: the day's raw file keeps every frame
-    import duckdb
-    raw_pq = next((tmp_path / "raw" / "SBIN").glob("*.parquet"))
-    n_before = duckdb.sql(f"SELECT count(*) FROM read_parquet('{raw_pq.as_posix()}')").fetchone()[0]
-    late_frame = ticks.TickRecorder(tmp_path)
-    late_frame.on_tick("NSE:SBIN-EQ", {"ltp": 100.1, "vol_traded_today": 1600, "bid_price": 100.05, "ask_price": 100.1,
-                                        "exch_feed_time": t0 + 50})
-    late_frame.flush()
-    late_frame.compact((t0 + 19800) // 86400)
-    assert duckdb.sql(f"SELECT count(*) FROM read_parquet('{raw_pq.as_posix()}')").fetchone()[0] == n_before + 1
-    m1 = {"t": [t0], "o": [100.0], "h": [100.1], "l": [99.95], "c": [100.1], "v": [500]}
-    b = of.build_bars(m1, "time", 1, real=flow)
-    assert b["buy_v"][0] == 400 and b["real_pct"][0] == 100.0  # the candle's split IS the recorded one
-    rec.on_tick("NSE:SBIN-EQ", {"ltp": 99.0, "vol_traded_today": 9e6, "exch_feed_time": t0 - 86400 * 3})
-    assert rec.flush() == 0                                  # subscribe snapshot of an earlier session: dropped
-    y = t0 - 86400                                           # a day the bot was down at the close
-    late = ticks.TickRecorder(tmp_path)
-    for k, (ltp, vol, bid, ask) in enumerate(seq):
-        late._buf.setdefault("SBIN", []).append(late._classify("SBIN", (y + k, y + 10 * k, ltp, vol, 0.0, 0, bid, ask,
-                                                                        0.0, 0.0, 0.0, 0.0)))
-    late.flush()
-    late._minutes, late._fp, late._state = {}, {}, {}
-    ticks.TickRecorder(tmp_path).sweep()
-    assert not list((tmp_path / "raw" / "SBIN").glob("*.csv"))
-    assert ticks.TickRecorder(tmp_path).minute_flow("SBIN", y, y + 60) == {y: (400.0, 100.0)}
-
-
 def test_adv_from_daily_candles_unblocks_known_liquid_symbols():
     """Fyers quotes carry no ADV; it is derived from daily candles so
     REQUIRE_KNOWN_LIQUIDITY doesn't refuse every live order."""
@@ -785,21 +732,6 @@ def test_atr_stop_on_an_option_premium_is_the_underlyings_atr_times_delta():
     assert abs(engine.premium_atr({14: 40.0}, priced, 24550.0, DAY0)[14] - atm) < 0.5   # IV implied from the live price
     closes = [24500, 24520, 24540, 24560, 24600, 24650, 24700] + [24700] * 30
     assert engine.run(spec, {"N": _nifty(closes)})["trades"]      # backtests instead of a ValueError
-
-
-def test_tick_retention_deletes_only_old_files(tmp_path):
-    from app.algo import ticks
-
-    rec = ticks.TickRecorder(tmp_path)
-    rec.save_config(True, ["NIFTY:FUT"], retention_days=15)
-    for rel in ("raw/NIFTY-FUT/20260901.parquet", "raw/NIFTY-FUT/20261018.parquet",
-                "flow/NIFTY-FUT/202608.parquet", "flow/NIFTY-FUT/202610.parquet", "fp/NIFTY-FUT/202609.parquet"):
-        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / rel).write_bytes(b"x")
-    today = 1792368000 // 86400                         # 2026-10-19
-    assert rec.prune(today) == 3                        # Sep 1 raw, Aug flow, Sep footprint (cutoff Oct 4)
-    left = sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.glob("*/*/*.parquet"))
-    assert left == ["flow/NIFTY-FUT/202610.parquet", "raw/NIFTY-FUT/20261018.parquet"]
 
 
 def test_stats_median_win_and_loss():

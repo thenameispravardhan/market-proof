@@ -580,7 +580,7 @@ class AlgoRunner:
         # Record real ticks for everything an enabled strategy trades.
         from app.algo import ticks
 
-        ticks.recorder().extra = sorted({x for s in strategies if s["enabled"] for x in s["spec"]["symbols"]})
+        ticks.set_strategy_symbols({x for s in strategies if s["enabled"] for x in s["spec"]["symbols"]})
         if self._master_day != day and any(s["spec"]["instrument"]["type"] != "equity" for s in strategies):
             self._master_day = day
             try:

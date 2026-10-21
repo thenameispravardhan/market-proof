@@ -4,6 +4,7 @@
 // "follow the app theme".
 
 import type { DateFormat } from "./chartData";
+import type { FootprintSettings } from "./footprint";
 
 export type LineVisibility = "hover" | "always" | "never";
 
@@ -150,6 +151,8 @@ export interface ChartSettings {
   // ---- Alerts ----
   alertLines: boolean;
   alertColor: string;
+  // ---- Footprint (order flow chart type) ----
+  footprint: Partial<FootprintSettings>;
 }
 
 export const DEFAULT_SETTINGS: ChartSettings = {
@@ -239,6 +242,7 @@ export const DEFAULT_SETTINGS: ChartSettings = {
   showMarks: true,
   alertLines: true,
   alertColor: "",
+  footprint: {},
 };
 
 export const SETTINGS_KEY = "chart:settings";
