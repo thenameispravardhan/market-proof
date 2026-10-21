@@ -40,6 +40,7 @@ from app.api import (
     outcomes as outcomes_api,
     positions as positions_api,
     prompts as prompts_api,
+    replay as replay_api,
     risk as risk_api,
     research as research_api,
     news as news_api,
@@ -711,6 +712,7 @@ app.include_router(warehouse_api.router)
 app.include_router(model_api.router)
 app.include_router(system_api.router)
 app.include_router(algo_api.router)
+app.include_router(replay_api.router)
 app.include_router(snapshots_api.router)
 app.include_router(research_api.router)
 app.include_router(news_api.router)
