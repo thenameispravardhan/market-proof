@@ -20,7 +20,7 @@ import {
   visibleOnInterval,
 } from "../components/trade/indicatorCatalog";
 import { candlePatterns, zigzag } from "../components/trade/indicatorMore";
-import type { Bar } from "../components/trade/chartData";
+import { barTime, timeToBar, type Bar } from "../components/trade/chartData";
 
 // ---------------------------------------------------------------------------
 // alerts
@@ -224,5 +224,26 @@ describe("indicator catalog", () => {
     expect(visibleOnInterval(i, "30")).toBe(false);
     expect(visibleOnInterval(i, "D")).toBe(false);
     expect(visibleOnInterval(i, "60")).toBe(true); // hours untouched
+  });
+});
+
+describe("drawing anchors across timeframes (TradingView rule)", () => {
+  const D = 86400, OPEN = 9 * 3600 + 15 * 60;
+  const bar = (time: number): Bar => ({ time, open: 1, high: 1, low: 1, close: 1, volume: 0 });
+  // two sessions of 5m bars (09:15-15:25), and a Fri / Mon pair of 1D bars
+  const m5 = [0, 1].flatMap((d) => Array.from({ length: 75 }, (_, i) => bar(d * D + OPEN + i * 300)));
+  const d1 = [bar(0), bar(3 * D)];
+
+  it("a 1D anchor lands on that day's first 5m bar, not in the overnight gap", () => {
+    expect(timeToBar(m5, D, 300)).toBe(75);
+  });
+  it("a 5m anchor sits inside its own day's 1D bar, never across the weekend", () => {
+    const l = timeToBar(d1, OPEN + 10 * 300, D)!;
+    expect(l).toBeGreaterThanOrEqual(0);
+    expect(l).toBeLessThan(1);
+  });
+  it("bar times round-trip, and a gap time snaps to the next bar", () => {
+    for (const l of [0, 37, 74, 75, 149, 152]) expect(timeToBar(m5, barTime(m5, l, 300)!, 300)).toBeCloseTo(l);
+    expect(timeToBar(d1, 2 * D, D)).toBe(1); // Sunday → Monday
   });
 });

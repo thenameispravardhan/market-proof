@@ -128,6 +128,36 @@ export function intervalSeconds(key: string): number {
   }
 }
 
+/** Chart time → fractional bar index of `c` (bar length `span` s), the
+ *  TradingView way: a time sits in the bar that contains it, and a time in a
+ *  gap (overnight, weekend, holiday) belongs to the next bar — so a 1D anchor
+ *  lands on that day's first 5m bar, and a 5m anchor inside its day's 1D bar. */
+export function timeToBar(c: Bar[], t: number, span: number): number | null {
+  const n = c.length;
+  if (n === 0) return null;
+  if (t < c[0].time) return (t - c[0].time) / span;
+  if (t >= c[n - 1].time) return n - 1 + (t - c[n - 1].time) / span;
+  let lo = 0;
+  let hi = n - 1;
+  while (lo + 1 < hi) {
+    const mid = (lo + hi) >> 1;
+    if (c[mid].time <= t) lo = mid;
+    else hi = mid;
+  }
+  const f = (t - c[lo].time) / Math.min(span, c[hi].time - c[lo].time);
+  return f < 1 ? lo + f : hi;
+}
+
+/** Inverse of timeToBar. */
+export function barTime(c: Bar[], l: number, span: number): number | null {
+  const n = c.length;
+  if (n === 0) return null;
+  if (l <= 0) return c[0].time + l * span;
+  if (l >= n - 1) return c[n - 1].time + (l - (n - 1)) * span;
+  const i = Math.floor(l);
+  return c[i].time + (l - i) * Math.min(span, c[i + 1].time - c[i].time);
+}
+
 export function isIntraday(key: string): boolean {
   const iv = parseInterval(key);
   return iv != null && (iv.unit === "S" || iv.unit === "m");

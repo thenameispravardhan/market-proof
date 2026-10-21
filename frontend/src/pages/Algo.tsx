@@ -2092,7 +2092,7 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
                     if (on && s.mode === "live" && !window.confirm(`REAL MONEY: switch on "${s.name}"? It will place real orders on the next signal.`)) return;
                     put(s.id, { enabled: on });
                   }} /></td>
-                  <td><a href="#/algo" onClick={(e) => { e.preventDefault(); setSel(sel === s.id ? null : s.id); }}>{s.name}</a>{" "}
+                  <td style={{ whiteSpace: "normal", minWidth: 140, maxWidth: 220, overflowWrap: "anywhere" }}><a href="#/algo" onClick={(e) => { e.preventDefault(); setSel(sel === s.id ? null : s.id); }}>{s.name}</a>{" "}
                     <button type="button" className="btn-sm" onClick={() => setSel(s.id)} title="this automation's trades and open positions" data-testid={`algo-trades-${s.id}`}>Trades</button></td>
                   <td>
                     <select value={s.version} title="the version that runs — switch back and forth any time" onChange={async (e) => {
@@ -2104,7 +2104,7 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
                     </select>
                   </td>
                   <td className="mono" style={{ maxWidth: 200, overflow: "hidden", textOverflow: "ellipsis" }} title={s.spec.symbols.join(", ")}>{s.spec.symbols.map(shortSym).join(", ")}</td>
-                  <td className="meta" style={{ maxWidth: 240, whiteSpace: "normal" }}>{instLabel(s)}</td>
+                  <td className="meta" style={{ minWidth: 180, maxWidth: 260, whiteSpace: "normal" }}>{instLabel(s)}</td>
                   <td className="mono">{barLabel(s.spec)}</td>
                   <td>
                     <select value={s.mode} onChange={(e) => {
