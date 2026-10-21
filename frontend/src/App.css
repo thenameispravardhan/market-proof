@@ -3332,3 +3332,10 @@ a.news-title:hover { color: var(--accent); text-decoration: underline; }
 .flow-table th:first-child, .flow-table td:first-child { text-align: left; }
 .flow-table .flow-bar-col { width: 22%; }
 .dock-panel[data-testid="dock-flow"] .dock-body { overflow: hidden; }
+
+/* line icons (components/trade/tvIcons.tsx) inside the drawing strip, its flyouts and the right panel bar */
+.tv-ico { display: block; }
+.chart-tool .tv-ico { width: 22px; height: 22px; }
+.dtb-fly-item .ico { display: grid; place-items: center; width: 20px; }
+.dtb-fly-item .ico .tv-ico { width: 20px; height: 20px; }
+.fav-bar .chart-tool .tv-ico { width: 20px; height: 20px; }
