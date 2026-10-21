@@ -30,7 +30,7 @@ import {
 } from "lightweight-charts";
 import { api } from "../api/client";
 import { useSessionState } from "../router";
-import { peekQuote, useQuoteTick } from "../hooks/useQuotes";
+import { peekQuote, useQuoteTick, watchSymbol } from "../hooks/useQuotes";
 import { Toggle } from "../components/common/Toggle";
 import { chartHref } from "../lib/chartLink";
 
@@ -203,8 +203,13 @@ type LiveTrade = {
   entry_at: string; entry_price: number | null; stop_loss: number | null; target: number | null; trail_stop: number | null;
   exit_at: string | null; exit_price: number | null; exit_reason: string | null; net_pnl: number | null; charges: number | null;
   note: string | null; ltp?: number | null; unrealized?: number | null; legs: LiveLeg[] | null; be_on?: boolean | null; ref?: string;
+  version?: number | null;
 };
-type RunnerStatus = { running: boolean; last_tick: number | null; last_sync: { t: number; symbols: number; ok: number; failed: string[] } | null; events: { t: number; level: string; msg: string }[]; open: LiveTrade[] };
+type RunnerStatus = {
+  running: boolean; last_tick: number | null; last_sync: { t: number; symbols: number; ok: number; failed: string[] } | null;
+  events: { t: number; level: string; msg: string; strategy_id?: number }[]; open: LiveTrade[];
+  ticks?: { seen: number; last_exit_check: number | null; watching: number };
+};
 type Account = { id: number; name: string; broker: string; paper_mode: boolean; enabled: boolean };
 type InstInfo = { symbol: string; name: string; fno: boolean; lot: number | null; weekly: boolean; futures: { symbol: string; expiry: number }[]; coverage: { first: number; last: number; rows: number } | null };
 type Hit = { symbol: string; short_name: string; segment: string; exchange: string; display: string; lot_size: number };
@@ -2027,10 +2032,33 @@ function AlgoLiveMtm({ t }: { t: LiveTrade }) {
   return <td className={`mono ${pnlCls(v)}`} data-testid={`algo-mtm-${t.id}`}>{inr(v)}</td>;
 }
 
+// The reference price straight off the websocket, flashing green / red on each up / down tick.
 function AlgoLiveLtp({ t }: { t: LiveTrade }) {
   useQuoteTick();
   const ref = t.ref === "u" ? t.symbol : t.legs?.[0]?.symbol ?? t.symbol;
-  return <>{num(peekQuote(ref)?.last_price ?? t.ltp)}</>;
+  const px = peekQuote(ref)?.last_price ?? t.ltp ?? null;
+  const last = useRef<number | null>(null);
+  const [dir, setDir] = useState<"up" | "down" | null>(null);
+  useEffect(() => {
+    if (px == null) return;
+    const prev = last.current;
+    last.current = px;
+    if (prev == null || prev === px) return;
+    setDir(px > prev ? "up" : "down");
+    const h = setTimeout(() => setDir(null), 350);
+    return () => clearTimeout(h);
+  }, [px]);
+  return <span data-testid={`algo-ltp-${t.id}`} style={dir ? { color: dir === "up" ? "var(--green)" : "var(--red)", fontWeight: 600 } : undefined}>{num(px)}</span>;
+}
+
+// Keep every symbol an open automation position holds streaming to this
+// browser, so its LTP / MTM cells move on each websocket tick.
+function useWatchOpen(open: LiveTrade[]) {
+  const key = [...new Set(open.flatMap((t) => [t.symbol, ...(t.legs ?? []).map((l) => l.symbol)]))].sort().join(",");
+  useEffect(() => {
+    const releases = key ? key.split(",").map((s) => watchSymbol(s)) : [];
+    return () => releases.forEach((r) => r());
+  }, [key]);
 }
 
 function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
@@ -2039,10 +2067,14 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
   // 1 s: the endpoint reads the tick stream (no Fyers REST per call); the MTM cells tick per frame on top of it.
   const status = useQuery({ queryKey: ["algo", "status"], queryFn: () => api.get<RunnerStatus>("/api/algo/status"), refetchInterval: 1000 });
   const accounts = useQuery({ queryKey: ["algo", "accounts"], queryFn: () => api.get<{ accounts: Account[] }>("/api/broker-accounts") });
-  const [sel, setSel] = useState<number | null>(null);
+  // Strategies whose trades, positions and log lines are shown; empty = all of them.
+  const [sel, setSel] = useState<number[]>([]);
+  const selKey = [...sel].sort((a, b) => a - b).join(",");
+  const toggleSel = (id: number) => setSel((cur) => cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]);
+  const shown = (id: number | undefined) => !sel.length || (id != null && sel.includes(id));
   const trades = useQuery({
-    queryKey: ["algo", "trades", sel], refetchInterval: 3000,
-    queryFn: () => api.get<{ trades: LiveTrade[] }>(`/api/algo/trades?limit=300${sel ? `&strategy_id=${sel}` : ""}`),
+    queryKey: ["algo", "trades", selKey], refetchInterval: 3000,
+    queryFn: () => api.get<{ trades: LiveTrade[] }>(`/api/algo/trades?limit=300${selKey ? `&strategy_ids=${selKey}` : ""}`),
   });
   const [err, setErr] = useState<string | null>(null);
   const refresh = () => { qc.invalidateQueries({ queryKey: ["algo"] }); };
@@ -2055,8 +2087,13 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
   const st = status.data;
   const ago = st?.last_tick ? Math.round(Date.now() / 1000 - st.last_tick) : null;
   const nameOf = (id: number) => strategies.data?.strategies.find((s) => s.id === id)?.name ?? String(id);
-  const openShown = (st?.open ?? []).filter((t) => !sel || t.strategy_id === sel);
+  const openShown = (st?.open ?? []).filter((t) => shown(t.strategy_id));
+  useWatchOpen(st?.open ?? []);
   useQuoteTick();   // re-render the header total per tick
+  const selNames = sel.map(nameOf).join(", ");
+  const events = (st?.events ?? []).filter((e) => shown(e.strategy_id));
+  const tk = st?.ticks;
+  const tickAgo = tk?.last_exit_check ? Math.max(0, Math.round(Date.now() / 1000 - tk.last_exit_check)) : null;
   const liveTotal = openShown.reduce((a, t) => a + (liveMtm(t) ?? 0), 0);
   const closed = (trades.data?.trades ?? []).filter((t) => t.status === "closed");
   const summary = {
@@ -2077,23 +2114,27 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
       <div className="widget widget-wide" style={{ marginBottom: 12 }}>
         <h3>Automations <span className="meta">
           runner {st?.running ? (ago !== null && ago < 30 ? `alive · tick ${ago}s ago` : "idle") : "not running"} ·
-          evaluates on each completed candle, exits on live LTP every 1s · every setting lives in Builder & backtest
+          evaluates on each completed candle · stops / targets checked on every websocket tick
+          {tk ? ` (${tk.seen.toLocaleString()} ticks · ${tk.watching} symbol${tk.watching === 1 ? "" : "s"}${tickAgo !== null ? ` · last check ${tickAgo}s ago` : ""})` : ""}
+          {" "}with a 1s REST sweep as backstop · every setting lives in Builder & backtest
         </span></h3>
         {(strategies.data?.strategies ?? []).length === 0 ? (
           <div className="empty">No saved strategies yet — build one in the Builder & backtest tab and press “Save as new strategy”.</div>
         ) : (
           <div style={grow()} data-testid="algo-auto-panel">
             <table>
-              <thead><tr><th>On</th><th>Strategy</th><th>Version</th><th>Symbols</th><th>Trades</th><th>TF</th><th>Mode</th><th>Open</th><th>Closed</th><th>Realised</th><th></th></tr></thead>
+              <thead><tr><th title="tick strategies to show only their trades, positions and log">Show</th><th>On</th><th>Strategy</th><th>Version</th><th>Symbols</th><th>Trades</th><th>TF</th><th>Mode</th><th>Open</th><th>Closed</th><th>Realised</th><th></th></tr></thead>
               <tbody>{strategies.data!.strategies.map((s) => (
-                <tr key={s.id} style={sel === s.id ? { background: "var(--bg-row)" } : undefined}>
+                <tr key={s.id} style={sel.includes(s.id) ? { background: "var(--bg-row)" } : undefined}>
+                  <td><input type="checkbox" checked={sel.includes(s.id)} onChange={() => toggleSel(s.id)}
+                    title="show this strategy's trades (tick several to compare them)" data-testid={`algo-sel-${s.id}`} /></td>
                   <td><Toggle on={s.enabled} size="sm" onChange={(on: boolean) => {
                     // Switching on a LIVE automation starts real orders — confirm it every time, not just when the mode was picked.
                     if (on && s.mode === "live" && !window.confirm(`REAL MONEY: switch on "${s.name}"? It will place real orders on the next signal.`)) return;
                     put(s.id, { enabled: on });
                   }} /></td>
-                  <td style={{ whiteSpace: "normal", minWidth: 140, maxWidth: 220, overflowWrap: "anywhere" }}><a href="#/algo" onClick={(e) => { e.preventDefault(); setSel(sel === s.id ? null : s.id); }}>{s.name}</a>{" "}
-                    <button type="button" className="btn-sm" onClick={() => setSel(s.id)} title="this automation's trades and open positions" data-testid={`algo-trades-${s.id}`}>Trades</button></td>
+                  <td style={{ whiteSpace: "normal", minWidth: 140, maxWidth: 220, overflowWrap: "anywhere" }}><a href="#/algo" onClick={(e) => { e.preventDefault(); toggleSel(s.id); }}>{s.name}</a>{" "}
+                    <button type="button" className="btn-sm" onClick={() => setSel([s.id])} title="only this automation's trades and open positions" data-testid={`algo-trades-${s.id}`}>Trades</button></td>
                   <td>
                     <select value={s.version} title="the version that runs — switch back and forth any time" onChange={async (e) => {
                       setErr(null);
@@ -2144,7 +2185,7 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
         )}
       </div>
       <div className="widget widget-wide" style={{ marginBottom: 12 }}>
-        <h3>Open positions {sel ? <span className="meta">— {nameOf(sel)}</span> : null} <span className="meta">· live MTM {inr(liveTotal)}</span></h3>
+        <h3>Open positions {sel.length ? <span className="meta">— {selNames}</span> : null} <span className="meta">· live MTM {inr(liveTotal)}</span></h3>
         {!openShown.length ? <div className="empty">flat</div> : (
           <div style={grow()} data-testid="algo-open-panel">
             <table>
@@ -2162,14 +2203,15 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
         )}
       </div>
       <div className="widget widget-wide" style={{ marginBottom: 12 }}>
-          <h3>Trades {sel ? <span className="meta">— {nameOf(sel)} <button type="button" className="btn-sm" onClick={() => setSel(null)}>show all</button></span> : <span className="meta">— all strategies</span>}</h3>
+          <h3>Trades {sel.length ? <span className="meta" data-testid="algo-trades-filter">— {selNames} <button type="button" className="btn-sm" onClick={() => setSel([])}>show all</button></span> : <span className="meta">— all strategies · tick strategies above to show only theirs</span>}</h3>
           <div className="meta" data-testid="algo-trade-summary">{summary.n} closed · {summary.n ? Math.round((summary.wins / summary.n) * 100) : 0}% winners · net <span className={pnlCls(summary.net)}>{inr(summary.net)}</span> · open MTM <span className={pnlCls(liveTotal)}>{inr(liveTotal)}</span></div>
           <div style={grow(420)} data-testid="algo-trades-panel">
             {!trades.data?.trades.length ? <div className="empty">none yet</div> : (
               <table>
-                <thead><tr><th>Instrument</th><th>Signal</th><th>Qty</th><th>Status</th><th>Entry</th><th>Exit</th><th>Reason</th><th>Net</th></tr></thead>
+                <thead><tr><th>Strategy</th><th>Instrument</th><th>Signal</th><th>Qty</th><th>Status</th><th>Entry</th><th>Exit</th><th>Reason</th><th>Net</th></tr></thead>
                 <tbody>{trades.data.trades.map((t) => (
                   <tr key={t.id} title={[t.note ?? "", ...(t.legs ?? []).map((l) => `${l.act > 0 ? "BUY" : "SELL"} ${l.qty} ${l.label ?? l.symbol}: ${num(l.entry)} → ${num(l.exit)}`)].filter(Boolean).join("\n")}>
+                    <td style={{ whiteSpace: "normal", maxWidth: 180, overflowWrap: "anywhere" }} data-testid={`algo-trade-strategy-${t.id}`}>{nameOf(t.strategy_id)}{t.version ? <span className="meta"> v{t.version}</span> : null}</td>
                     <td><a href={tradeChart(t)} target="_blank" rel="noopener" className="sym-link" title="Open the chart at this trade (15m)">{(t.instrument ?? t.symbol).replace(/NSE:/g, "")}</a></td><td>{t.side === "BUY" ? "LONG" : "SHORT"}</td><td className="mono">{t.quantity}</td>
                     <td>{t.status}{t.mode === "live" ? " ₹" : ""}</td>
                     <td className="mono">{num(t.entry_price)} <span className="meta">{isoIst(t.entry_at)}</span></td>
@@ -2182,9 +2224,9 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
           </div>
       </div>
       <div className="widget widget-wide">
-          <h3>Runner log</h3>
+          <h3>Runner log {sel.length ? <span className="meta">— {selNames}</span> : null}</h3>
           <div style={{ ...grow(320), fontSize: 12 }} data-testid="algo-log-panel">
-            {!st?.events.length ? <div className="empty">quiet</div> : st.events.map((e, i) => (
+            {!events.length ? <div className="empty">quiet</div> : events.map((e, i) => (
               <div key={i} className="mono" style={{ color: e.level === "error" ? "var(--red)" : e.level === "entry" ? "var(--green)" : e.level === "exit" ? "var(--accent)" : "var(--text-dim)" }}>
                 {ist(e.t)} {e.msg}
               </div>))}
@@ -2558,8 +2600,12 @@ export default function Algo() {
 
   return (
     <div className="algo">
-      <div className="dashboard-head">
-        <h1 className="page-title">Algo Lab</h1>
+      <div className="tabs" style={{ alignItems: "center", flexWrap: "wrap" }}>
+        {(["builder", "optimize", "compare", "automations", "data"] as Tab[]).map((t) => (
+          <button type="button" key={t} className={`tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
+            {{ builder: "Builder & backtest", optimize: "Optimise", compare: "Compare", automations: "Automations", data: "Data" }[t]}
+          </button>
+        ))}
         <button type="button" className="primary" style={{ marginLeft: 12 }} onClick={() => {
           if (!okToReplace()) return;
           load(withDefaults(c.defaults, { symbols: [], entry_long: G([]), entry_short: G([]) }), "New strategy", null, null);
@@ -2575,13 +2621,6 @@ export default function Algo() {
               download("algo-lab-guide.txt", await res.text(), "text/plain");
             } catch (e) { setMsg(`Guide download failed: ${errMsg(e)}`); }
           }}>⬇ Algo guide (for AI)</button>
-      </div>
-      <div className="tabs">
-        {(["builder", "optimize", "compare", "automations", "data"] as Tab[]).map((t) => (
-          <button type="button" key={t} className={`tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
-            {{ builder: "Builder & backtest", optimize: "Optimise", compare: "Compare", automations: "Automations", data: "Data" }[t]}
-          </button>
-        ))}
       </div>
 
       {tab === "automations" && <Automations onEdit={(s) => {
