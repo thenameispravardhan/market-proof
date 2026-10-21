@@ -2112,11 +2112,11 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
     <>
       {err && <div className="widget widget-wide pnl-neg" style={{ marginBottom: 12 }}>{err}</div>}
       <div className="widget widget-wide" style={{ marginBottom: 12 }}>
-        <h3>Automations <span className="meta">
-          runner {st?.running ? (ago !== null && ago < 30 ? `alive · tick ${ago}s ago` : "idle") : "not running"} ·
-          evaluates on each completed candle · stops / targets checked on every websocket tick
-          {tk ? ` (${tk.seen.toLocaleString()} ticks · ${tk.watching} symbol${tk.watching === 1 ? "" : "s"}${tickAgo !== null ? ` · last check ${tickAgo}s ago` : ""})` : ""}
-          {" "}with a 1s REST sweep as backstop · every setting lives in Builder & backtest
+        <h3>Automations <span className="meta" data-testid="algo-runner-state" title={
+          "Entries on each completed candle; stops / targets on every websocket tick, with a 1 s REST sweep as backstop."
+          + (tk ? ` ${tk.seen.toLocaleString()} ticks · ${tk.watching} symbol(s) watched${tickAgo !== null ? ` · last check ${tickAgo}s ago` : ""}.` : "")}>
+          {(([word, color]) => <><span style={{ color }}>●</span> {word}</>)(
+            !st?.running ? ["stopped", "var(--red)"] : ago !== null && ago < 30 ? ["live", "var(--green)"] : ["idle", "var(--amber)"])}
         </span></h3>
         {(strategies.data?.strategies ?? []).length === 0 ? (
           <div className="empty">No saved strategies yet — build one in the Builder & backtest tab and press “Save as new strategy”.</div>
@@ -2600,7 +2600,7 @@ export default function Algo() {
 
   return (
     <div className="algo">
-      <div className="tabs" style={{ alignItems: "center", flexWrap: "wrap" }}>
+      <div className="tabs algo-tabs">
         {(["builder", "optimize", "compare", "automations", "data"] as Tab[]).map((t) => (
           <button type="button" key={t} className={`tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
             {{ builder: "Builder & backtest", optimize: "Optimise", compare: "Compare", automations: "Automations", data: "Data" }[t]}
@@ -2612,7 +2612,7 @@ export default function Algo() {
           bt.reset(); setTab("builder");
           setMsg("New algo — pick symbols, add entry conditions, then backtest and save.");
         }}>＋ New algo</button>
-        <button type="button" className="btn-sm" style={{ marginLeft: 8 }} data-testid="algo-guide"
+        <button type="button" style={{ marginLeft: 8 }} data-testid="algo-guide"
           title="everything the builder and backtest can do, with the strategy JSON and worked examples — give it to an AI, describe your idea, then paste its JSON here (📋 paste JSON)"
           onClick={async () => {
             try {
