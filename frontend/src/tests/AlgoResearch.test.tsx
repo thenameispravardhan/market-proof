@@ -76,6 +76,10 @@ function route(url: string, init?: RequestInit) {
   if (url.includes("/api/algo/trades")) return json({ trades: [] });
   if (url.includes("/api/algo/instrument")) return json({ symbol: "NSE:SBIN-EQ", name: "SBIN", fno: false, lot: null, weekly: false, futures: [], coverage: null });
   if (url.includes("/api/algo/research/pairs")) return json(PAIRS);
+  if (url.includes("/api/algo/research/universe/nifty50/changes")) return json({ added: 2, total: 2, changes: 2 });
+  if (url.includes("/api/algo/research/universe")) return json({ indexes: [
+    { index: "nifty50", label: "NIFTY 50", snapshots: 3, first_snapshot: "20251001", last_snapshot: "20251022", changes: 0, first_change: null, trusted_from: "20251001", members_now: 50 },
+    { index: "niftybank", label: "NIFTY Bank", snapshots: 0, first_snapshot: null, last_snapshot: null, changes: 0, first_change: null, trusted_from: null, members_now: 0 }] });
   if (url.includes("/api/algo/research/surface/evaluate")) return json({
     name: "NIFTY", days: 14, quotes: 52000, lag: 1, methods: ["surface", "flat_atm", "flat"], min_days: 10, beats_flat: true,
     verdict: "the surface prices closer than flat IV", flat_source: "India VIX", elapsed_s: 3.1,
@@ -207,5 +211,23 @@ describe("Algo Lab research loop", () => {
     expect(sum.textContent).toContain("3 TARGET → SL");
     const body = calls.find((c) => c.url.includes("/tick-replay"))!.body;
     expect(body.spec.entry_long.conditions.length).toBeGreaterThan(0);
+  });
+
+  it("backtests on an index as it was each day, and imports its change log", async () => {
+    mount();
+    await screen.findByDisplayValue(/EMA 9\/21/);
+    const pick = within(screen.getByTestId("algo-universe")).getByRole("combobox");
+    fireEvent.change(pick, { target: { value: "nifty50" } });
+    fireEvent.click(screen.getByText("▶ Run backtest"));
+    await waitFor(() => expect(calls.some((c) => c.url.includes("/api/algo/backtest"))).toBe(true));
+    expect(calls.find((c) => c.url.includes("/api/algo/backtest"))!.body.spec.universe).toEqual({ index: "nifty50" });
+    fireEvent.click(screen.getByRole("button", { name: "Research" }));
+    const row = await screen.findByTestId("universe-nifty50");
+    expect(row.textContent).toContain("2025-10-01 → 2025-10-22");
+    fireEvent.click(within(row).getByText("import changes"));
+    fireEvent.change(screen.getByTestId("universe-csv"), { target: { value: "2024-03-28,SHRIRAMFIN,add\n2024-03-28,UPL,remove" } });
+    fireEvent.click(screen.getByText("Import"));
+    await waitFor(() => expect(calls.some((c) => c.url.includes("/universe/nifty50/changes"))).toBe(true));
+    expect(calls.find((c) => c.url.includes("/universe/nifty50/changes"))!.body).toEqual({ csv: "2024-03-28,SHRIRAMFIN,add\n2024-03-28,UPL,remove" });
   });
 });
