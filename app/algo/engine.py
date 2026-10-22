@@ -123,7 +123,11 @@ DEFAULT_SPEC: dict[str, Any] = {
 #   "rank": {"by": operand, "order": "desc"|"asc", "top": N} — when several
 #       symbols' entries fire on the same candle, only the best N by `by` enter,
 #       best first (shorts ranked the other way round).
-OPTIONAL_KEYS = ("scale_out", "margin", "position_rules", "rank")
+#   "guard": {"max_drawdown", "max_rejects", "max_slippage_pct", "on_breach"} —
+#       live only: the runner switches the strategy off when one is breached.
+OPTIONAL_KEYS = ("scale_out", "margin", "position_rules", "rank", "guard")
+GUARD_LIMITS = (("max_drawdown", "guard: max drawdown ₹", False), ("max_rejects", "guard: rejected orders a day", True),
+                ("max_slippage_pct", "guard: median live slippage %", False))
 # Per set (one set = the legs at their configured lots): delta in lots of the
 # underlying (1 = one lot of the future), gamma = delta change for a 1% move,
 # theta ₹ per day, vega ₹ per vol point, credit ₹ (net premium received; a
@@ -483,6 +487,16 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
         if top > 50:
             raise ValueError("rank: at most 50 may enter")
         s["rank"] = {"by": rk["by"], "order": order, "top": top}
+    gd = s.pop("guard", None)
+    if gd:
+        if not isinstance(gd, dict):
+            raise ValueError('guard is {"max_drawdown": ₹, "max_rejects": n, "max_slippage_pct": %, "on_breach": "pause"}')
+        g = {k: v for k, label, integer in GUARD_LIMITS
+             if (v := _num(gd.get(k), label, 1 if integer else 1e-9, integer=integer, allow_none=True)) is not None}
+        if (gd.get("on_breach") or "pause") not in ("pause", "flatten"):
+            raise ValueError("guard on_breach is pause (switch off, keep managing open positions) or flatten")
+        if g:
+            s["guard"] = {**g, "on_breach": gd.get("on_breach") or "pause"}
     if len(ref_frames(s)) > MAX_REF_SYMBOLS:
         raise ValueError(f"conditions can read at most {MAX_REF_SYMBOLS} other symbols")
     return s
@@ -2294,6 +2308,21 @@ def trial_dsr(trades: list[dict[str, Any]], data: dict[str, dict], capital: floa
         k = (x["exit_t"] + IST) // 86400
         net[k] = net.get(k, 0.0) + x["net"]
     return rstats.deflated_sharpe([net.get(k, 0.0) / capital for k in days], n_trials=max(1, n_trials))
+
+
+def fill_slippage(lg: dict[str, Any]) -> list[tuple[float, float]]:
+    """A live leg's fills against the quotes they were decided at: [(%, ₹)]
+    for its entry and exit, + = it cost you. A leg the broker no longer held
+    (external) or one without a quote gives nothing."""
+    out = []
+    if lg.get("external"):
+        return out
+    act = lg.get("act", 1)
+    for quote, fill, sign in (("entry_quote", "entry", act), ("exit_quote", "exit", -act)):
+        q, f = lg.get(quote), lg.get(fill)
+        if q and f:
+            out.append(((f - q) / q * 100 * sign, (f - q) * sign * (lg.get("qty") or 0)))
+    return out
 
 
 def match_trades(live: list[dict[str, Any]], bt: list[dict[str, Any]], tol_s: float

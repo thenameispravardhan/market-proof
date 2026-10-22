@@ -938,13 +938,11 @@ def tca(days: int = Query(30, ge=1, le=365), db: Session = Depends(get_db)) -> d
     groups: dict[tuple[int, str], list[tuple[float, float]]] = {}
     for t in rows:
         for lg in t.legs or []:
-            for quote, fill, sign in (("entry_quote", "entry", lg.get("act", 1)), ("exit_quote", "exit", -lg.get("act", 1))):
-                q, f = lg.get(quote), lg.get(fill)
-                if q and f and not lg.get("external"):
-                    groups.setdefault((t.strategy_id, lg.get("kind", "EQ")), []).append(
-                        ((f - q) / q * 100 * sign, (f - q) * sign * (lg.get("qty") or 0)))
+            groups.setdefault((t.strategy_id, lg.get("kind", "EQ")), []).extend(engine.fill_slippage(lg))
     out = []
     for (sid, kind), xs in sorted(groups.items()):
+        if not xs:
+            continue
         s = strategies.get(sid)
         pct = [x[0] for x in xs]
         out.append({"strategy_id": sid, "name": s.name if s else str(sid), "kind": kind, "fills": len(xs),

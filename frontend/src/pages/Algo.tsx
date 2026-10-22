@@ -127,6 +127,8 @@ type Spec = {
   costs: { slippage_pct: number; charges: boolean };
   // Several symbols fire on one candle: only the best `top` by `by` enter, best first (shorts ranked the other way).
   rank?: { by: Operand; order: "desc" | "asc"; top: number };
+  // Live only: the runner switches the automation off when one is breached.
+  guard?: { max_drawdown?: number; max_rejects?: number; max_slippage_pct?: number; on_breach: "pause" | "flatten" };
 };
 type IndicatorDef = { name: string; params: Record<string, number | string>; outputs: string[]; group: string; about?: string };
 type Catalog = {
@@ -3083,6 +3085,22 @@ export default function Algo() {
               <label className="meta">max trades / symbol <NumInput width={44} value={spec.max_trades_per_day} onChange={(n) => upd({ max_trades_per_day: Math.max(1, Math.floor(n ?? 1)) })} /></label>
               <label className="meta" title="after an exit, wait this many candles before re-entering the same symbol">re-entry cooldown <NumInput width={44} value={spec.cooldown_bars} onChange={(n) => upd({ cooldown_bars: Math.max(0, Math.floor(n ?? 0)) })} /> bars</label>
               <label className="meta" title="exit a position that has been open this many candles">time stop <NumInput width={44} allowEmpty placeholder="off" value={spec.max_bars} onChange={(n) => upd({ max_bars: n === null ? null : Math.max(1, Math.floor(n)) })} /> bars</label>
+            </div>
+            <div className="algo-operand" style={{ gap: 14, marginTop: 8 }} data-testid="algo-guard"
+              title="live only: the runner checks these once a minute and switches the automation OFF when one is breached (audited, risk-halt alert). Switching it back on is yours">
+              <span className="meta" style={{ color: "var(--text)" }}>Guard (switch off when):</span>
+              {([["max_drawdown", "drawdown ₹", 80], ["max_rejects", "rejected orders today", 36], ["max_slippage_pct", "median slippage %", 44]] as const).map(([k, label, w]) => (
+                <label key={k} className="meta">{label} <NumInput width={w} allowEmpty placeholder="off" value={spec.guard?.[k] ?? null} onChange={(n) => {
+                  const { [k]: _old, on_breach, ...rest } = spec.guard ?? {};
+                  const g = { ...rest, ...(n && n > 0 ? { [k]: k === "max_rejects" ? Math.floor(n) : n } : {}) };
+                  upd({ guard: Object.keys(g).length ? { ...g, on_breach: on_breach ?? "pause" } : undefined });
+                }} /></label>
+              ))}
+              {spec.guard && (
+                <select value={spec.guard.on_breach} onChange={(e) => upd({ guard: { ...spec.guard!, on_breach: e.target.value as "pause" | "flatten" } })}>
+                  <option value="pause">then keep managing open positions</option><option value="flatten">then flatten its positions</option>
+                </select>
+              )}
             </div>
             <div className="algo-operand" style={{ gap: 14, marginTop: 8 }}>
               {(["start", "end", "square_off"] as const).map((k) => {
