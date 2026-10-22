@@ -1836,13 +1836,16 @@ METRICS = ("net_pnl", "profit_factor", "sharpe", "sortino", "win_rate", "return_
 
 
 def optimize(spec: dict, data: dict[str, dict], grid: list[dict[str, Any]], metric: str = "net_pnl",
-             min_trades: int = 5, trade_from: Optional[int] = None, oos_from: Optional[int] = None) -> dict[str, Any]:
+             min_trades: int = 5, trade_from: Optional[int] = None, oos_from: Optional[int] = None,
+             prior_trials: int = 0) -> dict[str, Any]:
     """Grid-search over [{path, values}] and rank by `metric`.
 
     Ranks only combos with >= min_trades: a 1-trade 100% win rate wins every
     grid search and means nothing. With `oos_from` the ranking uses ONLY the
     in-sample trades and each row carries its out-of-sample result — the
-    walk-forward check that a winner was found, not fitted.
+    walk-forward check that a winner was found, not fitted. `prior_trials`:
+    backtests / combos already run on this idea, added to the Deflated
+    Sharpe's trial count.
     """
     axes, combos = _grid(grid, metric)
     caches: dict[str, dict] = {}
@@ -1877,7 +1880,7 @@ def optimize(spec: dict, data: dict[str, dict], grid: list[dict[str, Any]], metr
         raise ValueError(f"no valid combination: {invalid[0]}")
     ok = [r for r in rows if r["trades"] >= min_trades]
     ok.sort(key=lambda r: (r[metric] is not None, r[metric] or 0), reverse=True)
-    over = overfitting_stats([r["_daily"] for r in ok], capital, n_trials=len(combos))
+    over = overfitting_stats([r["_daily"] for r in ok], capital, n_trials=prior_trials + len(combos))
     for r in rows:
         r.pop("_daily", None)
     return {"combos": len(combos), "ranked": ok[:100],
@@ -2015,3 +2018,21 @@ def overfitting_stats(daily: list[dict[int, float]], capital: float, *, n_trials
     splits = next((k for k in (8, 6, 4) if len(days) // k >= 2), None)
     out["pbo"] = rstats.pbo_cscv(matrix, n_splits=splits) if splits and len(daily) >= 2 else None
     return out
+
+
+def trial_dsr(trades: list[dict[str, Any]], data: dict[str, dict], capital: float, n_trials: int,
+              trade_from: Optional[int] = None) -> Optional[dict[str, Any]]:
+    """Deflated Sharpe of ONE backtest after `n_trials` tries on the idea:
+    daily net P&L over every trading day of the run (0 on a day without an
+    exit). Without the other tries' Sharpes the deflation uses this series'
+    own Sharpe standard error — a floor, not the full penalty."""
+    from app.research import stats as rstats
+
+    days = sorted({(t + IST) // 86400 for d in data.values() for t in d["t"] if trade_from is None or t >= trade_from})
+    if len(days) < 10 or not capital:
+        return None
+    net: dict[int, float] = {}
+    for x in trades:
+        k = (x["exit_t"] + IST) // 86400
+        net[k] = net.get(k, 0.0) + x["net"]
+    return rstats.deflated_sharpe([net.get(k, 0.0) / capital for k in days], n_trials=max(1, n_trials))

@@ -204,3 +204,75 @@ def test_api_resolves_operand_symbols_and_lists_the_exceptions(client):
     bad = _cross_spec()
     bad["entry_long"]["conditions"][0]["left"] = {"ind": "VIX", "symbol": REF}
     assert client.post("/api/algo/validate", json={"spec": bad}).status_code == 422
+
+
+# ---- A2: every try counts toward the Deflated Sharpe -------------------------
+
+def _days_bars(n_days: int, seed: int = 5):
+    """5-minute candles over n_days sessions: a seeded random walk."""
+    import random
+
+    rnd, px, t, c = random.Random(seed), 100.0, [], []
+    day0 = DAY0
+    for k in range(n_days):
+        for i in range(75):
+            px *= 1 + rnd.gauss(0, 0.002)
+            t.append(day0 + k * 86400 + i * 300)
+            c.append(px)
+    d = bars(c)
+    d["t"] = t
+    return d
+
+
+def _ema_spec(**kw):
+    """Long when price crosses above its 20-candle EMA: trades often on a random walk."""
+    spec = _cross_spec(exit_long=None, target={"type": "pct", "value": 0.4}, stop_loss={"type": "pct", "value": 0.4}, **kw)
+    spec["entry_long"]["conditions"][0]["right"] = {"ind": "EMA", "params": {"period": 20}}
+    return spec
+
+
+def test_more_tries_deflate_the_sharpe():
+    d = _days_bars(30)
+    # a modest edge: +300 / -150 on alternating days, one exit a day
+    trades = [{"exit_t": DAY0 + k * 86400 + 3600, "net": 300.0 if k % 2 else -150.0} for k in range(30)]
+    one = engine.trial_dsr(trades, {"X": d}, 100000, 1)
+    many = engine.trial_dsr(trades, {"X": d}, 100000, 200)
+    assert one["n_trials"] == 1 and many["n_trials"] == 200
+    assert many["benchmark_sharpe"] > one["benchmark_sharpe"] == 0
+    assert many["dsr"] < one["dsr"]                       # the same result means less after 200 tries
+    assert engine.trial_dsr(trades, {"X": bars([100.0] * 20)}, 100000, 5) is None   # < 10 days
+
+
+def _fake_assemble(monkeypatch):
+    from app.api import algo as api
+
+    async def fake(spec, start, end):
+        return {s: _days_bars(30) for s in spec["symbols"]}, [], DAY0
+
+    monkeypatch.setattr(api.data, "assemble", fake)
+
+
+def test_backtests_and_sweeps_count_on_the_strategy_or_the_draft(client, monkeypatch):
+    from app.db import session as dbs
+    from app.db.models import AlgoStrategy
+
+    _fake_assemble(monkeypatch)
+    spec = _ema_spec()
+    rng = {"start": "2025-01-01", "end": "2025-02-15"}
+    s = client.post("/api/algo/strategies", json={"name": "rs", "spec": spec, "trials": 3}).json()
+    assert s["trials"] == 3                                   # a draft's tries come along on save
+    with dbs.SessionLocal() as db:
+        stamp = db.get(AlgoStrategy, s["id"]).updated_at
+    r = client.post("/api/algo/backtest", json={"spec": spec, **rng, "strategy_id": s["id"]}).json()
+    assert r["trials"] == 4 and r["stats"]["deflated_sharpe"]["n_trials"] == 4
+    grid = [{"path": "target.value", "values": [0.3, 0.4, 0.5]}]
+    o = client.post("/api/algo/optimize", json={"spec": spec, **rng, "grid": grid, "min_trades": 1,
+                                                "strategy_id": s["id"]}).json()
+    assert o["trials"] == 7 and o["overfitting"]["deflated_sharpe"]["n_trials"] == 7
+    with dbs.SessionLocal() as db:
+        row = db.get(AlgoStrategy, s["id"])
+        assert row.trials == 7 and row.updated_at == stamp     # counting is not an edit
+    assert client.get("/api/algo/strategies").json()["strategies"][0]["trials"] == 7
+    # an unsaved draft carries its own count
+    assert client.post("/api/algo/backtest", json={"spec": spec, **rng, "trials": 9}).json()["trials"] == 10
+    assert client.post("/api/algo/backtest", json={"spec": spec, **rng}).json()["trials"] == 1
