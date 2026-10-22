@@ -6,7 +6,9 @@ you want in plain words, and ask for the JSON. Then import that JSON in the
 Algo Lab (**⬆ import** for a file, **📋 paste JSON** for text) — the builder
 fills in, you backtest, tweak, save and automate.
 
-The last part of this file (*Reference*) is generated from the running app,
+Sections 10-12 walk through every field of the Builder screen, every
+number on the results screen and the other tabs. The last part of this file
+(*Reference*) is generated from the running app,
 so the indicator list, their settings and every allowed value are always
 current.
 
@@ -1214,3 +1216,369 @@ NIFTY 5-minute, Jan-Jul 2026, both sides together made 30 trades, 30% won,
 net −₹7,000 (profit factor 0.85); the call side alone (`"direction": "long"`)
 made 20 trades, net +₹5,000 — too few trades to mean anything. Put it through
 the research check before you paper-trade it.
+
+---
+
+## 10. The Builder, field by field
+
+Every input on the **Builder** tab, top to bottom, with the JSON key it
+writes (so a JSON from an AI and the screen always mean the same thing),
+its allowed values and its default. "empty / off" = the box left blank.
+
+### 10.0 From a basic strategy to a complex one — the order to build in
+
+Add one layer at a time and backtest after each; keep a layer only if it
+helps out of sample.
+
+1. **Basic** — one symbol, one entry condition, a stop and a target.
+   *EMA 9 crosses above EMA 21 → buy shares, 1% stop, 2R target.* (9.1)
+2. **Filters** — add AND conditions: a trend filter on a higher timeframe
+   (`tf: 1440`), a time window (`TIME`), RSI / ADX strength, a candle-body
+   check (4.5). (9.2, 9.8, 9.16)
+3. **Exits** — exit conditions, a trailing stop, move-stop-to-cost, a time
+   stop, scale-out of part of the position. (9.8, 9.9)
+4. **Risk & sizing** — risk-% sizing from the stop, daily max loss, max
+   trades per day, cooldown, the session window and entry days.
+5. **Many symbols** — a list of symbols sharing one capital pool,
+   `max_positions`, `rank` to take only the strongest, `universe` for an
+   honest backtest. (9.11, 9.15)
+6. **Derivatives** — futures, or option legs (buy a call / put, spreads,
+   straddles, condors), levels on premium or spot, MTM ₹ stops, SPAN margin.
+   (9.3-9.7)
+7. **Option management** — per-leg stops / targets, `on_leg_stop`,
+   re-entries, rolls, delta-hedging, Greek / premium position rules. (9.12)
+8. **Cross-symbol & pairs** — operands on another symbol, spreads and
+   z-scores, a hedged pair leg. (9.10, 9.13, 9.14)
+9. **Proof** — research check, optimise with walk-forward, Monte Carlo,
+   then paper, drift, guard, LIVE (8, 8.1).
+
+### 10.1 Strategy (top card)
+
+| field | JSON | values / default | notes |
+|---|---|---|---|
+| **⬇ export** | — | — | downloads `{name, spec}` as `<name>.json` |
+| **⬆ import** | — | a `.json` file | checked by the validator; an error says which value is wrong |
+| **📋 paste JSON** | — | text | paste what an AI wrote (a json code block or text around it is fine). **Import** checks it; on an error, **load anyway** opens it as written so you can fix it in the builder; **cancel** closes the box. Paste the error back to the AI to fix it |
+| **name** | `name` | text | the strategy's name; saved strategies need a unique one |
+| **template** | — | 39 ready-made strategies | loads one into the builder (asks before replacing unsaved work). Equity: EMA cross, VWAP + RSI, opening range, Bollinger reversion, gap-up, Turtle Donchian, squeeze, Ichimoku, Heikin-Ashi + ADX, linear-regression slope, PSAR, NR7, z-score, gap fade, Stoch-RSI pullback, steep cross, held spread, scale-out. Options: Supertrend CE / PE buy, 9:20 straddle, expiry-day strangle, 20Δ strangle, 16Δ condor, per-leg-stop strangle, 9:30 condor, credit spreads, long straddle on a squeeze, delta-surge buy, CPR stock options. Futures: BANKNIFTY EMA + trend, BANKNIFTY ORB. Order flow: delta-confirmed cross, CVD divergence, absorption, initiative pressure, value-area rejection, 80% rule, RVOL breakout, absorption at the extreme |
+| **candles** | `bars.type`, `timeframe`, `bars.per_day` | `time` + 1m … daily (default 5m) · `volume` / `turnover ₹` + ~N per day (5-1000, default 50) | time = a candle every N minutes; volume / turnover = a candle closes once that much has traded (sized so a typical day — the median of the 20 before the start — has about N) |
+| **direction** | `direction` | long / bullish only · short / bearish only · both | which signal(s) are used; for options it only names the signal, the legs decide buy / sell |
+| **symbols** | `symbols` | 1-50 | search a stock or index; **+ NIFTY / BANKNIFTY / FINNIFTY / MIDCPNIFTY / SENSEX** quick-adds; paste a comma / space separated list to add many; Backspace in the empty box removes the last; **clear** removes all; **×** on a chip removes one |
+| **versions** v1 v2 … | — | saved strategies only | click to load that version (✓ = the one Automations runs); **make vN active** switches Automations to it; **shadow-test vN** runs it in paper beside the active one (8.1) |
+
+Unsaved work is kept in this browser as a draft and comes back on reload.
+
+### 10.2 What to trade
+
+| field | JSON | values / default | notes |
+|---|---|---|---|
+| **Equity / index (cash)** · **Futures** · **Options** | `instrument.type` | equity · future · option | the header shows the symbol's F&O lot and whether it has weekly expiries. Switching sets sizing to shares (equity) or lots (F&O) |
+| **expiry** | `instrument.expiry` | current · next | F&O only |
+| expiry kind | `instrument.expiry_kind` | weekly (NIFTY, SENSEX) · monthly | options only; stocks and most indices are monthly |
+| **levels on** | `instrument.levels_on` | the option premium / the futures price (`instrument`) · the underlying spot (`underlying`) | where stop / target / trailing / breakeven are measured. Multi-leg positions must use the underlying (the premium choice is disabled) |
+| **▸ presets (19)** | `legs_long` / `legs_short` | leg setups | buy ATM CE / PE, buy 1-OTM, sell ATM (writer), bull call / bear put spread, short straddle, short strangle (3 OTM), iron fly, 20Δ strangle, credit spreads, long straddle / strangle, 16Δ / 5Δ iron condor, 1×2 ratio, butterfly, calendar, jade lizard, iron condor (2 / 4 OTM), protective put / call, covered call / put, collar. Multi-leg presets switch levels to the underlying |
+| **On a LONG / bullish signal** / **On a SHORT / bearish signal** | `legs_long` / `legs_short` | list of legs | **+ leg** adds BUY CE ATM 1 lot; ✕ removes one |
+
+**One leg (a row):**
+
+| field | JSON | values / default | notes |
+|---|---|---|---|
+| BUY / SELL | `action` | BUY · SELL | |
+| CE / PE / FUT | `right` | CE (call) · PE (put) · FUT (future) | a FUT leg + option legs = protective put, covered call, collar |
+| strike | `strike`, `steps` | ATM · ITM 1-20 · OTM 1-20 · closest to premium ₹ · closest to delta Δ | counted in the underlying's strike steps (ITM 2 = two strikes in the money) |
+| ₹ | `premium` | default 100 | with "closest to premium": the strike whose premium is nearest ₹X |
+| Δ | `delta` | 0.01-0.99, default 0.3 | with "closest to delta": 0.5 ≈ ATM, 0.2 a typical short-strangle strike, 0.05 a far wing |
+| expiry | `expiry` | strategy expiry (absent) · current · next | a leg's own expiry: sell this week + buy next week = a calendar |
+| **lots** | `lots` | 0+, default 1 | per set; **0 = leg off** (the optimiser can sweep a hedge on / off) |
+| **SL %** | `sl_pct` | empty = off | this leg's own stop: its premium moves this % against it (up for a SELL, down for a BUY) |
+| **TG %** | `tg_pct` | empty = off | this leg's own target; closes only this leg |
+| **re-enter ×** | `reentries` | 0-5, empty = 0 | after this leg's own stop, open it again (strike re-picked at the new spot) on the next candle close, up to N times per position. Needs `sl_pct` (or `on_leg_stop: cost`) |
+| **roll \|Δ\| >** … **→** … | `roll: {above, to, max}` | above between 0 and 1, to below it (default ≤ 0.2), max 1 | when the leg's \|delta\| goes above `above` on a candle close, close it and open the same leg at the strike nearest `to` (once per position) |
+
+**Below the legs:**
+
+| field | JSON | values / default | notes |
+|---|---|---|---|
+| **when a leg's stop hits** | `instrument.on_leg_stop` | only that leg exits (`leg`, default) · move the other legs' stops to cost (`cost`) · exit every leg (`all`) | shown once any leg has an SL %; can't be combined with scale-out |
+| **backtest IV** | `instrument.iv.source`, `.value` | auto · India VIX · 20-day realised vol · fixed % (value, default 15) · recorded IV surface | backtests only; live uses real premiums. auto = VIX for indices, realised vol for stocks |
+| **put skew** / **call skew** | `instrument.iv.put_skew` / `call_skew` | 0-10, empty = flat IV | extra IV points per 1% out of the money (NIFTY puts ≈ 0.5-1) |
+| **margin** | `margin.model` | contract value ÷ leverage (absent, default) · SPAN + exposure (`span`) | what a futures / written-option position blocks — decides how many sets fit |
+| **price scan %** | `margin.scan_pct` | empty = 6% index, 13% stock | SPAN only: the worst-case price move scanned |
+| **exposure %** | `margin.exposure_pct` | empty = 2% index, 3.5% stock | SPAN only: on short options and futures |
+| **pair leg** (equity / futures only) | `pair_leg` | off · symbol, as its future (whole lots) or shares, ratio β over N bars (10-500, default 100) or fixed × (default 1) | 6.8. Turning it on clears price stops / targets / trailing / breakeven / scale-out and sets the entry to market |
+
+### 10.3 Payoff & funds required (options and futures)
+
+A live what-if of the legs, before any backtest.
+
+| item | meaning |
+|---|---|
+| **spot** / **IV %** boxes | what-if: price the position at another spot / implied volatility (empty = today's spot, the backtest's IV source) |
+| chart | P&L at expiry, today and halfway, against spot; the shaded band is the expected move; the dashed line is spot |
+| **Max profit / Max loss** | at the first expiry over any price; "unlimited" = a naked short call (or short future) with no cap |
+| **Breakevens** | spots where the expiry P&L crosses zero |
+| **Chance of profit** | probability the expiry P&L is above 0 (lognormal at this IV) — selling wins often but small, buying rarely but big |
+| **Return on funds** | max profit ÷ funds required |
+| **Expected move ±1σ** | one standard deviation of the underlying to the first expiry at this IV |
+| **Δ delta** | ₹ gained per 1-point rise of the underlying (whole position) |
+| **Γ gamma** | how fast delta changes per point; negative = a writer, moves hurt more the further they go |
+| **Θ theta / day** | ₹ earned (+) or bled (−) per day from time decay alone |
+| **ν vega / vol pt** | ₹ per 1-point rise in IV |
+| **ρ rho / 1% rate** | ₹ per 1% rise in interest rates |
+| **vanna** | change of delta for a 1-point IV rise — why a short strangle's delta drifts when volatility jumps |
+| **charm / day** | change of delta per day with price unchanged — delta decay into expiry |
+| **vomma** | change of vega (₹) for a 1-point IV rise |
+| **speed** | change of gamma per point — how fast gamma risk grows as price moves |
+| **Funds required** | SPAN est. or contract value ÷ leverage; the bar splits it into **SPAN** (worst-scenario loss), **exposure** and **premium paid**; **Each leg on its own** = no offsets; **hedge benefit** = what offsetting legs save |
+| **use the SPAN estimate** | switches `margin.model` to `span` |
+| **Sets from capital** | how many sets `portfolio.capital` can hold at once (0 = it can't afford one) |
+| **per set: delta / gamma (lots)** | the position's Greeks per set, in lots of the underlying |
+| **Entry rules at this spot** | whether each `position_rules.entry` rule passes right now |
+| legs table | per leg: side, qty, price, Δ per unit, pos Δ (₹ per point, whole leg), θ / day, vega, **P(ITM)** (risk-neutral chance it expires in the money), **λ** (% the premium moves for a 1% move of the underlying), SL / TG as premium prices, margin **if bought** (its premium) and **if sold** (SPAN + exposure) |
+
+### 10.4 Entry & exit conditions
+
+Conditions are checked on each **completed** candle of the underlying.
+
+| field | JSON | values | notes |
+|---|---|---|---|
+| **LONG / bullish signal when** | `entry_long` | a group | the long entry |
+| **Exit long when** · **+ add exit conditions** / **remove** | `exit_long` | a group or null | extra exits; without them, exits are stop / target / trailing / MTM / square-off only |
+| **SHORT / bearish signal when**, **Exit short when** | `entry_short`, `exit_short` | the same for shorts | |
+| **ALL of (AND)** / **ANY of (OR)** | `logic` | AND · OR | how this group's lines combine |
+| **+ condition** | `conditions[]` | adds `PRICE > EMA(20)` | |
+| **+ group** | a nested `{logic, conditions}` | up to 2 levels deep | adds an OR group, e.g. *(RSI > 60 OR ADX > 25)* inside an AND |
+| ✕ | — | — | removes that line or group; an empty group never fires |
+
+**A condition (a line):** `left` · operator · `right` (· `right2`).
+
+| part | JSON | values | notes |
+|---|---|---|---|
+| left operand | `left` | any indicator, or **ƒ Combine two values** | never a plain number |
+| operator | `op` | crosses above · crosses below · crosses · `>` `<` `>=` `<=` `==` · is rising for (bars) · is falling for (bars) · is between · is outside | rising / falling take a bar count (≥ 1) on the right; between / outside take a low and a high (`right`, `right2`) |
+| right operand | `right` | a **Number** or any indicator / combined value | |
+| **⋯** → **held N bars** | `for_bars` | 2+ | true only when it has held N bars in a row |
+| **⋯** → **within last N bars** | `within_bars` | 2+ | true if it happened at least once in the last N bars (a cross 3 bars ago still counts) |
+| **⋯** → **NOT** | `negate` | true | the condition must be FALSE (shows **NOT** in front) |
+
+**An operand (an indicator box):**
+
+| part | JSON | values | notes |
+|---|---|---|---|
+| indicator list | `ind` | grouped list (see Reference); **Number** = `{"value": n}` | hover an indicator for what it is |
+| output | `field` | e.g. MACD `macd` / `signal` / `hist`, BBANDS `upper` / `middle` / `lower`, ADX `adx` / `plus_di` / `minus_di` | only for indicators with several outputs |
+| settings (period, mult, source, event …) | `params` | per indicator (see Reference) | `source` picks the price: close, open, high, low, hl2, hlc3, ohlc4, **range** (= high − low), volume …; `event` for FILING |
+| **on** | `tf` | base candle · a higher timeframe that is a multiple of the base · daily | only that timeframe's completed candles are used |
+| **of** | `symbol` | empty = this symbol · an index or a stock | compute it on another symbol's candles (not for VIX, DTE, TIME, order flow) |
+| **ago** | `offset` | 0+ | 1 = the previous candle's value |
+| **as** (transform) | `xf`, `xn` | value · angle ° · slope / bar · change · % change · highest · lowest · average · z-score · absolute · rank 0-100 · percentile, over N bars (default 3) | 4.4. `absolute` takes no N |
+| **ƒ** → **×** / **+** | `mult`, `add` | default 1 / 0 | scale or offset: `× 1.02` = 2% above, `+ 20` = 20 points above |
+
+**ƒ Combine two values:** `(A op B)` → `{"math": op, "a": A, "b": B}`.
+
+| op | JSON | meaning |
+|---|---|---|
+| − + × ÷ | `-` `+` `*` `/` | arithmetic (A − B = a spread, or a candle body with `xf: abs`) |
+| % gap | `pct_diff` | how far A is from B, in % of B |
+| spread z vs | `pair_z` (+ `n`) | least-squares fit of log A on log B over the last n bars (10-500, default 100): how many deviations A is from its fitted value |
+| spread % vs | `spread` (+ `n`) | the same in % |
+| hedge ratio β vs | `beta` (+ `n`) | the fitted hedge ratio |
+| return corr. with | `corr` (+ `n`) | correlation of their one-bar returns |
+
+A combined value takes its own **as** transform; **✕** turns it back into a
+single value. Combinations nest 2 deep. Put another symbol on B for pairs.
+
+### 10.5 Stop loss, target & risk
+
+| field | JSON | values / default | notes |
+|---|---|---|---|
+| **stop loss** | `stop_loss: {type, value, atr_period}` | off · % of price · points · × ATR (period, default 14) | measured per "levels on". ATR on an option premium = the underlying's ATR × the option's delta |
+| **target** | `target` | off · % · points · × ATR · **× risk (R:R)** | `rr` = a multiple of the stop distance (needs a stop) |
+| **trailing stop** | `trailing: {…, activate}` | off · % · points · × ATR; **after** = profit before it starts (same unit, 0 = at once) | follows the best price by this gap |
+| **move stop to cost after** | `breakeven` | off · % · points · × ATR | once this far in profit, the stop moves to the entry price |
+| **Scale out: close X% at V** | `scale_out: [{qty_pct, value, type, atr_period}]` | up to 5 steps; type × risk (R) · % · points · × ATR; **+ step** adds 50% at step-number R | partial exits; each closes X% of the ENTRY size, rounded down to whole shares / lots (under one lot = skipped); the rest keeps its stop / trail / target; each part is its own trade row `SCALE_OUT_n`. Steps can't total over 100%; R steps need a stop; not with per-leg stops |
+| **Position MTM: stop ₹** | `mtm.stop` | empty = off | exit when the position's P&L falls to −₹X |
+| **target ₹** | `mtm.target` | empty = off | exit at +₹X |
+| **trail after ₹** … **by ₹** | `mtm.trail_start`, `mtm.trail_gap` | both or neither | once P&L reaches ₹X, exit if it gives back ₹Y from its peak |
+| **stop % of premium** (options) | `mtm.stop_pct` | empty = off | the loss reaches this % of the net premium at entry (100 = lost as much as the credit); with a ₹ stop too, the tighter applies |
+| **target % of premium** (options) | `mtm.target_pct` | empty = off | the profit reaches this % of the net premium (50 = keep half the credit) |
+| **Option Greeks & premium rules** — Enter only if ALL hold / Exit when ANY holds | `position_rules.entry` / `.exit` `[{metric, op, value}]` | metrics in 6.4 (delta, abs_delta, gamma, theta, vega, credit, pnl_pct, dte, iv …), ops `>` `<` `>=` `<=`; **+ entry rule** / **+ exit rule** | per set; entry rules are checked on the legs about to open, exit rules on each candle close (reason `RULE_<METRIC>`) |
+| **delta-hedge with the future when \|Δ\| per set >** X, **at most** N **hedges** | `position_rules.hedge: {above, max}` | above ≥ 0.05 (default 0.6, keep ≥ 0.5), max 1-50 (default 10) | on each close, buy / sell whole future lots per set to bring net delta back toward 0 |
+| **Per day: max loss ₹** | `daily.max_loss` | empty = off | realised + open P&L for the day; hit it → flatten, no more entries today (`DAILY_MAX_LOSS`) |
+| **max profit ₹** | `daily.max_profit` | empty = off | lock the day in (`DAILY_TARGET`) |
+| **max trades / symbol** | `max_trades_per_day` | ≥ 1, default 3 | entries per symbol per day |
+| **re-entry cooldown** | `cooldown_bars` | ≥ 0, default 0 | candles to wait after an exit before re-entering the same symbol |
+| **time stop** | `max_bars` | empty = off, ≥ 1 | exit a position open this many candles (`TIME_STOP`) |
+| **Guard: drawdown ₹ / rejected orders today / median slippage %**, **then keep managing / then flatten** | `guard` | each empty = off; `on_breach` pause · flatten | live only (6.5) |
+| **entries from** / **entries until** / **square off** (tick + time) | `session.start` / `end` / `square_off` | 09:15-15:29; unticked = from the open / until square-off / **carry forward overnight** | live square-off ≤ 15:15 |
+| **entry days** Mon-Fri | `session.days` | all ticked = every day (absent) | new entries only on ticked days; open positions are still managed and squared off daily; the last day can't be unticked |
+| **entry order** | `entry_order.type` | at market · on a pullback · on a breakout | market = next candle's open; pullback = wait for a price X% better (limit-style); breakout = X% further in the trade's direction (stop-style) |
+| X **% better than / beyond the signal close** | `entry_order.offset_pct` | default 0.1 | pullback / breakout only |
+| **cancel after** N **bars** | `entry_order.valid_bars` | ≥ 1, default 3 | unfilled → counted as `entry_expired` |
+| **live: limit at the quote**, **chase** N **times over** S **s, then market** | `entry_order.limit: {steps, wait_s}` | steps 1-10 (default 3), wait 2-30 s (default 10) | live orders only (6.7) |
+
+### 10.6 Sizing & portfolio
+
+| field | JSON | values / default | notes |
+|---|---|---|---|
+| **quick setup: Conservative** | sizing + portfolio + daily | 0.5% risk per trade (10% of equity without a stop), 3 open, ≤ 25% per position, day stop −1.5%, no compounding | fills the fields below; edit after |
+| **Balanced** | | 1% risk (or 20% of equity), 5 open, ≤ 40% per position, day stop −3%, compounding | |
+| **Aggressive** | | 2% risk (or 35% of equity), 10 open, ≤ 60% per position, day stop −5%, compounding | |
+| **each trade is**: fixed shares · fixed lots · ₹ amount · % of equity · ₹ risk · % risk | `sizing.mode` | qty · lots · amount · pct_equity · risk · risk_pct | risk modes need a stop (greyed out without one); the unit beside the box follows the mode; F&O shows "× lot per lot" |
+| value | `sizing.value` | default 1 | shares, lots, ₹ per trade, % of equity, ₹ lost if the stop hits, % of equity lost if the stop hits |
+| **capital ₹** | `portfolio.capital` | default 1,00,000 | one pool for every symbol (or the allocation's share, 8.1) |
+| **max open positions** | `portfolio.max_positions` | ≥ 1, default 10 | extra signals are skipped (`max_positions`) |
+| **max % per position** | `portfolio.max_position_pct` | empty = no cap | no single position may block more than this share of equity |
+| **leverage ×** | `portfolio.leverage` | default 1 | intraday margin multiplier: equity MIS ≈ 5, futures / written options ≈ 6-9 (or use SPAN); bought options always pay the full premium |
+| **compound profits** | `portfolio.compounding` | default on | sizes follow the equity curve; off = sizes stay on the starting capital |
+| **on the same candle, enter only the best** N **by** … **highest / lowest first** | `rank: {top, by, order}` | top 1-50 (default 1), by = any operand (default ROC 20), desc · asc | shown for 2+ symbols; time candles only (7) |
+| **backtest on**: the symbols above · NIFTY 50 / 100 / Next 50 / Bank / 500 / Midcap 150 / Smallcap 250 as it was each day | `universe.index` | absent · nifty50 · nifty100 · niftynext50 · niftybank · nifty500 · midcap150 · smallcap250 | equity / futures without a pair leg (7.1) |
+| **slippage %** | `costs.slippage_pct` | default 0.02 | on every fill. Realistic: liquid stocks 0.02-0.05, index futures 0.02, options 0.3-1 |
+| **Indian charges** | `costs.charges` | default on | brokerage, STT, exchange, SEBI, GST, stamp duty, per segment |
+| summary line | — | — | the whole sizing block in one sentence — read it to check |
+
+### 10.7 Run bar
+
+| field | meaning |
+|---|---|
+| **from** / **to** | the backtest range (up to ~3 years); **30d 90d 180d 1y 2y** set it to end today |
+| **out-of-sample %** | hold out the last X% (5-80, 0 = off; a smaller number is rounded up to 5) |
+| **▶ Run backtest** | downloads missing candles first, then runs. "The settings changed since the results below were run" = press it again |
+| **N tries so far** | backtests + optimiser combinations run on this idea — the Deflated Sharpe gets stricter with every one; kept with the draft and the saved strategy |
+| **Save as vN** | saved strategy: keeps every earlier version, the new one becomes active |
+| **Save as new strategy** | a new saved strategy (OFF, paper) |
+
+### 10.8 Optimise (below the results)
+
+| field | meaning |
+|---|---|
+| **+ parameter** | any number in the spec: indicator settings, condition numbers, × multipliers, stops, targets, leg lots / delta, scale-out steps … each with a list of values (≤ 400 combinations in all) |
+| **rank by** | net P&L, profit factor, Sharpe, Sortino, win rate, return %, expectancy, Calmar, t-stat |
+| **check: one out-of-sample split** | ranks on the earlier part; each row shows how it did on the held-out end (**hold out last X%**, 5-80) |
+| **check: rolling walk-forward** | **windows** (2-12 out-of-sample windows), **in-sample ×** (0.5-10 windows of history per window), **anchored** (in-sample always starts at the range start) or rolling; each window is traded with the winner of the in-sample before it |
+| **check: research check → strategy card** | 8: pass / killed, saved as a card |
+| **min trades** | combinations with fewer trades are not ranked (a 1-trade 100% win rate means nothing) |
+| table | params, trades, win %, net, PF, Sharpe, max DD, OOS trades / PF / net; **apply** sends that row's values back to the builder |
+| heatmap | two swept parameters against the metric; a lone bright cell = luck, a broad bright area = robust |
+| **Overfitting check** line | Deflated Sharpe after N trials (< 95% = the top row may be luck) and PBO (> 50% = the in-sample winner usually loses out of sample) |
+| walk-forward result | each window (ranked on → traded unseen, its params, IS metric, OOS trades / PF / net), **Out-of-sample net** (every window's unseen trades stitched), **WF efficiency** (out-of-sample net per unit of time as a % of the in-sample winners' net per unit of time; ≥ 50% good, — when in-sample lost), OOS trades / win rate / profit factor / Sharpe / max DD, the OOS equity curve |
+
+---
+
+## 11. Reading the backtest results
+
+Top to bottom. A number shown green / red is on the good / bad side of its
+usual bar.
+
+**Notes and warnings** (above the numbers): `⚠ symbol: …` = data gaps, a
+symbol with no candles, a universe member missing, etc. **Order flow: X%
+real ticks** = the rest of the order-flow values were estimated per minute.
+**Signals not taken: N × reason** —
+
+| reason | means |
+|---|---|
+| no capital | the position didn't fit the free capital / margin — raise capital or leverage, or size smaller |
+| max positions | `max_positions` were already open |
+| daily halt | the day's max loss / profit had stopped trading |
+| entry expired | a pullback / breakout order not filled within `valid_bars` |
+| entry rules | an option `position_rules.entry` rule failed |
+| reentry / roll / hedge no capital | an option adjustment didn't fit (5.1) |
+
+**Performance**
+
+| metric | meaning | rule of thumb |
+|---|---|---|
+| Net P&L | after charges and slippage | |
+| Return | net ÷ starting capital | |
+| CAGR | annualised return (needs 30+ days) | |
+| Win rate | % of trades that made money | means little alone — read it with the payoff ratio |
+| Profit factor | gross wins ÷ gross losses | > 1.3 decent, > 1.7 good, < 1 loses |
+| Expectancy | average net per trade | must clear costs comfortably |
+| Max drawdown | worst peak-to-trough fall of equity (₹ and %) | size capital for ~2× this |
+| Sharpe | daily P&L mean ÷ sd, annualised (√252) | > 1 decent, > 2 strong (intraday) |
+| Sortino | Sharpe counting only down days as risk | |
+| Calmar | CAGR ÷ max drawdown % | > 1 good |
+| Charges | brokerage, STT, exchange, SEBI, GST, stamp, by segment | close to gross P&L = the edge is eaten by costs |
+| Gross P&L | before charges (slippage is already in the fills) | |
+| Avg win / loss | average winning / losing trade | |
+| Median win / loss | the typical win / loss (ignores outliers) | far from the average = a few trades drive the result |
+| Largest win / loss | the single best / worst trade | one trade > 30% of net = fragile |
+| Best / worst day | the best / worst day's net | |
+| Streaks W / L | longest run of wins / losses | plan to survive 2× the losing streak |
+| Profitable days | winning days / trading days | |
+| Avg bars held | candles per trade | |
+| t-stat (mean trade) | mean trade ÷ its standard error | ≥ 2 = unlikely to be luck alone (before counting tries) |
+| Payoff ratio | average win ÷ average loss | with win rate W: an edge if W × payoff > 1 − W |
+| Kelly % | W − (1 − W) ÷ payoff | ≤ 0 = no edge; trade ¼-½ of it at most |
+| Avg R | net per trade in units of the initial stop risk | needs a stop |
+| Recovery factor | net ÷ max drawdown | > 3 good |
+| Ulcer index | RMS of % drawdown along the curve — depth AND duration of the pain | lower is better |
+| Avg MAE / MFE | how far trades went against / for you before the exit, % of entry | MFE far beyond the exits = targets too tight; MAE near the stop = stop too tight |
+| Exposure | share of candles with a position open | |
+| Avg hold | minutes per trade | |
+| Buy & hold | the underlying's own move over the window (average across symbols) | the benchmark to beat |
+
+**Risk & confidence**
+
+| metric | meaning | bar |
+|---|---|---|
+| PSR | Probabilistic Sharpe: the chance the true Sharpe is above 0, given the number of days and their skew / fat tails | ≥ 95% |
+| DSR · N tries | Deflated Sharpe: PSR against the best Sharpe luck alone would give after N backtests / optimiser combinations | ≥ 95% — the real bar |
+| SQN | √n × mean ÷ sd of trade P&L (n ≤ 100) | 1.6-2 average, 2-3 good, > 3 excellent |
+| VaR 95% (1 day) | a day worse than this happened on 5% of days (needs 20+ days) | |
+| CVaR 95% | the average of those worst 5% of days — what a bad day really costs | keep it below your daily max loss |
+| Tail ratio | best 5% day ÷ worst 5% day | > 1 = wins bigger than losses at the extremes |
+| Skew / ex-kurtosis | the shape of daily P&L: negative skew = rare big losing days; kurtosis > 0 = fatter tails than normal | option selling shows negative skew |
+
+**In-sample vs out-of-sample** (with an OOS %): trades, win rate, net,
+profit factor, Sharpe, expectancy, max DD %, t-stat for each part, split at
+the date shown. The out-of-sample column is the one that counts; a strategy
+that only works in-sample is overfit.
+
+**Monte Carlo** (resampled orderings of the same trades): net P&L bad case
+(5%) / median / good case (95%), max drawdown median / bad case (95%),
+chance of ending at a loss, chance equity halves at some point. Size capital
+for the 95% drawdown, not the one history happened to give.
+
+**Charts and tables**
+
+| panel | read it for |
+|---|---|
+| Equity curve + drawdown | a steady slope vs a few jumps; long flat / underwater stretches |
+| Capital in use | margin blocked over time: **Peak in use** (size the account for this), **Avg per position**, **Return on peak capital** (net ÷ peak margin — how hard the money actually needed worked) |
+| P&L distribution | trades per net-P&L bucket: a fat left tail = rare big losses |
+| P&L by entry hour (IST) | hours that lose → narrow `session.start` / `end` |
+| Excursions (MAE vs MFE) | each trade's worst / best % against its result — tune the stop and target |
+| Monthly returns | net ₹ per month (darker = bigger): consistency vs one lucky month |
+| underlying chart | the last candles of the chart symbol with ▲▼ entries and ● exits (indicator overlays; order-flow volume coloured by delta) |
+| By symbol | trades, win %, net, PF, max DD, buy & hold per symbol — drop symbols that never work |
+| By exit reason | count and net per reason (list in 8): mostly `SQUARE_OFF` = the levels are never reached; many `SL` and few `TARGET` = the stop is too tight |
+| By month / By weekday | net per month / weekday → `session.days` |
+| Trades (newest first) | instrument, signal, qty, entry / exit time and price (the underlying for multi-leg — hover a row for its legs), reason, bars, MAE / MFE %, R, and for options IV %, Δ, Θ / day and credit per set at entry; charges, net. **⬇ trades CSV** downloads every trade |
+
+## 12. The other tabs, in one line each
+
+* **Automations** — every saved strategy: **On** (switch it on / off),
+  **Mode** (paper · LIVE, LIVE needs `LIVE` typed and a logged-in Fyers
+  account), **Version** (the one that runs — switch any time), symbols,
+  timeframe, trades, open / closed, realised ₹; **edit** loads it into the
+  builder, **square off** closes its open positions now, **delete** (only
+  once it is flat). **Show** ticks filter the tables below to those
+  strategies (**show all** clears it). Then **Open positions** (live MTM,
+  stop / target / trail, the chart link), **Trades**, **Runner log** (each
+  signal, order, fill, reject, guard and book event), and the live-desk
+  panels of 8.1 (Book, Allocation, Drift, Fills vs quotes).
+* **Compare** — several saved strategies (or the builder draft) run on the
+  same range, side by side.
+* **Research** — strategy cards, pair finder, IV surface vs flat IV, tick
+  replay, universes, nightly re-validation (8).
+* **Data** — **Market data**: what the local 1-minute candle store holds per
+  symbol (from / to / candles); download N days for symbols from Fyers, or
+  sync the last 5 days of every strategy symbol (every timeframe is built
+  from these candles). **Research recording** (option chains, short list,
+  disk line — 8). **Order-flow collector**: its own Fyers socket that
+  classifies every trade print buy / sell for footprint, CVD and the
+  order-flow indicators — the symbols on it, days kept, raw frames for
+  hand-picked symbols, the disk guard, futures (next month always or only
+  in the roll window) and options (strikes per side), and today's frames /
+  prints / buy-sell volume per key.
