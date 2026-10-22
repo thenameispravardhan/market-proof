@@ -18,7 +18,11 @@ What it does, all day:
     arriving late) it sheds the lowest-priority symbols, and adds them back
     once it has been healthy for half an hour;
   * after 16:10 compacts the day into days/<YYYYMMDD>/ and drops the oldest
-    collected day beyond `retention_days` (90 by default).
+    collected day beyond `retention_days` (90 by default) — or, with the
+    research short list on (`long`), trims it to that list's keys and keeps
+    it to `long.days`;
+  * with `chains` on, snapshots the option chains of the chain underlyings
+    (named + switched-on strategies') on a fixed exchange-time grid.
   * guards the disk: below `min_free_gb` free it drops the oldest days early
     (keeping the newest 5), and pauses recording below half of it;
   * if Fyers refuses symbols for the plan's symbol cap, it cuts its own budget.
@@ -195,13 +199,19 @@ class Collector:
         stocks = {s for n in self.lists.values() for s in n[0]}
         under = [fu.INDEX_SYMBOL[n] for n in fu.INDEX_SYMBOL if n in fo]
         under += [f"NSE:{n}-EQ" for n in stocks if n in fo and fo[n]["fut"]]
+        strat = ticks.strategy_symbols(self.root)
+        chain_src = [*(cfg["chains"].get("underlyings") or []), *strat] if cfg["chains"].get("enabled") else []
+        for n in dict.fromkeys(x for s in chain_src if (x := fu.chain_name(s, fo))):
+            under.append(fu.INDEX_SYMBOL.get(n) or f"{fo[n]['exch']}:{n}-EQ")      # a chain centres on its price
         await self.refresh_quotes(under)
-        focus = list(cfg.get("symbols") or []) + ticks.strategy_symbols(self.root)
+        focus = list(cfg.get("symbols") or []) + strat
         plan = await asyncio.to_thread(fu.build, cfg, focus, self.spot, now, self.prev_sel, fo, self.lists, None,
-                                       self.active_budget)
+                                       self.active_budget, strat)
         self.prev_sel = plan.opt_sel
         self.rec.key_of = {**self.rec.key_of, **plan.keys}
-        self.rec.raw_keys = {plan.keys[s] for s in plan.symbols if plan.meta[plan.keys[s]]["cls"] == "focus"}
+        self.rec.raw_keys = {k for s in plan.symbols
+                             if plan.meta[(k := plan.keys[s])]["cls"] == "focus" or plan.meta[k].get("raw")}
+        self.rec.set_chain(plan.chain, int(cfg["chains"].get("interval_s") or 60))
         self.rec.write_meta(plan.meta, day)
         self.symbols = plan.symbols
         self.plan_summary = plan.summary()
@@ -327,6 +337,8 @@ class Collector:
             "plan": {"at": self.plan_at, **self.plan_summary},
             "today": {"keys": len(st), "ticks": totals[0], "trades": totals[1], "buy": totals[2], "sell": totals[3],
                       "unk": totals[4]},
+            "chains": {"keys": len(self.rec.chain_keys), "quoted": len(self.rec._quote), "snapshots": self.rec.snapshots,
+                       "last": self.rec._last_snap or None, "interval_s": self.rec.snap_s},
             "errors": self.errors[-10:],
         })
 
@@ -342,12 +354,14 @@ class Collector:
             self._day = day
             self.cap = None
             await asyncio.to_thread(self.rec.sweep, now)
-            await asyncio.to_thread(self.rec.prune, int(self.cfg["retention_days"]), int(self.cfg["raw_days"]))
+            await asyncio.to_thread(self.rec.prune, int(self.cfg["retention_days"]), int(self.cfg["raw_days"]),
+                                    self.cfg["long"])
         if (now + ticks.IST) % 86400 // 60 >= ticks.COMPACT_AFTER_MIN and self._compacted != day:
             self._compacted = day
             await asyncio.to_thread(self.rec.flush)
             if await asyncio.to_thread(self.rec.compact, day):
-                await asyncio.to_thread(self.rec.prune, int(self.cfg["retention_days"]), int(self.cfg["raw_days"]))
+                await asyncio.to_thread(self.rec.prune, int(self.cfg["retention_days"]), int(self.cfg["raw_days"]),
+                                        self.cfg["long"])
 
     async def run(self) -> None:
         from app.execution.fyers_stream import FyersStreamManager
@@ -370,7 +384,8 @@ class Collector:
             self.note_error(f"migration: {e}")
             log.exception("flowd.migration_failed")
         await asyncio.to_thread(self.rec.sweep)
-        await asyncio.to_thread(self.rec.prune, int(self.cfg["retention_days"]), int(self.cfg["raw_days"]))
+        await asyncio.to_thread(self.rec.prune, int(self.cfg["retention_days"]), int(self.cfg["raw_days"]),
+                                self.cfg["long"])
         self.rec.resume()
         try:
             await self.replan(time.time())

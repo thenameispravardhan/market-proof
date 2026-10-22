@@ -409,12 +409,20 @@ def _flow_status(q: str = "", top: int = 50) -> dict[str, Any]:
     rows = [[k, *v] for k, v in stats.items() if not q or q.upper() in k]
     rows.sort(key=lambda r: -(r[3] + r[4] + r[5]))           # traded volume today, busiest first
     days = ticks.store().collected_days()
+    long_days = ticks.store().long_days()
+    full_days = [d for d in days if d not in set(long_days)]
+    try:
+        cap = ticks.capacity(cfg)
+    except Exception as e:  # noqa: BLE001 — a status page never fails on the projection
+        cap = {"error": str(e)[:200]}
     return {
         "enabled": bool(cfg.get("enabled")), "config": cfg, "config_symbols": cfg.get("symbols", []),
         "strategy_symbols": ticks.strategy_symbols(), "collector": {**col, "alive": alive, "supervisor": sup},
-        "days": {"count": len(days), "first": days[0] if days else None, "last": days[-1] if days else None,
-                 "retention": int(cfg.get("retention_days") or ticks.RETENTION_DAYS)},
-        "disk_mb": ticks.disk_mb(), "lists": {k: v["label"] for k, v in fu.LISTS.items()},
+        "days": {"count": len(full_days), "first": full_days[0] if full_days else None,
+                 "last": full_days[-1] if full_days else None,
+                 "retention": int(cfg.get("retention_days") or ticks.RETENTION_DAYS),
+                 "long": {"count": len(long_days), "first": long_days[0] if long_days else None}},
+        "disk_mb": ticks.disk_mb(), "capacity": cap, "lists": {k: v["label"] for k, v in fu.LISTS.items()},
         "top": rows[:max(1, min(500, top))], "keys_today": len(stats),
     }
 
@@ -436,7 +444,11 @@ def ticks_config(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     the disk guard drops old days early, then pauses) and universe {lists,
     stocks, index_futures, stock_futures, next_futures, index_options,
     index_strikes, index_next_strikes, stock_options, stock_strikes,
-    stock_next_expiry, roll_days, enabled}."""
+    stock_next_expiry, roll_days, enabled}, chains {enabled, underlyings (F&O
+    names), strategies, strikes 0-50, expiries 1-6, interval_s 15-3600: option-
+    chain snapshots on that exchange-time grid} and long {enabled, symbols,
+    strategies, days 1-1095, raw_days 0-365, raw_strikes 0-20: the research
+    short list, trimmed out of each day leaving the window and kept longer}."""
     from app.algo import flow_universe as fu
     from app.algo import ticks
 
@@ -483,8 +495,56 @@ def ticks_config(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
                 raise HTTPException(422, detail=f"{k} must be true or false")
             clean[k] = v
         patch["universe"] = clean
+    for block, lists, ints in (("chains", ("underlyings",), {"strikes": (0, 50), "expiries": (1, 6),
+                                                              "interval_s": (ticks.SNAP_MIN_S, 3600)}),
+                               ("long", ("symbols",), {"days": (1, 1095), "raw_days": (0, 365),
+                                                       "raw_strikes": (0, 20)})):
+        v = body.get(block)
+        if v is None:
+            continue
+        defaults = ticks.DEFAULT_CHAINS if block == "chains" else ticks.DEFAULT_LONG
+        if not isinstance(v, dict):
+            raise HTTPException(422, detail=f"{block} must be an object")
+        clean = {}
+        for k, x in v.items():
+            if k not in defaults:
+                raise HTTPException(422, detail=f"unknown {block} setting {k!r}")
+            if k in lists:
+                if not isinstance(x, list) or len(x) > ticks.MAX_FOCUS or not all(isinstance(i, str) for i in x):
+                    raise HTTPException(422, detail=f"{block}.{k} must be a list of at most {ticks.MAX_FOCUS} names")
+            elif k in ints:
+                lo, hi = ints[k]
+                if not isinstance(x, int) or isinstance(x, bool) or not lo <= x <= hi:
+                    raise HTTPException(422, detail=f"{block}.{k} must be {lo}-{hi}")
+            elif not isinstance(x, bool):
+                raise HTTPException(422, detail=f"{block}.{k} must be true or false")
+            clean[k] = x
+        patch[block] = clean
     ticks.save_config(patch)
     return _flow_status()
+
+
+@router.get("/ticks/chain")
+def ticks_chain(name: str, at: Optional[int] = None) -> dict[str, Any]:
+    """The recorded option chain of `name` (NIFTY, BANKNIFTY, SBIN ...): its latest
+    snapshot at or before `at` (default now) the same IST day — every contract's
+    standing quote then (bid / ask / sizes / last / OI / volume) with `qts`, the
+    quote's own exchange time, and `mid` / `spread` where both sides quote. The
+    underlying and its current future are rows too (kind IDX / EQ / FUT)."""
+    from app.algo import ticks
+
+    n = (name or "").strip().upper()
+    if not n or len(n) > 40 or not all(ch.isalnum() or ch in "&-_" for ch in n):
+        raise HTTPException(422, detail="name is an F&O underlying, e.g. NIFTY")
+    t, rows = ticks.store().chain_at(n, int(at if at is not None else time.time()))
+    for r in rows:
+        bid, ask = r.get("bid"), r.get("ask")
+        r["mid"] = round((bid + ask) / 2, 4) if bid and ask and ask >= bid else None
+        r["spread"] = round(ask - bid, 4) if bid and ask and ask >= bid else None
+    order = {"IDX": 0, "EQ": 0, "FUT": 1}
+    rows.sort(key=lambda r: (order.get(r.get("kind") or "", 2), r.get("expiry") or 0, r.get("strike") or 0,
+                             r.get("kind") or ""))
+    return {"name": n, "ts": t, "count": len(rows), "rows": rows}
 
 
 @router.get("/ticks/plan")
