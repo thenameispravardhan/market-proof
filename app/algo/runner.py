@@ -962,6 +962,9 @@ class AlgoRunner:
         if k < 1:
             return
         bar = int(open_s + (k - 1) * tf_s)                # start of the bar that just closed
+        ranks = bool(spec.get("rank"))
+        rank_key = (s["id"], "#rank")                      # in _last_bar: the bar this strategy last ranked
+        ready: dict[str, dict] = {}
         for sym in spec["symbols"]:
             key = (s["id"], sym)
             if self._last_bar.get(key, 0) >= bar:
@@ -1002,14 +1005,35 @@ class AlgoRunner:
             if now < bar + tf_s + REF_WAIT_S and any(not x["t"] or x["t"][-1] < bar for x in (d.get("xs") or {}).values()):
                 continue                                   # an index / peer the conditions read isn't published yet;
                                                            # past the wait it counts as its last closed candle (as backtests do)
+            if ranks and self._last_bar.get(rank_key, 0) < bar:
+                ready[sym] = d                             # entries are ranked against the other symbols, below
+                continue
             self._last_bar[key] = bar
-            try:
-                await self._decide(s, sym, d, now, day_start)
+            try:     # ranked already: a candle that came in late only manages its position
+                await self._decide(s, sym, d, now, day_start, may_enter=not ranks)
             except Exception as e:  # noqa: BLE001 — one symbol must not stop the others
                 log.exception("algo.decide_failed", symbol=sym)
                 self.event("error", f"{s['name']} {sym}: {e}"[:300], strategy_id=s["id"])
+        if not ready:
+            return
+        if now < bar + tf_s + REF_WAIT_S and any(self._last_bar.get((s["id"], x), 0) < bar and x not in ready
+                                                 for x in spec["symbols"]):
+            return                                         # rank against every symbol's candle, not the first few in
+        self._last_bar[rank_key] = bar
+        try:
+            order, allowed = engine.rank_pick(spec, ready)
+        except Exception as e:  # noqa: BLE001 — no ranking, no entries; exits still run
+            self.event("error", f"{s['name']}: ranking failed, no entries this candle: {e}"[:300], strategy_id=s["id"])
+            order, allowed = list(ready), set()
+        for sym in order:                                  # best first: capital and max positions go to them
+            self._last_bar[(s["id"], sym)] = bar
+            try:
+                await self._decide(s, sym, ready[sym], now, day_start, may_enter=sym in allowed)
+            except Exception as e:  # noqa: BLE001
+                log.exception("algo.decide_failed", symbol=sym)
+                self.event("error", f"{s['name']} {sym}: {e}"[:300], strategy_id=s["id"])
 
-    async def _decide(self, s: dict, sym: str, d: dict, now: float, day_start: float) -> None:
+    async def _decide(self, s: dict, sym: str, d: dict, now: float, day_start: float, may_enter: bool = True) -> None:
         spec = s["spec"]
         engine.prepare(d, spec)
         sig = engine.signals(d, spec, {})
@@ -1035,7 +1059,7 @@ class AlgoRunner:
         if not start <= close_min <= end or not engine.day_allowed(spec, now):
             return
         side = "BUY" if sig["entry_long"][-1] else "SELL" if sig["entry_short"][-1] else None
-        if side is None:
+        if side is None or not may_enter:                  # not among the candle's best N (rank)
             return
         if await asyncio.to_thread(_trades_today, s["id"], sym, day_start) >= spec["max_trades_per_day"]:
             return

@@ -120,7 +120,10 @@ DEFAULT_SPEC: dict[str, Any] = {
 #   "position_rules": {"entry": [rule], "exit": [rule]}, rule = {"metric", "op",
 #       "value"} on the option position's Greeks / premium (POSITION_METRICS):
 #       entries only when every entry rule holds, exit when any exit rule does.
-OPTIONAL_KEYS = ("scale_out", "margin", "position_rules")
+#   "rank": {"by": operand, "order": "desc"|"asc", "top": N} — when several
+#       symbols' entries fire on the same candle, only the best N by `by` enter,
+#       best first (shorts ranked the other way round).
+OPTIONAL_KEYS = ("scale_out", "margin", "position_rules", "rank")
 # Per set (one set = the legs at their configured lots): delta in lots of the
 # underlying (1 = one lot of the future), gamma = delta change for a 1% move,
 # theta ₹ per day, vega ₹ per vol point, credit ₹ (net premium received; a
@@ -405,6 +408,20 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
     s["max_bars"] = _num(s.get("max_bars"), "max bars in trade", 1, integer=True, allow_none=True)
     s["costs"]["slippage_pct"] = _num(s["costs"].get("slippage_pct", 0), "slippage %", 0)
     s["costs"]["charges"] = bool(s["costs"].get("charges", True))
+    rk = s.pop("rank", None)
+    if rk:
+        if not isinstance(rk, dict) or not isinstance(rk.get("by"), dict) or not ({"ind", "math"} & set(rk["by"])):
+            raise ValueError('rank is {"by": an indicator or combined value, "order": "desc" | "asc", "top": N}')
+        if s["bars"]["type"] != "time":
+            raise ValueError("rank needs time candles — volume / turnover candles close at different times per symbol")
+        _check_operand(rk["by"], "rank by", s["timeframe"])
+        order = rk.get("order") or "desc"
+        if order not in ("desc", "asc"):
+            raise ValueError("rank order is desc (highest first) or asc (lowest first)")
+        top = _num(rk.get("top", 1), "rank: how many may enter", 1, integer=True)
+        if top > 50:
+            raise ValueError("rank: at most 50 may enter")
+        s["rank"] = {"by": rk["by"], "order": order, "top": top}
     if len(ref_frames(s)) > MAX_REF_SYMBOLS:
         raise ValueError(f"conditions can read at most {MAX_REF_SYMBOLS} other symbols")
     return s
@@ -509,6 +526,8 @@ def _walk_operands(spec: dict[str, Any]):
             yield o
     for k in ("entry_long", "exit_long", "entry_short", "exit_short"):
         yield from walk(spec.get(k))
+    if spec.get("rank"):                    # what entries are ranked by: loaded and warmed up like a condition
+        yield from walk({"conditions": [{"left": spec["rank"]["by"]}]})
 
 
 # Indicators that need buy / sell flow (recorded ticks, else per-minute BVC
@@ -535,6 +554,62 @@ def ref_frames(spec: dict[str, Any]) -> dict[str, set[int]]:
         if o.get("symbol"):
             out.setdefault(o["symbol"], set()).add(int(o.get("tf") or 0) or spec["timeframe"])
     return out
+
+
+def _ranked(rk: dict[str, Any], fired: list[tuple[Optional[float], Any]]) -> tuple[list[Any], list[Any]]:
+    """(longs, shorts) allowed to enter, best first. `fired` = [(score, item, side)]:
+    longs ranked by `order`, shorts the other way round (desc = long the
+    strongest, short the weakest); no score = no rank = no entry. Ties keep
+    `fired`'s order."""
+    out = []
+    for side, desc in (("entry_long", rk["order"] == "desc"), ("entry_short", rk["order"] != "desc")):
+        mine = [(sc, it) for sc, it, sd in fired if sd == side and sc is not None]
+        out.append([it for _, it in sorted(mine, key=lambda x: x[0], reverse=desc)[:rk["top"]]])
+    return out[0], out[1]
+
+
+def _rank_entries(spec: dict[str, Any], syms: list[str], st: dict[str, dict], caches: dict[str, dict]) -> dict[tuple[int, int], int]:
+    """Backtest side of "rank": on each candle keep only the best `top` entry
+    signals per side (the rest are switched off) and return their fills'
+    order — {(symbol index, fill bar): n}, longs best first, then shorts."""
+    rk = spec["rank"]
+    by_t: dict[int, list] = {}
+    for k, sym in enumerate(syms):
+        d, sig = st[sym]["d"], st[sym]["sig"]
+        score = series(d, rk["by"], caches.setdefault(sym, {}))
+        for side in ("entry_long", "entry_short"):
+            for i, on in enumerate(sig[side]):
+                if on:
+                    by_t.setdefault(d["t"][i], []).append((score[i], (k, i), side))
+    prio: dict[tuple[int, int], int] = {}
+    for fired in by_t.values():
+        longs, shorts = _ranked(rk, fired)
+        keep = {(it, "entry_long") for it in longs} | {(it, "entry_short") for it in shorts}
+        for _, (k, i), side in fired:
+            if ((k, i), side) not in keep:
+                st[syms[k]]["sig"][side][i] = False
+        for n, (k, i) in enumerate(longs + shorts):
+            prio[(k, i + 1)] = n + 1                  # the fill is the next candle's open
+    return prio
+
+
+def rank_pick(spec: dict[str, Any], ready: dict[str, dict]) -> tuple[list[str], set[str]]:
+    """Live side of "rank", for the symbols whose candle just closed: the
+    order to decide them in (allowed entries first, best first) and the ones
+    allowed to enter. Same rule as the backtest: ranked among the symbols
+    whose entry fired, held ones included."""
+    fired = []
+    for sym, d in ready.items():
+        prepare(d, spec)
+        cache: dict = {}
+        sig = signals(d, spec, cache)
+        sc = series(d, spec["rank"]["by"], cache)[-1] if d["t"] else None
+        side = "entry_long" if sig["entry_long"][-1] else "entry_short" if sig["entry_short"][-1] else None
+        if side:
+            fired.append((sc, sym, side))
+    longs, shorts = _ranked(spec["rank"], fired)
+    picks = longs + [x for x in shorts if x not in longs]
+    return picks + [x for x in ready if x not in picks], set(picks)
 
 
 def bar_minutes(spec: dict[str, Any]) -> float:
@@ -583,6 +658,8 @@ def _transform_lengths(spec: dict[str, Any]):
                     stack += [o.get("a"), o.get("b")]
     for k in ("entry_long", "exit_long", "entry_short", "exit_short"):
         yield from walk(spec.get(k))
+    if spec.get("rank"):
+        yield from walk({"conditions": [{"left": spec["rank"]["by"]}]})
 
 
 # ---- signals ---------------------------------------------------------------
@@ -1217,7 +1294,10 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                    "atr": {p: series(d, {"ind": "ATR", "params": {"period": p}}, cache) for p in atr_periods(spec)},
                    "pos": None, "pending": None, "per_day": {}, "cool": 0, "u": None}
 
-    events = sorted(((t, k, i) for k, sym in enumerate(syms) for i, t in enumerate(data[sym]["t"])))
+    # With "rank", entries outside each candle's best N are switched off and the
+    # kept fills go first at the next open, best first (prio 0 = everything else).
+    prio = _rank_entries(spec, syms, st, caches) if spec.get("rank") else {}
+    events = sorted(((t, prio.get((k, i), 0), k, i) for k, sym in enumerate(syms) for i, t in enumerate(data[sym]["t"])))
     trades: list[dict[str, Any]] = []
     skipped = {"no_capital": 0, "max_positions": 0, "daily_halt": 0, "entry_expired": 0, "entry_rules": 0}
     exit_rules = (spec.get("position_rules") or {}).get("exit")
@@ -1483,7 +1563,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                 u_x = o if m(o) >= m_target else _solve(m, m_target, o, hi_u)
                 return close(sym, u_x, t, "MTM_TARGET", i, slipped=False)
 
-    for t, k, i in events:
+    for t, _, k, i in events:
         sym = syms[k]
         s_ = st[sym]
         d = s_["d"]
