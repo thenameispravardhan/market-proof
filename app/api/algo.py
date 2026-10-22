@@ -680,6 +680,80 @@ async def square_off(sid: int, request: Request, db: Session = Depends(get_db)) 
     return {"closed": closed, "failed": failed}
 
 
+def _epoch(dt: Optional[datetime]) -> Optional[int]:
+    return int(dt.replace(tzinfo=timezone.utc).timestamp()) if dt else None     # stored as naive UTC
+
+
+def _drift_inputs(sid: int, since: int) -> tuple[dict[int, list[dict[str, Any]]], dict[int, dict]]:
+    """The strategy's live / paper trades since `since`, by the version that
+    took them, and those versions' specs."""
+    from app.db import session as dbs
+
+    with dbs.SessionLocal() as db:
+        s = _get(db, sid)
+        trades = db.execute(select(AlgoTrade).where(
+            AlgoTrade.strategy_id == sid,
+            AlgoTrade.entry_at >= datetime.fromtimestamp(since, tz=timezone.utc).replace(tzinfo=None))).scalars().all()
+        specs = {v.version: v.spec for v in db.execute(select(AlgoStrategyVersion).where(
+            AlgoStrategyVersion.strategy_id == sid)).scalars()}
+        specs.setdefault(s.version or 1, s.spec)
+        rows: dict[int, list[dict[str, Any]]] = {}
+        for t in trades:
+            rows.setdefault(t.version or s.version or 1, []).append({
+                "symbol": t.symbol, "side": t.side, "entry_t": _epoch(t.entry_at), "entry": t.entry_price,
+                "exit_t": _epoch(t.exit_at), "exit": t.exit_price, "reason": t.exit_reason, "net": t.net_pnl,
+                "status": t.status})
+        return rows, {v: specs.get(v, s.spec) for v in rows}
+
+
+@router.get("/strategies/{sid}/drift")
+async def drift(sid: int, days: int = Query(10, ge=1, le=60)) -> dict[str, Any]:
+    """Live vs backtest: each version that traded in the last `days` days is
+    backtested over the days it traded (same engine, real candles) and every
+    live / paper trade is put beside the backtest's — matched by symbol, side
+    and an entry within one candle. A gap is data, fills or timing; a trade
+    on one side only is a miss (runner off, no live price, a rejected order)
+    or an extra (a manual action)."""
+    rows, specs = await asyncio.to_thread(_drift_inputs, sid, int(time.time()) - days * DAY)
+    if not rows:
+        return {"strategy_id": sid, "days": days, "versions": [], "note": f"no trades in the last {days} days to compare"}
+    out = []
+    async with _heavy:
+        for v, live in sorted(rows.items()):
+            spec = _spec(specs[v])
+            first = min(x["entry_t"] for x in live)
+            last = max(x["exit_t"] or x["entry_t"] for x in live)
+            day0 = first - (first + engine.IST) % DAY
+            end = min(last - (last + engine.IST) % DAY + DAY, int(time.time()) + 60)
+            item: dict[str, Any] = {"version": v, "from": day0, "to": end, "matched": [], "live_only": live, "bt_only": [],
+                                    "live_net": round(sum(x["net"] or 0 for x in live), 2), "bt_net": 0.0, "notes": []}
+            out.append(item)
+            try:
+                _guard(spec, day0, end)
+                bars, notes, trade_from = await _assemble(spec, day0, end)
+                res = await asyncio.to_thread(engine.run, spec, bars, None, trade_from)
+            except HTTPException as e:
+                item["notes"] = [{"symbol": f"v{v}", "note": f"not backtested: {e.detail}"}]
+                continue
+            except (ValueError, KeyError, ZeroDivisionError) as e:
+                item["notes"] = [{"symbol": f"v{v}", "note": f"not backtested: {e}"}]
+                continue
+            bt = [{"symbol": x["symbol"], "side": x["side"], "entry_t": x["entry_t"], "entry": x["entry"],
+                   "exit_t": x["exit_t"], "exit": x["exit"], "reason": x["reason"], "net": x["net"]}
+                  for x in res["trades"] if day0 <= x["entry_t"] < end]
+            pairs, only_live, only_bt = engine.match_trades(live, bt, engine.bar_minutes(spec) * 60 + 120)
+            priced = spec["instrument"]["type"] in ("equity", "future")      # option rows mix premium / spot
+            item.update({
+                "matched": [{"live": a, "bt": b, "same_reason": a["reason"] == b["reason"],
+                             "net_gap": round(a["net"] - b["net"], 2) if a["net"] is not None else None,
+                             # + = live filled worse than the backtest
+                             "entry_gap_pct": round((a["entry"] - b["entry"]) / b["entry"] * 100 * (1 if a["side"] == "BUY" else -1), 3)
+                             if priced and a["entry"] and b["entry"] else None} for a, b in pairs],
+                "live_only": only_live, "bt_only": only_bt,
+                "bt_net": round(sum(x["net"] for x in bt), 2), "notes": notes})
+    return {"strategy_id": sid, "days": days, "versions": out}
+
+
 @router.get("/trades")
 def list_trades(strategy_id: Optional[int] = None, strategy_ids: Optional[str] = None,
                 limit: int = Query(300, ge=1, le=5000), db: Session = Depends(get_db)) -> dict[str, Any]:

@@ -252,7 +252,7 @@ def _fake_assemble(monkeypatch):
     monkeypatch.setattr(api.data, "assemble", fake)
 
 
-def test_backtests_and_sweeps_count_on_the_strategy_or_the_draft(client, monkeypatch):
+def test_backtests_and_sweeps_count_on_the_strategy_or_the_draft(client, monkeypatch, isolated_db):
     from app.db import session as dbs
     from app.db.models import AlgoStrategy
 
@@ -366,3 +366,59 @@ def test_runner_ranks_every_symbols_candle_before_entering(monkeypatch, isolated
     asyncio.run(r.tick(t_close + 5))
     with dbs.SessionLocal() as db:
         assert [t.symbol for t in db.query(AlgoTrade).all()] == ["NSE:B-EQ"]
+
+
+# ---- A4: live vs backtest drift ------------------------------------------------
+
+def test_match_trades_pairs_the_nearest_same_symbol_and_side():
+    live = [{"symbol": "A", "side": "BUY", "entry_t": 1000}, {"symbol": "A", "side": "BUY", "entry_t": 5000},
+            {"symbol": "B", "side": "SELL", "entry_t": 1000}]
+    bt = [{"symbol": "A", "side": "BUY", "entry_t": 1150}, {"symbol": "A", "side": "BUY", "entry_t": 900},
+          {"symbol": "B", "side": "BUY", "entry_t": 1000}, {"symbol": "C", "side": "BUY", "entry_t": 1000}]
+    pairs, only_live, only_bt = engine.match_trades(live, bt, 420)
+    assert [(a["entry_t"], b["entry_t"]) for a, b in pairs] == [(1000, 900)]      # nearest wins
+    assert [(x["symbol"], x["entry_t"]) for x in only_live] == [("B", 1000), ("A", 5000)]   # other side / too far
+    assert [(x["symbol"], x["entry_t"]) for x in only_bt] == [("A", 1150), ("B", 1000), ("C", 1000)]
+
+
+def test_drift_lines_up_live_trades_with_the_backtest(client, monkeypatch, isolated_db):
+    import copy
+    import time as _t
+    from datetime import datetime, timezone
+
+    from app.api import algo as api
+    from app.db import session as dbs
+    from app.db.models import AlgoStrategy, AlgoStrategyVersion, AlgoTrade
+
+    base = int(_t.time()) - 2 * 86400
+    day0 = base - (base + 19800) % 86400 + 33300           # 09:15 IST two days ago
+    d = bars([100.0, 101, 102, 106, 108, 104, 102, 101, 100, 99, 100, 101, 102, 106, 107, 103, 102, 100, 99, 98],
+             start=day0, spread=0)                        # the backtest: in at bar 4, out at 7; in at 14, out at 17
+
+    async def fake(spec, start, end):
+        return {"NSE:TEST-EQ": copy.deepcopy(d)}, [], day0
+
+    monkeypatch.setattr(api.data, "assemble", fake)
+    spec = _cross_spec()
+    naive = lambda ts: datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None)  # noqa: E731
+    with dbs.SessionLocal() as db:
+        s = AlgoStrategy(name="d", spec=spec, version=1)
+        db.add(s)
+        db.flush()
+        db.add(AlgoStrategyVersion(strategy_id=s.id, version=1, spec=spec))
+        db.add(AlgoTrade(strategy_id=s.id, symbol="NSE:TEST-EQ", side="BUY", quantity=1, mode="paper", status="closed",
+                         version=1, entry_at=naive(d["t"][4] + 5), entry_price=106.106, exit_at=naive(d["t"][7] + 3),
+                         exit_price=101.0, exit_reason="SIGNAL", net_pnl=-5.2))
+        db.add(AlgoTrade(strategy_id=s.id, symbol="NSE:TEST-EQ", side="BUY", quantity=1, mode="paper", status="rejected",
+                         version=1, entry_at=naive(d["t"][10] + 5), entry_price=100.0, note="no live price"))
+        db.commit()
+        sid = s.id
+    r = client.get(f"/api/algo/strategies/{sid}/drift?days=5").json()
+    v = r["versions"][0]
+    assert v["version"] == 1 and len(v["matched"]) == 1
+    m = v["matched"][0]
+    assert m["bt"]["entry"] == 106 and m["entry_gap_pct"] == pytest.approx(0.1) and m["same_reason"]
+    assert [x["status"] for x in v["live_only"]] == ["rejected"]                  # live tried what the test never took
+    assert [x["entry_t"] for x in v["bt_only"]] == [d["t"][14]]                  # … and missed what it did
+    assert client.get(f"/api/algo/strategies/{sid}/drift?days=1").json()["versions"] == []   # nothing that recent
+    assert client.get("/api/algo/strategies/999/drift").status_code == 404

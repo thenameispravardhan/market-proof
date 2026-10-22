@@ -2116,3 +2116,24 @@ def trial_dsr(trades: list[dict[str, Any]], data: dict[str, dict], capital: floa
         k = (x["exit_t"] + IST) // 86400
         net[k] = net.get(k, 0.0) + x["net"]
     return rstats.deflated_sharpe([net.get(k, 0.0) / capital for k in days], n_trials=max(1, n_trials))
+
+
+def match_trades(live: list[dict[str, Any]], bt: list[dict[str, Any]], tol_s: float
+                 ) -> tuple[list[tuple[dict[str, Any], dict[str, Any]]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Pair live / paper trades with a backtest's over the same days: same
+    symbol and side, entries at most `tol_s` apart, nearest first. Rows are
+    {symbol, side, entry_t, ...}. Returns (pairs, only live, only backtest).
+    ponytail: O(live x backtest) greedy scan — fine for a few hundred trades;
+    scale-out parts pair up in entry order."""
+    left = list(bt)
+    pairs, only_live = [], []
+    for x in sorted(live, key=lambda r: r["entry_t"]):
+        near = [b for b in left if b["symbol"] == x["symbol"] and b["side"] == x["side"]
+                and abs(b["entry_t"] - x["entry_t"]) <= tol_s]
+        if not near:
+            only_live.append(x)
+            continue
+        best = min(near, key=lambda b: abs(b["entry_t"] - x["entry_t"]))
+        left.remove(best)
+        pairs.append((x, best))
+    return pairs, only_live, left

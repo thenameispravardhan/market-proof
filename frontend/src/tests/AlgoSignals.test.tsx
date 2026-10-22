@@ -108,3 +108,27 @@ describe("Algo Lab signals", () => {
     expect("rank" in backtests()[1].body.spec).toBe(false);          // off = left out
   });
 });
+
+describe("Live vs backtest drift", () => {
+  let originalFetch: typeof fetch;
+  afterEach(() => { globalThis.fetch = originalFetch; vi.restoreAllMocks(); });
+
+  it("lines up live trades with the backtest's and lists the misses", async () => {
+    const { DriftPanel } = await import("../components/algo/DriftPanel");
+    const row = (entry_t: number, extra = {}) => ({ symbol: "NSE:SBIN-EQ", side: "BUY", entry_t, entry: 800, exit_t: entry_t + 600, exit: 805, reason: "TARGET", net: 40, ...extra });
+    const drift = { strategy_id: 7, days: 10, versions: [{ version: 3, from: 0, to: 0, live_net: 40, bt_net: 85, notes: [],
+      matched: [{ live: row(1790000005, { entry: 800.8 }), bt: row(1790000000), entry_gap_pct: 0.1, net_gap: -5, same_reason: true }],
+      live_only: [row(1790090000, { status: "rejected", reason: null, net: null, exit: null, exit_t: null })], bt_only: [row(1790190000, { net: 45 })] }] };
+    const urls: string[] = [];
+    originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn((u: RequestInfo | URL) => { urls.push(String(u)); return json(drift); }) as typeof fetch;
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(<QueryClientProvider client={qc}><DriftPanel strategies={[{ id: 7, name: "Live one" }]} /></QueryClientProvider>);
+    fireEvent.click(screen.getByText("Compare"));
+    const v = await screen.findByTestId("algo-drift-v3");
+    expect(urls[0]).toContain("/api/algo/strategies/7/drift?days=10");
+    expect(v.textContent).toContain("1 matched · 1 only live · 1 only in the backtest");
+    expect(v.textContent).toContain("0.10%");
+    expect(v.textContent).toContain("rejected");
+  });
+});
