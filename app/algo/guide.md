@@ -424,6 +424,12 @@ price `offset_pct`% better than the signal close — limit style), `breakout`
   them on to paper-trade live, or to **LIVE** (real orders on Fyers) after
   typing `LIVE` to confirm. Every save is a new version; any version can be
   made active again.
+* **Fills vs quotes (TCA)** — every LIVE fill keeps the price the runner
+  decided at beside the broker's fill. The Automations tab shows each
+  strategy's measured slippage (median / mean, % and ₹, + = it cost you) per
+  instrument kind next to the `costs.slippage_pct` its backtests assume — if
+  live fills cost more, raise it so the backtests stay honest. Paper fills
+  fill at the quote and are left out.
 
 ### Exit reasons you will see
 

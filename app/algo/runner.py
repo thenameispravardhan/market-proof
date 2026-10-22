@@ -726,6 +726,8 @@ class AlgoRunner:
                     self._retry_at[t["id"]] = now + 30
                     break
                 lg["exit"], lg["exit_reason"] = r["px"], reason
+                if r.get("quote") is not None:
+                    lg["exit_quote"] = r["quote"]          # TCA: the price the exit was decided at
                 if r["oid"]:
                     lg["exit_order_id"] = r["oid"]
                 if r["external"]:
@@ -799,6 +801,8 @@ class AlgoRunner:
                 self._retry_at[t["id"]] = now + 30
                 return False
             lg["exit"] = r["px"]
+            if r.get("quote") is not None:
+                lg["exit_quote"] = r["quote"]
             if r["oid"]:
                 lg["exit_order_id"] = r["oid"]
             if r["external"]:
@@ -810,7 +814,9 @@ class AlgoRunner:
         """Exit `qty` of one leg — paper: at `px`; live: a MARKET order, never
         for more than the broker holds. {"px", "qty", "oid", "external"}
         (external = the broker no longer holds it: no order sent), or None when
-        it failed — the trade note and an event say why, nothing is booked."""
+        it failed — the trade note and an event say why, nothing is booked.
+        A live fill the broker reported also carries "quote": `px`, the price
+        the runner decided at (TCA: fill vs quote); paper fills never do."""
         if t["mode"] != "live":
             return {"px": px, "qty": qty, "oid": None, "external": False}
         acc, why = await asyncio.to_thread(_account, await asyncio.to_thread(_strategy_account, t["strategy_id"]))
@@ -838,7 +844,8 @@ class AlgoRunner:
                 self.event("error", f"{self.label(t['strategy_id'], t.get('version'))}: EXIT NOT FILLED "
                                     f"{lg['symbol']} ({reason})", trade_id=t["id"], strategy_id=t["strategy_id"])
                 return None
-        return {"px": fill or px, "qty": min(qty, abs(held)), "oid": oid, "external": False}
+        return {"px": fill or px, "qty": min(qty, abs(held)), "oid": oid, "external": False,
+                **({"quote": px} if fill is not None else {})}
 
     async def _scale_out(self, t: dict, prices: dict[str, float], now: float) -> None:
         """Take the next scale-out level once the reference price reaches it:
@@ -898,7 +905,8 @@ class AlgoRunner:
             lg["qty"] -= r["qty"]
             done[j] = {**{x: lg[x] for x in ("symbol", "kind", "act", "entry", "label", "K", "exp", "product", "qty0")
                           if x in lg},
-                       "qty": r["qty"], "exit": r["px"], **({"exit_order_id": r["oid"]} if r["oid"] else {})}
+                       "qty": r["qty"], "exit": r["px"], **({"exit_order_id": r["oid"]} if r["oid"] else {}),
+                       **({"exit_quote": r["quote"]} if r.get("quote") is not None else {})}
         part = [done[j] for j in sorted(done)]
         closed, gross, ch = None, 0.0, 0.0
         if part:
@@ -1167,7 +1175,7 @@ class AlgoRunner:
                 for lg in legs:                                    # book the broker's fill, not the quote
                     fill = await _fill_price(acc, lg.get("order_id"))
                     if fill:
-                        lg["entry"] = fill
+                        lg["entry_quote"], lg["entry"] = lg["price"], fill    # TCA: the quote it was decided at
                         continue
                     net = await _broker_net(acc, lg["symbol"])
                     if net is not None and net * lg["act"] <= 0:
@@ -1230,5 +1238,5 @@ class AlgoRunner:
 
 def _clean(legs: list[dict]) -> list[dict]:
     keep = ("symbol", "kind", "act", "qty", "qty0", "entry", "label", "K", "exp", "order_id", "product",
-            "per_set", "sl", "tg")
+            "per_set", "sl", "tg", "entry_quote")
     return [{k: lg[k] for k in keep if k in lg} for lg in legs]

@@ -16,6 +16,7 @@
     GET    /api/algo/trades?strategy_id=&strategy_ids=1,2&limit=
     GET    /api/algo/status                runner heartbeat, events, open positions
     POST   /api/algo/sync                  download today's candles for every strategy symbol now
+    GET    /api/algo/tca?days=30           live fills vs the quotes they were decided at, per strategy / kind
 
 Switching a strategy to LIVE needs `confirm: "LIVE"` typed in the UI and a real,
 logged-in Fyers account — the same typed-confirm rule as the global LIVE mode.
@@ -24,7 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
@@ -808,3 +809,57 @@ async def sync_now(request: Request) -> dict[str, Any]:
     if not strategies:
         return {"symbols": 0, "ok": 0, "failed": []}
     return await _runner(request).sync(strategies, days=int(request.query_params.get("days", 5)))
+
+
+# ---- TCA: live fills vs the quotes the runner decided at ----------------------------------------
+
+def _tca_fills(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One record per LIVE fill that has its quote beside it (entry_quote / exit_quote on a leg):
+    slippage per unit signed so + = it cost you (bought above / sold below the quote), in % of the
+    quote and in ₹ for the fill's quantity. Paper fills carry no quote and never appear."""
+    out = []
+    for t in rows:
+        for lg in t.get("legs") or []:
+            for fill, quote, way in ((lg.get("entry"), lg.get("entry_quote"), lg["act"]),
+                                     (lg.get("exit"), lg.get("exit_quote"), -lg["act"])):
+                if fill is None or not quote:
+                    continue
+                cost = way * (float(fill) - float(quote))
+                out.append({"strategy_id": t["strategy_id"], "kind": lg.get("kind") or "EQ",
+                            "pct": cost / float(quote) * 100, "rs": cost * int(lg.get("qty") or 0)})
+    return out
+
+
+def _tca_summary(fills: list[dict[str, Any]]) -> dict[str, Any]:
+    import statistics
+
+    pct, rs = [f["pct"] for f in fills], [f["rs"] for f in fills]
+    return {"fills": len(fills),
+            "median_pct": round(statistics.median(pct), 4), "mean_pct": round(statistics.fmean(pct), 4),
+            "median_rs": round(statistics.median(rs), 2), "mean_rs": round(statistics.fmean(rs), 2),
+            "total_rs": round(sum(rs), 2)}
+
+
+@router.get("/tca")
+def tca(days: int = Query(30, ge=1, le=366), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Measured slippage of LIVE fills over the last `days`, per strategy and per instrument kind
+    (EQ / FUT / CE / PE), next to the slippage the strategy's backtests assume (costs.slippage_pct).
+    Read-only: it never edits a spec."""
+    from app.algo.runner import _row
+
+    since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
+    rows = [_row(t) for t in db.execute(select(AlgoTrade).where(
+        AlgoTrade.mode == "live", AlgoTrade.status != "rejected", AlgoTrade.entry_at >= since)).scalars()]
+    fills = _tca_fills(rows)
+    strategies = []
+    for sid in sorted({f["strategy_id"] for f in fills}):
+        s = db.get(AlgoStrategy, sid)
+        mine = [f for f in fills if f["strategy_id"] == sid]
+        assumed = ((s.spec or {}).get("costs") or {}).get("slippage_pct") if s else None
+        strategies.append({
+            "strategy_id": sid, "name": s.name if s else f"#{sid}",
+            "assumed_pct": engine.DEFAULT_SPEC["costs"]["slippage_pct"] if assumed is None else float(assumed),
+            **_tca_summary(mine),
+            "kinds": [{"kind": k, **_tca_summary([f for f in mine if f["kind"] == k])}
+                      for k in ("EQ", "FUT", "CE", "PE") if any(f["kind"] == k for f in mine)]})
+    return {"days": days, "strategies": strategies}

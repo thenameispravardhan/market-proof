@@ -33,6 +33,7 @@ import { useSessionState } from "../router";
 import { peekQuote, useQuoteTick, watchSymbol } from "../hooks/useQuotes";
 import { Toggle } from "../components/common/Toggle";
 import { chartHref } from "../lib/chartLink";
+import { TcaPanel } from "../components/algo/TcaPanel";
 
 // ---------------------------------------------------------------------------
 // types
@@ -2223,6 +2224,7 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
             )}
           </div>
       </div>
+      <TcaPanel />
       <div className="widget widget-wide">
           <h3>Runner log {sel.length ? <span className="meta">— {selNames}</span> : null}</h3>
           <div style={{ ...grow(320), fontSize: 12 }} data-testid="algo-log-panel">
