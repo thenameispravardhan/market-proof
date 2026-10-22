@@ -32,6 +32,7 @@ import { api } from "../api/client";
 import { BookPanel } from "../components/algo/BookPanel";
 import { DriftPanel } from "../components/algo/DriftPanel";
 import { TcaPanel } from "../components/algo/TcaPanel";
+import { ResearchTab, StrategyCard, type ResearchCard } from "../components/research/StrategyCards";
 import { useSessionState } from "../router";
 import { peekQuote, useQuoteTick, watchSymbol } from "../hooks/useQuotes";
 import { Toggle } from "../components/common/Toggle";
@@ -1950,14 +1951,17 @@ function WalkForward({ r, label, onApply }: { r: WfResult; label: (p: string) =>
   );
 }
 
-function Optimizer({ spec, cat, range, onApply, trialBody, onTrials }: { spec: Spec; cat: Catalog; range: { start: string; end: string }; onApply: (params: Record<string, number>) => void; trialBody: TrialBody; onTrials: (n?: number) => void }) {
+function Optimizer({ spec, name, cat, range, onApply, trialBody, onTrials }: { spec: Spec; name: string; cat: Catalog; range: { start: string; end: string }; onApply: (params: Record<string, number>) => void; trialBody: TrialBody; onTrials: (n?: number) => void }) {
+  const qc = useQueryClient();
   const paths = useMemo(() => numericPaths(spec, cat), [spec, cat]);
   const [axes, setAxes] = useState<{ path: string; from: number; to: number; step: number }[]>([]);
   const [metric, setMetric] = useState("net_pnl");
   const [minTrades, setMinTrades] = useState(10);
   const [oos, setOos] = useState(30);
   // "wf" = rolling walk-forward: re-rank on each in-sample window, trade the next window unseen.
-  const [mode, setMode] = useState<"rank" | "wf">("rank");
+  // "research" = held-out split + walk-forward + DSR + PBO in one run, judged against the bar and saved as a card.
+  const [mode, setMode] = useState<"rank" | "wf" | "research">("rank");
+  const [idea, setIdea] = useState("");
   const [wf, setWf] = useState({ windows: 4, is_mult: 3, anchored: false });
   const values = (a: { from: number; to: number; step: number }) => {
     const out: number[] = [];
@@ -1965,19 +1969,28 @@ function Optimizer({ spec, cat, range, onApply, trialBody, onTrials }: { spec: S
     for (let v = a.from; v <= a.to + 1e-9 && out.length < 60; v += a.step) out.push(Math.round(v * 1e6) / 1e6);
     return out;
   };
-  const combos = axes.reduce((n, a) => n * values(a).length, axes.length ? 1 : 0);
+  const combos = axes.reduce((n, a) => n * values(a).length, axes.length || mode === "research" ? 1 : 0);   // a research check with no grid tests the rules as they are
   // The builder can change under the grid (a condition removed, a stop switched off) — those axes can't run.
   const missing = axes.filter((a) => !paths.some((p) => p.path === a.path)).length;
   const run = useMutation({
     mutationFn: () => longPost<OptResult | WfResult>("/api/algo/optimize", {
       spec: tidy(spec), ...range, metric, min_trades: minTrades,
       // clamped here, not per keystroke (typing "10" passes through "1")
-      ...(mode === "wf" ? { walk_forward: { ...wf, windows: Math.max(2, Math.min(12, wf.windows)), is_mult: Math.max(0.5, Math.min(10, wf.is_mult)) } }
+      ...(mode === "wf" ? { walk_forward: wfBody() }
         : { oos_pct: oosParam(oos) }),
       grid: axes.map((a) => ({ path: a.path, values: values(a) })), ...trialBody,
     }),
     onSuccess: (r) => onTrials(r.trials),
   });
+  const wfBody = () => ({ ...wf, windows: Math.max(2, Math.min(12, wf.windows)), is_mult: Math.max(0.5, Math.min(10, wf.is_mult)) });
+  const check = useMutation({
+    mutationFn: () => longPost<ResearchCard>("/api/algo/research/check", {
+      spec: tidy(spec), ...range, metric, min_trades: minTrades, oos_pct: Math.max(5, oos), walk_forward: wfBody(),
+      grid: axes.map((a) => ({ path: a.path, values: values(a) })), name, hypothesis: idea, ...trialBody,
+    }),
+    onSuccess: (r) => { onTrials(r.trials); qc.invalidateQueries({ queryKey: ["algo", "research"] }); },
+  });
+  const busy = run.isPending || check.isPending;
   const opt = run.data && !isWf(run.data) ? run.data : null;
   const wfr = run.data && isWf(run.data) ? run.data : null;
   const heat = opt?.all && opt.all.length && Object.keys(opt.all[0].params).length === 2 ? opt.all : null;
@@ -2010,13 +2023,15 @@ function Optimizer({ spec, cat, range, onApply, trialBody, onTrials }: { spec: S
           }}>+ parameter</button>
           <label className="meta">rank by <select value={metric} onChange={(e) => setMetric(e.target.value)}>{cat.metrics.map((m) => <option key={m}>{m}</option>)}</select></label>
           <label className="meta" title="one split: rank on the earlier part, check the held-out end. Walk-forward: cut the range into windows, re-rank on each in-sample window and trade the next one unseen — the stitched unseen windows are what re-optimising would really have earned">check
-            <select value={mode} onChange={(e) => setMode(e.target.value as "rank" | "wf")}>
+            <select value={mode} onChange={(e) => setMode(e.target.value as "rank" | "wf" | "research")}>
               <option value="rank">one out-of-sample split</option><option value="wf">rolling walk-forward</option>
+              <option value="research">research check → strategy card</option>
             </select>
           </label>
-          {mode === "rank" ? (
+          {mode !== "wf" && (
             <label className="meta" title="the last X% of the range is held out: ranking uses only the earlier part, and each row shows how it did afterwards. 5–80, 0 = off">hold out last <NumInput width={36} value={oos} onChange={(n) => setOos(Math.max(0, Math.min(80, Math.floor(n ?? 0))))} />% as out-of-sample</label>
-          ) : (
+          )}
+          {mode !== "rank" && (
             <>
               <label className="meta" title="out-of-sample windows (2–12), each traded with the winner of the in-sample window before it">windows <NumInput width={36} value={wf.windows} onChange={(n) => setWf({ ...wf, windows: Math.floor(n ?? 4) })} /></label>
               <label className="meta" title="in-sample length in out-of-sample windows (0.5–10): 3 = rank on 3 windows of history, trade the 4th">in-sample × <NumInput width={36} value={wf.is_mult} onChange={(n) => setWf({ ...wf, is_mult: n ?? 3 })} /></label>
@@ -2025,11 +2040,26 @@ function Optimizer({ spec, cat, range, onApply, trialBody, onTrials }: { spec: S
           )}
           <label className="meta" title="combos with fewer trades are not ranked — a 1-trade 100% win rate means nothing">min trades <NumInput width={52} value={minTrades} onChange={(n) => setMinTrades(Math.max(1, Math.floor(n ?? 1)))} /></label>
           <span className="meta">{combos} combinations (max 400)</span>
-          <button type="button" className="primary" disabled={!combos || combos > 400 || missing > 0 || run.isPending} onClick={() => run.mutate()}>{run.isPending ? "Optimising…" : "Run optimisation"}</button>
+          {mode === "research"
+            ? <button type="button" className="primary" disabled={combos > 400 || missing > 0 || busy} onClick={() => check.mutate()}>{check.isPending ? "Checking…" : "Run research check"}</button>
+            : <button type="button" className="primary" disabled={!combos || combos > 400 || missing > 0 || busy} onClick={() => run.mutate()}>{run.isPending ? "Optimising…" : "Run optimisation"}</button>}
         </div>
-        {!axes.length && <div className="meta">Add the parameters to sweep with “+ parameter”, then run. Apply a row to send its values back to the builder.</div>}
+        {mode === "research" && (
+          <div className="algo-operand" style={{ gap: 10 }}>
+            <input value={idea} onChange={(e) => setIdea(e.target.value)} style={{ flex: 1 }} data-testid="research-idea"
+              placeholder="the idea in one line — why should this make money? (goes on the card)" />
+            <span className="meta">{axes.length ? "sweeps the grid, chooses on the in-sample part only" : "no grid: tests the rules as they are"}; held-out split + walk-forward + Deflated Sharpe{axes.length ? " + PBO" : ""} → pass or killed, saved under Research</span>
+          </div>
+        )}
+        {!axes.length && mode !== "research" && <div className="meta">Add the parameters to sweep with “+ parameter”, then run. Apply a row to send its values back to the builder.</div>}
         {missing > 0 && <div className="meta pnl-neg">{missing} parameter{missing > 1 ? "s are" : " is"} no longer in the builder's strategy — remove {missing > 1 ? "them" : "it"} (✕) to run.</div>}
       </div>
+      {mode === "research" ? (
+        <>
+          {check.error && <div className="pnl-neg">{errMsg(check.error)}</div>}
+          {check.data && <StrategyCard key={check.data.id} card={check.data} />}
+        </>
+      ) : <>
       {run.error && <div className="pnl-neg">{errMsg(run.error)}</div>}
       {wfr && <WalkForward r={wfr} label={label} onApply={onApply} />}
       {opt && (
@@ -2056,6 +2086,7 @@ function Optimizer({ spec, cat, range, onApply, trialBody, onTrials }: { spec: S
           </div>
         </>
       )}
+      </>}
     </div>
   );
 }
@@ -2675,7 +2706,7 @@ function DataTab() {
 // page
 // ---------------------------------------------------------------------------
 
-type Tab = "builder" | "optimize" | "compare" | "automations" | "data";
+type Tab = "builder" | "optimize" | "compare" | "research" | "automations" | "data";
 
 export default function Algo() {
   const cat = useQuery({ queryKey: ["algo", "catalog"], queryFn: () => api.get<Catalog>("/api/algo/indicators"), staleTime: Infinity });
@@ -2862,9 +2893,9 @@ export default function Algo() {
     <div className="algo">
       <datalist id="algo-ref-symbols">{QUICK.map((x) => <option key={x.s} value={x.s}>{x.l}</option>)}</datalist>
       <div className="tabs algo-tabs">
-        {(["builder", "optimize", "compare", "automations", "data"] as Tab[]).map((t) => (
+        {(["builder", "optimize", "compare", "research", "automations", "data"] as Tab[]).map((t) => (
           <button type="button" key={t} className={`tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
-            {{ builder: "Builder & backtest", optimize: "Optimise", compare: "Compare", automations: "Automations", data: "Data" }[t]}
+            {{ builder: "Builder & backtest", optimize: "Optimise", compare: "Compare", research: "Research", automations: "Automations", data: "Data" }[t]}
           </button>
         ))}
         <button type="button" className="primary" style={{ marginLeft: 12 }} onClick={() => {
@@ -2890,10 +2921,11 @@ export default function Algo() {
         bt.reset(); setMsg(null); setTab("builder");
       }} />}
       {tab === "data" && <><RecorderPanel /><DataTab /></>}
+      {tab === "research" && <ResearchTab />}
       {/* Optimise and Compare stay mounted so their results survive a trip to the builder and back. */}
       <div hidden={tab !== "compare"}><CompareTab cat={c} range={range} draft={spec} /></div>
       <div hidden={tab !== "optimize"}>
-        <Optimizer spec={spec} cat={c} range={range} trialBody={trialBody} onTrials={gotTrials} onApply={(params) => {
+        <Optimizer spec={spec} name={name} cat={c} range={range} trialBody={trialBody} onTrials={gotTrials} onApply={(params) => {
           const s = clone(spec);
           Object.entries(params).forEach(([p, v]) => setPath(s, p, v));
           setSpec(s);

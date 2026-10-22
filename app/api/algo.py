@@ -6,6 +6,9 @@
     POST   /api/algo/payoff               {spec, side?, spot?, iv_pct?} — payoff, Greeks, funds required
     POST   /api/algo/optimize              {spec, start, end, grid:[{path, values}], metric, min_trades,
                                             walk_forward?: {windows, is_mult, anchored}}
+    POST   /api/algo/research/check        {spec, start, end, grid?, oos_pct?, walk_forward?, hypothesis?}:
+                                           split + walk-forward + DSR + PBO -> pass / kill, saved as a card
+    GET    /api/algo/research/cards        ?strategy_id=&verdict=   (GET /{id}, /{id}/markdown, PATCH /{id})
     GET    /api/algo/data?symbol=          what the candle store holds for a symbol
     POST   /api/algo/data/download         {symbols, days} — fill the store from Fyers
     GET    /api/algo/strategies            saved strategies + live P&L
@@ -36,9 +39,10 @@ from sqlalchemy.orm import Session
 from app.algo import data, engine
 from app.algo import indicators as ind
 from app.db.init import init_db
-from app.db.models import AlgoStrategy, AlgoStrategyVersion, AlgoTrade, AuditLog, BrokerAccount
+from app.db.models import AlgoResearchCard, AlgoStrategy, AlgoStrategyVersion, AlgoTrade, AuditLog, BrokerAccount
 from app.db.session import get_db
 from app.logging_config import get_logger
+from app.research import loop
 
 log = get_logger(__name__)
 router = APIRouter(prefix="/api/algo", tags=["algo"])
@@ -290,6 +294,116 @@ async def optimize(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         except (ValueError, KeyError, IndexError, TypeError, ZeroDivisionError, AttributeError) as e:
             raise HTTPException(422, detail=f"optimize: {e}")
     return {**res, "notes": notes, "elapsed_s": round(time.monotonic() - t0, 2), "oos_from": oos_from, "trials": trials}
+
+
+# ---- research loop: one idea through every out-of-sample test -> a card ------
+
+def _card(c: AlgoResearchCard, full: bool = True) -> dict[str, Any]:
+    r = c.result or {}
+    over = r.get("overfitting") or {}
+    out = {"id": c.id, "strategy_id": c.strategy_id, "version": c.version, "name": c.name, "trials": c.trials,
+           "verdict": c.verdict, "checks": c.checks, "hypothesis": c.hypothesis, "note": c.note, "setup": c.setup,
+           "created_at": c.created_at.isoformat() + "Z" if c.created_at else None,
+           "headline": {"dsr": (over.get("deflated_sharpe") or {}).get("dsr"), "pbo": (over.get("pbo") or {}).get("pbo"),
+                        "wf_net": (r.get("walk_forward") or {}).get("oos", {}).get("net_pnl"),
+                        "held_out_net": ((r.get("split") or {}).get("oos") or {}).get("net_pnl")}}
+    if full:
+        out.update({"spec": c.spec, "result": r, "rules": loop.rules_text(c.spec)})
+    return out
+
+
+def _save_card(body: dict[str, Any], spec: dict[str, Any], res: dict[str, Any], setup: dict[str, Any]) -> dict[str, Any]:
+    from app.db import session as dbs
+
+    sid = body.get("strategy_id")
+    with dbs.SessionLocal() as db:
+        s = db.get(AlgoStrategy, int(sid)) if sid else None
+        name = s.name if s else (str(body.get("name") or "").strip()[:128] or "Unsaved draft")
+        hyp = str(body.get("hypothesis") or "").strip() or None
+        c = AlgoResearchCard(strategy_id=s.id if s else None, version=s.version if s else None, name=name,
+                             spec=spec, setup=setup, trials=res["trials"], result=res, checks=res.pop("checks"),
+                             verdict=res.pop("verdict"), hypothesis=hyp)
+        db.add(c)
+        db.commit()
+        return _card(c)
+
+
+@router.post("/research/check")
+async def research_check(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """{spec, start, end, grid?, metric?, min_trades?, oos_pct? (default 30),
+    walk_forward?: {windows, is_mult, anchored}, strategy_id? | trials?, name?, hypothesis?}
+    Runs the held-out split, a walk-forward, the Deflated Sharpe and PBO on
+    the same backtests, judges them against the bar and saves the card."""
+    spec = _spec(body.get("spec"))
+    start, end = _range(body)
+    grid = body.get("grid") or []
+    combos = 1
+    for g in grid:
+        combos *= max(1, len(g.get("values") or []))
+    _guard(spec, start, end, combos)
+    pct = _oos_pct(body) or 30.0
+    wf = body.get("walk_forward") or {}
+    try:
+        metric, min_trades = str(body.get("metric") or "net_pnl"), max(1, int(body.get("min_trades") or 10))
+        windows, is_mult = engine.wf_check(wf.get("windows") or 4, wf.get("is_mult") or 3)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(422, detail=f"research check: {e}") from None
+    async with _heavy:
+        t0 = time.monotonic()
+        bars, notes, trade_from = await _assemble(spec, start, end)
+        oos_from = _oos_from(bars, trade_from, pct)
+        trials = await asyncio.to_thread(_bump_trials, body, combos)
+        try:
+            res = await asyncio.to_thread(loop.check, spec, bars, grid, oos_from=oos_from, metric=metric,
+                                          min_trades=min_trades, trade_from=trade_from, windows=windows,
+                                          is_mult=is_mult, anchored=bool(wf.get("anchored")),
+                                          prior_trials=trials - combos)
+        except (ValueError, KeyError, IndexError, TypeError, ZeroDivisionError, AttributeError) as e:
+            raise HTTPException(422, detail=f"research check: {e}")
+    setup = {"start": str(body["start"]), "end": str(body["end"]), "grid": grid, "metric": metric,
+             "min_trades": min_trades, "oos_pct": pct,
+             "walk_forward": {"windows": windows, "is_mult": is_mult, "anchored": bool(wf.get("anchored"))}}
+    card = await asyncio.to_thread(_save_card, body, spec, res, setup)
+    return {**card, "notes": notes, "elapsed_s": round(time.monotonic() - t0, 2)}
+
+
+@router.get("/research/cards")
+def research_cards(strategy_id: Optional[int] = None, verdict: Optional[str] = None,
+                   limit: int = Query(200, ge=1, le=1000), db: Session = Depends(get_db)) -> dict[str, Any]:
+    q = select(AlgoResearchCard).order_by(AlgoResearchCard.id.desc()).limit(limit)
+    if strategy_id:
+        q = q.where(AlgoResearchCard.strategy_id == strategy_id)
+    if verdict:
+        q = q.where(AlgoResearchCard.verdict == verdict)
+    return {"cards": [_card(c, full=False) for c in db.execute(q).scalars()], "bar": loop.BAR}
+
+
+def _get_card(db: Session, cid: int) -> AlgoResearchCard:
+    c = db.get(AlgoResearchCard, cid)
+    if not c:
+        raise HTTPException(404, detail="no such card")
+    return c
+
+
+@router.get("/research/cards/{cid}")
+def research_card(cid: int, db: Session = Depends(get_db)) -> dict[str, Any]:
+    return _card(_get_card(db, cid))
+
+
+@router.get("/research/cards/{cid}/markdown")
+def research_card_markdown(cid: int, db: Session = Depends(get_db)) -> PlainTextResponse:
+    return PlainTextResponse(loop.markdown(_card(_get_card(db, cid))), media_type="text/markdown; charset=utf-8")
+
+
+@router.patch("/research/cards/{cid}")
+def research_card_edit(cid: int, body: dict[str, Any] = Body(...), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Only the idea and note text change; the results and verdict are the record."""
+    c = _get_card(db, cid)
+    for k in ("hypothesis", "note"):
+        if k in body:
+            setattr(c, k, (str(body[k] or "").strip() or None))
+    db.commit()
+    return _card(c)
 
 
 @router.get("/instrument")
