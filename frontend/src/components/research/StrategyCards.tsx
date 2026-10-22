@@ -9,13 +9,14 @@ import { api } from "../../api/client";
 import { PairFinder } from "./PairFinder";
 import { SurfaceCheck, TickReplay } from "./SurfacePanels";
 import { UniversePanel } from "./UniversePanel";
+import { NightlyPanel } from "./NightlyPanel";
 
 export type Check = { key: string; label: string; value: number | null; pass: boolean | null; note: string | null };
 type Sum = { trades: number; win_rate: number; net_pnl: number; profit_factor: number | null; sharpe: number | null; max_drawdown?: number; max_drawdown_pct?: number };
 type Fold = { is_from: number; oos_from: number; oos_to: number; params: Record<string, number> | null; oos: Sum | null };
 export type CardSummary = {
   id: number; strategy_id: number | null; version: number | null; name: string; trials: number; verdict: "pass" | "kill";
-  checks: Check[]; hypothesis: string | null; note: string | null; created_at: string | null;
+  checks: Check[]; hypothesis: string | null; note: string | null; created_at: string | null; kind?: "check" | "nightly";
   setup: { start: string; end: string; grid: { path: string; values: number[] }[]; metric: string; min_trades: number; oos_pct: number; walk_forward: { windows: number; is_mult: number; anchored: boolean } };
   headline: { dsr: number | null; pbo: number | null; wf_net: number | null; held_out_net: number | null };
 };
@@ -135,10 +136,12 @@ export function StrategyCard({ card }: { card: ResearchCard }) {
 export function ResearchTab({ timeframes, onUse, spec, range }: { timeframes: number[]; onUse: (spec: Record<string, unknown>, name: string, tries: number) => void;
   spec: unknown; range: { start: string; end: string } }) {
   const [verdict, setVerdict] = useState<"" | "pass" | "kill">("");
+  const [kind, setKind] = useState<"" | "check" | "nightly">("");
   const [open, setOpen] = useState<number | null>(null);
   const list = useQuery({
-    queryKey: ["algo", "research", "cards", verdict],
-    queryFn: () => api.get<{ cards: CardSummary[]; bar: { dsr: number; pbo: number } }>(`/api/algo/research/cards${verdict ? `?verdict=${verdict}` : ""}`),
+    queryKey: ["algo", "research", "cards", verdict, kind],
+    queryFn: () => api.get<{ cards: CardSummary[]; bar: { dsr: number; pbo: number } }>(
+      `/api/algo/research/cards?${new URLSearchParams({ ...(verdict ? { verdict } : {}), ...(kind ? { kind } : {}) })}`),
   });
   const card = useQuery({
     queryKey: ["algo", "research", "card", open], enabled: open !== null,
@@ -152,6 +155,7 @@ export function ResearchTab({ timeframes, onUse, spec, range }: { timeframes: nu
     <SurfaceCheck range={range} />
     <TickReplay spec={spec} range={range} />
     <UniversePanel />
+    <NightlyPanel onOpenCard={setOpen} />
     <div className="widget widget-wide" data-testid="research-tab">
       <h3>Strategy cards <span className="meta">one per research check — run one from Optimise → “research check”</span></h3>
       <div className="meta" style={{ marginBottom: 8 }}>
@@ -159,6 +163,9 @@ export function ResearchTab({ timeframes, onUse, spec, range }: { timeframes: nu
         Anything below it is killed.{" "}
         <label>show <select value={verdict} onChange={(e) => setVerdict(e.target.value as "" | "pass" | "kill")}>
           <option value="">all</option><option value="pass">passed</option><option value="kill">killed</option>
+        </select></label>{" "}
+        <label><select value={kind} onChange={(e) => setKind(e.target.value as "" | "check" | "nightly")} data-testid="card-kind">
+          <option value="">checks and nightly</option><option value="check">research checks</option><option value="nightly">nightly re-validations</option>
         </select></label>
       </div>
       {list.error && <div className="pnl-neg">{String(list.error)}</div>}
@@ -171,7 +178,7 @@ export function ResearchTab({ timeframes, onUse, spec, range }: { timeframes: nu
               <tr key={c.id} onClick={() => setOpen(open === c.id ? null : c.id)} style={{ cursor: "pointer" }} className={open === c.id ? "active" : ""}>
                 <td className="mono">{c.id}</td>
                 <td className="mono">{c.created_at ? new Date(c.created_at).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", dateStyle: "short", timeStyle: "short" }) : "—"}</td>
-                <td>{c.name}{c.strategy_id === null ? <span className="meta"> (draft)</span> : null}</td>
+                <td>{c.name}{c.strategy_id === null ? <span className="meta"> (draft)</span> : null}{c.kind === "nightly" ? <span className="badge neutral" style={{ marginLeft: 4 }}>nightly</span> : null}</td>
                 <td><Verdict v={c.verdict} /></td>
                 <td className="mono">{c.trials}</td>
                 <td className="mono">{pct(c.headline.dsr)}</td>

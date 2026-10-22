@@ -76,6 +76,10 @@ function route(url: string, init?: RequestInit) {
   if (url.includes("/api/algo/trades")) return json({ trades: [] });
   if (url.includes("/api/algo/instrument")) return json({ symbol: "NSE:SBIN-EQ", name: "SBIN", fno: false, lot: null, weekly: false, futures: [], coverage: null });
   if (url.includes("/api/algo/research/pairs")) return json(PAIRS);
+  if (url.includes("/api/algo/research/flags/3/clear")) return json({ id: 3 });
+  if (url.includes("/api/algo/research/nightly")) return json({ enabled: init?.method === "PUT" ? body.enabled : false, time: "18:30",
+    last_run: 1761140000, last: { strategies: 4, flagged: 1, new_flags: 1, elapsed_s: 40 },
+    flags: [{ id: 3, strategy_id: 12, name: "ORB", card_id: 8, reason: "below the bar on the latest data: Deflated Sharpe ≥ 95% after 31 tries", created_at: "2026-10-21T13:01:00Z" }] });
   if (url.includes("/api/algo/research/universe/nifty50/changes")) return json({ added: 2, total: 2, changes: 2 });
   if (url.includes("/api/algo/research/universe")) return json({ indexes: [
     { index: "nifty50", label: "NIFTY 50", snapshots: 3, first_snapshot: "20251001", last_snapshot: "20251022", changes: 0, first_change: null, trusted_from: "20251001", members_now: 50 },
@@ -229,5 +233,19 @@ describe("Algo Lab research loop", () => {
     fireEvent.click(screen.getByText("Import"));
     await waitFor(() => expect(calls.some((c) => c.url.includes("/universe/nifty50/changes"))).toBe(true));
     expect(calls.find((c) => c.url.includes("/universe/nifty50/changes"))!.body).toEqual({ csv: "2024-03-28,SHRIRAMFIN,add\n2024-03-28,UPL,remove" });
+  });
+
+  it("switches the nightly re-validation on and clears a flag with a note", async () => {
+    mount();
+    await screen.findByDisplayValue(/EMA 9\/21/);
+    fireEvent.click(screen.getByRole("button", { name: "Research" }));
+    const panel = await screen.findByTestId("nightly-panel");
+    expect((await within(panel).findByTestId("nightly-flags")).textContent).toContain("ORB");
+    expect(panel.textContent).toContain("4 strategies, 1 flagged");
+    fireEvent.click(within(panel).getByTestId("nightly-toggle"));
+    await waitFor(() => expect(calls.some((c) => c.url.endsWith("/api/algo/research/nightly") && c.body?.enabled === true)).toBe(true));
+    fireEvent.change(within(panel).getByPlaceholderText("what was decided"), { target: { value: "paused it" } });
+    fireEvent.click(within(panel).getByText("clear"));
+    await waitFor(() => expect(calls.find((c) => c.url.includes("/flags/3/clear"))?.body).toEqual({ note: "paused it" }));
   });
 });
