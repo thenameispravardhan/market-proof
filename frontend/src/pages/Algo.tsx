@@ -29,6 +29,7 @@ import {
   type UTCTimestamp,
 } from "lightweight-charts";
 import { api } from "../api/client";
+import { BookPanel } from "../components/algo/BookPanel";
 import { DriftPanel } from "../components/algo/DriftPanel";
 import { TcaPanel } from "../components/algo/TcaPanel";
 import { useSessionState } from "../router";
@@ -2230,6 +2231,7 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
           </div>
         )}
       </div>
+      <BookPanel />
       <div className="widget widget-wide" style={{ marginBottom: 12 }}>
         <h3>Open positions {sel.length ? <span className="meta">— {selNames}</span> : null} <span className="meta">· live MTM {inr(liveTotal)}</span></h3>
         {!openShown.length ? <div className="empty">flat</div> : (

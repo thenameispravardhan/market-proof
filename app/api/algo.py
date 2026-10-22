@@ -911,6 +911,67 @@ async def status(request: Request, db: Session = Depends(get_db)) -> dict[str, A
             "open": open_rows}
 
 
+@router.get("/book")
+async def book_view(request: Request, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Every automation's open positions as ONE book: per underlying the
+    positions, net delta (lots; shares for cash), margin and MTM, plus the
+    book's day P&L against ALGO_BOOK_MAX_DAY_LOSS and its margin against
+    ALGO_BOOK_MAX_MARGIN. A delta that can't be priced is null, not guessed."""
+    from app.algo import fno
+    from app.algo.runner import _book_all, _ltp, _mtm, _row
+    from app.config import get_settings
+
+    rows = [_row(t) for t in db.execute(select(AlgoTrade).where(AlgoTrade.status == "open")).scalars()]
+    prices = await _ltp(list({lg["symbol"] for t in rows for lg in t["legs"]} | {t["symbol"] for t in rows})) if rows else {}
+    now = time.time()
+    by: dict[str, dict[str, Any]] = {}
+    for t in rows:
+        u = by.setdefault(t["symbol"], {"symbol": t["symbol"], "positions": 0, "margin": 0.0, "mtm": 0.0, "delta": 0.0})
+        u["positions"] += 1
+        u["margin"] += t.get("margin") or 0.0
+        m = _mtm(t["legs"], prices)
+        u["mtm"] = None if m is None or u["mtm"] is None else u["mtm"] + m
+        spot = prices.get(t["symbol"].upper())
+        lot = (fno.known_lot(fno.fno_name(t["symbol"])) or 1) if any(lg["kind"] != "EQ" for lg in t["legs"]) else 1
+        d = engine.position_metrics(t["legs"], spot, now, lot, lambda lg: prices.get(lg["symbol"].upper()))["delta"] \
+            if spot else None
+        first = t["legs"][0]
+        sets = first["qty"] / (first.get("per_set") or first["qty"]) if first.get("qty") else 1
+        u["delta"] = None if d is None or u["delta"] is None else u["delta"] + d * sets
+    out = [{**u, "margin": round(u["margin"], 2), "mtm": None if u["mtm"] is None else round(u["mtm"], 2),
+            "delta": None if u["delta"] is None else round(u["delta"], 3)} for u in sorted(by.values(), key=lambda x: x["symbol"])]
+    day_start = now - (now + engine.IST) % DAY
+    agg = await asyncio.to_thread(_book_all, day_start)
+    open_mtm = None if any(u["mtm"] is None for u in out) else sum(u["mtm"] for u in out)
+    st = get_settings()
+    return {"underlyings": out, "positions": len(rows), "margin": round(agg["margin"], 2),
+            "realized_today": round(agg["today"], 2), "open_mtm": None if open_mtm is None else round(open_mtm, 2),
+            "day_pnl": None if open_mtm is None else round(agg["today"] + open_mtm, 2),
+            "limits": {"max_day_loss": st.ALGO_BOOK_MAX_DAY_LOSS or None, "max_margin": st.ALGO_BOOK_MAX_MARGIN or None},
+            "halted": _runner(request)._book_halt == int((now + engine.IST) // DAY)}
+
+
+@router.post("/book/kill")
+async def book_kill(request: Request) -> dict[str, Any]:
+    """Operator kill switch for the Algo Lab only: flatten every automation's
+    open position and stop all automation entries until tomorrow (the news
+    bot and the Trade page are untouched)."""
+    from app.algo.runner import _ltp, _row
+    from app.db import session as dbs
+
+    def rows() -> list[dict[str, Any]]:
+        with dbs.SessionLocal() as s:
+            return [_row(t) for t in s.execute(select(AlgoTrade).where(AlgoTrade.status == "open")).scalars()]
+    open_rows = await asyncio.to_thread(rows)
+    prices = await _ltp([lg["symbol"] for t in open_rows for lg in t["legs"]]) if open_rows else {}
+    now = time.time()
+    r = _runner(request)
+    await r.halt_book(int((now + engine.IST) // DAY), "operator kill switch", open_rows, prices, now, "BOOK_KILL")
+    left = await asyncio.to_thread(rows)
+    log.warning("algo.book_kill", flattened=len(open_rows) - len(left), still_open=len(left))
+    return {"flattened": len(open_rows) - len(left), "still_open": len(left)}
+
+
 @router.post("/sync")
 async def sync_now(request: Request) -> dict[str, Any]:
     from app.algo.runner import _snapshot
