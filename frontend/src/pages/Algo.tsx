@@ -136,7 +136,10 @@ type Spec = {
   rank?: { by: Operand; order: "desc" | "asc"; top: number };
   // Live only: the runner switches the automation off when one is breached.
   guard?: { max_drawdown?: number; max_rejects?: number; max_slippage_pct?: number; on_breach: "pause" | "flatten" };
+  // A second leg on another symbol, opened and closed with each position (backtest only for now).
+  pair_leg?: PairLeg;
 };
+type PairLeg = { symbol: string; kind: "FUT" | "EQ"; ratio: { type: "beta"; n: number } | { type: "fixed"; value: number }; expiry?: "current" | "next" };
 type IndicatorDef = { name: string; params: Record<string, number | string>; outputs: string[]; group: string; about?: string };
 type Catalog = {
   indicators: IndicatorDef[];
@@ -2100,6 +2103,35 @@ function Optimizer({ spec, name, cat, range, onApply, trialBody, onTrials }: { s
   );
 }
 
+/** The second leg of a two-symbol position: hedge each trade with another symbol. */
+function PairLegEditor({ v, onChange }: { v: PairLeg | undefined; onChange: (v: PairLeg | undefined) => void }) {
+  const r = v?.ratio;
+  return (
+    <div className="algo-operand" style={{ gap: 10, marginTop: 8 }} data-testid="pair-leg">
+      <label className="meta" title="each position also takes the opposite side in another symbol — long this, short that — sized by a hedge ratio, and both legs close together. Backtest only for now: a strategy with a pair leg can't be switched on yet">
+        <input type="checkbox" checked={!!v} onChange={(e) => onChange(e.target.checked ? { symbol: "NSE:NIFTY50-INDEX", kind: "FUT", ratio: { type: "beta", n: 100 } } : undefined)} /> hedge each trade with
+      </label>
+      {v && (
+        <>
+          <input value={v.symbol} list="algo-ref-symbols" style={{ width: 170 }} data-testid="pair-leg-symbol" onChange={(e) => onChange({ ...v, symbol: e.target.value.toUpperCase() })} />
+          <label className="meta">as <select value={v.kind} onChange={(e) => onChange({ ...v, kind: e.target.value as PairLeg["kind"] })}>
+            <option value="FUT">its future (whole lots)</option><option value="EQ">shares</option>
+          </select></label>
+          <label className="meta" title="₹ of the hedge per ₹1 of the position: β = the rolling hedge ratio of log prices at the signal candle, or a fixed number">size
+            <select value={r!.type} onChange={(e) => onChange({ ...v, ratio: e.target.value === "beta" ? { type: "beta", n: 100 } : { type: "fixed", value: 1 } })}>
+              <option value="beta">β over</option><option value="fixed">fixed ×</option>
+            </select>
+            {r!.type === "beta"
+              ? <><NumInput width={44} value={r!.n} onChange={(n) => onChange({ ...v, ratio: { type: "beta", n: Math.max(10, Math.min(500, Math.floor(n ?? 100))) } })} /> bars</>
+              : <NumInput width={44} value={r!.value} onChange={(n) => onChange({ ...v, ratio: { type: "fixed", value: n ?? 1 } })} />}
+          </label>
+          <span className="meta">exits on the spread only: exit conditions, max bars or the MTM ₹ stop / target (on each close) — price stops are off · backtest only</span>
+        </>
+      )}
+    </div>
+  );
+}
+
 /** Live MTM of one open algo trade from the tick store: Σ act × (ltp − entry) × qty
  *  over legs (closed legs at their exit). Falls back to the server's figure. */
 function liveMtm(t: LiveTrade): number | null {
@@ -3164,6 +3196,16 @@ export default function Algo() {
                 )}
               </div>
             )}
+            {!opt && <PairLegEditor v={spec.pair_leg} onChange={(pair_leg) => {
+              const next = { ...spec };
+              if (pair_leg) {
+                next.pair_leg = pair_leg;
+                // a pair exits on its spread: price levels on one leg would ignore the other
+                Object.assign(next, { stop_loss: null, target: null, trailing: null, breakeven: null, scale_out: undefined,
+                  entry_order: { ...spec.entry_order, type: "market" } });
+              } else delete next.pair_leg;
+              setSpec(next);
+            }} />}
           </div>
           {fno && spec.symbols.length > 0 && <PayoffPanel spec={spec} onSpan={() => upd({ margin: { model: "span", scan_pct: null, exposure_pct: null } })} />}
 

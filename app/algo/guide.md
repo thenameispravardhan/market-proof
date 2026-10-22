@@ -441,6 +441,28 @@ exchange's freeze quantity (index options) goes out in whole-lot slices.
 
 ---
 
+### 6.8 Pair leg — a position on two symbols (backtest only)
+
+`"pair_leg": {"symbol": "NSE:NIFTYBANK-INDEX", "kind": "FUT", "ratio": {"type": "beta", "n": 100}}`
+adds a second leg on another symbol to every position, opened at the same
+candle's open and closed with it: a long signal buys the strategy symbol and
+sells the pair symbol, a short does the reverse.
+
+| key | meaning |
+|---|---|
+| `symbol` | the other symbol (not one the strategy trades) |
+| `kind` | `FUT` its near-month future (`expiry` `current` / `next`), rounded to whole lots — under one lot the trade is skipped; `EQ` shares |
+| `ratio` | ₹ of the pair leg per ₹1 of the position: `{"type": "beta", "n": 100}` the rolling hedge ratio of log prices over `n` candles at the signal candle, or `{"type": "fixed", "value": 1.0}` |
+
+The position exits on its spread, never on one leg's price: no stop loss,
+target, trailing, breakeven or scale-out (the validator rejects them); use
+exit conditions, `max_bars`, and the MTM ₹ stop / target / trail, which are
+checked on each candle's close (two symbols' candles can't say which leg's
+high or low came first) and filled at the next open. Entries are at market.
+Each trade lists both legs (each with its `symbol`) and `hedge`: the ratio
+asked for and the one whole lots made of it. A strategy with a pair leg
+can't be switched on yet — the live half comes later.
+
 ## 7. Sizing, portfolio and costs
 
 * `sizing.mode` and `sizing.value`:
@@ -910,6 +932,36 @@ or at a 3% stop. Square-off is off: a spread can take days to close.
     "max_bars": 40,
     "session": {"start": "09:15", "end": "15:15", "square_off": null},
     "sizing": {"mode": "pct_equity", "value": 20}
+  }
+}
+```
+
+### 9.14 Pairs, hedged — the same signal, short Bank NIFTY futures against each long
+
+9.13 with a pair leg: every long in HDFC Bank also sells β × its value of
+Bank NIFTY futures (and every short buys them), so a market-wide move
+washes out of the position and what's left is the spread. Out on the spread
+closing, after 40 candles, or at a ₹15,000 loss on the whole position.
+
+```json
+{
+  "name": "Pair HDFCBANK vs NIFTYBANK, hedged",
+  "spec": {
+    "symbols": ["NSE:HDFCBANK-EQ"],
+    "timeframe": 60,
+    "direction": "both",
+    "entry_long": {"logic": "AND", "conditions": [{"left": {"math": "pair_z", "a": {"ind": "PRICE"}, "b": {"ind": "PRICE", "symbol": "NSE:NIFTYBANK-INDEX"}, "n": 40}, "op": "crosses_below", "right": {"value": -2.0}}]},
+    "exit_long": {"logic": "AND", "conditions": [{"left": {"math": "pair_z", "a": {"ind": "PRICE"}, "b": {"ind": "PRICE", "symbol": "NSE:NIFTYBANK-INDEX"}, "n": 40}, "op": ">", "right": {"value": -0.5}}]},
+    "entry_short": {"logic": "AND", "conditions": [{"left": {"math": "pair_z", "a": {"ind": "PRICE"}, "b": {"ind": "PRICE", "symbol": "NSE:NIFTYBANK-INDEX"}, "n": 40}, "op": "crosses_above", "right": {"value": 2.0}}]},
+    "exit_short": {"logic": "AND", "conditions": [{"left": {"math": "pair_z", "a": {"ind": "PRICE"}, "b": {"ind": "PRICE", "symbol": "NSE:NIFTYBANK-INDEX"}, "n": 40}, "op": "<", "right": {"value": 0.5}}]},
+    "pair_leg": {"symbol": "NSE:NIFTYBANK-INDEX", "kind": "FUT", "ratio": {"type": "beta", "n": 100}},
+    "stop_loss": null,
+    "target": null,
+    "mtm": {"stop": 15000},
+    "max_bars": 40,
+    "session": {"start": "09:15", "end": "15:15", "square_off": null},
+    "sizing": {"mode": "pct_equity", "value": 40},
+    "portfolio": {"capital": 1000000, "leverage": 5}
   }
 }
 ```

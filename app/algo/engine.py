@@ -132,7 +132,15 @@ DEFAULT_SPEC: dict[str, Any] = {
 #       best first (shorts ranked the other way round).
 #   "guard": {"max_drawdown", "max_rejects", "max_slippage_pct", "on_breach"} —
 #       live only: the runner switches the strategy off when one is breached.
-OPTIONAL_KEYS = ("scale_out", "margin", "position_rules", "rank", "guard")
+#   "pair_leg": {"symbol", "kind": "FUT"|"EQ", "ratio": {"type": "beta", "n"} |
+#       {"type": "fixed", "value"}, "expiry": "current"|"next"} — a second leg
+#       on another symbol, opened and closed with the position: a long signal
+#       buys the strategy symbol and sells `ratio` x its value of the pair
+#       symbol (its future, lot-rounded, or shares), a short does the reverse.
+#       "beta" = the rolling hedge ratio of log prices over n bars at the
+#       signal candle. The position exits on its spread (conditions, time
+#       stop, MTM ₹ on each close), never on one leg's price.
+OPTIONAL_KEYS = ("scale_out", "margin", "position_rules", "rank", "guard", "pair_leg")
 GUARD_LIMITS = (("max_drawdown", "guard: max drawdown ₹", False), ("max_rejects", "guard: rejected orders a day", True),
                 ("max_slippage_pct", "guard: median live slippage %", False))
 # Per set (one set = the legs at their configured lots): delta in lots of the
@@ -513,9 +521,53 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("guard on_breach is pause (switch off, keep managing open positions) or flatten")
         if g:
             s["guard"] = {**g, "on_breach": gd.get("on_breach") or "pause"}
+    pl = s.pop("pair_leg", None)
+    if pl:
+        s["pair_leg"] = _check_pair_leg(s, pl)
     if len(ref_frames(s)) > MAX_REF_SYMBOLS:
         raise ValueError(f"conditions can read at most {MAX_REF_SYMBOLS} other symbols")
     return s
+
+
+def _check_pair_leg(s: dict[str, Any], pl: Any) -> dict[str, Any]:
+    if not isinstance(pl, dict) or not str(pl.get("symbol") or "").strip():
+        raise ValueError('pair_leg is {"symbol": ..., "kind": "FUT" | "EQ", "ratio": {"type": "beta", "n": 100}}')
+    sym = str(pl["symbol"]).strip().upper()
+    if sym in s["symbols"]:
+        raise ValueError("the pair leg's symbol must be another symbol than the ones the strategy trades")
+    if s["instrument"]["type"] == "option":
+        raise ValueError("a pair leg goes with a shares or futures position, not options")
+    if s["bars"]["type"] != "time":
+        raise ValueError("a pair leg needs time candles — both legs fill at the same candle's open")
+    kind = str(pl.get("kind") or "FUT").upper()
+    if kind not in ("FUT", "EQ"):
+        raise ValueError("pair leg kind is FUT (its future) or EQ (shares)")
+    expiry = pl.get("expiry") or "current"
+    if expiry not in ("current", "next"):
+        raise ValueError("pair leg expiry is current or next")
+    r = pl.get("ratio") or {"type": "beta"}
+    if not isinstance(r, dict) or r.get("type") not in ("beta", "fixed"):
+        raise ValueError('pair leg ratio is {"type": "beta", "n": bars} or {"type": "fixed", "value": x}')
+    if r["type"] == "beta":
+        n = _num(r.get("n") or 100, "pair leg β window (bars)", 10, integer=True)
+        if n > MAX_LOOKBACK:
+            raise ValueError(f"pair leg β window must be at most {MAX_LOOKBACK} bars")
+        ratio: dict[str, Any] = {"type": "beta", "n": n}
+    else:
+        v = _num(r.get("value"), "pair leg ratio", 0.01)
+        if v > 20:
+            raise ValueError("pair leg ratio must be at most 20")
+        ratio = {"type": "fixed", "value": v}
+    for k, label in (("stop_loss", "stop loss"), ("target", "target"), ("trailing", "trailing stop"),
+                     ("breakeven", "breakeven")):
+        if s[k]:
+            raise ValueError(f"a pair position exits on its spread, not one leg's price — switch off the {label} "
+                             "and use exit conditions, a time stop or the MTM ₹ stop / target")
+    if s.get("scale_out"):
+        raise ValueError("a pair position closes both legs together — no scale-out")
+    if s["entry_order"]["type"] != "market":
+        raise ValueError("a pair position enters at market: both legs at the same candle's open")
+    return {"symbol": sym, "kind": kind, "ratio": ratio, "expiry": expiry}
 
 
 def _check_group(g: dict[str, Any], base_tf: int, depth: int = 0) -> None:
@@ -650,6 +702,8 @@ def ref_frames(spec: dict[str, Any]) -> dict[str, set[int]]:
     for o in _walk_operands(spec):
         if o.get("symbol"):
             out.setdefault(o["symbol"], set()).add(int(o.get("tf") or 0) or spec["timeframe"])
+    if spec.get("pair_leg"):                 # the second leg's candles price it, like a symbol a condition reads
+        out.setdefault(spec["pair_leg"]["symbol"], set()).add(spec["timeframe"])
     return out
 
 
@@ -1507,12 +1561,38 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                    "pos": None, "pending": None, "per_day": {}, "cool": 0, "u": None}
 
     tick_of = {sym: tick_for(data[sym]["meta"].get("symbol") or sym, data[sym]["meta"]) for sym in syms}
+    pl = spec.get("pair_leg")
+    pb_name, pb_lot, pb_tick = "", 1, TICK
+    if pl:
+        # The pair leg's open / close on each of this symbol's candles (the same
+        # timeframe: its candle opens and closes with this one) and the hedge
+        # ratio on each close.
+        pb_name = fno.fno_name(pl["symbol"])
+        pb_tick = tick_for(pl["symbol"], {})
+        if pl["kind"] == "FUT":
+            if not fno.is_fno(pb_name):
+                raise ValueError(f"{pl['symbol']} has no futures — trade the pair leg as shares (kind EQ)")
+            pb_lot = int(fno.lot_size(pb_name) or 1)
+        for sym in syms:
+            d = st[sym]["d"]
+            ref = (d.get("xs") or {}).get(pl["symbol"])
+            if ref is None:
+                raise ValueError(f"no candles loaded for the pair leg {pl['symbol']}")
+            cache = caches[sym]
+            bc = _align(d, ref, ref["c"], cache)
+            st[sym]["pb"] = {"o": _align(d, ref, ref["o"], cache), "c": bc,
+                             "beta": _pair("beta", d["c"], bc, pl["ratio"]["n"]) if pl["ratio"]["type"] == "beta" else None}
+
+    def ub_at(sym: str, i: int, key: str) -> Optional[float]:
+        return st[sym]["pb"][key][i] if pl and st[sym]["pos"] and st[sym]["pos"].get("pair") else None
     # With "rank", entries outside each candle's best N are switched off and the
     # kept fills go first at the next open, best first (prio 0 = everything else).
     prio = _rank_entries(spec, syms, st, caches) if spec.get("rank") else {}
     events = sorted(((t, prio.get((k, i), 0), k, i) for k, sym in enumerate(syms) for i, t in enumerate(data[sym]["t"])))
     trades: list[dict[str, Any]] = []
     skipped = {"no_capital": 0, "max_positions": 0, "daily_halt": 0, "entry_expired": 0, "entry_rules": 0}
+    if spec.get("pair_leg"):
+        skipped.update(pair_no_ratio=0, pair_too_small=0)
     exit_rules = (spec.get("position_rules") or {}).get("exit")
     adjusting = adjusts(spec)
     on_leg_stop = inst.get("on_leg_stop", "leg")
@@ -1525,16 +1605,23 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
     def equity_now() -> float:
         return pf["capital"] + (realized if pf["compounding"] else 0.0)
 
-    def mtm(pos: dict, u: float, t: float, iv: float) -> float:
-        return sum(l["act"] * (_leg_px(l, u, t, iv) - l["entry"]) * l["qty"] for l in pos["legs"])
+    def lpx(l: dict, u: float, t: float, iv: float, ub: Optional[float]) -> float:
+        """A leg's price: the pair leg at the pair symbol's price `ub`, the rest off `u`."""
+        if l.get("other"):
+            return l["exit"] if l.get("exit") is not None else ub
+        return _leg_px(l, u, t, iv)
+
+    def mtm(pos: dict, u: float, t: float, iv: float, ub: Optional[float] = None) -> float:
+        return sum(l["act"] * (lpx(l, u, t, iv, ub) - l["entry"]) * l["qty"] for l in pos["legs"])
 
     def ref_at(pos: dict, u: float, t: float, iv: float) -> float:
         return u if pos["ref"] == "u" else _leg_px(pos["legs"][0], u, t, iv)
 
     def close(sym: str, u: float, t: float, reason: str, i: int, slipped: bool = True,
-              sets: Optional[int] = None) -> None:
+              sets: Optional[int] = None, ub: Optional[float] = None) -> None:
         """Close the position — or, with `sets` below its size, that many sets
-        of it (a scale-out: booked as its own trade, the rest stays open)."""
+        of it (a scale-out: booked as its own trade, the rest stays open).
+        `ub`: the pair leg's price at the same moment."""
         nonlocal realized, used_margin, open_n, day_realized
         s_ = st[sym]
         pos, d = s_["pos"], s_["d"]
@@ -1545,14 +1632,16 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         legs_out = []
         for l in pos["legs"]:
             q = l["qty"] * n // pos["sets"]          # qty = per_set x sets, so this is exact
-            px = _leg_px(l, u, t, iv)
+            px = lpx(l, u, t, iv, ub)
+            tk = pb_tick if l.get("other") else tick_of[sym]
             if slipped and l.get("exit") is None:      # closing a long sells (down), a short buys (up)
-                px = snap(px * (1 - slip), tick_of[sym], -1) if l["act"] > 0 else snap(px * (1 + slip), tick_of[sym], 1)
+                px = snap(px * (1 - slip), tk, -1) if l["act"] > 0 else snap(px * (1 + slip), tk, 1)
             else:
-                px = snap(px, tick_of[sym])
+                px = snap(px, tk)
             g, ch = leg_pnl(l["act"], q, l["entry"], px, l["kind"], with_ch, l["qty0"])
             gross, chg = gross + g, chg + ch
-            legs_out.append({"label": l["label"], "side": "BUY" if l["act"] > 0 else "SELL", "qty": q,
+            legs_out.append({**({"symbol": l.get("symbol", sym)} if pos.get("pair") else {}),
+                             "label": l["label"], "side": "BUY" if l["act"] > 0 else "SELL", "qty": q,
                              "entry": round(l["entry"], 2), "exit": round(px, 2),
                              **({"reason": l["exit_reason"]} if l.get("exit_reason") else {}),
                              **({"via": l["via"]} if l.get("via") else {})})
@@ -1578,6 +1667,14 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
             if pos["ref_entry"] else None,
             "mfe_pct": round(pos["sign"] * (pos["best"] - pos["ref_entry"]) / pos["ref_entry"] * 100, 3)
             if pos["ref_entry"] else None,
+            # a pair: the position's worst / best close MTM in % of both legs' value at entry
+            **({"mae_pct": round(pos["mtm_lo"] / pos["notional"] * 100, 3),
+                "mfe_pct": round(pos["mtm_hi"] / pos["notional"] * 100, 3),
+                # the hedge asked for (β or fixed) and what whole lots of the pair leg made of it
+                "hedge": {"ratio": pos["legs"][-1]["ratio"],
+                          "actual": round(sum(l["qty"] * l["entry"] for l in pos["legs"] if l.get("other"))
+                                          / sum(l["qty"] * l["entry"] for l in pos["legs"] if not l.get("other")), 3)}}
+               if pos.get("pair") else {}),
             "r": round(net / risk, 2) if risk else None,
             "minutes": round((t - pos["t"]) / 60),
             **({"greeks": pos["greeks0"]} if pos.get("greeks0") else {}),
@@ -1632,6 +1729,24 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         per_set_margin = position_margin(legs, u, pf["leverage"], model=spec.get("margin"), t=t,
                                          iv=iv if inst["type"] == "option" else None, name=meta["name"])
         per_set_risk = lv["sl_dist"] * legs[0]["per_set"] if lv["sl_dist"] else None
+        b_leg = None
+        if pl:
+            pb = s_["pb"]
+            ub = pb["o"][i]
+            r = pb["beta"][sig_i] if pb["beta"] is not None else pl["ratio"]["value"]   # known at the signal's close
+            if ub is None or r is None or r <= 0:
+                return "pair_no_ratio"
+            b_leg = {"kind": pl["kind"], "act": -sign, "symbol": pl["symbol"], "other": True, "per_set": 0,
+                     "label": pl["symbol"], "ratio": round(r, 4)}
+            if pl["kind"] == "FUT":
+                exp = fno.expiry_after(pb_name, fno.exchange_of(pl["symbol"]), "monthly", pl["expiry"], t, tdays)
+                b_leg.update(exp=exp, label=f"{pb_name} FUT {fno.label_date(exp)}")
+            b_leg["entry"] = snap(ub * (1 + slip), pb_tick, 1) if b_leg["act"] > 0 else snap(ub * (1 - slip), pb_tick, -1)
+            b_per_set = r * sum(l["per_set"] * l["entry"] for l in legs) / b_leg["entry"]   # units of B per set
+            b_margin = lambda q: position_margin([{**b_leg, "per_set": q}], b_leg["entry"], pf["leverage"],  # noqa: E731
+                                                 model=spec.get("margin"), t=t, name=pb_name)
+            a_per_set_margin = per_set_margin
+            per_set_margin += b_margin(1) * b_per_set
         eq = equity_now()
         # Losses always come out of the account, compounding or not: once the
         # cash is gone there is nothing left to trade with (compounding only
@@ -1647,6 +1762,15 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         for l in legs:
             l["qty"] = l["qty0"] = l["per_set"] * sets
         margin = per_set_margin * sets
+        if b_leg:
+            q = int(round(b_per_set * sets / pb_lot)) * pb_lot
+            if q < pb_lot:
+                return "pair_too_small"
+            b_leg["qty"] = b_leg["qty0"] = q
+            margin = a_per_set_margin * sets + b_margin(q)
+            if margin > cash - used_margin:
+                return "no_capital"
+            legs.append(b_leg)
         s_["pos"] = {"side": side, "legs": legs, "ref": ref, "sign": rsign, "ref_entry": ref_entry,
                      "sl": lv["sl"], "tg": lv["tg"], "trd": lv["trd"], "tra": lv["tra"], "be": lv["be"],
                      "be_on": False, "trail": None, "best": ref_entry, "worst": ref_entry, "peak": None,
@@ -1656,7 +1780,9 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                      "t": t, "i": i, "day": (t + IST) // 86400, "u0": u, "sets": sets, "margin": margin,
                      "exit_pending": None, "mid_bar": u_fill is not None,
                      "so": scale_plan(lv["so"], sets), "so_k": 0, "greeks0": greeks0,
-                     "leg_rules": any(l.get("sl") is not None or l.get("tg") is not None for l in legs)}
+                     "leg_rules": any(l.get("sl") is not None or l.get("tg") is not None for l in legs),
+                     **({"pair": True, "mtm_lo": 0.0, "mtm_hi": 0.0,
+                         "notional": sum(l["qty"] * l["entry"] for l in legs)} if b_leg else {})}
         used_margin += margin
         open_n += 1
         open_syms.add(sym)
@@ -1765,6 +1891,8 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
 
     def check_intrabar(sym: str, i: int) -> None:
         s_ = st[sym]
+        if s_["pos"].get("pair"):    # two symbols' candles: no telling which leg's high / low came first
+            return
         if s_["pos"]["leg_rules"] and leg_events(sym, i):
             return
         pos, d = s_["pos"], s_["d"]
@@ -1839,9 +1967,9 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         if day != day_key:
             day_key, day_realized = day, 0.0
         if s_["pos"] and day != s_["pos"]["day"] and sq < CARRY:
-            close(sym, d["c"][i - 1], ind.close_time(d, i - 1), "EOD", i - 1)
+            close(sym, d["c"][i - 1], ind.close_time(d, i - 1), "EOD", i - 1, ub=ub_at(sym, i - 1, "c"))
         if s_["pos"] and (s_["pos"]["exit_pending"] or mod >= sq):
-            close(sym, d["o"][i], t, s_["pos"]["exit_pending"] or "SQUARE_OFF", i)
+            close(sym, d["o"][i], t, s_["pos"]["exit_pending"] or "SQUARE_OFF", i, ub=ub_at(sym, i, "o"))
         if s_["pending"]:
             p = s_["pending"]
             fill: Optional[float] = None
@@ -1886,9 +2014,19 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                 pos["trail"] = nt if pos["trail"] is None else (max if sgn > 0 else min)(pos["trail"], nt)
             if pos["be"] and gain >= pos["be"]:
                 pos["be_on"] = True
-            m_c = mtm(pos, d["c"][i], t, iv)
+            m_c = mtm(pos, d["c"][i], t, iv, ub_at(sym, i, "c"))
             pos["peak"] = m_c if pos["peak"] is None else max(pos["peak"], m_c)
-            if s_["sig"]["exit_long" if pos["side"] == "BUY" else "exit_short"][i]:
+            m_hit = None
+            if pos.get("pair"):                  # MTM ₹ rules on the close, filled at the next open
+                pos["mtm_lo"], pos["mtm_hi"] = min(pos["mtm_lo"], m_c), max(pos["mtm_hi"], m_c)
+                m_stop, m_target = mtm_limits(mtm_rules, pos["legs"])
+                trail = (mtm_rules["trail_start"] and pos["peak"] >= mtm_rules["trail_start"]
+                         and m_c <= pos["peak"] - mtm_rules["trail_gap"])
+                m_hit = ("MTM_SL" if m_stop and m_c <= -m_stop else "MTM_TRAIL" if trail else
+                         "MTM_TARGET" if m_target and m_c >= m_target else None)
+            if m_hit:
+                pos["exit_pending"] = m_hit
+            elif s_["sig"]["exit_long" if pos["side"] == "BUY" else "exit_short"][i]:
                 pos["exit_pending"] = "SIGNAL"
             elif spec["max_bars"] and i - pos["i"] + 1 >= spec["max_bars"]:
                 pos["exit_pending"] = "TIME_STOP"
@@ -1908,7 +2046,8 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                 if s2["u"]:
                     j = s2["u"][1]
                     iv2 = s2["d"]["iv"][j] if inst["type"] == "option" else 0.0
-                    day_pnl += mtm(s2["pos"], s2["u"][0], s2["d"]["t"][j], iv2)
+                    ub2 = s2["pb"]["c"][j] if s2["pos"].get("pair") else None
+                    day_pnl += mtm(s2["pos"], s2["u"][0], s2["d"]["t"][j], iv2, ub2)
             hit = ("DAILY_MAX_LOSS" if daily["max_loss"] and day_pnl <= -daily["max_loss"] else
                    "DAILY_TARGET" if daily["max_profit"] and day_pnl >= daily["max_profit"] else None)
             if hit:
@@ -1931,7 +2070,8 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
     for sym in syms:
         if st[sym]["pos"]:
             d = st[sym]["d"]
-            close(sym, d["c"][-1], ind.close_time(d, len(d["t"]) - 1), "END", len(d["t"]) - 1)
+            close(sym, d["c"][-1], ind.close_time(d, len(d["t"]) - 1), "END", len(d["t"]) - 1,
+                  ub=ub_at(sym, len(d["t"]) - 1, "c"))
 
     trades.sort(key=lambda x: x["entry_t"])
     per_symbol = {}

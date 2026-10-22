@@ -76,6 +76,7 @@ function route(url: string, init?: RequestInit) {
   if (url.includes("/api/algo/trades")) return json({ trades: [] });
   if (url.includes("/api/algo/instrument")) return json({ symbol: "NSE:SBIN-EQ", name: "SBIN", fno: false, lot: null, weekly: false, futures: [], coverage: null });
   if (url.includes("/api/algo/research/pairs")) return json(PAIRS);
+  if (url.includes("/api/algo/backtest")) return Promise.resolve(new Response(JSON.stringify({ detail: "stub" }), { status: 422 }));
   if (url.includes("/api/algo/research/check")) return json({ ...CARD, trials: (body.trials ?? 0) + 1, elapsed_s: 0.4 });
   if (url.includes("/api/algo/research/cards/7")) return json(CARD);
   if (url.includes("/api/algo/research/cards")) {
@@ -161,5 +162,23 @@ describe("Algo Lab research loop", () => {
     const ops = screen.getAllByTestId("operand-math-op") as HTMLSelectElement[];
     expect(ops[0].value).toBe("pair_z");
     expect(screen.getAllByDisplayValue("24").length).toBeGreaterThan(0);        // the window, in bars
+  });
+
+  it("hedges each trade with a second symbol: the pair leg goes in, price levels come off", async () => {
+    mount();
+    await screen.findByDisplayValue(/EMA 9\/21/);
+    const box = screen.getByTestId("pair-leg");
+    fireEvent.click(within(box).getByRole("checkbox"));
+    fireEvent.change(within(box).getByTestId("pair-leg-symbol"), { target: { value: "nse:niftybank-index" } });
+    fireEvent.click(screen.getByText("▶ Run backtest"));
+    await waitFor(() => expect(calls.some((c) => c.url.includes("/api/algo/backtest"))).toBe(true));
+    const body = calls.find((c) => c.url.includes("/api/algo/backtest"))!.body;
+    expect(body.spec.pair_leg).toEqual({ symbol: "NSE:NIFTYBANK-INDEX", kind: "FUT", ratio: { type: "beta", n: 100 } });
+    expect([body.spec.stop_loss, body.spec.target, body.spec.trailing]).toEqual([null, null, null]);
+    expect(body.spec.entry_order.type).toBe("market");
+    fireEvent.click(within(box).getByRole("checkbox"));                 // off again: absent, as before
+    fireEvent.click(screen.getByText("▶ Run backtest"));
+    await waitFor(() => expect(calls.filter((c) => c.url.includes("/api/algo/backtest")).length).toBe(2));
+    expect("pair_leg" in calls.filter((c) => c.url.includes("/api/algo/backtest"))[1].body.spec).toBe(false);
   });
 });
