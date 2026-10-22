@@ -11,6 +11,9 @@
     GET    /api/algo/research/cards        ?strategy_id=&verdict=   (GET /{id}, /{id}/markdown, PATCH /{id})
     POST   /api/algo/research/pairs        {symbols, anchor?, timeframe?, days?}: pair finder (cointegration,
                                            held-out check, half-life, z now)
+    GET    /api/algo/research/surface      ?name=NIFTY&at=   the recorded chain's IV surface
+    POST   /api/algo/research/surface/evaluate  {name, start, end, lag?}: surface vs flat IV on recorded quotes
+    POST   /api/algo/research/tick-replay  {spec, start, end}: the backtest's stop / target exits vs recorded prints
     GET    /api/algo/data?symbol=          what the candle store holds for a symbol
     POST   /api/algo/data/download         {symbols, days} — fill the store from Fyers
     GET    /api/algo/strategies            saved strategies + live P&L
@@ -464,6 +467,91 @@ async def research_pairs(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         r["spec"] = pf.spec_for(r["a"], r["b"], r["window"], tf)
     return {**res, "anchor": anchor, "timeframe": tf, "days": days, "notes": notes,
             "elapsed_s": round(time.monotonic() - t0, 2)}
+
+
+@router.get("/research/surface")
+def research_surface(name: str, at: Optional[int] = None) -> dict[str, Any]:
+    """The IV surface of `name`'s recorded chain at `at` (default now): the
+    smile per expiry and the quotes it was fitted on."""
+    from app.algo import ticks
+    from app.research import surface as sf
+
+    at = int(at or time.time())
+    t, rows = ticks.store().chain_at(name.upper(), at)
+    if t is None:
+        raise HTTPException(404, detail=f"no recorded chain for {name.upper()} that day — switch chains on in Data → Research recording")
+    surf = sf.fit(rows, t)
+    if surf is None:
+        raise HTTPException(422, detail="the snapshot has no usable two-sided option quotes")
+    pts = sf.points(rows, t, surf.spot)
+    return {**surf.to_dict(), "name": name.upper(),
+            "points": [{"kind": p["kind"], "strike": p["strike"], "exp": p["exp"], "k": round(p["k"], 4),
+                        "iv": round(p["iv"], 4), "fit": round(surf.iv(p["strike"], surf.spot, t, p["exp"]), 4),
+                        "mid": round(p["mid"], 2)} for p in pts]}
+
+
+@router.post("/research/surface/evaluate")
+async def research_surface_evaluate(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """{name: "NIFTY", start, end, lag?: 1} — does the recorded surface price
+    the next snapshots closer than flat IV? (B4's bar before live Greeks.)"""
+    from app.algo import fno
+    from app.research import surface as sf
+
+    name = str(body.get("name") or "").strip().upper()
+    if not name:
+        raise HTTPException(422, detail="name is the chain's underlying, e.g. NIFTY")
+    start, end = _range(body)
+    try:
+        lag = int(body["lag"]) if body.get("lag") is not None else 1
+    except (TypeError, ValueError):
+        raise HTTPException(422, detail="lag is a whole number of snapshots") from None
+    if not 1 <= lag <= 60:
+        raise HTTPException(422, detail="lag is 1-60 snapshots")
+    flat = None
+    if name in fno.INDEX_LOTS:                          # what index backtests price with today: India VIX
+        vix = await asyncio.to_thread(data.load, data.store_key(data.VIX), 1, start, end)
+        if vix and vix["t"]:
+            import bisect
+
+            vt, vc = vix["t"], vix["c"]
+
+            def flat(t: int) -> Optional[float]:
+                j = bisect.bisect_right(vt, t - 60) - 1      # the last minute CLOSED by t
+                return vc[j] / 100 if j >= 0 and t - vt[j] < 86400 else None
+    async with _heavy:
+        t0 = time.monotonic()
+        res = await asyncio.to_thread(sf.evaluate, data.chain_snapshots(name, start, end), lag=lag, flat=flat)
+    return {**res, "name": name, "flat_source": "India VIX" if flat else None, "elapsed_s": round(time.monotonic() - t0, 2)}
+
+
+@router.post("/research/tick-replay")
+async def research_tick_replay(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """{spec, start, end} — backtest, then replay each fixed stop / target exit
+    on the recorded trade prints: which level did price touch first?"""
+    from app.algo import ticks
+    from app.research import tick_replay as tr
+
+    spec = _spec(body.get("spec"))
+    start, end = _range(body)
+    _guard(spec, start, end)
+    st = ticks.store()
+
+    def ticks_for(symbol: str, a: int, b: int) -> list[tuple[int, float]]:
+        out: list[tuple[int, float]] = []
+        for day, key in st.keys_for(symbol, a, b).items():
+            d0 = day * DAY - engine.IST
+            out += [(int(r[0]), float(r[1])) for r in st.prints(key, max(a, d0), min(b, d0 + DAY))]
+        return out
+
+    async with _heavy:
+        t0 = time.monotonic()
+        bars, notes, trade_from = await _assemble(spec, start, end)
+        try:
+            res = await asyncio.to_thread(engine.run, spec, bars, {}, trade_from)
+        except (ValueError, KeyError, ZeroDivisionError) as e:
+            raise HTTPException(422, detail=f"backtest: {e}")
+        out = await asyncio.to_thread(tr.replay, res["trades"], spec, ticks_for)
+    return {**out, "notes": notes, "elapsed_s": round(time.monotonic() - t0, 2)}
 
 
 @router.get("/instrument")

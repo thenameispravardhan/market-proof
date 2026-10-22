@@ -7,6 +7,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../../api/client";
 import { PairFinder } from "./PairFinder";
+import { SurfaceCheck, TickReplay } from "./SurfacePanels";
 
 export type Check = { key: string; label: string; value: number | null; pass: boolean | null; note: string | null };
 type Sum = { trades: number; win_rate: number; net_pnl: number; profit_factor: number | null; sharpe: number | null; max_drawdown?: number; max_drawdown_pct?: number };
@@ -130,7 +131,8 @@ export function StrategyCard({ card }: { card: ResearchCard }) {
 }
 
 /** The pair finder, then every card, newest first; click one to open it. */
-export function ResearchTab({ timeframes, onUse }: { timeframes: number[]; onUse: (spec: Record<string, unknown>, name: string, tries: number) => void }) {
+export function ResearchTab({ timeframes, onUse, spec, range }: { timeframes: number[]; onUse: (spec: Record<string, unknown>, name: string, tries: number) => void;
+  spec: unknown; range: { start: string; end: string } }) {
   const [verdict, setVerdict] = useState<"" | "pass" | "kill">("");
   const [open, setOpen] = useState<number | null>(null);
   const list = useQuery({
@@ -146,6 +148,8 @@ export function ResearchTab({ timeframes, onUse }: { timeframes: number[]; onUse
   return (
     <>
     <PairFinder timeframes={timeframes} onUse={onUse} />
+    <SurfaceCheck range={range} />
+    <TickReplay spec={spec} range={range} />
     <div className="widget widget-wide" data-testid="research-tab">
       <h3>Strategy cards <span className="meta">one per research check — run one from Optimise → “research check”</span></h3>
       <div className="meta" style={{ marginBottom: 8 }}>
