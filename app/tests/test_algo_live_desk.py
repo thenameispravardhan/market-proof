@@ -289,3 +289,44 @@ def test_limit_chase_spec_is_validated_and_off_by_default():
     assert s["entry_order"]["limit"] == {"wait_s": 8.0, "steps": 3}
     with pytest.raises(ValueError, match="at most 30 s"):
         _cross_spec(entry_order={"type": "market", "limit": {"wait_s": 60}})
+
+
+# ---- A4: shadow tests ---------------------------------------------------------------
+
+def test_shadow_a_version_compare_it_and_promote_it(client, isolated_db):
+    from app.algo import runner as rn
+    from app.db import session as dbs
+    from app.db.models import AlgoStrategy, AlgoTrade
+
+    v1 = _cross_spec()
+    s = client.post("/api/algo/strategies", json={"name": "orb", "spec": v1}).json()
+    v2 = _cross_spec(max_trades_per_day=1)
+    client.put(f"/api/algo/strategies/{s['id']}", json={"spec": v2})
+    client.post(f"/api/algo/strategies/{s['id']}/versions/1/activate")          # v1 runs, v2 is the candidate
+    r = client.post(f"/api/algo/strategies/{s['id']}/versions/2/shadow")
+    assert r.status_code == 201
+    sh = r.json()
+    assert (sh["name"], sh["mode"], sh["enabled"], sh["shadow_of"]) == ("orb · shadow v2", "paper", True, s["id"])
+    assert client.post(f"/api/algo/strategies/{s['id']}/versions/2/shadow").status_code == 409
+    assert client.post(f"/api/algo/strategies/{sh['id']}/versions/1/shadow").status_code == 422
+    assert "only paper-trades" in client.put(f"/api/algo/strategies/{sh['id']}",
+                                             json={"mode": "live", "confirm": "LIVE"}).json()["detail"]
+    later = rn._utc(__import__("time").time() + 60).replace(tzinfo=None)
+    with dbs.SessionLocal() as db:
+        for sid, net in ((sh["id"], 300.0), (sh["id"], -100.0), (s["id"], -250.0)):
+            db.add(AlgoTrade(strategy_id=sid, symbol="NSE:TEST-EQ", side="BUY", quantity=1, mode="paper",
+                             status="closed", entry_at=later, exit_at=later, net_pnl=net))
+        db.commit()
+        assert rn._book_all(0)["today"] == -250.0                                  # the shadow is outside the book
+    cmp_ = client.get(f"/api/algo/strategies/{sh['id']}/shadow").json()
+    assert cmp_["shadow"] == {"trades": 2, "wins": 1, "net": 200.0} and cmp_["parent"]["net"] == -250.0
+    p = client.post(f"/api/algo/strategies/{sh['id']}/promote").json()
+    assert p["version"] == 2                                                     # the matching version, re-activated
+    with dbs.SessionLocal() as db:
+        assert db.get(AlgoStrategy, sh["id"]).enabled is False
+    # a shadow whose rules were tweaked promotes as a NEW version
+    sh2 = client.post(f"/api/algo/strategies/{s['id']}/versions/1/shadow").json()
+    client.put(f"/api/algo/strategies/{sh2['id']}", json={"spec": _cross_spec(max_trades_per_day=2)})
+    p2 = client.post(f"/api/algo/strategies/{sh2['id']}/promote").json()
+    assert p2["version"] == 3 and p2["spec"]["max_trades_per_day"] == 2
+    assert client.post(f"/api/algo/strategies/{s['id']}/promote").status_code == 422

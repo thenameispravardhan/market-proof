@@ -210,7 +210,8 @@ export function overfittingLine(o: Overfitting | undefined): string | null {
   }
   return parts.length ? `Overfitting check: ${parts.join(" · ")}.` : null;
 }
-type Saved = { id: number; name: string; spec: Spec; enabled: boolean; mode: "paper" | "live"; account_id: number | null; closed_trades: number; realized_pnl: number; open_positions: number; version: number; versions: number; trials?: number };
+type Saved = { id: number; name: string; spec: Spec; enabled: boolean; mode: "paper" | "live"; account_id: number | null; closed_trades: number; realized_pnl: number; open_positions: number; version: number; versions: number; trials?: number;
+  shadow_of?: number | null };   // a shadow: a paper copy of a parent's version, promoted when it holds up
 type Version = { version: number; spec: Spec; note: string | null; active: boolean; created_at: string | null; closed_trades: number; realized_pnl: number };
 type LiveLeg = { symbol: string; label?: string; act: number; qty: number; entry: number; exit?: number; ltp?: number | null };
 type LiveTrade = {
@@ -2108,6 +2109,27 @@ function useWatchOpen(open: LiveTrade[]) {
   }, [key]);
 }
 
+type ShadowCmp = { since: string | null; shadow: { trades: number; wins: number; net: number }; parent: { trades: number; wins: number; net: number }; parent_mode: string | null };
+
+/** On a shadow's row: whose shadow it is, how it compares since it started, and Promote. */
+export function ShadowLine({ s, parent, onDone, onErr }: { s: Saved; parent: string; onDone: () => void; onErr: (e: string | null) => void }) {
+  const [cmp, setCmp] = useState<ShadowCmp | null>(null);
+  return (
+    <div className="meta" data-testid={`algo-shadow-${s.id}`}>
+      shadow of <b>{parent}</b>{" "}
+      <button type="button" className="btn-sm ghost" onClick={async () => {
+        try { setCmp(await api.get<ShadowCmp>(`/api/algo/strategies/${s.id}/shadow`)); } catch (e) { onErr(errMsg(e)); }
+      }}>compare</button>
+      <button type="button" className="btn-sm" disabled={!s.enabled} onClick={async () => {
+        if (!window.confirm(`Promote "${s.name}"? Its rules become the active version of "${parent}"${cmp?.parent_mode === "live" ? " — which trades REAL MONEY" : ""}, from the next candle, and the shadow stops.`)) return;
+        try { await api.post(`/api/algo/strategies/${s.id}/promote`, {}); onErr(null); } catch (e) { onErr(errMsg(e)); }
+        onDone();
+      }}>promote</button>
+      {cmp && <div>since {cmp.since ? isoIst(cmp.since) : "start"}: shadow {cmp.shadow.trades} trades <span className={pnlCls(cmp.shadow.net)}>{inr(cmp.shadow.net)}</span> · {parent} {cmp.parent.trades} trades <span className={pnlCls(cmp.parent.net)}>{inr(cmp.parent.net)}</span></div>}
+    </div>
+  );
+}
+
 function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
   const qc = useQueryClient();
   const strategies = useQuery({ queryKey: ["algo", "strategies"], queryFn: () => api.get<{ strategies: Saved[] }>("/api/algo/strategies"), refetchInterval: 10000 });
@@ -2181,7 +2203,8 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
                     put(s.id, { enabled: on });
                   }} /></td>
                   <td style={{ whiteSpace: "normal", minWidth: 140, maxWidth: 220, overflowWrap: "anywhere" }}><a href="#/algo" onClick={(e) => { e.preventDefault(); toggleSel(s.id); }}>{s.name}</a>{" "}
-                    <button type="button" className="btn-sm" onClick={() => setSel([s.id])} title="only this automation's trades and open positions" data-testid={`algo-trades-${s.id}`}>Trades</button></td>
+                    <button type="button" className="btn-sm" onClick={() => setSel([s.id])} title="only this automation's trades and open positions" data-testid={`algo-trades-${s.id}`}>Trades</button>
+                    {s.shadow_of != null && <ShadowLine s={s} parent={nameOf(s.shadow_of)} onDone={refresh} onErr={setErr} />}</td>
                   <td>
                     <select value={s.version} title="the version that runs — switch back and forth any time" onChange={async (e) => {
                       setErr(null);
@@ -2899,6 +2922,17 @@ export default function Algo() {
                 ))}
                 {viewing && viewing !== versions.data.active && (
                   <button type="button" className="btn-sm" disabled={activate.isPending} onClick={() => activate.mutate(viewing)}>make v{viewing} active</button>
+                )}
+                {viewing && viewing !== versions.data.active && !current?.shadow_of && (
+                  <button type="button" className="btn-sm" data-testid="algo-shadow-btn"
+                    title="run this version in PAPER beside the active one (its own automation) and compare them on the live market — promote it when it holds up"
+                    onClick={async () => {
+                      try {
+                        const sh = await api.post<Saved>(`/api/algo/strategies/${editing}/versions/${viewing}/shadow`, {});
+                        setMsg(`Shadow-testing v${viewing} as “${sh.name}” (paper). Compare and promote it in Automations.`);
+                        qc.invalidateQueries({ queryKey: ["algo"] });
+                      } catch (e) { setMsg(errMsg(e)); }
+                    }}>shadow-test v{viewing}</button>
                 )}
                 <span className="meta">✓ = the version Automations runs · saving changes creates the next version and makes it active</span>
               </div>

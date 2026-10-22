@@ -673,6 +673,9 @@ class AlgoStrategy(Base):
     # Backtests + optimiser combinations run on this research line: the
     # Deflated Sharpe deflates by every try, not just the last sweep.
     trials: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # A shadow: a PAPER copy of one of `shadow_of`'s versions, run beside it
+    # to see how it trades before it is promoted. Never live; outside the book.
+    shadow_of: Mapped[Optional[int]] = mapped_column(Integer)
 
 
 class AlgoStrategyVersion(Base):

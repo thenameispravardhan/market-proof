@@ -623,6 +623,7 @@ def _ser(s: AlgoStrategy, db: Session) -> dict[str, Any]:
     return {"id": s.id, "name": s.name, "spec": s.spec, "enabled": s.enabled, "mode": s.mode,
             "account_id": s.account_id, "closed_trades": agg[0], "realized_pnl": round(agg[1], 2),
             "open_positions": open_n, "version": s.version or 1, "versions": versions, "trials": s.trials or 0,
+            "shadow_of": s.shadow_of,
             "created_at": s.created_at.isoformat() if s.created_at else None,
             "updated_at": s.updated_at.isoformat() if s.updated_at else None}
 
@@ -674,12 +675,7 @@ def update_strategy(sid: int, body: dict[str, Any] = Body(...), db: Session = De
     if body.get("spec") is not None:
         new = _spec(body["spec"])
         if new != s.spec:
-            _ensure_v1(db, s)
-            v = (db.execute(select(func.max(AlgoStrategyVersion.version)).where(
-                AlgoStrategyVersion.strategy_id == s.id)).scalar_one() or 0) + 1
-            db.add(AlgoStrategyVersion(strategy_id=s.id, version=v, spec=new, note=body.get("note")))
-            s.spec, s.version = new, v
-            changes["version"] = v
+            changes["version"] = _new_version(db, s, new, body.get("note"))
     if "account_id" in body:
         s.account_id = int(body["account_id"]) if body["account_id"] else None
         changes["account_id"] = s.account_id
@@ -687,6 +683,8 @@ def update_strategy(sid: int, body: dict[str, Any] = Body(...), db: Session = De
         mode = str(body["mode"])
         if mode not in ("paper", "live"):
             raise HTTPException(422, detail="mode is paper or live")
+        if mode == "live" and s.shadow_of:
+            raise HTTPException(422, detail="a shadow only paper-trades — promote it to put its rules on the live strategy")
         if mode == "live" and s.mode != "live" and body.get("confirm") != "LIVE":
             raise HTTPException(422, detail='type LIVE to confirm real-money automation')
         s.mode = changes["mode"] = mode
@@ -708,6 +706,16 @@ def update_strategy(sid: int, body: dict[str, Any] = Body(...), db: Session = De
         db.rollback()
         raise HTTPException(409, detail="another save of this strategy landed at the same moment — reload and retry")
     return _ser(s, db)
+
+
+def _new_version(db: Session, s: AlgoStrategy, spec: dict[str, Any], note: Optional[str]) -> int:
+    """`spec` becomes the strategy's next version and the active one."""
+    _ensure_v1(db, s)
+    v = (db.execute(select(func.max(AlgoStrategyVersion.version)).where(
+        AlgoStrategyVersion.strategy_id == s.id)).scalar_one() or 0) + 1
+    db.add(AlgoStrategyVersion(strategy_id=s.id, version=v, spec=spec, note=note))
+    s.spec, s.version = spec, v
+    return v
 
 
 def _ensure_v1(db: Session, s: AlgoStrategy) -> None:
@@ -757,6 +765,76 @@ def activate_version(sid: int, version: int, db: Session = Depends(get_db)) -> d
     return _ser(s, db)
 
 
+@router.post("/strategies/{sid}/versions/{version}/shadow", status_code=201)
+def shadow_version(sid: int, version: int, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Shadow test: run one of this strategy's versions in PAPER beside it, as
+    its own automation, to see how it trades on the live market before it
+    replaces the active version. Promote it when it holds up."""
+    s = _get(db, sid)
+    if s.shadow_of:
+        raise HTTPException(422, detail="a shadow can't have a shadow")
+    _ensure_v1(db, s)
+    v = db.execute(select(AlgoStrategyVersion).where(
+        AlgoStrategyVersion.strategy_id == sid, AlgoStrategyVersion.version == version)).scalar_one_or_none()
+    if v is None:
+        raise HTTPException(404, detail=f"strategy {sid} has no v{version}")
+    name = f"{s.name} · shadow v{version}"[:128]
+    if db.execute(select(AlgoStrategy).where(AlgoStrategy.name == name)).scalar_one_or_none():
+        raise HTTPException(409, detail=f"v{version} is already being shadow-tested")
+    sh = AlgoStrategy(name=name, spec=v.spec, enabled=True, mode="paper", version=1, shadow_of=sid)
+    db.add(sh)
+    db.flush()
+    db.add(AlgoStrategyVersion(strategy_id=sh.id, version=1, spec=v.spec, note=f"shadow of {s.name} v{version}"))
+    _audit(db, "algo.shadow", s, {"version": version, "shadow": sh.id})
+    db.commit()
+    return _ser(sh, db)
+
+
+@router.post("/strategies/{sid}/promote")
+def promote_shadow(sid: int, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """The shadow's rules become its parent's active version (an existing
+    version when one matches, else a new one) and the shadow stops. The
+    parent's open positions keep the levels they were opened with."""
+    sh = _get(db, sid)
+    if not sh.shadow_of:
+        raise HTTPException(422, detail="only a shadow can be promoted")
+    s = _get(db, sh.shadow_of)
+    _ensure_v1(db, s)
+    same = next((v for v in db.execute(select(AlgoStrategyVersion).where(
+        AlgoStrategyVersion.strategy_id == s.id)).scalars() if v.spec == sh.spec), None)
+    if s.mode == "live":
+        spec = engine.normalize(sh.spec)
+        if engine._hhmm(LIVE_SQUARE_OFF_LATEST) < engine.session_window(spec)[2] < engine.CARRY:
+            raise HTTPException(422, detail=f"its square-off is after {LIVE_SQUARE_OFF_LATEST} — "
+                                            "switch the live strategy to paper first")
+    if same is not None:
+        s.spec, s.version = same.spec, same.version
+    else:
+        _new_version(db, s, sh.spec, f"promoted from shadow {sh.name}"[:200])
+    sh.enabled = False
+    _audit(db, "algo.promote", s, {"from_shadow": sh.id, "version": s.version})
+    db.commit()
+    return _ser(s, db)
+
+
+@router.get("/strategies/{sid}/shadow")
+def shadow_compare(sid: int, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """A shadow beside its parent over the same stretch (since the shadow
+    started): closed trades, winners and net P&L of each."""
+    sh = _get(db, sid)
+    if not sh.shadow_of:
+        raise HTTPException(422, detail="not a shadow")
+
+    def side(strategy_id: int) -> dict[str, Any]:
+        nets = [n or 0.0 for (n,) in db.execute(select(AlgoTrade.net_pnl).where(
+            AlgoTrade.strategy_id == strategy_id, AlgoTrade.status == "closed", AlgoTrade.entry_at >= sh.created_at))]
+        return {"trades": len(nets), "wins": sum(1 for n in nets if n > 0), "net": round(sum(nets), 2)}
+    parent = db.get(AlgoStrategy, sh.shadow_of)
+    return {"since": sh.created_at.isoformat() if sh.created_at else None, "shadow": side(sh.id),
+            "parent": side(sh.shadow_of), "parent_name": parent.name if parent else None,
+            "parent_mode": parent.mode if parent else None}
+
+
 @router.delete("/strategies/{sid}")
 def delete_strategy(sid: int, db: Session = Depends(get_db)) -> dict[str, Any]:
     s = _get(db, sid)
@@ -766,6 +844,7 @@ def delete_strategy(sid: int, db: Session = Depends(get_db)) -> dict[str, Any]:
     _audit(db, "algo.delete", s, {"name": s.name})
     db.query(AlgoTrade).filter(AlgoTrade.strategy_id == sid).delete()
     db.query(AlgoStrategyVersion).filter(AlgoStrategyVersion.strategy_id == sid).delete()
+    db.query(AlgoStrategy).filter(AlgoStrategy.shadow_of == sid).update({"shadow_of": None})   # orphans: plain paper
     db.delete(s)
     db.commit()
     return {"ok": True}
@@ -921,7 +1000,9 @@ async def book_view(request: Request, db: Session = Depends(get_db)) -> dict[str
     from app.algo.runner import _book_all, _ltp, _mtm, _row
     from app.config import get_settings
 
-    rows = [_row(t) for t in db.execute(select(AlgoTrade).where(AlgoTrade.status == "open")).scalars()]
+    shadows = select(AlgoStrategy.id).where(AlgoStrategy.shadow_of.is_not(None))
+    rows = [_row(t) for t in db.execute(select(AlgoTrade).where(
+        AlgoTrade.status == "open", AlgoTrade.strategy_id.not_in(shadows))).scalars()]
     prices = await _ltp(list({lg["symbol"] for t in rows for lg in t["legs"]} | {t["symbol"] for t in rows})) if rows else {}
     now = time.time()
     by: dict[str, dict[str, Any]] = {}
