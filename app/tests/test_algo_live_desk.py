@@ -181,3 +181,111 @@ def test_book_view_and_kill_switch(client, monkeypatch, isolated_db):
     assert client.get("/api/algo/book").json()["halted"] is True
     with dbs.SessionLocal() as db:
         assert {t.exit_reason for t in db.query(AlgoTrade)} == {"BOOK_KILL"}
+
+
+# ---- A3: execution — freeze-quantity slices, limit-then-chase ---------------------
+
+class _Status:
+    def __init__(self, state, qty=0, avg=None):
+        from app.execution.base import OrderState
+
+        self.state, self.filled_quantity, self.average_price = OrderState(state), qty, avg
+
+
+def test_orders_above_the_freeze_quantity_go_out_in_whole_lot_slices(monkeypatch):
+    from app.algo import fno, runner as rn
+
+    monkeypatch.setattr(fno, "freeze_qty", lambda s: 1800)
+    monkeypatch.setattr(fno, "contract_lot", lambda s, now=None: 75)
+    assert rn._slices("NSE:NIFTYX-CE", 1800) == [1800]
+    assert rn._slices("NSE:NIFTYX-CE", 4500) == [1800, 1800, 900]
+    monkeypatch.setattr(fno, "freeze_qty", lambda s: 1000)                     # not a lot multiple: 13 lots
+    assert rn._slices("NSE:NIFTYX-CE", 2250) == [975, 975, 300]
+    monkeypatch.setattr(fno, "freeze_qty", lambda s: None)
+    assert rn._slices("NSE:SBIN-EQ", 50000) == [50000]
+
+
+def test_a_refused_later_slice_unwinds_an_entry_but_not_an_exit(monkeypatch):
+    from app.algo import fno, runner as rn
+
+    monkeypatch.setattr(fno, "freeze_qty", lambda s: 1800)
+    monkeypatch.setattr(fno, "contract_lot", lambda s, now=None: 75)
+    sent, cancelled = [], []
+
+    async def place(acc, symbol, side, qty, *, exit_, strategy_id, product="INTRADAY", order_type="MARKET", limit_price=None):
+        sent.append((side, qty, exit_))
+        if len(sent) == 2 and not exit_:
+            return False, None, "RMS: margin"
+        return True, f"o{len(sent)}", "ok"
+
+    async def cancel(acc, oid):
+        cancelled.append(oid)
+
+    monkeypatch.setattr(rn, "_place", place)
+    monkeypatch.setattr(rn, "_cancel", cancel)
+    ok, oid, msg = asyncio.run(rn._order(object(), "NSE:NIFTYX-CE", "BUY", 3600, exit_=False, strategy_id=1))
+    assert (ok, msg) == (False, "RMS: margin") and cancelled == ["o1"]
+    assert sent == [("BUY", 1800, False), ("BUY", 1800, False), ("SELL", 1800, True)]     # the slice that filled, undone
+    sent.clear()
+    ok, oid, _ = asyncio.run(rn._order(object(), "NSE:NIFTYX-CE", "SELL", 3600, exit_=True, strategy_id=1))
+    assert ok and oid == "o1,o2" and sent == [("SELL", 1800, True), ("SELL", 1800, True)]
+
+
+def test_fill_price_is_the_quantity_weighted_average_of_the_slices(monkeypatch):
+    from app.algo import runner as rn
+
+    book = {"a": _Status("FILLED", 1800, 100.0), "b": _Status("FILLED", 900, 103.0), "c": _Status("PENDING")}
+
+    class B:
+        async def get_order_status(self, oid):
+            return book[oid]
+
+    monkeypatch.setattr(rn, "_backend", lambda acc: B())
+    assert asyncio.run(rn._fill_price(object(), "a,b")) == pytest.approx(101.0)
+    assert asyncio.run(rn._fill_price(object(), "a,c", tries=1)) is None       # not every slice filled yet
+
+
+def test_limit_chase_reprices_then_goes_market_and_stops_once_filled(monkeypatch):
+    from app.algo import fno, runner as rn
+
+    monkeypatch.setattr(fno, "freeze_qty", lambda s: None)
+    placed, mods = [], []
+    state = {"fill_after": 99}
+
+    async def place(acc, symbol, side, qty, *, exit_, strategy_id, product="INTRADAY", order_type="MARKET", limit_price=None):
+        placed.append((order_type, limit_price))
+        return True, "L1", "ok"
+
+    class B:
+        async def get_order_status(self, oid):
+            return _Status("FILLED" if len(mods) >= state["fill_after"] else "PENDING")
+
+        async def modify_order(self, oid, **kw):
+            mods.append(kw)
+            return True, "ok"
+
+    async def ltp(symbols):
+        return {s.upper(): 101.13 for s in symbols}
+
+    monkeypatch.setattr(rn, "_place", place)
+    monkeypatch.setattr(rn, "_backend", lambda acc: B())
+    monkeypatch.setattr(rn, "_ltp", ltp)
+    ok, oid, msg = asyncio.run(rn._order_chase(object(), "NSE:SBIN-EQ", "BUY", 10, strategy_id=1, product="INTRADAY",
+                                               quote=100.02, wait_s=0.03, steps=2))
+    assert ok and oid == "L1" and msg == "chased to market"
+    assert placed == [("LIMIT", 100.05)]                                     # a buy limit rounds UP onto the 0.05 grid
+    assert mods[:2] == [{"limit_price": 101.15, "symbol": "NSE:SBIN-EQ"}] * 2 and str(mods[2]["order_type"]) .endswith("MARKET")
+    placed.clear()
+    mods.clear()
+    state["fill_after"] = 1                                                   # fills after the first re-price
+    ok, _, msg = asyncio.run(rn._order_chase(object(), "NSE:SBIN-EQ", "BUY", 10, strategy_id=1, product="INTRADAY",
+                                             quote=100.02, wait_s=0.03, steps=3))
+    assert msg == "limit filled" and len(mods) == 1
+
+
+def test_limit_chase_spec_is_validated_and_off_by_default():
+    assert "limit" not in _cross_spec()["entry_order"]
+    s = _cross_spec(entry_order={"type": "market", "limit": {"wait_s": 8}})
+    assert s["entry_order"]["limit"] == {"wait_s": 8.0, "steps": 3}
+    with pytest.raises(ValueError, match="at most 30 s"):
+        _cross_spec(entry_order={"type": "market", "limit": {"wait_s": 60}})
