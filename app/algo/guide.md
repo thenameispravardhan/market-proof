@@ -252,6 +252,8 @@ Combined values take `mult` / `add` / `xf` too and nest 3 deep.
 | `expiry` | optional: this leg's own expiry `current` / `next` (calendars, diagonals); default = the instrument's |
 | `sl_pct` | optional: this leg's own stop, % of its entry premium (a SELL leg exits when its premium rises 30%; a BUY leg when it falls 30%) |
 | `tg_pct` | optional: this leg's own target, % of its entry premium (SELL leg: premium falls that much; BUY leg: rises) |
+| `reentries` | optional, 1-5: after this leg's own **stop** (`LEG_SL` / `LEG_COST`), open the same leg again (strike re-picked at the new spot, its own fresh stop) on the next candle close — while the position is still open and before `session.end` |
+| `roll` | optional: `{"above": 0.45, "to": 0.25, "max": 2}` — on a candle close, when this open leg's \|delta\| is above `above`, close it and open the same leg at the strike nearest \|delta\| `to`; at most `max` (1-5) rolls per position, before `session.end` |
 
 Other instrument keys:
 
@@ -263,11 +265,17 @@ Other instrument keys:
   set those levels to null and use MTM, leg stops or position rules).
 * `iv` — backtest option pricing: `auto` (India VIX for indices, 20-day
   realised vol for stocks), `vix`, `hv`, or `fixed` with `value` (IV %).
+  Optional `put_skew` / `call_skew` (0-10): extra IV points per 1% out of the
+  money, so wings price richer like the real smile (`put_skew: 0.8` = a put 2%
+  below spot at IV + 1.6). Live trading uses the real chain, so it ignores them.
 * `on_leg_stop` — what happens when a leg's own **stop** hits:
   `leg` (default — only that leg exits), `cost` (every other leg's stop moves
   to its entry price), `all` (exit every leg). Leg targets only close their leg.
 
-Per-leg stops can't be combined with `scale_out`.
+Per-leg stops, `reentries`, `roll` and the `hedge` rule can't be combined with
+`scale_out`. Re-entries can't follow `on_leg_stop: all` (nothing is left open).
+New legs show `via` `REENTRY` / `ROLL` / `HEDGE` in the trade's legs; a rolled
+leg exits with reason `LEG_ROLL`.
 
 ### 5.2 Margin — `margin` (optional)
 
@@ -344,6 +352,11 @@ Up to 5 steps, total ≤ 100%. The rest keeps its stop / trail / target.
   trade is skipped unless **every** rule holds.
 * **exit** rules are checked on each candle's close — the position exits
   when **any** rule holds (reason `RULE_<METRIC>`).
+* **hedge** (optional) `{"above": 0.6, "max": 10}` — on each candle's close,
+  when the net `delta` per set is beyond ±`above`, buy / sell whole lots of
+  the underlying's future per set to bring it back toward 0 (at most `max`
+  hedges per position; runs until square-off). Use `above` ≥ 0.5: a smaller
+  imbalance rounds to 0 lots.
 * `op`: `>` `<` `>=` `<=`. Up to 10 rules each. Values are **per set** (one
   set = the legs at their configured lots):
 
@@ -771,6 +784,37 @@ only `MANUAL`, `STALE_SESSION`, `CLOSED_EXTERNAL`.
     "target": {"type": "rr", "value": 2},
     "sizing": {"mode": "risk_pct", "value": 0.5},
     "portfolio": {"capital": 300000, "leverage": 5, "max_positions": 2, "compounding": true}
+  }
+}
+```
+
+### 9.12 Adjusted short strangle — 20-delta legs re-sold after a stop, rolled when tested, delta-hedged with the future
+
+```json
+{
+  "name": "Adjusted 20-delta strangle",
+  "spec": {
+    "symbols": ["NSE:NIFTY50-INDEX"],
+    "timeframe": 5,
+    "direction": "long",
+    "session": {"start": "09:30", "end": "14:30", "square_off": "15:15"},
+    "entry_long": {"logic": "AND", "conditions": [
+      {"left": {"ind": "TIME", "field": "hhmm"}, "op": ">=", "right": {"value": 930}}
+    ]},
+    "instrument": {"type": "option", "expiry": "current", "expiry_kind": "weekly", "levels_on": "underlying",
+                   "iv": {"source": "auto", "value": 15, "put_skew": 0.8, "call_skew": 0.2},
+                   "legs_long": [{"right": "CE", "action": "SELL", "strike": "DELTA", "delta": 0.2, "lots": 1,
+                                  "sl_pct": 40, "reentries": 1, "roll": {"above": 0.4, "to": 0.2, "max": 1}},
+                                 {"right": "PE", "action": "SELL", "strike": "DELTA", "delta": 0.2, "lots": 1,
+                                  "sl_pct": 40, "reentries": 1, "roll": {"above": 0.4, "to": 0.2, "max": 1}}]},
+    "stop_loss": null,
+    "target": null,
+    "position_rules": {"hedge": {"above": 0.6, "max": 4}},
+    "mtm": {"stop_pct": 150, "target_pct": 50},
+    "max_trades_per_day": 1,
+    "margin": {"model": "span"},
+    "sizing": {"mode": "lots", "value": 1},
+    "portfolio": {"capital": 400000, "max_positions": 1, "compounding": false}
   }
 }
 ```

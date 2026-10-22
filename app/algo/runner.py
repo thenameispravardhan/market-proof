@@ -380,14 +380,14 @@ async def build_legs(spec: dict, sym: str, side: str, u: float, now: float) -> l
         return chains[which]
 
     legs = []
-    for c in cfgs:
+    for src, c in enumerate(cfgs):
         if not c["lots"]:
             continue
         if c["right"] == "FUT":
             fs = fno.future_symbol(name, inst["expiry"], now)
             if not fs:
                 raise ValueError(f"no {inst['expiry']} {name} future in the F&O master")
-            legs.append({"symbol": fs, "kind": "FUT", "act": 1 if c["action"] == "BUY" else -1,
+            legs.append({"symbol": fs, "kind": "FUT", "act": 1 if c["action"] == "BUY" else -1, "src": src,
                          "per_set": lot_of(fs) * c["lots"], "label": fs.split(":")[-1],
                          "price": (await _ltp([fs])).get(fs)})
             continue
@@ -413,7 +413,7 @@ async def build_legs(spec: dict, sym: str, side: str, u: float, now: float) -> l
         legs.append({"symbol": leg["symbol"].upper(), "kind": c["right"], "act": 1 if c["action"] == "BUY" else -1,
                      "per_set": lot_of(leg["symbol"], leg.get("lot_size")) * c["lots"],
                      "label": leg["symbol"].split(":")[-1],
-                     "price": leg.get("ltp"), "K": row["strike"], "exp": exp,
+                     "price": leg.get("ltp"), "K": row["strike"], "exp": exp, "src": src,
                      **{k: c[k] for k in ("sl_pct", "tg_pct") if c.get(k)}})
     return legs
 
@@ -812,6 +812,7 @@ class AlgoRunner:
         for more than the broker holds. {"px", "qty", "oid", "external"}
         (external = the broker no longer holds it: no order sent), or None when
         it failed — the trade note and an event say why, nothing is booked."""
+        lg["exit_quote"] = px                       # what the exit was decided at (TCA: fill vs quote)
         if t["mode"] != "live":
             return {"px": px, "qty": qty, "oid": None, "external": False}
         acc, why = await asyncio.to_thread(_account, await asyncio.to_thread(_strategy_account, t["strategy_id"]))
@@ -897,7 +898,8 @@ class AlgoRunner:
                 continue                                # the broker no longer holds it
             lg.setdefault("qty0", lg["qty"])
             lg["qty"] -= r["qty"]
-            done[j] = {**{x: lg[x] for x in ("symbol", "kind", "act", "entry", "label", "K", "exp", "product", "qty0")
+            done[j] = {**{x: lg[x] for x in ("symbol", "kind", "act", "entry", "label", "K", "exp", "product", "qty0",
+                                             "entry_quote", "exit_quote")
                           if x in lg},
                        "qty": r["qty"], "exit": r["px"], **({"exit_order_id": r["oid"]} if r["oid"] else {})}
         part = [done[j] for j in sorted(done)]
@@ -930,6 +932,112 @@ class AlgoRunner:
             self.event("error", f"{self.label(t['strategy_id'], t.get('version'))}: "
                                 f"{reason} {t['symbol']}: {len(todo) - len(part)} leg(s) not reduced — they stay in "
                                 "the open position for its final exit", trade_id=t["id"], strategy_id=t["strategy_id"])
+
+    async def _adjust(self, s: dict, t: dict, sym: str, now: float) -> None:
+        """Re-entries, rolls and hedges on a candle's close — engine.adjustments,
+        the backtest's own rule. Safety: a rolled leg closes BEFORE its
+        replacement opens, new BUY legs open before SELL legs, every step is
+        saved as it lands, and a failed open stops the rest of this candle's
+        adjustments (an event + note) — it never unwinds what is already on."""
+        spec = s["spec"]
+        mins = int((now + IST) % 86400) // 60
+        _, end, sq = engine.session_window(spec)
+        if mins >= sq or t["id"] in self._busy or self._retry_at.get(t["id"], 0) > now:
+            return
+        self._busy.add(t["id"])
+        try:
+            fresh = await asyncio.to_thread(_fresh, t["id"])
+            if fresh is None or fresh["status"] != "open":
+                return
+            t.update(fresh)
+            prices = await _ltp([lg["symbol"] for lg in t["legs"] if lg.get("exit") is None] + [sym])
+            u = prices.get(sym.upper())
+            if u is None:
+                return
+            acts = engine.adjustments(spec, t["side"], t["legs"], u, now, fno.known_lot(fno.fno_name(sym), now) or 1,
+                                      lambda lg: prices.get(lg["symbol"].upper()), None, mins <= end)
+            name = self.label(t["strategy_id"], t.get("version"))
+            for kind, j, _ in acts:                     # closes first: a roll never stacks a second short
+                lg = t["legs"][j]
+                if kind != "roll" or prices.get(lg["symbol"].upper()) is None:
+                    continue
+                r = await self._close_leg(t, lg, lg["qty"], prices[lg["symbol"].upper()], "LEG_ROLL")
+                if r is None:
+                    continue                            # still on: no replacement for it
+                lg["exit"], lg["exit_reason"] = r["px"], "LEG_ROLL"
+                if r["oid"]:
+                    lg["exit_order_id"] = r["oid"]
+                await asyncio.to_thread(_update, t["id"], legs=t["legs"])
+            first = t["legs"][0]
+            sets = max(1, first["qty"] // (first.get("per_set") or first["qty"]))
+            for kind, j, cfg in sorted(acts, key=lambda a: a[2]["action"] != "BUY"):      # bought legs first
+                if kind == "roll" and t["legs"][j].get("exit") is None:
+                    continue
+                new = await self._add_leg(t, spec, sym, cfg, u, now, sets)
+                if new is None:
+                    break
+                via = {"reenter": "REENTRY", "roll": "ROLL", "hedge": "HEDGE"}[kind]
+                new["via"] = via
+                if kind == "hedge":
+                    new.pop("src", None)
+                    new["hedge"] = True
+                else:
+                    new["src"] = t["legs"][j].get("src")
+                    if kind == "reenter":
+                        t["legs"][j]["redone"] = True
+                t["legs"].append(new)
+                await asyncio.to_thread(_update, t["id"], legs=t["legs"])
+                self.event("entry", f"{name}: {via} {'BUY' if new['act'] > 0 else 'SELL'} {new['qty']} {new['label']} "
+                                    f"@ {new['entry']:.2f}", trade_id=t["id"], strategy_id=t["strategy_id"])
+        finally:
+            self._busy.discard(t["id"])
+
+    async def _add_leg(self, t: dict, spec: dict, sym: str, cfg: dict, u: float, now: float,
+                       sets: int) -> Optional[dict[str, Any]]:
+        """Open one more leg of an open position (paper: at the quote; live: a
+        MARKET order on the strategy's account, booked at the broker's fill).
+        None when it couldn't — the event and the trade note say why."""
+        key = "legs_long" if t["side"] == "BUY" else "legs_short"
+        one = {**spec, "instrument": {**spec["instrument"], key: [{**cfg, "lots": cfg.get("lots") or 1}]}}
+        name = self.label(t["strategy_id"], t.get("version"))
+
+        async def fail(why: str) -> None:
+            await asyncio.to_thread(_update, t["id"], note=f"adjustment failed: {why}"[:500])
+            self.event("error", f"{name}: adjustment of {t['symbol']} failed: {why}"[:300],
+                       trade_id=t["id"], strategy_id=t["strategy_id"])
+        try:
+            lg = (await build_legs(one, sym, t["side"], u, now))[0]
+        except Exception as e:  # noqa: BLE001
+            await fail(str(e))
+            return None
+        if not lg.get("price"):
+            await fail(f"no live price for {lg['symbol']}")       # no synthetic fills
+            return None
+        lg["qty"] = lg["qty0"] = lg["per_set"] * sets
+        lg["entry"] = lg["entry_quote"] = lg["price"]
+        if t["mode"] == "live":
+            acc, why = await asyncio.to_thread(_account, await asyncio.to_thread(_strategy_account, t["strategy_id"]))
+            if acc is None:
+                await fail(why or "no live account")
+                return None
+            lg["product"] = _product(spec, lg)
+            ok, oid, msg = await _order(acc, lg["symbol"], "BUY" if lg["act"] > 0 else "SELL", lg["qty"],
+                                        exit_=False, strategy_id=t["strategy_id"], product=lg["product"])
+            if not ok:
+                await fail(f"{lg['symbol']}: {msg}")
+                return None
+            lg["order_id"] = oid
+            fill = await _fill_price(acc, oid)
+            if fill:
+                lg["entry"] = fill
+            else:
+                net = await _broker_net(acc, lg["symbol"])
+                if net is None or net * lg["act"] <= 0:
+                    await _cancel(acc, oid)            # a late fill would be unmanaged
+                    await fail(f"{lg['symbol']}: not filled at the broker")
+                    return None
+        engine.leg_levels([lg])
+        return lg
 
     async def _book(self, t: dict, reason: str, now: float) -> None:
         gross = ch = 0.0
@@ -1053,6 +1161,9 @@ class AlgoRunner:
                     self.event("exit", f"{s['name']}: {sym} exit rule {engine.rule_label(hit)} "
                                        f"({hit['metric']} = {m[hit['metric']]:.3f})", strategy_id=s["id"])
                     await self._exit(mine, prices, f"RULE_{hit['metric'].upper()}", now)
+                    return
+            if engine.adjusts(spec):
+                await self._adjust(s, mine, sym, now)
             return
         close_min = int((indicators.close_time(d, len(d["t"]) - 1) + IST) % 86400) // 60
         start, end, _ = engine.session_window(spec)
@@ -1170,7 +1281,7 @@ class AlgoRunner:
             return
         for lg in legs:
             lg["qty"] = lg["qty0"] = lg["per_set"] * sets
-            lg["entry"] = lg["price"]
+            lg["entry"] = lg["entry_quote"] = lg["price"]        # the fill replaces entry; the quote stays (TCA)
         order_ids: list[str] = []
         if s["mode"] == "live":
             acc, why = await asyncio.to_thread(_account, s["account_id"])
@@ -1257,5 +1368,5 @@ class AlgoRunner:
 
 def _clean(legs: list[dict]) -> list[dict]:
     keep = ("symbol", "kind", "act", "qty", "qty0", "entry", "label", "K", "exp", "order_id", "product",
-            "per_set", "sl", "tg")
+            "per_set", "sl", "tg", "src", "via", "hedge", "entry_quote")
     return [{k: lg[k] for k in keep if k in lg} for lg in legs]

@@ -24,7 +24,7 @@ def _value(lg: dict, s: float, at: float, iv: float) -> float:
         return s
     if at >= lg["exp"]:
         return max(0.0, s - lg["K"]) if lg["kind"] == "CE" else max(0.0, lg["K"] - s)
-    return fno.bs_price(s, lg["K"], fno.years_to(lg["exp"], at), iv, lg["kind"])
+    return fno.bs_price(s, lg["K"], fno.years_to(lg["exp"], at), engine.leg_iv(lg, s, iv), lg["kind"])
 
 
 def _pnl(legs: list[dict], s: float, at: float, iv: float) -> float:
