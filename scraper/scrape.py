@@ -259,6 +259,9 @@ class Crawler:
             self.db.execute("ALTER TABLE assets ADD COLUMN text TEXT")
         self.db.execute("CREATE INDEX IF NOT EXISTS pages_digest ON pages(digest)")
         self.db.execute("CREATE INDEX IF NOT EXISTS pages_fetched ON pages(fetched)")   # the News page's 24 h stats
+        # The News page counts pages with text on every status poll; without this
+        # index the count reads every stored article body (650 MB by 2026-10-22).
+        self.db.execute("CREATE INDEX IF NOT EXISTS pages_with_text ON pages(status) WHERE text IS NOT NULL")
 
     def ensure_pool(self):
         if self.pool is None:
