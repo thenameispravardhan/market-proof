@@ -330,3 +330,56 @@ def test_shadow_a_version_compare_it_and_promote_it(client, isolated_db):
     p2 = client.post(f"/api/algo/strategies/{sh2['id']}/promote").json()
     assert p2["version"] == 3 and p2["spec"]["max_trades_per_day"] == 2
     assert client.post(f"/api/algo/strategies/{s['id']}/promote").status_code == 422
+
+
+# ---- A5: capital allocation across automations -------------------------------------
+
+def test_inverse_volatility_weights_halve_a_decaying_strategy():
+    from app.algo.runner import alloc_weights
+
+    calm = [100.0, -100.0] * 10                                                 # σ 100
+    wild = [200.0, -200.0] * 10                                                 # σ 200
+    w = alloc_weights({1: calm, 2: wild}, {1: 0.0, 2: 0.0})
+    assert w[1]["weight"] == pytest.approx(2 / 3) and w[2]["weight"] == pytest.approx(1 / 3)
+    w = alloc_weights({1: calm, 2: wild}, {1: -50.0, 2: 0.0})                   # 1 is losing lately
+    assert w[1]["weight"] == pytest.approx(0.5) and w[1]["decayed"]
+    w = alloc_weights({1: calm, 2: wild, 3: [0.0] * 20}, {})                   # 3 has no history: the median σ
+    assert w[3]["vol"] is None and w[3]["weight"] == pytest.approx((1 / 150) / (1 / 100 + 1 / 200 + 1 / 150))
+    assert sum(x["weight"] for x in w.values()) == pytest.approx(1.0)
+
+
+def test_allocation_sizes_entries_on_the_allocated_capital(monkeypatch, isolated_db, client):
+    from app.algo import runner as rn
+    from app.config import get_settings
+    from app.db import session as dbs
+    from app.db.models import AlgoStrategy, AlgoTrade
+    from app.tests.test_algo import bars
+
+    spec = _cross_spec(exit_long=None, sizing={"mode": "pct_equity", "value": 50},
+                       portfolio={"capital": 100000, "leverage": 1, "max_positions": 10, "compounding": False})
+    with dbs.SessionLocal() as db:
+        db.add(AlgoStrategy(name="a", spec=spec, enabled=True, mode="paper"))
+        db.add(AlgoStrategy(name="a · shadow v1", spec=spec, enabled=True, mode="paper", shadow_of=1))
+        db.commit()
+    assert rn.allocation(rn._snapshot()[0], DAY0) == {}                         # off by default
+    monkeypatch.setattr(get_settings(), "ALGO_ALLOC_CAPITAL", 10600.0)
+    alloc = rn.allocation(rn._snapshot()[0], DAY0)
+    assert list(alloc) == [1] and alloc[1]["capital"] == 10600.0                # the shadow gets nothing
+
+    async def fake_bars(sym, tf, bars_n=400, now=None, **kw):
+        d = bars([100.0, 101, 102, 106], spread=0)
+        keep = [i for i, t in enumerate(d["t"]) if t + 300 <= now]
+        return {k: ([v[i] for i in keep] if isinstance(v, list) else v) for k, v in d.items()}
+
+    async def fake_ltp(symbols):
+        return {x.upper(): 106.0 for x in symbols}
+
+    monkeypatch.setattr(rn.data, "recent_bars", fake_bars)
+    monkeypatch.setattr(rn, "_ltp", fake_ltp)
+    r = rn.AlgoRunner()
+    asyncio.run(r.tick(DAY0 + 4 * 300 + 4))
+    with dbs.SessionLocal() as db:
+        t = db.query(AlgoTrade).filter(AlgoTrade.strategy_id == 1).one()
+        assert t.quantity == 50                                                 # 50% of ₹10,600 at 106, not of ₹1,00,000
+    view = client.get("/api/algo/allocation").json()
+    assert view["capital"] == 10600.0 and [x["name"] for x in view["rows"]] == ["a"]

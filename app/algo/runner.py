@@ -201,6 +201,56 @@ def _book_all(day_start: float) -> dict[str, float]:
     return {"today": float(today), "margin": float(margin)}
 
 
+ALLOC_MIN_DAYS = 10   # days with trades before a strategy's own volatility is trusted
+
+
+def alloc_weights(daily: dict[int, list[float]], recent: dict[int, float]) -> dict[int, dict[str, Any]]:
+    """Inverse-volatility weights. `daily` = each strategy's net P&L per
+    trading day of the lookback (0 on a day it didn't trade), `recent` = its
+    net over the decay window. A strategy with fewer than ALLOC_MIN_DAYS
+    trading days borrows the median volatility of the others (no history, no
+    special treatment); one losing over the decay window gets half weight.
+    Weights sum to 1."""
+    import statistics
+
+    vol = {}
+    for sid, xs in daily.items():
+        if sum(1 for x in xs if x) >= ALLOC_MIN_DAYS and len(xs) > 1 and statistics.pstdev(xs) > 0:
+            vol[sid] = statistics.pstdev(xs)
+    fallback = statistics.median(vol.values()) if vol else 1.0
+    raw = {}
+    for sid in daily:
+        v = vol.get(sid, fallback)
+        raw[sid] = (1 / v) * (0.5 if recent.get(sid, 0.0) < 0 else 1.0)
+    total = sum(raw.values()) or 1.0
+    return {sid: {"weight": raw[sid] / total, "vol": vol.get(sid), "decayed": recent.get(sid, 0.0) < 0,
+                  "recent": round(recent.get(sid, 0.0), 2)} for sid in daily}
+
+
+def allocation(strategies: list[dict], now: float) -> dict[int, dict[str, Any]]:
+    """ALGO_ALLOC_CAPITAL split across the enabled, non-shadow automations
+    (empty when off): {strategy id: {capital, weight, vol, decayed, recent}}."""
+    st = get_settings()
+    total = st.ALGO_ALLOC_CAPITAL
+    sids = [s["id"] for s in strategies if s["enabled"] and not s.get("shadow_of")]
+    if not total or not sids:
+        return {}
+    today = int((now + IST) // 86400)
+    days = [d for d in range(today - int(st.ALGO_ALLOC_LOOKBACK_DAYS), today) if (d + 3) % 7 < 5]   # weekdays
+    decay_from = today - int(st.ALGO_ALLOC_DECAY_DAYS)
+    with db_session.SessionLocal() as db:
+        rows = db.execute(select(AlgoTrade.strategy_id, AlgoTrade.exit_at, AlgoTrade.net_pnl).where(
+            AlgoTrade.strategy_id.in_(sids), AlgoTrade.status == "closed",
+            AlgoTrade.exit_at >= _naive(days[0] * 86400 - IST if days else now))).all()
+    per: dict[int, dict[int, float]] = {sid: {} for sid in sids}
+    for sid, ex, net in rows:
+        d = int((_epoch(ex) + IST) // 86400)
+        per[sid][d] = per[sid].get(d, 0.0) + (net or 0.0)
+    w = alloc_weights({sid: [per[sid].get(d, 0.0) for d in days] for sid in sids},
+                      {sid: sum(v for d, v in per[sid].items() if d >= decay_from) for sid in sids})
+    return {sid: {**x, "capital": round(total * x["weight"], 2)} for sid, x in w.items()}
+
+
 def _insert(**fields: Any) -> int:
     with db_session.SessionLocal() as db:
         t = AlgoTrade(**fields)
@@ -613,6 +663,7 @@ class AlgoRunner:
         self._busy: set[int] = set()     # trades with an exit / scale-out in flight
         self._guard_at = 0.0             # last time the guards were read
         self._book_halt: Optional[int] = None   # IST day the book loss limit (or a kill) stopped every automation
+        self._alloc: tuple[Optional[int], dict[int, dict[str, Any]]] = (None, {})   # (IST day, allocation)
         self._names: dict[int, str] = {}
         # Tick-driven exits: every websocket tick for a symbol an open position
         # holds wakes `_tick_loop`, which runs the same stop / target / trail
@@ -815,6 +866,16 @@ class AlgoRunner:
                 if pnl <= -lim:
                     await self.halt_book(day, f"book day loss ₹{-pnl:,.0f} reached the ₹{lim:,.0f} limit",
                                          every, prices, now, "BOOK_MAX_LOSS")
+
+    async def allocated(self, now: float) -> dict[int, dict[str, Any]]:
+        """Today's capital allocation (ALGO_ALLOC_CAPITAL), worked out once a
+        day — and again when the setting changes."""
+        day = int((now + IST) // 86400)
+        key = (day, get_settings().ALGO_ALLOC_CAPITAL)
+        if self._alloc[0] != key:
+            strategies, _ = await asyncio.to_thread(_snapshot)
+            self._alloc = (key, await asyncio.to_thread(allocation, strategies, now))
+        return self._alloc[1]
 
     async def halt_book(self, day: int, why: str, trades: list[dict], prices: dict[str, float], now: float,
                         reason: str) -> None:
@@ -1488,6 +1549,9 @@ class AlgoRunner:
         per_set_margin = engine.position_margin(legs, u, pf["leverage"], price_key="price", model=spec.get("margin"),
                                                 t=now, name=fno.fno_name(sym))
         equity = pf["capital"] + (book["realized"] if pf["compounding"] else 0.0)
+        alloc = await self.allocated(now)
+        if s["id"] in alloc:                      # the book's split replaces the strategy's own capital
+            equity = alloc[s["id"]]["capital"]
         sets = engine.units(spec, equity, per_set_margin,
                             pre["sl_dist"] * legs[0]["per_set"] if pre["sl_dist"] else None)
         if per_set_margin > 0:

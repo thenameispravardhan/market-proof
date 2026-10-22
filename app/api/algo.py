@@ -1032,6 +1032,22 @@ async def book_view(request: Request, db: Session = Depends(get_db)) -> dict[str
             "halted": _runner(request)._book_halt == int((now + engine.IST) // DAY)}
 
 
+@router.get("/allocation")
+async def allocation_view(request: Request) -> dict[str, Any]:
+    """Today's capital split across automations (ALGO_ALLOC_CAPITAL; empty
+    when off): each one's weight, the volatility it was measured at, its net
+    over the decay window and the capital it sizes on."""
+    from app.algo.runner import _snapshot
+    from app.config import get_settings
+
+    alloc = await _runner(request).allocated(time.time())
+    names = {s["id"]: s["name"] for s in (await asyncio.to_thread(_snapshot))[0]}
+    return {"capital": get_settings().ALGO_ALLOC_CAPITAL or None,
+            "rows": [{"strategy_id": sid, "name": names.get(sid, str(sid)), **{k: (round(v, 4) if isinstance(v, float) else v)
+                                                                               for k, v in x.items()}}
+                     for sid, x in sorted(alloc.items(), key=lambda kv: -kv[1]["weight"])]}
+
+
 @router.post("/book/kill")
 async def book_kill(request: Request) -> dict[str, Any]:
     """Operator kill switch for the Algo Lab only: flatten every automation's

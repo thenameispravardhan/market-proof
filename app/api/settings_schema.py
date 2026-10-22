@@ -89,7 +89,7 @@ GROUPS: list[dict[str, Any]] = [
             "PORTFOLIO_VALUE", "MAX_CAPITAL_RISK_PCT", "DAILY_MAX_LOSS_PCT",
             "MAX_CONCURRENT_POSITIONS", "MAX_SINGLE_POSITION_PCT", "MIN_LIQUIDITY_CRORE",
             "MAX_SIGNALS_PER_DAY", "MAX_TRADES_PER_DAY", "INTRADAY_LEVERAGE", "RISK_RAMP_",
-            "MANUAL_RISK_ENFORCED",
+            "MANUAL_RISK_ENFORCED", "ALGO_ALLOC_",
         ],
     },
     {
@@ -285,6 +285,9 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "ORDER_RATE_LIMIT_PER_SEC": (0, 10),       # 10/s is the SEBI no-registration ceiling
     "ALGO_BOOK_MAX_DAY_LOSS": (0, 1e12),
     "ALGO_BOOK_MAX_MARGIN": (0, 1e12),
+    "ALGO_ALLOC_CAPITAL": (0, 1e12),
+    "ALGO_ALLOC_LOOKBACK_DAYS": (10, 365),
+    "ALGO_ALLOC_DECAY_DAYS": (5, 120),
     "ORDER_RATE_MAX_WAIT_SECONDS": (0, 10),
     "GATE_CIRCUIT_PROXIMITY_PCT": (0, 20),
     "BACKUP_MAX_AGE_HOURS": (0, 720),
@@ -360,6 +363,9 @@ LABELS: dict[str, str] = {
     "ORDER_RATE_LIMIT_PER_SEC": "Order rate limit per app (orders/s, 0 = off)",
     "ALGO_BOOK_MAX_DAY_LOSS": "Algo Lab: day loss across ALL automations that flattens them and stops entries (₹, 0 = off)",
     "ALGO_BOOK_MAX_MARGIN": "Algo Lab: most margin all automations may block together (₹, 0 = off)",
+    "ALGO_ALLOC_CAPITAL": "Algo Lab: capital split across automations by inverse volatility (₹, 0 = each uses its own)",
+    "ALGO_ALLOC_LOOKBACK_DAYS": "Algo Lab allocation: days of P&L its volatility is measured over",
+    "ALGO_ALLOC_DECAY_DAYS": "Algo Lab allocation: a strategy losing over this many days gets half weight",
     "ORDER_RATE_MAX_WAIT_SECONDS": "Max wait for an order-rate slot (seconds)",
     "GATE_SURVEILLANCE_ENABLED": "Block intraday entries on ASM/GSM/T2T symbols",
     "GATE_CIRCUIT_PROXIMITY_PCT": "Skip entries this close to the circuit (%, 0 = off)",
