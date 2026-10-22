@@ -5,6 +5,11 @@ Standard) and every symbol costs CPU on a small server, so the universe is
 built in priority order and cut at a budget:
 
    1. focus       hand-picked symbols (Algo Lab > Data) + switched-on strategies' symbols
+                  (+ the research short list's, when `long` is on)
+   1b. chain      option chains (`chains`, off by default): for each chain underlying the
+                  underlying, its current future and ATM +/- `strikes` for the first
+                  `expiries` expiries — ahead of the broad universe, so the budget never
+                  cuts a strategy's chain first
    2. index       the indices themselves (their price centres the option strikes)
    3. index_fut   index futures: current and next month
    4. index_opt   index options, current expiry, ATM +/- index_strikes
@@ -54,7 +59,7 @@ LISTS: dict[str, dict[str, Any]] = {
     "microcap250": {"label": "NIFTY Microcap 250", "file": "ind_niftymicrocap250_list.csv", "ranks": (501, 750)},
 }
 INDEX_SYMBOL = {name: sym for sym, (name, _, _) in fno.INDICES.items()}     # NIFTY -> NSE:NIFTY50-INDEX
-CLASSES = ("focus", "index", "index_fut", "index_opt", "stock_fut", "stocks", "index_opt2", "fut_next",
+CLASSES = ("focus", "chain", "index", "index_fut", "index_opt", "stock_fut", "stocks", "index_opt2", "fut_next",
            "stock_opt", "stock_opt2", "sticky")
 
 
@@ -242,6 +247,8 @@ class Plan:
         self.opt_sel: dict[str, list[float]] = {}           # "NAME|expiry" -> strikes picked (stickiness)
         self.no_price: list[str] = []
         self.lists: dict[str, dict[str, Any]] = {}
+        self.chain: dict[str, str] = {}                       # key -> chain underlying
+        self.chain_names: list[str] = []
 
     @property
     def room(self) -> int:
@@ -260,33 +267,100 @@ class Plan:
         self.classes[cls] += 1
         return True
 
+    def flag(self, key: str, **flags: Any) -> None:
+        m = self.meta.get(key)
+        if m is not None:
+            m.update({k: v for k, v in flags.items() if v})
+
     def summary(self) -> dict[str, Any]:
         return {"budget": self.budget, "used": len(self.symbols), "classes": self.classes, "wanted": self.wanted,
                 "dropped": {c: self.wanted[c] - self.classes[c] for c in CLASSES if self.wanted[c] > self.classes[c]},
-                "no_price": self.no_price[:50], "lists": self.lists}
+                "no_price": self.no_price[:50], "lists": self.lists,
+                "chains": {"names": self.chain_names, "keys": len(self.chain)},
+                "long": sum(1 for m in self.meta.values() if m.get("long")),
+                "raw_flagged": sum(1 for m in self.meta.values() if m.get("raw"))}
+
+
+def chain_name(symbol: str, fo: dict[str, dict[str, Any]]) -> Optional[str]:
+    """The F&O underlying behind a strategy / hand-picked symbol, when it lists
+    options: NSE:NIFTY50-INDEX, NIFTY:FUT, NIFTY, NSE:SBIN-EQ, NSE:SBIN26OCTFUT and
+    an option contract all give their name; anything else None."""
+    s = (symbol or "").strip().upper()
+    if not s:
+        return None
+    if s in fno.INDICES:
+        name: Optional[str] = fno.INDICES[s][0]
+    elif s.endswith(":FUT"):
+        name = s[:-4]
+    elif ":" not in s:
+        name = s
+    else:
+        name = fno.underlying_of(s) or (fno.fno_name(s) if s.endswith("-EQ") else None)
+    c = fo.get(name or "")
+    return name if c and c.get("opt") else None
 
 
 def build(cfg: dict[str, Any], focus: list[str], spot: Callable[[str], Optional[float]], now: float,
           prev: Optional[dict[str, list[float]]] = None, fo: Optional[dict[str, dict]] = None,
           lists: Optional[dict[str, tuple[list[str], str]]] = None, eq: Optional[set[str]] = None,
-          budget: Optional[int] = None) -> Plan:
+          budget: Optional[int] = None, strat: Optional[list[str]] = None) -> Plan:
     """The prioritised symbol plan (see the module doc). `spot(full)` is the
-    underlying's last price (None = unknown: its options wait for one)."""
+    underlying's last price (None = unknown: its options wait for one).
+    `strat`: the switched-on strategies' symbols (already in `focus`) — they
+    pick chain underlyings and the research short list."""
     uni = cfg["universe"]
+    chains = cfg.get("chains") or {}
+    long_ = cfg.get("long") or {}
     plan = Plan(budget if budget is not None else cfg.get("budget", 4500))
     fo = fo if fo is not None else contracts()
     eq = eq if eq is not None else equities()
     today = _ist_date(now)
     roll_days = int(uni.get("roll_days") or 5)
+    strat = [x.strip().upper() for x in strat or [] if x and x.strip()]
+
+    # the research short list (long): its symbols are recorded as focus and flagged in the day's meta
+    long_syms: list[str] = []
+    if long_.get("enabled"):
+        long_syms = list(dict.fromkeys([*(str(x).strip().upper() for x in long_.get("symbols") or []),
+                                        *(strat if long_.get("strategies", True) else [])]))
+        focus = [*focus, *long_syms]
+    long_set = set(long_syms)
+    long_names = {n for x in long_syms if (n := chain_name(x, fo))}
+    raw_k = int(long_.get("raw_strikes") or 0) if long_.get("enabled") else -1
 
     def fut_meta(name: str, exp: int) -> dict[str, Any]:
         return {"kind": "FUT", "name": name, "expiry": exp}
+
+    def options(cls: str, name: str, exp: int, k: int, underlying: str, chain: Optional[str] = None) -> int:
+        c = fo[name]
+        px = spot(underlying)
+        if not px:
+            plan.no_price.append(underlying)
+            return 0
+        opts = c["opt"].get(exp) or {}
+        strikes = sorted(set(opts.get("CE", {})) | set(opts.get("PE", {})))
+        picked = _band(strikes, px, k)
+        near = set(_band(strikes, px, raw_k)) if chain and raw_k >= 0 and name in long_names else set()
+        sel_key = f"{name}|{exp}"
+        plan.opt_sel[sel_key] = sorted(set(plan.opt_sel.get(sel_key, [])) | set(picked))
+        n = 0
+        for strike in sorted(picked, key=lambda x: abs(x - px)):           # nearest the money first
+            for right in ("CE", "PE"):
+                sym = opts.get(right, {}).get(strike)
+                if sym and plan.add(cls, sym, flow_key(sym), {"kind": right, "name": name, "expiry": exp,
+                                                               "strike": strike}):
+                    n += 1
+                    if chain:
+                        plan.chain[flow_key(sym)] = chain
+                        plan.flag(flow_key(sym), chain=chain, long=name in long_names, raw=strike in near)
+        return n
 
     # 1. focus: hand-picked + strategies. "NAME:FUT" is that future's current month; an index records its future too.
     for s in focus:
         s = s.strip().upper()
         if not s:
             continue
+        is_long = s in long_set
         if s == "ALL:FUT":
             for name, c in sorted(fo.items()):
                 f = _futs(c, today)
@@ -299,11 +373,40 @@ def build(cfg: dict[str, Any], focus: list[str], spot: Callable[[str], Optional[
             f = _futs(c, today) if c else []
             if f:
                 plan.add("focus", f[0][1], _fut_key(name, c["exch"], 0), fut_meta(name, f[0][0]))
+                plan.flag(_fut_key(name, c["exch"], 0), long=is_long)
             if s in fno.INDICES:
                 plan.add("focus", s, f"IDX_{name}", {"kind": "IDX", "name": name})
+                plan.flag(f"IDX_{name}", long=is_long)
             continue
         if ":" in s:
             plan.add("focus", s, flow_key(s), {"kind": "EQ" if s.endswith("-EQ") else "OTHER"})
+            plan.flag(plan.keys.get(s, flow_key(s)), long=is_long)
+
+    # 1b. option chains: named underlyings + the strategies' (those that list options)
+    if chains.get("enabled"):
+        wanted = [str(x).strip().upper() for x in chains.get("underlyings") or []]
+        if chains.get("strategies", True):
+            wanted += strat
+        names = list(dict.fromkeys(n for x in wanted if (n := chain_name(x, fo))))
+        plan.chain_names = names
+        k = max(0, int(chains.get("strikes", 10)))
+        n_exp = max(1, int(chains.get("expiries", 2)))
+        for name in names:
+            c = fo[name]
+            under = INDEX_SYMBOL.get(name) or f"{c['exch']}:{name}-EQ"
+            ukey = f"IDX_{name}" if name in INDEX_SYMBOL else flow_key(under)
+            is_long = name in long_names
+            if plan.add("chain", under, ukey, {"kind": "IDX" if name in INDEX_SYMBOL else "EQ", "name": name}):
+                plan.chain[ukey] = name
+                plan.flag(ukey, chain=name, long=is_long)
+            f = _futs(c, today)
+            if f:
+                fkey = _fut_key(name, c["exch"], 0)
+                if plan.add("chain", f[0][1], fkey, fut_meta(name, f[0][0])):
+                    plan.chain[fkey] = name
+                    plan.flag(fkey, chain=name, long=is_long)
+            for exp in _expiries(c, today)[:n_exp]:
+                options("chain", name, exp, k, under, chain=name)
 
     if not uni.get("enabled", True):
         return plan
@@ -319,26 +422,6 @@ def build(cfg: dict[str, Any], focus: list[str], spot: Callable[[str], Optional[
             f = _futs(c, today)
             for i, (exp, sym) in enumerate(f[:2] if uni.get("next_futures", "roll") != "off" else f[:1]):
                 plan.add("index_fut", sym, _fut_key(name, c["exch"], i), fut_meta(name, exp))
-
-    def options(cls: str, name: str, exp: int, k: int, underlying: str) -> int:
-        c = fo[name]
-        px = spot(underlying)
-        if not px:
-            plan.no_price.append(underlying)
-            return 0
-        chain = c["opt"].get(exp) or {}
-        strikes = sorted(set(chain.get("CE", {})) | set(chain.get("PE", {})))
-        picked = _band(strikes, px, k)
-        sel_key = f"{name}|{exp}"
-        plan.opt_sel[sel_key] = sorted(set(plan.opt_sel.get(sel_key, [])) | set(picked))
-        n = 0
-        for strike in sorted(picked, key=lambda x: abs(x - px)):           # nearest the money first
-            for right in ("CE", "PE"):
-                sym = chain.get(right, {}).get(strike)
-                if sym and plan.add(cls, sym, flow_key(sym), {"kind": right, "name": name, "expiry": exp,
-                                                               "strike": strike}):
-                    n += 1
-        return n
 
     # 4. index options, current expiry
     if uni.get("index_options", True):
@@ -449,8 +532,10 @@ def build(cfg: dict[str, Any], focus: list[str], spot: Callable[[str], Optional[
                 continue
             for right in ("CE", "PE"):
                 sym = chain.get(right, {}).get(strike)
-                if sym:
-                    plan.add("sticky", sym, flow_key(sym), {"kind": right, "name": name, "expiry": exp, "strike": strike})
+                if sym and plan.add("sticky", sym, flow_key(sym), {"kind": right, "name": name, "expiry": exp,
+                                                                     "strike": strike}) and name in plan.chain_names:
+                    plan.chain[flow_key(sym)] = name                   # an earlier strike of a recorded chain
+                    plan.flag(flow_key(sym), chain=name, long=name in long_names)
             plan.opt_sel.setdefault(sel_key, [])
             if strike not in plan.opt_sel[sel_key]:
                 plan.opt_sel[sel_key].append(strike)
