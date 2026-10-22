@@ -273,7 +273,12 @@ Other instrument keys:
   to its entry price), `all` (exit every leg). Leg targets only close their leg.
 
 Per-leg stops, `reentries`, `roll` and the `hedge` rule can't be combined with
-`scale_out`. Re-entries can't follow `on_leg_stop: all` (nothing is left open).
+`scale_out`. Re-entries need the leg's own `sl_pct` (or `on_leg_stop: cost`) and
+can't follow `on_leg_stop: all` (nothing is left open). Adjusted positions need
+`levels_on: underlying` (or no stop / target / trail / breakeven). In a
+backtest each added leg must fit the free capital, else it is skipped and
+counted (`reentry_no_capital`, `roll_no_capital`, `hedge_no_capital`). MTM %
+stops / targets and `pnl_pct` stay measured against the ORIGINAL legs' premium.
 New legs show `via` `REENTRY` / `ROLL` / `HEDGE` in the trade's legs; a rolled
 leg exits with reason `LEG_ROLL`.
 
@@ -353,10 +358,10 @@ Up to 5 steps, total ≤ 100%. The rest keeps its stop / trail / target.
 * **exit** rules are checked on each candle's close — the position exits
   when **any** rule holds (reason `RULE_<METRIC>`).
 * **hedge** (optional) `{"above": 0.6, "max": 10}` — on each candle's close,
-  when the net `delta` per set is beyond ±`above`, buy / sell whole lots of
-  the underlying's future per set to bring it back toward 0 (at most `max`
-  hedges per position; runs until square-off). Use `above` ≥ 0.5: a smaller
-  imbalance rounds to 0 lots.
+  when the net `delta` per set is beyond ±`above`, add a future of
+  −round(total delta in lots) lots (e.g. −0.6 per set × 2 sets = −1.2 → BUY 1
+  lot) to bring it back toward 0; skipped when that rounds to 0. At most `max`
+  hedges per position; runs until square-off.
 * `op`: `>` `<` `>=` `<=`. Up to 10 rules each. Values are **per set** (one
   set = the legs at their configured lots):
 
