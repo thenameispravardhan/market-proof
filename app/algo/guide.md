@@ -456,6 +456,24 @@ price `offset_pct`% better than the signal close — limit style), `breakout`
   them on to paper-trade live, or to **LIVE** (real orders on Fyers) after
   typing `LIVE` to confirm. Every save is a new version; any version can be
   made active again.
+* **Data → Research recording** (both off until switched on) — Fyers keeps
+  no tick or option-chain history, so anything a future backtest needs has
+  to be recorded now:
+  * **Option chains** — for each named underlying (and, by default, every
+    switched-on strategy's F&O underlying): the underlying, its current
+    future and ATM ± N strikes of the first N expiries. Every contract's
+    standing bid / ask / sizes / last / OI / volume is written on a fixed
+    grid (60 s by default, 09:15–15:30, the 15:30 close always), with the
+    quote's own exchange time. A snapshot at T only holds quotes from before
+    T. `GET /api/algo/ticks/chain?name=NIFTY&at=<epoch>` reads one back.
+  * **Keep a short list longer** — the list's symbols (and switched-on
+    strategies', and their chains) are marked in each day as it is recorded.
+    When a day leaves the window it is cut down to those keys instead of
+    deleted: flow, footprint, prints and chains kept 365 days, every frame
+    120 days (plus the near-the-money chain contracts', ATM ± N).
+  * The **disk line** projects the steady-state size of all windows from
+    the real size of the stored days, against the free space and the
+    disk guard's floor, and says whether it fits.
 
 ### Exit reasons you will see
 
