@@ -55,6 +55,8 @@ type Operand = {
   xn?: number;
   /** A combined value: a <math> b. */
   math?: string;
+  /** Pair combinations: the rolling window in bars. */
+  n?: number;
   a?: Operand;
   b?: Operand;
   /** Compute it on another symbol's candles (an index, a peer); absent = the strategy symbol itself. */
@@ -76,7 +78,10 @@ const TRANSFORMS: [string, string, string][] = [
   ["rank", "rank 0-100", "where it sits between its lowest (0) and highest (100) of the last N bars — IV rank = VIX on daily with this over ~200 (live keeps about a year of daily candles)"],
   ["percentile", "percentile", "% of the previous N bars that were below it — IV percentile"],
 ];
-const MATH_OPS: [string, string][] = [["-", "−"], ["+", "+"], ["*", "×"], ["/", "÷"], ["pct_diff", "% gap"]];
+const MATH_OPS: [string, string][] = [["-", "−"], ["+", "+"], ["*", "×"], ["/", "÷"], ["pct_diff", "% gap"],
+  ["pair_z", "spread z vs"], ["spread", "spread % vs"], ["beta", "hedge ratio β vs"], ["corr", "return corr. with"]];
+// Pair combinations fit log A on log B over the last n bars (engine.PAIR_MATH).
+const PAIR_MATH = new Set(["pair_z", "spread", "beta", "corr"]);
 type Group = { logic: "AND" | "OR"; conditions: (Cond | Group)[] };
 type Level = { type: string; value: number; atr_period?: number; activate?: number } | null;
 // Partial exit: close qty_pct % of the ENTRY size at this level (rr = R multiples of the stop).
@@ -842,10 +847,14 @@ function OperandEditor({ v, onChange, cat, baseTf, allowNumber = true, depth = 0
     return (
       <span className="algo-operand algo-combined" data-testid="operand-math">
         (<OperandEditor v={v.a ?? I("EMA", { period: 9 })} cat={cat} baseTf={baseTf} depth={depth + 1} onChange={(a) => onChange({ ...v, a })} />
-        <select value={v.math} onChange={(e) => onChange({ ...v, math: e.target.value })} title="% gap = how far the first is from the second, in % of the second">
+        <select value={v.math} data-testid="operand-math-op" onChange={(e) => {
+          const { n: _n, ...rest } = v;
+          onChange(PAIR_MATH.has(e.target.value) ? { ...rest, math: e.target.value, n: v.n ?? 100 } : { ...rest, math: e.target.value });
+        }} title="% gap = how far the first is from the second, in % of the second. Pairs (put another symbol on the second): a least-squares fit of log A on log B over the last n bars — spread z = how many deviations A is from its fitted value, spread % = the same in %, β = the hedge ratio, corr. = correlation of their one-bar returns">
           {MATH_OPS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
         </select>
         <OperandEditor v={v.b ?? I("EMA", { period: 21 })} cat={cat} baseTf={baseTf} depth={depth + 1} onChange={(b) => onChange({ ...v, b })} />)
+        {PAIR_MATH.has(v.math) && <label className="meta">over <NumInput width={44} value={v.n ?? 100} onChange={(n) => onChange({ ...v, n: Math.max(10, Math.min(500, Math.floor(n ?? 100))) })} /> bars</label>}
         <TransformEditor v={v} onChange={onChange} />
         <button type="button" className="btn-sm ghost" title="back to a single value" onClick={() => onChange(v.a ?? I("PRICE"))}>✕</button>
       </span>
@@ -857,7 +866,7 @@ function OperandEditor({ v, onChange, cat, baseTf, allowNumber = true, depth = 0
         : e.target.value === "@math" ? { math: "-", a: v.ind ? { ...v } : I("EMA", { period: 9 }), b: I("EMA", { period: 21 }) }
         : { ...I(e.target.value), ...(v.symbol && !cat.no_symbol?.includes(e.target.value) ? { symbol: v.symbol } : {}) })}>
         {allowNumber && <option value="#">Number</option>}
-        {depth < 2 && <option value="@math">ƒ Combine two values (A − B, A ÷ B, % gap…)</option>}
+        {depth < 2 && <option value="@math">ƒ Combine two values (A − B, A ÷ B, % gap, pair spread…)</option>}
         {groups.map((g) => (
           <optgroup key={g} label={g}>
             {cat.indicators.filter((d) => d.group === g).map((d) => <option key={d.name} value={d.name} title={d.about}>{d.name}</option>)}
@@ -2822,7 +2831,13 @@ export default function Algo() {
         bt.reset(); setMsg(null); setTab("builder");
       }} />}
       {tab === "data" && <><RecorderPanel /><DataTab /></>}
-      {tab === "research" && <ResearchTab />}
+      {tab === "research" && <ResearchTab timeframes={c.timeframes} onUse={(next, nm, tries) => {
+        if (!okToReplace()) return;
+        load(withDefaults(c.defaults, next as Partial<Spec>), nm, null, null, false);
+        setTrials(tries);                   // the pairs scanned to find it count as tries on the idea
+        bt.reset(); setTab("builder");
+        setMsg(`${nm}: trades the first symbol on its spread against the second. It starts at ${tries} tries (every pair scanned) — backtest it, then run a research check before trusting it.`);
+      }} />}
       {/* Optimise and Compare stay mounted so their results survive a trip to the builder and back. */}
       <div hidden={tab !== "compare"}><CompareTab cat={c} range={range} draft={spec} /></div>
       <div hidden={tab !== "optimize"}>

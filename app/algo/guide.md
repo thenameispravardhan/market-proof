@@ -196,6 +196,21 @@ Modifiers on a condition (optional):
 `math` one of `+ - * /` or `pct_diff` (`(a - b) / b × 100`, the % gap).
 Combined values take `mult` / `add` / `xf` too and nest 3 deep.
 
+**A pair** (usually `b` on another `symbol`): `{"math": "pair_z", "a": operand,
+"b": operand, "n": 100}` fits log a on log b by least squares over the last
+`n` candles (10-500, default 100; each candle sees candles up to its own
+close) and gives one of:
+
+| math | value |
+|---|---|
+| `pair_z` | how many standard deviations `a` is from its fitted value — the pairs-trading signal |
+| `spread` | the same gap in % (log units × 100) |
+| `beta` | the hedge ratio: `a`'s % move per 1% of `b` |
+| `corr` | correlation of the two's one-candle returns over `n` |
+
+Both sides must be positive (prices). A candle where either is missing
+restarts the window.
+
 ### 4.4 Transforms (`xf`, over `xn` candles, 1-500)
 
 | xf | meaning |
@@ -459,6 +474,13 @@ price `offset_pct`% better than the signal close — limit style), `breakout`
   on at least the minimum trades, PBO ≤ 50% when a grid was swept. It
   passes or is **killed**, and is saved as a strategy card (Research tab,
   downloadable as one markdown page). Write an idea that can pass it.
+* **Pair finder** (Research tab) — up to 30 symbols against an anchor
+  (stock vs index) or against each other (peers), on the timeframe the
+  strategy will trade: hedge ratio, Engle-Granger cointegration on the
+  first two thirds of the history, the same fit re-tested on the last third
+  it never saw, half-life and today's z. Only pairs that hold on the last
+  third load into the builder, as the one-leg strategy of 9.13, starting at
+  as many tries as pairs were scanned.
 * **Compare** — saved strategies side by side on the same range.
 * **Automations** — saved strategies start OFF and in **paper** mode; switch
   them on to paper-trade live, or to **LIVE** (real orders on Fyers) after
@@ -823,6 +845,33 @@ only `MANUAL`, `STALE_SESSION`, `CLOSED_EXTERNAL`.
     "margin": {"model": "span"},
     "sizing": {"mode": "lots", "value": 1},
     "portfolio": {"capital": 400000, "max_positions": 1, "compounding": false}
+  }
+}
+```
+
+### 9.13 Pairs — HDFC Bank against Bank NIFTY, one leg, back to the fitted spread
+
+Trade only the stock; the index is the signal. Long when HDFC Bank falls 2
+deviations below where its 40-hour fit on Bank NIFTY puts it, short when it
+rises as far above; out once the gap is back inside 0.5, after 40 candles,
+or at a 3% stop. Square-off is off: a spread can take days to close.
+
+```json
+{
+  "name": "Pair HDFCBANK vs NIFTYBANK",
+  "spec": {
+    "symbols": ["NSE:HDFCBANK-EQ"],
+    "timeframe": 60,
+    "direction": "both",
+    "entry_long": {"logic": "AND", "conditions": [{"left": {"math": "pair_z", "a": {"ind": "PRICE"}, "b": {"ind": "PRICE", "symbol": "NSE:NIFTYBANK-INDEX"}, "n": 40}, "op": "crosses_below", "right": {"value": -2.0}}]},
+    "exit_long": {"logic": "AND", "conditions": [{"left": {"math": "pair_z", "a": {"ind": "PRICE"}, "b": {"ind": "PRICE", "symbol": "NSE:NIFTYBANK-INDEX"}, "n": 40}, "op": ">", "right": {"value": -0.5}}]},
+    "entry_short": {"logic": "AND", "conditions": [{"left": {"math": "pair_z", "a": {"ind": "PRICE"}, "b": {"ind": "PRICE", "symbol": "NSE:NIFTYBANK-INDEX"}, "n": 40}, "op": "crosses_above", "right": {"value": 2.0}}]},
+    "exit_short": {"logic": "AND", "conditions": [{"left": {"math": "pair_z", "a": {"ind": "PRICE"}, "b": {"ind": "PRICE", "symbol": "NSE:NIFTYBANK-INDEX"}, "n": 40}, "op": "<", "right": {"value": 0.5}}]},
+    "stop_loss": {"type": "pct", "value": 3.0},
+    "target": null,
+    "max_bars": 40,
+    "session": {"start": "09:15", "end": "15:15", "square_off": null},
+    "sizing": {"mode": "pct_equity", "value": 20}
   }
 }
 ```
