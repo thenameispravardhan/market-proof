@@ -1029,7 +1029,7 @@ async def book_view(request: Request, db: Session = Depends(get_db)) -> dict[str
             "realized_today": round(agg["today"], 2), "open_mtm": None if open_mtm is None else round(open_mtm, 2),
             "day_pnl": None if open_mtm is None else round(agg["today"] + open_mtm, 2),
             "limits": {"max_day_loss": st.ALGO_BOOK_MAX_DAY_LOSS or None, "max_margin": st.ALGO_BOOK_MAX_MARGIN or None},
-            "halted": _runner(request)._book_halt == int((now + engine.IST) // DAY)}
+            "halted": await _runner(request).book_halted(now)}
 
 
 @router.get("/allocation")

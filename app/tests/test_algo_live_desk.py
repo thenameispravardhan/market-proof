@@ -221,11 +221,21 @@ def test_a_refused_later_slice_unwinds_an_entry_but_not_an_exit(monkeypatch):
     async def cancel(acc, oid):
         cancelled.append(oid)
 
+    net = iter([0, 1800])                                                      # before / after: one slice filled
+
+    async def broker_net(acc, symbol):
+        return next(net)
+
     monkeypatch.setattr(rn, "_place", place)
     monkeypatch.setattr(rn, "_cancel", cancel)
+    monkeypatch.setattr(rn, "_broker_net", broker_net)
     ok, oid, msg = asyncio.run(rn._order(object(), "NSE:NIFTYX-CE", "BUY", 3600, exit_=False, strategy_id=1))
     assert (ok, msg) == (False, "RMS: margin") and cancelled == ["o1"]
     assert sent == [("BUY", 1800, False), ("BUY", 1800, False), ("SELL", 1800, True)]     # the slice that filled, undone
+    sent.clear()
+    net = iter([0, 0])                                                         # a LIMIT slice that never filled
+    asyncio.run(rn._order(object(), "NSE:NIFTYX-CE", "BUY", 3600, exit_=False, strategy_id=1))
+    assert sent == [("BUY", 1800, False), ("BUY", 1800, False)]                # nothing to undo: no reverse order
     sent.clear()
     ok, oid, _ = asyncio.run(rn._order(object(), "NSE:NIFTYX-CE", "SELL", 3600, exit_=True, strategy_id=1))
     assert ok and oid == "o1,o2" and sent == [("SELL", 1800, True), ("SELL", 1800, True)]
@@ -383,3 +393,81 @@ def test_allocation_sizes_entries_on_the_allocated_capital(monkeypatch, isolated
         assert t.quantity == 50                                                 # 50% of ₹10,600 at 106, not of ₹1,00,000
     view = client.get("/api/algo/allocation").json()
     assert view["capital"] == 10600.0 and [x["name"] for x in view["rows"]] == ["a"]
+
+
+
+# ---- review fixes ----------------------------------------------------------------------
+
+def test_a_guard_switched_back_on_starts_fresh(monkeypatch, isolated_db):
+    import time as _t
+
+    from app.algo import runner as rn
+    from app.db import session as dbs
+    from app.db.models import AlgoStrategy, AlgoTrade
+
+    at = lambda s: rn._utc(_t.time() - 7200 + s).replace(tzinfo=None)  # noqa: E731
+    with dbs.SessionLocal() as db:
+        s = AlgoStrategy(name="g", spec=_cross_spec(guard={"max_drawdown": 1000}), enabled=True, mode="paper")
+        db.add(s)
+        db.flush()
+        for k, net in enumerate((500.0, -1600.0)):
+            db.add(AlgoTrade(strategy_id=s.id, symbol="NSE:TEST-EQ", side="BUY", quantity=1, mode="paper",
+                             status="closed", entry_at=at(k), exit_at=at(k + 1), net_pnl=net))
+        db.commit()
+        sid = s.id
+    day_start = _t.time() - (_t.time() + 19800) % 86400
+    st = rn._guard_stats(sid, day_start)
+    assert rn.guard_breach({"max_drawdown": 1000}, st, 0.0)                   # 1,600 down
+    assert rn._guard_off(sid, "drawdown")
+    with dbs.SessionLocal() as db:
+        db.get(AlgoStrategy, sid).enabled = True                              # the operator switches it back on
+        db.commit()
+    st = rn._guard_stats(sid, day_start)
+    assert (st["closed"], st["peak"]) == (0.0, 0.0) and rn.guard_breach({"max_drawdown": 1000}, st, 0.0) is None
+
+
+def test_book_halt_survives_a_restart_and_trips_on_realised_loss_alone(monkeypatch, isolated_db):
+    import time as _t
+
+    from app.algo import runner as rn
+    from app.config import get_settings
+    from app.db import session as dbs
+    from app.db.models import AlgoStrategy, AlgoTrade
+
+    now = _t.time()
+    asyncio.run(rn.AlgoRunner().halt_book(int((now + 19800) // 86400), "operator kill switch", [], {}, now, "BOOK_KILL"))
+    assert asyncio.run(rn.AlgoRunner().book_halted(now))                      # a new runner (a restart) still sees it
+    with dbs.SessionLocal() as db:
+        db.query(__import__("app.db.models", fromlist=["AuditLog"]).AuditLog).delete()
+        a = AlgoStrategy(name="a", spec=_cross_spec(), enabled=True, mode="paper")
+        db.add(a)
+        db.flush()
+        db.add(AlgoTrade(strategy_id=a.id, symbol="NSE:X-EQ", side="BUY", quantity=1, mode="paper", status="closed",
+                         entry_at=rn._utc(now - 60).replace(tzinfo=None), exit_at=rn._utc(now - 30).replace(tzinfo=None),
+                         net_pnl=-1500.0))
+        db.commit()
+    r = rn.AlgoRunner()
+    assert not asyncio.run(r.book_halted(now))                                # no limit set: nothing to trip
+    monkeypatch.setattr(get_settings(), "ALGO_BOOK_MAX_DAY_LOSS", 1000.0)
+    assert asyncio.run(r.book_halted(now))                                    # realised -1,500, nothing open: halted
+    assert any("realised loss" in e["msg"] for e in r.events)
+
+
+def test_allocation_follows_a_strategy_switched_on_mid_day(monkeypatch, isolated_db):
+    import time as _t
+
+    from app.algo import runner as rn
+    from app.config import get_settings
+    from app.db import session as dbs
+    from app.db.models import AlgoStrategy
+
+    monkeypatch.setattr(get_settings(), "ALGO_ALLOC_CAPITAL", 100000.0)
+    with dbs.SessionLocal() as db:
+        db.add(AlgoStrategy(name="a", spec=_cross_spec(), enabled=True, mode="paper"))
+        db.add(AlgoStrategy(name="b", spec=_cross_spec(), enabled=False, mode="paper"))
+        db.commit()
+    r = rn.AlgoRunner()
+    r._by_id = {s["id"]: s for s in rn._snapshot()[0]}
+    assert {k: v["capital"] for k, v in asyncio.run(r.allocated(_t.time())).items()} == {1: 100000.0}
+    r._by_id[2]["enabled"] = True                                              # switched on later the same day
+    assert {k: v["capital"] for k, v in asyncio.run(r.allocated(_t.time())).items()} == {1: 50000.0, 2: 50000.0}
