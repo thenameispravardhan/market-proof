@@ -99,20 +99,26 @@ def _snapshot() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
 
 def _guard_stats(sid: int, day_start: float, fills: int = 20) -> dict[str, Any]:
     """What a strategy's guard reads: its closed net P&L now and at its peak,
-    entries rejected today, and the slippage of its last `fills` live fills."""
+    entries rejected today, and the slippage of its last `fills` live fills —
+    all counted only since its guard last paused it, so switching it back on
+    starts it fresh instead of tripping it again a minute later."""
     with db_session.SessionLocal() as db:
+        since = db.execute(select(func.max(AuditLog.created_at)).where(
+            AuditLog.action == "algo.guard_pause", AuditLog.target == f"algo_strategy:{sid}")).scalar_one()
+        after = (lambda col: col > since) if since else (lambda col: col.is_not(None))  # noqa: E731
         cum = peak = 0.0
         for (net,) in db.execute(select(AlgoTrade.net_pnl).where(
-                AlgoTrade.strategy_id == sid, AlgoTrade.status == "closed").order_by(AlgoTrade.exit_at)):
+                AlgoTrade.strategy_id == sid, AlgoTrade.status == "closed", after(AlgoTrade.exit_at))
+                .order_by(AlgoTrade.exit_at)):
             cum += net or 0.0
             peak = max(peak, cum)
         rejects = db.execute(select(func.count()).select_from(AlgoTrade).where(
             AlgoTrade.strategy_id == sid, AlgoTrade.status == "rejected",
-            AlgoTrade.entry_at >= _naive(day_start))).scalar_one()
+            AlgoTrade.entry_at >= _naive(day_start), after(AlgoTrade.entry_at))).scalar_one()
         slip: list[float] = []
         for (legs,) in db.execute(select(AlgoTrade.legs).where(
-                AlgoTrade.strategy_id == sid, AlgoTrade.mode == "live", AlgoTrade.status == "closed")
-                .order_by(AlgoTrade.exit_at.desc()).limit(fills)):
+                AlgoTrade.strategy_id == sid, AlgoTrade.mode == "live", AlgoTrade.status == "closed",
+                after(AlgoTrade.exit_at)).order_by(AlgoTrade.exit_at.desc()).limit(fills)):
             slip += [p for lg in legs or [] for p, _ in engine.fill_slippage(lg)]
     return {"closed": cum, "peak": peak, "rejects": rejects, "slippage": slip[:fills]}
 
@@ -186,6 +192,20 @@ def _book(strategy_id: int, day_start: float) -> dict[str, float]:
         margin, n = db.execute(select(func.coalesce(func.sum(AlgoTrade.margin), 0.0), func.count()).where(
             AlgoTrade.strategy_id == strategy_id, AlgoTrade.status == "open")).one()
     return {"realized": float(total), "today": float(today), "margin": float(margin), "open": int(n)}
+
+
+def _book_halt_logged(day_start: float) -> bool:
+    """Was the book halted today (loss limit or kill switch)? The audit row is
+    what survives a restart."""
+    with db_session.SessionLocal() as db:
+        return db.execute(select(func.count()).select_from(AuditLog).where(
+            AuditLog.action == "algo.book_halt", AuditLog.created_at >= _naive(day_start))).scalar_one() > 0
+
+
+def _log_book_halt(why: str) -> None:
+    with db_session.SessionLocal() as db:
+        db.add(AuditLog(actor="algo-book", action="algo.book_halt", target="algo_book", before=None, after={"why": why}))
+        db.commit()
 
 
 def _book_all(day_start: float) -> dict[str, float]:
@@ -393,21 +413,27 @@ async def _order(account: BrokerAccount, symbol: str, side: str, qty: int, *, ex
     half a position the caller doesn't know about; an EXIT keeps them (its
     retry re-reads what the broker still holds)."""
     ids: list[str] = []
-    done = 0
-    for q in _slices(symbol, int(qty)):
+    parts = _slices(symbol, int(qty))
+    net0 = await _broker_net(account, symbol) if len(parts) > 1 and not exit_ else None
+    for q in parts:
         ok, oid, msg = await _place(account, symbol, side, q, exit_=exit_, strategy_id=strategy_id, product=product,
                                     order_type=order_type, limit_price=limit_price)
         if not ok:
             if ids and not exit_:
-                await _cancel(account, ",".join(ids))
-                undo, _, why = await _place(account, symbol, "SELL" if side == "BUY" else "BUY", done, exit_=True,
-                                            strategy_id=strategy_id, product=product)
-                if not undo:
-                    log.error("algo.slice_unwind_failed", symbol=symbol, qty=done, error=why)
+                await _cancel(account, ",".join(ids))           # a LIMIT slice still working: never fills now
+                net1 = await _broker_net(account, symbol)
+                filled = (net1 - net0) * (1 if side == "BUY" else -1) if net0 is not None and net1 is not None else None
+                if filled is None:
+                    log.error("algo.slice_unwind_unknown", symbol=symbol, order_ids=",".join(ids),
+                              error="positions unavailable — check the broker for a partial entry")
+                elif filled > 0:                                # undo exactly what went through, in slices too
+                    undo, _, why = await _order(account, symbol, "SELL" if side == "BUY" else "BUY", filled,
+                                                exit_=True, strategy_id=strategy_id, product=product)
+                    if not undo:
+                        log.error("algo.slice_unwind_failed", symbol=symbol, qty=filled, error=why)
                 ids = []
             return False, ",".join(ids) or oid, msg
         ids.append(str(oid))
-        done += q
     return True, ",".join(ids), msg
 
 
@@ -430,17 +456,19 @@ async def _order_chase(account: BrokerAccount, symbol: str, side: str, qty: int,
     backend = _backend(account)
     for k in range(steps + 1):
         await asyncio.sleep(wait_s / (steps + 1))
-        working = []
+        working, filled = [], True
         for oid in str(oids).split(","):
             try:
                 st = await backend.get_order_status(oid)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001 — unknown: keep chasing it
                 log.warning("algo.chase_status_failed", order_id=oid, error=str(e)[:200])
+                working.append(oid)
                 continue
             if st.state == OrderState.PENDING:
                 working.append(oid)
-        if not working:
-            return True, oids, "limit filled"
+            filled = filled and st.state == OrderState.FILLED
+        if not working:                                       # the caller's fill check books it, or rolls it back
+            return True, oids, "limit filled" if filled else "not working any more (rejected / cancelled)"
         px = None if k == steps else (await _ltp([symbol])).get(symbol.upper())
         for oid in working:
             try:
@@ -663,7 +691,7 @@ class AlgoRunner:
         self._busy: set[int] = set()     # trades with an exit / scale-out in flight
         self._guard_at = 0.0             # last time the guards were read
         self._book_halt: Optional[int] = None   # IST day the book loss limit (or a kill) stopped every automation
-        self._alloc: tuple[Optional[int], dict[int, dict[str, Any]]] = (None, {})   # (IST day, allocation)
+        self._alloc: tuple[Optional[tuple], dict[int, dict[str, Any]]] = (None, {})   # (key, allocation)
         self._names: dict[int, str] = {}
         # Tick-driven exits: every websocket tick for a symbol an open position
         # holds wakes `_tick_loop`, which runs the same stop / target / trail
@@ -867,13 +895,34 @@ class AlgoRunner:
                     await self.halt_book(day, f"book day loss ₹{-pnl:,.0f} reached the ₹{lim:,.0f} limit",
                                          every, prices, now, "BOOK_MAX_LOSS")
 
+    async def book_halted(self, now: float) -> bool:
+        """Is every automation stopped for today? A halt in memory, one logged
+        earlier today (it survives a restart), or a realised loss alone that
+        already reached ALGO_BOOK_MAX_DAY_LOSS with nothing left open."""
+        day = int((now + IST) // 86400)
+        if self._book_halt == day:
+            return True
+        day_start = day * 86400 - IST
+        if await asyncio.to_thread(_book_halt_logged, day_start):
+            self._book_halt = day
+            return True
+        lim = get_settings().ALGO_BOOK_MAX_DAY_LOSS
+        if lim and (today := (await asyncio.to_thread(_book_all, day_start))["today"]) <= -lim:
+            await self.halt_book(day, f"book realised loss ₹{-today:,.0f} reached the ₹{lim:,.0f} limit", [], {}, now,
+                                 "BOOK_MAX_LOSS")
+            return True
+        return False
+
     async def allocated(self, now: float) -> dict[int, dict[str, Any]]:
         """Today's capital allocation (ALGO_ALLOC_CAPITAL), worked out once a
-        day — and again when the setting changes."""
-        day = int((now + IST) // 86400)
-        key = (day, get_settings().ALGO_ALLOC_CAPITAL)
-        if self._alloc[0] != key:
+        day — and again when the setting or the set of enabled automations
+        changes (a strategy switched on mid-day gets its share)."""
+        strategies = list(self._by_id.values())
+        if not strategies:
             strategies, _ = await asyncio.to_thread(_snapshot)
+        key = (int((now + IST) // 86400), get_settings().ALGO_ALLOC_CAPITAL,
+               tuple(sorted(s["id"] for s in strategies if s["enabled"] and not s.get("shadow_of"))))
+        if self._alloc[0] != key:
             self._alloc = (key, await asyncio.to_thread(allocation, strategies, now))
         return self._alloc[1]
 
@@ -883,6 +932,7 @@ class AlgoRunner:
         automation position is flattened (the book loss limit, or the
         operator's kill). Alerted as a risk halt."""
         self._book_halt = day
+        await asyncio.to_thread(_log_book_halt, why)
         msg = f"ALL AUTOMATIONS halted for today — {why}; flattening {len(trades)} position(s)"
         self.event("error", msg)
         from app.services.event_bus import event_bus
@@ -1475,7 +1525,7 @@ class AlgoRunner:
             return
         if int((now + IST) % 86400) // 60 >= engine.session_window(spec)[2]:
             return
-        if self._book_halt == int((now + IST) // 86400):
+        if await self.book_halted(now):
             return                                         # the whole book stopped for today
         book = await asyncio.to_thread(_book, s["id"], day_start)
         if book["open"] >= spec["portfolio"]["max_positions"]:
@@ -1557,7 +1607,7 @@ class AlgoRunner:
         if per_set_margin > 0:
             sets = min(sets, int(max(0.0, equity - book["margin"]) // per_set_margin))
         cap = get_settings().ALGO_BOOK_MAX_MARGIN
-        if cap and per_set_margin > 0 and sets >= 1:
+        if cap and per_set_margin > 0 and sets >= 1 and not s.get("shadow_of"):
             used = (await asyncio.to_thread(_book_all, now - (now + IST) % 86400))["margin"]
             sets = min(sets, int(max(0.0, cap - used) // per_set_margin))
             if sets < 1:

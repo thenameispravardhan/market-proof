@@ -1690,6 +1690,9 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
             m = margin_of(open_legs())                            # per add: the next one is checked against it
             used_margin += m - pos["margin"]
             pos["margin"] = m
+        m = margin_of(open_legs())                                # a rolled-out leg frees its margin either way
+        used_margin += m - pos["margin"]
+        pos["margin"] = m
         pos["leg_rules"] = pos["leg_rules"] or any(l.get("sl") is not None or l.get("tg") is not None for l in open_legs())
         if all(l.get("exit") is not None for l in pos["legs"]):
             close(sym, u, tc, "LEG_ROLL", i)                      # a roll whose replacement didn't fit left nothing open
