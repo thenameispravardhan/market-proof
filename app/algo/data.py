@@ -118,8 +118,8 @@ async def assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str
         await fno.ensure_master()
     vix = None
     notes: list[dict] = []
-    wants_vix = inst["iv"]["source"] == "vix" or (
-        inst["iv"]["source"] == "auto" and any(fno.fno_name(x) in fno.INDEX_LOTS for x in spec["symbols"]))
+    wants_vix = inst["iv"]["source"] == "vix" or (       # surface: VIX prices the candles no snapshot covers
+        inst["iv"]["source"] in ("auto", "surface") and any(fno.fno_name(x) in fno.INDEX_LOTS for x in spec["symbols"]))
     vix_tfs = engine.vix_timeframes(spec)            # the VIX indicator, at these timeframes
     vix_htf: dict[int, dict] = {}
     if (inst["type"] == "option" and wants_vix) or vix_tfs:
@@ -184,6 +184,11 @@ async def assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str
                     bars["htf"][tf]["vix"] = v
             name = fno.fno_name(fy)
             bars["meta"] = {"symbol": fy, "name": name, "exch": fno.exchange_of(fy), "bar_size": size}
+            if inst["type"] == "option" and inst["iv"]["source"] == "surface":
+                bars["surfaces"] = await asyncio.to_thread(chain_surfaces, name, bars["t"])
+                got = sum(1 for x in bars["surfaces"] if x)
+                notes.append({"symbol": fy, "note": f"recorded IV surface on {got / len(bars['t']) * 100:.0f}% of candles"
+                              + (" — the rest priced with flat IV (VIX / realised)" if got < len(bars["t"]) else "")})
             if inst["type"] != "equity":
                 if not fno.is_fno(name):
                     notes.append({"symbol": fy, "note": f"{name} has no F&O contracts — skipped"})
@@ -194,6 +199,54 @@ async def assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str
         except Exception as e:  # noqa: BLE001
             notes.append({"symbol": fy, "note": str(e)[:200]})
     return out, notes, start
+
+
+def chain_snapshots(name: str, start: int, end: int):
+    """`name`'s recorded chain snapshots in [start, end), one IST day read at a
+    time (a day of a chain is ~35k rows; months of it at once would not fit
+    the box): yields (ts, [{key, kind, strike, expiry, qts, ltp, bid, ask}])."""
+    from app.algo import ticks
+
+    st = ticks.store()
+    for day in range((start + 19800) // DAY, (end - 1 + 19800) // DAY + 1):
+        meta = st.chain_keys(name, day)
+        if not meta:
+            continue
+        d0 = day * DAY - 19800
+        snaps: dict[int, list[dict]] = {}
+        for r in st.chain_rows(name, max(start, d0), min(end, d0 + DAY)):
+            m = meta.get(r[1], {})
+            snaps.setdefault(r[0], []).append({"key": r[1], "kind": m.get("kind"), "strike": m.get("strike"),
+                                               "expiry": m.get("expiry"), "qts": r[2], "ltp": r[3], "bid": r[4], "ask": r[5]})
+        for t in sorted(snaps):
+            yield t, snaps[t]
+
+
+def chain_surfaces(name: str, times: list[int]) -> list[Any]:
+    """Per candle: the IV surface of `name`'s latest recorded chain snapshot
+    at or before the candle's open, the same IST day; None where none was
+    recorded. Each snapshot used is fitted once."""
+    from app.research import surface as sf
+
+    out: list[Any] = [None] * len(times)
+    by_day: dict[int, list[int]] = {}
+    for i, t in enumerate(times):
+        by_day.setdefault((t + 19800) // DAY, []).append(i)
+    for day, idx in by_day.items():
+        d0 = day * DAY - 19800
+        snaps = list(chain_snapshots(name, d0, d0 + DAY))      # one day at a time
+        fitted: dict[int, Any] = {}
+        j = -1
+        for i in idx:
+            while j + 1 < len(snaps) and snaps[j + 1][0] <= times[i]:
+                j += 1
+            if j < 0:
+                continue
+            t, contracts = snaps[j]
+            if t not in fitted:
+                fitted[t] = sf.fit(contracts, t)
+            out[i] = fitted[t]
+    return out
 
 
 def bars_from(rows: list, tf_s: int) -> dict[str, Any]:
