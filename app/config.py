@@ -92,6 +92,13 @@ class Settings(BaseSettings):
     # sized down (or skipped) so the margin all automations block stays <= ₹X.
     ALGO_BOOK_MAX_DAY_LOSS: float = 0.0
     ALGO_BOOK_MAX_MARGIN: float = 0.0
+    # Algo Lab capital allocation. 0 = off: each automation sizes on its own
+    # portfolio.capital. Set ₹X to split X across the enabled (non-shadow)
+    # automations by inverse volatility of their daily P&L over the lookback,
+    # a strategy losing over the decay window getting half its weight.
+    ALGO_ALLOC_CAPITAL: float = 0.0
+    ALGO_ALLOC_LOOKBACK_DAYS: int = 60
+    ALGO_ALLOC_DECAY_DAYS: int = 20
 
     # ---------- Storage ----------
     # Ignored if TESTING=1 (in-memory sqlite is used).

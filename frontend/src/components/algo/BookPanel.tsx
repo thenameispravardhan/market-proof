@@ -11,12 +11,15 @@ export type Book = {
   day_pnl: number | null; limits: { max_day_loss: number | null; max_margin: number | null }; halted: boolean;
 };
 
+type Alloc = { capital: number | null; rows: { strategy_id: number; name: string; weight: number; capital: number; vol: number | null; decayed: boolean; recent: number }[] };
+
 const rs = (v: number | null | undefined) => (v == null ? "—" : `₹${Math.round(v).toLocaleString("en-IN")}`);
 const cls = (v: number | null | undefined) => (v == null ? "" : v >= 0 ? "pnl-pos" : "pnl-neg");
 
 export function BookPanel() {
   const qc = useQueryClient();
   const q = useQuery({ queryKey: ["algo", "book"], queryFn: () => api.get<Book>("/api/algo/book"), refetchInterval: 5000 });
+  const al = useQuery({ queryKey: ["algo", "allocation"], queryFn: () => api.get<Alloc>("/api/algo/allocation"), refetchInterval: 60000 });
   const [err, setErr] = useState<string | null>(null);
   const b = q.data;
   if (!b?.underlyings) return null;
@@ -46,6 +49,16 @@ export function BookPanel() {
             <tr key={u.symbol}><td>{u.symbol.replace(/^NSE:/, "")}</td><td className="mono">{u.positions}</td>
               <td className="mono">{u.delta == null ? "—" : u.delta.toFixed(2)}</td><td className="mono">{rs(u.margin)}</td>
               <td className={`mono ${cls(u.mtm)}`}>{rs(u.mtm)}</td></tr>))}
+          </tbody>
+        </table>
+      )}
+      {al.data?.capital && al.data.rows.length > 0 && (
+        <table style={{ marginTop: 8 }} data-testid="algo-allocation">
+          <thead><tr><th title={`₹${Math.round(al.data.capital).toLocaleString("en-IN")} split by inverse volatility of daily P&L (Settings → Capital & risk)`}>Allocation</th><th>Weight</th><th>Capital</th><th title="standard deviation of its daily net P&L over the lookback; — = too little history, the others' median is used">Daily vol</th><th>Recent net</th></tr></thead>
+          <tbody>{al.data.rows.map((r) => (
+            <tr key={r.strategy_id}><td>{r.name}{r.decayed && <span className="badge sell" style={{ marginLeft: 6 }} title="losing over the decay window: half weight">½</span>}</td>
+              <td className="mono">{(r.weight * 100).toFixed(1)}%</td><td className="mono">{rs(r.capital)}</td>
+              <td className="mono">{r.vol == null ? "—" : rs(r.vol)}</td><td className={`mono ${cls(r.recent)}`}>{rs(r.recent)}</td></tr>))}
           </tbody>
         </table>
       )}
