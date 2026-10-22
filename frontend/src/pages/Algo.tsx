@@ -2935,7 +2935,7 @@ export default function Algo() {
         bt.reset(); setMsg(null); setTab("builder");
       }} />}
       {tab === "data" && <><RecorderPanel /><DataTab /></>}
-      {tab === "research" && <ResearchTab timeframes={c.timeframes} onUse={(next, nm, tries) => {
+      {tab === "research" && <ResearchTab timeframes={c.timeframes} spec={tidy(spec)} range={range} onUse={(next, nm, tries) => {
         if (!okToReplace()) return;
         load(withDefaults(c.defaults, next as Partial<Spec>), nm, null, null, false);
         setTrials(tries);                   // the pairs scanned to find it count as tries on the idea
@@ -3126,6 +3126,7 @@ export default function Algo() {
                     <select value={inst.iv.source} onChange={(e) => updInst({ iv: { ...inst.iv, source: e.target.value } })}>
                       <option value="auto">auto (India VIX for indices, realised vol for stocks)</option>
                       <option value="vix">India VIX</option><option value="hv">20-day realised volatility</option><option value="fixed">fixed %</option>
+                      <option value="surface">recorded IV surface (where chains were recorded; flat IV elsewhere)</option>
                     </select>
                     {inst.iv.source === "fixed" && <NumInput width={48} value={inst.iv.value} onChange={(n) => updInst({ iv: { ...inst.iv, value: n ?? 15 } })} />}
                   </label>

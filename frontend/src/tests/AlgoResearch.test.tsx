@@ -76,6 +76,14 @@ function route(url: string, init?: RequestInit) {
   if (url.includes("/api/algo/trades")) return json({ trades: [] });
   if (url.includes("/api/algo/instrument")) return json({ symbol: "NSE:SBIN-EQ", name: "SBIN", fno: false, lot: null, weekly: false, futures: [], coverage: null });
   if (url.includes("/api/algo/research/pairs")) return json(PAIRS);
+  if (url.includes("/api/algo/research/surface/evaluate")) return json({
+    name: "NIFTY", days: 14, quotes: 52000, lag: 1, methods: ["surface", "flat_atm", "flat"], min_days: 10, beats_flat: true,
+    verdict: "the surface prices closer than flat IV", flat_source: "India VIX", elapsed_s: 3.1,
+    overall: { surface: { mae: 0.8, mape_pct: 2.1, inside_pct: 71 }, flat_atm: { mae: 3.4, mape_pct: 8.8, inside_pct: 22 }, flat: { mae: 4.1, mape_pct: 9.9, inside_pct: 15 } },
+    vs: { flat_atm: { days_won: 13, mean_edge: 2.6, ci95: [2.1, 3.0] }, flat: { days_won: 14, mean_edge: 3.3, ci95: [2.9, 3.7] } } });
+  if (url.includes("/api/algo/research/tick-replay")) return json({
+    replayable: true, trades: 40, replayed: 31, no_ticks: 9, agree: 28, agree_pct: 90.3, pnl_diff: -4200, ambiguous_candles: 5, ambiguous_right: 2,
+    flipped: { "TARGET->SL": 3 }, disagreements: [], notes: [] });
   if (url.includes("/api/algo/backtest")) return Promise.resolve(new Response(JSON.stringify({ detail: "stub" }), { status: 422 }));
   if (url.includes("/api/algo/research/check")) return json({ ...CARD, trials: (body.trials ?? 0) + 1, elapsed_s: 0.4 });
   if (url.includes("/api/algo/research/cards/7")) return json(CARD);
@@ -180,5 +188,24 @@ describe("Algo Lab research loop", () => {
     fireEvent.click(screen.getByText("▶ Run backtest"));
     await waitFor(() => expect(calls.filter((c) => c.url.includes("/api/algo/backtest")).length).toBe(2));
     expect("pair_leg" in calls.filter((c) => c.url.includes("/api/algo/backtest"))[1].body.spec).toBe(false);
+  });
+
+  it("checks the recorded surface against flat IV and replays the builder's exits on ticks", async () => {
+    mount();
+    await screen.findByDisplayValue(/EMA 9\/21/);
+    fireEvent.click(screen.getByRole("button", { name: "Research" }));
+    const sc = await screen.findByTestId("surface-check");
+    fireEvent.click(within(sc).getByText("Check against flat IV"));
+    expect((await within(sc).findByTestId("surface-verdict")).textContent).toContain("the surface prices closer than flat IV");
+    const ev = calls.find((c) => c.url.includes("/surface/evaluate"))!.body;
+    expect(ev).toMatchObject({ name: "NIFTY", lag: 1, start: expect.any(String), end: expect.any(String) });
+    expect(within(sc).getByText(/surface closer on 14\/14 days/)).toBeTruthy();
+    const tr = screen.getByTestId("tick-replay");
+    fireEvent.click(within(tr).getByText("Replay exits on ticks"));
+    const sum = await within(tr).findByTestId("replay-summary");
+    expect(sum.textContent).toContain("90.3% exited as the backtest said");
+    expect(sum.textContent).toContain("3 TARGET → SL");
+    const body = calls.find((c) => c.url.includes("/tick-replay"))!.body;
+    expect(body.spec.entry_long.conditions.length).toBeGreaterThan(0);
   });
 });

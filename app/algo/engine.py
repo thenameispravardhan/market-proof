@@ -90,7 +90,7 @@ DEFAULT_SPEC: dict[str, Any] = {
         "legs_long": [{"right": "CE", "action": "BUY", "strike": "ATM", "steps": 0, "premium": 100, "lots": 1}],
         "legs_short": [{"right": "PE", "action": "BUY", "strike": "ATM", "steps": 0, "premium": 100, "lots": 1}],
         "levels_on": "instrument",        # stop/target on the traded price, or on the underlying
-        "iv": {"source": "auto", "value": 15},  # backtest pricing: auto (VIX for indices) | hv | vix | fixed %
+        "iv": {"source": "auto", "value": 15},  # backtest pricing: auto (VIX for indices) | hv | vix | fixed % | surface
     },
     "stop_loss": {"type": "pct", "value": 1.0},
     "target": {"type": "pct", "value": 2.0},
@@ -292,8 +292,8 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("expiry is current|next and weekly|monthly")
     if inst["levels_on"] not in ("instrument", "underlying"):
         raise ValueError("levels_on is instrument or underlying")
-    if inst["iv"]["source"] not in ("auto", "hv", "vix", "fixed"):
-        raise ValueError("iv source is auto, hv, vix or fixed")
+    if inst["iv"]["source"] not in ("auto", "hv", "vix", "fixed", "surface"):
+        raise ValueError("iv source is auto, hv, vix, fixed or surface")
     inst["iv"]["value"] = _num(inst["iv"]["value"], "fixed IV %", 0.1)
     for k in ("put_skew", "call_skew"):           # IV points per 1% out of the money (backtests); 0 / absent = flat
         v = _num(inst["iv"].pop(k, None), k.replace("_", " "), 0, allow_none=True)
@@ -1348,13 +1348,27 @@ def prepare(d: dict, spec: dict) -> None:
             m = sum(window) / len(window)
             hv_by_day[k] = max(0.05, math.sqrt(sum((r - m) ** 2 for r in window) / (len(window) - 1)) * math.sqrt(252))
     hv = [hv_by_day.get((t + IST) // 86400, default) for t in d["t"]]
-    if src == "auto":           # implied vol where there is one: VIX for index options
+    surfaces = d.get("surfaces") if src == "surface" else None
+    if src in ("auto", "surface"):  # implied vol where there is one: VIX for index options
         src = "vix" if meta["name"] in fno.INDEX_LOTS else "hv"
     if src == "vix" and d.get("vix"):
         v = _align(d, d["vix"], d["vix"]["c"], {})
         d["iv"] = [x / 100 if x else h for x, h in zip(v, hv)]
     else:
         d["iv"] = hv
+    if surfaces:                    # a recorded surface on a candle replaces the flat IV there
+        d["iv"] = [SurfIV(sf.atm() or v, sf, t) if sf else v for v, sf, t in zip(d["iv"], surfaces, d["t"])]
+
+
+class SurfIV(float):
+    """A candle's IV when a recorded surface (app/research/surface.py) covers
+    it: the ATM level as a number, plus the surface every leg_iv() asks for
+    its own strike and expiry. Arithmetic on it is plain float arithmetic."""
+
+    def __new__(cls, atm: float, surf: Any, t: float) -> "SurfIV":
+        x = super().__new__(cls, atm)
+        x.surf, x.t = surf, t
+        return x
 
 
 def sim_legs(spec: dict, side: str, meta: dict, u: float, t: float, iv: float,
@@ -1387,7 +1401,7 @@ def sim_legs(spec: dict, side: str, meta: dict, u: float, t: float, iv: float,
         exp = fno.expiry_after(meta["name"], meta["exch"], inst["expiry_kind"], cfg.get("expiry") or inst["expiry"],
                                t, tdays)
         tyrs = fno.years_to(exp, t)
-        kiv = lambda k: leg_iv({"kind": cfg["right"], "K": k, **skew}, u, iv)  # noqa: E731
+        kiv = lambda k: leg_iv({"kind": cfg["right"], "K": k, "exp": exp, **skew}, u, iv)  # noqa: E731
         if cfg["strike"] == "PREMIUM":
             k_ = fno.strike_for_premium(u, step, cfg["right"], cfg["premium"],
                                         lambda k: fno.bs_price(u, k, tyrs, kiv(k), cfg["right"]))
@@ -1406,7 +1420,14 @@ def sim_legs(spec: dict, side: str, meta: dict, u: float, t: float, iv: float,
 def leg_iv(leg: dict, u: float, iv: float) -> float:
     """A backtest option leg's IV: the flat IV plus its skew — instrument.iv
     put_skew / call_skew IV points per 1% out of the money, measured at the
-    current spot (sticky moneyness). No skew on the leg = the flat IV."""
+    current spot (sticky moneyness). No skew on the leg = the flat IV. On a
+    candle a recorded surface covers, the surface's IV at the leg's strike and
+    expiry instead."""
+    surf = getattr(iv, "surf", None)
+    if surf is not None and leg.get("K"):
+        v = surf.iv(leg["K"], u, iv.t, leg.get("exp"))
+        if v:
+            return v
     sk = leg.get("skew")
     if not sk or iv is None:
         return iv

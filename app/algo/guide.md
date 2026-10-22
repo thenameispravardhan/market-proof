@@ -53,8 +53,9 @@ the JSON — the messages say exactly which value is wrong.
   switched off — then positions carry overnight until an exit rule closes them).
 * **Options in backtests are priced with Black-Scholes** from the underlying's
   real candles (Fyers keeps no history for expired contracts). IV comes from
-  India VIX (indices), the stock's realised volatility, or a fixed number —
-  option backtests are good estimates, not exact fills. Live trading uses the
+  India VIX (indices), the stock's realised volatility, a fixed number, or
+  — where option chains were recorded — the recorded IV surface; option
+  backtests are good estimates, not exact fills. Live trading uses the
   real option chain and real prices.
 * **One portfolio.** All symbols of a strategy share one capital pool;
   positions compete for it, `max_positions` caps how many are open at once.
@@ -87,7 +88,7 @@ works). Everything you leave out takes the default shown here:
       "legs_long":  [{"right": "CE", "action": "BUY", "strike": "ATM", "steps": 0, "premium": 100, "lots": 1}],
       "legs_short": [{"right": "PE", "action": "BUY", "strike": "ATM", "steps": 0, "premium": 100, "lots": 1}],
       "levels_on": "instrument",               // where stop / target are measured: instrument | underlying
-      "iv": {"source": "auto", "value": 15}    // backtest option pricing: auto | vix | hv | fixed (value %)
+      "iv": {"source": "auto", "value": 15}    // backtest option pricing: auto | vix | hv | fixed (value %) | surface
     },
     "stop_loss": {"type": "pct", "value": 1.0},
     "target":    {"type": "pct", "value": 2.0},
@@ -279,7 +280,11 @@ Other instrument keys:
   or `underlying` (spot). **Multi-leg positions must use `underlying`** (or
   set those levels to null and use MTM, leg stops or position rules).
 * `iv` — backtest option pricing: `auto` (India VIX for indices, 20-day
-  realised vol for stocks), `vix`, `hv`, or `fixed` with `value` (IV %).
+  realised vol for stocks), `vix`, `hv`, `fixed` with `value` (IV %), or
+  `surface`: on each candle, the smile of the latest chain snapshot recorded
+  at or before it (each leg at its own strike and expiry; Data → Research
+  recording must have been on), `auto` on candles no snapshot covers. Check
+  it beats flat IV first (Research → IV surface vs flat IV).
   Optional `put_skew` / `call_skew` (0-10): extra IV points per 1% out of the
   money, so wings price richer like the real smile (`put_skew: 0.8` = a put 2%
   below spot at IV + 1.6). Live trading uses the real chain, so it ignores them.
@@ -503,6 +508,13 @@ can't be switched on yet — the live half comes later.
   it never saw, half-life and today's z. Only pairs that hold on the last
   third load into the builder, as the one-leg strategy of 9.13, starting at
   as many tries as pairs were scanned.
+* **IV surface vs flat IV** (Research tab) — prices every recorded option
+  quote with the surface fitted a snapshot earlier and with flat IV, and
+  says which priced closer (mean error, share inside the bid-ask, days won
+  with a bootstrap CI). Needs 10+ recorded days to say yes.
+* **Tick replay of exits** (Research tab) — the builder's backtest, then each
+  fixed stop / target exit replayed on the recorded trade prints: which
+  level price really touched first, and the P&L that moves.
 * **Compare** — saved strategies side by side on the same range.
 * **Automations** — saved strategies start OFF and in **paper** mode; switch
   them on to paper-trade live, or to **LIVE** (real orders on Fyers) after
