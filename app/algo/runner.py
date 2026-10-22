@@ -90,7 +90,8 @@ def _snapshot() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
                 log.warning("algo.bad_spec", strategy=s.id, error=str(e))
                 continue
             strategies.append({"id": s.id, "name": s.name, "enabled": s.enabled, "mode": s.mode,
-                               "account_id": s.account_id, "spec": spec, "version": s.version or 1})
+                               "account_id": s.account_id, "spec": spec, "version": s.version or 1,
+                               "shadow_of": s.shadow_of})
         trades = [_row(t) for t in db.execute(
             select(AlgoTrade).where(AlgoTrade.status == "open")).scalars()]
     return strategies, trades
@@ -188,13 +189,15 @@ def _book(strategy_id: int, day_start: float) -> dict[str, float]:
 
 
 def _book_all(day_start: float) -> dict[str, float]:
-    """Every automation together: P&L realised today and the margin their
-    open positions block."""
+    """Every automation together (shadows are tests: left out): P&L realised
+    today and the margin their open positions block."""
+    book = select(AlgoStrategy.id).where(AlgoStrategy.shadow_of.is_(None))
     with db_session.SessionLocal() as db:
         today = db.execute(select(func.coalesce(func.sum(AlgoTrade.net_pnl), 0.0)).where(
-            AlgoTrade.status == "closed", AlgoTrade.exit_at >= _naive(day_start))).scalar_one()
+            AlgoTrade.status == "closed", AlgoTrade.exit_at >= _naive(day_start),
+            AlgoTrade.strategy_id.in_(book))).scalar_one()
         margin = db.execute(select(func.coalesce(func.sum(AlgoTrade.margin), 0.0)).where(
-            AlgoTrade.status == "open")).scalar_one()
+            AlgoTrade.status == "open", AlgoTrade.strategy_id.in_(book))).scalar_one()
     return {"today": float(today), "margin": float(margin)}
 
 
@@ -804,7 +807,8 @@ class AlgoRunner:
                     await self._exit(t, prices, hit, now)
         lim = get_settings().ALGO_BOOK_MAX_DAY_LOSS
         if lim and self._book_halt != day:
-            every = [t for t in (trades if book is None else book) if t["status"] == "open"]
+            every = [t for t in (trades if book is None else book) if t["status"] == "open"
+                     and not (by_id.get(t["strategy_id"]) or {}).get("shadow_of")]
             marks = [_mtm(t["legs"], prices) for t in every]
             if None not in marks:
                 pnl = (await asyncio.to_thread(_book_all, day_start))["today"] + sum(marks)
