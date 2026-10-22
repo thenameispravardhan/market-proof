@@ -670,6 +670,9 @@ class AlgoStrategy(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow,
                                                  nullable=False)
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)   # the ACTIVE version
+    # Backtests + optimiser combinations run on this research line: the
+    # Deflated Sharpe deflates by every try, not just the last sweep.
+    trials: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
 
 class AlgoStrategyVersion(Base):

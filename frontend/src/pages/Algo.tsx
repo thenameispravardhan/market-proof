@@ -165,7 +165,10 @@ type BtResult = {
   chart: { symbol: string; candles: number[][]; trades: BtTrade[]; overlays?: { label: string; price: boolean; values: (number | null)[] }[] };
   flow_source?: Record<string, number>;
   spec: Spec;
+  trials?: number;   // backtests + optimiser combos run on this idea so far, this one included
 };
+// Where the trial count lives: on the saved strategy (server) or in the unsaved draft (sent along).
+type TrialBody = { strategy_id: number } | { trials: number };
 type OptRow = { params: Record<string, number>; trades: number; win_rate: number; net_pnl: number; profit_factor: number | null; sharpe: number | null; max_drawdown: number; return_pct: number; expectancy: number; t_stat: number | null; oos: Summary | null };
 type Overfitting = {
   note?: string;
@@ -174,11 +177,12 @@ type Overfitting = {
   pbo?: { pbo: number; splits: number; n_configs: number } | null;
 } | null;
 type HeatCell = { params: Record<string, number>; value: number | null; trades: number };
-type OptResult = { combos: number; ranked: OptRow[]; too_few_trades: number; metric: string; notes: { symbol: string; note: string }[]; elapsed_s: number; oos_from: number | null; overfitting?: Overfitting; all?: HeatCell[] };
+type OptResult = { combos: number; ranked: OptRow[]; too_few_trades: number; metric: string; notes: { symbol: string; note: string }[]; elapsed_s: number; oos_from: number | null; overfitting?: Overfitting; all?: HeatCell[]; trials?: number };
 type WfFold = { is_from: number; oos_from: number; oos_to: number; params: Record<string, number> | null; is: Summary | null; is_value?: number | null; oos: Summary | null };
 type WfResult = {
   combos: number; metric: string; windows: number; anchored: boolean; folds: WfFold[]; wfe_pct: number | null; elapsed_s: number;
   oos: { trades: number; win_rate: number; net_pnl: number; profit_factor: number | null; sharpe: number | null; max_drawdown: number; max_drawdown_pct: number; equity: [number, number][] };
+  trials?: number;
 };
 const isWf = (r: OptResult | WfResult): r is WfResult => (r as WfResult).folds !== undefined;
 
@@ -198,7 +202,7 @@ export function overfittingLine(o: Overfitting | undefined): string | null {
   }
   return parts.length ? `Overfitting check: ${parts.join(" · ")}.` : null;
 }
-type Saved = { id: number; name: string; spec: Spec; enabled: boolean; mode: "paper" | "live"; account_id: number | null; closed_trades: number; realized_pnl: number; open_positions: number; version: number; versions: number };
+type Saved = { id: number; name: string; spec: Spec; enabled: boolean; mode: "paper" | "live"; account_id: number | null; closed_trades: number; realized_pnl: number; open_positions: number; version: number; versions: number; trials?: number };
 type Version = { version: number; spec: Spec; note: string | null; active: boolean; created_at: string | null; closed_trades: number; realized_pnl: number };
 type LiveLeg = { symbol: string; label?: string; act: number; qty: number; entry: number; exit?: number; ltp?: number | null };
 type LiveTrade = {
@@ -1675,6 +1679,12 @@ function Results({ r }: { r: BtResult }) {
         <div style={{ display: "flex", flexWrap: "wrap", gap: 18 }} data-testid="algo-risk-metrics">
           <Metric label="PSR" value={s.psr_pct == null ? "—" : `${num(s.psr_pct, 1)}%`} cls={s.psr_pct == null ? "" : s.psr_pct >= 95 ? "pnl-pos" : s.psr_pct < 50 ? "pnl-neg" : ""}
             hint="Probabilistic Sharpe: the chance the true Sharpe is above 0, given how many days you have and their skew / fat tails. ≥ 95% is the usual bar" />
+          {(() => {
+            const n = r.trials ?? 1, dsr = s.deflated_sharpe?.dsr as number | null | undefined;
+            return <Metric label={`DSR · ${n} ${n === 1 ? "try" : "tries"}`} value={dsr == null ? "—" : `${num(dsr * 100, 1)}%`}
+              cls={dsr == null ? "" : dsr >= 0.95 ? "pnl-pos" : dsr < 0.5 ? "pnl-neg" : ""}
+              hint="Deflated Sharpe: PSR measured against the best Sharpe luck alone would give after this many backtests and optimiser combinations on the idea. ≥ 95% is the bar — every extra try raises it" />;
+          })()}
           <Metric label="SQN" value={num(s.sqn)} cls={s.sqn == null ? "" : s.sqn >= 2 ? "pnl-pos" : s.sqn < 1 ? "pnl-neg" : ""} hint="System Quality Number: √n × mean / sd of trade P&L (n ≤ 100). 1.6–2 average, 2–3 good, > 3 excellent" />
           <Metric label="VaR 95% (1 day)" value={s.var95 == null ? "—" : inr(s.var95)} hint="a day worse than this happened on 5% of days (historical, needs 20+ days)" />
           <Metric label="CVaR 95%" value={s.cvar95 == null ? "—" : inr(s.cvar95)} cls={s.cvar95 == null ? "" : "pnl-neg"} hint="expected shortfall: the average of those worst 5% of days — what a bad day really costs" />
@@ -1914,7 +1924,7 @@ function WalkForward({ r, label, onApply }: { r: WfResult; label: (p: string) =>
   );
 }
 
-function Optimizer({ spec, cat, range, onApply }: { spec: Spec; cat: Catalog; range: { start: string; end: string }; onApply: (params: Record<string, number>) => void }) {
+function Optimizer({ spec, cat, range, onApply, trialBody, onTrials }: { spec: Spec; cat: Catalog; range: { start: string; end: string }; onApply: (params: Record<string, number>) => void; trialBody: TrialBody; onTrials: (n?: number) => void }) {
   const paths = useMemo(() => numericPaths(spec, cat), [spec, cat]);
   const [axes, setAxes] = useState<{ path: string; from: number; to: number; step: number }[]>([]);
   const [metric, setMetric] = useState("net_pnl");
@@ -1938,8 +1948,9 @@ function Optimizer({ spec, cat, range, onApply }: { spec: Spec; cat: Catalog; ra
       // clamped here, not per keystroke (typing "10" passes through "1")
       ...(mode === "wf" ? { walk_forward: { ...wf, windows: Math.max(2, Math.min(12, wf.windows)), is_mult: Math.max(0.5, Math.min(10, wf.is_mult)) } }
         : { oos_pct: oosParam(oos) }),
-      grid: axes.map((a) => ({ path: a.path, values: values(a) })),
+      grid: axes.map((a) => ({ path: a.path, values: values(a) })), ...trialBody,
     }),
+    onSuccess: (r) => onTrials(r.trials),
   });
   const opt = run.data && !isWf(run.data) ? run.data : null;
   const wfr = run.data && isWf(run.data) ? run.data : null;
@@ -2000,7 +2011,7 @@ function Optimizer({ spec, cat, range, onApply }: { spec: Spec; cat: Catalog; ra
           {overfittingLine(opt.overfitting) && (
             <div className="meta" style={{ marginBottom: 6 }} data-testid="overfitting-line">{overfittingLine(opt.overfitting)}</div>
           )}
-          <div className="meta" style={{ marginBottom: 6 }}>{opt.combos} combos in {opt.elapsed_s}s · {opt.too_few_trades} skipped for too few trades.{opt.oos_from ? ` Ranked on the in-sample period only (before ${ist(opt.oos_from)}); trust rows whose OOS columns hold up.` : " Beware overfitting — hold out an out-of-sample % or run a walk-forward to check."}</div>
+          <div className="meta" style={{ marginBottom: 6 }}>{opt.combos} combos in {opt.elapsed_s}s · {opt.too_few_trades} skipped for too few trades.{opt.trials ? ` ${opt.trials} tries on this idea so far (the Deflated Sharpe counts them all).` : ""}{opt.oos_from ? ` Ranked on the in-sample period only (before ${ist(opt.oos_from)}); trust rows whose OOS columns hold up.` : " Beware overfitting — hold out an out-of-sample % or run a walk-forward to check."}</div>
           {heat && <Heatmap cells={heat} metric={opt.metric} minTrades={minTrades} label={label} onApply={onApply} />}
           <div style={{ maxHeight: 480, overflow: "auto" }}>
             <table>
@@ -2445,6 +2456,7 @@ export default function Algo() {
   const [spec, setSpec] = useState<Spec | null>(null);
   const [name, setName] = useState("My strategy");
   const [editing, setEditing] = useState<number | null>(null);
+  const [trials, setTrials] = useState(0);                       // tries on this idea (a saved one's live on the server)
   const [viewing, setViewing] = useState<number | null>(null);   // version loaded into the builder
   const [range, setRange] = useState({ start: daysAgo(180), end: daysAgo(0) });
   const [msg, setMsg] = useState<string | null>(null);
@@ -2459,12 +2471,13 @@ export default function Algo() {
   // Restore the draft (or start from the server defaults + the first template).
   useEffect(() => {
     if (!cat.data || spec) return;
-    let draft: { spec: Partial<Spec>; name: string; editing: number | null; viewing?: number | null; baseline?: string | null } | null = null;
+    let draft: { spec: Partial<Spec>; name: string; editing: number | null; viewing?: number | null; baseline?: string | null; trials?: number } | null = null;
     try { draft = JSON.parse(localStorage.getItem(DRAFT_KEY) ?? "null"); } catch { /* private mode */ }
     if (draft?.spec) {
       setSpec(withDefaults(cat.data.defaults, draft.spec));
       setName(draft.name);
       setEditing(draft.editing);
+      setTrials(draft.trials ?? 0);
       setViewing(draft.viewing ?? null);
       setBaseline(draft.baseline ?? null);
     } else {
@@ -2476,10 +2489,16 @@ export default function Algo() {
   }, [cat.data, spec]);
   useEffect(() => {
     if (!spec) return;
-    try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ spec, name, editing, viewing, baseline })); } catch { /* ignore */ }
-  }, [spec, name, editing, viewing, baseline]);
+    try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ spec, name, editing, viewing, baseline, trials })); } catch { /* ignore */ }
+  }, [spec, name, editing, viewing, baseline, trials]);
   const strategies = useQuery({ queryKey: ["algo", "strategies"], queryFn: () => api.get<{ strategies: Saved[] }>("/api/algo/strategies") });
   const current = editing ? strategies.data?.strategies.find((x) => x.id === editing) : undefined;
+  const trialBody: TrialBody = editing ? { strategy_id: editing } : { trials };
+  const gotTrials = (n?: number) => {
+    if (n == null) return;
+    setTrials(n);
+    if (editing) qc.invalidateQueries({ queryKey: ["algo", "strategies"] });   // the saved count moved on the server
+  };
 
   const first = spec?.symbols[0];
   const info = useQuery({
@@ -2489,7 +2508,8 @@ export default function Algo() {
 
   const bt = useMutation({
     onMutate: () => setBtKey(JSON.stringify({ spec, range, oosPct })),
-    mutationFn: () => longPost<BtResult>("/api/algo/backtest", { spec: tidy(spec!), ...range, oos_pct: oosParam(oosPct) }),
+    mutationFn: () => longPost<BtResult>("/api/algo/backtest", { spec: tidy(spec!), ...range, oos_pct: oosParam(oosPct), ...trialBody }),
+    onSuccess: (r) => gotTrials(r.trials),
   });
   const versions = useQuery({
     queryKey: ["algo", "versions", editing], enabled: !!editing,
@@ -2499,7 +2519,7 @@ export default function Algo() {
     mutationFn: async (asNew: boolean) => {
       const body = { name, spec: tidy(spec!) };
       if (!asNew && editing) return api.put<Saved>(`/api/algo/strategies/${editing}`, body);
-      return api.post<Saved>("/api/algo/strategies", body);
+      return api.post<Saved>("/api/algo/strategies", { ...body, trials });   // the draft's tries come with it
     },
     onSuccess: (s, asNew) => {
       const unchanged = !asNew && s.version === versions.data?.active;
@@ -2551,6 +2571,7 @@ export default function Algo() {
   // Put a strategy into the builder; `clean` = it matches what is saved (or is a fresh template).
   const load = (next: Spec, nm: string, ed: number | null, vw: number | null, clean = true) => {
     setSpec(next); setName(nm); setEditing(ed); setViewing(vw); setBaseline(clean ? draftKey(next, nm) : null);
+    setTrials(ed ? strategies.data?.strategies.find((x) => x.id === ed)?.trials ?? 0 : 0);   // a new idea starts at 0
   };
   const saveVersion = () => {
     if (current?.enabled && !window.confirm(`“${current.name}” is switched on${current.mode === "live" ? " in LIVE (real money)" : ""}. Saving makes the new version trade from the next candle. Save?`)) return;
@@ -2644,7 +2665,7 @@ export default function Algo() {
       {/* Optimise and Compare stay mounted so their results survive a trip to the builder and back. */}
       <div hidden={tab !== "compare"}><CompareTab cat={c} range={range} draft={spec} /></div>
       <div hidden={tab !== "optimize"}>
-        <Optimizer spec={spec} cat={c} range={range} onApply={(params) => {
+        <Optimizer spec={spec} cat={c} range={range} trialBody={trialBody} onTrials={gotTrials} onApply={(params) => {
           const s = clone(spec);
           Object.entries(params).forEach(([p, v]) => setPath(s, p, v));
           setSpec(s);
@@ -3001,6 +3022,7 @@ export default function Algo() {
               <button type="button" className="primary" disabled={bt.isPending} onClick={() => { setMsg(null); bt.mutate(); }}>
                 {bt.isPending ? "Backtesting… (downloads missing candles first)" : "▶ Run backtest"}
               </button>
+              {trials > 0 && <span className="meta" data-testid="algo-trials" title="backtests + optimiser combinations run on this idea (kept with the draft and the saved strategy). The Deflated Sharpe gets stricter with every one">{trials} {trials === 1 ? "try" : "tries"} so far</span>}
               {editing && <button type="button" disabled={save.isPending || !dirty} onClick={saveVersion}
                 title={dirty ? "keeps every earlier version — switch back any time" : "no changes to save"}>Save as v{(versions.data?.versions[0]?.version ?? 0) + 1}</button>}
               <button type="button" disabled={save.isPending} onClick={() => save.mutate(true)}>Save as new strategy</button>

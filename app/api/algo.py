@@ -29,7 +29,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -112,6 +112,28 @@ def _guard(spec: dict[str, Any], start: int, end: int, combos: int = 1) -> int:
             f"optimisation too heavy: {combos} combinations x ~{est:,} candles. Narrow the grid "
             f"or the date range (limit {MAX_BAR_RUNS:,} candle-runs)."))
     return est
+
+
+def _bump_trials(body: dict[str, Any], n: int) -> int:
+    """Tries on this research line so far, `n` more included. A saved
+    strategy's count lives on it (each backtest +1, each optimiser
+    combination +1); an unsaved draft sends its own `trials`. The Deflated
+    Sharpe deflates by all of them, not just the last sweep."""
+    from app.db import session as dbs
+
+    sid = body.get("strategy_id")
+    if sid:
+        with dbs.SessionLocal() as db:
+            db.execute(update(AlgoStrategy).where(AlgoStrategy.id == int(sid))       # not an edit: updated_at stays
+                       .values(trials=AlgoStrategy.trials + n, updated_at=AlgoStrategy.updated_at))
+            db.commit()
+            got = db.execute(select(AlgoStrategy.trials).where(AlgoStrategy.id == int(sid))).scalar_one_or_none()
+        if got is not None:
+            return got
+    try:
+        return max(0, int(body.get("trials") or 0)) + n
+    except (TypeError, ValueError):
+        return n
 
 
 def _oos_pct(body: dict[str, Any]) -> float:
@@ -212,10 +234,14 @@ async def backtest(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         t0 = time.monotonic()
         bars, notes, trade_from = await _assemble(spec, start, end)
         oos_from = _oos_from(bars, trade_from, pct)
+        trials = await asyncio.to_thread(_bump_trials, body, 1)
         try:
             caches: dict[str, dict] = {}
             res = await asyncio.to_thread(engine.run, spec, bars, caches, trade_from, oos_from)
             res["monte_carlo"] = await asyncio.to_thread(engine.monte_carlo, res["trades"], spec["portfolio"]["capital"])
+            res["trials"] = trials
+            res["stats"]["deflated_sharpe"] = await asyncio.to_thread(
+                engine.trial_dsr, res["trades"], bars, spec["portfolio"]["capital"], trials, trade_from)
         except (ValueError, KeyError, ZeroDivisionError) as e:
             raise HTTPException(422, detail=f"backtest: {e}")
     chart_sym = body.get("chart_symbol") if body.get("chart_symbol") in bars else next(iter(bars))
@@ -251,6 +277,7 @@ async def optimize(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         t0 = time.monotonic()
         bars, notes, trade_from = await _assemble(spec, start, end)
         oos_from = None if wf else _oos_from(bars, trade_from, pct)
+        trials = await asyncio.to_thread(_bump_trials, body, combos)
         try:
             metric, min_trades = str(body.get("metric") or "net_pnl"), int(body.get("min_trades") or 5)
             if wf:
@@ -259,10 +286,10 @@ async def optimize(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
                                               bool(wf.get("anchored")))
             else:
                 res = await asyncio.to_thread(engine.optimize, spec, bars, grid, metric, min_trades,
-                                              trade_from, oos_from)
+                                              trade_from, oos_from, trials - combos)
         except (ValueError, KeyError, IndexError, TypeError, ZeroDivisionError, AttributeError) as e:
             raise HTTPException(422, detail=f"optimize: {e}")
-    return {**res, "notes": notes, "elapsed_s": round(time.monotonic() - t0, 2), "oos_from": oos_from}
+    return {**res, "notes": notes, "elapsed_s": round(time.monotonic() - t0, 2), "oos_from": oos_from, "trials": trials}
 
 
 @router.get("/instrument")
@@ -477,7 +504,7 @@ def _ser(s: AlgoStrategy, db: Session) -> dict[str, Any]:
         AlgoStrategyVersion.strategy_id == s.id)).scalar_one() or 1
     return {"id": s.id, "name": s.name, "spec": s.spec, "enabled": s.enabled, "mode": s.mode,
             "account_id": s.account_id, "closed_trades": agg[0], "realized_pnl": round(agg[1], 2),
-            "open_positions": open_n, "version": s.version or 1, "versions": versions,
+            "open_positions": open_n, "version": s.version or 1, "versions": versions, "trials": s.trials or 0,
             "created_at": s.created_at.isoformat() if s.created_at else None,
             "updated_at": s.updated_at.isoformat() if s.updated_at else None}
 
@@ -506,7 +533,8 @@ def create_strategy(body: dict[str, Any] = Body(...), db: Session = Depends(get_
         raise HTTPException(422, detail="name is required (max 128 chars)")
     if db.execute(select(AlgoStrategy).where(AlgoStrategy.name == name)).scalar_one_or_none():
         raise HTTPException(409, detail=f"a strategy named {name!r} already exists")
-    s = AlgoStrategy(name=name, spec=_spec(body.get("spec")), enabled=False, mode="paper", version=1)
+    s = AlgoStrategy(name=name, spec=_spec(body.get("spec")), enabled=False, mode="paper", version=1,
+                     trials=_bump_trials({"trials": body.get("trials")}, 0))     # a draft's tries come with it
     db.add(s)
     db.flush()
     db.add(AlgoStrategyVersion(strategy_id=s.id, version=1, spec=s.spec, note=body.get("note")))
