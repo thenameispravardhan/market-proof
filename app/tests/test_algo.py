@@ -1385,7 +1385,11 @@ def test_every_guide_example_backtests_on_synthetic_candles():
     vix = _sessions(40, 14.0, seed=11)
     for b in re.findall(r"```json\n(.*?)\n```", guide.text(), re.S):
         spec = engine.normalize(json.loads(b)["spec"])
-        data = {}
+        data, xs = {}, {}
+        for j, (ref, tfs) in enumerate(engine.ref_frames(spec).items()):   # other symbols the conditions read
+            m1 = _sessions(40, 24000.0, seed=100 + j)
+            xs[ref] = _agg(m1, spec["timeframe"]) | {"tf_min": spec["timeframe"],
+                                                     "htf": {tf: _agg(m1, tf) for tf in tfs - {spec["timeframe"]}}}
         for k, sym in enumerate(spec["symbols"]):
             name = fno.fno_name(sym)
             m1 = _sessions(40, 24000.0 if name in fno.INDEX_LOTS else 1500.0, seed=k)
@@ -1399,6 +1403,8 @@ def test_every_guide_example_backtests_on_synthetic_candles():
                     d["htf"][tf]["vix"] = _agg(vix, tf)
             d["meta"] = {"symbol": sym, "name": name, "exch": fno.exchange_of(sym), "lot": fno.lot_size(name),
                          "step": fno.default_step(name, d["c"][-1])}
+            if xs:
+                d["xs"] = xs
             data[sym] = d
         res = engine.run(spec, data, trade_from=data[spec["symbols"][0]]["t"][0] + 5 * 86400)
         assert res["stats"]["trades"] > 0, json.loads(b)["name"]          # an example that can never fire teaches nothing
