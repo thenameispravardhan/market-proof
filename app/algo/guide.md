@@ -26,6 +26,8 @@ The attached guide describes the strategy JSON exactly. Follow it strictly:
 - Symbols are Fyers symbols such as "NSE:SBIN-EQ" or "NSE:NIFTY50-INDEX".
 - Option positions: multi-leg positions need "levels_on": "underlying" or stop_loss /
   target set to null (manage them with mtm, per-leg sl_pct / tg_pct or position_rules).
+- A candle's BODY is abs(close - open) (see 4.5); PRICE "range" is high - low, wicks included.
+- Two indicators that should cross (EMA 5 / EMA 24) use the same source unless I say otherwise.
 - Keep it as simple as the idea allows; leave out anything not needed (defaults apply).
 - After the JSON, list in 2-3 lines any assumption you made.
 
@@ -110,8 +112,11 @@ works). Everything you leave out takes the default shown here:
 ```
 
 Optional sections (left out = off): `scale_out`, `margin`, `position_rules`,
-`session.days`, `mtm.stop_pct` / `mtm.target_pct`, `instrument.on_leg_stop`
-and the per-leg keys `delta`, `expiry`, `sl_pct`, `tg_pct`.
+`rank` (7), `guard` (6.5, live only), `pair_leg` (6.8), `universe` (7.1),
+`entry_order.limit` (6.7, live only), `session.days`, `mtm.stop_pct` /
+`mtm.target_pct`, `instrument.on_leg_stop`, `instrument.iv.put_skew` /
+`call_skew`, and the per-leg keys `delta`, `expiry`, `sl_pct`, `tg_pct`,
+`reentries`, `roll`, `hedge` (5.1).
 
 ---
 
@@ -240,6 +245,26 @@ restarts the window.
   50-candle average): `{"left": {"math": "/", "a": {"ind": "PRICE"}, "b": {"ind": "PRICE", "symbol": "NSE:NIFTY50-INDEX"}, "xf": "zscore", "xn": 50}, "op": ">", "right": {"value": 2}}`.
   The same with a peer stock as `b` is a pairs spread.
 * Steep cross: EMA 9 crosses above EMA 21 **and** `{"left": {"ind": "EMA", "params": {"period": 9}, "xf": "angle", "xn": 3}, "op": "between", "right": {"value": 30}, "right2": {"value": 45}}`.
+* **Candle body** — `abs(close − open)`, built from two PRICE operands:
+  `{"math": "-", "a": {"ind": "PRICE", "params": {"source": "close"}}, "b": {"ind": "PRICE", "params": {"source": "open"}}, "xf": "abs"}`.
+  The **previous candle's** body is the same with `"offset": 1` on both `a`
+  and `b`. Body smaller than the previous candle's:
+
+  ```jsonc
+  {"left":  {"math": "-", "a": {"ind": "PRICE", "params": {"source": "close"}}, "b": {"ind": "PRICE", "params": {"source": "open"}}, "xf": "abs"},
+   "op": "<",
+   "right": {"math": "-", "a": {"ind": "PRICE", "params": {"source": "close"}, "offset": 1}, "b": {"ind": "PRICE", "params": {"source": "open"}, "offset": 1}, "xf": "abs"}}
+  ```
+
+  Don't use `PRICE` `source: "range"` for this: `range` is **high − low**
+  (the whole candle, wicks included), not the body.
+* Bullish / bearish candle: `{"left": {"ind": "PRICE", "params": {"source": "close"}}, "op": ">", "right": {"ind": "PRICE", "params": {"source": "open"}}}` (`<` for bearish).
+* Body at least half the candle (a strong candle, small wicks): left = the
+  body above, `op` `>`, right = `{"math": "*", "a": {"ind": "PRICE", "params": {"source": "range"}}, "b": {"value": 0.5}}`.
+* Upper wick on a bullish candle is `high − close` (bearish: `high − open`):
+  `{"math": "-", "a": {"ind": "PRICE", "params": {"source": "high"}}, "b": {"ind": "PRICE", "params": {"source": "close"}}}`.
+  There is no `max` combiner, so pair it with the bullish-candle condition
+  (lower wick: `open − low` bullish, `close − low` bearish).
 
 ---
 
@@ -414,8 +439,12 @@ uses implied volatility from the real option prices.
   positions marked to market), entries rejected today and the median slippage
   of its last 20 live fills (needs 10+). A breach switches it OFF — audited,
   with a risk-halt alert; `pause` keeps managing its open positions,
-  `flatten` closes them (reason `GUARD`). Switching it back on is yours.
-  Backtests ignore it.
+  `flatten` closes them (reason `GUARD`). Switching it back on is yours;
+  the guard then counts only from that pause on (old losses, rejects and
+  fills don't trip it again a minute later). Backtests ignore it. All three
+  limits are optional; set the ones you want. Sensible start: max drawdown
+  ≈ 3× the worst day in the backtest, `max_rejects` 3, `max_slippage_pct`
+  ≈ 2-3× the backtest's `costs.slippage_pct`.
 
 ### 6.6 Session
 
@@ -581,14 +610,115 @@ members.
     the real size of the stored days, against the free space and the
     disk guard's floor, and says whether it fits.
 
+### 8.1 Running automations — the live desk (Automations tab)
+
+What happens after a strategy passes its research check. Every panel below
+is on the **Automations** tab; the ₹ limits are in **Settings → Capital &
+risk** (0 = off for each).
+
+**Lifecycle — the order to do it in**
+
+1. **Backtest → research check.** Only a strategy that passes (a card in the
+   Research tab) should go further. Set `costs.slippage_pct` realistically
+   (options 0.3-1%), not the 0.02% default.
+2. **Save, switch on in paper.** Paper fills at the live quote — no real
+   orders. Leave it running for at least 2-4 weeks.
+3. **Watch drift and fills** (below) every few days. A strategy whose paper
+   trades don't match its backtest is not ready, however good the backtest.
+4. **Add a `guard`** (6.5) before LIVE.
+5. **LIVE** — type `LIVE` to confirm; start at 1 lot. Fyers must be logged in
+   that morning (the token expires daily) or entries are blocked with no
+   live price.
+6. **Change it through a shadow test**, never by editing the live version.
+
+**Versions and shadow tests.** Every save is a new version; the trade log
+records which version took each trade. On a saved strategy, open a version
+and press **shadow-test vN**: that version runs as its own automation, in
+**paper**, beside the active one, on the same live market. Its row shows
+"shadow of …" with a **compare** (closed trades and net P&L of each since the
+shadow started). **promote** makes the shadow's rules the parent's active
+version (re-using an identical existing version, else a new one) and stops
+the shadow; the parent's open positions keep the levels they were opened
+with. A shadow can't have its own shadow, can't be LIVE, and is left out of
+the book, the margin cap and the allocation. Promoting into a LIVE parent is
+refused when its square-off is after the live limit (15:15).
+
+**Live vs backtest drift** (Drift panel, last 1-60 days). Each version that
+traded is backtested over exactly the days it traded — same engine, real
+candles — and every live / paper trade is put beside the backtest's,
+matched by symbol, side and an entry within one candle:
+
+| you see | it means |
+|---|---|
+| matched, same reason, small gap | the backtest describes this strategy — good |
+| matched, `entry_gap_pct` > 0 | live filled worse than the backtest (equity / futures; + = cost you) — raise `slippage_pct` |
+| matched, different exit reason | intrabar order (stop vs target in one candle) or a quote the candles never showed |
+| **live only** | a manual action, or the backtest's data differs from the live candles |
+| **backtest only** (a miss) | the runner was off, no live price (Fyers token), a rejected order, a guard / book stop |
+
+Option positions get no entry gap % (premium and spot can't be compared on
+one scale) — use Fills vs quotes for them.
+
+**Fills vs quotes** (TCA, last N days, LIVE orders only). For every live fill:
+the price you got against the quote the runner decided at, per strategy and
+instrument kind, signed so **+ = it cost you**, next to the `slippage_pct`
+that strategy's backtests assume. Measured above assumed = the backtest
+flatters the strategy; raise `costs.slippage_pct` to the measured value and
+backtest again. Paper fills are the quote, so they show nothing here.
+
+**The book** (Book panel). Every automation's open positions as one book,
+per underlying: positions, **net delta** (in lots; shares for cash), margin
+blocked and MTM — plus the book's day P&L (realised today + open MTM). A
+delta that can't be priced shows `—`, never a guess. Shadows are left out.
+
+| setting | what it does |
+|---|---|
+| `ALGO_BOOK_MAX_DAY_LOSS` ₹ | the whole book's day P&L at or below −₹X — or its realised loss alone — flattens **every** automation (reason `BOOK_MAX_LOSS`) and stops all automation entries **until tomorrow**. The halt is written to the audit log, so a restart doesn't undo it. |
+| `ALGO_BOOK_MAX_MARGIN` ₹ | an entry is sized down (whole lots / sets) or skipped so the margin all automations block together stays ≤ ₹X. Per-strategy `portfolio.capital` still applies on top. |
+| **Kill switch** (button) | flattens every automation's open position now (reason `BOOK_KILL`) and stops all automation entries until tomorrow. The news bot and the Trade page are untouched. |
+
+`daily.max_loss` in a spec stops that one strategy; the book limits stop all
+of them. Use both: the spec's for each idea, the book's for the account.
+
+**Capital allocation** (`ALGO_ALLOC_CAPITAL` ₹, 0 = off). Off, each
+automation sizes on its own `portfolio.capital`. On, ₹X is split once a day
+across the switched-on, non-shadow automations by **inverse volatility** of
+their daily net P&L over `ALGO_ALLOC_LOOKBACK_DAYS` (default 60 weekdays): a
+steadier strategy gets more. One with fewer than 10 trading days borrows the
+others' median volatility; one losing money over `ALGO_ALLOC_DECAY_DAYS`
+(default 20) gets **half** its weight. Weights sum to 1; the split is worked
+out again when the setting or the set of switched-on automations changes
+(one switched on mid-day gets its share). The Allocation table shows each
+weight, capital, daily vol and recent net. Wait until 3+ strategies have a
+live track record before switching it on — with one or two it only adds
+noise.
+
+**Nightly re-validation flags** (Research tab, 8) don't switch anything off:
+read the flag, then pause the strategy yourself or shadow-test a fix.
+
+**Going-live checklist**
+
+* research card passed; `slippage_pct` at least what Fills vs quotes measures;
+* 2-4 weeks of paper with drift mostly "matched";
+* `guard` set; `daily.max_loss` set; `ALGO_BOOK_MAX_DAY_LOSS` set for the account;
+* `session.square_off` ≤ 15:15; 1 lot to start;
+* Fyers logged in today; no open manual position on the same contract.
+
 ### Exit reasons you will see
 
 `SL`, `TARGET`, `TRAIL`, `BREAKEVEN`, `SCALE_OUT_n`, `MTM_SL`, `MTM_TARGET`,
 `MTM_TRAIL`, `SIGNAL` (exit conditions), `TIME_STOP` (max_bars),
 `RULE_<METRIC>` (position rule), `LEG_SL` / `LEG_TARGET` / `LEG_COST`
-(a leg's own stop / target / cost stop), `DAILY_MAX_LOSS`, `DAILY_TARGET`,
-`SQUARE_OFF`, `EOD` (a new day began), `END` (end of the data), and live
-only `MANUAL`, `STALE_SESSION`, `CLOSED_EXTERNAL`.
+(a leg's own stop / target / cost stop), `LEG_ROLL` (a leg rolled out),
+`DAILY_MAX_LOSS`, `DAILY_TARGET`, `SQUARE_OFF`, `EOD` (a new day began),
+`END` (end of the data), and live only `MANUAL`, `STALE_SESSION`,
+`CLOSED_EXTERNAL`, `GUARD` (its guard flattened it), `BOOK_MAX_LOSS` (the
+book's day loss limit), `BOOK_KILL` (the kill switch).
+
+**A backtest where every exit is `SQUARE_OFF`** usually means the stop and
+target can never be reached — e.g. `levels_on: "underlying"` with option-sized
+percentages (15% of NIFTY is ~3,700 points). Use small % for spot, or
+`levels_on: "instrument"` for % of the premium.
 
 ### Things the validator rejects (fix these first)
 
@@ -1028,3 +1158,59 @@ when several fire on one candle, the two with the strongest 20-candle ROC.
   }
 }
 ```
+
+### 9.16 EMA 5 / 24 cross with RSI + ADX, small-body candle — buy a call or a put
+
+Buy side only: an ATM call when EMA 5 crosses above EMA 24 with RSI above 55
+and ADX above 25, on a candle whose body is smaller than the previous
+candle's (a quiet cross, not a spike); an ATM put on the mirror image (cross
+below, RSI below 45). Stop / target on NIFTY spot (0.3% / 0.6%), so they can
+actually be reached; 0.5% slippage because it trades options; a guard for
+when it goes live.
+
+```json
+{
+  "name": "EMA 5/24 RSI+ADX small body - buy CE or PE",
+  "spec": {
+    "symbols": ["NSE:NIFTY50-INDEX"],
+    "timeframe": 5,
+    "direction": "both",
+    "entry_long": {"logic": "AND", "conditions": [
+      {"left": {"ind": "EMA", "params": {"period": 5}}, "op": "crosses_above", "right": {"ind": "EMA", "params": {"period": 24}}},
+      {"left": {"ind": "RSI", "params": {"period": 14}}, "op": ">", "right": {"value": 55}},
+      {"left": {"ind": "ADX", "params": {"period": 14}, "field": "adx"}, "op": ">", "right": {"value": 25}},
+      {"left":  {"math": "-", "a": {"ind": "PRICE", "params": {"source": "close"}}, "b": {"ind": "PRICE", "params": {"source": "open"}}, "xf": "abs"},
+       "op": "<",
+       "right": {"math": "-", "a": {"ind": "PRICE", "params": {"source": "close"}, "offset": 1}, "b": {"ind": "PRICE", "params": {"source": "open"}, "offset": 1}, "xf": "abs"}}
+    ]},
+    "entry_short": {"logic": "AND", "conditions": [
+      {"left": {"ind": "EMA", "params": {"period": 5}}, "op": "crosses_below", "right": {"ind": "EMA", "params": {"period": 24}}},
+      {"left": {"ind": "RSI", "params": {"period": 14}}, "op": "<", "right": {"value": 45}},
+      {"left": {"ind": "ADX", "params": {"period": 14}, "field": "adx"}, "op": ">", "right": {"value": 25}},
+      {"left":  {"math": "-", "a": {"ind": "PRICE", "params": {"source": "close"}}, "b": {"ind": "PRICE", "params": {"source": "open"}}, "xf": "abs"},
+       "op": "<",
+       "right": {"math": "-", "a": {"ind": "PRICE", "params": {"source": "close"}, "offset": 1}, "b": {"ind": "PRICE", "params": {"source": "open"}, "offset": 1}, "xf": "abs"}}
+    ]},
+    "instrument": {"type": "option", "expiry": "current", "expiry_kind": "weekly", "levels_on": "underlying",
+                   "legs_long":  [{"right": "CE", "action": "BUY", "strike": "ATM", "lots": 1}],
+                   "legs_short": [{"right": "PE", "action": "BUY", "strike": "ATM", "lots": 1}]},
+    "stop_loss": {"type": "pct", "value": 0.3},
+    "target": {"type": "pct", "value": 0.6},
+    "daily": {"max_loss": 5000},
+    "session": {"start": "09:20", "end": "13:30", "square_off": "15:13"},
+    "max_trades_per_day": 3,
+    "cooldown_bars": 2,
+    "sizing": {"mode": "lots", "value": 1},
+    "portfolio": {"capital": 150000, "max_positions": 1, "compounding": false},
+    "costs": {"slippage_pct": 0.5, "charges": true},
+    "guard": {"max_drawdown": 15000, "max_rejects": 3, "max_slippage_pct": 1.5, "on_breach": "pause"}
+  }
+}
+```
+
+Note the put side: `direction` "short" only names which signal fired — the
+leg is still a BUY (of a put). This is a template, not a proven edge: on
+NIFTY 5-minute, Jan-Jul 2026, both sides together made 30 trades, 30% won,
+net −₹7,000 (profit factor 0.85); the call side alone (`"direction": "long"`)
+made 20 trades, net +₹5,000 — too few trades to mean anything. Put it through
+the research check before you paper-trade it.
