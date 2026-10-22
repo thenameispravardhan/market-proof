@@ -2359,9 +2359,20 @@ type Universe = {
   next_futures: "always" | "roll" | "off"; index_options: boolean; index_strikes: number; index_next_strikes: number;
   stock_options: boolean; stock_strikes: number; stock_next_expiry: "roll" | "off"; roll_days: number;
 };
-type FlowCfg = { enabled: boolean; symbols: string[]; retention_days: number; raw_days: number; budget: number; min_free_gb: number; universe: Universe };
+type Chains = { enabled: boolean; underlyings: string[]; strategies: boolean; strikes: number; expiries: number; interval_s: number };
+type LongList = { enabled: boolean; symbols: string[]; strategies: boolean; days: number; raw_days: number; raw_strikes: number };
+type FlowCfg = { enabled: boolean; symbols: string[]; retention_days: number; raw_days: number; budget: number; min_free_gb: number; universe: Universe;
+  chains: Chains; long: LongList };
+type Capacity = {
+  per_day_mb: { full: number; raw: number; long: number; long_raw: number; today_so_far: number };
+  days: { full: number; raw: number; long: number; long_raw: number };
+  tiers_gb: { full: number; raw: number; long: number; long_raw: number };
+  projected_gb: number; now_gb: number; disk_total_gb: number; free_gb: number; min_free_gb: number; room_gb: number;
+  fits: boolean; estimate: string[]; note: string | null; error?: string;
+};
 type PlanSummary = { at?: number; used?: number; budget?: number; classes?: Record<string, number>; wanted?: Record<string, number>;
-  dropped?: Record<string, number>; no_price?: string[]; lists?: Record<string, { label: string; n: number; source: string }> };
+  dropped?: Record<string, number>; no_price?: string[]; lists?: Record<string, { label: string; n: number; source: string }>;
+  chains?: { names: string[]; keys: number }; long?: number; raw_flagged?: number };
 type FlowStatus = {
   enabled: boolean; config: FlowCfg; config_symbols: string[]; strategy_symbols: string[];
   collector: {
@@ -2371,18 +2382,77 @@ type FlowStatus = {
     stream?: { connected: boolean; reason: string | null; subscribed: number; record_only: number; limit_error: string | null; rejected_count: number } | null;
     today?: { keys: number; trades: number; buy: number; sell: number; unk: number };
     supervisor?: { running: boolean; restarts: number; last_exit: { at: number; rc: number } | null } | null;
+    chains?: { keys: number; quoted: number; snapshots: number; last: number | null; interval_s: number };
   };
-  days: { count: number; first: string | null; last: string | null; retention: number };
-  disk_mb: number; lists: Record<string, string>; keys_today: number;
+  days: { count: number; first: string | null; last: string | null; retention: number; long?: { count: number; first: string | null } };
+  disk_mb: number; capacity?: Capacity; lists: Record<string, string>; keys_today: number;
   top: [string, number, number, number, number, number, number][];
 };
 
 const CLASS_LABEL: Record<string, string> = {
-  focus: "hand-picked", index: "indices", index_fut: "index futures", index_opt: "index options", stock_fut: "stock futures",
+  focus: "hand-picked", chain: "option chains", index: "indices", index_fut: "index futures", index_opt: "index options", stock_fut: "stock futures",
   stocks: "stocks", index_opt2: "index options (next expiry)", fut_next: "next-month futures", stock_opt: "stock options",
   stock_opt2: "stock options (next expiry)", sticky: "earlier strikes",
 };
 const ymdLabel = (d: string | null) => (d ? `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6)}` : "—");
+const listIn = (v: string) => Array.from(new Set(v.split(/[\s,]+/).map((x) => x.trim().toUpperCase()).filter(Boolean)));
+
+// Research recording (B0): option-chain snapshots + the short list kept past the window, and whether it all fits the disk.
+function ResearchRecording({ cfg, st, save, numIn }: {
+  cfg: FlowCfg; st: FlowStatus | undefined;
+  save: (patch: { chains?: Partial<Chains>; long?: Partial<LongList> }) => Promise<void>;
+  numIn: (value: number, onSave: (n: number) => void, min: number, max: number, testId: string, w?: number) => JSX.Element;
+}) {
+  const ch = cfg.chains;
+  const lg = cfg.long;
+  const live = st?.collector?.chains;
+  const planCh = st?.collector?.plan?.chains;
+  const cap = st?.capacity;
+  const textIn = (value: string[], onSave: (v: string[]) => void, testId: string, placeholder: string) => (
+    <input type="text" defaultValue={value.join(", ")} key={`${testId}-${value.join(",")}`} placeholder={placeholder} style={{ width: 220 }} data-testid={testId}
+      onBlur={(e) => { const v = listIn(e.target.value); if (v.join(",") !== value.join(",")) onSave(v); }}
+      onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }} />
+  );
+  return (
+    <div className="flow-universe" data-testid="flow-research">
+      <div className="meta" style={{ margin: "4px 0" }}>Research recording — data the backtests can only have if it is recorded now (IV surface, tick replay).</div>
+      <div className="algo-operand" style={{ gap: 10 }}>
+        <label className="meta" title="Every chain contract's standing quote (bid / ask / sizes / last / OI / volume, with its exchange time) on a fixed exchange-time grid, 09:15–15:30. A snapshot at T holds only quotes from before T.">
+          <input type="checkbox" checked={ch.enabled} data-testid="flow-chains-on" onChange={(e) => save({ chains: { enabled: e.target.checked } })} /> option chains of</label>
+        {textIn(ch.underlyings, (v) => save({ chains: { underlyings: v } }), "flow-chains-names", "NIFTY, BANKNIFTY, SBIN")}
+        <label className="meta"><input type="checkbox" checked={ch.strategies} disabled={!ch.enabled} onChange={(e) => save({ chains: { strategies: e.target.checked } })} /> + switched-on strategies&apos;</label>
+        <label className="meta">ATM ± {numIn(ch.strikes, (n) => save({ chains: { strikes: n } }), 0, 50, "flow-chains-strikes", 50)}</label>
+        <label className="meta">expiries {numIn(ch.expiries, (n) => save({ chains: { expiries: n } }), 1, 6, "flow-chains-expiries", 40)}</label>
+        <label className="meta">every {numIn(ch.interval_s, (n) => save({ chains: { interval_s: n } }), 15, 3600, "flow-chains-interval", 60)} s</label>
+      </div>
+      {ch.enabled && (
+        <div className="meta" data-testid="flow-chains-state">
+          {planCh?.names?.length ? `chains: ${planCh.names.join(", ")} · ${planCh.keys} contracts` : "no chain underlying yet — name one, or switch on a strategy on an F&O underlying"}
+          {live ? ` · ${live.quoted} quoted now · ${live.snapshots} snapshots this run${live.last ? ` · last ${ist(live.last)}` : ""}` : ""}
+        </div>
+      )}
+      <div className="algo-operand" style={{ gap: 10, marginTop: 4 }}>
+        <label className="meta" title="Days leaving the window are trimmed to this list's keys (and its chains) instead of deleted. Which keys belong to the list is written into each day as it is recorded.">
+          <input type="checkbox" checked={lg.enabled} data-testid="flow-long-on" onChange={(e) => save({ long: { enabled: e.target.checked } })} /> keep a short list longer:</label>
+        {textIn(lg.symbols, (v) => save({ long: { symbols: v } }), "flow-long-symbols", "NIFTY:FUT, NSE:SBIN-EQ")}
+        <label className="meta"><input type="checkbox" checked={lg.strategies} disabled={!lg.enabled} onChange={(e) => save({ long: { strategies: e.target.checked } })} /> + switched-on strategies&apos;</label>
+        <label className="meta">flow {numIn(lg.days, (n) => save({ long: { days: n } }), 1, 1095, "flow-long-days", 60)} days</label>
+        <label className="meta">raw ticks {numIn(lg.raw_days, (n) => save({ long: { raw_days: n } }), 0, 365, "flow-long-raw", 55)} days</label>
+        <label className="meta" title="Raw frames of the short list's chain contracts this close to the money too (for replaying option exits)">chain raw ATM ± {numIn(lg.raw_strikes, (n) => save({ long: { raw_strikes: n } }), 0, 20, "flow-long-raw-strikes", 45)}</label>
+      </div>
+      {cap && !cap.error && (
+        <div className="meta" data-testid="flow-capacity" style={{ marginTop: 4, color: cap.note ? "var(--text-dim)" : cap.fits ? "var(--green)" : "var(--red)" }}
+          title={`per day: window ${cap.per_day_mb.full} MB + raw ${cap.per_day_mb.raw} MB · short list ${cap.per_day_mb.long} MB + raw ${cap.per_day_mb.long_raw} MB${cap.estimate.length ? ` (estimated: ${cap.estimate.join(", ")})` : ""}`}>
+          {cap.note ? `Disk: ${cap.note}` : <>
+            Steady state ≈ {cap.projected_gb} GB (window {cap.tiers_gb.full} + raw {cap.tiers_gb.raw}{lg.enabled ? ` + short list ${cap.tiers_gb.long} + its raw ${cap.tiers_gb.long_raw}` : ""})
+            {" "}of {cap.room_gb} GB room ({cap.free_gb} GB free of {cap.disk_total_gb}, keeping {cap.min_free_gb}) — {cap.fits ? "fits" : "will not fit: shorten a window or raise the disk"}
+            {cap.estimate.length ? " · short list estimated until a day is trimmed" : ""}
+          </>}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function RecorderPanel() {
   const qc = useQueryClient();
@@ -2392,7 +2462,7 @@ function RecorderPanel() {
   const [err, setErr] = useState<string | null>(null);
   const cfg = st.data?.config;
   const list = syms ?? cfg?.symbols ?? [];
-  const save = async (patch: Partial<Omit<FlowCfg, "universe">> & { universe?: Partial<Universe> }) => {
+  const save = async (patch: Partial<Omit<FlowCfg, "universe" | "chains" | "long">> & { universe?: Partial<Universe>; chains?: Partial<Chains>; long?: Partial<LongList> }) => {
     setErr(null);
     try {
       await api.put("/api/algo/ticks/config", patch);
@@ -2442,7 +2512,8 @@ function RecorderPanel() {
           keep {cfg && numIn(cfg.min_free_gb ?? 5, (n) => save({ min_free_gb: n }), 1, 1000, "flow-min-free")} GB free
         </label>
         <span className="meta" data-testid="flow-days">
-          stored: {st.data?.days.count ?? 0} of {st.data?.days.retention ?? 90} days ({ymdLabel(st.data?.days.first ?? null)} → {ymdLabel(st.data?.days.last ?? null)}) · {fmt(st.data?.disk_mb ?? 0)} MB
+          stored: {st.data?.days.count ?? 0} of {st.data?.days.retention ?? 90} days ({ymdLabel(st.data?.days.first ?? null)} → {ymdLabel(st.data?.days.last ?? null)})
+          {st.data?.days.long?.count ? ` + ${st.data.days.long.count} short-list days (from ${ymdLabel(st.data.days.long.first)})` : ""} · {fmt(st.data?.disk_mb ?? 0)} MB
           {col?.disk?.free_gb != null ? ` · ${col.disk.free_gb} GB free` : ""}
         </span>
       </div>
@@ -2485,6 +2556,7 @@ function RecorderPanel() {
           </div>
         </div>
       )}
+      {cfg?.chains && cfg?.long && <ResearchRecording cfg={cfg} st={st.data} save={save} numIn={numIn} />}
       {plan?.classes && (
         <div className="meta" style={{ margin: "6px 0" }} data-testid="flow-plan">
           Recording {fmt(plan.used ?? 0)} of a {fmt(plan.budget ?? 0)} budget: {Object.entries(plan.classes).filter(([, n]) => n).map(([k, n]) => `${CLASS_LABEL[k] ?? k} ${fmt(n)}`).join(" · ")}

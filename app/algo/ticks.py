@@ -26,11 +26,29 @@ Storage, under data/ticks/ (one writer: the collector process, flowd.py):
     today/<YYYYMMDD>/fp/<KEY>.csv     footprint rows (minute, price) — last row per level wins
     today/<YYYYMMDD>/prints.csv       big prints (every key)
     today/<YYYYMMDD>/raw/<KEY>.csv    every frame — focus symbols only
-    today/<YYYYMMDD>/meta.json        key -> contract (symbol, kind, expiry, strike)
-    days/<YYYYMMDD>/flow.parquet, fp.parquet, prints.parquet, raw.parquet, meta.json
+    today/<YYYYMMDD>/chain.csv        option-chain snapshots (the `chains` setting)
+    today/<YYYYMMDD>/meta.json        key -> contract (symbol, kind, expiry, strike; chain / long / raw flags)
+    days/<YYYYMMDD>/flow.parquet, fp.parquet, prints.parquet, raw.parquet, chain.parquet, meta.json
 A day is compacted after the close (or at the next start). Days are a
 sliding window: with `retention_days` (default 90) collected days kept, the
 oldest is deleted as each new one lands. Raw frames keep `raw_days`.
+
+Option chains (`chains`, off by default): for each chain underlying (named
+ones + those of switched-on strategies) the planner records the underlying,
+its current future and ATM +/- `strikes` for the first `expiries` expiries,
+and the recorder writes the standing quote of every such contract (bid / ask
+/ sizes / last / OI / volume and the quote's own exchange time) on a fixed
+exchange-time grid (`interval_s`). A snapshot is taken on the socket thread
+by the first frame stamped at or after the grid time, before that frame is
+applied, so a snapshot at T holds only quotes from before T — what a
+backtest could have known at T.
+
+The research short list (`long`, off by default): strategy symbols (and
+hand-picked ones) are flagged `long` in the day's meta when recorded — with
+their chains' contracts. Past `retention_days` a day is trimmed to the
+flagged keys instead of deleted and kept to `long.days`; their raw frames
+(the near-the-money chain contracts' too, `long.raw_strikes`) keep to
+`long.raw_days`.
 
 Keys: a stock is its ticker (SBIN), an option its contract (NIFTY26O2725000CE),
 the current future CONTINUOUS (NIFTY-FUT, rolls with expiry) and the next
@@ -83,6 +101,29 @@ DEFAULT_UNIVERSE: dict[str, Any] = {
     "stock_next_expiry": "roll",           # roll | off
     "roll_days": 5,
 }
+# Option-chain snapshots for research (IV surface, tick replay): off unless switched on.
+DEFAULT_CHAINS: dict[str, Any] = {
+    "enabled": False,
+    "underlyings": [],                     # F&O names (NIFTY, BANKNIFTY, SBIN ...)
+    "strategies": True,                    # + the underlyings of switched-on strategies
+    "strikes": 10,                         # ATM +/- N strikes
+    "expiries": 2,                         # the first N listed expiries
+    "interval_s": 60,                      # the snapshot grid, exchange time
+}
+# The research short list: kept longer than the sliding window. Off unless switched on.
+DEFAULT_LONG: dict[str, Any] = {
+    "enabled": False,
+    "symbols": [],                         # hand-picked (as in `symbols`)
+    "strategies": True,                    # + switched-on strategies' symbols
+    "days": 365,                           # flow / footprint / prints / chains of the list
+    "raw_days": 120,                       # every frame of the list
+    "raw_strikes": 3,                      # + raw frames of chain contracts within ATM +/- N
+}
+META_FLAGS = ("chain", "long", "raw")
+SORT_ORDER = {"flow.parquet": "key, minute", "fp.parquet": "key, minute, price", "prints.parquet": "key, ts",
+              "raw.parquet": "key, exch_ts", "chain.parquet": "key, ts"}
+CHAIN_COLS = ("ts", "qts", "ltp", "bid", "ask", "bid_size", "ask_size", "oi", "vol")
+SNAP_MIN_S = 15
 FLOW_COLS = ("minute", "buy", "sell", "unk", "trades", "ticks", "o", "h", "l", "c", "tot_buy", "tot_sell", "oi",
              "cumvol")
 FLOW_TYPES = ("BIGINT", "DOUBLE", "DOUBLE", "DOUBLE", "INTEGER", "INTEGER", "DOUBLE", "DOUBLE", "DOUBLE", "DOUBLE",
@@ -160,6 +201,8 @@ def load_config(root: Path = ROOT) -> dict[str, Any]:
         cfg["retention_days"] = max(int(raw.get("retention_days") or 0), RETENTION_DAYS)
         cfg["version"] = 2
     cfg["universe"] = {**DEFAULT_UNIVERSE, **(raw.get("universe") or {})}
+    cfg["chains"] = {**DEFAULT_CHAINS, **(raw.get("chains") or {})}
+    cfg["long"] = {**DEFAULT_LONG, **(raw.get("long") or {})}
     return cfg
 
 
@@ -169,9 +212,17 @@ def save_config(patch: dict[str, Any], root: Path = ROOT) -> dict[str, Any]:
     for k, v in patch.items():
         if k == "universe" and isinstance(v, dict):
             cfg["universe"] = {**cfg["universe"], **{kk: vv for kk, vv in v.items() if kk in DEFAULT_UNIVERSE}}
+        elif k == "chains" and isinstance(v, dict):
+            cfg["chains"] = {**cfg["chains"], **{kk: vv for kk, vv in v.items() if kk in DEFAULT_CHAINS}}
+        elif k == "long" and isinstance(v, dict):
+            cfg["long"] = {**cfg["long"], **{kk: vv for kk, vv in v.items() if kk in DEFAULT_LONG}}
         elif k in ("enabled", "symbols", "retention_days", "raw_days", "budget", "min_free_gb"):
             cfg[k] = v
     cfg["symbols"] = list(dict.fromkeys(str(s).strip().upper() for s in cfg["symbols"] if str(s).strip()))[:MAX_FOCUS]
+    cfg["chains"]["underlyings"] = list(dict.fromkeys(
+        str(s).strip().upper() for s in cfg["chains"].get("underlyings") or [] if str(s).strip()))[:MAX_FOCUS]
+    cfg["long"]["symbols"] = list(dict.fromkeys(
+        str(s).strip().upper() for s in cfg["long"].get("symbols") or [] if str(s).strip()))[:MAX_FOCUS]
     cfg["version"] = 2
     root.mkdir(parents=True, exist_ok=True)
     tmp = root / "config.json.tmp"
@@ -207,6 +258,21 @@ def strategy_symbols(root: Path = ROOT) -> list[str]:
         return [str(x) for x in v] if isinstance(v, list) else []
     except (OSError, ValueError):
         return []
+
+
+def merge_meta(first: dict[str, dict], later: dict[str, dict]) -> dict[str, dict]:
+    """A day's key -> contract map: a key keeps the contract it held first;
+    the research flags (chain, long, raw) accumulate from either side."""
+    out = {k: dict(v) for k, v in first.items()}
+    for k, v in later.items():
+        cur = out.get(k)
+        if cur is None:
+            out[k] = dict(v)
+            continue
+        for flag in META_FLAGS:
+            if v.get(flag) and not cur.get(flag):
+                cur[flag] = v[flag]
+    return out
 
 
 def read_json(path: Path) -> Any:
@@ -247,8 +313,25 @@ class TickRecorder:
         self.stats: dict[str, list[float]] = {}                  # key -> [ticks, trades, buy, sell, unk, last_ts]
         self.frames = 0
         self.lag: list[float] = []                               # recent receive - exchange delays (s)
+        # option chains: written only on the socket thread, read by flush() under the lock
+        self.chain_keys: dict[str, str] = {}                     # key -> chain underlying (the plan's)
+        self.snap_s = int(DEFAULT_CHAINS["interval_s"])
+        self._quote: dict[str, tuple] = {}                       # key -> (qts, ltp, bid, ask, bsz, asz, oi, vol)
+        self._next_snap = 0                                      # exchange time of the next snapshot
+        self._last_snap = 0
+        self._snaps: list[tuple] = []                            # (key, ts, *quote) awaiting the next flush
+        self.snapshots = 0
 
     # -- hot path (socket thread) ----------------------------------------------
+
+    def set_chain(self, keys: dict[str, str], interval_s: int) -> None:
+        """The plan's chain contracts (key -> underlying); quotes of keys that
+        left the chain are dropped. Called from the collector's loop."""
+        self.chain_keys = dict(keys)
+        self.snap_s = max(SNAP_MIN_S, int(interval_s or DEFAULT_CHAINS["interval_s"]))
+        # in place, not a new dict: the socket thread may be storing a chain key's quote right now
+        for k in [k for k in list(self._quote) if k not in self.chain_keys]:
+            self._quote.pop(k, None)
 
     def mark_resync(self) -> None:
         """A (re)connect: the next frame of every symbol only re-anchors its
@@ -261,9 +344,20 @@ class TickRecorder:
             return
         full = full.upper()
         self.ltp[full] = ltp
+        recv_ts = recv_ts or time.time()
+        if self.chain_keys:
+            qts = int(_f(msg.get("exch_feed_time")) or _f(msg.get("last_traded_time")) or recv_ts)
+            if qts >= self._next_snap:
+                self._snap(qts, recv_ts)          # the standing quotes, before this frame moves any
+            key = self.key_of.get(full)
+            if key is not None and key in self.chain_keys:
+                self._quote[key] = (qts, ltp, _f(msg.get("bid_price")) or None, _f(msg.get("ask_price")) or None,
+                                    _f(msg.get("bid_size")), _f(msg.get("ask_size")),
+                                    _f(msg.get("OI")) if msg.get("OI") is not None else None,
+                                    _f(msg.get("vol_traded_today")) if msg.get("vol_traded_today") is not None
+                                    else None)
         if msg.get("vol_traded_today") is None:
             return                                # an index: a price, no trades
-        recv_ts = recv_ts or time.time()
         exch_ts = int(_f(msg.get("exch_feed_time")) or _f(msg.get("last_traded_time")) or recv_ts)
         if ist_day(exch_ts) != ist_day(recv_ts):
             return                                # the subscribe snapshot of an earlier session
@@ -273,6 +367,38 @@ class TickRecorder:
                _f(msg.get("OI")) if msg.get("OI") is not None else None)
         with self._lock:
             self._classify(full, row)
+
+    def _snap(self, t: int, recv_ts: float) -> None:
+        """Exchange time reached the next grid point: queue every chain key's
+        standing quote stamped at that point (the grid inside 09:15-15:30 IST,
+        the 15:30 close always included). Quotes from an earlier session are
+        left out — they say nothing about today's market."""
+        if ist_day(t) != ist_day(recv_ts) or t > recv_ts + 60:
+            return                                # an earlier session's snapshot, or a clock glitch
+        iv = max(SNAP_MIN_S, int(self.snap_s))
+        day0 = t - (t + IST) % DAY
+        lo, hi = day0 + OPEN_S, day0 + CLOSE_S
+        g = t - (t - lo) % iv if t >= lo else lo
+        if t < lo:
+            self._next_snap = lo
+            return
+        g = min(g, hi)
+        if g <= self._last_snap:                  # this point is done (the close, or a late start's skip)
+            self._next_snap = g + iv if g < hi else day0 + DAY + OPEN_S
+            return
+        if self._next_snap == 0:                  # a fresh start: the quotes are still arriving, skip a point
+            self._last_snap = g
+            self._next_snap = min(g + iv, hi) if g < hi else day0 + DAY + OPEN_S
+            return
+        day = ist_day(g)
+        keys = self.chain_keys
+        rows = [(k, g, *q) for k, q in list(self._quote.items()) if k in keys and q[0] < g and ist_day(q[0]) == day]
+        if rows:
+            with self._lock:
+                self._snaps.extend(rows)
+            self.snapshots += 1
+        self._last_snap = g
+        self._next_snap = min(g + iv, hi) if g < hi else day0 + DAY + OPEN_S
 
     def _classify(self, full: str, row: tuple, key: Optional[str] = None, exchange_hours: Optional[bool] = None) -> None:
         recv_ts, exch_ts, ltp, vol, bid, ask, bsz, asz, tbq, tsq, ltq, oi = row
@@ -377,6 +503,7 @@ class TickRecorder:
                     fps.setdefault(key, []).append((minute, price, b, s))
             prints, self._prints = self._prints, []
             raw, self._raw = self._raw, {}
+            snaps, self._snaps = self._snaps, []
             for key, mins in self._min.items():          # keep the last 3 minutes; the rest is final
                 if len(mins) > 3:
                     keep = sorted(mins)[-3:]
@@ -399,6 +526,15 @@ class TickRecorder:
                 csv.writer(fh).writerows(rows)
         for key, rows in raw.items():
             n += self._append(key, rows, "raw", day_col=1)
+        snap_days: dict[int, list[tuple]] = {}
+        for s in snaps:
+            snap_days.setdefault(ist_day(s[1]), []).append(s)
+        for day, rows in snap_days.items():
+            path = self.today_dir(day) / "chain.csv"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", newline="", encoding="utf-8") as fh:
+                csv.writer(fh).writerows(["" if x is None else x for x in r] for r in rows)
+            n += len(rows)
         return n
 
     def _append(self, key: str, rows: list, kind: str, day_col: int = 0) -> int:
@@ -452,12 +588,13 @@ class TickRecorder:
         return n
 
     def write_meta(self, meta: dict[str, dict], day: Optional[int] = None) -> None:
-        """key -> contract details of the day (merged: a key keeps the first contract it held that day)."""
+        """key -> contract details of the day (merged: a key keeps the first contract it held that day;
+        the research flags — chain, long, raw — accumulate: once set during a day, they stay)."""
         path = self.today_dir(day if day is not None else ist_day(time.time())) / "meta.json"
         cur = read_json(path) or {}
-        for k, v in meta.items():
-            cur.setdefault(k, v)
-        write_json(path, cur)
+        merged = merge_meta(cur, meta)
+        if merged != cur or not path.exists():
+            write_json(path, merged)
 
     # -- after the close ------------------------------------------------------
 
@@ -504,11 +641,19 @@ class TickRecorder:
                 _write_parquet(con, out / "raw.parquet",
                                f"SELECT * FROM read_csv('{(tmp / 'raw.csv').as_posix()}', header=false, "
                                f"columns={{'key': 'VARCHAR', {cols}}}, nullstr='')", "key, exch_ts", dedupe=False)
+            chain = src / "chain.csv"
+            if chain.exists() and chain.stat().st_size:
+                # one row per (key, grid point) by construction: DuckDB streams it (no rows in Python's memory)
+                types = ("BIGINT", "BIGINT", *("DOUBLE",) * (len(CHAIN_COLS) - 2))
+                cols = ", ".join(f"'{c}': '{t}'" for c, t in zip(("key", *CHAIN_COLS), ("VARCHAR", *types)))
+                _write_parquet(con, out / "chain.parquet",
+                               f"SELECT * FROM read_csv('{chain.as_posix()}', header=false, columns={{{cols}}}, "
+                               "nullstr='', ignore_errors=true) QUALIFY row_number() OVER (PARTITION BY key, ts) = 1",
+                               "key, ts")
             con.close()
         meta = read_json(src / "meta.json") or {}
         if meta:
-            old = read_json(out / "meta.json") or {}
-            write_json(out / "meta.json", {**meta, **old})
+            write_json(out / "meta.json", merge_meta(read_json(out / "meta.json") or {}, meta))
         shutil.rmtree(src, ignore_errors=True)
         with self._lock:
             self.stats = {}
@@ -527,22 +672,96 @@ class TickRecorder:
                 n += 1
         return n
 
-    def prune(self, retention_days: int, raw_days: int) -> int:
+    def prune(self, retention_days: int, raw_days: int, long: Optional[dict[str, Any]] = None) -> int:
         """The sliding window: keep the newest `retention_days` collected days
-        (delete the oldest as each new one lands); raw frames only `raw_days`."""
+        (delete the oldest as each new one lands); raw frames only `raw_days`.
+
+        With the research short list on (`long`), a day leaving the window is
+        trimmed to the keys flagged `long` in its meta instead of deleted, and
+        kept until it is `long.days` collected days old; raw frames of those
+        keys keep to `long.raw_days`. A day with nothing flagged goes as before."""
         base = self.root / "days"
         days = sorted(d for d in base.iterdir() if d.is_dir() and day_of(d.name) is not None) if base.is_dir() else []
-        gone = 0
-        for d in days[:max(0, len(days) - max(1, int(retention_days)))]:
-            shutil.rmtree(d, ignore_errors=True)
-            gone += 1
-        for d in days[max(0, len(days) - max(1, int(retention_days))):][:-max(0, int(raw_days)) or None]:
-            if (d / "raw.parquet").exists():
-                (d / "raw.parquet").unlink()
+        keep = max(1, int(retention_days))
+        raw_keep = max(0, int(raw_days))
+        on = bool(long and long.get("enabled"))
+        long_keep = max(keep, int(long.get("days") or 0)) if on else keep
+        long_raw = max(0, int(long.get("raw_days") or 0)) if on else 0
+        gone = trimmed = 0
+        for i, d in enumerate(days):
+            age = len(days) - 1 - i                 # 0 = the newest collected day
+            if age >= long_keep:
+                shutil.rmtree(d, ignore_errors=True)
                 gone += 1
-        if gone:
-            log.info("ticks.pruned", removed=gone, kept=min(len(days), retention_days))
-        return gone
+            elif age >= keep:                       # past the window: the short list only
+                n = self._trim(d, keep_raw=age < long_raw)
+                if n < 0:
+                    shutil.rmtree(d, ignore_errors=True)
+                    gone += 1
+                else:
+                    trimmed += n
+            elif age >= raw_keep and (d / "raw.parquet").exists():
+                if on and age < long_raw:
+                    trimmed += self._trim_file(d / "raw.parquet", self._long_keys(d))
+                else:
+                    (d / "raw.parquet").unlink()
+                    gone += 1
+        if gone or trimmed:
+            log.info("ticks.pruned", removed=gone, trimmed=trimmed, kept=min(len(days), long_keep))
+        return gone + trimmed
+
+    def _long_keys(self, d: Path) -> set[str]:
+        return {k for k, v in (read_json(d / "meta.json") or {}).items() if v.get("long")}
+
+    def _trim(self, d: Path, keep_raw: bool) -> int:
+        """A day past the window -> only its short-list keys. Returns the files
+        rewritten (0 = already trimmed), or -1 when the day held none of them."""
+        keys = self._long_keys(d)
+        if not keys:
+            return -1
+        mark = read_json(d / "trim.json") or {}
+        n = 0
+        if not mark:
+            for name in ("flow.parquet", "fp.parquet", "prints.parquet", "chain.parquet"):
+                n += self._trim_file(d / name, keys)
+        if keep_raw:
+            if not mark.get("raw_trimmed"):
+                n += self._trim_file(d / "raw.parquet", keys)
+        elif (d / "raw.parquet").exists():
+            (d / "raw.parquet").unlink()
+            n += 1
+        raw_left = keep_raw and (d / "raw.parquet").exists()
+        if not mark or n or bool(mark.get("raw_trimmed")) != raw_left:
+            write_json(d / "trim.json", {"keys": len(keys), "raw_trimmed": raw_left, "at": int(time.time())})
+        return n
+
+    def _trim_file(self, path: Path, keys: set[str]) -> int:
+        """Rewrite one parquet with only `keys`' rows (deleted when none are left)."""
+        if not path.exists():
+            return 0
+        if not keys:
+            path.unlink()
+            return 1
+        con = _duck()
+        try:
+            con.execute("CREATE TEMP TABLE _keep(key VARCHAR)")
+            con.executemany("INSERT INTO _keep VALUES (?)", [[k] for k in sorted(keys)])
+            src = f"read_parquet('{path.as_posix()}')"
+            total, left = con.execute(f"SELECT count(*), count(*) FILTER (WHERE key IN (SELECT key FROM _keep)) "
+                                      f"FROM {src}").fetchone()
+            if left == total:
+                return 0                              # holds only the list already: nothing to rewrite
+            if not left:
+                path.unlink()
+                return 1
+            tmp = path.with_suffix(".parquet.tmp")
+            order = SORT_ORDER.get(path.name, "key")
+            con.execute(f"COPY (SELECT * FROM {src} WHERE key IN (SELECT key FROM _keep) ORDER BY {order}) "
+                        f"TO '{tmp.as_posix()}' (FORMAT parquet, ROW_GROUP_SIZE 100000)")
+            tmp.replace(path)
+        finally:
+            con.close()
+        return 1
 
     def drop_oldest(self, keep: int) -> Optional[str]:
         """The disk guard's lever: delete the oldest collected day while more
@@ -843,6 +1062,63 @@ class FlowStore:
             out[d] = hit or flow_key(sym)
         return out
 
+    # -- option chains ------------------------------------------------------------
+
+    def chain_keys(self, name: str, day: int) -> dict[str, dict]:
+        """key -> contract of `name`'s chain that day (options, its future, the underlying)."""
+        n = name.upper()
+        return {k: v for k, v in self.meta(day).items() if str(v.get("chain", "")).upper() == n}
+
+    def chain_rows(self, name: str, start: int, end: int) -> list[tuple]:
+        """Snapshots of `name`'s chain in [start, end): (ts, key, qts, ltp, bid, ask, bid_size, ask_size,
+        oi, vol), by time then key. Join a key to its contract with chain_keys(name, day)."""
+        out: dict[tuple[int, str], tuple] = {}
+        for d in self._days(start, end):
+            keys = sorted(self.chain_keys(name, d))
+            if not keys:
+                continue
+            p = self.root / "days" / ymd(d) / "chain.parquet"
+            if p.exists():
+                marks = ", ".join("?" for _ in keys)
+                for r in self._query(f"SELECT ts, key, {', '.join(CHAIN_COLS[1:])} FROM read_parquet('{p.as_posix()}') "
+                                     f"WHERE key IN ({marks}) AND ts >= ? AND ts < ?", [*keys, int(start), int(end)]):
+                    out[(int(r[0]), r[1])] = r
+            want = set(keys)
+            for r in _rows(self.root / "today" / ymd(d) / "chain.csv"):
+                if len(r) != len(CHAIN_COLS) + 1 or r[0] not in want:
+                    continue
+                try:
+                    t = int(float(r[1]))
+                except ValueError:
+                    continue
+                if start <= t < end:
+                    out[(t, r[0])] = (t, r[0], int(float(r[2])), *(_num(x) for x in r[3:]))
+        return [out[k] for k in sorted(out)]
+
+    def chain_at(self, name: str, at: int) -> tuple[Optional[int], list[dict[str, Any]]]:
+        """The latest snapshot of `name`'s chain at or before `at` (same IST day):
+        (its time, [{key, kind, strike, expiry, symbol, qts, ltp, bid, ask, ...}])."""
+        day0 = at - (at + IST) % DAY
+        rows = self.chain_rows(name, day0, at + 1)
+        if not rows:
+            return None, []
+        t = rows[-1][0]
+        meta = self.chain_keys(name, ist_day(at))
+        out = []
+        for r in rows:
+            if r[0] != t:
+                continue
+            m = meta.get(r[1], {})
+            out.append({"key": r[1], "symbol": m.get("symbol"), "kind": m.get("kind"), "strike": m.get("strike"),
+                        "expiry": m.get("expiry"), **dict(zip(CHAIN_COLS[1:], r[2:]))})
+        return t, out
+
+    def long_days(self) -> list[str]:
+        """Days past the window kept for the research short list only (trimmed)."""
+        base = self.root / "days"
+        return sorted(d.name for d in base.iterdir() if d.is_dir() and (d / "trim.json").exists()) \
+            if base.is_dir() else []
+
     def collected_days(self) -> list[str]:
         base = self.root / "days"
         return sorted(d.name for d in base.iterdir() if d.is_dir() and (d / "flow.parquet").exists()) \
@@ -857,6 +1133,114 @@ def store() -> FlowStore:
     if _STORE is None:
         _STORE = FlowStore()
     return _STORE
+
+
+_CAP: dict[str, Any] = {"t": 0.0, "sig": None, "v": None}
+CAP_SAMPLE_DAYS = 10
+
+
+def _size(p: Path) -> int:
+    try:
+        return p.stat().st_size
+    except OSError:
+        return 0
+
+
+def capacity(cfg: dict[str, Any], root: Path = ROOT, max_age_s: float = 300.0) -> dict[str, Any]:
+    """Will the recordings fit? The steady-state size of the window as configured,
+    projected from the newest stored days' real sizes (per tier: full days, raw
+    frames, short-list days, short-list raw), against the disk's free space and
+    the guard's floor. A tier with no stored day yet is estimated from the
+    newest full day's key counts in its meta and marked `estimate`."""
+    sig = json.dumps([str(root), *(cfg.get(k) for k in ("retention_days", "raw_days", "min_free_gb", "long"))],
+                     sort_keys=True, default=str)
+    if _CAP["v"] is not None and _CAP["sig"] == sig and time.time() - _CAP["t"] < max_age_s:
+        return _CAP["v"]
+    base = root / "days"
+    dirs = sorted((d for d in base.iterdir() if d.is_dir() and day_of(d.name) is not None), reverse=True) \
+        if base.is_dir() else []
+    full, raw, trim, trim_raw = [], [], [], []
+    for d in dirs:
+        rest = sum(_size(p) for p in d.glob("*.parquet") if p.name != "raw.parquet")
+        r = _size(d / "raw.parquet")
+        if (d / "trim.json").exists():
+            if len(trim) < CAP_SAMPLE_DAYS:
+                trim.append(rest)
+                if r:
+                    trim_raw.append(r)
+        else:
+            if len(full) < CAP_SAMPLE_DAYS:
+                full.append(rest)
+            if r and len(raw) < CAP_SAMPLE_DAYS:
+                raw.append(r)
+        if len(full) >= CAP_SAMPLE_DAYS and len(trim) >= CAP_SAMPLE_DAYS:
+            break
+
+    def avg(xs: list[int]) -> float:
+        return sum(xs) / len(xs) if xs else 0.0
+
+    full_b, raw_b = avg(full), avg(raw)
+    basis = {"full": len(full), "raw": len(raw), "long": len(trim), "long_raw": len(trim_raw)}
+    estimate: list[str] = []
+    long = cfg.get("long") or {}
+    on = bool(long.get("enabled"))
+    keep = max(1, int(cfg.get("retention_days") or RETENTION_DAYS))
+    raw_keep = min(keep, max(0, int(cfg.get("raw_days") or 0)))
+    long_keep = max(keep, int(long.get("days") or 0)) if on else keep
+    long_raw = min(long_keep, max(raw_keep, int(long.get("raw_days") or 0))) if on else raw_keep
+    trim_b, trim_raw_b = avg(trim), avg(trim_raw)
+    if on and (not trim or not trim_raw):
+        newest = next((d for d in dirs if not (d / "trim.json").exists()), None)
+        meta = (read_json(newest / "meta.json") or {}) if newest is not None else {}
+        n_all = max(1, len(meta))
+        n_long = sum(1 for v in meta.values() if v.get("long"))
+        n_raw = max(1, sum(1 for v in meta.values() if v.get("cls") == "focus" or v.get("raw")))
+        n_long_raw = sum(1 for v in meta.values() if v.get("long") and (v.get("cls") == "focus" or v.get("raw")))
+        if not trim:
+            trim_b = full_b * n_long / n_all
+            estimate.append("long")
+        if not trim_raw:
+            trim_raw_b = raw_b * min(1.0, n_long_raw / n_raw)
+            estimate.append("long_raw")
+    tiers = {
+        "full": full_b * keep,
+        "raw": raw_b * raw_keep,
+        "long": trim_b * (long_keep - keep) if on else 0.0,
+        "long_raw": trim_raw_b * max(0, long_raw - raw_keep) if on else 0.0,
+    }
+    today_b = 0
+    for dirpath, _, names in os.walk(root / "today") if (root / "today").is_dir() else []:
+        today_b += sum(_size(Path(dirpath) / n) for n in names)
+    projected = sum(tiers.values()) + 2 * today_b      # the day being recorded + its compaction's scratch
+    now_b = 0
+    for dirpath, _, names in os.walk(root) if root.is_dir() else []:
+        now_b += sum(_size(Path(dirpath) / n) for n in names)
+    try:
+        du = shutil.disk_usage(root if root.exists() else root.parent)
+        total, free = du.total, du.free
+    except OSError:
+        total = free = 0
+    floor = float(cfg.get("min_free_gb") or MIN_FREE_GB) * 1e9
+    room = free + now_b - floor                         # what the recordings may grow to before the guard acts
+    gb = 1e9
+    out = {
+        "per_day_mb": {"full": round(full_b / 1e6, 2), "raw": round(raw_b / 1e6, 2), "long": round(trim_b / 1e6, 2),
+                       "long_raw": round(trim_raw_b / 1e6, 2), "today_so_far": round(today_b / 1e6, 2)},
+        "days": {"full": keep, "raw": raw_keep, "long": long_keep if on else 0, "long_raw": long_raw if on else 0},
+        "tiers_gb": {k: round(v / gb, 2) for k, v in tiers.items()},
+        "projected_gb": round(projected / gb, 2),
+        "now_gb": round(now_b / gb, 2),
+        "disk_total_gb": round(total / gb, 1),
+        "free_gb": round(free / gb, 1),
+        "min_free_gb": round(floor / gb, 1),
+        "room_gb": round(room / gb, 2),
+        "fits": bool(full) and projected <= room,
+        "basis_days": basis,
+        "estimate": estimate,
+        "note": None if full else "no stored day yet: the projection needs one recorded session",
+    }
+    _CAP.update(t=time.time(), sig=sig, v=out)
+    return out
 
 
 _DISK: dict[str, Any] = {"t": 0.0, "mb": 0.0}
