@@ -322,6 +322,7 @@ async def lifespan(app: FastAPI):
     news_task: asyncio.Task[None] | None = None
     news_extract_task: asyncio.Task[None] | None = None
     crypto_task: asyncio.Task[None] | None = None
+    research_task: asyncio.Task[None] | None = None
     if not settings.TESTING:
         # T3: start the analyzer before the monitors so its event-bus
         # subscription is live before the first `announcements.new`
@@ -557,6 +558,23 @@ async def lifespan(app: FastAPI):
 
         fno_master_task = asyncio.create_task(_fno_master_refresh(), name="fno-master")
 
+        # Research desk: nightly re-validation of every switched-on strategy
+        # (app/research/revalidate.py). Off until switched on in Algo Lab ->
+        # Research; runs once a weekday at its set time, never in market hours.
+        async def _research_nightly() -> None:
+            from app.research import revalidate
+
+            while True:
+                try:
+                    await asyncio.sleep(60.0)
+                    await revalidate.tick()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 — never kill the loop
+                    log.exception("research.nightly_loop_failed")
+
+        research_task = asyncio.create_task(_research_nightly(), name="research-nightly")
+
         # News page headline monitor: monitoring only (never feeds the analyzer). Idles until the
         # operator switches it on from the News page.
         from app.services.news_wire import news_wire
@@ -577,7 +595,7 @@ async def lifespan(app: FastAPI):
         if not settings.TESTING:
             # Stop the breaker monitor first.
             for _t in (risk_monitor_task, dataset_eod_task, ai_schedule_task, algo_task, tick_task,
-                       fno_master_task, news_task, news_extract_task, crypto_task):
+                       fno_master_task, news_task, news_extract_task, crypto_task, research_task):
                 if _t is not None:
                     _t.cancel()
                     try:
