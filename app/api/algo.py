@@ -16,6 +16,8 @@
     POST   /api/algo/research/tick-replay  {spec, start, end}: the backtest's stop / target exits vs recorded prints
     GET    /api/algo/research/universe     point-in-time index membership per index (POST /{index}/changes,
                                            POST /{index}/snapshot, GET /{index}/members?on=)
+    GET    /api/algo/research/nightly      nightly re-validation: switch, last run, open flags (PUT to set,
+                                           POST /run to run now); GET /research/flags, POST /flags/{id}/clear
     GET    /api/algo/data?symbol=          what the candle store holds for a symbol
     POST   /api/algo/data/download         {symbols, days} — fill the store from Fyers
     GET    /api/algo/strategies            saved strategies + live P&L
@@ -323,6 +325,7 @@ def _card(c: AlgoResearchCard, full: bool = True) -> dict[str, Any]:
     over = r.get("overfitting") or {}
     out = {"id": c.id, "strategy_id": c.strategy_id, "version": c.version, "name": c.name, "trials": c.trials,
            "verdict": c.verdict, "checks": c.checks, "hypothesis": c.hypothesis, "note": c.note, "setup": c.setup,
+           "kind": c.kind or "check",
            "created_at": c.created_at.isoformat() + "Z" if c.created_at else None,
            "headline": {"dsr": (over.get("deflated_sharpe") or {}).get("dsr"), "pbo": (over.get("pbo") or {}).get("pbo"),
                         "wf_net": (r.get("walk_forward") or {}).get("oos", {}).get("net_pnl"),
@@ -388,9 +391,11 @@ async def research_check(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
 
 
 @router.get("/research/cards")
-def research_cards(strategy_id: Optional[int] = None, verdict: Optional[str] = None,
+def research_cards(strategy_id: Optional[int] = None, verdict: Optional[str] = None, kind: Optional[str] = None,
                    limit: int = Query(200, ge=1, le=1000), db: Session = Depends(get_db)) -> dict[str, Any]:
     q = select(AlgoResearchCard).order_by(AlgoResearchCard.id.desc()).limit(limit)
+    if kind:
+        q = q.where(AlgoResearchCard.kind == kind)
     if strategy_id:
         q = q.where(AlgoResearchCard.strategy_id == strategy_id)
     if verdict:
@@ -630,6 +635,74 @@ def research_universe_members(index: str, on: Optional[str] = None) -> dict[str,
     if m is None:
         raise HTTPException(404, detail="no recorded list for this index yet")
     return {"index": index, "on": universe.ymd(day), "members": sorted(m)}
+
+
+def _flag(f: Any, names: dict[int, str]) -> dict[str, Any]:
+    return {"id": f.id, "strategy_id": f.strategy_id, "name": names.get(f.strategy_id), "card_id": f.card_id,
+            "reason": f.reason, "detail": f.detail, "created_at": f.created_at.isoformat() + "Z" if f.created_at else None,
+            "cleared_at": f.cleared_at.isoformat() + "Z" if f.cleared_at else None, "cleared_note": f.cleared_note}
+
+
+@router.get("/research/nightly")
+def research_nightly(db: Session = Depends(get_db)) -> dict[str, Any]:
+    """The nightly re-validation's switch and last run, and every open flag."""
+    from app.research import revalidate
+
+    names = dict(db.execute(select(AlgoStrategy.id, AlgoStrategy.name)).all())
+    return {**revalidate.load_config(), "flags": [_flag(f, names) for f in revalidate.active_flags(db)]}
+
+
+@router.put("/research/nightly")
+def research_nightly_config(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    from app.research import revalidate
+
+    try:
+        return revalidate.save_config({k: body[k] for k in ("enabled", "time") if k in body})
+    except ValueError as e:
+        raise HTTPException(422, detail=str(e)) from None
+
+
+@router.post("/research/nightly/run")
+async def research_nightly_run() -> dict[str, Any]:
+    """Run it now (outside market hours): every switched-on strategy."""
+    from app.research import revalidate
+
+    try:
+        return await revalidate.run_nightly(heavy=_heavy)
+    except RuntimeError as e:
+        raise HTTPException(409, detail=str(e)) from None
+
+
+@router.get("/research/flags")
+def research_flags(strategy_id: Optional[int] = None, active: bool = True, db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Strategies whose edge no longer holds. The live desk's auto-pause reads
+    the open ones (in process: app.research.revalidate.active_flags)."""
+    from app.db.models import AlgoResearchFlag
+    from app.research import revalidate
+
+    names = dict(db.execute(select(AlgoStrategy.id, AlgoStrategy.name)).all())
+    if active:
+        rows = revalidate.active_flags(db, strategy_id)
+    else:
+        q = select(AlgoResearchFlag).order_by(AlgoResearchFlag.id.desc()).limit(500)
+        rows = list(db.execute(q.where(AlgoResearchFlag.strategy_id == strategy_id) if strategy_id else q).scalars())
+    return {"flags": [_flag(f, names) for f in rows]}
+
+
+@router.post("/research/flags/{fid}/clear")
+def research_flag_clear(fid: int, body: dict[str, Any] = Body(default={}), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """A person looked at it: {note} says what was decided."""
+    from app.db.models import AlgoResearchFlag
+
+    f = db.get(AlgoResearchFlag, fid)
+    if not f:
+        raise HTTPException(404, detail="no such flag")
+    if f.cleared_at is None:
+        f.cleared_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        f.cleared_note = (str(body.get("note") or "").strip() or None)
+        db.commit()
+    names = dict(db.execute(select(AlgoStrategy.id, AlgoStrategy.name)).all())
+    return _flag(f, names)
 
 
 @router.get("/instrument")

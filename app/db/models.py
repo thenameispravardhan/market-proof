@@ -714,6 +714,26 @@ class AlgoResearchCard(Base):
     hypothesis: Mapped[Optional[str]] = mapped_column(Text)
     note: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+    # "check" = run by hand on an idea; "nightly" = the re-validation of a switched-on strategy
+    kind: Mapped[str] = mapped_column(String(8), default="check", nullable=False)
+
+
+class AlgoResearchFlag(Base):
+    """A switched-on strategy whose edge no longer holds on the newest data
+    (app/research/revalidate.py). Open until a person clears it; the live
+    desk's auto-pause reads the open ones (revalidate.active_flags)."""
+
+    __tablename__ = "algo_research_flags"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    strategy_id: Mapped[int] = mapped_column(
+        ForeignKey("algo_strategies.id", ondelete="CASCADE"), nullable=False, index=True)
+    card_id: Mapped[Optional[int]] = mapped_column(ForeignKey("algo_research_cards.id", ondelete="SET NULL"))
+    reason: Mapped[str] = mapped_column(String(300), nullable=False)
+    detail: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+    cleared_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    cleared_note: Mapped[Optional[str]] = mapped_column(String(300))
 
 
 class AlgoTrade(Base):
