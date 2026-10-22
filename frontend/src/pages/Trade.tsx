@@ -59,6 +59,7 @@ import { BookPanel, FnoPanel, type DeskTab } from "../components/trade/ProPanels
 import { loadUserPrefs, UserSettingsDialog, type UserPrefs } from "../components/trade/UserSettings";
 import type { SyncFlags } from "../components/trade/chartSync";
 import { useOutside } from "../components/trade/chartUi";
+import { TvIcon } from "../components/trade/tvIcons";
 import { expiryIso, optionRoot } from "../lib/options";
 import type {
   BrokerAccount,
@@ -2446,7 +2447,7 @@ export default function Trade() {
             onClick={() => toggleDock(d.id)}
             data-testid={`rail-${d.id}`}
           >
-            <span className="ico">{d.icon}</span>
+            <span className="ico"><TvIcon name={d.id} fallback={d.icon} size={20} /></span>
             <span className="lbl">{d.short}</span>
           </button>
         ))}

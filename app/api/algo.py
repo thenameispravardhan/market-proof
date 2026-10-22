@@ -388,39 +388,127 @@ async def payoff(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     return {**res, "symbol": fy, "iv_source": iv_src, "spot_source": "input" if body.get("spot") else "last close"}
 
 
-# ---- real tick recording (app/algo/ticks.py) --------------------------------
+# ---- real order flow (app/algo/ticks.py, recorded by app/algo/flowd.py) -------
 
-@router.get("/ticks/status")
-def ticks_status() -> dict[str, Any]:
+def _flow_status(q: str = "", top: int = 50) -> dict[str, Any]:
+    from app.algo import flow_universe as fu
     from app.algo import ticks
 
-    return ticks.recorder().status()
+    cfg = ticks.load_config()
+    col = ticks.read_json(ticks.ROOT / "status.json") or {}
+    alive = bool(col) and col.get("state") == "running" and time.time() - float(col.get("heartbeat") or 0) < 30
+    sup = None
+    try:
+        from app.main import app as _app
+
+        s_ = getattr(_app.state, "flow_supervisor", None)
+        sup = s_.info() if s_ is not None else None
+    except Exception:  # noqa: BLE001
+        sup = None
+    stats = ticks.read_json(ticks.ROOT / "stats.json") or {}
+    rows = [[k, *v] for k, v in stats.items() if not q or q.upper() in k]
+    rows.sort(key=lambda r: -(r[3] + r[4] + r[5]))           # traded volume today, busiest first
+    days = ticks.store().collected_days()
+    return {
+        "enabled": bool(cfg.get("enabled")), "config": cfg, "config_symbols": cfg.get("symbols", []),
+        "strategy_symbols": ticks.strategy_symbols(), "collector": {**col, "alive": alive, "supervisor": sup},
+        "days": {"count": len(days), "first": days[0] if days else None, "last": days[-1] if days else None,
+                 "retention": int(cfg.get("retention_days") or ticks.RETENTION_DAYS)},
+        "disk_mb": ticks.disk_mb(), "lists": {k: v["label"] for k, v in fu.LISTS.items()},
+        "top": rows[:max(1, min(500, top))], "keys_today": len(stats),
+    }
+
+
+@router.get("/ticks/status")
+def ticks_status(q: str = "", top: int = 50) -> dict[str, Any]:
+    """The order-flow collector: config, its process's health and load, the
+    symbol plan by class, the stored days (a sliding window) and today's
+    busiest keys (`q` filters them by name)."""
+    return _flow_status(q, top)
 
 
 @router.put("/ticks/config")
 def ticks_config(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    """Which symbols to record. "NIFTY:FUT" = the current NIFTY future (rolls
-    by itself); an index entry records its current future too."""
+    """Change what is recorded. Any of: enabled, symbols (hand-picked; "NIFTY:FUT"
+    = the current NIFTY future, rolling by itself), retention_days (1-365,
+    the sliding window), raw_days (0-30, every frame of the hand-picked
+    symbols), budget (50-5000 symbols on the socket), min_free_gb (0.5-1000:
+    the disk guard drops old days early, then pauses) and universe {lists,
+    stocks, index_futures, stock_futures, next_futures, index_options,
+    index_strikes, index_next_strikes, stock_options, stock_strikes,
+    stock_next_expiry, roll_days, enabled}."""
+    from app.algo import flow_universe as fu
     from app.algo import ticks
 
-    syms = body.get("symbols") or []
-    if not isinstance(syms, list) or len(syms) > ticks.MAX_SYMBOLS:
-        raise HTTPException(422, detail=f"symbols must be a list of at most {ticks.MAX_SYMBOLS}")
-    keep = body.get("retention_days")
-    if keep is not None and (not isinstance(keep, int) or not 1 <= keep <= 365):
-        raise HTTPException(422, detail="retention_days must be 1-365")
-    ticks.recorder().save_config(bool(body.get("enabled", True)), [str(x) for x in syms], keep)
-    return ticks.recorder().status()
+    patch: dict[str, Any] = {}
+    if "enabled" in body:
+        patch["enabled"] = bool(body["enabled"])
+    if "symbols" in body:
+        syms = body.get("symbols") or []
+        if not isinstance(syms, list) or len(syms) > ticks.MAX_FOCUS:
+            raise HTTPException(422, detail=f"symbols must be a list of at most {ticks.MAX_FOCUS}")
+        patch["symbols"] = [str(x) for x in syms]
+    for k, lo, hi in (("retention_days", 1, 365), ("raw_days", 0, 30), ("budget", 50, 5000)):
+        if body.get(k) is not None:
+            v = body[k]
+            if not isinstance(v, int) or isinstance(v, bool) or not lo <= v <= hi:
+                raise HTTPException(422, detail=f"{k} must be {lo}-{hi}")
+            patch[k] = v
+    if body.get("min_free_gb") is not None:
+        v = body["min_free_gb"]
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or not 0.5 <= v <= 1000:
+            raise HTTPException(422, detail="min_free_gb must be 0.5-1000")
+        patch["min_free_gb"] = float(v)
+    uni = body.get("universe")
+    if uni is not None:
+        if not isinstance(uni, dict):
+            raise HTTPException(422, detail="universe must be an object")
+        clean: dict[str, Any] = {}
+        for k, v in uni.items():
+            if k not in ticks.DEFAULT_UNIVERSE:
+                raise HTTPException(422, detail=f"unknown universe setting {k!r}")
+            if k == "lists":
+                if not isinstance(v, list) or any(x not in fu.LISTS for x in v):
+                    raise HTTPException(422, detail=f"lists are some of {sorted(fu.LISTS)}")
+            elif k in ("next_futures",):
+                if v not in ("always", "roll", "off"):
+                    raise HTTPException(422, detail="next_futures is always, roll or off")
+            elif k in ("stock_next_expiry",):
+                if v not in ("roll", "off"):
+                    raise HTTPException(422, detail="stock_next_expiry is roll or off")
+            elif k in ("index_strikes", "index_next_strikes", "stock_strikes", "roll_days"):
+                if not isinstance(v, int) or isinstance(v, bool) or not 0 <= v <= 50:
+                    raise HTTPException(422, detail=f"{k} must be 0-50")
+            elif not isinstance(v, bool):
+                raise HTTPException(422, detail=f"{k} must be true or false")
+            clean[k] = v
+        patch["universe"] = clean
+    ticks.save_config(patch)
+    return _flow_status()
+
+
+@router.get("/ticks/plan")
+def ticks_plan(cls: str = "", q: str = "", limit: int = Query(300, ge=1, le=5000)) -> dict[str, Any]:
+    """The symbols the collector records now ([symbol, key, class]), by class or name."""
+    from app.algo import ticks
+
+    plan = ticks.read_json(ticks.ROOT / "plan.json") or {}
+    rows = [r for r in plan.get("symbols") or [] if (not cls or r[2] == cls) and (not q or q.upper() in r[0])]
+    return {"at": plan.get("at"), "classes": plan.get("classes"), "total": len(rows), "symbols": rows[:limit]}
 
 
 @router.get("/ticks/flow")
 async def ticks_flow(symbol: str, resolution: str = "5", from_ts: int = Query(..., alias="from"),
-                     to_ts: int = Query(..., alias="to"), footprint: bool = False) -> dict[str, Any]:
+                     to_ts: int = Query(..., alias="to"), footprint: bool = False, prints: bool = False) -> dict[str, Any]:
     """REAL order flow per chart candle: buy / sell volume classified from
-    recorded ticks, delta, trades, and the resting book at the candle's end.
-    Candles align with /api/market/history (09:15 buckets, D = session).
-    With footprint=true also buy/sell per price per candle. Crypto: Binance's
-    taker-buy volume per candle (every trade's aggressor), no footprint."""
+    recorded ticks. Candles align with /api/market/history (09:15 buckets,
+    D = session). Each bar: [t, buy, sell, delta, trades, unk, oi, close,
+    delta_low, delta_high] — unk = volume with no aggressor (a feed gap, the
+    auction), oi = open interest at the bar's end (F&O), close = its last
+    trade (an index's bars are its future's: the chart shifts by the basis),
+    delta_low / high = the lowest / highest running delta inside the bar.
+    footprint=true adds [t, price, buy, sell]; prints=true the big trades
+    [ts, price, qty, side]. Crypto: Binance's taker-buy volume per candle."""
     from app.services import crypto
 
     if resolution != "D" and not resolution.isdigit():
@@ -434,16 +522,20 @@ async def ticks_flow(symbol: str, resolution: str = "5", from_ts: int = Query(..
             raise HTTPException(502, detail=f"Binance unavailable: {e!s}"[:200]) from None
         out = {"symbol": symbol, "key": symbol.upper(), "recorded": bool(rows),
                "bars": [[int(t), round(tb, 6), round(v - tb, 6), round(2 * tb - v, 6)] for t, *_, v, tb in rows]}
-        return {**out, "footprint": []} if footprint else out
-    return await asyncio.to_thread(_recorded_flow, symbol, resolution, from_ts, to_ts, footprint)
+        return {**out, "footprint": [], "prints": []} if footprint or prints else out
+    return await asyncio.to_thread(_recorded_flow, symbol, resolution, from_ts, to_ts, footprint, prints)
 
 
-def _recorded_flow(symbol: str, resolution: str, from_ts: int, to_ts: int, footprint: bool) -> dict[str, Any]:
+FOOTPRINT_MAX_ROWS = 250_000
+
+
+def _recorded_flow(symbol: str, resolution: str, from_ts: int, to_ts: int, footprint: bool,
+                   prints: bool = False) -> dict[str, Any]:
     from app.algo import ticks
 
     span = 86400 if resolution == "D" else int(resolution) * 60
-    rec = ticks.recorder()
-    key = ticks.flow_key(data.fyers_symbol(symbol))
+    st = ticks.store()
+    fy = data.fyers_symbol(symbol)
 
     def bucket(t: int) -> int:
         day0 = t - (t + 19800) % 86400
@@ -452,20 +544,46 @@ def _recorded_flow(symbol: str, resolution: str, from_ts: int, to_ts: int, footp
         o_s = day0 + 33300
         return o_s + ((t - o_s) // span) * span
 
-    rows: dict[int, list[float]] = {}
-    for t, (b, s_) in sorted(rec.minute_flow(key, from_ts, to_ts).items()):
-        r = rows.setdefault(bucket(t), [0.0, 0.0])
-        r[0] += b
-        r[1] += s_
-    out = {"symbol": symbol, "key": key, "recorded": bool(rows),
-           "bars": [[t, round(b, 2), round(s_, 2), round(b - s_, 2)] for t, (b, s_) in sorted(rows.items())]}
+    # The key that held this symbol each day (a future was <NAME>-FUT2 before it became <NAME>-FUT).
+    spans: list[tuple[str, int, int]] = []
+    for day, key in sorted(st.keys_for(fy, from_ts, to_ts).items()):
+        a, b = max(from_ts, day * 86400 - 19800), min(to_ts, (day + 1) * 86400 - 19800)
+        if spans and spans[-1][0] == key and spans[-1][2] == a:
+            spans[-1] = (key, spans[-1][1], b)
+        else:
+            spans.append((key, a, b))
+    bars: dict[int, list] = {}
+    for key, a, b in spans:
+        for r in st.flow_rows(key, a, b):
+            t, buy, sell, unk, trades, _, _, _, _, c, _, _, oi, _ = r
+            buy, sell = buy or 0.0, sell or 0.0
+            x = bars.setdefault(bucket(int(t)), [0.0, 0.0, 0.0, 0, None, None, 0.0, 0.0, 0.0])
+            x[0] += buy
+            x[1] += sell
+            x[2] += unk or 0.0
+            x[3] += int(trades or 0)
+            x[4] = oi if oi is not None else x[4]
+            x[5] = c if c is not None else x[5]
+            x[6] += buy - sell                                     # running delta inside the bar
+            x[7], x[8] = min(x[7], x[6]), max(x[8], x[6])
+    key_last = spans[-1][0] if spans else ticks.flow_key(fy)
+    out: dict[str, Any] = {
+        "symbol": symbol, "key": key_last, "recorded": bool(bars),
+        "bars": [[t, round(v[0], 2), round(v[1], 2), round(v[0] - v[1], 2), v[3], round(v[2], 2), v[4], v[5],
+                  round(v[7], 2), round(v[8], 2)] for t, v in sorted(bars.items())],
+    }
     if footprint:
         fp: dict[tuple[int, float], list[float]] = {}
-        for t, price, b, s_ in rec.footprint(key, from_ts, to_ts):
-            f = fp.setdefault((bucket(int(t)), price), [0.0, 0.0])
-            f[0] += b
-            f[1] += s_
-        out["footprint"] = [[t, p, round(b, 2), round(s_, 2)] for (t, p), (b, s_) in sorted(fp.items())]
+        for key, a, b in spans:
+            for t, price, b_, s_ in st.footprint(key, a, b):
+                f = fp.setdefault((bucket(int(t)), price), [0.0, 0.0])
+                f[0] += b_
+                f[1] += s_
+        rows = [[t, p, round(b_, 2), round(s_, 2)] for (t, p), (b_, s_) in sorted(fp.items())]
+        out["footprint"] = rows[-FOOTPRINT_MAX_ROWS:]
+        out["footprint_truncated"] = len(rows) > FOOTPRINT_MAX_ROWS
+    if prints:
+        out["prints"] = [[int(t), p, q, int(sd)] for key, a, b in spans for t, p, q, sd in st.prints(key, a, b)]
     return out
 
 

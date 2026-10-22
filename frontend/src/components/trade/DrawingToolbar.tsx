@@ -6,6 +6,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "re
 import { createPortal } from "react-dom";
 import { EMOJIS, GLYPHS, STICKERS, TOOLS, TOOL_BY_ID, TOOL_GROUPS, type Drawing, type DrawingData, type DrawingStyle, type ToolGroupId } from "./drawings";
 import { ColorInput, overlayRoot, useOutside } from "./chartUi";
+import { ToolIcon, TvIcon } from "./tvIcons";
 
 export type CursorMode = "cross" | "dot" | "arrow" | "demo" | "eraser";
 export type Magnet = "off" | "weak" | "strong";
@@ -160,7 +161,7 @@ export function LeftToolbar(p: LeftToolbarProps) {
           title={g === "icons" ? "Icons" : `${tool.label}`}
           data-testid={`chart-draw-${g === "icons" ? "icons" : tool.id}`}
         >
-          {g === "icons" ? "☺" : tool.icon}
+          {g === "icons" ? <TvIcon name="smile" fallback="☺" /> : <ToolIcon id={tool.id} group={g} glyph={tool.icon} />}
         </button>
         {g !== "icons" && <button type="button" className="dtb-more" onClick={(e) => toggle(g, e)} title={label} aria-label={label} data-testid={`chart-group-${g}`}>›</button>}
         {open === g && g !== "icons" && (
@@ -172,7 +173,7 @@ export function LeftToolbar(p: LeftToolbarProps) {
                 {tools.filter((t) => (t.section ?? "") === sec).map((t) => (
                   <div key={t.id} className={`dtb-fly-row${p.drawMode === t.id ? " on" : ""}`}>
                     <button type="button" className="dtb-fly-item" onClick={() => { p.onTool(t.id); setOpen(null); }} data-testid={`chart-draw-${t.id}`} title={t.kbd ? `${t.label} (${t.kbd})` : t.label}>
-                      <span className="ico">{t.icon}</span>
+                      <span className="ico"><ToolIcon id={t.id} group={t.group} glyph={t.icon} size={22} /></span>
                       {t.label}
                       {t.kbd && <span className="kbd">{t.kbd}</span>}
                     </button>
@@ -231,7 +232,7 @@ export function LeftToolbar(p: LeftToolbarProps) {
           title={`${cursorDef.label} (Esc)`}
           data-testid="chart-draw-none"
         >
-          {cursorDef.icon}
+          <TvIcon name={cursorDef.id} fallback={cursorDef.icon} />
         </button>
         <button type="button" className="dtb-more" onClick={(e) => toggle("cursor", e)} title="Cursors" aria-label="Cursors">›</button>
         {open === "cursor" && (
@@ -240,7 +241,7 @@ export function LeftToolbar(p: LeftToolbarProps) {
             {CURSORS.map((c) => (
               <div key={c.id} className={`dtb-fly-row${p.cursor === c.id ? " on" : ""}`}>
                 <button type="button" className="dtb-fly-item" onClick={() => { p.onCursor(c.id); setOpen(null); }} data-testid={`chart-cursor-${c.id}`}>
-                  <span className="ico">{c.icon}</span>
+                  <span className="ico"><TvIcon name={c.id} fallback={c.icon} size={22} /></span>
                   {c.label}
                 </button>
               </div>
@@ -250,7 +251,7 @@ export function LeftToolbar(p: LeftToolbarProps) {
       </div>
       {TOOL_GROUPS.map((g) => groupBtn(g.id))}
       <div className="dtb-group">
-        <button type="button" className={`chart-tool${p.drawMode === "image" ? " on" : ""}`} title="Image" onClick={() => fileRef.current?.click()} data-testid="chart-draw-image">▣</button>
+        <button type="button" className={`chart-tool${p.drawMode === "image" ? " on" : ""}`} title="Image" onClick={() => fileRef.current?.click()} data-testid="chart-draw-image"><TvIcon name="image" fallback="▣" /></button>
         <input
           ref={fileRef}
           type="file"
@@ -280,8 +281,8 @@ export function LeftToolbar(p: LeftToolbarProps) {
         />
       </div>
       <div className="chart-tool-sep" />
-      <button type="button" className={`chart-tool${p.drawMode === "measure" ? " on" : ""}`} onClick={() => p.onTool("measure")} title="Measure — click start, click end" data-testid="chart-measure">📏</button>
-      <button type="button" className={`chart-tool${p.drawMode === "zoom" ? " on" : ""}`} onClick={() => p.onTool("zoom")} title="Zoom in — drag a rectangle (or click two corners)" data-testid="chart-zoom">🔍</button>
+      <button type="button" className={`chart-tool${p.drawMode === "measure" ? " on" : ""}`} onClick={() => p.onTool("measure")} title="Measure — click start, click end" data-testid="chart-measure"><TvIcon name="measure" fallback="📏" /></button>
+      <button type="button" className={`chart-tool${p.drawMode === "zoom" ? " on" : ""}`} onClick={() => p.onTool("zoom")} title="Zoom in — drag a rectangle (or click two corners)" data-testid="chart-zoom"><TvIcon name="zoom" fallback="🔍" /></button>
       <div className="dtb-group">
         <button
           type="button"
@@ -290,7 +291,7 @@ export function LeftToolbar(p: LeftToolbarProps) {
           title={`Magnet mode${p.magnet === "off" ? "" : ` (${p.magnet})`} — snaps drawings placed near price bars to the closest OHLC value`}
           data-testid="chart-magnet"
         >
-          🧲
+          <TvIcon name="magnet" fallback="🧲" />
         </button>
         <button type="button" className="dtb-more" onClick={(e) => toggle("magnet", e)} title="Magnet options" aria-label="Magnet options">›</button>
         {open === "magnet" && (
@@ -305,8 +306,8 @@ export function LeftToolbar(p: LeftToolbarProps) {
           </Flyout>
         )}
       </div>
-      <button type="button" className={`chart-tool${p.stay ? " on" : ""}`} onClick={p.onStay} title="Stay in drawing mode" data-testid="chart-stay">✎̲</button>
-      <button type="button" className={`chart-tool${p.lockAll ? " on" : ""}`} onClick={p.onLockAll} title={p.lockAll ? "Unlock all drawings" : "Lock all drawings"} data-testid="chart-lock-all">{p.lockAll ? "🔒" : "🔓"}</button>
+      <button type="button" className={`chart-tool${p.stay ? " on" : ""}`} onClick={p.onStay} title="Stay in drawing mode" data-testid="chart-stay"><TvIcon name="stay" fallback="✎̲" /></button>
+      <button type="button" className={`chart-tool${p.lockAll ? " on" : ""}`} onClick={p.onLockAll} title={p.lockAll ? "Unlock all drawings" : "Lock all drawings"} data-testid="chart-lock-all"><TvIcon name={p.lockAll ? "lock" : "unlock"} /></button>
       <div className="dtb-group">
         <button
           type="button"
@@ -315,7 +316,7 @@ export function LeftToolbar(p: LeftToolbarProps) {
           title={p.hide.drawings ? "Show all drawings" : "Hide all drawings"}
           data-testid="chart-hide-drawings"
         >
-          {p.hide.drawings ? "◌" : "👁"}
+          <TvIcon name={p.hide.drawings ? "eyeoff" : "eye"} />
         </button>
         <button type="button" className="dtb-more" onClick={(e) => toggle("hide", e)} title="Hide options" aria-label="Hide options">›</button>
         {open === "hide" && (
@@ -328,12 +329,12 @@ export function LeftToolbar(p: LeftToolbarProps) {
           </Flyout>
         )}
       </div>
-      <button type="button" className={`chart-tool${p.syncDrawings ? " on" : ""}`} onClick={p.onSyncDrawings} title="Sync drawings to all charts of this symbol" data-testid="chart-sync-drawings">🔗</button>
+      <button type="button" className={`chart-tool${p.syncDrawings ? " on" : ""}`} onClick={p.onSyncDrawings} title="Sync drawings to all charts of this symbol" data-testid="chart-sync-drawings"><TvIcon name="link" fallback="🔗" /></button>
       <div className="dtb-group">
-        <button type="button" className="chart-tool" disabled={!p.selected} onClick={p.onDeleteSelected} title="Delete selected drawing (Del)" data-testid="chart-draw-delete">⌫</button>
+        <button type="button" className="chart-tool" disabled={!p.selected} onClick={p.onDeleteSelected} title="Delete selected drawing (Del)" data-testid="chart-draw-delete"><TvIcon name="backspace" fallback="⌫" /></button>
       </div>
       <div className="dtb-group">
-        <button type="button" className="chart-tool" onClick={(e) => toggle("remove", e)} title="Remove drawings / indicators" data-testid="chart-draw-clear">🗑</button>
+        <button type="button" className="chart-tool" onClick={(e) => toggle("remove", e)} title="Remove drawings / indicators" data-testid="chart-draw-clear"><TvIcon name="trash" fallback="🗑" /></button>
         {open === "remove" && (
           <Flyout anchor={anchor} onClose={() => setOpen(null)}>
             <div className="dtb-fly-row"><button type="button" className="dtb-fly-item" disabled={!p.drawingCount} onClick={() => { p.onRemove("drawings"); setOpen(null); }} data-testid="chart-remove-drawings">Remove {p.drawingCount} drawing{p.drawingCount === 1 ? "" : "s"}</button></div>
@@ -347,13 +348,13 @@ export function LeftToolbar(p: LeftToolbarProps) {
         )}
       </div>
       <div className="chart-tool-sep" />
-      <button type="button" className={`chart-tool${p.alertMode ? " on" : ""}`} onClick={p.onAlert} title="Price alert — click a price" data-testid="chart-draw-alert">🔔</button>
+      <button type="button" className={`chart-tool${p.alertMode ? " on" : ""}`} onClick={p.onAlert} title="Price alert — click a price" data-testid="chart-draw-alert"><TvIcon name="bell" fallback="🔔" /></button>
       {p.onPick && (
-        <button type="button" className={`chart-tool${p.pickMode ? " on" : ""}`} onClick={p.onPick} title="Click a chart price to load it into the ticket as a LIMIT" data-testid="chart-pick-price">⤷</button>
+        <button type="button" className={`chart-tool${p.pickMode ? " on" : ""}`} onClick={p.onPick} title="Click a chart price to load it into the ticket as a LIMIT" data-testid="chart-pick-price"><TvIcon name="pick" fallback="⤷" /></button>
       )}
-      <button type="button" className={`chart-tool${p.showFavBar ? " on" : ""}`} onClick={p.onFavBar} title="Show favorite drawing tools toolbar" data-testid="chart-fav-bar">★</button>
+      <button type="button" className={`chart-tool${p.showFavBar ? " on" : ""}`} onClick={p.onFavBar} title="Show favorite drawing tools toolbar" data-testid="chart-fav-bar"><TvIcon name="star" fallback="★" /></button>
       <span className="grow" />
-      <button type="button" className="chart-tool" onClick={p.onCollapse} title="Hide drawings toolbar" data-testid="chart-tools-collapse">«</button>
+      <button type="button" className="chart-tool" onClick={p.onCollapse} title="Hide drawings toolbar" data-testid="chart-tools-collapse"><TvIcon name="collapse" fallback="«" /></button>
     </div>
   );
 }
@@ -383,7 +384,7 @@ export function FavoritesBar({ favorites, drawMode, onTool, onClose }: { favorit
       {favorites.map((id) => {
         const t = TOOL_BY_ID.get(id);
         if (!t) return null;
-        return <button key={id} type="button" className={`chart-tool${drawMode === id ? " on" : ""}`} title={t.label} onClick={() => onTool(id)}>{t.icon}</button>;
+        return <button key={id} type="button" className={`chart-tool${drawMode === id ? " on" : ""}`} title={t.label} onClick={() => onTool(id)}><ToolIcon id={t.id} group={t.group} glyph={t.icon} size={22} /></button>;
       })}
       <button type="button" className="chart-tool" onClick={onClose} title="Close">×</button>
     </div>

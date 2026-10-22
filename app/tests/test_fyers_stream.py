@@ -1302,8 +1302,9 @@ async def test_expired_token_does_not_open_the_socket():
     mgr._loop = asyncio.get_running_loop()
     await mgr._ensure_connected()
     assert "data" not in holder
-    assert mgr.status() == {"connected": False, "reason": "token_expired", "subscribed": 0,
-                            "last_tick_age_s": None, "rejected_symbols": []}
+    assert mgr.status() == {"connected": False, "reason": "token_expired", "subscribed": 0, "record_only": 0,
+                            "last_tick_age_s": None, "rejected_symbols": [], "rejected_count": 0,
+                            "limit_error": None, "limit_hits": 0, "received": 0}
 
 
 @pytest.mark.asyncio
@@ -1335,3 +1336,105 @@ async def test_browser_watched_symbols_stream_and_survive_reconnect():
         ws_mod.WATCHED.pop(1, None)
     await mgr._reconcile_subscriptions()
     assert opt not in mgr._subscribed
+
+
+@pytest.mark.asyncio
+async def test_record_only_symbols_reach_the_listeners_but_never_the_bus():
+    """The order-flow collector's universe: recorded, never published — thousands
+    of symbols on the bus (and every browser) would swamp both."""
+    md = MarketDataBus()
+    holder, df, of = _factories()
+    mgr = FyersStreamManager(
+        market_data=md, quote_feed=_FakeQuoteFeed(["SBIN"]), backend_provider=lambda: _FakeBackend(),
+        data_socket_factory=df, order_socket_factory=of,
+        resolve_fn=lambda s: "NSE:SBIN-EQ" if s == "SBIN" else None,
+        record_symbols=lambda: ["NSE:INFY-EQ", "NSE:SBIN-EQ"], orders=False,
+    )
+    mgr._loop = asyncio.get_running_loop()
+    connects: list[int] = []
+    seen: list[str] = []
+    mgr.connect_listeners.append(lambda: connects.append(1))
+    mgr.tick_listeners.append(lambda full, msg, recv: seen.append(full))
+    await mgr._ensure_connected()
+    assert connects == [1] and "order" not in holder          # the collector runs no order socket
+    await mgr._reconcile_subscriptions()
+    assert set(holder["data"].subscribed[0][0]) == {"NSE:SBIN-EQ", "NSE:INFY-EQ"}
+    assert mgr.status()["record_only"] == 1                   # SBIN is also the app's: published
+    mgr._on_data_message({"symbol": "NSE:INFY-EQ", "ltp": 1500.0})
+    mgr._on_data_message({"symbol": "NSE:SBIN-EQ", "ltp": 810.0})
+    await asyncio.sleep(0.05)
+    assert seen == ["NSE:INFY-EQ", "NSE:SBIN-EQ"]
+    assert await md.get_quote("NSE:INFY-EQ") is None and (await md.get_quote("SBIN")).last_price == 810.0
+
+
+@pytest.mark.asyncio
+async def test_a_large_subscription_goes_in_chunks_off_the_event_loop():
+    holder, df, of = _factories()
+    syms = [f"NSE:S{i}-EQ" for i in range(120)]
+    mgr = FyersStreamManager(
+        market_data=MarketDataBus(), quote_feed=None, backend_provider=lambda: _FakeBackend(),
+        data_socket_factory=df, order_socket_factory=of, record_symbols=lambda: syms, orders=False,
+        subscribe_chunk=50,
+    )
+    mgr._loop = asyncio.get_running_loop()
+    await mgr._ensure_connected()
+    await mgr._reconcile_subscriptions()
+    assert [len(c[0]) for c in holder["data"].subscribed] == [50, 50, 20]
+    assert len(mgr._subscribed) == 120
+    holder["data"].subscribed.clear()
+    await mgr._reconcile_subscriptions()                      # nothing new: nothing sent
+    assert holder["data"].subscribed == []
+
+
+@pytest.mark.asyncio
+async def test_a_refused_subscribe_is_not_held_and_a_swap_unsubscribes_first():
+    """The SDK refuses a subscribe past its symbol cap by calling on_error and
+    returning: those symbols must not count as streaming. And a swap of
+    symbols must free room before taking more, or a full socket refuses it."""
+
+    class _CappedSocket(_FakeDataSocket):
+        CAP = 100
+
+        def __init__(self, **cb):
+            super().__init__(**cb)
+            self.held: set[str] = set()
+
+        def subscribe(self, symbols, data_type="SymbolUpdate"):
+            if len(self.held | set(symbols)) > self.CAP:
+                self._cb["on_error"]({"code": -99, "message": "Please provide less than 5000 symbols", "s": "error"})
+                return
+            self.held |= set(symbols)
+            super().subscribe(symbols, data_type)
+
+        def unsubscribe(self, symbols, data_type="SymbolUpdate"):
+            self.held -= set(symbols)
+            super().unsubscribe(symbols, data_type)
+
+    holder: dict = {}
+
+    def df(token, **cb):
+        holder["data"] = _CappedSocket(**cb)
+        return holder["data"]
+
+    want = [f"NSE:S{i}-EQ" for i in range(120)]
+    mgr = FyersStreamManager(
+        market_data=MarketDataBus(), quote_feed=None, backend_provider=lambda: _FakeBackend(),
+        data_socket_factory=df, order_socket_factory=lambda token, **cb: _FakeOrderSocket(**cb),
+        record_symbols=lambda: want, orders=False, subscribe_chunk=50, always_subscribe=[],
+    )
+    mgr._loop = asyncio.get_running_loop()
+    await mgr._ensure_connected()
+    await mgr._reconcile_subscriptions()
+    sock = holder["data"]
+    assert len(sock.held) == 100 and set(mgr._subscribed.values()) == sock.held     # the refused 20 aren't held
+    assert mgr.limit_hits == 1 and "5000" in mgr.status()["limit_error"]
+    sock.subscribed.clear()
+    await mgr._reconcile_subscriptions()
+    assert sock.subscribed == []                             # a refusal waits a minute before retrying
+    # the collector shrinks to what fits, then swaps 20 strikes: room is freed first
+    mgr._sub_retry_at = 0.0
+    want[:] = [f"NSE:S{i}-EQ" for i in range(100)]
+    await mgr._reconcile_subscriptions()
+    want[:] = [f"NSE:S{i}-EQ" for i in range(20, 120)]
+    await mgr._reconcile_subscriptions()
+    assert sock.held == set(want) and set(mgr._subscribed.values()) == set(want) and mgr.limit_hits == 1

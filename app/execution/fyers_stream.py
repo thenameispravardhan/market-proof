@@ -157,6 +157,9 @@ class FyersStreamManager:
         resolve_fn: Optional[Callable[[str], Optional[str]]] = None,
         always_subscribe: Optional[list[str]] = None,
         extra_symbols: Optional[Callable[[], list[str]]] = None,
+        record_symbols: Optional[Callable[[], list[str]]] = None,
+        orders: bool = True,
+        subscribe_chunk: int = 500,
         reconcile_interval_s: float = 2.0,
         fresh_window_s: float = 6.0,
         ondemand_ttl_s: float = 12.0,
@@ -181,6 +184,26 @@ class FyersStreamManager:
         # More full ids to keep subscribed (the tick recorder's list), asked
         # each reconcile so edits and futures rolls apply without a restart.
         self._extra_symbols = extra_symbols
+        # Full ids subscribed ONLY for the tick listeners (the order-flow
+        # collector's universe): their frames never reach the bus or the
+        # browsers — thousands of symbols would swamp both.
+        self._record_symbols = record_symbols
+        self._record_only: set[str] = set()
+        # The collector process runs its own feed without the order socket
+        # (order updates are the app's to reconcile, once).
+        self._orders = bool(orders)
+        self._chunk = max(1, int(subscribe_chunk))
+        # Called on the SDK thread on every (re)connect of the data socket.
+        self.connect_listeners: list[Callable[[], None]] = []
+        # full id -> bus keys holding it (rebuilt when subscriptions change, not per tick).
+        self._keys_cache: dict[str, list[str]] = {}
+        # Bumped whenever the socket drops its subscriptions (close / reconnect).
+        self._epoch = 0
+        # Fyers refused the subscription count (plan limit): shown on the status.
+        self.limit_error: Optional[str] = None
+        self.limit_hits = 0                 # subscribe calls refused for the symbol cap
+        self._refused = False               # the SDK turned down the subscribe call in flight
+        self._sub_retry_at = 0.0            # after a refusal, new subscriptions wait a minute
         # Called on the SDK thread with (full_id, raw frame, receive time) for
         # every frame — the tick recorder hangs off this. Must be cheap.
         self.tick_listeners: list[Callable[[str, dict[str, Any], float], None]] = []
@@ -403,6 +426,7 @@ class FyersStreamManager:
     async def _connect_sockets(self) -> None:
         self._subscribed.clear()
         self._full_to_short.clear()
+        self._keys_cache = {}
         self._ondemand.clear()
         self._rejected.clear()
         self._data_connected = False
@@ -420,18 +444,19 @@ class FyersStreamManager:
             on_connect=self._on_order_connect,
             on_error=self._on_order_error,
             on_close=self._on_order_close,
-        )
+        ) if self._orders else None
         # connect() spawns the SDK's ws/ping threads but does a synchronous
         # time.sleep(2), so run it off the event loop.
         # Both at once (each blocks ~2 s inside the SDK): half the blind window.
         await asyncio.gather(
             self._loop.run_in_executor(None, self._data_socket.connect),
-            self._loop.run_in_executor(None, self._order_socket.connect),
+            *([self._loop.run_in_executor(None, self._order_socket.connect)] if self._order_socket else []),
         )
         self._data_connected = True
         # Updates sent while the order socket was down are gone — replay today's
         # order book once so no fill / reject is lost across a reconnect.
-        asyncio.ensure_future(self._resync_orders())
+        if self._orders:
+            asyncio.ensure_future(self._resync_orders())
         self._order_ready = True  # later order-socket connects are SDK auto-reconnects
         # Order socket subscribes itself in `_on_order_connect` — that
         # covers both the initial connect AND any SDK auto-reconnect
@@ -479,6 +504,8 @@ class FyersStreamManager:
         self._data_connected = False
         self._subscribed.clear()
         self._full_to_short.clear()
+        self._keys_cache = {}
+        self._epoch += 1
         self._ondemand.clear()
         self._depth.clear()
 
@@ -511,6 +538,18 @@ class FyersStreamManager:
             full = self._resolve(short) or (short if ":" in short else None)
             if full:
                 desired[short] = full.upper()
+        bus_fulls = set(desired.values())
+        record_only: set[str] = set()
+        if self._record_symbols is not None:
+            try:
+                for full in self._record_symbols():
+                    f = full.upper()
+                    desired.setdefault(f, f)
+                    if f not in bus_fulls:
+                        record_only.add(f)
+            except Exception:  # noqa: BLE001 — a broken provider must not stop the feed
+                log.exception("fyers_stream.record_symbols_failed")
+        self._record_only = record_only
         desired = {s: f for s, f in desired.items() if f not in self._rejected}
 
         add = {s: f for s, f in desired.items() if s not in self._subscribed}
@@ -530,17 +569,8 @@ class FyersStreamManager:
             if s not in desired and (now - self._ondemand.get(s, 0.0)) > self._ondemand_ttl
         }
 
-        if add:
-            try:
-                self._data_socket.subscribe(
-                    symbols=list(add.values()), data_type="SymbolUpdate"
-                )
-                for s, f in add.items():
-                    self._subscribed[s] = f
-                    self._full_to_short[f] = s
-                log.info("fyers_stream.subscribed", symbols=list(add.values()))
-            except Exception:  # noqa: BLE001
-                log.exception("fyers_stream.subscribe_failed")
+        # Removals first: a large swap (a re-centred strike ladder, an expiry
+        # roll) then never takes the socket over its symbol cap on the way.
         if remove:
             # Only drop an instrument from the socket when no remaining key still uses it.
             still = {f for k, f in subscribed_snapshot.items() if k not in remove}
@@ -559,6 +589,40 @@ class FyersStreamManager:
                     self._full_to_short[f] = others[0]
                 else:
                     self._full_to_short.pop(f, None)
+            self._keys_cache = {}
+        if add and now >= self._sub_retry_at:
+            items = list(add.items())
+            epoch = self._epoch
+            held = 0
+            try:
+                for i in range(0, len(items), self._chunk):
+                    part = items[i:i + self._chunk]
+                    fulls = [f for _, f in part]
+                    self._refused = False
+                    if len(items) <= 50:
+                        self._data_socket.subscribe(symbols=fulls, data_type="SymbolUpdate")
+                    else:
+                        # The SDK resolves symbols over HTTP and sleeps between
+                        # its own batches: thousands would stall the loop for seconds.
+                        await asyncio.to_thread(self._data_socket.subscribe, symbols=fulls, data_type="SymbolUpdate")
+                    if epoch != self._epoch or self._data_socket is None:
+                        break                       # the socket dropped meanwhile: the next sweep starts over
+                    if self._refused:
+                        # The SDK turned the whole call down (its 5,000-symbol cap, or its
+                        # symbol lookup failed) and returned quietly: nothing in it streams,
+                        # so none of it is held; the next try waits a minute.
+                        self._sub_retry_at = time.monotonic() + 60.0
+                        log.warning("fyers_stream.subscribe_refused", count=len(items) - i, held=len(self._subscribed))
+                        break
+                    for s, f in part:
+                        self._subscribed[s] = f
+                        self._full_to_short[f] = s
+                    held += len(part)
+                    self._keys_cache = {}
+                if held:
+                    log.info("fyers_stream.subscribed", count=held, symbols=[f for _, f in items[:20]])
+            except Exception:  # noqa: BLE001
+                log.exception("fyers_stream.subscribe_failed")
 
     def _unsubscribe(self, fulls: list[str], data_type: str) -> None:
         """Unsubscribe `fulls`, working around an SDK bug.
@@ -589,8 +653,13 @@ class FyersStreamManager:
             "connected": bool(self._data_socket is not None and self._data_connected),
             "reason": self._down_reason,
             "subscribed": len(self._subscribed),
+            "record_only": len(self._record_only),
             "last_tick_age_s": age,
-            "rejected_symbols": sorted(self._rejected),
+            "rejected_symbols": sorted(self._rejected)[:200],
+            "rejected_count": len(self._rejected),
+            "limit_error": self.limit_error,
+            "limit_hits": self.limit_hits,
+            "received": self._rx_count,
         }
 
     # -- WS-first one-shot price (signal / manual pricing) ---------------
@@ -711,6 +780,7 @@ class FyersStreamManager:
         if bus_key not in self._subscribed:
             self._full_to_short[full] = bus_key
             self._subscribed[bus_key] = full
+            self._keys_cache = {}
             try:
                 self._data_socket.subscribe(symbols=[full], data_type="SymbolUpdate")
             except Exception:  # noqa: BLE001
@@ -743,6 +813,11 @@ class FyersStreamManager:
     def _on_data_connect(self, *args: Any) -> None:
         self._data_connected = True
         log.info("fyers_stream.data_connected")
+        for fn in list(self.connect_listeners):
+            try:
+                fn()
+            except Exception:  # noqa: BLE001 — a listener must never break the feed
+                log.exception("fyers_stream.connect_listener_failed")
 
     def _on_data_close(self, *args: Any) -> None:
         self._data_connected = False
@@ -756,6 +831,8 @@ class FyersStreamManager:
         # subs unsubscribe the instant after reconnect.
         self._subscribed.clear()
         self._full_to_short.clear()
+        self._keys_cache = {}
+        self._epoch += 1
         self._depth.clear()
         log.info("fyers_stream.data_closed")
 
@@ -774,9 +851,17 @@ class FyersStreamManager:
                     self._ondemand.pop(k, None)
             for f in bad_set:
                 self._full_to_short.pop(f, None)
-            log.warning("fyers_stream.symbols_rejected", symbols=sorted(bad_set))
+            self._keys_cache = {}
+            log.warning("fyers_stream.symbols_rejected", count=len(bad_set), symbols=sorted(bad_set)[:50])
             return
-        log.warning("fyers_stream.data_error", detail=str(detail))
+        text = str(detail)
+        if "5000" in text or "limit" in text.lower():
+            self.limit_error = text[:300]
+            self.limit_hits += 1
+            self._refused = True
+        elif isinstance(detail, dict) and detail.get("type") == "sub" and "depth" not in str(detail.get("message", "")).lower():
+            self._refused = True            # the SDK's symbol lookup failed: it sent nothing
+        log.warning("fyers_stream.data_error", detail=text[:500])
 
     def _on_data_message(self, message: Any) -> None:
         try:
@@ -828,14 +913,16 @@ class FyersStreamManager:
             if ltp <= 0:
                 self._drop_count += 1
                 return
+            full = self._subscribed.get(short, short)
             if self.tick_listeners:
-                full = self._subscribed.get(short, short)
                 recv = time.time()
                 for fn in self.tick_listeners:
                     try:
                         fn(full, message, recv)
                     except Exception:  # noqa: BLE001 — a listener must never break the feed
                         log.exception("fyers_stream.tick_listener_failed")
+            if full in self._record_only:
+                return                                  # recorded, never published
             bid = safe_float(message.get("bid_price") or message.get("bid")) or None
             ask = safe_float(message.get("ask_price") or message.get("ask")) or None
             vol_raw = message.get("vol_traded_today") or message.get("volume")
@@ -845,8 +932,10 @@ class FyersStreamManager:
             pc = message.get("prev_close_price")
             # Every key that holds this instrument (the bot's bare "SBIN" and
             # the Trade page's "NSE:SBIN-EQ") gets the tick — one never steals it.
-            full_id = self._subscribed.get(short, short)
-            keys = [k for k, f in list(self._subscribed.items()) if f == full_id] or [short]
+            full_id = full
+            keys = self._keys_cache.get(full_id)
+            if keys is None:
+                keys = self._keys_cache[full_id] = [k for k, f in list(self._subscribed.items()) if f == full_id] or [short]
             for key in keys:
                 self._publish_threadsafe(
                     key,
