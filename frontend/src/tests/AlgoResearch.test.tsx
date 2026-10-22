@@ -50,6 +50,20 @@ const CARD = {
     full: { ...SUM, net_pnl: 600, max_drawdown_pct: 3.2 },
   },
 };
+const Z = { math: "pair_z", a: { ind: "PRICE" }, b: { ind: "PRICE", symbol: "NSE:NIFTYBANK-INDEX" }, n: 24 };
+const PAIRS = {
+  tested: 5, skipped: 0, cointegrated: 2, confirmed: 1, expected_by_luck: 0.3, anchor: "NSE:NIFTYBANK-INDEX", timeframe: 60, days: 365, notes: [], elapsed_s: 0.2,
+  pairs: [
+    { a: "NSE:HDFCBANK-EQ", b: "NSE:NIFTYBANK-INDEX", bars: 1500, beta: 1.12, corr: 0.81, adf_fit: -4.6, adf_held_out: -3.4, half_life: 6.1, z_now: -1.7,
+      spread_sd_pct: 1.2, cointegrated: true, holds_out: true, window: 24,
+      spec: { symbols: ["NSE:HDFCBANK-EQ"], timeframe: 60, direction: "both",
+        entry_long: { logic: "AND", conditions: [{ left: Z, op: "crosses_below", right: { value: -2 } }] }, exit_long: { logic: "AND", conditions: [{ left: Z, op: ">", right: { value: -0.5 } }] },
+        entry_short: { logic: "AND", conditions: [{ left: Z, op: "crosses_above", right: { value: 2 } }] }, exit_short: { logic: "AND", conditions: [{ left: Z, op: "<", right: { value: 0.5 } }] },
+        stop_loss: { type: "pct", value: 3 }, target: null, max_bars: 24, session: { start: "09:15", end: "15:15", square_off: null } } },
+    { a: "NSE:SBIN-EQ", b: "NSE:NIFTYBANK-INDEX", bars: 1500, beta: 0.9, corr: 0.6, adf_fit: -3.5, adf_held_out: -1.2, half_life: 20, z_now: 0.4,
+      spread_sd_pct: 2, cointegrated: true, holds_out: false, window: 80, spec: {} },
+  ],
+};
 const json = (body: unknown) => Promise.resolve(new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } }));
 let calls: { url: string; body: any }[] = [];
 
@@ -61,6 +75,7 @@ function route(url: string, init?: RequestInit) {
   if (url.includes("/api/algo/status")) return json({ running: true, last_tick: null, last_sync: null, events: [], open: [] });
   if (url.includes("/api/algo/trades")) return json({ trades: [] });
   if (url.includes("/api/algo/instrument")) return json({ symbol: "NSE:SBIN-EQ", name: "SBIN", fno: false, lot: null, weekly: false, futures: [], coverage: null });
+  if (url.includes("/api/algo/research/pairs")) return json(PAIRS);
   if (url.includes("/api/algo/research/check")) return json({ ...CARD, trials: (body.trials ?? 0) + 1, elapsed_s: 0.4 });
   if (url.includes("/api/algo/research/cards/7")) return json(CARD);
   if (url.includes("/api/algo/research/cards")) {
@@ -126,5 +141,25 @@ describe("Algo Lab research loop", () => {
     const card = await within(tab).findByTestId("strategy-card");
     expect(within(card).getByText(/trend days follow an EMA cross/)).toBeTruthy();
     expect(calls.some((c) => c.url.endsWith("/api/algo/research/cards/7"))).toBe(true);
+  });
+
+  it("finds a pair and loads it into the builder as a one-leg strategy carrying the pairs scanned as tries", async () => {
+    mount();
+    await screen.findByDisplayValue(/EMA 9\/21/);
+    fireEvent.click(screen.getByRole("button", { name: "Research" }));
+    const finder = await screen.findByTestId("pair-finder");
+    fireEvent.change(within(finder).getByTestId("pair-symbols"), { target: { value: "HDFCBANK SBIN" } });
+    fireEvent.click(within(finder).getByText("Find pairs"));
+    expect((await within(finder).findByTestId("pair-summary")).textContent).toContain("1 still hold on the last third");
+    const req = calls.find((c) => c.url.includes("/api/algo/research/pairs"))!;
+    expect(req.body).toEqual({ symbols: ["HDFCBANK", "SBIN"], anchor: "NSE:NIFTYBANK-INDEX", timeframe: 60, days: 365 });
+    expect(within(finder).getAllByText("→ builder").length).toBe(1);          // only the pair that held out
+    expect(within(finder).getByText("didn't hold")).toBeTruthy();
+    fireEvent.click(within(finder).getByText("→ builder"));
+    await screen.findByDisplayValue("Pair HDFCBANK vs NIFTYBANK-INDEX");
+    expect(JSON.parse(localStorage.getItem("algo.draft.v2")!).trials).toBe(5);
+    const ops = screen.getAllByTestId("operand-math-op") as HTMLSelectElement[];
+    expect(ops[0].value).toBe("pair_z");
+    expect(screen.getAllByDisplayValue("24").length).toBeGreaterThan(0);        // the window, in bars
   });
 });

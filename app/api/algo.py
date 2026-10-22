@@ -9,6 +9,8 @@
     POST   /api/algo/research/check        {spec, start, end, grid?, oos_pct?, walk_forward?, hypothesis?}:
                                            split + walk-forward + DSR + PBO -> pass / kill, saved as a card
     GET    /api/algo/research/cards        ?strategy_id=&verdict=   (GET /{id}, /{id}/markdown, PATCH /{id})
+    POST   /api/algo/research/pairs        {symbols, anchor?, timeframe?, days?}: pair finder (cointegration,
+                                           held-out check, half-life, z now)
     GET    /api/algo/data?symbol=          what the candle store holds for a symbol
     POST   /api/algo/data/download         {symbols, days} — fill the store from Fyers
     GET    /api/algo/strategies            saved strategies + live P&L
@@ -404,6 +406,60 @@ def research_card_edit(cid: int, body: dict[str, Any] = Body(...), db: Session =
             setattr(c, k, (str(body[k] or "").strip() or None))
     db.commit()
     return _card(c)
+
+
+@router.post("/research/pairs")
+async def research_pairs(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """{symbols: [...], anchor?: "NIFTY50-INDEX", timeframe?: 60, days?: 365}
+    Every symbol against the anchor (or every pair of peers without one):
+    hedge ratio, Engle-Granger on the first two thirds, the same fit
+    checked on the last third, half-life, today's z — in bars of the
+    timeframe the strategy will trade. `tested` is how many
+    pairs were tried — load a pair and they count as its tries."""
+    from app.research import pairs as pf
+
+    try:
+        syms = list(dict.fromkeys(data.fyers_symbol(str(x)) for x in body.get("symbols") or [] if str(x).strip()))
+        anchor = data.fyers_symbol(str(body["anchor"])) if body.get("anchor") else None
+        tf, days = int(body.get("timeframe") or 60), int(body.get("days") or 365)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(422, detail=f"pairs: {e}") from None
+    if anchor in syms:
+        syms.remove(anchor)
+    if len(syms) < (1 if anchor else 2) or len(syms) > pf.MAX_SYMBOLS:
+        raise HTTPException(422, detail=f"give 2-{pf.MAX_SYMBOLS} symbols (1+ with an anchor)")
+    if tf not in engine.TIMEFRAMES:
+        raise HTTPException(422, detail=f"timeframe must be one of {engine.TIMEFRAMES}")
+    if not 30 <= days <= MAX_RANGE_DAYS:
+        raise HTTPException(422, detail=f"days must be 30-{MAX_RANGE_DAYS}")
+    per_day = 375 / tf
+    est = int((len(syms) + bool(anchor)) * days * 5 / 7 * per_day)
+    if est > MAX_BARS:
+        raise HTTPException(422, detail=f"too much data: ~{est:,} candles (limit {MAX_BARS:,}) — fewer symbols, "
+                                        "fewer days or a larger timeframe")
+    end = int(time.time()) + 60
+    start = end - days * DAY
+    async with _heavy:
+        t0 = time.monotonic()
+        closes, notes = {}, []
+        for fy in ([anchor] if anchor else []) + syms:
+            try:
+                info = await data.ensure(fy, start, end)
+                b = await asyncio.to_thread(data.load, info["key"], tf, start, end)
+            except Exception as e:  # noqa: BLE001 — one symbol is a note, not an error
+                notes.append({"symbol": fy, "note": str(e)[:200]})
+                continue
+            if not b or len(b["t"]) < 60:
+                notes.append({"symbol": fy, "note": "fewer than 60 candles in this range"})
+                continue
+            closes[fy] = {"t": b["t"], "c": b["c"]}
+        if anchor and anchor not in closes:
+            raise HTTPException(422, detail=f"{anchor}: no candles — " + "; ".join(n["note"] for n in notes if n["symbol"] == anchor))
+        res = await asyncio.to_thread(pf.scan, closes, anchor)
+    for r in res["pairs"]:
+        r["spec"] = pf.spec_for(r["a"], r["b"], r["window"], tf)
+    return {**res, "anchor": anchor, "timeframe": tf, "days": days, "notes": notes,
+            "elapsed_s": round(time.monotonic() - t0, 2)}
 
 
 @router.get("/instrument")
