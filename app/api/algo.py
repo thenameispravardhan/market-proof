@@ -14,6 +14,8 @@
     GET    /api/algo/research/surface      ?name=NIFTY&at=   the recorded chain's IV surface
     POST   /api/algo/research/surface/evaluate  {name, start, end, lag?}: surface vs flat IV on recorded quotes
     POST   /api/algo/research/tick-replay  {spec, start, end}: the backtest's stop / target exits vs recorded prints
+    GET    /api/algo/research/universe     point-in-time index membership per index (POST /{index}/changes,
+                                           POST /{index}/snapshot, GET /{index}/members?on=)
     GET    /api/algo/data?symbol=          what the candle store holds for a symbol
     POST   /api/algo/data/download         {symbols, days} — fill the store from Fyers
     GET    /api/algo/strategies            saved strategies + live P&L
@@ -106,7 +108,16 @@ def _estimate_bars(spec: dict[str, Any], start: int, end: int) -> int:
     btype = spec["bars"]["type"]
     base = spec["bars"]["per_day"] if btype != "time" else 375 / spec["timeframe"]
     htf = sum(1 if tf == 1440 else 375 / tf for tf in engine.cond_timeframes(spec))
-    held = len(spec["symbols"]) * days * (base + htf)
+    n_syms = len(spec["symbols"])
+    if spec.get("universe"):                       # every past member is loaded, not just today's list
+        from app.research import universe
+
+        try:
+            n_syms = len(universe.members_between(spec["universe"]["index"], universe.ist_day(start),
+                                                  universe.ist_day(end - 1)))
+        except ValueError as e:
+            raise HTTPException(422, detail=str(e)) from None
+    held = n_syms * days * (base + htf)
     for tfs in engine.ref_frames(spec).values():   # other symbols' candles: time candles, loaded once
         held += days * sum(1 if tf == 1440 else 375 / tf for tf in tfs | {spec["timeframe"]})
     transient = days * 375 if engine.needs_minutes(spec) else 0
@@ -117,7 +128,7 @@ def _guard(spec: dict[str, Any], start: int, end: int, combos: int = 1) -> int:
     est = _estimate_bars(spec, start, end)
     if est > MAX_BARS:
         raise HTTPException(422, detail=(
-            f"too much data for one run: ~{est:,} candles ({len(spec['symbols'])} symbols x "
+            f"too much data for one run: ~{est:,} candles ({'the universe' if spec.get('universe') else str(len(spec['symbols'])) + ' symbols'} x "
             f"{(end - start) // 86400} days at {spec['timeframe']}m). Keep it under {MAX_BARS:,} — "
             "shorten the range, use a larger timeframe or fewer symbols."))
     if est * combos > MAX_BAR_RUNS:
@@ -218,7 +229,7 @@ def indicators() -> dict[str, Any]:
     return {"indicators": ind.catalog(), "operators": engine.OPS, "timeframes": engine.TIMEFRAMES,
             "cond_timeframes": engine.COND_TIMEFRAMES, "sources": ind.SOURCES, "metrics": engine.METRICS,
             "sizing": engine.SIZING, "defaults": engine.DEFAULT_SPEC, "max_range_days": MAX_RANGE_DAYS,
-            "position_metrics": engine.POSITION_METRICS, "no_symbol": sorted(engine.NO_SYMBOL)}
+            "position_metrics": engine.POSITION_METRICS, "no_symbol": sorted(engine.NO_SYMBOL), "events": ind.EVENTS}
 
 
 @router.get("/guide")
@@ -552,6 +563,73 @@ async def research_tick_replay(body: dict[str, Any] = Body(...)) -> dict[str, An
             raise HTTPException(422, detail=f"backtest: {e}")
         out = await asyncio.to_thread(tr.replay, res["trades"], spec, ticks_for)
     return {**out, "notes": notes, "elapsed_s": round(time.monotonic() - t0, 2)}
+
+
+@router.get("/research/universe")
+def research_universes() -> dict[str, Any]:
+    """Each index's point-in-time membership: recorded lists, change log, from when it holds."""
+    from app.research import universe
+
+    return {"indexes": [universe.coverage(i) for i in universe.INDEXES]}
+
+
+def _index(index: str) -> str:
+    from app.research import universe
+
+    if index not in universe.INDEXES:
+        raise HTTPException(404, detail=f"unknown index {index!r}")
+    return index
+
+
+@router.post("/research/universe/{index}/changes")
+def research_universe_changes(index: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """{csv: "date,symbol,action\n2024-03-28,SHRIRAMFIN,add\n..."} — inclusions /
+    exclusions from NSE's index-change announcements, by effective date."""
+    from app.research import universe
+
+    try:
+        res = universe.import_changes(_index(index), str(body.get("csv") or ""))
+    except ValueError as e:
+        raise HTTPException(422, detail=str(e)) from None
+    return {**res, **universe.coverage(index)}
+
+
+@router.post("/research/universe/{index}/snapshot")
+async def research_universe_snapshot(index: str, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+    """Record the index's list: {symbols, date} as given (a list you have for a
+    past date), or — empty — today's from niftyindices.com."""
+    from app.research import universe
+
+    _index(index)
+    if body.get("symbols"):
+        try:
+            day = universe.day_of(date.fromisoformat(str(body.get("date") or date.today().isoformat())))
+            syms = [str(x) for x in (body["symbols"] if isinstance(body["symbols"], list)
+                                     else str(body["symbols"]).replace(",", " ").split())]
+            n = universe.record_snapshot(index, [x.upper().removeprefix("NSE:").removesuffix("-EQ") for x in syms], day)
+        except ValueError as e:
+            raise HTTPException(422, detail=str(e)) from None
+        return {"recorded": True, "day": universe.ymd(day), "members": n, **universe.coverage(index)}
+    try:
+        res = await asyncio.to_thread(universe.fetch_snapshot, index, force=True)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, detail=f"could not fetch the list: {e}"[:300]) from None
+    return {**res, **universe.coverage(index)}
+
+
+@router.get("/research/universe/{index}/members")
+def research_universe_members(index: str, on: Optional[str] = None) -> dict[str, Any]:
+    from app.research import universe
+
+    _index(index)
+    try:
+        day = universe.day_of(date.fromisoformat(on)) if on else universe.ist_day(time.time())
+    except ValueError:
+        raise HTTPException(422, detail="on is YYYY-MM-DD") from None
+    m = universe.members_at(index, day)
+    if m is None:
+        raise HTTPException(404, detail="no recorded list for this index yet")
+    return {"index": index, "on": universe.ymd(day), "members": sorted(m)}
 
 
 @router.get("/instrument")

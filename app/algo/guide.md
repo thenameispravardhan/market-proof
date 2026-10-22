@@ -474,6 +474,20 @@ can't be switched on yet — the live half comes later.
 
 ---
 
+### 7.1 Point-in-time universe — `universe` (backtests)
+
+`"universe": {"index": "nifty50"}` (also `nifty100`, `niftynext50`,
+`niftybank`, `nifty500`, `midcap150`, `smallcap250`) backtests the index **as
+it was each day**: every stock that was a member at any point of the range is
+loaded — the ones dropped since included — and a stock can enter only on days
+it was a member (ranking never picks an outsider). Today's list alone has
+survivorship bias: it never holds the losers that were dropped, and holds
+the winners from before they joined. Membership comes from the lists recorded
+so far and the imported change log (Research → universes); the backtest
+notes say from when it holds and which past members have no candles. Shares /
+futures strategies only. Live trading uses `symbols` — keep them today's
+members.
+
 ## 8. Backtest, optimise, automate
 
 * **Backtest** — pick a date range (up to ~3 years), optionally hold out the
@@ -515,6 +529,9 @@ can't be switched on yet — the live half comes later.
 * **Tick replay of exits** (Research tab) — the builder's backtest, then each
   fixed stop / target exit replayed on the recorded trade prints: which
   level price really touched first, and the P&L that moves.
+* **Universes** (Research tab) — each index's recorded lists and change log
+  (inclusions / exclusions by effective date, from NSE's announcements),
+  and from when its point-in-time membership holds.
 * **Compare** — saved strategies side by side on the same range.
 * **Automations** — saved strategies start OFF and in **paper** mode; switch
   them on to paper-trade live, or to **LIVE** (real orders on Fyers) after
@@ -954,6 +971,35 @@ closing, after 40 candles, or at a ₹15,000 loss on the whole position.
     "session": {"start": "09:15", "end": "15:15", "square_off": null},
     "sizing": {"mode": "pct_equity", "value": 40},
     "portfolio": {"capital": 1000000, "leverage": 5}
+  }
+}
+```
+
+### 9.15 Point in time — NIFTY 50 as it was, momentum, out of the way of results
+
+Backtested on the NIFTY 50 of each day (past members included, entries only
+while a member); live it trades the five listed. Long on a close back above
+the 50-candle EMA, but not within 3 days after the stock's results came out
+(`FILING` counts a filing only once it was public by the candle's close);
+when several fire on one candle, the two with the strongest 20-candle ROC.
+
+```json
+{
+  "name": "NIFTY 50 momentum, out of the way of results",
+  "spec": {
+    "symbols": ["NSE:RELIANCE-EQ", "NSE:HDFCBANK-EQ", "NSE:ICICIBANK-EQ", "NSE:INFY-EQ", "NSE:TCS-EQ"],
+    "universe": {"index": "nifty50"},
+    "timeframe": 15,
+    "direction": "long",
+    "entry_long": {"logic": "AND", "conditions": [
+      {"left": {"ind": "PRICE"}, "op": "crosses_above", "right": {"ind": "EMA", "params": {"period": 50}}},
+      {"left": {"ind": "FILING", "params": {"event": "RESULTS", "days": 3}, "field": "count"}, "op": "==", "right": {"value": 0}}
+    ]},
+    "rank": {"by": {"ind": "ROC", "params": {"period": 20}}, "order": "desc", "top": 2},
+    "stop_loss": {"type": "atr", "value": 2, "atr_period": 14},
+    "target": {"type": "rr", "value": 2},
+    "sizing": {"mode": "pct_equity", "value": 20},
+    "portfolio": {"capital": 500000, "max_positions": 4}
   }
 }
 ```

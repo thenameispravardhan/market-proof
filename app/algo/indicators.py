@@ -681,6 +681,46 @@ def vix_level(d: dict) -> S:
     return engine._align(d, v, v["c"], {})  # noqa: SLF001 — the engine's no-lookahead alignment
 
 
+# Filing event types (the analyzer's classification, app/analyzer/schemas.py) + ANY.
+EVENTS = ("ANY", "ORDER_WIN", "ACQUISITION", "MERGER", "DIVIDEND", "BUYBACK", "STOCK_SPLIT", "BONUS", "RIGHTS_ISSUE",
+          "Q1_RESULTS", "Q2_RESULTS", "Q3_RESULTS", "Q4_RESULTS", "ANNUAL_RESULTS", "RESULTS", "BOARD_MEETING", "OTHER")
+
+
+def filing(d: dict, event: str = "ANY", days: int = 1) -> dict[str, S]:
+    """The symbol's exchange filings as they became public (the loader
+    attaches `filings`: [(disseminated epoch, event type, AI sentiment
+    -100..100 or None)], oldest first). A filing counts on a bar only once it
+    was public by the bar's CLOSE — never earlier. `count`: filings of
+    `event` in the last `days` x 24 h; `bars_since`: bars since the newest
+    one (0 = it came out during this bar); `sentiment`: that newest one's AI
+    score while it is inside the window, else 0. RESULTS = any quarter's or
+    the annual results."""
+    n = len(d["t"])
+    rows = d.get("filings") or []
+    want = (lambda e: True) if event == "ANY" else (lambda e: (e or "").endswith("_RESULTS")) if event == "RESULTS"         else (lambda e: e == event)
+    ts = [r[0] for r in rows if want(r[1])]
+    sc = [r[2] for r in rows if want(r[1])]
+    count: S = [0.0] * n
+    since: S = [None] * n
+    sent: S = [0.0] * n
+    j = lo = 0
+    last_bar: Optional[int] = None
+    win = days * 86400
+    for i in range(n):
+        c = close_time(d, i)
+        while j < len(ts) and ts[j] <= c:
+            last_bar = i
+            j += 1
+        while lo < j and ts[lo] <= c - win:
+            lo += 1
+        count[i] = float(j - lo)
+        if last_bar is not None:
+            since[i] = float(i - last_bar)
+        if j > lo:
+            sent[i] = float(sc[j - 1] or 0.0)
+    return {"count": count, "bars_since": since, "sentiment": sent}
+
+
 # ---- registry --------------------------------------------------------------
 # name -> (fn(d, **params) -> list | {field: list}, default params, outputs, group)
 # The UI builds its pickers from this, so adding an indicator is one line here.
@@ -784,6 +824,9 @@ REGISTRY: dict[str, tuple[Callable[..., Any], dict[str, Any], list[str], str]] =
     # "sell premium only when VIX > 14", or IV rank = VIX on the daily
     # timeframe with the rank transform over ~200 bars (live keeps about a year of daily candles).
     "VIX":        (lambda d: vix_level(d), {}, ["value"], "Volatility"),
+    # Exchange filings of the strategy's own symbol, point in time (B5).
+    "FILING":     (lambda d, event="ANY", days=1: filing(d, event, days), {"event": "ANY", "days": 1},
+                   ["count", "bars_since", "sentiment"], "News"),
 }
 
 SOURCES = ("close", "open", "high", "low", "hl2", "hlc3", "ohlc4", "volume", "range")
@@ -849,11 +892,14 @@ ABOUT: dict[str, str] = {
            "expiry day = DTE < 1",
     "VIX": "India VIX %, the market's 30-day implied volatility, beside any symbol (use tf 1440 + the rank "
            "transform over ~200 for IV rank)",
+    "FILING": "the symbol's exchange filings of `event` (ANY, RESULTS, ORDER_WIN, DIVIDEND …), counted only once "
+              "public by the candle's close: `count` in the last `days` x 24 h, `bars_since` the newest, its AI "
+              "`sentiment` -100..100 (0 when none in the window)",
 }
 
 
 # Upper bounds for the few params that are not bar counts.
-_PARAM_MAX = {"value_area": 100, "maximum": 1.0, "start": 1.0, "increment": 1.0, "threshold": 10.0}
+_PARAM_MAX = {"value_area": 100, "maximum": 1.0, "start": 1.0, "increment": 1.0, "threshold": 10.0, "days": 365}
 MAX_PERIOD = 5000
 
 
@@ -872,6 +918,11 @@ def normalize_params(name: str, params: Optional[dict[str, Any]]) -> dict[str, A
         if k == "source":
             if v not in SOURCES:
                 raise ValueError(f"{name}: unknown source {v!r}")
+            continue
+        if k == "event":
+            if str(v).upper() not in EVENTS:
+                raise ValueError(f"{name}: unknown event {v!r} (one of {', '.join(EVENTS)})")
+            p[k] = str(v).upper()
             continue
         if isinstance(v, bool) or v is None or v == "":
             raise ValueError(f"{name}: {k} must be a number")

@@ -196,6 +196,10 @@ def index_list(name: str, cache_dir: Path, fetch: bool = True) -> tuple[list[str
             if len(syms) >= 50:
                 cache_dir.mkdir(parents=True, exist_ok=True)
                 path.write_text(r.text, encoding="utf-8")
+                from app.research import universe
+
+                if name in universe.INDEXES:                 # a dated copy: the point-in-time universe's history
+                    universe.record_snapshot(name, syms)
             else:
                 log.warning("flow_universe.list_download_bad", index=name, status=r.status_code, rows=len(syms))
         except Exception as e:  # noqa: BLE001 — the cached file / market-cap ranks stand in
