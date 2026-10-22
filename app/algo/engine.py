@@ -40,6 +40,7 @@ import copy
 import itertools
 import math
 import statistics
+from collections import deque
 from typing import Any, Callable, Optional
 
 from app.algo import fno
@@ -59,7 +60,13 @@ MAX_LOOKBACK = 500
 # percentile: % of the previous N bars that were below it (IV percentile).
 TRANSFORMS = ("angle", "slope", "change", "pct_change", "highest", "lowest", "sma", "zscore", "abs",
               "rank", "percentile")
-MATH = ("+", "-", "*", "/", "pct_diff")
+# Pair combinations: a rolling least-squares fit of log A on log B over the
+# last `n` bars (each bar sees bars up to its own close): `beta` the hedge
+# ratio, `spread` A's distance from its fitted value in %, `pair_z` that
+# distance in standard deviations of the fit's residuals, `corr` the
+# correlation of the two's one-bar returns. B is usually another symbol.
+PAIR_MATH = ("beta", "spread", "pair_z", "corr")
+MATH = ("+", "-", "*", "/", "pct_diff") + PAIR_MATH
 INSTRUMENTS = ("equity", "future", "option")
 SIZING = ("qty", "lots", "amount", "pct_equity", "risk", "risk_pct")
 STRIKE_MODES = ("ATM", "ITM", "OTM", "PREMIUM", "DELTA")
@@ -525,6 +532,12 @@ def _check_operand(o: dict[str, Any], side: str, base_tf: int, depth: int = 0) -
             raise ValueError("combined values nest at most 3 deep")
         if o["math"] not in MATH:
             raise ValueError(f"unknown combination {o['math']!r} (one of {MATH})")
+        if o["math"] in PAIR_MATH:
+            o["n"] = _num(o.get("n") or 100, f"{o['math']} window (bars)", 10, integer=True)
+            if o["n"] > MAX_LOOKBACK:
+                raise ValueError(f"{o['math']} window must be at most {MAX_LOOKBACK} bars")
+        else:
+            o.pop("n", None)
         for k in ("a", "b"):
             if not isinstance(o.get(k), dict):
                 raise ValueError(f"combined value is missing its {'first' if k == 'a' else 'second'} part")
@@ -710,6 +723,7 @@ def _transform_lengths(spec: dict[str, Any]):
                 o = stack.pop()
                 if isinstance(o, dict):
                     yield int(o.get("xn") or 0) if o.get("xf") else 0
+                    yield int(o.get("n") or 0) if o.get("math") in PAIR_MATH else 0
                     stack += [o.get("a"), o.get("b")]
     for k in ("entry_long", "exit_long", "entry_short", "exit_short"):
         yield from walk(spec.get(k))
@@ -755,6 +769,55 @@ def _combine(how: str, a: ind.S, b: ind.S) -> ind.S:
             return x / y if y else None
         return (x - y) / y * 100 if y else None          # pct_diff: how far a is from b, in % of b
     return [f(x, y) for x, y in zip(a, b)]
+
+
+def _pair(how: str, a: ind.S, b: ind.S, n: int) -> ind.S:
+    """PAIR_MATH over a rolling window of n bars, O(1) per bar from running
+    sums. A bar where either side is missing or not positive empties the
+    window: no fit reaches across a gap."""
+    out: ind.S = [None] * len(a)
+    win: deque = deque()
+    sx = sy = sxx = sxy = syy = 0.0
+    origin = prev = None
+    for i, (u, v) in enumerate(zip(a, b)):
+        if u is None or v is None or u <= 0 or v <= 0:
+            win.clear()
+            sx = sy = sxx = sxy = syy = 0.0
+            prev = None
+            continue
+        ly, lx = math.log(u), math.log(v)
+        if how == "corr":                         # one-bar log returns
+            last, prev = prev, (lx, ly)
+            if last is None:
+                continue
+            px, py = lx - last[0], ly - last[1]
+        else:                                     # log levels, centred for precision
+            origin = origin or (lx, ly)
+            px, py = lx - origin[0], ly - origin[1]
+        win.append((px, py))
+        sx, sy, sxx, sxy, syy = sx + px, sy + py, sxx + px * px, sxy + px * py, syy + py * py
+        if len(win) > n:
+            ox, oy = win.popleft()
+            sx, sy, sxx, sxy, syy = sx - ox, sy - oy, sxx - ox * ox, sxy - ox * oy, syy - oy * oy
+        if len(win) < n:
+            continue
+        vx, vy, cxy = sxx - sx * sx / n, syy - sy * sy / n, sxy - sx * sy / n
+        if how == "corr":
+            out[i] = max(-1.0, min(1.0, cxy / math.sqrt(vx * vy))) if vx > 1e-18 and vy > 1e-18 else None
+            continue
+        if vx <= 1e-18:
+            continue
+        beta = cxy / vx
+        if how == "beta":
+            out[i] = beta
+            continue
+        resid = py - (sy - beta * sx) / n - beta * px
+        if how == "spread":
+            out[i] = resid * 100
+            continue
+        sd = math.sqrt(max(0.0, vy - beta * cxy) / (n - 2))
+        out[i] = resid / sd if sd > 1e-12 else None
+    return out
 
 
 def _rank(s: ind.S, n: int, how: str) -> ind.S:
@@ -821,7 +884,10 @@ def _shape(d: dict, op: dict[str, Any], s: ind.S, cache: dict) -> ind.S:
 def series(d: dict, op: dict[str, Any], cache: dict) -> ind.S:
     n = len(d["c"])
     if "math" in op:
-        return _shape(d, op, _combine(op["math"], series(d, op["a"], cache), series(d, op["b"], cache)), cache)
+        a, b = series(d, op["a"], cache), series(d, op["b"], cache)
+        if op["math"] in PAIR_MATH:
+            return _shape(d, op, _pair(op["math"], a, b, int(op.get("n") or 100)), cache)
+        return _shape(d, op, _combine(op["math"], a, b), cache)
     if "ind" not in op:
         return [float(op["value"])] * n
     if op.get("symbol"):

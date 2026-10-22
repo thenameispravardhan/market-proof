@@ -6,6 +6,7 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../../api/client";
+import { PairFinder } from "./PairFinder";
 
 export type Check = { key: string; label: string; value: number | null; pass: boolean | null; note: string | null };
 type Sum = { trades: number; win_rate: number; net_pnl: number; profit_factor: number | null; sharpe: number | null; max_drawdown?: number; max_drawdown_pct?: number };
@@ -128,8 +129,8 @@ export function StrategyCard({ card }: { card: ResearchCard }) {
   );
 }
 
-/** Every card, newest first; click one to open it. */
-export function ResearchTab() {
+/** The pair finder, then every card, newest first; click one to open it. */
+export function ResearchTab({ timeframes, onUse }: { timeframes: number[]; onUse: (spec: Record<string, unknown>, name: string, tries: number) => void }) {
   const [verdict, setVerdict] = useState<"" | "pass" | "kill">("");
   const [open, setOpen] = useState<number | null>(null);
   const list = useQuery({
@@ -143,6 +144,8 @@ export function ResearchTab() {
   const cards = list.data?.cards ?? [];
   const bar = list.data?.bar;
   return (
+    <>
+    <PairFinder timeframes={timeframes} onUse={onUse} />
     <div className="widget widget-wide" data-testid="research-tab">
       <h3>Strategy cards <span className="meta">one per research check — run one from Optimise → “research check”</span></h3>
       <div className="meta" style={{ marginBottom: 8 }}>
@@ -176,5 +179,6 @@ export function ResearchTab() {
       )}
       {open !== null && card.data && <div style={{ marginTop: 12 }}><StrategyCard key={card.data.id} card={card.data} /></div>}
     </div>
+    </>
   );
 }
