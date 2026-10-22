@@ -2216,11 +2216,7 @@ def walk_forward(spec: dict, data: dict[str, dict], grid: list[dict[str, Any]], 
     sliced by entry time, so compounding / free capital carry across slices
     per combo, not along the stitched path; re-run per slice if that matters.
     """
-    windows, is_mult = int(windows), float(is_mult)
-    if not 2 <= windows <= 12:
-        raise ValueError("walk-forward takes 2-12 out-of-sample windows")
-    if not 0.5 <= is_mult <= 10:
-        raise ValueError("in-sample length must be 0.5-10x an out-of-sample window")
+    windows, is_mult = wf_check(windows, is_mult)
     axes, combos = _grid(grid, metric)
     caches: dict[str, dict] = {}
     runs, capital, invalid = [], 0.0, []
@@ -2232,6 +2228,25 @@ def walk_forward(spec: dict, data: dict[str, dict], grid: list[dict[str, Any]], 
         runs.append(({p: v for (p, _), v in zip(axes, combo)}, run(s, data, caches, trade_from)["trades"]))
     if not runs:
         raise ValueError(f"no valid combination: {invalid[0]}")
+    out, _ = wf_folds(runs, data, capital, metric, min_trades, trade_from, windows, is_mult, anchored)
+    return {"combos": len(combos), "invalid": len(invalid), **out}
+
+
+def wf_check(windows: Any, is_mult: Any) -> tuple[int, float]:
+    windows, is_mult = int(windows), float(is_mult)
+    if not 2 <= windows <= 12:
+        raise ValueError("walk-forward takes 2-12 out-of-sample windows")
+    if not 0.5 <= is_mult <= 10:
+        raise ValueError("in-sample length must be 0.5-10x an out-of-sample window")
+    return windows, is_mult
+
+
+def wf_folds(runs: list[tuple[dict, list[dict[str, Any]]]], data: dict[str, dict], capital: float, metric: str,
+             min_trades: int, trade_from: Optional[int], windows: int, is_mult: float, anchored: bool
+             ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """The walk-forward folds over trades already run: `runs` is
+    [(params, trades over the whole range)] per combo. Returns the result
+    block and the stitched out-of-sample trades."""
     t0 = trade_from if trade_from is not None else min(d["t"][0] for d in data.values())
     t1 = max(d["t"][-1] for d in data.values()) + 1
     span = (t1 - t0) / (is_mult + windows)
@@ -2263,10 +2278,9 @@ def walk_forward(spec: dict, data: dict[str, dict], grid: list[dict[str, Any]], 
     total = stats(oos_trades, capital)
     oos_s = sum(f["oos_to"] - f["oos_from"] for f in folds if f["params"])
     wfe = (total["net_pnl"] / oos_s) / (is_net / is_s) * 100 if oos_s and is_s and is_net > 0 else None
-    return {"combos": len(combos), "invalid": len(invalid), "metric": metric, "windows": windows,
-            "anchored": anchored, "folds": folds,
+    return {"metric": metric, "windows": windows, "anchored": anchored, "folds": folds,
             "oos": {**summary(total), "max_drawdown": total["max_drawdown"], "equity": total["equity"]},
-            "wfe_pct": round(wfe, 1) if wfe is not None else None}
+            "wfe_pct": round(wfe, 1) if wfe is not None else None}, oos_trades
 
 
 def overfitting_stats(daily: list[dict[int, float]], capital: float, *, n_trials: int) -> Optional[dict[str, Any]]:
