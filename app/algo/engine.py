@@ -155,17 +155,39 @@ def day_allowed(spec: dict[str, Any], t: float) -> bool:
     return not days or ((int(t) + IST) // 86400 + 3) % 7 + 1 in days
 
 
-def entry_trigger(spec: dict[str, Any], side: str, close: float) -> Optional[float]:
+TICK = 0.05   # the NSE / BSE price grid: every price an order can carry is a multiple of it
+
+
+def tick_for(symbol: str, meta: Optional[dict] = None) -> Optional[float]:
+    """The price grid for `symbol`: meta's own `tick` if given, else 0.05 on
+    NSE / BSE; None (no snapping) elsewhere — MCX and currency ticks differ."""
+    if meta and meta.get("tick"):
+        return float(meta["tick"])
+    return TICK if (symbol or "").split(":", 1)[0].upper() in ("NSE", "BSE") else None
+
+
+def snap(px: Optional[float], tick: Optional[float], side: int = 0) -> Optional[float]:
+    """`px` on the price grid: rounded up for a buy filling against you
+    (side > 0), down for a sell (side < 0), else to the nearest step. Never
+    below one tick (an option's floor)."""
+    if px is None or not tick or not math.isfinite(px):
+        return px
+    n = px / tick
+    k = math.ceil(n - 1e-6) if side > 0 else math.floor(n + 1e-6) if side < 0 else math.floor(n + 0.5)
+    return round(max(k, 1) * tick, 6)
+
+
+def entry_trigger(spec: dict[str, Any], side: str, close: float, tick: Optional[float] = TICK) -> Optional[float]:
     """Price the underlying must trade at for a non-market entry. pullback =
     X% better than the signal close (limit-style), breakout = X% beyond it in
-    the trade's direction (stop-style)."""
+    the trade's direction (stop-style). On the price grid."""
     eo = spec["entry_order"]
     if eo["type"] == "market":
         return None
     k = eo["offset_pct"] / 100
     better = -1 if side == "BUY" else 1
     sign = better if eo["type"] == "pullback" else -better
-    return close * (1 + sign * k)
+    return snap(close * (1 + sign * k), tick)
 
 
 def _hhmm(s: str) -> int:
@@ -919,9 +941,11 @@ def _dist(lv: Optional[dict], price: float, atr_val: Optional[float], value_key:
     return None
 
 
-def entry_levels(spec: dict, sign: int, ref: float, atr_vals: dict[int, Optional[float]]) -> dict[str, Optional[float]]:
+def entry_levels(spec: dict, sign: int, ref: float, atr_vals: dict[int, Optional[float]],
+                 tick: Optional[float] = TICK) -> dict[str, Optional[float]]:
     """Stop / target / trail gap / trail activation / breakeven trigger for a
-    position whose reference price `ref` profits in direction `sign`."""
+    position whose reference price `ref` profits in direction `sign`. Stop,
+    target and scale-out prices sit on the price grid (`tick`)."""
     g = lambda lv, key="value": _dist(lv, ref, atr_vals.get(lv["atr_period"]) if lv else None, key)  # noqa: E731
     sl_lv, tg_lv, tr_lv = spec["stop_loss"], spec["target"], spec["trailing"]
     sl_d = g(sl_lv)
@@ -931,11 +955,11 @@ def entry_levels(spec: dict, sign: int, ref: float, atr_vals: dict[int, Optional
         dd = (sl_d * st["value"] if sl_d else None) if st["type"] == "rr" else g(st)
         if dd:
             so.append((dd, st["qty_pct"]))
-    return {"sl": ref - sign * sl_d if sl_d else None,
-            "tg": ref + sign * tg_d if tg_d else None,
+    return {"sl": snap(ref - sign * sl_d, tick) if sl_d else None,
+            "tg": snap(ref + sign * tg_d, tick) if tg_d else None,
             "trd": g(tr_lv), "tra": g(tr_lv, "activate") or 0.0,
             "be": g(spec["breakeven"]), "sl_dist": sl_d,
-            "so": [(ref + sign * dd, pct) for dd, pct in sorted(so)]}
+            "so": [(snap(ref + sign * dd, tick), pct) for dd, pct in sorted(so)]}
 
 
 def scale_plan(levels: list[tuple[float, float]], sets: int) -> list[list[float]]:
@@ -1053,13 +1077,13 @@ def exit_rule_hit(spec: dict, m: dict) -> Optional[dict]:
     return next((r for r in (spec.get("position_rules") or {}).get("exit", []) if _rule_true(r, m)), None)
 
 
-def leg_levels(legs: list[dict]) -> None:
-    """A leg's own stop / target as premium prices, from its entry (in place)."""
+def leg_levels(legs: list[dict], tick: Optional[float] = TICK) -> None:
+    """A leg's own stop / target as premium prices on the grid, from its entry (in place)."""
     for lg in legs:
         if lg.get("sl_pct"):
-            lg["sl"] = lg["entry"] * (1 - lg["act"] * lg["sl_pct"] / 100)
+            lg["sl"] = snap(lg["entry"] * (1 - lg["act"] * lg["sl_pct"] / 100), tick)
         if lg.get("tg_pct"):
-            lg["tg"] = lg["entry"] * (1 + lg["act"] * lg["tg_pct"] / 100)
+            lg["tg"] = snap(lg["entry"] * (1 + lg["act"] * lg["tg_pct"] / 100), tick)
 
 
 def leg_hit(lg: dict, p: float) -> Optional[str]:
@@ -1392,6 +1416,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                    "atr": {p: series(d, {"ind": "ATR", "params": {"period": p}}, cache) for p in atr_periods(spec)},
                    "pos": None, "pending": None, "per_day": {}, "cool": 0, "u": None}
 
+    tick_of = {sym: tick_for(data[sym]["meta"].get("symbol") or sym, data[sym]["meta"]) for sym in syms}
     # With "rank", entries outside each candle's best N are switched off and the
     # kept fills go first at the next open, best first (prio 0 = everything else).
     prio = _rank_entries(spec, syms, st, caches) if spec.get("rank") else {}
@@ -1431,8 +1456,10 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         for l in pos["legs"]:
             q = l["qty"] * n // pos["sets"]          # qty = per_set x sets, so this is exact
             px = _leg_px(l, u, t, iv)
-            if slipped and l.get("exit") is None:
-                px = px * (1 - slip) if l["act"] > 0 else px * (1 + slip)
+            if slipped and l.get("exit") is None:      # closing a long sells (down), a short buys (up)
+                px = snap(px * (1 - slip), tick_of[sym], -1) if l["act"] > 0 else snap(px * (1 + slip), tick_of[sym], 1)
+            else:
+                px = snap(px, tick_of[sym])
             g, ch = leg_pnl(l["act"], q, l["entry"], px, l["kind"], with_ch, l["qty0"])
             gross, chg = gross + g, chg + ch
             legs_out.append({"label": l["label"], "side": "BUY" if l["act"] > 0 else "SELL", "qty": q,
@@ -1492,9 +1519,10 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         iv = d["iv"][i] if inst["type"] == "option" else 0.0
         sign = 1 if side == "BUY" else -1
         legs = sim_legs(spec, side, meta, u, t, iv, tdays)
+        tk = tick_of[sym]
         for l in legs:
             raw = _leg_px(l, u, t, iv)
-            l["entry"] = raw * (1 + slip) if l["act"] > 0 else raw * (1 - slip)
+            l["entry"] = snap(raw * (1 + slip), tk, 1) if l["act"] > 0 else snap(raw * (1 - slip), tk, -1)
         greeks0 = None
         if inst["type"] == "option":
             one = [{**l, "qty": l["per_set"]} for l in legs]
@@ -1503,14 +1531,14 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                 return "entry_rules"
             greeks0 = {k: round(m0[k], 4 if k in ("delta", "gamma") else 2)
                        for k in ("delta", "gamma", "theta", "vega", "credit", "iv", "dte") if m0[k] is not None}
-            leg_levels(legs)
+            leg_levels(legs, tk)
         ref = "u" if inst["type"] == "equity" or inst["levels_on"] == "underlying" else 0
         rsign = sign if ref == "u" else legs[0]["act"]
         ref_entry = u if ref == "u" else legs[0]["entry"]
         atrs = {p: a[sig_i] for p, a in s_["atr"].items()}
         if ref != "u":                                   # levels on the option premium: its own ATR
             atrs = premium_atr(atrs, legs[0], u, t, iv)
-        lv = entry_levels(spec, rsign, ref_entry, atrs)
+        lv = entry_levels(spec, rsign, ref_entry, atrs, tk)
         per_set_margin = position_margin(legs, u, pf["leverage"], model=spec.get("margin"), t=t,
                                          iv=iv if inst["type"] == "option" else None, name=meta["name"])
         per_set_risk = lv["sl_dist"] * legs[0]["per_set"] if lv["sl_dist"] else None
@@ -1581,7 +1609,9 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                 u_x, lg, why = hit
                 px = _leg_px(lg, u_x, t, iv)
                 if why == "SL":                      # a stop fills against you, like the position's
-                    px = px * (1 - slip) if lg["act"] > 0 else px * (1 + slip)
+                    px = snap(px * (1 - slip), tick_of[sym], -1) if lg["act"] > 0 else snap(px * (1 + slip), tick_of[sym], 1)
+                else:
+                    px = snap(px, tick_of[sym])
                 reason = "LEG_TARGET" if why == "TARGET" else "LEG_COST" if lg.get("at_cost") else "LEG_SL"
                 lg["exit"], lg["exit_reason"] = px, reason
                 if why == "SL" and on_leg_stop == "all":
@@ -1609,7 +1639,9 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                                         lambda l: _leg_px(l, u, tc, iv), iv, opens):
             new = one_leg(spec, pos["side"], meta, cfg, u, tc, iv, d.get("trading_days"))
             raw = _leg_px(new, u, tc, iv)
-            new.update(entry=raw * (1 + slip) if new["act"] > 0 else raw * (1 - slip), qty=new["per_set"] * pos["sets"],
+            tk = tick_of[sym]
+            new.update(entry=snap(raw * (1 + slip), tk, 1) if new["act"] > 0 else snap(raw * (1 - slip), tk, -1),
+                       qty=new["per_set"] * pos["sets"],
                        qty0=new["per_set"] * pos["sets"], via={"reenter": "REENTRY", "roll": "ROLL", "hedge": "HEDGE"}[kind])
             if kind == "hedge":
                 new.pop("src", None)
@@ -1623,10 +1655,11 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                 new["src"] = old["src"]
                 if kind == "roll":
                     p = _leg_px(old, u, tc, iv)
-                    old["exit"], old["exit_reason"] = (p * (1 - slip) if old["act"] > 0 else p * (1 + slip)), "LEG_ROLL"
+                    old["exit"] = snap(p * (1 - slip), tk, -1) if old["act"] > 0 else snap(p * (1 + slip), tk, 1)
+                    old["exit_reason"] = "LEG_ROLL"
                 else:
                     old["redone"] = True
-            leg_levels([new])
+            leg_levels([new], tk)
             pos["legs"].append(new)
         m = margin_of(open_legs())
         used_margin += m - pos["margin"]
@@ -1752,7 +1785,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
             pos["worst"] = min(pos["worst"], f(worst_now)) if sgn > 0 else max(pos["worst"], f(worst_now))
             gain = sgn * (pos["best"] - pos["ref_entry"])
             if pos["trd"] and gain >= pos["tra"]:
-                nt = pos["best"] - sgn * pos["trd"]
+                nt = snap(pos["best"] - sgn * pos["trd"], tick_of[sym])
                 pos["trail"] = nt if pos["trail"] is None else (max if sgn > 0 else min)(pos["trail"], nt)
             if pos["be"] and gain >= pos["be"]:
                 pos["be_on"] = True
@@ -1795,7 +1828,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                 side = "BUY" if s_["sig"]["entry_long"][i] else "SELL" if s_["sig"]["entry_short"][i] else None
                 if side:
                     s_["pending"] = {"side": side, "day": day, "i": i,
-                                     "level": entry_trigger(spec, side, d["c"][i]),
+                                     "level": entry_trigger(spec, side, d["c"][i], tick_of[sym]),
                                      "kind": spec["entry_order"]["type"],
                                      "expires": i + 1 + spec["entry_order"]["valid_bars"]}
     for sym in syms:

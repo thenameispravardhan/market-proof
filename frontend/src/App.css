@@ -1144,6 +1144,9 @@ button.ghost:hover { border-color: var(--accent); }
   font-family: inherit;
 }
 .tab:hover { color: var(--text); background: var(--bg-surface); }
+/* Algo page: the tabs and the two actions beside them share one size. */
+.algo-tabs { align-items: center; flex-wrap: wrap; }
+.algo-tabs > button { height: 30px; padding: 0 14px; font-size: 11px; letter-spacing: 0.06em; line-height: 1; display: inline-flex; align-items: center; white-space: nowrap; }
 .tab.active {
   color: var(--accent);
   background: var(--bg-panel);
@@ -2108,6 +2111,8 @@ kbd {
    full-width rule above would stack every select on its own line. */
 .algo select, .algo input:not([type="checkbox"]) { width: auto; padding: 3px 6px; }
 .algo label.meta { display: inline-flex; gap: 4px; align-items: center; white-space: nowrap; }
+.flow-universe { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; padding: 8px 10px; border: 1px solid var(--border); }
+.algo .flow-universe input[type="checkbox"] { width: auto; margin: 0; }
 .algo .widget { padding: 10px 12px; gap: 8px; overflow: visible; resize: none; }
 .algo .widget h3 { flex: none; justify-content: flex-start; }
 .algo th, .algo td { padding: 3px 8px; white-space: nowrap; text-align: left; }
@@ -2224,7 +2229,7 @@ kbd {
 .chart-body { display: flex; gap: 6px; min-height: 0; }
 .chart-body .chart-container { flex: 1; min-width: 0; }
 .chart-tools { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 2px 0 2px 2px; overflow-x: hidden; overflow-y: auto; scrollbar-width: none; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-surface); }
-.chart-tool { flex-shrink: 0; width: 28px; height: 28px; display: grid; place-items: center; overflow: hidden; background: transparent; border: 0; border-radius: 3px; color: var(--text-dim); font-size: 14px; line-height: 1; font-variant-emoji: text; cursor: pointer; }
+.chart-tool { flex-shrink: 0; width: 28px; height: 28px; padding: 0; display: grid; place-items: center; overflow: hidden; background: transparent; border: 0; border-radius: 3px; color: var(--text-dim); font-size: 14px; line-height: 1; font-variant-emoji: text; cursor: pointer; }
 .chart-tool:hover:not(:disabled) { background: var(--bg-elev); color: var(--text); }
 .chart-tool.on { background: var(--accent); color: var(--text-inv); }
 .chart-tool:disabled { opacity: 0.35; cursor: default; }
@@ -2405,8 +2410,8 @@ kbd {
 
 /* drawing strip */
 /* group = 28px tool + an 8px lane for the flyout arrow, so the arrow never sits on the icon */
-.dtb-group { position: relative; display: flex; flex-shrink: 0; padding-right: 8px; }
-.dtb-more { position: absolute; right: 0; top: 7px; width: 8px; height: 14px; padding: 0; border: 0; background: transparent; color: var(--text-faint); font-size: 10px; line-height: 1; cursor: pointer; opacity: 0.35; }
+.dtb-group { position: relative; display: flex; flex-shrink: 0; padding-right: 11px; }   /* the › gets its own lane beside the button */
+.dtb-more { position: absolute; right: 0; top: 50%; transform: translateY(-50%); width: 10px; height: 16px; padding: 0; border: 0; background: transparent; color: var(--text-faint); font-size: 10px; line-height: 1; cursor: pointer; opacity: 0.35; }
 .dtb-group:hover .dtb-more { opacity: 1; }
 .dtb-more:hover { color: var(--accent); }
 .chart-tools .grow { min-height: 4px; }
@@ -2501,6 +2506,45 @@ kbd {
 .chart-replay button:hover { border-color: #2962ff; }
 .chart-replay select { width: auto; padding: 1px 4px; font-size: 11px; }
 .chart-replay b { color: #2962ff; text-transform: uppercase; letter-spacing: 0.06em; }
+/* footprint settings (order flow chart type) */
+.fp-bar { position: absolute; top: 8px; right: 72px; z-index: 9; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  max-width: calc(100% - 160px); padding: 3px 6px; background: var(--bg-elev); border: 1px solid var(--border-hi); border-radius: 6px; font-size: 11px; color: var(--text); }
+.fp-bar:not(.open) { padding: 0; border: 0; background: transparent; }
+.fp-bar .fp-chip { padding: 2px 8px; font-size: 11px; border-radius: 4px; }
+.fp-bar label { display: inline-flex; align-items: center; gap: 4px; color: var(--text-dim); white-space: nowrap; }
+.fp-bar select { width: auto; padding: 1px 4px; font-size: 11px; }
+.fp-bar .fp-seg { display: inline-flex; gap: 2px; }
+.fp-bar .fp-seg button { padding: 2px 8px; font-size: 11px; }
+.fp-bar .fp-seg button.on { border-color: var(--accent); color: var(--accent); }
+.fp-bar .fp-check input { width: auto; margin: 0; }
+.fp-bar .fp-stats { display: inline-flex; gap: 6px; flex-wrap: wrap; padding-left: 6px; border-left: 1px solid var(--border); }
+/* replay trading (ReplayTrader.tsx): the toolbar grows a ticket and the trade lists */
+.chart-replay { flex-direction: column; align-items: stretch; width: max-content; max-width: calc(100% - 16px); }
+.replay-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.rtrade { display: flex; flex-direction: column; gap: 4px; padding-top: 5px; border-top: 1px solid var(--border); min-width: 0; }
+.rtrade-ticket { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.rtrade .rt-num { width: 52px; padding: 1px 4px; font-size: 11px; }
+.rtrade .rt-lvl { width: 64px; }
+.rtrade .rt-lots { display: inline-flex; align-items: center; gap: 3px; color: var(--text-dim); }
+.chart-replay .rt-buy { background: #2962ff; border-color: #2962ff; color: #fff; font-weight: 700; }
+.chart-replay .rt-sell { background: var(--red); border-color: var(--red); color: #fff; font-weight: 700; }
+.chart-replay .rt-buy:hover, .chart-replay .rt-sell:hover { filter: brightness(1.15); color: #fff; }
+.rt-note, .rt-msg { font-size: 10.5px; color: var(--text-dim); }
+.rt-msg { color: var(--amber); }
+.rt-model { color: var(--amber); }
+.rt-real { color: var(--green); }
+.rt-sum { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-family: var(--mono); }
+.rtrade .up { color: var(--green); }
+.rtrade .down { color: var(--red); }
+.rt-tabs { margin-left: auto; display: inline-flex; gap: 3px; }
+.chart-replay .rt-tabs button.on { border-color: #2962ff; color: #2962ff; }
+.rt-list { max-height: 180px; overflow: auto; }
+.rt-list table { width: 100%; border-collapse: collapse; font-size: 10.5px; }
+.rt-list th, .rt-list td { padding: 2px 6px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--border-soft); }
+.rt-list th { color: var(--text-dim); font-weight: 600; position: sticky; top: 0; background: var(--bg-elev); }
+.rt-list td button { padding: 0 6px; }
+.rt-stats { display: flex; align-items: center; gap: 6px; padding: 2px 0 4px; flex-wrap: wrap; }
+.rt-stats button:first-of-type { margin-left: auto; }
 .chart-toast { display: flex; align-items: flex-start; gap: 8px; pointer-events: auto; }
 .chart-toast span { flex: 1; }
 .chart-toast .chart-menu-x { flex-shrink: 0; width: 18px; height: 18px; display: grid; place-items: center; padding: 0; border-radius: 3px; color: var(--amber); font-size: 12px; opacity: 0.85; cursor: pointer; }
@@ -3288,3 +3332,11 @@ a.news-title:hover { color: var(--accent); text-decoration: underline; }
 .flow-table th:first-child, .flow-table td:first-child { text-align: left; }
 .flow-table .flow-bar-col { width: 22%; }
 .dock-panel[data-testid="dock-flow"] .dock-body { overflow: hidden; }
+
+/* line icons (components/trade/tvIcons.tsx) inside the drawing strip, its flyouts and the right panel bar */
+.tv-ico { display: block; }
+.chart-tool .tv-ico { width: 20px; height: 20px; }
+@media (max-height: 860px) { .chart-tool .tv-ico { width: 18px; height: 18px; } }
+.dtb-fly-item .ico { display: grid; place-items: center; width: 20px; }
+.dtb-fly-item .ico .tv-ico { width: 20px; height: 20px; }
+.fav-bar .chart-tool .tv-ico { width: 20px; height: 20px; }

@@ -2156,11 +2156,11 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
     <>
       {err && <div className="widget widget-wide pnl-neg" style={{ marginBottom: 12 }}>{err}</div>}
       <div className="widget widget-wide" style={{ marginBottom: 12 }}>
-        <h3>Automations <span className="meta">
-          runner {st?.running ? (ago !== null && ago < 30 ? `alive · tick ${ago}s ago` : "idle") : "not running"} ·
-          evaluates on each completed candle · stops / targets checked on every websocket tick
-          {tk ? ` (${tk.seen.toLocaleString()} ticks · ${tk.watching} symbol${tk.watching === 1 ? "" : "s"}${tickAgo !== null ? ` · last check ${tickAgo}s ago` : ""})` : ""}
-          {" "}with a 1s REST sweep as backstop · every setting lives in Builder & backtest
+        <h3>Automations <span className="meta" data-testid="algo-runner-state" title={
+          "Entries on each completed candle; stops / targets on every websocket tick, with a 1 s REST sweep as backstop."
+          + (tk ? ` ${tk.seen.toLocaleString()} ticks · ${tk.watching} symbol(s) watched${tickAgo !== null ? ` · last check ${tickAgo}s ago` : ""}.` : "")}>
+          {(([word, color]) => <><span style={{ color }}>●</span> {word}</>)(
+            !st?.running ? ["stopped", "var(--red)"] : ago !== null && ago < 30 ? ["live", "var(--green)"] : ["idle", "var(--amber)"])}
         </span></h3>
         {(strategies.data?.strategies ?? []).length === 0 ? (
           <div className="empty">No saved strategies yet — build one in the Builder & backtest tab and press “Save as new strategy”.</div>
@@ -2282,68 +2282,173 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
   );
 }
 
-type RecStatus = { enabled: boolean; config_symbols: string[]; strategy_symbols: string[]; subscribed: string[];
-  today: Record<string, { ticks: number; trades: number; buy: number; sell: number; last: number }>;
-  days_recorded: Record<string, number>; disk_mb: number; retention_days?: number; max_symbols?: number };
+type Universe = {
+  enabled: boolean; lists: string[]; stocks: boolean; index_futures: boolean; stock_futures: boolean;
+  next_futures: "always" | "roll" | "off"; index_options: boolean; index_strikes: number; index_next_strikes: number;
+  stock_options: boolean; stock_strikes: number; stock_next_expiry: "roll" | "off"; roll_days: number;
+};
+type FlowCfg = { enabled: boolean; symbols: string[]; retention_days: number; raw_days: number; budget: number; min_free_gb: number; universe: Universe };
+type PlanSummary = { at?: number; used?: number; budget?: number; classes?: Record<string, number>; wanted?: Record<string, number>;
+  dropped?: Record<string, number>; no_price?: string[]; lists?: Record<string, { label: string; n: number; source: string }> };
+type FlowStatus = {
+  enabled: boolean; config: FlowCfg; config_symbols: string[]; strategy_symbols: string[];
+  collector: {
+    alive: boolean; state?: string; heartbeat?: number; fps?: number; cpu_pct?: number; lag_p50?: number; lag_p95?: number;
+    budget?: { configured: number; active: number; note: string | null }; plan?: PlanSummary; errors?: string[];
+    disk?: { free_gb: number | null; min_free_gb: number; note: string | null; paused: boolean };
+    stream?: { connected: boolean; reason: string | null; subscribed: number; record_only: number; limit_error: string | null; rejected_count: number } | null;
+    today?: { keys: number; trades: number; buy: number; sell: number; unk: number };
+    supervisor?: { running: boolean; restarts: number; last_exit: { at: number; rc: number } | null } | null;
+  };
+  days: { count: number; first: string | null; last: string | null; retention: number };
+  disk_mb: number; lists: Record<string, string>; keys_today: number;
+  top: [string, number, number, number, number, number, number][];
+};
+
+const CLASS_LABEL: Record<string, string> = {
+  focus: "hand-picked", index: "indices", index_fut: "index futures", index_opt: "index options", stock_fut: "stock futures",
+  stocks: "stocks", index_opt2: "index options (next expiry)", fut_next: "next-month futures", stock_opt: "stock options",
+  stock_opt2: "stock options (next expiry)", sticky: "earlier strikes",
+};
+const ymdLabel = (d: string | null) => (d ? `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6)}` : "—");
 
 function RecorderPanel() {
   const qc = useQueryClient();
-  const st = useQuery({ queryKey: ["algo", "ticks"], queryFn: () => api.get<RecStatus>("/api/algo/ticks/status"), refetchInterval: 10000 });
+  const [q, setQ] = useState("");
+  const st = useQuery({ queryKey: ["algo", "ticks", q], queryFn: () => api.get<FlowStatus>(`/api/algo/ticks/status?top=50${q ? `&q=${encodeURIComponent(q)}` : ""}`), refetchInterval: 10000 });
   const [syms, setSyms] = useState<string[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
-  const list = syms ?? st.data?.config_symbols ?? [];
-  const save = async (enabled: boolean, symbols: string[], retention_days?: number) => {
+  const cfg = st.data?.config;
+  const list = syms ?? cfg?.symbols ?? [];
+  const save = async (patch: Partial<Omit<FlowCfg, "universe">> & { universe?: Partial<Universe> }) => {
     setErr(null);
-    try { await api.put("/api/algo/ticks/config", { enabled, symbols, ...(retention_days ? { retention_days } : {}) }); setSyms(null); qc.invalidateQueries({ queryKey: ["algo", "ticks"] }); }
-    catch (e) { setErr(errMsg(e)); }
+    try {
+      await api.put("/api/algo/ticks/config", patch);
+      setSyms(null);
+      qc.invalidateQueries({ queryKey: ["algo", "ticks"] });
+    } catch (e) { setErr(errMsg(e)); }
   };
   const fmt = (v: number) => Math.round(v).toLocaleString("en-IN");
-  const keys = Array.from(new Set([...Object.keys(st.data?.today ?? {}), ...Object.keys(st.data?.days_recorded ?? {})])).sort();
+  const col = st.data?.collector;
+  const plan = col?.plan;
+  const uni = cfg?.universe;
+  const numIn = (value: number, onSave: (n: number) => void, min: number, max: number, testId: string, w = 60) => (
+    <input type="number" min={min} max={max} defaultValue={value} key={`${testId}-${value}`} style={{ width: w }} data-testid={testId}
+      onBlur={(e) => { const n = Math.round(Number(e.target.value)); if (Number.isFinite(n) && n !== value && n >= min && n <= max) onSave(n); }}
+      onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }} />
+  );
+  const state = !cfg?.enabled ? ["off", "var(--text-dim)"] : col?.alive ? ["recording", "var(--green)"] : ["starting / not running", "var(--amber)"];
   return (
-    <div className="widget widget-wide" style={{ marginBottom: 12 }}>
-      <h3>Real tick recorder <span className="meta">every Fyers tick classified buy / sell (Lee-Ready) → real order flow for backtests, live candles and the chart</span></h3>
+    <div className="widget widget-wide" style={{ marginBottom: 12 }} data-testid="flow-collector">
+      <h3>Order-flow collector <span className="meta" title="Its own process and Fyers socket: every frame classified buy / sell (Lee-Ready) for the footprint, CVD and the order-flow strategies">
+        <span style={{ color: state[1] }}>●</span> {state[0]}</span></h3>
       {err && <div className="pnl-neg">{err}</div>}
-      <div className="algo-operand" style={{ gap: 10 }}>
-        <Toggle on={!!st.data?.enabled} onChange={(on: boolean) => save(on, list)} label="recording" />
-        <span className="meta">{st.data ? `${st.data.subscribed.length} subscribed · ${st.data.disk_mb} MB on disk` : "…"}</span>
-        <label className="meta" title="Older tick files are deleted after each day's close">
-          Keep{" "}
-          <select value={st.data?.retention_days ?? 30} onChange={(e) => save(st.data?.enabled ?? true, list, Number(e.target.value))} data-testid="ticks-retention">
-            {[7, 15, 30, 60, 90].map((d) => <option key={d} value={d}>{d} days</option>)}
-          </select>
-        </label>
-      </div>
-      <div className="meta" style={{ margin: "8px 0 4px" }}>Symbols to record ("NIFTY:FUT" = the current NIFTY future, rolls by itself; an index records its future). Symbols of switched-on strategies are added automatically.</div>
-      <SymbolPicker value={list} onChange={(v) => setSyms(v)} />
-      <div className="algo-operand" style={{ gap: 6, marginTop: 6 }}>
-        {!list.includes("ALL:FUT") && (
-          <button type="button" className="btn-sm ghost" onClick={() => setSyms([...list, "ALL:FUT"])}
-            title="Every index and stock future (~220), current month, rolling by itself — the order flow an index's chart uses">+ All F&amp;O futures</button>
+      <div className="algo-operand" style={{ gap: 12 }}>
+        <Toggle on={!!cfg?.enabled} onChange={(on: boolean) => save({ enabled: on })} label="recording" />
+        {col?.alive && (
+          <span className="meta" data-testid="flow-health">
+            {fmt(col.stream?.subscribed ?? 0)} symbols on its socket · {fmt(col.fps ?? 0)} frames/s · CPU {col.cpu_pct ?? 0}% · frames {col.lag_p95 ?? 0}s late (p95)
+            {col.stream && !col.stream.connected ? ` · socket down: ${col.stream.reason ?? "connecting"}` : ""}
+          </span>
         )}
-        {["NIFTY:FUT", "BANKNIFTY:FUT", "FINNIFTY:FUT", "MIDCPNIFTY:FUT", "SENSEX:FUT"].filter((x) => !list.includes(x) && !list.includes("ALL:FUT")).map((x) => (
-          <button key={x} type="button" className="btn-sm ghost" onClick={() => setSyms([...list, x])}>+ {x.replace(":FUT", " future")}</button>
-        ))}
-        {syms && <button type="button" className="primary" onClick={() => save(st.data?.enabled ?? true, list)}>Save list</button>}
-        {(st.data?.strategy_symbols ?? []).length > 0 && <span className="meta">+ from strategies: {st.data!.strategy_symbols.map(shortSym).join(", ")}</span>}
       </div>
-      {keys.length > 0 && (
-        <div className="algo-scroll" style={{ marginTop: 8 }}>
-          <table>
-            <thead><tr><th>Key</th><th>Ticks today</th><th>Trades</th><th>Buy vol</th><th>Sell vol</th><th>Delta</th><th>Buy %</th><th>Last tick</th><th>Days stored</th></tr></thead>
-            <tbody>{keys.map((k) => {
-              const t = st.data?.today[k];
-              return (
-                <tr key={k}><td>{k}</td><td className="mono">{t ? fmt(t.ticks) : "—"}</td><td className="mono">{t ? fmt(t.trades) : "—"}</td>
-                  <td className="mono up">{t ? fmt(t.buy) : "—"}</td><td className="mono down">{t ? fmt(t.sell) : "—"}</td>
-                  <td className={`mono ${t && t.buy >= t.sell ? "pnl-pos" : "pnl-neg"}`}>{t ? fmt(t.buy - t.sell) : "—"}</td>
-                  <td className="mono">{t && t.buy + t.sell ? ((t.buy / (t.buy + t.sell)) * 100).toFixed(1) : "—"}</td>
-                  <td className="mono">{t?.last ? ist(t.last) : "—"}</td><td className="mono">{st.data?.days_recorded[k] ?? 0}</td></tr>
-              );
-            })}</tbody>
-          </table>
+      {col?.budget?.note && <div className="meta" style={{ color: "var(--amber)" }}>Load: {col.budget.note}</div>}
+      {col?.disk?.note && <div className="meta" style={{ color: col.disk.paused ? "var(--red)" : "var(--amber)" }} data-testid="flow-disk-note">Disk: {col.disk.note}</div>}
+      {col?.stream?.limit_error && <div className="meta" style={{ color: "var(--red)" }}>Fyers refused the symbol count: {col.stream.limit_error} — the collector shrinks its budget to fit (Standard plan: 100 symbols, Prime: 5,000).</div>}
+      {(col?.errors ?? []).length > 0 && <div className="meta" title={(col?.errors ?? []).join("\n")}>last error: {col!.errors![col!.errors!.length - 1]}</div>}
+      <div className="algo-operand" style={{ gap: 14, marginTop: 8 }}>
+        <label className="meta" title="Symbols on the collector's socket. Fyers allows 5,000 per user on Prime (100 on Standard), and the app's own price feed needs a few hundred of them">
+          Budget {cfg && numIn(cfg.budget, (n) => save({ budget: n }), 50, 5000, "flow-budget", 70)} symbols
+        </label>
+        <label className="meta" title="A sliding window: when a new day is stored, the oldest beyond this many collected days is deleted">
+          Keep {cfg && numIn(cfg.retention_days, (n) => save({ retention_days: n }), 1, 365, "flow-retention")} days
+        </label>
+        <label className="meta" title="Every frame of the hand-picked symbols (for re-classifying later)">
+          raw ticks {cfg && numIn(cfg.raw_days, (n) => save({ raw_days: n }), 0, 30, "flow-raw")} days
+        </label>
+        <label className="meta" title="The disk guard: below this much free space the oldest days go early (the newest 5 stay); below half of it recording pauses until space is back">
+          keep {cfg && numIn(cfg.min_free_gb ?? 5, (n) => save({ min_free_gb: n }), 1, 1000, "flow-min-free")} GB free
+        </label>
+        <span className="meta" data-testid="flow-days">
+          stored: {st.data?.days.count ?? 0} of {st.data?.days.retention ?? 90} days ({ymdLabel(st.data?.days.first ?? null)} → {ymdLabel(st.data?.days.last ?? null)}) · {fmt(st.data?.disk_mb ?? 0)} MB
+          {col?.disk?.free_gb != null ? ` · ${col.disk.free_gb} GB free` : ""}
+        </span>
+      </div>
+      {uni && (
+        <div className="flow-universe" data-testid="flow-universe">
+          <div className="algo-operand" style={{ gap: 10 }}>
+            <label className="meta"><input type="checkbox" checked={uni.enabled} onChange={(e) => save({ universe: { enabled: e.target.checked } })} /> universe</label>
+            {Object.entries(st.data?.lists ?? {}).map(([k, label]) => (
+              <label key={k} className="meta" title={plan?.lists?.[k] ? `${plan.lists[k].n} stocks · from ${plan.lists[k].source}` : undefined}>
+                <input type="checkbox" checked={uni.lists.includes(k)} disabled={!uni.enabled} data-testid={`flow-list-${k}`}
+                  onChange={(e) => save({ universe: { lists: e.target.checked ? [...uni.lists, k] : uni.lists.filter((x) => x !== k) } })} /> {label}
+              </label>
+            ))}
+            <label className="meta"><input type="checkbox" checked={uni.stocks} disabled={!uni.enabled} onChange={(e) => save({ universe: { stocks: e.target.checked } })} /> the stocks (cash)</label>
+          </div>
+          <div className="algo-operand" style={{ gap: 10 }}>
+            <span className="meta">Futures:</span>
+            <label className="meta"><input type="checkbox" checked={uni.index_futures} disabled={!uni.enabled} onChange={(e) => save({ universe: { index_futures: e.target.checked } })} /> index</label>
+            <label className="meta"><input type="checkbox" checked={uni.stock_futures} disabled={!uni.enabled} onChange={(e) => save({ universe: { stock_futures: e.target.checked } })} /> stock</label>
+            <label className="meta" title="Next month: always, or only in the roll window before the current contract expires">next month
+              <select value={uni.next_futures} disabled={!uni.enabled} onChange={(e) => save({ universe: { next_futures: e.target.value as Universe["next_futures"] } })}>
+                <option value="always">always</option><option value="roll">in the roll window</option><option value="off">off</option>
+              </select>
+            </label>
+            <label className="meta">roll window {numIn(uni.roll_days, (n) => save({ universe: { roll_days: n } }), 0, 50, "flow-roll", 50)} days</label>
+          </div>
+          <div className="algo-operand" style={{ gap: 10 }}>
+            <span className="meta">Options:</span>
+            <label className="meta"><input type="checkbox" checked={uni.index_options} disabled={!uni.enabled} onChange={(e) => save({ universe: { index_options: e.target.checked } })} /> index ATM ±</label>
+            {numIn(uni.index_strikes, (n) => save({ universe: { index_strikes: n } }), 0, 50, "flow-index-strikes", 50)}
+            <label className="meta">next expiry ± {numIn(uni.index_next_strikes, (n) => save({ universe: { index_next_strikes: n } }), 0, 50, "flow-index-next", 50)}</label>
+            <label className="meta" title="Each stock gets the widest band that fits the budget, up to this many strikes each side; the largest companies get more when room is left">
+              <input type="checkbox" checked={uni.stock_options} disabled={!uni.enabled} onChange={(e) => save({ universe: { stock_options: e.target.checked } })} /> stock ATM ± up to</label>
+            {numIn(uni.stock_strikes, (n) => save({ universe: { stock_strikes: n } }), 0, 50, "flow-stock-strikes", 50)}
+            <label className="meta">next expiry
+              <select value={uni.stock_next_expiry} disabled={!uni.enabled} onChange={(e) => save({ universe: { stock_next_expiry: e.target.value as Universe["stock_next_expiry"] } })}>
+                <option value="roll">in the roll window</option><option value="off">off</option>
+              </select>
+            </label>
+          </div>
         </div>
       )}
-      {keys.length === 0 && <div className="empty">Nothing recorded yet — ticks arrive during market hours (09:15–15:30 IST).</div>}
+      {plan?.classes && (
+        <div className="meta" style={{ margin: "6px 0" }} data-testid="flow-plan">
+          Recording {fmt(plan.used ?? 0)} of a {fmt(plan.budget ?? 0)} budget: {Object.entries(plan.classes).filter(([, n]) => n).map(([k, n]) => `${CLASS_LABEL[k] ?? k} ${fmt(n)}`).join(" · ")}
+          {Object.keys(plan.dropped ?? {}).length > 0 && <> · <span style={{ color: "var(--amber)" }}>over budget: {Object.entries(plan.dropped!).map(([k, n]) => `${CLASS_LABEL[k] ?? k} ${fmt(n)}`).join(" · ")}</span></>}
+          {(plan.no_price ?? []).length > 0 && <> · waiting for a price: {plan.no_price!.length}</>}
+          {plan.at ? <> · planned {ist(plan.at)}</> : null}
+        </div>
+      )}
+      <div className="meta" style={{ margin: "8px 0 4px" }}>Hand-picked (always recorded first, with their raw ticks; "NIFTY:FUT" = the current NIFTY future, rolling by itself). Switched-on strategies' symbols are added automatically.</div>
+      <SymbolPicker value={list} onChange={(v) => setSyms(v)} />
+      <div className="algo-operand" style={{ gap: 6, marginTop: 6 }}>
+        {["NIFTY:FUT", "BANKNIFTY:FUT", "FINNIFTY:FUT", "MIDCPNIFTY:FUT", "SENSEX:FUT"].filter((x) => !list.includes(x)).map((x) => (
+          <button key={x} type="button" className="btn-sm ghost" onClick={() => setSyms([...list, x])}>+ {x.replace(":FUT", " future")}</button>
+        ))}
+        {syms && <button type="button" className="primary" onClick={() => save({ symbols: list })}>Save list</button>}
+        {(st.data?.strategy_symbols ?? []).length > 0 && <span className="meta">+ from strategies: {st.data!.strategy_symbols.map(shortSym).join(", ")}</span>}
+      </div>
+      <div className="algo-operand" style={{ gap: 8, marginTop: 10 }}>
+        <span className="meta">Today: {fmt(st.data?.keys_today ?? 0)} symbols traded{col?.today ? ` · ${fmt(col.today.trades)} prints classified` : ""}</span>
+        <input type="search" placeholder="find a symbol…" value={q} onChange={(e) => setQ(e.target.value)} style={{ width: 180 }} data-testid="flow-search" />
+      </div>
+      {(st.data?.top ?? []).length > 0 ? (
+        <div className="algo-scroll" style={{ marginTop: 6 }}>
+          <table data-testid="flow-top">
+            <thead><tr><th>Key</th><th>Frames</th><th>Prints</th><th>Buy vol</th><th>Sell vol</th><th>Delta</th><th>Buy %</th><th title="Volume with no aggressor: a feed gap or the auction">No side</th><th>Last</th></tr></thead>
+            <tbody>{st.data!.top.map(([k, ticks, trades, buy, sell, unk, last]) => (
+              <tr key={k}><td>{k}</td><td className="mono">{fmt(ticks)}</td><td className="mono">{fmt(trades)}</td>
+                <td className="mono up">{fmt(buy)}</td><td className="mono down">{fmt(sell)}</td>
+                <td className={`mono ${buy >= sell ? "pnl-pos" : "pnl-neg"}`}>{fmt(buy - sell)}</td>
+                <td className="mono">{buy + sell ? ((buy / (buy + sell)) * 100).toFixed(1) : "—"}</td>
+                <td className="mono">{unk ? fmt(unk) : "—"}</td>
+                <td className="mono">{last ? ist(last) : "—"}</td></tr>
+            ))}</tbody>
+          </table>
+        </div>
+      ) : <div className="empty">Nothing recorded yet today — frames arrive during market hours (09:15–15:30 IST).</div>}
     </div>
   );
 }
@@ -2657,7 +2762,7 @@ export default function Algo() {
   return (
     <div className="algo">
       <datalist id="algo-ref-symbols">{QUICK.map((x) => <option key={x.s} value={x.s}>{x.l}</option>)}</datalist>
-      <div className="tabs" style={{ alignItems: "center", flexWrap: "wrap" }}>
+      <div className="tabs algo-tabs">
         {(["builder", "optimize", "compare", "automations", "data"] as Tab[]).map((t) => (
           <button type="button" key={t} className={`tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>
             {{ builder: "Builder & backtest", optimize: "Optimise", compare: "Compare", automations: "Automations", data: "Data" }[t]}
@@ -2669,7 +2774,7 @@ export default function Algo() {
           bt.reset(); setTab("builder");
           setMsg("New algo — pick symbols, add entry conditions, then backtest and save.");
         }}>＋ New algo</button>
-        <button type="button" className="btn-sm" style={{ marginLeft: 8 }} data-testid="algo-guide"
+        <button type="button" style={{ marginLeft: 8 }} data-testid="algo-guide"
           title="everything the builder and backtest can do, with the strategy JSON and worked examples — give it to an AI, describe your idea, then paste its JSON here (📋 paste JSON)"
           onClick={async () => {
             try {
