@@ -29,6 +29,7 @@ import {
   type UTCTimestamp,
 } from "lightweight-charts";
 import { api } from "../api/client";
+import { DriftPanel } from "../components/algo/DriftPanel";
 import { useSessionState } from "../router";
 import { peekQuote, useQuoteTick, watchSymbol } from "../hooks/useQuotes";
 import { Toggle } from "../components/common/Toggle";
@@ -2247,6 +2248,7 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
             )}
           </div>
       </div>
+      <DriftPanel strategies={(strategies.data?.strategies ?? []).filter((x) => shown(x.id))} />
       <div className="widget widget-wide">
           <h3>Runner log {sel.length ? <span className="meta">— {selNames}</span> : null}</h3>
           <div style={{ ...grow(320), fontSize: 12 }} data-testid="algo-log-panel">
