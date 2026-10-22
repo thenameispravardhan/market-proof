@@ -33,7 +33,9 @@ import { useSessionState } from "../router";
 import { peekQuote, useQuoteTick, watchSymbol } from "../hooks/useQuotes";
 import { Toggle } from "../components/common/Toggle";
 import { chartHref } from "../lib/chartLink";
+import { NumInput } from "../components/algo/NumInput";
 import { TcaPanel } from "../components/algo/TcaPanel";
+import { HedgeEditor, LegAdjustEditor } from "../components/algo/AdjustEditors";
 
 // ---------------------------------------------------------------------------
 // types
@@ -79,7 +81,10 @@ type Level = { type: string; value: number; atr_period?: number; activate?: numb
 type ScaleStep = { type: string; value: number; atr_period?: number; qty_pct: number };
 // delta: with strike "DELTA", the strike nearest that |delta|. expiry: the leg's own expiry (calendars); absent = the instrument's.
 // sl_pct / tg_pct: the leg's own stop / target, % of its entry premium (absent = off).
-type Leg = { right: "CE" | "PE" | "FUT"; action: "BUY" | "SELL"; strike: string; steps: number; premium: number; lots: number; delta?: number; expiry?: "current" | "next"; sl_pct?: number; tg_pct?: number };
+// reentries: re-open the leg after its own stop, up to N times per position. roll: when its |delta| passes `above`, close it and
+// re-open it at |delta| `to`, at most `max` times. Both act on a candle's close (absent = off).
+type Leg = { right: "CE" | "PE" | "FUT"; action: "BUY" | "SELL"; strike: string; steps: number; premium: number; lots: number; delta?: number; expiry?: "current" | "next"; sl_pct?: number; tg_pct?: number;
+  reentries?: number; roll?: { above: number; to: number; max: number } };
 // A rule on the option position's Greeks / premium (per set): entry = all must hold, exit = any.
 type Rule = { metric: string; op: string; value: number };
 // span: F&O blocks an exchange-style SPAN + exposure estimate; absent = notional / leverage.
@@ -110,7 +115,7 @@ type Spec = {
   breakeven: Level;
   scale_out?: ScaleStep[];        // absent / empty = off (the server leaves it out when off)
   margin?: Margin;                // absent = leverage model
-  position_rules?: { entry?: Rule[]; exit?: Rule[] };   // absent = none
+  position_rules?: { entry?: Rule[]; exit?: Rule[]; hedge?: { above: number; max: number } };   // absent = none; hedge: FUT delta hedge
   mtm: { stop: number | null; target: number | null; trail_start: number | null; trail_gap: number | null; stop_pct?: number | null; target_pct?: number | null };
   daily: { max_loss: number | null; max_profit: number | null };
   session: { start: string | null; end: string | null; square_off: string | null; days?: number[] | null };
@@ -702,35 +707,6 @@ const DRAFT_KEY = "algo.draft.v2";
 // inputs
 // ---------------------------------------------------------------------------
 
-// A number box that lets you TYPE decimals ("0.", "1.05") — a controlled
-// <input type=number> fights partial input in some browsers. Keeps the raw
-// text locally and reports only complete numbers.
-function NumInput({ value, onChange, width = 64, allowEmpty = false, signed = false, title, placeholder }: {
-  value: number | null | undefined; onChange: (v: number | null) => void; width?: number;
-  allowEmpty?: boolean; signed?: boolean; title?: string; placeholder?: string;
-}) {
-  const shown = value === null || value === undefined ? "" : String(value);
-  const [text, setText] = useState(shown);
-  const committed = useRef(value);
-  useEffect(() => {
-    if (value !== committed.current) { committed.current = value; setText(shown); }
-  }, [value, shown]);
-  const re = signed ? /^-?\d*\.?\d*$/ : /^\d*\.?\d*$/;
-  return (
-    <input type="text" inputMode="decimal" style={{ width }} value={text} title={title} placeholder={placeholder}
-      onChange={(e) => {
-        const t = e.target.value.trim();
-        if (!re.test(t)) return;
-        setText(t);
-        if (t === "") { if (allowEmpty) { committed.current = null; onChange(null); } return; }
-        if (t === "-" || t === "." || t.endsWith(".")) return;
-        const n = Number(t);
-        if (!Number.isNaN(n)) { committed.current = n; onChange(n); }
-      }}
-      onBlur={() => { if (text === "" && !allowEmpty) setText(shown); else if (text.endsWith(".")) setText(text.slice(0, -1)); }} />
-  );
-}
-
 const QUICK = [
   { s: "NSE:NIFTY50-INDEX", l: "NIFTY" }, { s: "NSE:NIFTYBANK-INDEX", l: "BANKNIFTY" }, { s: "NSE:FINNIFTY-INDEX", l: "FINNIFTY" },
   { s: "NSE:MIDCPNIFTY-INDEX", l: "MIDCPNIFTY" }, { s: "BSE:SENSEX-INDEX", l: "SENSEX" },
@@ -1072,6 +1048,7 @@ function LegsEditor({ legs, onChange, title }: { legs: Leg[]; onChange: (l: Leg[
               }} />%
             </label>
           ))}
+          {lg.right !== "FUT" && <LegAdjustEditor lg={lg} onChange={(next) => onChange(legs.map((x, j) => (j === i ? next : x)))} />}
           <button type="button" className="btn-sm danger" onClick={() => onChange(legs.filter((_, j) => j !== i))}>✕</button>
         </div>
       ))}
@@ -2667,7 +2644,12 @@ export default function Algo() {
     const next = { ...rules, [k]: r };
     if (!next.entry?.length) delete next.entry;
     if (!next.exit?.length) delete next.exit;
-    upd({ position_rules: next.entry || next.exit ? next : undefined });
+    upd({ position_rules: next.entry || next.exit || next.hedge ? next : undefined });
+  };
+  const setHedge = (h: { above: number; max: number } | undefined) => {
+    const { hedge: _old, ...rest } = rules;
+    const next: NonNullable<Spec["position_rules"]> = h ? { ...rest, hedge: h } : rest;
+    upd({ position_rules: next.entry || next.exit || next.hedge ? next : undefined });
   };
   const setMtmPct = (k: "stop_pct" | "target_pct", v: number | null) => {
     const { [k]: _old, ...rest } = spec.mtm;
@@ -3008,6 +2990,7 @@ export default function Algo() {
                   <RulesEditor kind="entry" rules={rules.entry ?? []} onChange={(r) => setRules("entry", r)} />
                   <RulesEditor kind="exit" rules={rules.exit ?? []} onChange={(r) => setRules("exit", r)} />
                 </div>
+                <HedgeEditor hedge={rules.hedge} onChange={setHedge} />
               </div>
             )}
             <div className="algo-operand" style={{ gap: 14, marginTop: 8 }}>

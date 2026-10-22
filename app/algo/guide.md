@@ -108,9 +108,10 @@ works). Everything you leave out takes the default shown here:
 }
 ```
 
-Optional sections (left out = off): `scale_out`, `margin`, `position_rules`,
-`session.days`, `mtm.stop_pct` / `mtm.target_pct`, `instrument.on_leg_stop`
-and the per-leg keys `delta`, `expiry`, `sl_pct`, `tg_pct`.
+Optional sections (left out = off): `scale_out`, `margin`, `position_rules`
+(with `position_rules.hedge`), `session.days`, `mtm.stop_pct` / `mtm.target_pct`,
+`instrument.on_leg_stop`, `instrument.iv.put_skew` / `call_skew` and the per-leg
+keys `delta`, `expiry`, `sl_pct`, `tg_pct`, `reentries`, `roll`.
 
 ---
 
@@ -242,6 +243,8 @@ Combined values take `mult` / `add` / `xf` too and nest 3 deep.
 | `expiry` | optional: this leg's own expiry `current` / `next` (calendars, diagonals); default = the instrument's |
 | `sl_pct` | optional: this leg's own stop, % of its entry premium (a SELL leg exits when its premium rises 30%; a BUY leg when it falls 30%) |
 | `tg_pct` | optional: this leg's own target, % of its entry premium (SELL leg: premium falls that much; BUY leg: rises) |
+| `reentries` | optional, 0-5: after this leg exits on its own **stop** (`LEG_SL` / `LEG_COST`, never a target), open the same leg again on that candle's close — same right / action / strike rule / lots / expiry / `sl_pct` / `tg_pct`, strike re-picked at the current spot — up to N times per position, while the position is open. Entry conditions are not re-checked. Needs the leg's own `sl_pct` (or `on_leg_stop: "cost"`); not with `on_leg_stop: "all"` |
+| `roll` | optional, CE / PE legs: `{"above": 0.45, "to": 0.25, "max": 2}` — on a candle's close, when this open leg's \|delta\| (per unit, 0-1) is above `above`, close it, then open the same leg at the strike whose \|delta\| is closest to `to`; at most `max` (1-5) times per position. Needs 0 < `to` < `above` < 1. The new leg's `sl_pct` / `tg_pct` start from its own entry premium |
 
 Other instrument keys:
 
@@ -265,6 +268,23 @@ Other instrument keys:
   to its entry price), `all` (exit every leg). Leg targets only close their leg.
 
 Per-leg stops can't be combined with `scale_out`.
+
+**Adjustments** (`reentries`, `roll`, `position_rules.hedge`) act on each
+candle's close, after the exit checks — an exit signal or exit rule ends the
+position first; then re-entries, then rolls, then the hedge (on the legs as
+they stand after the rolls). Re-entries and rolls stop at `session.end`; the
+hedge runs until square-off; nothing happens on a halted day. A roll closes
+the tested leg BEFORE its replacement opens, and BUY legs open before SELL
+legs. In a backtest each added leg fills at the candle's close (with
+slippage) and must fit the free capital once the position's margin is
+recomputed — else it is skipped and counted (`reentry_no_capital`,
+`roll_no_capital`, `hedge_no_capital`). Live, a leg that can't be opened is
+logged on the trade; the rest of the position is never unwound for it. They
+need an option instrument, can't be combined with `scale_out`, and need
+`levels_on: "underlying"` (or no stop / target / trail / breakeven). The MTM %
+stop / target and `pnl_pct` stay measured against the ORIGINAL legs' premium.
+In the backtest's trade list every added leg shows `entry_reason`
+(`LEG_REENTRY`, `LEG_ROLLED`, `HEDGE`).
 
 ### 5.2 Margin — `margin` (optional)
 
@@ -341,6 +361,12 @@ Up to 5 steps, total ≤ 100%. The rest keeps its stop / trail / target.
   trade is skipped unless **every** rule holds.
 * **exit** rules are checked on each candle's close — the position exits
   when **any** rule holds (reason `RULE_<METRIC>`).
+* **hedge** — `{"above": 0.5, "max": 10}`: on a candle's close, when the
+  position's net `delta` per set (lots) is beyond ±`above`, add a FUT leg
+  (the instrument's expiry) of −round(total delta in lots) lots — e.g. delta
+  −0.6 per set × 2 sets = −1.2 → BUY 1 lot. Skipped when that rounds to 0; at
+  most `max` (1-50) hedges per position. Append-only: a later opposite hedge
+  simply nets out. Backtests price the future on spot, like FUT legs.
 * `op`: `>` `<` `>=` `<=`. Up to 10 rules each. Values are **per set** (one
   set = the legs at their configured lots):
 
@@ -443,7 +469,9 @@ price `offset_pct`% better than the signal close — limit style), `breakout`
 `SL`, `TARGET`, `TRAIL`, `BREAKEVEN`, `SCALE_OUT_n`, `MTM_SL`, `MTM_TARGET`,
 `MTM_TRAIL`, `SIGNAL` (exit conditions), `TIME_STOP` (max_bars),
 `RULE_<METRIC>` (position rule), `LEG_SL` / `LEG_TARGET` / `LEG_COST`
-(a leg's own stop / target / cost stop), `DAILY_MAX_LOSS`, `DAILY_TARGET`,
+(a leg's own stop / target / cost stop), `LEG_ROLL` (a leg rolled out — its
+replacement enters as `LEG_ROLLED`; a re-entered leg enters as
+`LEG_REENTRY`, a hedge as `HEDGE`), `DAILY_MAX_LOSS`, `DAILY_TARGET`,
 `SQUARE_OFF`, `EOD` (a new day began), `END` (end of the data), and live
 only `MANUAL`, `STALE_SESSION`, `CLOSED_EXTERNAL`.
 
@@ -457,7 +485,11 @@ only `MANUAL`, `STALE_SESSION`, `CLOSED_EXTERNAL`.
 * a session outside 09:15-15:29 or in the wrong order;
 * scale-out steps above 100% or more than 5, or combined with leg stops;
 * `stop_pct` / `target_pct` / `position_rules` without an option instrument;
-* MTM trailing with only one of `trail_start` / `trail_gap`.
+* MTM trailing with only one of `trail_start` / `trail_gap`;
+* re-entries, rolls or a hedge without an option instrument, with
+  `scale_out`, or with price levels on the instrument; `reentries` with
+  `on_leg_stop: "all"` or on a leg without its own stop; a roll that isn't
+  0 < `to` < `above` < 1.
 
 ---
 
@@ -741,6 +773,37 @@ only `MANUAL`, `STALE_SESSION`, `CLOSED_EXTERNAL`.
     "margin": {"model": "span"},
     "sizing": {"mode": "lots", "value": 1},
     "portfolio": {"capital": 300000, "max_positions": 1}
+  }
+}
+```
+
+### 9.11 Adjusted strangle — 20-delta legs that re-enter after a stop, roll when tested, and a futures delta hedge
+
+```json
+{
+  "name": "Adjusted 20-delta strangle",
+  "spec": {
+    "symbols": ["NSE:NIFTY50-INDEX"],
+    "timeframe": 5,
+    "direction": "long",
+    "session": {"start": "09:30", "end": "14:30", "square_off": "15:15"},
+    "entry_long": {"logic": "AND", "conditions": [
+      {"left": {"ind": "TIME", "field": "hhmm"}, "op": ">=", "right": {"value": 930}}
+    ]},
+    "instrument": {"type": "option", "expiry": "current", "expiry_kind": "weekly", "levels_on": "underlying",
+                   "iv": {"source": "auto", "put_skew": 0.8},
+                   "legs_long": [{"right": "CE", "action": "SELL", "strike": "DELTA", "delta": 0.2, "lots": 1, "sl_pct": 40,
+                                  "reentries": 1, "roll": {"above": 0.45, "to": 0.2, "max": 2}},
+                                 {"right": "PE", "action": "SELL", "strike": "DELTA", "delta": 0.2, "lots": 1, "sl_pct": 40,
+                                  "reentries": 1, "roll": {"above": 0.45, "to": 0.2, "max": 2}}]},
+    "stop_loss": null,
+    "target": null,
+    "position_rules": {"hedge": {"above": 0.6, "max": 4}},
+    "mtm": {"stop_pct": 150, "target_pct": 50},
+    "max_trades_per_day": 1,
+    "margin": {"model": "span"},
+    "sizing": {"mode": "lots", "value": 1},
+    "portfolio": {"capital": 400000, "max_positions": 1, "compounding": false}
   }
 }
 ```

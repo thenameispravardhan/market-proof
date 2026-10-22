@@ -314,6 +314,28 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
                     lg[k] = _num(lg[k], label, 1e-9)
                     if lg[k] > 1000:
                         raise ValueError(f"{label} must be at most 1000")
+            if lg.get("reentries") in (None, "", 0):
+                lg.pop("reentries", None)
+            else:
+                lg["reentries"] = _num(lg["reentries"], "leg re-entries", 0, integer=True)
+                if lg["reentries"] > 5:
+                    raise ValueError("leg re-entries are 0-5 per position")
+                if lg["right"] == "FUT":
+                    raise ValueError("re-entries are for option legs (a FUT leg has no stop of its own)")
+            if not lg.get("roll"):
+                lg.pop("roll", None)
+            else:
+                ro = lg["roll"]
+                if lg["right"] == "FUT" or not isinstance(ro, dict):
+                    raise ValueError('roll is {"above": |delta|, "to": |delta|, "max": n} on a CE / PE leg')
+                ro = {"above": _num(ro.get("above"), "roll above |delta|", 1e-9),
+                      "to": _num(ro.get("to"), "roll to |delta|", 1e-9),
+                      "max": _num(ro.get("max", 1), "rolls per position", 1, integer=True)}
+                if not ro["to"] < ro["above"] < 1:
+                    raise ValueError("a roll needs 0 < to < above < 1 (|delta| per unit: above 0.45, to 0.25)")
+                if ro["max"] > 5:
+                    raise ValueError("rolls per position are 1-5")
+                lg["roll"] = ro
             lg["steps"] = _num(lg.get("steps", 0), "strike steps", 0, integer=True)
             lg["premium"] = _num(lg.get("premium", 100), "target premium", 0.05)
             # 0 lots = leg switched off, so the optimiser can sweep a hedge on / off.
@@ -400,10 +422,19 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
             r["value"] = _num(r.get("value"), f"{r['metric']} rule value", -1e12)
         if lst:
             rules[k] = lst
+    hd = pr.get("hedge")
+    if hd:
+        if not isinstance(hd, dict):
+            raise ValueError('position_rules.hedge is {"above": |delta| in lots, "max": hedges}')
+        rules["hedge"] = {"above": _num(hd.get("above"), "hedge above |delta| (lots)", 1e-9),
+                          "max": _num(hd.get("max", 10), "hedges per position", 1, integer=True)}
+        if rules["hedge"]["max"] > 50:
+            raise ValueError("hedges per position are 1-50")
     if rules:
         if not opt:
             raise ValueError("position rules (Greeks / premium) need an option instrument")
         s["position_rules"] = rules
+    _check_adjustments(s)
     if (s["mtm"]["trail_start"] is None) != (s["mtm"]["trail_gap"] is None):
         raise ValueError("MTM trailing needs both a start and a gap")
     for k in ("max_loss", "max_profit"):
@@ -864,7 +895,8 @@ def charges(buy_value: float, sell_value: float, segment: str = "eq") -> float:
 def premium_base(legs: list[dict]) -> float:
     """|net option premium| at entry (credit or debit, rupees): what the MTM %
     stop / target and the premium P&L % are measured against."""
-    return abs(sum(lg["act"] * lg["entry"] * lg["qty"] for lg in legs if lg["kind"] in ("CE", "PE")))
+    return abs(sum(lg["act"] * lg["entry"] * lg["qty"] for lg in legs
+                   if lg["kind"] in ("CE", "PE") and not lg.get("gen")))     # the ORIGINAL legs (gen 0)
 
 
 def mtm_limits(m: dict, legs: list[dict]) -> tuple[Optional[float], Optional[float]]:
@@ -960,6 +992,147 @@ def legs_to_cost(legs: list[dict]) -> None:
     for lg in legs:
         if lg.get("exit") is None and lg["kind"] in ("CE", "PE"):
             lg["sl"], lg["at_cost"] = lg["entry"], True
+
+
+# ---- adjustments on a candle's close: leg re-entry, roll, delta hedge (shared with the live runner) ----
+#
+# Order on a close: an exit (signal / rule) ends it; else re-entries, then rolls, then the hedge on the
+# legs as they stand after the rolls. Every leg carries "src" (index of the configured leg it came from)
+# and "gen" (0 = original, 1 = first replacement …); replacements carry "entry_reason" (LEG_REENTRY /
+# LEG_ROLLED / HEDGE), hedge legs "hedge": True. The counters are read back from the legs themselves.
+
+ADJUST_REASONS = {"reentry": "LEG_REENTRY", "roll": "LEG_ROLLED", "hedge": "HEDGE"}
+
+
+def _adjust_cfgs(s: dict) -> list[dict]:
+    inst, d = s["instrument"], s["direction"]
+    return [lg for key, used in (("legs_long", d != "short"), ("legs_short", d != "long"))
+            if used for lg in inst.get(key) or [] if lg.get("lots")]
+
+
+def _check_adjustments(s: dict) -> None:
+    """Validator: re-entries / rolls / a hedge need an option instrument, can't scale out, and need levels
+    that don't ride on one leg's premium (a rolled leg would freeze them)."""
+    cfgs = _adjust_cfgs(s)
+    re_ = [lg for lg in cfgs if lg.get("reentries")]
+    if not (re_ or any(lg.get("roll") for lg in cfgs) or (s.get("position_rules") or {}).get("hedge")):
+        return
+    inst = s["instrument"]
+    if inst["type"] != "option":
+        raise ValueError("leg re-entries, rolls and the delta hedge need an option instrument")
+    if s.get("scale_out"):
+        raise ValueError("leg re-entries, rolls and the delta hedge can't be combined with scale-out")
+    if inst["levels_on"] == "instrument" and any(s[k] for k in ("stop_loss", "target", "trailing", "breakeven")):
+        raise ValueError("adjusted positions need levels_on 'underlying' (or no stop / target / trail / breakeven) — "
+                         "a rolled leg would freeze levels on its premium")
+    if re_ and inst.get("on_leg_stop") == "all":
+        raise ValueError("re-entries can't be used with on_leg_stop 'all' — every leg exits on the first stop")
+    if inst.get("on_leg_stop") != "cost" and any(not lg.get("sl_pct") for lg in re_):
+        raise ValueError("a leg with re-entries needs its own stop (sl_pct) — it re-enters after that stop")
+
+
+def adjusts(spec: dict) -> bool:
+    """Does this (normalized) spec adjust open positions on a candle's close?"""
+    return spec["instrument"]["type"] == "option" and (
+        any(lg.get("reentries") or lg.get("roll") for lg in _adjust_cfgs(spec))
+        or bool((spec.get("position_rules") or {}).get("hedge")))
+
+
+def adjust_window(spec: dict, close_min: int) -> tuple[bool, bool]:
+    """(re-entries / rolls allowed, hedge allowed) for a candle closing at `close_min` (IST minutes):
+    re-entries and rolls stop with the entry window (session.end), everything once square-off starts."""
+    _, end, sq = session_window(spec)
+    return close_min <= end and close_min < sq, close_min < sq
+
+
+def leg_cfgs(spec: dict, side: str) -> list[dict]:
+    """The configured legs of a position on `side` — what a leg's "src" indexes."""
+    return spec["instrument"]["legs_long" if side == "BUY" else "legs_short"]
+
+
+def one_leg_spec(spec: dict, cfg: dict) -> dict:
+    """`spec` with `cfg` as its only leg on both sides: resolve ONE leg like an entry would."""
+    return {**spec, "instrument": {**spec["instrument"], "legs_long": [cfg], "legs_short": [cfg]}}
+
+
+def roll_cfg(cfg: dict) -> dict:
+    """The leg a roll opens: the same leg at the strike nearest |delta| = roll.to."""
+    return {**cfg, "strike": "DELTA", "delta": cfg["roll"]["to"]}
+
+
+def hedge_cfg(lots: int) -> dict:
+    return {"right": "FUT", "action": "BUY" if lots > 0 else "SELL", "lots": abs(lots), "strike": "ATM", "steps": 0}
+
+
+def _latest(legs: list[dict]) -> dict[int, dict]:
+    """The newest leg of each configured leg (highest gen), hedges aside."""
+    out: dict[int, dict] = {}
+    for lg in legs:
+        k = lg.get("src")
+        if k is not None and not lg.get("hedge") and (k not in out or lg.get("gen", 0) >= out[k].get("gen", 0)):
+            out[k] = lg
+    return out
+
+
+def next_gen(legs: list[dict], src: Optional[int]) -> int:
+    """gen of a new leg replacing configured leg `src` (1 = first replacement); a hedge (src None) is 0."""
+    if src is None:
+        return 0
+    return max([lg.get("gen", 0) for lg in legs if lg.get("src") == src], default=0) + 1
+
+
+def adj_count(legs: list[dict], src: Optional[int], reason: str) -> int:
+    return sum(1 for lg in legs if lg.get("entry_reason") == reason and (src is None or lg.get("src") == src))
+
+
+def reentries_due(spec: dict, side: str, legs: list[dict]) -> list[tuple[int, dict]]:
+    """(src, cfg) of every leg to re-open now: its newest leg exited on its OWN stop (LEG_SL / LEG_COST,
+    never a target or a roll) and it has re-entries left. BUY legs first."""
+    cfgs = leg_cfgs(spec, side)
+    due = [(k, cfgs[k]) for k, lg in sorted(_latest(legs).items()) if k < len(cfgs) and cfgs[k].get("reentries")
+           and lg.get("exit") is not None and lg.get("exit_reason") in ("LEG_SL", "LEG_COST")
+           and adj_count(legs, k, ADJUST_REASONS["reentry"]) < cfgs[k]["reentries"]]
+    return sorted(due, key=lambda x: x[1]["action"] != "BUY")
+
+
+def rolls_due(spec: dict, side: str, legs: list[dict],
+              abs_delta: Callable[[dict], Optional[float]]) -> list[tuple[dict, dict]]:
+    """(open leg, cfg) of every leg whose |delta| per unit (abs_delta(leg); None = unknown, never rolled)
+    is above its roll.above, with rolls left. BUY legs first."""
+    cfgs = leg_cfgs(spec, side)
+    due = []
+    for k, lg in sorted(_latest(legs).items()):
+        cfg = cfgs[k] if k < len(cfgs) else {}
+        if not cfg.get("roll") or lg.get("exit") is not None or lg["kind"] not in ("CE", "PE") \
+                or adj_count(legs, k, ADJUST_REASONS["roll"]) >= cfg["roll"]["max"]:
+            continue
+        dl = abs_delta(lg)
+        if dl is not None and dl > cfg["roll"]["above"]:
+            due.append((lg, cfg))
+    return sorted(due, key=lambda x: x[1]["action"] != "BUY")
+
+
+def hedge_lots(spec: dict, legs: list[dict], delta_per_set: Optional[float], sets: float) -> int:
+    """Signed FUT lots to add now (0 = none): -round(total delta in lots) once |delta per set| is above
+    position_rules.hedge.above, while hedges are left. Rounded half away from zero (same live and backtest)."""
+    hd = (spec.get("position_rules") or {}).get("hedge")
+    if not hd or delta_per_set is None or abs(delta_per_set) <= hd["above"] \
+            or adj_count(legs, None, ADJUST_REASONS["hedge"]) >= hd["max"]:
+        return 0
+    total = delta_per_set * sets
+    return -int(math.copysign(math.floor(abs(total) + 0.5), total))
+
+
+def leg_abs_delta(lg: dict, u: float, t: float, iv: Optional[float], px: Optional[float] = None) -> Optional[float]:
+    """|delta| per unit of an open option leg: at the backtest IV (`iv`), or implied from its price `px` (live)."""
+    yrs = fno.years_to(lg["exp"], t)
+    if iv is None:
+        if not px:
+            return None
+        v = fno.implied_vol(px, u, lg["K"], yrs, lg["kind"])
+    else:
+        v = fno.leg_iv(lg, u, iv)
+    return abs(fno.bs_greeks(u, lg["K"], yrs, v, lg["kind"])["delta"])
 
 
 def _brokerage(value: float, segment: str) -> float:
@@ -1114,13 +1287,14 @@ def sim_legs(spec: dict, side: str, meta: dict, u: float, t: float, iv: float,
                  "label": f"{meta['name']} FUT {fno.label_date(exp)}"}]
     legs: list[dict[str, Any]] = []
     step = float(meta.get("step") or fno.default_step(meta["name"], u))
-    for cfg in inst["legs_long" if side == "BUY" else "legs_short"]:
+    for src, cfg in enumerate(inst["legs_long" if side == "BUY" else "legs_short"]):
         if not cfg["lots"]:
             continue
         if cfg["right"] == "FUT":          # priced on spot, like a future-type strategy
             exp = fno.expiry_after(meta["name"], meta["exch"], "monthly", inst["expiry"], t, tdays)
             legs.append({"kind": "FUT", "act": 1 if cfg["action"] == "BUY" else -1, "exp": exp,
-                         "per_set": lot * cfg["lots"], "label": f"{meta['name']} FUT {fno.label_date(exp)}"})
+                         "per_set": lot * cfg["lots"], "label": f"{meta['name']} FUT {fno.label_date(exp)}",
+                         "src": src, "gen": 0})
             continue
         exp = fno.expiry_after(meta["name"], meta["exch"], inst["expiry_kind"], cfg.get("expiry") or inst["expiry"],
                                t, tdays)
@@ -1136,7 +1310,7 @@ def sim_legs(spec: dict, side: str, meta: dict, u: float, t: float, iv: float,
         else:
             k_ = fno.pick_strike(u, step, cfg["right"], cfg["strike"], cfg["steps"])
         legs.append({"kind": cfg["right"], "act": 1 if cfg["action"] == "BUY" else -1, "K": k_, "exp": exp,
-                     "per_set": lot * cfg["lots"],
+                     "per_set": lot * cfg["lots"], "src": src, "gen": 0,
                      "label": f"{meta['name']} {fno.label_date(exp)} {k_:g} {cfg['right']}",
                      **{k: cfg[k] for k in ("sl_pct", "tg_pct") if cfg.get(k)},
                      **({"skew": sk} if any(sk) else {})})
@@ -1221,6 +1395,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
     trades: list[dict[str, Any]] = []
     skipped = {"no_capital": 0, "max_positions": 0, "daily_halt": 0, "entry_expired": 0, "entry_rules": 0}
     exit_rules = (spec.get("position_rules") or {}).get("exit")
+    adjusting = adjusts(spec)
     on_leg_stop = inst.get("on_leg_stop", "leg")
     realized = 0.0
     used_margin = 0.0
@@ -1260,7 +1435,8 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
             gross, chg = gross + g, chg + ch
             legs_out.append({"label": l["label"], "side": "BUY" if l["act"] > 0 else "SELL", "qty": q,
                              "entry": round(l["entry"], 2), "exit": round(px, 2),
-                             **({"reason": l["exit_reason"]} if l.get("exit_reason") else {})})
+                             **({"reason": l["exit_reason"]} if l.get("exit_reason") else {}),
+                             **({"entry_reason": l["entry_reason"]} if l.get("entry_reason") else {})})
             if part:
                 l["qty"] -= q
         net = gross - chg
@@ -1420,6 +1596,56 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                 a = u_x
         return False
 
+    def adjust(sym: str, i: int) -> None:
+        """Re-entries, then rolls, then the delta hedge, on bar i's close (see reentries_due & co).
+        Fills at the close's prices with slippage against you; every added leg must fit the free
+        capital once the position's margin is recomputed, else it is skipped and counted."""
+        nonlocal used_margin
+        s_ = st[sym]
+        pos, d = s_["pos"], s_["d"]
+        meta, tk = d["meta"], tick_of[sym]
+        u, tc, iv = d["c"][i], ind.close_time(d, i), d["iv"][i]
+        lot = int(meta.get("lot") or 1)
+        legs_ok, hedge_ok = adjust_window(spec, ((tc + IST) % 86400) // 60)
+
+        def fill(px: float, act: int) -> float:
+            return snap(px * (1 + slip), tk, 1) if act > 0 else snap(px * (1 - slip), tk, -1)
+
+        def add(cfg: dict, reason: str, src: Optional[int], sets: int, skip_key: str) -> bool:
+            nonlocal used_margin
+            lg = sim_legs(one_leg_spec(spec, cfg), pos["side"], meta, u, tc, iv, d.get("trading_days"))[0]
+            lg["entry"] = fill(_leg_px(lg, u, tc, iv), lg["act"])
+            lg["qty"] = lg["qty0"] = lg["per_set"] * sets
+            lg.update(src=src, gen=next_gen(pos["legs"], src), entry_reason=reason,
+                      **({"hedge": True} if reason == ADJUST_REASONS["hedge"] else {}))
+            leg_levels([lg], tk)
+            new_m = position_margin([x for x in pos["legs"] + [lg] if x.get("exit") is None], u, pf["leverage"],
+                                    qty_key="qty", model=spec.get("margin"), t=tc, iv=iv, name=meta["name"])
+            cash = min(equity_now(), pf["capital"] + realized)
+            if new_m - pos["margin"] > cash - used_margin:
+                skipped[skip_key] = skipped.get(skip_key, 0) + 1
+                return False
+            pos["legs"].append(lg)
+            used_margin += new_m - pos["margin"]
+            pos["margin"] = new_m
+            pos["leg_rules"] = pos["leg_rules"] or lg.get("sl") is not None or lg.get("tg") is not None
+            return True
+
+        if legs_ok:
+            for src, cfg in reentries_due(spec, pos["side"], pos["legs"]):
+                add(cfg, ADJUST_REASONS["reentry"], src, pos["sets"], "reentry_no_capital")
+            for lg, cfg in rolls_due(spec, pos["side"], pos["legs"], lambda x: leg_abs_delta(x, u, tc, iv)):
+                p = _leg_px(lg, u, tc, iv)                 # out first: the tested leg closes before its replacement
+                lg["exit"], lg["exit_reason"] = fill(p, -lg["act"]), "LEG_ROLL"
+                add(roll_cfg(cfg), ADJUST_REASONS["roll"], lg["src"], pos["sets"], "roll_no_capital")
+        if hedge_ok:
+            m = position_metrics(pos["legs"], u, tc, lot, lambda x: _leg_px(x, u, tc, iv), iv)
+            n = hedge_lots(spec, pos["legs"], m["delta"], pos["sets"])
+            if n:
+                add(hedge_cfg(n), ADJUST_REASONS["hedge"], None, 1, "hedge_no_capital")
+        if all(x.get("exit") is not None for x in pos["legs"]):
+            close(sym, u, tc, "LEG_ROLL", i)        # a roll whose replacement didn't fit left nothing open
+
     def check_intrabar(sym: str, i: int) -> None:
         s_ = st[sym]
         if s_["pos"]["leg_rules"] and leg_events(sym, i):
@@ -1556,6 +1782,8 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                 r_ = exit_rule_hit(spec, pm)
                 if r_:
                     pos["exit_pending"] = f"RULE_{r_['metric'].upper()}"
+            if adjusting and not pos["exit_pending"] and halted != day:
+                adjust(sym, i)                  # after the exits: re-entries, rolls, then the hedge
         s_["u"] = (d["c"][i], i)
         if (daily["max_loss"] or daily["max_profit"]) and halted != day:
             day_pnl = day_realized
