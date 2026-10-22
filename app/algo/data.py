@@ -146,7 +146,11 @@ async def assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str
         b["meta"] = {"symbol": ref}
         xs[ref] = b
     out: dict[str, dict] = {}
-    for fy in spec["symbols"]:
+    symbols, member = list(spec["symbols"]), None
+    if spec.get("universe"):                         # the index as it was each day, dropped stocks included
+        member, symbols, note = universe_members(spec["universe"]["index"], start, end)
+        notes.append({"symbol": spec["universe"]["index"], "note": note})
+    for fy in symbols:
         try:
             info = await ensure(fy, first, end)
             if info["note"]:
@@ -177,6 +181,10 @@ async def assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str
             bars["htf"] = {tf: await asyncio.to_thread(load, info["key"], tf, first, end) for tf in htfs}
             if xs:
                 bars["xs"] = xs
+            if engine.uses_filings(spec):
+                _attach_filings(bars, await asyncio.to_thread(filing_rows, fy, first, end))
+            if member is not None:
+                bars["member_days"] = member[fy]
             if vix and vix["t"]:
                 bars["vix"] = vix
             for tf, v in vix_htf.items():
@@ -198,7 +206,61 @@ async def assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str
             out[fy] = bars
         except Exception as e:  # noqa: BLE001
             notes.append({"symbol": fy, "note": str(e)[:200]})
+    if member is not None:
+        gone = [fy for fy in symbols if fy not in out]
+        if gone:
+            notes.append({"symbol": spec["universe"]["index"],
+                          "note": f"{len(gone)} of {len(symbols)} past members have no candles (delisted / renamed?) — "
+                                  f"survivorship bias remains for them: {', '.join(store_key(x) for x in gone[:20])}"
+                                  + ("…" if len(gone) > 20 else "")})
     return out, notes, start
+
+
+def universe_members(index: str, start: int, end: int) -> tuple[dict[str, set[int]], list[str], str]:
+    """({NSE:X-EQ: member IST days}, those symbols, a note) for an index over
+    [start, end) — every stock that was in it at any point of the range."""
+    from app.research import universe
+
+    m = universe.members_between(index, universe.ist_day(start), universe.ist_day(end - 1))
+    member = {f"NSE:{t}-EQ": days for t, days in sorted(m.items())}
+    cov = universe.coverage(index)
+    note = f"{cov['label']} as it was each day: {len(member)} stocks were members during the range"
+    if cov["trusted_from"] and cov["trusted_from"] > universe.ymd(universe.ist_day(start)):
+        note += (f"; membership before {cov['trusted_from']} assumes no index changes (import the change log, "
+                 "Research → universes)")
+    return member, list(member), note
+
+
+def filing_rows(fy: str, start: int, end: int) -> list[tuple[int, str, Optional[float]]]:
+    """The symbol's exchange filings in [start, end) from the warehouse, each at
+    the moment it became public (disseminated, else announced; stored IST):
+    [(epoch, event type, AI sentiment -100..100 or None)], oldest first. Only
+    NSE shares have them; anything else gets []."""
+    from datetime import datetime as _dt
+    from datetime import timezone as _tz
+
+    from app.services import warehouse_store as ws
+
+    if not fy.startswith("NSE:") or not fy.endswith("-EQ"):
+        return []
+    ist = lambda e: _dt.fromtimestamp(e + 19800, _tz.utc).replace(tzinfo=None)   # noqa: E731
+    try:
+        rows = ws.connect().execute(
+            f"SELECT epoch(coalesce(disseminated_at, announced_at)) - 19800, upper(coalesce(ai_event_type, 'OTHER')), "
+            f"ai_sentiment_score FROM {ws.TABLE} WHERE symbol = ? AND coalesce(disseminated_at, announced_at) >= ? "
+            "AND coalesce(disseminated_at, announced_at) < ? ORDER BY 1",
+            [store_key(fy), ist(start), ist(end)]).fetchall()
+    except Exception as e:  # noqa: BLE001 — no warehouse: no filings, conditions on them stay false / 0
+        log.warning("algo.filings_unavailable", symbol=fy, error=str(e)[:200])
+        return []
+    return [(int(r[0]), r[1], None if r[2] is None else float(r[2])) for r in rows]
+
+
+def _attach_filings(bars: dict, rows: list) -> None:
+    bars["filings"] = rows
+    for h in (bars.get("htf") or {}).values():
+        if h:
+            h["filings"] = rows
 
 
 def chain_snapshots(name: str, start: int, end: int):
@@ -422,6 +484,8 @@ async def live_bundle(spec: dict[str, Any], fy: str, now: float) -> dict[str, An
         xs[ref] = b
     if xs:
         d["xs"] = xs
+    if engine.uses_filings(spec) and d.get("t"):
+        _attach_filings(d, await asyncio.to_thread(filing_rows, fy, d["t"][0] - 400 * 86400, int(now) + 60))
     for tf in engine.vix_timeframes(spec):         # India VIX beside the symbol, as the backtest loads it
         try:
             v = await shared_bars(VIX, tf, wb + (60 if tf == spec["timeframe"] else 5), now)

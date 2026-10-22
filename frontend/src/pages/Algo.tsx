@@ -138,7 +138,11 @@ type Spec = {
   guard?: { max_drawdown?: number; max_rejects?: number; max_slippage_pct?: number; on_breach: "pause" | "flatten" };
   // A second leg on another symbol, opened and closed with each position (backtest only for now).
   pair_leg?: PairLeg;
+  // Backtests trade this index as it was each day (past members included); live trades `symbols`.
+  universe?: { index: string };
 };
+const UNIVERSES: [string, string][] = [["nifty50", "NIFTY 50"], ["nifty100", "NIFTY 100"], ["niftynext50", "NIFTY Next 50"],
+  ["niftybank", "NIFTY Bank"], ["nifty500", "NIFTY 500"], ["midcap150", "NIFTY Midcap 150"], ["smallcap250", "NIFTY Smallcap 250"]];
 type PairLeg = { symbol: string; kind: "FUT" | "EQ"; ratio: { type: "beta"; n: number } | { type: "fixed"; value: number }; expiry?: "current" | "next" };
 type IndicatorDef = { name: string; params: Record<string, number | string>; outputs: string[]; group: string; about?: string };
 type Catalog = {
@@ -147,6 +151,7 @@ type Catalog = {
   timeframes: number[];
   cond_timeframes: number[];
   sources: string[];
+  events?: string[];     // FILING's event types
   metrics: string[];
   sizing: string[];
   defaults: Spec;
@@ -373,7 +378,7 @@ function numericPaths(spec: Spec, cat: Catalog): { path: string; label: string; 
         if (o.ind) {
           const def = cat.indicators.find((d) => d.name === o.ind);
           Object.entries(def?.params ?? {}).forEach(([k, dv]) => {
-            if (k === "source") return;
+            if (k === "source" || k === "event") return;
             out.push({ path: `${p}.${side}.params.${k}`, label: `${label} #${i + 1} ${side}: ${o.ind}.${k}`, value: Number(o.params?.[k] ?? dv) });
           });
           if (o.mult !== undefined && o.mult !== 1) out.push({ path: `${p}.${side}.mult`, label: `${label} #${i + 1} ${side}: × multiplier`, value: o.mult });
@@ -889,9 +894,9 @@ function OperandEditor({ v, onChange, cat, baseTf, allowNumber = true, depth = 0
       {def && Object.entries(def.params).map(([k, dv]) => (
         <label key={k} className="meta" title={k}>
           {k.replace("_period", "").replace("multiplier", "mult")}
-          {k === "source" ? (
+          {k === "source" || k === "event" ? (
             <select value={String(v.params?.[k] ?? dv)} onChange={(e) => onChange({ ...v, params: { ...v.params, [k]: e.target.value } })}>
-              {cat.sources.map((s) => <option key={s} value={s}>{s}</option>)}
+              {(k === "event" ? cat.events ?? [String(dv)] : cat.sources).map((s) => <option key={s} value={s}>{s}</option>)}
             </select>
           ) : (
             <NumInput width={52} value={Number(v.params?.[k] ?? dv)} onChange={(n) => onChange({ ...v, params: { ...v.params, [k]: n ?? Number(dv) } })} />
@@ -3396,6 +3401,21 @@ export default function Algo() {
                     </select>
                   </>
                 )}
+              </div>
+            )}
+            {!opt && !spec.pair_leg && (
+              <div className="algo-operand" style={{ gap: 8, marginTop: 8 }} data-testid="algo-universe">
+                <label className="meta" title="a ranking backtest over today's index members has survivorship bias: it never holds the stocks later dropped, and holds today's winners from before they joined. Point-in-time: every stock that was in the index at any point of the range is loaded, and entries happen only while it was a member (Research → universes keeps the history)">backtest on
+                  <select value={spec.universe?.index ?? ""} onChange={(e) => {
+                    const next = { ...spec };
+                    if (e.target.value) next.universe = { index: e.target.value }; else delete next.universe;
+                    setSpec(next);
+                  }}>
+                    <option value="">the symbols above</option>
+                    {UNIVERSES.map(([k, l]) => <option key={k} value={k}>{l} as it was each day</option>)}
+                  </select>
+                </label>
+                {spec.universe && <span className="meta">past members included, entries only while in the index · live trades the symbols above (keep them today's members)</span>}
               </div>
             )}
             <div className="algo-operand" style={{ gap: 14, marginTop: 8 }}>
