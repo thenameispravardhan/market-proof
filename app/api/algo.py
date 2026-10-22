@@ -55,6 +55,9 @@ def _spec(raw: Any) -> dict[str, Any]:
     except (ValueError, TypeError, KeyError) as e:
         raise HTTPException(422, detail=str(e))
     s["symbols"] = list(dict.fromkeys(data.fyers_symbol(x) for x in s["symbols"]))
+    for o in engine._walk_operands(s):             # another symbol a condition reads: same resolution
+        if o.get("symbol"):
+            o["symbol"] = data.fyers_symbol(o["symbol"])
     return s
 
 
@@ -91,6 +94,8 @@ def _estimate_bars(spec: dict[str, Any], start: int, end: int) -> int:
     base = spec["bars"]["per_day"] if btype != "time" else 375 / spec["timeframe"]
     htf = sum(1 if tf == 1440 else 375 / tf for tf in engine.cond_timeframes(spec))
     held = len(spec["symbols"]) * days * (base + htf)
+    for tfs in engine.ref_frames(spec).values():   # other symbols' candles: time candles, loaded once
+        held += days * sum(1 if tf == 1440 else 375 / tf for tf in tfs | {spec["timeframe"]})
     transient = days * 375 if engine.needs_minutes(spec) else 0
     return int(held + transient)
 
@@ -143,9 +148,10 @@ def _overlays(spec: dict[str, Any], d: dict, cache: dict, lo: int) -> list[dict[
     seen, out = set(), []
     pmin, pmax = min(d["l"][lo:] or [0]), max(d["h"][lo:] or [0])
     for op in engine._walk_operands(spec):
-        if op["ind"] in ("PRICE", "TIME", "CANDLE", "DTE") or len(out) >= 8:
+        if op["ind"] in ("PRICE", "TIME", "CANDLE", "DTE") and not op.get("symbol") or len(out) >= 8:
             continue
-        key = (op["ind"], op.get("field"), tuple(sorted((op.get("params") or {}).items())), op.get("tf"), op.get("mult"), op.get("add"))
+        key = (op["ind"], op.get("field"), tuple(sorted((op.get("params") or {}).items())), op.get("tf"), op.get("mult"), op.get("add"),
+               op.get("symbol"))
         if key in seen:
             continue
         seen.add(key)
@@ -157,13 +163,16 @@ def _overlays(spec: dict[str, Any], d: dict, cache: dict, lo: int) -> list[dict[
         if not nums:
             continue
         on_price = pmin * 0.8 <= min(nums) and max(nums) <= pmax * 1.2
-        label = op["ind"] + (f".{op['field']}" if op.get("field") else "") +             (f"({','.join(str(v) for v in (op.get('params') or {}).values())})" if op.get("params") else "") +             (f" {op['tf']}m" if op.get("tf") else "")
+        label = op["ind"] + (f".{op['field']}" if op.get("field") else "") +             (f"({','.join(str(v) for v in (op.get('params') or {}).values())})" if op.get("params") else "") +             (f" {op['tf']}m" if op.get("tf") else "") + (f" of {op['symbol']}" if op.get("symbol") else "")
         out.append({"label": label, "price": on_price, "values": [None if v is None else round(v, 4) for v in vals]})
     return out
 
 
 async def _assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str, dict], list[dict], int]:
-    bars, notes, trade_from = await data.assemble(spec, start, end)
+    try:
+        bars, notes, trade_from = await data.assemble(spec, start, end)
+    except ValueError as e:                        # e.g. another symbol a condition reads has no candles
+        raise HTTPException(422, detail=str(e)) from None
     if not bars:
         raise HTTPException(422, detail="; ".join(f"{n['symbol']}: {n['note']}" for n in notes) or "no data")
     return bars, notes, trade_from
@@ -174,7 +183,7 @@ def indicators() -> dict[str, Any]:
     return {"indicators": ind.catalog(), "operators": engine.OPS, "timeframes": engine.TIMEFRAMES,
             "cond_timeframes": engine.COND_TIMEFRAMES, "sources": ind.SOURCES, "metrics": engine.METRICS,
             "sizing": engine.SIZING, "defaults": engine.DEFAULT_SPEC, "max_range_days": MAX_RANGE_DAYS,
-            "position_metrics": engine.POSITION_METRICS}
+            "position_metrics": engine.POSITION_METRICS, "no_symbol": sorted(engine.NO_SYMBOL)}
 
 
 @router.get("/guide")

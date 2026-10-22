@@ -54,6 +54,8 @@ type Operand = {
   math?: string;
   a?: Operand;
   b?: Operand;
+  /** Compute it on another symbol's candles (an index, a peer); absent = the strategy symbol itself. */
+  symbol?: string;
 };
 type Cond = { left: Operand; op: string; right?: Operand; right2?: Operand; for_bars?: number; within_bars?: number; negate?: boolean };
 
@@ -132,6 +134,7 @@ type Catalog = {
   sizing: string[];
   defaults: Spec;
   max_range_days: number;
+  no_symbol?: string[];   // indicators that can't read another symbol (VIX, DTE, TIME, order flow)
 };
 type BtLeg = { label: string; side: string; qty: number; entry: number; exit: number; reason?: string };
 // Option position at entry, per set: delta / gamma in lots, theta / vega / credit in ₹, iv %, dte days.
@@ -841,7 +844,8 @@ function OperandEditor({ v, onChange, cat, baseTf, allowNumber = true, depth = 0
   return (
     <span className="algo-operand">
       <select value={v.ind ?? "#"} title={def?.about || undefined} onChange={(e) => onChange(e.target.value === "#" ? { value: 0 }
-        : e.target.value === "@math" ? { math: "-", a: v.ind ? { ...v } : I("EMA", { period: 9 }), b: I("EMA", { period: 21 }) } : I(e.target.value))}>
+        : e.target.value === "@math" ? { math: "-", a: v.ind ? { ...v } : I("EMA", { period: 9 }), b: I("EMA", { period: 21 }) }
+        : { ...I(e.target.value), ...(v.symbol && !cat.no_symbol?.includes(e.target.value) ? { symbol: v.symbol } : {}) })}>
         {allowNumber && <option value="#">Number</option>}
         {depth < 2 && <option value="@math">ƒ Combine two values (A − B, A ÷ B, % gap…)</option>}
         {groups.map((g) => (
@@ -875,6 +879,13 @@ function OperandEditor({ v, onChange, cat, baseTf, allowNumber = true, depth = 0
             <option value={0}>base candle</option>
             {tfs.map((t) => <option key={t} value={t}>{tfLabel(t)}</option>)}
           </select>
+        </label>
+      )}
+      {def && !cat.no_symbol?.includes(def.name) && (
+        <label className="meta" title="compute it on another symbol's candles — an index (pick from the list) or a stock (SBIN, NSE:HDFCBANK-EQ); only its completed candles are used. Empty = this symbol">
+          of
+          <input list="algo-ref-symbols" data-testid="operand-symbol" value={v.symbol ?? ""} placeholder="this symbol" style={{ width: 160 }}
+            onChange={(e) => { const n = { ...v }; const s = e.target.value.trim().toUpperCase(); if (s) n.symbol = s; else delete n.symbol; onChange(n); }} />
         </label>
       )}
       {def && (
@@ -2600,6 +2611,7 @@ export default function Algo() {
 
   return (
     <div className="algo">
+      <datalist id="algo-ref-symbols">{QUICK.map((x) => <option key={x.s} value={x.s}>{x.l}</option>)}</datalist>
       <div className="tabs" style={{ alignItems: "center", flexWrap: "wrap" }}>
         {(["builder", "optimize", "compare", "automations", "data"] as Tab[]).map((t) => (
           <button type="button" key={t} className={`tab ${tab === t ? "active" : ""}`} onClick={() => setTab(t)}>

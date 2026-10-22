@@ -405,6 +405,8 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
     s["max_bars"] = _num(s.get("max_bars"), "max bars in trade", 1, integer=True, allow_none=True)
     s["costs"]["slippage_pct"] = _num(s["costs"].get("slippage_pct", 0), "slippage %", 0)
     s["costs"]["charges"] = bool(s["costs"].get("charges", True))
+    if len(ref_frames(s)) > MAX_REF_SYMBOLS:
+        raise ValueError(f"conditions can read at most {MAX_REF_SYMBOLS} other symbols")
     return s
 
 
@@ -445,6 +447,8 @@ def _check_operand(o: dict[str, Any], side: str, base_tf: int, depth: int = 0) -
         if o["xn"] > MAX_LOOKBACK:
             raise ValueError(f"{o['xf']} bars must be at most {MAX_LOOKBACK}")
     if "math" in o:
+        if o.get("symbol") not in (None, ""):
+            raise ValueError("a combined value has no symbol of its own — put it on each indicator inside")
         if depth >= 3:
             raise ValueError("combined values nest at most 3 deep")
         if o["math"] not in MATH:
@@ -478,6 +482,14 @@ def _check_operand(o: dict[str, Any], side: str, base_tf: int, depth: int = 0) -
                        if k in (o.get("params") or {})}
         if o.get("offset") not in (None, ""):
             o["offset"] = _num(o["offset"], f"{o['ind']} offset (bars ago)", 0, integer=True)
+        if o.get("symbol") in (None, ""):
+            o.pop("symbol", None)
+        elif o["ind"] in NO_SYMBOL:
+            raise ValueError(f"{o['ind']} can't read another symbol — it uses the strategy symbol's own data")
+        else:
+            o["symbol"] = str(o["symbol"]).strip().upper()
+    elif o.get("symbol") not in (None, ""):
+        raise ValueError("a number has no symbol — put the symbol on an indicator")
 
 
 def _walk_operands(spec: dict[str, Any]):
@@ -502,12 +514,27 @@ def _walk_operands(spec: dict[str, Any]):
 # Indicators that need buy / sell flow (recorded ticks, else per-minute BVC
 # estimates). RVOL is NOT one: it only compares candle volume by time of day.
 ORDER_FLOW = {"DELTA", "CVD", "CVD_DIVERGENCE", "VPROFILE", "BAR_FLOW", "FLOW_PRESSURE"}
+# Indicators that read the strategy symbol's own non-candle data, so an operand
+# `symbol` (another symbol's candles) means nothing for them.
+NO_SYMBOL = {"VIX", "DTE", "TIME"} | ORDER_FLOW
+MAX_REF_SYMBOLS = 5
 
 
 def vix_timeframes(spec: dict[str, Any]) -> set[int]:
     """Timeframes (minutes) at which conditions read India VIX — the loaders
     attach VIX candles to those bars."""
     return {int(o.get("tf") or 0) or spec["timeframe"] for o in _walk_operands(spec) if o["ind"] == "VIX"}
+
+
+def ref_frames(spec: dict[str, Any]) -> dict[str, set[int]]:
+    """{symbol: timeframes} for operands computed on ANOTHER symbol's candles
+    (`"symbol"` on an indicator operand). The loaders attach those candles as
+    bars["xs"][symbol] = base bars with their own "htf"."""
+    out: dict[str, set[int]] = {}
+    for o in _walk_operands(spec):
+        if o.get("symbol"):
+            out.setdefault(o["symbol"], set()).add(int(o.get("tf") or 0) or spec["timeframe"])
+    return out
 
 
 def bar_minutes(spec: dict[str, Any]) -> float:
@@ -522,8 +549,10 @@ def needs_minutes(spec: dict[str, Any]) -> bool:
 
 
 def cond_timeframes(spec: dict[str, Any]) -> set[int]:
-    """Higher timeframes the conditions reference (the base excluded)."""
-    return {int(o["tf"]) for o in _walk_operands(spec) if int(o.get("tf") or 0) not in (0, spec["timeframe"])}
+    """Higher timeframes the conditions reference on the strategy's own symbols
+    (the base excluded; another symbol's timeframes are in ref_frames)."""
+    return {int(o["tf"]) for o in _walk_operands(spec)
+            if int(o.get("tf") or 0) not in (0, spec["timeframe"]) and not o.get("symbol")}
 
 
 def warmup_bars(spec: dict[str, Any]) -> int:
@@ -663,6 +692,13 @@ def series(d: dict, op: dict[str, Any], cache: dict) -> ind.S:
         return _shape(d, op, _combine(op["math"], series(d, op["a"], cache), series(d, op["b"], cache)), cache)
     if "ind" not in op:
         return [float(op["value"])] * n
+    if op.get("symbol"):
+        # Evaluated wholly on the other symbol's candles (its own timeframe,
+        # transforms and ATR), then each bar here sees its last CLOSED value.
+        ref = (d.get("xs") or {}).get(op["symbol"])
+        if ref is None:
+            raise ValueError(f"no candles loaded for {op['symbol']}")
+        return _align(d, ref, series(ref, {k: v for k, v in op.items() if k != "symbol"}, cache), cache)
     tf = int(op.get("tf") or 0)
     src = d
     if tf and tf != d.get("tf_min"):

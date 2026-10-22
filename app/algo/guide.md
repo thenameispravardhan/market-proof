@@ -185,6 +185,12 @@ Modifiers on a condition (optional):
   `{"ind": "EMA", "mult": 1.02}`; "open > previous close + 20" is
   `{"ind": "DAILY", "field": "prev_close", "add": 20}`.
 * `xf` + `xn` — reshape the series before comparing (transforms, below).
+* `symbol` — compute this indicator on **another symbol's** candles: an index
+  (`"NSE:NIFTY50-INDEX"`, `"NSE:NIFTYBANK-INDEX"` — indices need the full Fyers
+  symbol) or a stock (`"SBIN"` or `"NSE:HDFCBANK-EQ"`). Everything on the
+  operand (`tf`, `offset`, `xf`, `mult`…) applies on that symbol's candles; each
+  candle of the strategy then sees its last **completed** value. Up to 5 other
+  symbols per strategy. Not for `VIX`, `DTE`, `TIME` or order-flow indicators.
 
 **A combined value:** `{"math": "-", "a": operand, "b": operand}` with
 `math` one of `+ - * /` or `pct_diff` (`(a - b) / b × 100`, the % gap).
@@ -213,6 +219,10 @@ Combined values take `mult` / `add` / `xf` too and nest 3 deep.
 * Candle pattern: `{"left": {"ind": "CANDLE", "field": "bullish_engulfing"}, "op": "==", "right": {"value": 1}}`.
 * Daily trend filter: `{"left": {"ind": "PRICE"}, "op": ">", "right": {"ind": "EMA", "params": {"period": 20}, "tf": 1440}}`.
 * Gap up: `{"left": {"ind": "DAILY", "field": "gap_pct"}, "op": ">", "right": {"value": 0.8}}`.
+* Index trend filter on a stock: `{"left": {"ind": "PRICE", "symbol": "NSE:NIFTY50-INDEX"}, "op": ">", "right": {"ind": "EMA", "params": {"period": 50}, "symbol": "NSE:NIFTY50-INDEX"}}`.
+* Relative strength vs NIFTY (the stock / index ratio, 2 standard deviations above its
+  50-candle average): `{"left": {"math": "/", "a": {"ind": "PRICE"}, "b": {"ind": "PRICE", "symbol": "NSE:NIFTY50-INDEX"}, "xf": "zscore", "xn": 50}, "op": ">", "right": {"value": 2}}`.
+  The same with a peer stock as `b` is a pairs spread.
 * Steep cross: EMA 9 crosses above EMA 21 **and** `{"left": {"ind": "EMA", "params": {"period": 9}, "xf": "angle", "xn": 3}, "op": "between", "right": {"value": 30}, "right2": {"value": 45}}`.
 
 ---
@@ -728,6 +738,28 @@ only `MANUAL`, `STALE_SESSION`, `CLOSED_EXTERNAL`.
     "margin": {"model": "span"},
     "sizing": {"mode": "lots", "value": 1},
     "portfolio": {"capital": 300000, "max_positions": 1}
+  }
+}
+```
+
+### 9.11 Relative strength — the bank stock pulling ahead of NIFTY while NIFTY trends up
+
+```json
+{
+  "name": "Relative strength vs NIFTY in an index uptrend",
+  "spec": {
+    "symbols": ["NSE:HDFCBANK-EQ", "NSE:ICICIBANK-EQ", "NSE:AXISBANK-EQ"],
+    "timeframe": 15,
+    "direction": "long",
+    "entry_long": {"logic": "AND", "conditions": [
+      {"left": {"ind": "PRICE", "symbol": "NSE:NIFTY50-INDEX"}, "op": ">", "right": {"ind": "EMA", "params": {"period": 20}, "symbol": "NSE:NIFTY50-INDEX"}},
+      {"left": {"math": "/", "a": {"ind": "PRICE"}, "b": {"ind": "PRICE", "symbol": "NSE:NIFTY50-INDEX"}, "xf": "zscore", "xn": 20},
+       "op": "crosses_above", "right": {"value": 1.5}}
+    ]},
+    "stop_loss": {"type": "atr", "value": 1.5, "atr_period": 14},
+    "target": {"type": "rr", "value": 2},
+    "sizing": {"mode": "risk_pct", "value": 0.5},
+    "portfolio": {"capital": 300000, "leverage": 5, "max_positions": 2, "compounding": true}
   }
 }
 ```

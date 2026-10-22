@@ -55,6 +55,7 @@ IST = engine.IST
 OPEN_MIN, CLOSE_MIN = 9 * 60 + 15, 15 * 60 + 30
 GRACE_S = 3          # let Fyers finalise the candle that just closed
 STALE_BAR_S = 120    # a bar this old at first sight was missed, not acted on
+REF_WAIT_S = 30      # wait this long for another symbol the conditions read to publish its candle
 SYNC_AFTER_MIN = 15 * 60 + 45
 
 
@@ -998,6 +999,9 @@ class AlgoRunner:
                         and now > bar + tf_s + 20:
                     self._last_bar[key] = bar
                 continue                                   # Fyers hasn't published it yet; next tick
+            if now < bar + tf_s + REF_WAIT_S and any(not x["t"] or x["t"][-1] < bar for x in (d.get("xs") or {}).values()):
+                continue                                   # an index / peer the conditions read isn't published yet;
+                                                           # past the wait it counts as its last closed candle (as backtests do)
             self._last_bar[key] = bar
             try:
                 await self._decide(s, sym, d, now, day_start)

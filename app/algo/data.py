@@ -130,6 +130,21 @@ async def assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str
                 vix_htf[tf] = await asyncio.to_thread(load, store_key(VIX), tf, first, end)
         except Exception as e:  # noqa: BLE001
             notes.append({"symbol": VIX, "note": f"VIX unavailable ({'conditions on VIX stay false' if vix_tfs else 'using realised vol'}): {e}"[:200]})
+    # Other symbols the conditions read: loaded once, shared by every symbol's
+    # bars. Missing one is an error — those conditions can't be evaluated.
+    xs: dict[str, dict] = {}
+    for ref, tfs in engine.ref_frames(spec).items():
+        try:
+            info = await ensure(ref, first, end)
+        except RuntimeError as e:
+            raise ValueError(f"{ref} (read by the conditions): {e}") from None
+        b = await asyncio.to_thread(load, info["key"], base_tf, first, end)
+        if not b or not b["t"] or b["t"][-1] < start:
+            raise ValueError(f"{ref} (read by the conditions): no candles in this range")
+        b["tf_min"] = base_tf
+        b["htf"] = {tf: await asyncio.to_thread(load, info["key"], tf, first, end) for tf in tfs - {base_tf}}
+        b["meta"] = {"symbol": ref}
+        xs[ref] = b
     out: dict[str, dict] = {}
     for fy in spec["symbols"]:
         try:
@@ -160,6 +175,8 @@ async def assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str
                 continue
             bars["tf_min"] = base_tf
             bars["htf"] = {tf: await asyncio.to_thread(load, info["key"], tf, first, end) for tf in htfs}
+            if xs:
+                bars["xs"] = xs
             if vix and vix["t"]:
                 bars["vix"] = vix
             for tf, v in vix_htf.items():
@@ -293,6 +310,33 @@ async def minute_history(fy: str, need: int, now: float) -> dict[str, Any]:
     return {k: list(v) if isinstance(v, list) else v for k, v in have.items()}
 
 
+def last_closed(tf_min: int, now: float) -> int:
+    """Start of the newest `tf_min` candle that has closed by `now` (candles
+    from the 09:15 open; 1440 = the day's start once its session ended)."""
+    day0 = int(now - (now + 19800) % DAY)
+    if tf_min == 1440:
+        return day0 if now >= day0 + 55800 else day0 - DAY
+    k = int(now - day0 - 33300) // (tf_min * 60)
+    return day0 + 33300 + (k - 1) * tf_min * 60
+
+
+# Candles many strategy symbols read in the same pass (India VIX, an index a
+# condition compares against): fetched once per closed candle, not once per
+# symbol. ponytail: process memory, one entry per (symbol, timeframe, length).
+_shared: dict[tuple, tuple[int, dict[str, Any]]] = {}
+
+
+async def shared_bars(fy: str, tf_min: int, bars: int, now: float) -> dict[str, Any]:
+    """recent_bars, reused until a newer candle closes. An intraday fetch that
+    came back without the newest closed candle (Fyers hadn't published it
+    yet) is not reused: the next call asks again."""
+    key, stamp = (fy, tf_min, bars), last_closed(tf_min, now)
+    hit = _shared.get(key)
+    if hit is None or hit[0] != stamp or (tf_min != 1440 and (not hit[1]["t"] or hit[1]["t"][-1] < stamp)):
+        hit = _shared[key] = (stamp, await recent_bars(fy, tf_min, bars=bars, now=now))
+    return {k: list(v) if isinstance(v, list) else v for k, v in hit[1].items()}
+
+
 async def live_bundle(spec: dict[str, Any], fy: str, now: float) -> dict[str, Any]:
     """Base + higher-timeframe bars and F&O meta for one symbol, for the runner."""
     from app.algo import engine, fno, orderflow
@@ -316,9 +360,18 @@ async def live_bundle(spec: dict[str, Any], fy: str, now: float) -> dict[str, An
         d = await recent_bars(fy, spec["timeframe"], bars=wb + 60, now=now)
     d["tf_min"] = spec["timeframe"]
     d["htf"] = {tf: await recent_bars(fy, tf, bars=wb + 5, now=now) for tf in engine.cond_timeframes(spec)}
+    xs = {}
+    for ref, tfs in engine.ref_frames(spec).items():  # other symbols the conditions read, as the backtest loads them
+        b = await shared_bars(ref, spec["timeframe"], wb + 60, now)
+        b["tf_min"] = spec["timeframe"]
+        b["htf"] = {tf: await shared_bars(ref, tf, wb + 5, now) for tf in tfs - {spec["timeframe"]}}
+        b["meta"] = {"symbol": ref}
+        xs[ref] = b
+    if xs:
+        d["xs"] = xs
     for tf in engine.vix_timeframes(spec):         # India VIX beside the symbol, as the backtest loads it
         try:
-            v = await recent_bars(VIX, tf, bars=wb + (60 if tf == spec["timeframe"] else 5), now=now)
+            v = await shared_bars(VIX, tf, wb + (60 if tf == spec["timeframe"] else 5), now)
         except Exception as e:  # noqa: BLE001 — without VIX its conditions stay false, never guessed
             log.warning("algo.vix_unavailable", tf=tf, error=str(e)[:200])
             continue
