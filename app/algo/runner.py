@@ -187,6 +187,17 @@ def _book(strategy_id: int, day_start: float) -> dict[str, float]:
     return {"realized": float(total), "today": float(today), "margin": float(margin), "open": int(n)}
 
 
+def _book_all(day_start: float) -> dict[str, float]:
+    """Every automation together: P&L realised today and the margin their
+    open positions block."""
+    with db_session.SessionLocal() as db:
+        today = db.execute(select(func.coalesce(func.sum(AlgoTrade.net_pnl), 0.0)).where(
+            AlgoTrade.status == "closed", AlgoTrade.exit_at >= _naive(day_start))).scalar_one()
+        margin = db.execute(select(func.coalesce(func.sum(AlgoTrade.margin), 0.0)).where(
+            AlgoTrade.status == "open")).scalar_one()
+    return {"today": float(today), "margin": float(margin)}
+
+
 def _insert(**fields: Any) -> int:
     with db_session.SessionLocal() as db:
         t = AlgoTrade(**fields)
@@ -509,6 +520,7 @@ class AlgoRunner:
         self._last_tc: dict[tuple[int, str], int] = {}   # volume/turnover: last candle close acted on
         self._busy: set[int] = set()     # trades with an exit / scale-out in flight
         self._guard_at = 0.0             # last time the guards were read
+        self._book_halt: Optional[int] = None   # IST day the book loss limit (or a kill) stopped every automation
         self._names: dict[int, str] = {}
         # Tick-driven exits: every websocket tick for a symbol an open position
         # holds wakes `_tick_loop`, which runs the same stop / target / trail
@@ -701,6 +713,29 @@ class AlgoRunner:
                            strategy_id=sid)
                 for t in mine:
                     await self._exit(t, prices, hit, now)
+        lim = get_settings().ALGO_BOOK_MAX_DAY_LOSS
+        if lim and self._book_halt != day:
+            every = [t for t in (trades if book is None else book) if t["status"] == "open"]
+            marks = [_mtm(t["legs"], prices) for t in every]
+            if None not in marks:
+                pnl = (await asyncio.to_thread(_book_all, day_start))["today"] + sum(marks)
+                if pnl <= -lim:
+                    await self.halt_book(day, f"book day loss ₹{-pnl:,.0f} reached the ₹{lim:,.0f} limit",
+                                         every, prices, now, "BOOK_MAX_LOSS")
+
+    async def halt_book(self, day: int, why: str, trades: list[dict], prices: dict[str, float], now: float,
+                        reason: str) -> None:
+        """Every automation stops entering for the rest of `day` and every open
+        automation position is flattened (the book loss limit, or the
+        operator's kill). Alerted as a risk halt."""
+        self._book_halt = day
+        msg = f"ALL AUTOMATIONS halted for today — {why}; flattening {len(trades)} position(s)"
+        self.event("error", msg)
+        from app.services.event_bus import event_bus
+
+        asyncio.ensure_future(event_bus.publish("risk.halt", {"code": reason, "message": msg}))
+        for t in trades:
+            await self._exit(t, prices, reason, now)
 
     async def _guards(self, strategies: list[dict], now: float, day_start: float) -> None:
         """Each enabled strategy's guard (spec "guard"), once a minute: a breach
@@ -1286,6 +1321,8 @@ class AlgoRunner:
             return
         if int((now + IST) % 86400) // 60 >= engine.session_window(spec)[2]:
             return
+        if self._book_halt == int((now + IST) // 86400):
+            return                                         # the whole book stopped for today
         book = await asyncio.to_thread(_book, s["id"], day_start)
         if book["open"] >= spec["portfolio"]["max_positions"]:
             self.event("info", f"{s['name']}: {side} {sym} skipped — {book['open']} positions open (max)",
@@ -1362,6 +1399,14 @@ class AlgoRunner:
                             pre["sl_dist"] * legs[0]["per_set"] if pre["sl_dist"] else None)
         if per_set_margin > 0:
             sets = min(sets, int(max(0.0, equity - book["margin"]) // per_set_margin))
+        cap = get_settings().ALGO_BOOK_MAX_MARGIN
+        if cap and per_set_margin > 0 and sets >= 1:
+            used = (await asyncio.to_thread(_book_all, now - (now + IST) % 86400))["margin"]
+            sets = min(sets, int(max(0.0, cap - used) // per_set_margin))
+            if sets < 1:
+                self.event("info", f"{s['name']}: {side} {sym} skipped — the book margin cap is full "
+                                   f"(₹{used:,.0f} of ₹{cap:,.0f} in use)", strategy_id=s["id"])
+                return
         if sets < 1:
             self.event("error", f"{s['name']}: {side} {sym} skipped — sizing / free capital gives 0 "
                                 f"(needs ₹{per_set_margin:,.0f} per set)", strategy_id=s["id"])

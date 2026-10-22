@@ -86,6 +86,12 @@ class Settings(BaseSettings):
     # Protection band.
     GATE_FNO_BAN_ENABLED: bool = False
     GATE_LPP_ENABLED: bool = False
+    # Algo Lab book limits, across EVERY automation (paper and live). 0 = off.
+    # Day loss: realised today + open MTM at or below -₹X flattens every
+    # automation and stops their entries until tomorrow. Margin: an entry is
+    # sized down (or skipped) so the margin all automations block stays <= ₹X.
+    ALGO_BOOK_MAX_DAY_LOSS: float = 0.0
+    ALGO_BOOK_MAX_MARGIN: float = 0.0
 
     # ---------- Storage ----------
     # Ignored if TESTING=1 (in-memory sqlite is used).

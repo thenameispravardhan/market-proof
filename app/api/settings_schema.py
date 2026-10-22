@@ -99,7 +99,7 @@ GROUPS: list[dict[str, Any]] = [
                 "breaker flattens and stops; weekly throttles risk per trade.",
         "prefixes": [
             "WEEKLY_MAX_LOSS_PCT", "MONTHLY_MAX_DRAWDOWN_PCT", "WEEKLY_BREACH_RISK_PCT",
-            "MAX_CONSECUTIVE_LOSERS", "CONSECUTIVE_LOSER_",
+            "MAX_CONSECUTIVE_LOSERS", "CONSECUTIVE_LOSER_", "ALGO_BOOK_",
         ],
     },
     {
@@ -283,6 +283,8 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "BSE_RSS_POLL_SECONDS": (0, 60),           # 0 = follow the global interval
     "POLL_INTERVAL_SECONDS": (1, 3600),
     "ORDER_RATE_LIMIT_PER_SEC": (0, 10),       # 10/s is the SEBI no-registration ceiling
+    "ALGO_BOOK_MAX_DAY_LOSS": (0, 1e12),
+    "ALGO_BOOK_MAX_MARGIN": (0, 1e12),
     "ORDER_RATE_MAX_WAIT_SECONDS": (0, 10),
     "GATE_CIRCUIT_PROXIMITY_PCT": (0, 20),
     "BACKUP_MAX_AGE_HOURS": (0, 720),
@@ -356,6 +358,8 @@ LABELS: dict[str, str] = {
     "FYERS_WHITELISTED_IPS": "Fyers whitelisted static IPs (comma-separated)",
     "FYERS_EGRESS_IP_URL": "Egress-IP echo URL",
     "ORDER_RATE_LIMIT_PER_SEC": "Order rate limit per app (orders/s, 0 = off)",
+    "ALGO_BOOK_MAX_DAY_LOSS": "Algo Lab: day loss across ALL automations that flattens them and stops entries (₹, 0 = off)",
+    "ALGO_BOOK_MAX_MARGIN": "Algo Lab: most margin all automations may block together (₹, 0 = off)",
     "ORDER_RATE_MAX_WAIT_SECONDS": "Max wait for an order-rate slot (seconds)",
     "GATE_SURVEILLANCE_ENABLED": "Block intraday entries on ASM/GSM/T2T symbols",
     "GATE_CIRCUIT_PROXIMITY_PCT": "Skip entries this close to the circuit (%, 0 = off)",
