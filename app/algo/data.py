@@ -114,7 +114,7 @@ async def assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str
     lead = min(lead, 800)
     first = start - lead * DAY
     inst = spec["instrument"]
-    if inst["type"] != "equity":
+    if inst["type"] != "equity" or (spec.get("pair_leg") or {}).get("kind") == "FUT":   # lots of the pair leg's future
         await fno.ensure_master()
     vix = None
     notes: list[dict] = []
