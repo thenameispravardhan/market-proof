@@ -451,6 +451,14 @@ price `offset_pct`% better than the signal close — limit style), `breakout`
   Calmar or t-stat, with a minimum trade count, an out-of-sample split or a
   rolling walk-forward, a heatmap of two parameters and overfitting
   statistics (Deflated Sharpe, PBO).
+* **Research check** (Optimise → "research check") — one run puts the idea
+  (its rules as they are, or a grid on them) through a held-out split, a
+  rolling walk-forward, the Deflated Sharpe after every try on the idea and
+  PBO, and judges it against the bar: Deflated Sharpe ≥ 95%, the
+  walk-forward's unseen windows and the held-out period both net positive
+  on at least the minimum trades, PBO ≤ 50% when a grid was swept. It
+  passes or is **killed**, and is saved as a strategy card (Research tab,
+  downloadable as one markdown page). Write an idea that can pass it.
 * **Compare** — saved strategies side by side on the same range.
 * **Automations** — saved strategies start OFF and in **paper** mode; switch
   them on to paper-trade live, or to **LIVE** (real orders on Fyers) after

@@ -691,6 +691,31 @@ class AlgoStrategyVersion(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
 
 
+class AlgoResearchCard(Base):
+    """One run of the research loop (app/research/loop.py) on an idea: the
+    rules tested, every try counted, the out-of-sample results and the
+    verdict against the bar. The verdict and results never change once
+    written; only the idea and note text can be edited. A deleted strategy
+    keeps its cards — the record of what was tried and killed."""
+
+    __tablename__ = "algo_research_cards"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    strategy_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("algo_strategies.id", ondelete="SET NULL"), index=True)
+    version: Mapped[Optional[int]] = mapped_column(Integer)     # the strategy version saved at the time
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    spec: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    setup: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)    # range, grid, split, windows
+    trials: Mapped[int] = mapped_column(Integer, nullable=False)
+    result: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    checks: Mapped[list[Any]] = mapped_column(JSON, nullable=False)
+    verdict: Mapped[str] = mapped_column(String(8), nullable=False)        # pass | kill
+    hypothesis: Mapped[Optional[str]] = mapped_column(Text)
+    note: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, nullable=False)
+
+
 class AlgoTrade(Base):
     """One automated position, open (exit_at NULL) or closed."""
 
