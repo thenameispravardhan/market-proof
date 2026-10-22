@@ -276,3 +276,93 @@ def test_backtests_and_sweeps_count_on_the_strategy_or_the_draft(client, monkeyp
     # an unsaved draft carries its own count
     assert client.post("/api/algo/backtest", json={"spec": spec, **rng, "trials": 9}).json()["trials"] == 10
     assert client.post("/api/algo/backtest", json={"spec": spec, **rng}).json()["trials"] == 1
+
+
+# ---- A3: rank & pick the best N when several symbols fire on one candle -------
+
+def _three(rank=None, **kw):
+    s = {"symbols": ["NSE:A-EQ", "NSE:B-EQ", "NSE:C-EQ"], "exit_long": None,
+         "portfolio": {"capital": 100000, "leverage": 1, "max_positions": kw.pop("max_positions", 10), "compounding": False}}
+    if rank:
+        s["rank"] = rank
+    return _cross_spec(**s, **kw)
+
+
+def _crossing(last3: dict[str, float]):
+    """Every symbol crosses above 105 on bar 3, each to its own level."""
+    return {sym: bars([100.0, 101, 102, px, px, px], spread=0) for sym, px in last3.items()}
+
+
+BY_PRICE = {"by": {"ind": "PRICE"}, "order": "desc", "top": 1}
+
+
+def test_rank_lets_only_the_best_enter_and_fills_them_first():
+    levels = {"NSE:A-EQ": 106.0, "NSE:B-EQ": 110.0, "NSE:C-EQ": 108.0}
+    plain = engine.run(_three(), _crossing(levels))["trades"]
+    assert sorted(x["symbol"] for x in plain) == ["NSE:A-EQ", "NSE:B-EQ", "NSE:C-EQ"]
+    top1 = engine.run(_three(BY_PRICE), _crossing(levels))["trades"]
+    assert [x["symbol"] for x in top1] == ["NSE:B-EQ"]                 # the strongest of the three
+    # one free slot: without rank the first listed takes it, with rank the best does
+    first = engine.run(_three(max_positions=1), _crossing(levels))["trades"]
+    assert [x["symbol"] for x in first] == ["NSE:A-EQ"]
+    best = engine.run(_three({**BY_PRICE, "top": 2}, max_positions=1), _crossing(levels))["trades"]
+    assert [x["symbol"] for x in best] == ["NSE:B-EQ"]
+    asc = engine.run(_three({**BY_PRICE, "order": "asc"}), _crossing(levels))["trades"]
+    assert [x["symbol"] for x in asc] == ["NSE:A-EQ"]                  # lowest first
+
+
+def test_shorts_are_ranked_the_other_way_round():
+    falls = {sym: bars([100.0, 99, 98, px, px, px], spread=0)
+             for sym, px in {"NSE:A-EQ": 94.0, "NSE:B-EQ": 90.0, "NSE:C-EQ": 92.0}.items()}
+    spec = _three(BY_PRICE, direction="short", entry_short={"logic": "AND", "conditions": [
+        {"left": {"ind": "PRICE"}, "op": "crosses_below", "right": {"value": 95}}]}, exit_short=None)
+    assert [x["symbol"] for x in engine.run(spec, falls)["trades"]] == ["NSE:B-EQ"]   # desc: short the weakest
+
+
+def test_rank_is_validated_and_absent_by_default():
+    assert "rank" not in _cross_spec()
+    s = _three({"by": {"ind": "ROC", "params": {"period": 20}, "xf": "zscore", "xn": 30}, "top": 3})
+    assert s["rank"] == {"by": {"ind": "ROC", "params": {"period": 20}, "xf": "zscore", "xn": 30}, "order": "desc", "top": 3}
+    assert engine.warmup_bars(s) >= 3 * 30                 # what entries are ranked by warms up too
+    for bad, msg in [({"by": {"value": 3}}, "rank is"), ({"by": {"ind": "PRICE"}, "order": "up"}, "rank order"),
+                     ({"by": {"ind": "PRICE"}, "top": 51}, "at most 50"), ({"by": {"ind": "NOPE"}}, "unknown indicator")]:
+        with pytest.raises(ValueError, match=msg):
+            _three(bad)
+    with pytest.raises(ValueError, match="time candles"):
+        _three(BY_PRICE, bars={"type": "volume", "per_day": 50})
+    rs = _three({"by": {"math": "/", "a": {"ind": "PRICE"}, "b": {"ind": "PRICE", "symbol": REF}}})
+    assert engine.ref_frames(rs) == {REF: {5}}             # ranking by strength vs the index loads the index
+
+
+def test_runner_ranks_every_symbols_candle_before_entering(monkeypatch, isolated_db):
+    from app.algo import runner as rn
+    from app.db import session as dbs
+    from app.db.models import AlgoStrategy, AlgoTrade
+
+    spec = _cross_spec(symbols=["NSE:A-EQ", "NSE:B-EQ"], exit_long=None, rank=BY_PRICE)
+    with dbs.SessionLocal() as db:
+        db.add(AlgoStrategy(name="r", spec=spec, enabled=True, mode="paper"))
+        db.commit()
+    hold = {"A": True}                                 # A's newest candle isn't published yet
+
+    async def fake_bars(sym, tf, bars=400, now=None):
+        px = 106.0 if sym == "NSE:A-EQ" else 110.0
+        d = globals()["bars"]([100.0, 101, 102, px], spread=0)
+        keep = [i for i, t in enumerate(d["t"]) if t + 300 <= now and not (sym == "NSE:A-EQ" and hold["A"] and i == 3)]
+        return {k: ([v[i] for i in keep] if isinstance(v, list) else v) for k, v in d.items()}
+
+    async def fake_ltp(symbols):
+        return {s.upper(): 100.0 for s in symbols}
+
+    monkeypatch.setattr(rn.data, "recent_bars", fake_bars)
+    monkeypatch.setattr(rn.data, "_shared", {})
+    monkeypatch.setattr(rn, "_ltp", fake_ltp)
+    r = rn.AlgoRunner()
+    t_close = DAY0 + 4 * 300 + 4
+    asyncio.run(r.tick(t_close))
+    with dbs.SessionLocal() as db:
+        assert db.query(AlgoTrade).count() == 0        # B was ready, but ranking waits for A's candle
+    hold["A"] = False
+    asyncio.run(r.tick(t_close + 5))
+    with dbs.SessionLocal() as db:
+        assert [t.symbol for t in db.query(AlgoTrade).all()] == ["NSE:B-EQ"]

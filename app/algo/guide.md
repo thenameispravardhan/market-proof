@@ -406,6 +406,15 @@ price `offset_pct`% better than the signal close — limit style), `breakout`
   pay full premium), `max_positions` (open at once), `compounding` (sizes
   follow the equity curve), `max_position_pct` (no position may block more
   than this % of equity).
+* `rank` (optional) — when several symbols' entries fire on the same candle,
+  only the best `top` of them enter, best first (so capital and
+  `max_positions` go to the strongest, not to whichever is listed first):
+  `{"by": operand, "order": "desc", "top": 3}`. `by` is any indicator or
+  combined value (momentum `ROC`, a z-score, strength vs NIFTY…); `desc` = the
+  highest first, `asc` = the lowest. Shorts are ranked the other way round
+  (with `desc`, the lowest values get the short entries). Ranked among the
+  symbols whose entry conditions are true on that candle, ones already in a
+  position included. Time candles only.
 * `costs`: `slippage_pct` on every fill, `charges` true = Indian charges.
 
 ---
@@ -742,7 +751,7 @@ only `MANUAL`, `STALE_SESSION`, `CLOSED_EXTERNAL`.
 }
 ```
 
-### 9.11 Relative strength — the bank stock pulling ahead of NIFTY while NIFTY trends up
+### 9.11 Relative strength — the bank stock pulling ahead of NIFTY while NIFTY trends up, strongest one only
 
 ```json
 {
@@ -756,6 +765,8 @@ only `MANUAL`, `STALE_SESSION`, `CLOSED_EXTERNAL`.
       {"left": {"math": "/", "a": {"ind": "PRICE"}, "b": {"ind": "PRICE", "symbol": "NSE:NIFTY50-INDEX"}, "xf": "zscore", "xn": 20},
        "op": "crosses_above", "right": {"value": 1.5}}
     ]},
+    "rank": {"by": {"math": "/", "a": {"ind": "PRICE"}, "b": {"ind": "PRICE", "symbol": "NSE:NIFTY50-INDEX"}, "xf": "zscore", "xn": 20},
+             "order": "desc", "top": 1},
     "stop_loss": {"type": "atr", "value": 1.5, "atr_period": 14},
     "target": {"type": "rr", "value": 2},
     "sizing": {"mode": "risk_pct", "value": 0.5},

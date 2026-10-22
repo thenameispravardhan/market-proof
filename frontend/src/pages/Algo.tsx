@@ -122,6 +122,8 @@ type Spec = {
   sizing: { mode: string; value: number };
   portfolio: { capital: number; leverage: number; max_positions: number; compounding: boolean; max_position_pct?: number | null };
   costs: { slippage_pct: number; charges: boolean };
+  // Several symbols fire on one candle: only the best `top` by `by` enter, best first (shorts ranked the other way).
+  rank?: { by: Operand; order: "desc" | "asc"; top: number };
 };
 type IndicatorDef = { name: string; params: Record<string, number | string>; outputs: string[]; group: string; about?: string };
 type Catalog = {
@@ -3004,6 +3006,25 @@ export default function Algo() {
               <label className="meta" title="intraday margin multiplier: equity MIS ≈ 5, futures / written options ≈ 6–9 — or pick the SPAN + exposure margin under What to trade. Bought options always need the full premium.">leverage × <NumInput width={40} value={spec.portfolio.leverage} onChange={(n) => upd({ portfolio: { ...spec.portfolio, leverage: n ?? 1 } })} /></label>
               <label className="meta"><input type="checkbox" checked={spec.portfolio.compounding} onChange={(e) => upd({ portfolio: { ...spec.portfolio, compounding: e.target.checked } })} /> compound profits</label>
             </div>
+            {(spec.symbols.length > 1 || spec.rank) && (
+              <div className="algo-operand" style={{ gap: 8, marginTop: 8 }} data-testid="algo-rank">
+                <label className="meta" title={spec.bars.type !== "time" ? "ranking needs time candles — volume / turnover candles close at different times per symbol"
+                  : "when several symbols' entries fire on the same candle, only the best N by this value enter, best first — capital and max positions go to the strongest, not to whichever is listed first. Shorts are ranked the other way round"}>
+                  <input type="checkbox" checked={!!spec.rank} disabled={!spec.rank && spec.bars.type !== "time"}
+                    onChange={(e) => upd({ rank: e.target.checked ? { by: I("ROC", { period: 20 }), order: "desc", top: 1 } : undefined })} /> on the same candle, enter only the best
+                </label>
+                {spec.rank && (
+                  <>
+                    <NumInput width={36} value={spec.rank.top} onChange={(n) => upd({ rank: { ...spec.rank!, top: Math.max(1, Math.min(50, Math.floor(n ?? 1))) } })} />
+                    <span className="meta">by</span>
+                    <OperandEditor v={spec.rank.by} cat={c} baseTf={spec.timeframe} allowNumber={false} onChange={(by) => upd({ rank: { ...spec.rank!, by } })} />
+                    <select value={spec.rank.order} onChange={(e) => upd({ rank: { ...spec.rank!, order: e.target.value as "desc" | "asc" } })}>
+                      <option value="desc">highest first</option><option value="asc">lowest first</option>
+                    </select>
+                  </>
+                )}
+              </div>
+            )}
             <div className="algo-operand" style={{ gap: 14, marginTop: 8 }}>
               <label className="meta">slippage % <NumInput width={52} value={spec.costs.slippage_pct} onChange={(n) => upd({ costs: { ...spec.costs, slippage_pct: n ?? 0 } })} /></label>
               <label className="meta"><input type="checkbox" checked={spec.costs.charges} onChange={(e) => upd({ costs: { ...spec.costs, charges: e.target.checked } })} /> Indian charges (brokerage, STT, exchange, GST, stamp)</label>

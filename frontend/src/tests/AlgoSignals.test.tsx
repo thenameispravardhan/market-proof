@@ -24,7 +24,7 @@ const DEFAULTS = {
 };
 const CATALOG = {
   indicators: [{ name: "PRICE", params: {}, outputs: ["value"], group: "price" }, { name: "EMA", params: { period: 20 }, outputs: ["value"], group: "trend" },
-    { name: "VIX", params: {}, outputs: ["value"], group: "volatility" }],
+    { name: "VIX", params: {}, outputs: ["value"], group: "volatility" }, { name: "ROC", params: { period: 10 }, outputs: ["value"], group: "momentum" }],
   operators: [">", "<", "crosses_above", "crosses_below"], timeframes: [1, 5, 15, 60, 1440], cond_timeframes: [15, 60, 1440],
   sources: ["close"], metrics: ["net_pnl"], sizing: ["qty", "lots", "amount", "pct_equity", "risk", "risk_pct"], defaults: DEFAULTS, max_range_days: 1098,
   no_symbol: ["VIX", "DTE", "TIME"],
@@ -91,5 +91,20 @@ describe("Algo Lab signals", () => {
     await waitFor(() => expect(screen.getByTestId("algo-trials").textContent).toBe("2 tries so far"));
     expect(backtests()[1].body.trials).toBe(1);
     expect(JSON.parse(localStorage.getItem("algo.draft.v2")!).trials).toBe(2);
+  });
+
+  it("ranks same-candle entries once there are several symbols", async () => {
+    mount();
+    await screen.findByDisplayValue(/EMA 9\/21/);
+    expect(screen.queryByTestId("algo-rank")).toBeNull();          // one symbol: nothing to rank
+    fireEvent.click(screen.getByText("+ NIFTY"));
+    fireEvent.click(await screen.findByText(/on the same candle, enter only the best/));
+    fireEvent.click(screen.getByText("▶ Run backtest"));
+    await waitFor(() => expect(backtests().length).toBe(1));
+    expect(backtests()[0].body.spec.rank).toMatchObject({ by: { ind: "ROC", params: { period: 20 } }, order: "desc", top: 1 });
+    fireEvent.click(screen.getByText(/on the same candle, enter only the best/));
+    fireEvent.click(screen.getByText("▶ Run backtest"));
+    await waitFor(() => expect(backtests().length).toBe(2));
+    expect("rank" in backtests()[1].body.spec).toBe(false);          // off = left out
   });
 });
