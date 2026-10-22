@@ -138,7 +138,11 @@ DEFAULT_SPEC: dict[str, Any] = {
 #       "beta" = the rolling hedge ratio of log prices over n bars at the
 #       signal candle. The position exits on its spread (conditions, time
 #       stop, MTM ₹ on each close), never on one leg's price.
-OPTIONAL_KEYS = ("scale_out", "margin", "position_rules", "rank", "pair_leg")
+#   "universe": {"index": "nifty50"} — backtests trade the index as it was each
+#       day (app/research/universe.py): every stock that was a member at any
+#       point of the range is loaded, and entries are allowed only on days it
+#       was one. Live trades `symbols` (keep them the current members).
+OPTIONAL_KEYS = ("scale_out", "margin", "position_rules", "rank", "pair_leg", "universe")
 # Per set (one set = the legs at their configured lots): delta in lots of the
 # underlying (1 = one lot of the future), gamma = delta change for a 1% move,
 # theta ₹ per day, vega ₹ per vol point, credit ₹ (net premium received; a
@@ -495,6 +499,16 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
     pl = s.pop("pair_leg", None)
     if pl:
         s["pair_leg"] = _check_pair_leg(s, pl)
+    uv = s.pop("universe", None)
+    if uv:
+        from app.research import universe
+
+        idx = str((uv or {}).get("index") if isinstance(uv, dict) else "").strip().lower()
+        if idx not in universe.INDEXES:
+            raise ValueError(f"universe index is one of {', '.join(universe.INDEXES)}")
+        if s["instrument"]["type"] == "option" or s.get("pair_leg"):
+            raise ValueError("a point-in-time universe is for share / futures strategies on its stocks")
+        s["universe"] = {"index": idx}
     if len(ref_frames(s)) > MAX_REF_SYMBOLS:
         raise ValueError(f"conditions can read at most {MAX_REF_SYMBOLS} other symbols")
     return s
@@ -655,8 +669,13 @@ def _walk_operands(spec: dict[str, Any]):
 ORDER_FLOW = {"DELTA", "CVD", "CVD_DIVERGENCE", "VPROFILE", "BAR_FLOW", "FLOW_PRESSURE"}
 # Indicators that read the strategy symbol's own non-candle data, so an operand
 # `symbol` (another symbol's candles) means nothing for them.
-NO_SYMBOL = {"VIX", "DTE", "TIME"} | ORDER_FLOW
+NO_SYMBOL = {"VIX", "DTE", "TIME", "FILING"} | ORDER_FLOW
 MAX_REF_SYMBOLS = 5
+
+
+def uses_filings(spec: dict[str, Any]) -> bool:
+    """Whether a condition reads FILING — the loaders then attach the symbol's filings."""
+    return any(o["ind"] == "FILING" for o in _walk_operands(spec))
 
 
 def vix_timeframes(spec: dict[str, Any]) -> set[int]:
@@ -1557,6 +1576,13 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                    "atr": {p: series(d, {"ind": "ATR", "params": {"period": p}}, cache) for p in atr_periods(spec)},
                    "pos": None, "pending": None, "per_day": {}, "cool": 0, "u": None}
 
+    for sym in syms:                 # a point-in-time universe: no entry on a day the stock wasn't in the index
+        md = data[sym].get("member_days")
+        if md is not None:
+            ok = [(t + IST) // 86400 in md for t in data[sym]["t"]]
+            sig = st[sym]["sig"]
+            st[sym]["sig"] = {**sig, "entry_long": [a and b for a, b in zip(sig["entry_long"], ok)],
+                              "entry_short": [a and b for a, b in zip(sig["entry_short"], ok)]}
     tick_of = {sym: tick_for(data[sym]["meta"].get("symbol") or sym, data[sym]["meta"]) for sym in syms}
     pl = spec.get("pair_leg")
     pb_name, pb_lot, pb_tick = "", 1, TICK
