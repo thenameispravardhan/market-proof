@@ -64,6 +64,10 @@ def _spec(raw: Any) -> dict[str, Any]:
     for o in engine._walk_operands(s):             # another symbol a condition reads: same resolution
         if o.get("symbol"):
             o["symbol"] = data.fyers_symbol(o["symbol"])
+    if s.get("pair_leg"):
+        s["pair_leg"]["symbol"] = data.fyers_symbol(s["pair_leg"]["symbol"])
+        if s["pair_leg"]["symbol"] in s["symbols"]:
+            raise HTTPException(422, detail="the pair leg's symbol must be another symbol than the ones the strategy trades")
     return s
 
 
@@ -862,6 +866,10 @@ def update_strategy(sid: int, body: dict[str, Any] = Body(...), db: Session = De
         s.mode = changes["mode"] = mode
     if body.get("enabled") is not None:
         s.enabled = changes["enabled"] = bool(body["enabled"])
+    if s.enabled and (s.spec or {}).get("pair_leg"):
+        # B3 is backtest-only: the runner would trade the first leg unhedged until its live half (A4) ships.
+        raise HTTPException(422, detail="two-symbol positions (pair leg) are backtest-only for now — "
+                                        "the live / paper half isn't built yet")
     if s.mode == "live":
         acc = db.get(BrokerAccount, s.account_id) if s.account_id else None
         if acc is None or acc.paper_mode or acc.broker != "fyers":
