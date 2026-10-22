@@ -30,6 +30,7 @@ import {
 } from "lightweight-charts";
 import { api } from "../api/client";
 import { DriftPanel } from "../components/algo/DriftPanel";
+import { TcaPanel } from "../components/algo/TcaPanel";
 import { useSessionState } from "../router";
 import { peekQuote, useQuoteTick, watchSymbol } from "../hooks/useQuotes";
 import { Toggle } from "../components/common/Toggle";
@@ -81,7 +82,8 @@ type Level = { type: string; value: number; atr_period?: number; activate?: numb
 type ScaleStep = { type: string; value: number; atr_period?: number; qty_pct: number };
 // delta: with strike "DELTA", the strike nearest that |delta|. expiry: the leg's own expiry (calendars); absent = the instrument's.
 // sl_pct / tg_pct: the leg's own stop / target, % of its entry premium (absent = off).
-type Leg = { right: "CE" | "PE" | "FUT"; action: "BUY" | "SELL"; strike: string; steps: number; premium: number; lots: number; delta?: number; expiry?: "current" | "next"; sl_pct?: number; tg_pct?: number };
+type Leg = { right: "CE" | "PE" | "FUT"; action: "BUY" | "SELL"; strike: string; steps: number; premium: number; lots: number; delta?: number; expiry?: "current" | "next"; sl_pct?: number; tg_pct?: number;
+  reentries?: number; roll?: { above: number; to: number; max: number } };   // re-sell after its stop; roll when |Δ| > above
 // A rule on the option position's Greeks / premium (per set): entry = all must hold, exit = any.
 type Rule = { metric: string; op: string; value: number };
 // span: F&O blocks an exchange-style SPAN + exposure estimate; absent = notional / leverage.
@@ -93,7 +95,7 @@ type Instrument = {
   legs_long: Leg[];
   legs_short: Leg[];
   levels_on: "instrument" | "underlying";
-  iv: { source: string; value: number };
+  iv: { source: string; value: number; put_skew?: number; call_skew?: number };   // skew: IV points per 1% OTM (backtests)
   on_leg_stop?: "leg" | "cost" | "all";   // when a leg's own stop hits (absent = only that leg exits)
 };
 type Spec = {
@@ -112,7 +114,7 @@ type Spec = {
   breakeven: Level;
   scale_out?: ScaleStep[];        // absent / empty = off (the server leaves it out when off)
   margin?: Margin;                // absent = leverage model
-  position_rules?: { entry?: Rule[]; exit?: Rule[] };   // absent = none
+  position_rules?: { entry?: Rule[]; exit?: Rule[]; hedge?: { above: number; max: number } };   // absent = none
   mtm: { stop: number | null; target: number | null; trail_start: number | null; trail_gap: number | null; stop_pct?: number | null; target_pct?: number | null };
   daily: { max_loss: number | null; max_profit: number | null };
   session: { start: string | null; end: string | null; square_off: string | null; days?: number[] | null };
@@ -1089,6 +1091,23 @@ function LegsEditor({ legs, onChange, title }: { legs: Leg[]; onChange: (l: Leg[
               }} />%
             </label>
           ))}
+          {lg.right !== "FUT" && (
+            <label className="meta" data-testid="leg-reentries" title="after this leg's own stop, sell / buy it again (strike re-picked at the new spot) on the next candle close — up to this many times per position">
+              re-enter ×<NumInput width={32} allowEmpty placeholder="0" value={lg.reentries ?? null} onChange={(n) => {
+                const { reentries: _old, ...rest } = lg;
+                onChange(legs.map((x, j) => (j === i ? (n && n > 0 ? { ...rest, reentries: Math.min(5, Math.floor(n)) } : rest) : x)));
+              }} />
+            </label>
+          )}
+          {lg.right !== "FUT" && (
+            <label className="meta" data-testid="leg-roll" title="roll a tested leg: when its |delta| goes above this on a candle close, close it and open the same leg at the strike nearest the second |delta| (once per position). Empty = off">
+              roll |Δ|&gt;<NumInput width={40} allowEmpty placeholder="off" value={lg.roll?.above ?? null} onChange={(n) => {
+                const { roll: _old, ...rest } = lg;
+                onChange(legs.map((x, j) => (j === i ? (n && n > 0 && n < 1 ? { ...rest, roll: { to: Math.min(lg.roll?.to ?? 0.2, n / 2), max: lg.roll?.max ?? 1, above: n } } : rest) : x)));
+              }} />
+              {lg.roll && <>→<NumInput width={40} value={lg.roll.to} onChange={(n) => set(i, { roll: { ...lg.roll!, to: Math.max(0.01, Math.min(lg.roll!.above - 0.01, n ?? 0.2)) } })} /></>}
+            </label>
+          )}
           <button type="button" className="btn-sm danger" onClick={() => onChange(legs.filter((_, j) => j !== i))}>✕</button>
         </div>
       ))}
@@ -2249,6 +2268,7 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
           </div>
       </div>
       <DriftPanel strategies={(strategies.data?.strategies ?? []).filter((x) => shown(x.id))} />
+      <TcaPanel shown={shown} />
       <div className="widget widget-wide">
           <h3>Runner log {sel.length ? <span className="meta">— {selNames}</span> : null}</h3>
           <div style={{ ...grow(320), fontSize: 12 }} data-testid="algo-log-panel">
@@ -2596,7 +2616,7 @@ export default function Algo() {
     const next = { ...rules, [k]: r };
     if (!next.entry?.length) delete next.entry;
     if (!next.exit?.length) delete next.exit;
-    upd({ position_rules: next.entry || next.exit ? next : undefined });
+    upd({ position_rules: next.entry || next.exit || next.hedge ? next : undefined });
   };
   const setMtmPct = (k: "stop_pct" | "target_pct", v: number | null) => {
     const { [k]: _old, ...rest } = spec.mtm;
@@ -2853,6 +2873,14 @@ export default function Algo() {
                     </select>
                     {inst.iv.source === "fixed" && <NumInput width={48} value={inst.iv.value} onChange={(n) => updInst({ iv: { ...inst.iv, value: n ?? 15 } })} />}
                   </label>
+                  {(["put_skew", "call_skew"] as const).map((k) => (
+                    <label key={k} className="meta" data-testid={`iv-${k}`} title="backtests only: extra IV points per 1% out of the money, so wings price richer like the real smile (puts ~0.5-1 on NIFTY). Empty = flat IV">
+                      {k === "put_skew" ? "put skew" : "call skew"}<NumInput width={40} allowEmpty placeholder="0" value={inst.iv[k] ?? null} onChange={(n) => {
+                        const { [k]: _old, ...rest } = inst.iv;
+                        updInst({ iv: n && n > 0 ? { ...rest, [k]: Math.min(10, n) } : rest });
+                      }} />
+                    </label>
+                  ))}
                   <span className="meta">Strikes ATM/ITM/OTM are counted in the underlying's strike steps; Δ strikes pick the nearest delta. Multi-leg positions exit together — use MTM ₹ stops.</span>
                 </div>
               </>
@@ -2929,6 +2957,18 @@ export default function Algo() {
                   <RulesEditor kind="entry" rules={rules.entry ?? []} onChange={(r) => setRules("entry", r)} />
                   <RulesEditor kind="exit" rules={rules.exit ?? []} onChange={(r) => setRules("exit", r)} />
                 </div>
+                <label className="meta" data-testid="hedge-rule" style={{ display: "block", marginTop: 6 }}
+                  title="on each candle's close, when the net delta per set is beyond ± this, buy / sell whole lots of the future per set to bring it back toward 0 (keep it ≥ 0.5: smaller imbalances round to 0 lots)">
+                  <input type="checkbox" checked={!!rules.hedge} onChange={(e) => {
+                    const { hedge: _old, ...rest } = rules;
+                    const next: NonNullable<Spec["position_rules"]> = e.target.checked ? { ...rest, hedge: { above: 0.6, max: 10 } } : rest;
+                    upd({ position_rules: next.entry || next.exit || next.hedge ? next : undefined });
+                  }} /> delta-hedge with the future when |Δ| per set &gt;
+                  {rules.hedge && <>
+                    <NumInput width={40} value={rules.hedge.above} onChange={(n) => upd({ position_rules: { ...rules, hedge: { ...rules.hedge!, above: Math.max(0.05, n ?? 0.6) } } })} />
+                    , at most <NumInput width={36} value={rules.hedge.max} onChange={(n) => upd({ position_rules: { ...rules, hedge: { ...rules.hedge!, max: Math.max(1, Math.min(50, Math.floor(n ?? 10))) } } })} /> hedges
+                  </>}
+                </label>
               </div>
             )}
             <div className="algo-operand" style={{ gap: 14, marginTop: 8 }}>

@@ -258,6 +258,12 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
     if inst["iv"]["source"] not in ("auto", "hv", "vix", "fixed"):
         raise ValueError("iv source is auto, hv, vix or fixed")
     inst["iv"]["value"] = _num(inst["iv"]["value"], "fixed IV %", 0.1)
+    for k in ("put_skew", "call_skew"):           # IV points per 1% out of the money (backtests); 0 / absent = flat
+        v = _num(inst["iv"].pop(k, None), k.replace("_", " "), 0, allow_none=True)
+        if v:
+            if v > 10:
+                raise ValueError(f"{k.replace('_', ' ')} is IV points per 1% out of the money: at most 10")
+            inst["iv"][k] = v
     opt = inst["type"] == "option"
     multi = False
     for key, used in (("legs_long", s["direction"] != "short"), ("legs_short", s["direction"] != "long")):
@@ -289,6 +295,22 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
                     lg[k] = _num(lg[k], label, 1e-9)
                     if lg[k] > 1000:
                         raise ValueError(f"{label} must be at most 1000")
+            re_ = _num(lg.pop("reentries", None), "leg re-entries", 0, integer=True, allow_none=True)
+            if re_:
+                if lg["right"] == "FUT" or re_ > 5:
+                    raise ValueError("re-entries (0-5) are for option legs")
+                if inst.get("on_leg_stop") == "all":
+                    raise ValueError("re-entries can't follow a leg stop that exits every leg (on_leg_stop: all)")
+                lg["reentries"] = re_
+            ro = lg.pop("roll", None)
+            if ro:
+                if lg["right"] == "FUT" or not isinstance(ro, dict):
+                    raise ValueError('roll is {"above": |delta|, "to": |delta|, "max": n} on an option leg')
+                ro = {"above": _num(ro.get("above"), "roll above |delta|", 0.01), "to": _num(ro.get("to"), "roll to |delta|", 0.01),
+                      "max": _num(ro.get("max", 1), "rolls per position", 1, integer=True)}
+                if not ro["to"] < ro["above"] < 1 or ro["max"] > 5:
+                    raise ValueError("roll needs 0 < to < above < 1 (|delta|) and at most 5 rolls")
+                lg["roll"] = ro
             lg["steps"] = _num(lg.get("steps", 0), "strike steps", 0, integer=True)
             lg["premium"] = _num(lg.get("premium", 100), "target premium", 0.05)
             # 0 lots = leg switched off, so the optimiser can sweep a hedge on / off.
@@ -375,10 +397,21 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
             r["value"] = _num(r.get("value"), f"{r['metric']} rule value", -1e12)
         if lst:
             rules[k] = lst
+    if pr.get("hedge"):
+        h = pr["hedge"]
+        if not isinstance(h, dict):
+            raise ValueError('hedge is {"above": |delta| in lots per set, "max": n}')
+        rules["hedge"] = {"above": _num(h.get("above"), "hedge above |delta|", 0.05),
+                          "max": _num(h.get("max", 10), "hedges per position", 1, integer=True)}
+        if rules["hedge"]["max"] > 50:
+            raise ValueError("at most 50 hedges per position")
     if rules:
         if not opt:
             raise ValueError("position rules (Greeks / premium) need an option instrument")
         s["position_rules"] = rules
+    if s.get("scale_out") and (rules.get("hedge") or any(lg.get("reentries") or lg.get("roll") for key in
+                                                           ("legs_long", "legs_short") for lg in inst.get(key) or [])):
+        raise ValueError("scale-out and re-entries / rolls / hedges can't be combined — use one or the other")
     if (s["mtm"]["trail_start"] is None) != (s["mtm"]["trail_gap"] is None):
         raise ValueError("MTM trailing needs both a start and a gap")
     for k in ("max_loss", "max_profit"):
@@ -980,7 +1013,7 @@ def position_metrics(legs: list[dict], u: float, t: float, lot: int, px: Callabl
             continue
         if lg["kind"] in ("CE", "PE"):
             yrs = fno.years_to(lg["exp"], t)
-            v = iv if iv is not None else fno.implied_vol(p, u, lg["K"], yrs, lg["kind"])
+            v = leg_iv(lg, u, iv) if iv is not None else fno.implied_vol(p, u, lg["K"], yrs, lg["kind"])
             g = fno.bs_greeks(u, lg["K"], yrs, v, lg["kind"])
             ivs.append(v)
             dtes.append((lg["exp"] - t) / 86400)
@@ -1197,30 +1230,44 @@ def sim_legs(spec: dict, side: str, meta: dict, u: float, t: float, iv: float,
                  "label": f"{meta['name']} FUT {fno.label_date(exp)}"}]
     legs: list[dict[str, Any]] = []
     step = float(meta.get("step") or fno.default_step(meta["name"], u))
-    for cfg in inst["legs_long" if side == "BUY" else "legs_short"]:
+    sk = (inst["iv"].get("put_skew", 0), inst["iv"].get("call_skew", 0))
+    skew = {"skew": sk} if any(sk) else {}
+    for src, cfg in enumerate(inst["legs_long" if side == "BUY" else "legs_short"]):
         if not cfg["lots"]:
             continue
         if cfg["right"] == "FUT":          # priced on spot, like a future-type strategy
             exp = fno.expiry_after(meta["name"], meta["exch"], "monthly", inst["expiry"], t, tdays)
-            legs.append({"kind": "FUT", "act": 1 if cfg["action"] == "BUY" else -1, "exp": exp,
+            legs.append({"kind": "FUT", "act": 1 if cfg["action"] == "BUY" else -1, "exp": exp, "src": src,
                          "per_set": lot * cfg["lots"], "label": f"{meta['name']} FUT {fno.label_date(exp)}"})
             continue
         exp = fno.expiry_after(meta["name"], meta["exch"], inst["expiry_kind"], cfg.get("expiry") or inst["expiry"],
                                t, tdays)
         tyrs = fno.years_to(exp, t)
+        kiv = lambda k: leg_iv({"kind": cfg["right"], "K": k, **skew}, u, iv)  # noqa: E731
         if cfg["strike"] == "PREMIUM":
             k_ = fno.strike_for_premium(u, step, cfg["right"], cfg["premium"],
-                                        lambda k: fno.bs_price(u, k, tyrs, iv, cfg["right"]))
+                                        lambda k: fno.bs_price(u, k, tyrs, kiv(k), cfg["right"]))
         elif cfg["strike"] == "DELTA":
             k_ = fno.strike_for_delta(u, step, cfg["right"], cfg["delta"],
-                                      lambda k: fno.bs_greeks(u, k, tyrs, iv, cfg["right"])["delta"])
+                                      lambda k: fno.bs_greeks(u, k, tyrs, kiv(k), cfg["right"])["delta"])
         else:
             k_ = fno.pick_strike(u, step, cfg["right"], cfg["strike"], cfg["steps"])
         legs.append({"kind": cfg["right"], "act": 1 if cfg["action"] == "BUY" else -1, "K": k_, "exp": exp,
-                     "per_set": lot * cfg["lots"],
+                     "per_set": lot * cfg["lots"], "src": src, **skew,
                      "label": f"{meta['name']} {fno.label_date(exp)} {k_:g} {cfg['right']}",
                      **{k: cfg[k] for k in ("sl_pct", "tg_pct") if cfg.get(k)}})
     return legs
+
+
+def leg_iv(leg: dict, u: float, iv: float) -> float:
+    """A backtest option leg's IV: the flat IV plus its skew — instrument.iv
+    put_skew / call_skew IV points per 1% out of the money, measured at the
+    current spot (sticky moneyness). No skew on the leg = the flat IV."""
+    sk = leg.get("skew")
+    if not sk or iv is None:
+        return iv
+    otm = (u - leg["K"]) / u * 100 if leg["kind"] == "PE" else (leg["K"] - u) / u * 100
+    return iv + max(0.0, otm) * sk[0 if leg["kind"] == "PE" else 1] / 100
 
 
 def _leg_px(leg: dict, u: float, t: float, iv: float) -> float:
@@ -1228,7 +1275,56 @@ def _leg_px(leg: dict, u: float, t: float, iv: float) -> float:
         return leg["exit"]
     if leg["kind"] in ("EQ", "FUT"):
         return u
-    return fno.bs_price(u, leg["K"], fno.years_to(leg["exp"], t), iv, leg["kind"])
+    return fno.bs_price(u, leg["K"], fno.years_to(leg["exp"], t), leg_iv(leg, u, iv), leg["kind"])
+
+
+def one_leg(spec: dict, side: str, meta: dict, cfg: dict, u: float, t: float, iv: float,
+            tdays: Optional[frozenset] = None) -> dict[str, Any]:
+    """One leg of `cfg` resolved like sim_legs (a re-entry, a roll, a hedge)."""
+    key = "legs_long" if side == "BUY" else "legs_short"
+    return sim_legs({**spec, "instrument": {**spec["instrument"], key: [{**cfg, "lots": cfg.get("lots") or 1}]}},
+                    side, meta, u, t, iv, tdays)[0]
+
+
+def adjusts(spec: dict) -> bool:
+    """Does this option strategy re-enter, roll or hedge its legs?"""
+    inst = spec["instrument"]
+    return inst["type"] == "option" and bool((spec.get("position_rules") or {}).get("hedge") or any(
+        lg.get("reentries") or lg.get("roll") for k in ("legs_long", "legs_short") for lg in inst.get(k) or []))
+
+
+def adjustments(spec: dict, side: str, legs: list[dict], u: float, t: float, lot: int,
+                px: Callable[[dict], Optional[float]], iv: Optional[float] = None, opens: bool = True) -> list[tuple]:
+    """What an open option position does on a candle's close (backtest and
+    live alike): ("reenter", j) a leg stopped out with re-entries left,
+    ("roll", j, cfg) a leg whose |delta| passed its roll level → the same leg
+    at the roll delta, ("hedge", lots) FUT lots per set bringing the net delta
+    back toward 0. `opens` False (past the entry window) = hedges only."""
+    cfgs = spec["instrument"]["legs_long" if side == "BUY" else "legs_short"]
+    out: list[tuple] = []
+    used = lambda src, via: sum(1 for x in legs if x.get("src") == src and x.get("via") == via)  # noqa: E731
+    for j, lg in enumerate(legs):
+        cfg = cfgs[lg["src"]] if opens and lg.get("src") is not None and lg["src"] < len(cfgs) else None
+        if cfg is None or lg.get("hedge"):
+            continue
+        if lg.get("exit") is not None:
+            if lg.get("exit_reason") in ("LEG_SL", "LEG_COST") and not lg.get("redone") \
+                    and used(lg["src"], "REENTRY") < (cfg.get("reentries") or 0):
+                out.append(("reenter", j, cfg))
+        elif cfg.get("roll") and lg["kind"] in ("CE", "PE") and used(lg["src"], "ROLL") < cfg["roll"]["max"]:
+            p = px(lg)
+            if p:
+                yrs = fno.years_to(lg["exp"], t)
+                v = leg_iv(lg, u, iv) if iv is not None else fno.implied_vol(p, u, lg["K"], yrs, lg["kind"])
+                if abs(fno.bs_greeks(u, lg["K"], yrs, v, lg["kind"])["delta"]) > cfg["roll"]["above"]:
+                    out.append(("roll", j, {**cfg, "strike": "DELTA", "delta": cfg["roll"]["to"]}))
+    h = (spec.get("position_rules") or {}).get("hedge")
+    if h and sum(1 for x in legs if x.get("hedge")) < h["max"]:
+        d = position_metrics(legs, u, t, lot, px, iv)["delta"]
+        n = -round(d) if d is not None and abs(d) > h["above"] else 0
+        if n:
+            out.append(("hedge", n, {"right": "FUT", "action": "BUY" if n > 0 else "SELL", "lots": abs(n)}))
+    return out
 
 
 def premium_atr(atrs: dict[int, Optional[float]], leg: dict, u: float, t: float,
@@ -1242,6 +1338,8 @@ def premium_atr(atrs: dict[int, Optional[float]], leg: dict, u: float, t: float,
     if iv is None:
         px = float(leg.get("price") or leg.get("entry") or 0)
         iv = _solve(lambda s: fno.bs_price(u, leg["K"], yrs, s, leg["kind"]), px, 0.01, 5.0) if px > 0 else 0.0
+    else:
+        iv = leg_iv(leg, u, iv)
     h = max(u * 0.001, 0.01)
     dlt = abs(fno.bs_price(u + h, leg["K"], yrs, iv, leg["kind"]) - fno.bs_price(u - h, leg["K"], yrs, iv, leg["kind"])) / (2 * h)
     return {p: (v * dlt if v else v) for p, v in atrs.items()}
@@ -1301,6 +1399,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
     trades: list[dict[str, Any]] = []
     skipped = {"no_capital": 0, "max_positions": 0, "daily_halt": 0, "entry_expired": 0, "entry_rules": 0}
     exit_rules = (spec.get("position_rules") or {}).get("exit")
+    adjusting = adjusts(spec)
     on_leg_stop = inst.get("on_leg_stop", "leg")
     realized = 0.0
     used_margin = 0.0
@@ -1338,7 +1437,8 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
             gross, chg = gross + g, chg + ch
             legs_out.append({"label": l["label"], "side": "BUY" if l["act"] > 0 else "SELL", "qty": q,
                              "entry": round(l["entry"], 2), "exit": round(px, 2),
-                             **({"reason": l["exit_reason"]} if l.get("exit_reason") else {})})
+                             **({"reason": l["exit_reason"]} if l.get("exit_reason") else {}),
+                             **({"via": l["via"]} if l.get("via") else {})})
             if part:
                 l["qty"] -= q
         net = gross - chg
@@ -1495,6 +1595,44 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                 a = u_x
         return False
 
+    def adjust(sym: str, i: int, opens: bool) -> None:
+        """Re-entries, rolls and hedges (adjustments()) on the candle's close,
+        filled at its close price with slippage, sized like the position."""
+        nonlocal used_margin
+        s_ = st[sym]
+        pos, d = s_["pos"], s_["d"]
+        u, tc, iv, meta = d["c"][i], ind.close_time(d, i), d["iv"][i], d["meta"]
+        open_legs = lambda extra=(): [l for l in pos["legs"] if l.get("exit") is None] + list(extra)  # noqa: E731
+        margin_of = lambda legs: position_margin(legs, u, pf["leverage"], model=spec.get("margin"), t=tc,  # noqa: E731
+                                                 iv=iv, name=meta["name"]) * pos["sets"]
+        for kind, j, cfg in adjustments(spec, pos["side"], pos["legs"], u, tc, int(meta.get("lot") or 1),
+                                        lambda l: _leg_px(l, u, tc, iv), iv, opens):
+            new = one_leg(spec, pos["side"], meta, cfg, u, tc, iv, d.get("trading_days"))
+            raw = _leg_px(new, u, tc, iv)
+            new.update(entry=raw * (1 + slip) if new["act"] > 0 else raw * (1 - slip), qty=new["per_set"] * pos["sets"],
+                       qty0=new["per_set"] * pos["sets"], via={"reenter": "REENTRY", "roll": "ROLL", "hedge": "HEDGE"}[kind])
+            if kind == "hedge":
+                new.pop("src", None)
+                new["hedge"] = True
+                free = min(equity_now(), pf["capital"] + realized) - used_margin
+                if margin_of(open_legs([new])) - pos["margin"] > max(0.0, free):
+                    skipped["hedge_no_capital"] = skipped.get("hedge_no_capital", 0) + 1
+                    continue
+            else:
+                old = pos["legs"][j]
+                new["src"] = old["src"]
+                if kind == "roll":
+                    p = _leg_px(old, u, tc, iv)
+                    old["exit"], old["exit_reason"] = (p * (1 - slip) if old["act"] > 0 else p * (1 + slip)), "LEG_ROLL"
+                else:
+                    old["redone"] = True
+            leg_levels([new])
+            pos["legs"].append(new)
+        m = margin_of(open_legs())
+        used_margin += m - pos["margin"]
+        pos["margin"] = m
+        pos["leg_rules"] = pos["leg_rules"] or any(l.get("sl") is not None or l.get("tg") is not None for l in open_legs())
+
     def check_intrabar(sym: str, i: int) -> None:
         s_ = st[sym]
         if s_["pos"]["leg_rules"] and leg_events(sym, i):
@@ -1631,6 +1769,8 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                 r_ = exit_rule_hit(spec, pm)
                 if r_:
                     pos["exit_pending"] = f"RULE_{r_['metric'].upper()}"
+            if adjusting and not pos["exit_pending"] and halted != day and mod < sq:
+                adjust(sym, i, ((ind.close_time(d, i) + IST) % 86400) // 60 <= end)
         s_["u"] = (d["c"][i], i)
         if (daily["max_loss"] or daily["max_profit"]) and halted != day:
             day_pnl = day_realized

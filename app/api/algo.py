@@ -801,3 +801,36 @@ async def sync_now(request: Request) -> dict[str, Any]:
     if not strategies:
         return {"symbols": 0, "ok": 0, "failed": []}
     return await _runner(request).sync(strategies, days=int(request.query_params.get("days", 5)))
+
+
+@router.get("/tca")
+def tca(days: int = Query(30, ge=1, le=365), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Transaction-cost analysis: LIVE fills vs the quotes the runner decided
+    at, per strategy and instrument kind (paper fills ARE the quote). Signed
+    so + = it cost you. Beside each, the slippage % that strategy's backtests
+    assume — measured above assumed means the backtests flatter it.
+    ponytail: a scale-out part repeats its parent's entry fill."""
+    import statistics
+    from datetime import timedelta
+
+    since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
+    rows = db.execute(select(AlgoTrade).where(AlgoTrade.mode == "live", AlgoTrade.status != "rejected",
+                                              AlgoTrade.entry_at >= since)).scalars().all()
+    strategies = {s.id: s for s in db.execute(select(AlgoStrategy)).scalars()}
+    groups: dict[tuple[int, str], list[tuple[float, float]]] = {}
+    for t in rows:
+        for lg in t.legs or []:
+            for quote, fill, sign in (("entry_quote", "entry", lg.get("act", 1)), ("exit_quote", "exit", -lg.get("act", 1))):
+                q, f = lg.get(quote), lg.get(fill)
+                if q and f and not lg.get("external"):
+                    groups.setdefault((t.strategy_id, lg.get("kind", "EQ")), []).append(
+                        ((f - q) / q * 100 * sign, (f - q) * sign * (lg.get("qty") or 0)))
+    out = []
+    for (sid, kind), xs in sorted(groups.items()):
+        s = strategies.get(sid)
+        pct = [x[0] for x in xs]
+        out.append({"strategy_id": sid, "name": s.name if s else str(sid), "kind": kind, "fills": len(xs),
+                    "median_pct": round(statistics.median(pct), 4), "mean_pct": round(sum(pct) / len(pct), 4),
+                    "rupees": round(sum(x[1] for x in xs), 2),
+                    "assumed_pct": ((s.spec or {}).get("costs") or {}).get("slippage_pct") if s else None})
+    return {"days": days, "rows": out}
