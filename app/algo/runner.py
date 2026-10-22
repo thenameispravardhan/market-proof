@@ -46,7 +46,7 @@ from app.algo import data, engine, fno
 from app.algo import indicators
 from app.config import get_settings
 from app.db import session as db_session
-from app.db.models import AlgoStrategy, AlgoTrade, BrokerAccount
+from app.db.models import AlgoStrategy, AlgoTrade, AuditLog, BrokerAccount
 from app.logging_config import get_logger
 
 log = get_logger(__name__)
@@ -55,6 +55,8 @@ IST = engine.IST
 OPEN_MIN, CLOSE_MIN = 9 * 60 + 15, 15 * 60 + 30
 GRACE_S = 3          # let Fyers finalise the candle that just closed
 STALE_BAR_S = 120    # a bar this old at first sight was missed, not acted on
+GUARD_EVERY_S = 60   # how often each strategy's guard limits are read
+GUARD_MIN_FILLS = 10 # the slippage guard needs at least this many live fills
 REF_WAIT_S = 30      # wait this long for another symbol the conditions read to publish its candle
 SYNC_AFTER_MIN = 15 * 60 + 45
 
@@ -92,6 +94,57 @@ def _snapshot() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         trades = [_row(t) for t in db.execute(
             select(AlgoTrade).where(AlgoTrade.status == "open")).scalars()]
     return strategies, trades
+
+
+def _guard_stats(sid: int, day_start: float, fills: int = 20) -> dict[str, Any]:
+    """What a strategy's guard reads: its closed net P&L now and at its peak,
+    entries rejected today, and the slippage of its last `fills` live fills."""
+    with db_session.SessionLocal() as db:
+        cum = peak = 0.0
+        for (net,) in db.execute(select(AlgoTrade.net_pnl).where(
+                AlgoTrade.strategy_id == sid, AlgoTrade.status == "closed").order_by(AlgoTrade.exit_at)):
+            cum += net or 0.0
+            peak = max(peak, cum)
+        rejects = db.execute(select(func.count()).select_from(AlgoTrade).where(
+            AlgoTrade.strategy_id == sid, AlgoTrade.status == "rejected",
+            AlgoTrade.entry_at >= _naive(day_start))).scalar_one()
+        slip: list[float] = []
+        for (legs,) in db.execute(select(AlgoTrade.legs).where(
+                AlgoTrade.strategy_id == sid, AlgoTrade.mode == "live", AlgoTrade.status == "closed")
+                .order_by(AlgoTrade.exit_at.desc()).limit(fills)):
+            slip += [p for lg in legs or [] for p, _ in engine.fill_slippage(lg)]
+    return {"closed": cum, "peak": peak, "rejects": rejects, "slippage": slip[:fills]}
+
+
+def guard_breach(g: dict, st: dict, open_mtm: float) -> Optional[str]:
+    """The first guard limit a strategy has breached, or None. Drawdown is
+    from the peak of its closed P&L to now, open positions marked to market."""
+    import statistics
+
+    now = st["closed"] + open_mtm
+    dd = max(st["peak"], now) - now
+    if g.get("max_drawdown") and dd >= g["max_drawdown"]:
+        return f"drawdown ₹{dd:,.0f} reached the ₹{g['max_drawdown']:,.0f} limit"
+    if g.get("max_rejects") and st["rejects"] >= g["max_rejects"]:
+        return f"{st['rejects']} entries rejected today (limit {g['max_rejects']})"
+    sl = st["slippage"]
+    if g.get("max_slippage_pct") and len(sl) >= GUARD_MIN_FILLS and statistics.median(sl) > g["max_slippage_pct"]:
+        return (f"median slippage {statistics.median(sl):.3f}% over the last {len(sl)} live fills "
+                f"is above the {g['max_slippage_pct']}% limit")
+    return None
+
+
+def _guard_off(sid: int, why: str) -> bool:
+    """Switch a strategy off for its guard (audited). False = it already was."""
+    with db_session.SessionLocal() as db:
+        s = db.get(AlgoStrategy, sid)
+        if s is None or not s.enabled:
+            return False
+        s.enabled = False
+        db.add(AuditLog(actor="algo-guard", action="algo.guard_pause", target=f"algo_strategy:{sid}",
+                        before={"enabled": True}, after={"enabled": False, "why": why}))
+        db.commit()
+        return True
 
 
 def _row(t: AlgoTrade) -> dict[str, Any]:
@@ -455,6 +508,7 @@ class AlgoRunner:
         self._armed: dict[tuple[int, str], dict[str, Any]] = {}
         self._last_tc: dict[tuple[int, str], int] = {}   # volume/turnover: last candle close acted on
         self._busy: set[int] = set()     # trades with an exit / scale-out in flight
+        self._guard_at = 0.0             # last time the guards were read
         self._names: dict[int, str] = {}
         # Tick-driven exits: every websocket tick for a symbol an open position
         # holds wakes `_tick_loop`, which runs the same stop / target / trail
@@ -589,6 +643,7 @@ class AlgoRunner:
             except Exception as e:  # noqa: BLE001
                 self.event("error", f"F&O master refresh failed: {e}"[:200])
         if OPEN_MIN <= mins < CLOSE_MIN:
+            await self._guards(strategies, now, day_start)
             if self._armed:
                 await self._check_armed(by_id, now, day, day_start)
             for s in strategies:
@@ -646,6 +701,37 @@ class AlgoRunner:
                            strategy_id=sid)
                 for t in mine:
                     await self._exit(t, prices, hit, now)
+
+    async def _guards(self, strategies: list[dict], now: float, day_start: float) -> None:
+        """Each enabled strategy's guard (spec "guard"), once a minute: a breach
+        switches it off — no new entries; its open positions stay managed, or
+        are flattened with on_breach "flatten" — with an event, an audit row and
+        a risk-halt alert. Switching it back on is the operator's call."""
+        if now - self._guard_at < GUARD_EVERY_S:
+            return
+        self._guard_at = now
+        for s in strategies:
+            g = s["spec"].get("guard")
+            if not (s["enabled"] and g):
+                continue
+            mine = [t for t in self._open if t["strategy_id"] == s["id"] and t.get("status") == "open"]
+            prices = await _ltp(list({lg["symbol"] for t in mine for lg in t["legs"]})) if mine else {}
+            marks = [_mtm(t["legs"], prices) for t in mine]
+            why = guard_breach(g, await asyncio.to_thread(_guard_stats, s["id"], day_start),
+                               sum(m for m in marks if m is not None))
+            if not why or not await asyncio.to_thread(_guard_off, s["id"], why):
+                continue
+            s["enabled"] = False
+            flatten = g.get("on_breach") == "flatten"
+            msg = f"{s['name']}: GUARD switched it off — {why}" + (
+                "; flattening its positions" if flatten else "; its open positions stay managed")
+            self.event("error", msg, strategy_id=s["id"])
+            from app.services.event_bus import event_bus
+
+            asyncio.ensure_future(event_bus.publish("risk.halt", {"code": "ALGO_GUARD", "message": msg,
+                                                                   "symbol": s["name"]}))
+            for t in mine if flatten else []:
+                await self._exit(t, prices, "GUARD", now)
 
     async def _check(self, t: dict, spec: Optional[dict], prices: dict[str, float], now: float) -> Optional[str]:
         """Update trailing / breakeven / MTM peak and return an exit reason, if any."""

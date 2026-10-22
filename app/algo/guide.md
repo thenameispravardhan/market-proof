@@ -388,6 +388,14 @@ uses implied volatility from the real option prices.
   happen automatically while the entry condition stays true).
 * `cooldown_bars` — candles to wait after an exit before re-entering.
 * `max_bars` — time stop: exit after this many candles in the trade.
+* `guard` (optional, live only) — `{"max_drawdown": 15000, "max_rejects": 3,
+  "max_slippage_pct": 0.3, "on_breach": "pause"}`: once a minute the runner
+  checks the automation's drawdown (peak of its closed P&L to now, open
+  positions marked to market), entries rejected today and the median slippage
+  of its last 20 live fills (needs 10+). A breach switches it OFF — audited,
+  with a risk-halt alert; `pause` keeps managing its open positions,
+  `flatten` closes them (reason `GUARD`). Switching it back on is yours.
+  Backtests ignore it.
 
 ### 6.6 Session
 
