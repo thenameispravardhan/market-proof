@@ -314,9 +314,96 @@ def _product(spec: dict, lg: dict) -> str:
     return "DELIVERY" if lg["kind"] == "EQ" else "MARGIN"
 
 
-async def _order(account: BrokerAccount, symbol: str, side: str, qty: int, *, exit_: bool,
-                 strategy_id: int, product: str = "INTRADAY") -> tuple[bool, Optional[str], str]:
-    """(ok, broker order id, message) — one MARKET order."""
+def _slices(symbol: str, qty: int) -> list[int]:
+    """`qty` as orders the exchange accepts: at most its freeze quantity each,
+    in whole lots (an index option above the freeze limit is refused whole)."""
+    cap = fno.freeze_qty(symbol)
+    if not cap or qty <= cap:
+        return [int(qty)]
+    lot = fno.contract_lot(symbol) or 1
+    step = max(lot, cap // lot * lot)
+    return [step] * (qty // step) + ([qty % step] if qty % step else [])
+
+
+def _backend(account: BrokerAccount) -> Any:
+    from app.api.orders import _manager
+
+    return _manager()._manual_backend_for(account)  # noqa: SLF001
+
+
+async def _order(account: BrokerAccount, symbol: str, side: str, qty: int, *, exit_: bool, strategy_id: int,
+                 product: str = "INTRADAY", order_type: str = "MARKET",
+                 limit_price: Optional[float] = None) -> tuple[bool, Optional[str], str]:
+    """(ok, broker order id(s), message). Above the exchange's freeze quantity
+    the order goes out in slices, ids joined by commas. An ENTRY whose later
+    slice is refused cancels and unwinds the slices that went through — never
+    half a position the caller doesn't know about; an EXIT keeps them (its
+    retry re-reads what the broker still holds)."""
+    ids: list[str] = []
+    done = 0
+    for q in _slices(symbol, int(qty)):
+        ok, oid, msg = await _place(account, symbol, side, q, exit_=exit_, strategy_id=strategy_id, product=product,
+                                    order_type=order_type, limit_price=limit_price)
+        if not ok:
+            if ids and not exit_:
+                await _cancel(account, ",".join(ids))
+                undo, _, why = await _place(account, symbol, "SELL" if side == "BUY" else "BUY", done, exit_=True,
+                                            strategy_id=strategy_id, product=product)
+                if not undo:
+                    log.error("algo.slice_unwind_failed", symbol=symbol, qty=done, error=why)
+                ids = []
+            return False, ",".join(ids) or oid, msg
+        ids.append(str(oid))
+        done += q
+    return True, ",".join(ids), msg
+
+
+async def _order_chase(account: BrokerAccount, symbol: str, side: str, qty: int, *, strategy_id: int, product: str,
+                       quote: float, wait_s: float, steps: int) -> tuple[bool, Optional[str], str]:
+    """A live entry as a LIMIT at the quote, re-priced to the latest price
+    `steps` times over `wait_s`, then turned MARKET for whatever is left: a
+    chance at the quote instead of paying the spread every time, never a
+    missed entry. The caller books the broker's average fill as usual.
+    ponytail: the runner waits while it chases (exits run on their own tick
+    task); bounded by wait_s <= 30."""
+    from app.execution.base import OrderState, OrderType
+
+    sgn = 1 if side == "BUY" else -1
+    tick = engine.tick_for(symbol)
+    ok, oids, msg = await _order(account, symbol, side, qty, exit_=False, strategy_id=strategy_id, product=product,
+                                 order_type="LIMIT", limit_price=engine.snap(quote, tick, sgn))
+    if not ok:
+        return ok, oids, msg
+    backend = _backend(account)
+    for k in range(steps + 1):
+        await asyncio.sleep(wait_s / (steps + 1))
+        working = []
+        for oid in str(oids).split(","):
+            try:
+                st = await backend.get_order_status(oid)
+            except Exception as e:  # noqa: BLE001
+                log.warning("algo.chase_status_failed", order_id=oid, error=str(e)[:200])
+                continue
+            if st.state == OrderState.PENDING:
+                working.append(oid)
+        if not working:
+            return True, oids, "limit filled"
+        px = None if k == steps else (await _ltp([symbol])).get(symbol.upper())
+        for oid in working:
+            try:
+                if k == steps:
+                    await backend.modify_order(oid, order_type=OrderType.MARKET, symbol=symbol)
+                elif px:
+                    await backend.modify_order(oid, limit_price=engine.snap(px, tick, sgn), symbol=symbol)
+            except Exception as e:  # noqa: BLE001 — the broker's answer is read on the next pass / by the fill check
+                log.warning("algo.chase_modify_failed", order_id=oid, error=str(e)[:200])
+    return True, oids, "chased to market"
+
+
+async def _place(account: BrokerAccount, symbol: str, side: str, qty: int, *, exit_: bool, strategy_id: int,
+                 product: str = "INTRADAY", order_type: str = "MARKET",
+                 limit_price: Optional[float] = None) -> tuple[bool, Optional[str], str]:
+    """(ok, broker order id, message) — ONE order (MARKET, or LIMIT at `limit_price`)."""
     from app.api.orders import _manager, market_problem
 
     # The Trade page's market gate: crypto / currency never reach Fyers, MCX only with live MCX on and in whole
@@ -326,8 +413,8 @@ async def _order(account: BrokerAccount, symbol: str, side: str, qty: int, *, ex
         return False, None, problem
     try:
         r = await _manager().place_manual_order(
-            account=account, symbol=symbol, side=side, quantity=int(qty), order_type="MARKET",
-            product_type=product, bypass_risk=exit_, operator=f"algo:{strategy_id}")
+            account=account, symbol=symbol, side=side, quantity=int(qty), order_type=order_type,
+            limit_price=limit_price, product_type=product, bypass_risk=exit_, operator=f"algo:{strategy_id}")
     except Exception as e:  # noqa: BLE001 — a broker fault is reported, never raised into the loop
         return False, None, str(e)[:300]
     if r.get("ok"):
@@ -336,19 +423,22 @@ async def _order(account: BrokerAccount, symbol: str, side: str, qty: int, *, ex
 
 
 async def _fill_price(account: Optional[BrokerAccount], order_id: Optional[str], tries: int = 4) -> Optional[float]:
-    """Average traded price of a live order, polled briefly; None if the broker
-    hasn't reported a fill yet (the quote then stands in)."""
+    """Average traded price of a live order — of all its slices, weighted by
+    their filled quantity — polled briefly; None until every slice reports a
+    fill (the quote then stands in)."""
     if account is None or not order_id:
         return None
-    from app.api.orders import _manager
     from app.execution.base import OrderState
 
-    backend = _manager()._manual_backend_for(account)  # noqa: SLF001
+    backend = _backend(account)
     for k in range(tries):
         try:
-            st = await backend.get_order_status(str(order_id))
-            if st.state == OrderState.FILLED and st.average_price:
-                return float(st.average_price)
+            sts = [await backend.get_order_status(oid) for oid in str(order_id).split(",")]
+            if all(st.state == OrderState.FILLED and st.average_price for st in sts):
+                q = sum(st.filled_quantity or 0 for st in sts)
+                if len(sts) == 1 or not q:
+                    return float(sts[0].average_price)
+                return sum(float(st.average_price) * (st.filled_quantity or 0) for st in sts) / q
         except Exception as e:  # noqa: BLE001
             log.warning("algo.fill_price_failed", order_id=order_id, error=str(e)[:200])
             return None
@@ -363,12 +453,11 @@ async def _cancel(account: Optional[BrokerAccount], order_id: Optional[str]) -> 
     cancel of an order that already filled is a harmless "no"."""
     if account is None or not order_id:
         return
-    from app.api.orders import _manager
-
-    try:
-        await _manager()._manual_backend_for(account).cancel_order(str(order_id))  # noqa: SLF001
-    except Exception as e:  # noqa: BLE001
-        log.warning("algo.cancel_failed", order_id=order_id, error=str(e)[:200])
+    for oid in str(order_id).split(","):                  # every slice
+        try:
+            await _backend(account).cancel_order(oid)
+        except Exception as e:  # noqa: BLE001
+            log.warning("algo.cancel_failed", order_id=oid, error=str(e)[:200])
 
 
 def _mtm(legs: list[dict], prices: dict[str, float]) -> Optional[float]:
@@ -1422,8 +1511,14 @@ class AlgoRunner:
             if acc is not None:
                 for lg in sorted(legs, key=lambda x: -x["act"]):       # bought legs first
                     lg["product"] = _product(spec, lg)
-                    ok, oid, msg = await _order(acc, lg["symbol"], "BUY" if lg["act"] > 0 else "SELL",
-                                                lg["qty"], exit_=False, strategy_id=s["id"], product=lg["product"])
+                    lim = spec["entry_order"].get("limit")
+                    if lim and lg.get("price"):
+                        ok, oid, msg = await _order_chase(acc, lg["symbol"], "BUY" if lg["act"] > 0 else "SELL", lg["qty"],
+                                                          strategy_id=s["id"], product=lg["product"], quote=lg["price"],
+                                                          wait_s=lim["wait_s"], steps=lim["steps"])
+                    else:
+                        ok, oid, msg = await _order(acc, lg["symbol"], "BUY" if lg["act"] > 0 else "SELL",
+                                                    lg["qty"], exit_=False, strategy_id=s["id"], product=lg["product"])
                     if not ok:
                         failure = f"{lg['symbol']}: {msg}"
                         break

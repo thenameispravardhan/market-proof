@@ -265,6 +265,15 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("entry order is market, pullback or breakout")
     eo["offset_pct"] = _num(eo.get("offset_pct", 0.1), "entry offset %", 0)
     eo["valid_bars"] = _num(eo.get("valid_bars", 3), "entry valid bars", 1, integer=True)
+    lim = eo.pop("limit", None)
+    if lim:                                   # live entries: LIMIT at the quote, chased, then MARKET
+        if not isinstance(lim, dict):
+            raise ValueError('entry_order.limit is {"wait_s": 2-30, "steps": 1-10}')
+        w = _num(lim.get("wait_s", 10), "limit chase seconds", 2)
+        k = _num(lim.get("steps", 3), "limit chase steps", 1, integer=True)
+        if w > 30 or k > 10:
+            raise ValueError("a limit chase waits at most 30 s and re-prices at most 10 times")
+        eo["limit"] = {"wait_s": w, "steps": k}
     for key in ("entry_long", "exit_long", "entry_short", "exit_short"):
         if s[key]:
             _check_group(s[key], s["timeframe"])

@@ -119,7 +119,7 @@ type Spec = {
   mtm: { stop: number | null; target: number | null; trail_start: number | null; trail_gap: number | null; stop_pct?: number | null; target_pct?: number | null };
   daily: { max_loss: number | null; max_profit: number | null };
   session: { start: string | null; end: string | null; square_off: string | null; days?: number[] | null };
-  entry_order: { type: string; offset_pct: number; valid_bars: number };
+  entry_order: { type: string; offset_pct: number; valid_bars: number; limit?: { wait_s: number; steps: number } };   // limit: live LIMIT-then-chase
   max_trades_per_day: number;
   cooldown_bars: number;
   max_bars: number | null;
@@ -3141,6 +3141,16 @@ export default function Algo() {
                   <label className="meta"><NumInput width={48} value={spec.entry_order.offset_pct} onChange={(n) => upd({ entry_order: { ...spec.entry_order, offset_pct: n ?? 0 } })} />% {spec.entry_order.type === "pullback" ? "better than" : "beyond"} the signal close</label>
                   <label className="meta">cancel after <NumInput width={40} value={spec.entry_order.valid_bars} onChange={(n) => upd({ entry_order: { ...spec.entry_order, valid_bars: Math.max(1, Math.floor(n ?? 1)) } })} /> bars</label>
                 </>
+              )}
+              <label className="meta" data-testid="algo-limit-chase" title="LIVE orders only: send each entry as a LIMIT at the quote, re-price it to the latest price a few times, then turn it MARKET for whatever is left — saves the spread when it fills, never misses the entry. Paper and backtests fill as before (slippage %).">
+                <input type="checkbox" checked={!!spec.entry_order.limit} onChange={(e) => {
+                  const { limit: _old, ...rest } = spec.entry_order;
+                  upd({ entry_order: e.target.checked ? { ...rest, limit: { wait_s: 10, steps: 3 } } : rest });
+                }} /> live: limit at the quote
+              </label>
+              {spec.entry_order.limit && (
+                <label className="meta">chase <NumInput width={36} value={spec.entry_order.limit.steps} onChange={(n) => upd({ entry_order: { ...spec.entry_order, limit: { ...spec.entry_order.limit!, steps: Math.max(1, Math.min(10, Math.floor(n ?? 3))) } } })} /> times over
+                  <NumInput width={36} value={spec.entry_order.limit.wait_s} onChange={(n) => upd({ entry_order: { ...spec.entry_order, limit: { ...spec.entry_order.limit!, wait_s: Math.max(2, Math.min(30, n ?? 10)) } } })} /> s, then market</label>
               )}
             </div>
           </div>

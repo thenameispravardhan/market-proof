@@ -417,6 +417,13 @@ price `offset_pct`% better than the signal close — limit style), `breakout`
 (wait for `offset_pct`% beyond it in the trade's direction — stop style).
 `valid_bars` — cancel if not filled within that many candles.
 
+`entry_order.limit` (optional, LIVE orders only) — `{"wait_s": 10, "steps": 3}`:
+each live entry leg goes in as a LIMIT at the quote, is re-priced to the
+latest price `steps` times over `wait_s` seconds (2-30), then turns MARKET for
+whatever is left — the spread saved when it fills, never a missed entry. Paper
+trades and backtests fill as before (`costs.slippage_pct`). Any order above the
+exchange's freeze quantity (index options) goes out in whole-lot slices.
+
 ---
 
 ## 7. Sizing, portfolio and costs
