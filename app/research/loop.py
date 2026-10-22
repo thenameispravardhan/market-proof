@@ -47,10 +47,12 @@ def _thin(curve: list, n: int = CURVE_POINTS) -> list:
 
 def check(spec: dict, data: dict[str, dict], grid: Optional[list[dict[str, Any]]], *, oos_from: int,
           metric: str = "net_pnl", min_trades: int = 10, trade_from: Optional[int] = None,
-          windows: int = 4, is_mult: float = 3.0, anchored: bool = False, prior_trials: int = 0) -> dict[str, Any]:
+          windows: int = 4, is_mult: float = 3.0, anchored: bool = False, prior_trials: int = 0,
+          trades: bool = False) -> dict[str, Any]:
     """Run the idea (the spec, or each combo of `grid` on it) through the
     held-out split, a walk-forward and the overfitting statistics.
-    `prior_trials`: tries on the idea before this check."""
+    `prior_trials`: tries on the idea before this check. `trades`: also hand
+    back the chosen combo's trades (not stored on a card)."""
     windows, is_mult = engine.wf_check(windows, is_mult)
     if grid:
         axes, combos = engine._grid(grid, metric)     # noqa: SLF001
@@ -114,6 +116,8 @@ def check(spec: dict, data: dict[str, dict], grid: Optional[list[dict[str, Any]]
            "full": ({**engine.summary(full), "max_drawdown_pct": full["max_drawdown_pct"],
                      "equity": _thin(full["equity"])} if full else None)}
     out["checks"], out["verdict"] = verdict(out)
+    if trades:
+        out["trades"] = best_trades
     return out
 
 

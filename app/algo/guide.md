@@ -532,6 +532,11 @@ members.
 * **Universes** (Research tab) — each index's recorded lists and change log
   (inclusions / exclusions by effective date, from NSE's announcements),
   and from when its point-in-time membership holds.
+* **Nightly re-validation** (Research tab, off until switched on) — every
+  weekday evening each switched-on strategy gets its research check again on
+  the newest data, plus a look at its trades since its passing card; it is
+  flagged when it no longer clears the bar, has lost money since its card,
+  or trades LIVE without one. Flags stay open until a person clears them.
 * **Compare** — saved strategies side by side on the same range.
 * **Automations** — saved strategies start OFF and in **paper** mode; switch
   them on to paper-trade live, or to **LIVE** (real orders on Fyers) after
