@@ -973,7 +973,7 @@ class AlgoRunner:
             for kind, j, cfg in sorted(acts, key=lambda a: a[2]["action"] != "BUY"):      # bought legs first
                 if kind == "roll" and t["legs"][j].get("exit") is None:
                     continue
-                new = await self._add_leg(t, spec, sym, cfg, u, now, sets)
+                new = await self._add_leg(t, spec, sym, cfg, u, now, 1 if kind == "hedge" else sets)   # hedge: total lots
                 if new is None:
                     break
                 via = {"reenter": "REENTRY", "roll": "ROLL", "hedge": "HEDGE"}[kind]

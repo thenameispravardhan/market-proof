@@ -276,6 +276,19 @@ def asset_class(name: str) -> str:
     return "index" if name in INDEX_LOTS else "stock"
 
 
+def leg_iv(leg: dict[str, Any], u: float, iv: Optional[float]) -> Optional[float]:
+    """A backtest option leg's IV: the flat IV plus its skew — instrument.iv
+    put_skew / call_skew IV points per 1% out of the money, measured at the
+    current spot (sticky moneyness), never below 1%. No skew on the leg (every
+    live leg) = the flat IV. Every backtest pricing path goes through here,
+    SPAN margin included."""
+    sk = leg.get("skew")
+    if not sk or iv is None or leg.get("kind") not in ("CE", "PE"):
+        return iv
+    otm = (u - leg["K"]) / u * 100 if leg["kind"] == "PE" else (leg["K"] - u) / u * 100
+    return max(0.01, iv + max(0.0, otm) * sk[0 if leg["kind"] == "PE" else 1] / 100)
+
+
 def span_margin(legs: list[dict[str, Any]], spot: float, t: float, *, name: str, iv: Optional[float] = None,
                 price_key: str = "price", qty_key: str = "qty", scan_pct: Optional[float] = None,
                 exposure_pct: Optional[float] = None) -> dict[str, float]:
@@ -301,7 +314,7 @@ def span_margin(legs: list[dict[str, Any]], spot: float, t: float, *, name: str,
             continue
         yrs = years_to(lg["exp"], t)
         px = float(lg.get(price_key) or 0)
-        v = iv if iv is not None else (implied_vol(px, spot, lg["K"], yrs, lg["kind"]) if px > 0 else 0.15)
+        v = leg_iv(lg, spot, iv) if iv is not None else (implied_vol(px, spot, lg["K"], yrs, lg["kind"]) if px > 0 else 0.15)
         priced.append((lg, q, yrs, v))
         if lg["act"] > 0:
             premium += px * q

@@ -175,3 +175,46 @@ def test_tca_reports_live_slippage_against_the_assumed(client, isolated_db):
     pe = next(x for x in r if x["kind"] == "PE")
     assert ce["fills"] == 2 and ce["median_pct"] == pytest.approx(1.0) and ce["rupees"] == pytest.approx(65 + 78)
     assert pe["fills"] == 2 and pe["median_pct"] == pytest.approx(0.5) and pe["assumed_pct"] == 0   # paper rows ignored
+
+
+# ---- A0: fixes ported from the parallel Half B ------------------------------------
+
+def test_mtm_percent_stays_on_the_original_premium():
+    legs = [{"kind": "CE", "act": -1, "entry": 100.0, "qty": 65}, {"kind": "PE", "act": -1, "entry": 90.0, "qty": 65},
+            {"kind": "CE", "act": -1, "entry": 150.0, "qty": 65, "via": "REENTRY"}]
+    assert engine.premium_base(legs) == pytest.approx(190 * 65)                 # the re-entry doesn't move the base
+
+
+def test_hedge_is_sized_on_the_total_delta():
+    spec = _opt_spec(instrument=_strangle(), position_rules={"hedge": {"above": 0.3, "max": 5}})
+    fut = lambda per_set, sets: [{"kind": "FUT", "act": -1, "per_set": per_set, "qty": per_set * sets, "entry": 24500.0}]  # noqa: E731
+    lots = lambda legs: [a[1] for a in engine.adjustments(spec, "BUY", legs, 24500.0, DAY0, 65, lambda lg: 24500.0, 0.14)  # noqa: E731
+                         if a[0] == "hedge"]
+    assert lots(fut(39, 2)) == [1]            # -0.6 per set x 2 sets = -1.2 lots -> buy 1
+    assert lots(fut(39, 1)) == [1]            # -0.6 -> 1 (half away from zero)
+    assert lots(fut(26, 2)) == [1]            # -0.4 x 2 = -0.8 -> 1: per-set rounding would never hedge this
+    assert lots(fut(26, 1)) == []             # -0.4 rounds to 0
+    assert lots(fut(65, 3)) == [3]
+
+
+def test_reentries_need_a_stop_and_adjusted_levels_sit_on_the_underlying():
+    with pytest.raises(ValueError, match="needs its own stop"):
+        _opt_spec(instrument=_strangle(reentries=1))
+    assert _opt_spec(instrument=_strangle("cost", reentries=1))["instrument"]["legs_long"][0]["reentries"] == 1
+    with pytest.raises(ValueError, match="levels_on 'underlying'"):
+        _opt_spec(instrument={"type": "option", "levels_on": "instrument", "iv": {"source": "fixed", "value": 14},
+                              "legs_long": [{"right": "CE", "action": "SELL", "strike": "ATM", "lots": 1,
+                                             "roll": {"above": 0.6, "to": 0.3}}]},
+                  stop_loss={"type": "pct", "value": 30})
+
+
+def test_skew_reaches_span_margin_and_added_legs_must_fit_the_capital():
+    leg = {"kind": "PE", "act": -1, "K": 24000.0, "exp": DAY0 + 6 * 86400, "per_set": 65, "qty": 65, "entry": 50.0}
+    flat = fno.span_margin([leg], 24500.0, DAY0, name="NIFTY", iv=0.14)["total"]
+    skewed = fno.span_margin([{**leg, "skew": (0.8, 0.0)}], 24500.0, DAY0, name="NIFTY", iv=0.14)["total"]
+    assert skewed != pytest.approx(flat)                                       # SPAN prices the leg at its skewed IV
+    tight = engine.run(_opt_spec(instrument=_strangle(), position_rules={"hedge": {"above": 0.5, "max": 3}},
+                                 margin={"model": "span"}, portfolio={"capital": 300_000, "leverage": 8}),
+                       {"N": _nifty(_RISE_FALL)})
+    assert tight["stats"]["skipped"].get("hedge_no_capital", 0) >= 1           # no room for the future: counted, not taken
+    assert not any(lg.get("via") == "HEDGE" for t in tight["trades"] for lg in t["legs"])
