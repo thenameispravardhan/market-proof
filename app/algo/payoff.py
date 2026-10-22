@@ -24,7 +24,7 @@ def _value(lg: dict, s: float, at: float, iv: float) -> float:
         return s
     if at >= lg["exp"]:
         return max(0.0, s - lg["K"]) if lg["kind"] == "CE" else max(0.0, lg["K"] - s)
-    return fno.bs_price(s, lg["K"], fno.years_to(lg["exp"], at), iv, lg["kind"])
+    return fno.bs_price(s, lg["K"], fno.years_to(lg["exp"], at), fno.leg_iv(lg, s, iv), lg["kind"])
 
 
 def _pnl(legs: list[dict], s: float, at: float, iv: float) -> float:
@@ -84,7 +84,7 @@ def preview(spec: dict[str, Any], side: str, spot: float, t: float, iv: float,
     span_kw = {"name": meta["name"], "iv": iv, "scan_pct": mg.get("scan_pct"), "exposure_pct": mg.get("exposure_pct")}
     for lg in legs:
         g = ({**{k: 0.0 for k in greek_keys}, "delta": 1.0, "prob_itm": None} if lg["kind"] in ("EQ", "FUT")
-             else fno.bs_greeks(spot, lg["K"], fno.years_to(lg["exp"], t), iv, lg["kind"]))
+             else fno.bs_greeks(spot, lg["K"], fno.years_to(lg["exp"], t), fno.leg_iv(lg, spot, iv), lg["kind"]))
         pos = {k: g[k] * lg["act"] * lg["qty"] for k in greek_keys}
         for k in net:
             net[k] += pos[k]

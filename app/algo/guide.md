@@ -253,6 +253,13 @@ Other instrument keys:
   set those levels to null and use MTM, leg stops or position rules).
 * `iv` — backtest option pricing: `auto` (India VIX for indices, 20-day
   realised vol for stocks), `vix`, `hv`, or `fixed` with `value` (IV %).
+  Optional skew: `put_skew` / `call_skew` = IV points added per 1% a put is
+  below / a call is above spot (-5 to 5; absent = flat). A put 2% below spot
+  with `"put_skew": 0.8` is priced at the backtest IV + 1.6 points; ITM / ATM
+  strikes get nothing. Moneyness is measured at the current spot. It moves
+  every backtest price: premiums, DELTA / PREMIUM strike picks, Greeks and
+  position rules, premium ATR, margin and the payoff preview. Live trading
+  uses the real chain. `"iv": {"source": "auto", "put_skew": 0.8, "call_skew": 0.2}`.
 * `on_leg_stop` — what happens when a leg's own **stop** hits:
   `leg` (default — only that leg exits), `cost` (every other leg's stop moves
   to its entry price), `all` (exit every leg). Leg targets only close their leg.

@@ -277,6 +277,12 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
     if inst["iv"]["source"] not in ("auto", "hv", "vix", "fixed"):
         raise ValueError("iv source is auto, hv, vix or fixed")
     inst["iv"]["value"] = _num(inst["iv"]["value"], "fixed IV %", 0.1)
+    for k, label in (("put_skew", "put IV skew"), ("call_skew", "call IV skew")):
+        v = _num(inst["iv"].pop(k, None), label, -5, allow_none=True)       # absent / 0 = flat (left out)
+        if v:
+            if v > 5:
+                raise ValueError(f"{label} is -5 to 5 IV points per 1% out of the money (0.8 = typical NIFTY puts)")
+            inst["iv"][k] = v
     opt = inst["type"] == "option"
     multi = False
     for key, used in (("legs_long", s["direction"] != "short"), ("legs_short", s["direction"] != "long")):
@@ -891,7 +897,7 @@ def position_metrics(legs: list[dict], u: float, t: float, lot: int, px: Callabl
             continue
         if lg["kind"] in ("CE", "PE"):
             yrs = fno.years_to(lg["exp"], t)
-            v = iv if iv is not None else fno.implied_vol(p, u, lg["K"], yrs, lg["kind"])
+            v = fno.leg_iv(lg, u, iv) if iv is not None else fno.implied_vol(p, u, lg["K"], yrs, lg["kind"])
             g = fno.bs_greeks(u, lg["K"], yrs, v, lg["kind"])
             ivs.append(v)
             dtes.append((lg["exp"] - t) / 86400)
@@ -1119,18 +1125,21 @@ def sim_legs(spec: dict, side: str, meta: dict, u: float, t: float, iv: float,
         exp = fno.expiry_after(meta["name"], meta["exch"], inst["expiry_kind"], cfg.get("expiry") or inst["expiry"],
                                t, tdays)
         tyrs = fno.years_to(exp, t)
+        sk = (inst["iv"].get("put_skew", 0.0), inst["iv"].get("call_skew", 0.0))
+        kiv = lambda k: fno.skewed_iv(cfg["right"], k, u, iv, *sk)  # noqa: E731 — each strike at its own skewed IV
         if cfg["strike"] == "PREMIUM":
             k_ = fno.strike_for_premium(u, step, cfg["right"], cfg["premium"],
-                                        lambda k: fno.bs_price(u, k, tyrs, iv, cfg["right"]))
+                                        lambda k: fno.bs_price(u, k, tyrs, kiv(k), cfg["right"]))
         elif cfg["strike"] == "DELTA":
             k_ = fno.strike_for_delta(u, step, cfg["right"], cfg["delta"],
-                                      lambda k: fno.bs_greeks(u, k, tyrs, iv, cfg["right"])["delta"])
+                                      lambda k: fno.bs_greeks(u, k, tyrs, kiv(k), cfg["right"])["delta"])
         else:
             k_ = fno.pick_strike(u, step, cfg["right"], cfg["strike"], cfg["steps"])
         legs.append({"kind": cfg["right"], "act": 1 if cfg["action"] == "BUY" else -1, "K": k_, "exp": exp,
                      "per_set": lot * cfg["lots"],
                      "label": f"{meta['name']} {fno.label_date(exp)} {k_:g} {cfg['right']}",
-                     **{k: cfg[k] for k in ("sl_pct", "tg_pct") if cfg.get(k)}})
+                     **{k: cfg[k] for k in ("sl_pct", "tg_pct") if cfg.get(k)},
+                     **({"skew": sk} if any(sk) else {})})
     return legs
 
 
@@ -1139,7 +1148,7 @@ def _leg_px(leg: dict, u: float, t: float, iv: float) -> float:
         return leg["exit"]
     if leg["kind"] in ("EQ", "FUT"):
         return u
-    return fno.bs_price(u, leg["K"], fno.years_to(leg["exp"], t), iv, leg["kind"])
+    return fno.bs_price(u, leg["K"], fno.years_to(leg["exp"], t), fno.leg_iv(leg, u, iv), leg["kind"])
 
 
 def premium_atr(atrs: dict[int, Optional[float]], leg: dict, u: float, t: float,
@@ -1153,6 +1162,8 @@ def premium_atr(atrs: dict[int, Optional[float]], leg: dict, u: float, t: float,
     if iv is None:
         px = float(leg.get("price") or leg.get("entry") or 0)
         iv = _solve(lambda s: fno.bs_price(u, leg["K"], yrs, s, leg["kind"]), px, 0.01, 5.0) if px > 0 else 0.0
+    else:
+        iv = fno.leg_iv(leg, u, iv)
     h = max(u * 0.001, 0.01)
     dlt = abs(fno.bs_price(u + h, leg["K"], yrs, iv, leg["kind"]) - fno.bs_price(u - h, leg["K"], yrs, iv, leg["kind"])) / (2 * h)
     return {p: (v * dlt if v else v) for p, v in atrs.items()}

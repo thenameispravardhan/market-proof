@@ -200,6 +200,28 @@ def implied_vol(price: float, spot: float, strike: float, t_years: float, right:
     return (lo + hi) / 2
 
 
+def skewed_iv(right: str, strike: float, spot: float, iv: float, put_skew: float = 0.0,
+              call_skew: float = 0.0) -> float:
+    """Backtest IV of one strike with a linear skew: + `put_skew` IV points per 1% a put is
+    below spot, + `call_skew` per 1% a call is above it; ITM / ATM strikes keep `iv`. Moneyness
+    is measured at the spot being priced (sticky moneyness). Never below 1%."""
+    if right == "PE" and strike < spot and put_skew:
+        iv += put_skew * (spot - strike) / spot
+    elif right == "CE" and strike > spot and call_skew:
+        iv += call_skew * (strike - spot) / spot
+    return max(0.01, iv)
+
+
+def leg_iv(leg: dict[str, Any], spot: float, iv: float) -> float:
+    """THE backtest IV of a leg priced at `spot`: the flat backtest IV, plus the leg's skew
+    (`skew` = (put_skew, call_skew), set by engine.sim_legs from instrument.iv; absent = flat).
+    Every backtest pricing path goes through here; live trading never does (real chain IVs)."""
+    sk = leg.get("skew")
+    if not sk or leg.get("kind") not in ("CE", "PE"):
+        return iv
+    return skewed_iv(leg["kind"], leg["K"], spot, iv, sk[0], sk[1])
+
+
 def label_date(ts: float) -> str:
     return datetime.fromtimestamp(ts, IST).strftime("%d%b%y").upper()
 
@@ -301,7 +323,7 @@ def span_margin(legs: list[dict[str, Any]], spot: float, t: float, *, name: str,
             continue
         yrs = years_to(lg["exp"], t)
         px = float(lg.get(price_key) or 0)
-        v = iv if iv is not None else (implied_vol(px, spot, lg["K"], yrs, lg["kind"]) if px > 0 else 0.15)
+        v = leg_iv(lg, spot, iv) if iv is not None else (implied_vol(px, spot, lg["K"], yrs, lg["kind"]) if px > 0 else 0.15)
         priced.append((lg, q, yrs, v))
         if lg["act"] > 0:
             premium += px * q

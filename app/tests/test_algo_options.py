@@ -12,9 +12,11 @@ import time
 
 import pytest
 
+from app.algo import engine, fno, payoff
 from app.algo import runner as rn
 from app.db import session as dbs
 from app.db.models import AlgoStrategy, AlgoTrade
+from app.tests.test_algo import DAY0, _nifty, _opt_spec
 from app.tests.test_algo_live import T_CLOSE, FakeBroker, _install, _open_live_trade, _row_dict, _strategy
 
 
@@ -85,3 +87,74 @@ def test_tca_ignores_paper_and_rejected_trades(isolated_db, client):
                              entry_price=101.0, legs=[leg]))
         db.commit()
     assert client.get("/api/algo/tca").json()["strategies"] == []
+
+
+# ---- B5: IV skew in option backtests ----------------------------------------------------------------
+
+def test_skewed_iv_adds_points_per_percent_out_of_the_money():
+    assert fno.skewed_iv("PE", 24500, 25000, 0.14, put_skew=0.8) == pytest.approx(0.14 + 0.016)   # 2% OTM put: +1.6 pts
+    assert fno.skewed_iv("CE", 25500, 25000, 0.14, call_skew=0.5) == pytest.approx(0.14 + 0.01)   # 2% OTM call: +1 pt
+    assert fno.skewed_iv("PE", 25500, 25000, 0.14, put_skew=0.8) == 0.14                          # ITM put: flat
+    assert fno.skewed_iv("CE", 24500, 25000, 0.14, put_skew=0.8, call_skew=0.5) == 0.14           # ITM call: flat
+    assert fno.skewed_iv("CE", 30000, 25000, 0.14, call_skew=-5) == 0.01                          # never below 1%
+    leg = {"kind": "PE", "K": 24500, "skew": (0.8, 0.0)}
+    assert fno.leg_iv(leg, 25000, 0.14) == pytest.approx(0.156) and fno.leg_iv({**leg, "skew": None}, 25000, 0.14) == 0.14
+
+
+def _skew_inst(put=None, call=None, legs=None):
+    iv = {"source": "fixed", "value": 14, **({"put_skew": put} if put is not None else {}),
+          **({"call_skew": call} if call is not None else {})}
+    return {"type": "option", "expiry_kind": "weekly", "levels_on": "underlying", "iv": iv,
+            "legs_long": legs or [{"right": "PE", "action": "SELL", "strike": "OTM", "steps": 10, "lots": 1}]}
+
+
+def test_skew_validates_and_is_left_out_when_off():
+    assert "put_skew" not in _opt_spec(instrument=_skew_inst(put=0))["instrument"]["iv"]
+    assert _opt_spec(instrument=_skew_inst(put=0.8, call=-0.2))["instrument"]["iv"] == {
+        "source": "fixed", "value": 14, "put_skew": 0.8, "call_skew": -0.2}
+    with pytest.raises(ValueError, match="put IV skew is -5 to 5"):
+        _opt_spec(instrument=_skew_inst(put=9))
+    with pytest.raises(ValueError, match="call IV skew must be >= -5"):
+        _opt_spec(instrument=_skew_inst(call=-7))
+
+
+def test_otm_put_is_priced_richer_with_skew_in_every_backtest_path():
+    closes = [24500, 24520, 24540, 24560] + [24560] * 6
+    flat = engine.run(_opt_spec(instrument=_skew_inst()), {"N": _nifty(closes)})["trades"][0]
+    sk = engine.run(_opt_spec(instrument=_skew_inst(put=0.8)), {"N": _nifty(closes)})["trades"][0]
+    assert flat["legs"][0]["label"] == sk["legs"][0]["label"]                         # same strike (OTM 10 steps)
+    K = float(sk["legs"][0]["label"].split()[2])
+    u = 24560.0
+    want = flat["greeks"]["iv"] + 0.8 * (u - K) / u * 100
+    assert sk["greeks"]["iv"] == pytest.approx(want, abs=0.01)                         # position_metrics at the skewed IV
+    assert sk["legs"][0]["entry"] > flat["legs"][0]["entry"]                           # _leg_px: a richer put
+    # call legs untouched by a put skew; an ITM put untouched too
+    calls = _skew_inst(put=0.8, legs=[{"right": "CE", "action": "SELL", "strike": "OTM", "steps": 4, "lots": 1}])
+    c1 = engine.run(_opt_spec(instrument=calls), {"N": _nifty(closes)})["trades"][0]
+    c0 = engine.run(_opt_spec(instrument={**calls, "iv": {"source": "fixed", "value": 14}}), {"N": _nifty(closes)})["trades"][0]
+    assert c1["legs"][0]["entry"] == c0["legs"][0]["entry"]
+
+
+def test_delta_strike_search_and_premium_atr_use_the_skewed_iv():
+    meta = {"symbol": "NSE:NIFTY50-INDEX", "name": "NIFTY", "exch": "NSE", "lot": 65, "step": 50}
+    u, t = 25000.0, DAY0
+    pe = lambda sk: _opt_spec(instrument=_skew_inst(put=sk, legs=[  # noqa: E731
+        {"right": "PE", "action": "SELL", "strike": "DELTA", "delta": 0.2, "lots": 1}]))
+    k_flat = engine.sim_legs(pe(0), "BUY", meta, u, t, 0.14)[0]["K"]
+    leg = engine.sim_legs(pe(1.5), "BUY", meta, u, t, 0.14)[0]
+    assert leg["K"] < k_flat                     # fatter put wing: the 20-delta put sits further out
+    yrs = fno.years_to(leg["exp"], t)
+    want = abs(fno.bs_greeks(u, leg["K"], yrs, fno.skewed_iv("PE", leg["K"], u, 0.14, 1.5), "PE")["delta"])
+    assert want == pytest.approx(0.2, abs=0.03)
+    a_flat = engine.premium_atr({14: 100.0}, {**leg, "skew": None}, u, t, 0.14)[14]
+    a_skew = engine.premium_atr({14: 100.0}, leg, u, t, 0.14)[14]
+    assert a_skew != pytest.approx(a_flat)       # the premium's ATR uses its own (skewed) delta
+
+
+def test_payoff_preview_prices_the_skew():
+    meta = {"symbol": "NSE:NIFTY50-INDEX", "name": "NIFTY", "exch": "NSE", "lot": 65, "step": 50}
+    flat = payoff.preview(_opt_spec(instrument=_skew_inst()), "BUY", 25000.0, DAY0, 0.14, meta)
+    sk = payoff.preview(_opt_spec(instrument=_skew_inst(put=0.8)), "BUY", 25000.0, DAY0, 0.14, meta)
+    assert sk["legs"][0]["price"] > flat["legs"][0]["price"]
+    assert sk["position"]["iv"] > flat["position"]["iv"] and sk["premium"]["net"] > flat["premium"]["net"]
+    assert sk["margin"]["leverage"] > 0 and sk["curve"][0]["now"] != flat["curve"][0]["now"]

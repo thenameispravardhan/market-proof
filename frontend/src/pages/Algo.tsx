@@ -91,7 +91,7 @@ type Instrument = {
   legs_long: Leg[];
   legs_short: Leg[];
   levels_on: "instrument" | "underlying";
-  iv: { source: string; value: number };
+  iv: { source: string; value: number; put_skew?: number; call_skew?: number };   // skew: IV points per 1% OTM (backtests)
   on_leg_stop?: "leg" | "cost" | "all";   // when a leg's own stop hits (absent = only that leg exits)
 };
 type Spec = {
@@ -2923,6 +2923,15 @@ export default function Algo() {
                     </select>
                     {inst.iv.source === "fixed" && <NumInput width={48} value={inst.iv.value} onChange={(n) => updInst({ iv: { ...inst.iv, value: n ?? 15 } })} />}
                   </label>
+                  {(["put_skew", "call_skew"] as const).map((k) => (
+                    <label key={k} className="meta" data-testid={`iv-${k}`}
+                      title={`backtests only: add this many IV points for every 1% a ${k === "put_skew" ? "put is below" : "call is above"} spot (0.8 = a typical NIFTY put skew; ITM / ATM strikes stay flat)`}>
+                      {k === "put_skew" ? "put" : "call"} skew <NumInput width={40} allowEmpty signed placeholder="off" value={inst.iv[k] ?? null} onChange={(n) => {
+                        const { [k]: _old, ...rest } = inst.iv;
+                        updInst({ iv: n ? { ...rest, [k]: Math.max(-5, Math.min(5, n)) } : rest });
+                      }} /> pts/1%
+                    </label>
+                  ))}
                   <span className="meta">Strikes ATM/ITM/OTM are counted in the underlying's strike steps; Δ strikes pick the nearest delta. Multi-leg positions exit together — use MTM ₹ stops.</span>
                 </div>
               </>
