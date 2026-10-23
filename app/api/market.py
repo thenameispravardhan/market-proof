@@ -364,9 +364,28 @@ async def market_quotes(symbols: str = "") -> dict[str, Any]:
     from app.services import crypto
 
     syms = list(dict.fromkeys(s.strip().upper() for s in symbols.split(",") if s.strip()))[:50]
-    qs = await fyers_quotes([s for s in syms if not crypto.is_crypto(s)])
+    rest = [s for s in syms if not crypto.is_crypto(s)]
+    # Rows the tick stream already keeps fresh are served from the bus: the
+    # 5 s watchlist poll went to Fyers REST for all 50 every time — a round
+    # trip per poll, on the same rate budget orders need.
+    qs = await _streamed_quotes(rest)
+    qs.update(await fyers_quotes([s for s in rest if s not in qs]))
     return {"quotes": {**{s: {"ltp": q.last_price, "change": q.change, "change_pct": q.change_pct}
                           for s, q in qs.items()}, **await crypto.quotes(syms)}}
+
+
+async def _streamed_quotes(symbols: list[str]) -> dict[str, Quote]:
+    """Fresh, real (not paper-simulated) bus quotes carrying the day change."""
+    from app.api.orders import _bus_quote_is_fresh, _is_simulated
+
+    md = _manager().market_data
+    out: dict[str, Quote] = {}
+    for sym in symbols:
+        q = await md.get_quote(sym)
+        if (q is not None and q.last_price and q.change_pct is not None
+                and _bus_quote_is_fresh(q) and not _is_simulated(q)):
+            out[sym] = q
+    return out
 
 
 _ORDER_TYPES = {1: "LIMIT", 2: "MARKET", 3: "SL-M", 4: "SL-L"}
