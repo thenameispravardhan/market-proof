@@ -11,7 +11,7 @@
 // start OFF and in paper; LIVE needs a real Fyers account and the typed
 // confirm "LIVE".
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Legend, Line, LineChart, ReferenceArea, ReferenceLine,
@@ -34,7 +34,7 @@ import { DriftPanel } from "../components/algo/DriftPanel";
 import { TcaPanel } from "../components/algo/TcaPanel";
 import { ResearchTab, StrategyCard, type ResearchCard } from "../components/research/StrategyCards";
 import { useSessionState } from "../router";
-import { peekQuote, useQuoteTick, watchSymbol } from "../hooks/useQuotes";
+import { peekQuote, useQuotesTick, watchSymbol } from "../hooks/useQuotes";
 import { Toggle } from "../components/common/Toggle";
 import { chartHref } from "../lib/chartLink";
 
@@ -2166,16 +2166,18 @@ function liveMtm(t: LiveTrade): number | null {
   return total;
 }
 
+const legSymbols = (t: LiveTrade) => (t.legs ?? []).map((l) => l.symbol);
+
 function AlgoLiveMtm({ t }: { t: LiveTrade }) {
-  useQuoteTick();
+  useQuotesTick(legSymbols(t));
   const v = liveMtm(t);
   return <td className={`mono ${pnlCls(v)}`} data-testid={`algo-mtm-${t.id}`}>{inr(v)}</td>;
 }
 
 // The reference price straight off the websocket, flashing green / red on each up / down tick.
 function AlgoLiveLtp({ t }: { t: LiveTrade }) {
-  useQuoteTick();
   const ref = t.ref === "u" ? t.symbol : t.legs?.[0]?.symbol ?? t.symbol;
+  useQuotesTick([ref]);
   const px = peekQuote(ref)?.last_price ?? t.ltp ?? null;
   const last = useRef<number | null>(null);
   const [dir, setDir] = useState<"up" | "down" | null>(null);
@@ -2189,6 +2191,14 @@ function AlgoLiveLtp({ t }: { t: LiveTrade }) {
     return () => clearTimeout(h);
   }, [px]);
   return <span data-testid={`algo-ltp-${t.id}`} style={dir ? { color: dir === "up" ? "var(--green)" : "var(--red)", fontWeight: 600 } : undefined}>{num(px)}</span>;
+}
+
+/** Σ live MTM of `open`, re-rendered per tick on its own: in Automations it
+ *  re-rendered the whole panel (trades table, runner log) on every tick. */
+function AlgoLiveTotal({ open, colored }: { open: LiveTrade[]; colored?: boolean }) {
+  useQuotesTick(open.flatMap(legSymbols));
+  const v = open.reduce((a, t) => a + (liveMtm(t) ?? 0), 0);
+  return colored ? <span className={pnlCls(v)}>{inr(v)}</span> : <>{inr(v)}</>;
 }
 
 // Keep every symbol an open automation position holds streaming to this
@@ -2222,6 +2232,27 @@ export function ShadowLine({ s, parent, onDone, onErr }: { s: Saved; parent: str
   );
 }
 
+/** The Automations trades table (up to 300 rows). Memoised: the panel
+ *  re-renders on every 1 s status poll, and this only changes on a trade. */
+const TradesTable = memo(function TradesTable({ trades, strategies }: { trades: LiveTrade[]; strategies: Saved[] | undefined }) {
+  const nameOf = (id: number) => strategies?.find((s) => s.id === id)?.name ?? String(id);
+  return (
+    <table>
+      <thead><tr><th>Strategy</th><th>Instrument</th><th>Signal</th><th>Qty</th><th>Status</th><th>Entry</th><th>Exit</th><th>Reason</th><th>Net</th></tr></thead>
+      <tbody>{trades.map((t) => (
+        <tr key={t.id} title={[t.note ?? "", ...(t.legs ?? []).map((l) => `${l.act > 0 ? "BUY" : "SELL"} ${l.qty} ${l.label ?? l.symbol}: ${num(l.entry)} → ${num(l.exit)}`)].filter(Boolean).join("\n")}>
+          <td style={{ whiteSpace: "normal", maxWidth: 180, overflowWrap: "anywhere" }} data-testid={`algo-trade-strategy-${t.id}`}>{nameOf(t.strategy_id)}{t.version ? <span className="meta"> v{t.version}</span> : null}</td>
+          <td><a href={tradeChart(t)} target="_blank" rel="noopener" className="sym-link" title="Open the chart at this trade (15m)">{(t.instrument ?? t.symbol).replace(/NSE:/g, "")}</a></td><td>{t.side === "BUY" ? "LONG" : "SHORT"}</td><td className="mono">{t.quantity}</td>
+          <td>{t.status}{t.mode === "live" ? " ₹" : ""}</td>
+          <td className="mono">{num(t.entry_price)} <span className="meta">{isoIst(t.entry_at)}</span></td>
+          <td className="mono">{num(t.exit_price)} <span className="meta">{t.exit_at ? isoIst(t.exit_at) : ""}</span></td>
+          <td>{t.exit_reason ?? (t.status === "rejected" ? t.note?.slice(0, 40) : "")}</td>
+          <td className={`mono ${pnlCls(t.net_pnl)}`}>{inr(t.net_pnl)}</td></tr>))}
+      </tbody>
+    </table>
+  );
+});
+
 function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
   const qc = useQueryClient();
   const strategies = useQuery({ queryKey: ["algo", "strategies"], queryFn: () => api.get<{ strategies: Saved[] }>("/api/algo/strategies"), refetchInterval: 10000 });
@@ -2250,12 +2281,10 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
   const nameOf = (id: number) => strategies.data?.strategies.find((s) => s.id === id)?.name ?? String(id);
   const openShown = (st?.open ?? []).filter((t) => shown(t.strategy_id));
   useWatchOpen(st?.open ?? []);
-  useQuoteTick();   // re-render the header total per tick
   const selNames = sel.map(nameOf).join(", ");
   const events = (st?.events ?? []).filter((e) => shown(e.strategy_id));
   const tk = st?.ticks;
   const tickAgo = tk?.last_exit_check ? Math.max(0, Math.round(Date.now() / 1000 - tk.last_exit_check)) : null;
-  const liveTotal = openShown.reduce((a, t) => a + (liveMtm(t) ?? 0), 0);
   const closed = (trades.data?.trades ?? []).filter((t) => t.status === "closed");
   const summary = {
     n: closed.length,
@@ -2348,7 +2377,7 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
       </div>
       <BookPanel />
       <div className="widget widget-wide" style={{ marginBottom: 12 }}>
-        <h3>Open positions {sel.length ? <span className="meta">— {selNames}</span> : null} <span className="meta">· live MTM {inr(liveTotal)}</span></h3>
+        <h3>Open positions {sel.length ? <span className="meta">— {selNames}</span> : null} <span className="meta">· live MTM <AlgoLiveTotal open={openShown} /></span></h3>
         {!openShown.length ? <div className="empty">flat</div> : (
           <div style={grow()} data-testid="algo-open-panel">
             <table>
@@ -2367,22 +2396,10 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
       </div>
       <div className="widget widget-wide" style={{ marginBottom: 12 }}>
           <h3>Trades {sel.length ? <span className="meta" data-testid="algo-trades-filter">— {selNames} <button type="button" className="btn-sm" onClick={() => setSel([])}>show all</button></span> : <span className="meta">— all strategies · tick strategies above to show only theirs</span>}</h3>
-          <div className="meta" data-testid="algo-trade-summary">{summary.n} closed · {summary.n ? Math.round((summary.wins / summary.n) * 100) : 0}% winners · net <span className={pnlCls(summary.net)}>{inr(summary.net)}</span> · open MTM <span className={pnlCls(liveTotal)}>{inr(liveTotal)}</span></div>
+          <div className="meta" data-testid="algo-trade-summary">{summary.n} closed · {summary.n ? Math.round((summary.wins / summary.n) * 100) : 0}% winners · net <span className={pnlCls(summary.net)}>{inr(summary.net)}</span> · open MTM <AlgoLiveTotal open={openShown} colored /></div>
           <div style={grow(420)} data-testid="algo-trades-panel">
             {!trades.data?.trades.length ? <div className="empty">none yet</div> : (
-              <table>
-                <thead><tr><th>Strategy</th><th>Instrument</th><th>Signal</th><th>Qty</th><th>Status</th><th>Entry</th><th>Exit</th><th>Reason</th><th>Net</th></tr></thead>
-                <tbody>{trades.data.trades.map((t) => (
-                  <tr key={t.id} title={[t.note ?? "", ...(t.legs ?? []).map((l) => `${l.act > 0 ? "BUY" : "SELL"} ${l.qty} ${l.label ?? l.symbol}: ${num(l.entry)} → ${num(l.exit)}`)].filter(Boolean).join("\n")}>
-                    <td style={{ whiteSpace: "normal", maxWidth: 180, overflowWrap: "anywhere" }} data-testid={`algo-trade-strategy-${t.id}`}>{nameOf(t.strategy_id)}{t.version ? <span className="meta"> v{t.version}</span> : null}</td>
-                    <td><a href={tradeChart(t)} target="_blank" rel="noopener" className="sym-link" title="Open the chart at this trade (15m)">{(t.instrument ?? t.symbol).replace(/NSE:/g, "")}</a></td><td>{t.side === "BUY" ? "LONG" : "SHORT"}</td><td className="mono">{t.quantity}</td>
-                    <td>{t.status}{t.mode === "live" ? " ₹" : ""}</td>
-                    <td className="mono">{num(t.entry_price)} <span className="meta">{isoIst(t.entry_at)}</span></td>
-                    <td className="mono">{num(t.exit_price)} <span className="meta">{t.exit_at ? isoIst(t.exit_at) : ""}</span></td>
-                    <td>{t.exit_reason ?? (t.status === "rejected" ? t.note?.slice(0, 40) : "")}</td>
-                    <td className={`mono ${pnlCls(t.net_pnl)}`}>{inr(t.net_pnl)}</td></tr>))}
-                </tbody>
-              </table>
+              <TradesTable trades={trades.data.trades} strategies={strategies.data?.strategies} />
             )}
           </div>
       </div>

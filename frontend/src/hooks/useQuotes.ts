@@ -11,7 +11,7 @@
 // subscribers at most once per animation frame (~60fps) — still real
 // time, but one repaint per frame no matter the tick rate.
 
-import { useCallback, useEffect, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 
 export interface QuoteTick {
   symbol: string;
@@ -65,9 +65,23 @@ let version = 0;
 listeners.add(() => { version += 1; });
 
 /** Re-render on every tick flush (one per frame) — for small components that
- *  read several symbols at once via peekQuote (e.g. a multi-leg live P&L). */
+ *  read several symbols at once via peekQuote (e.g. a multi-leg live P&L).
+ *  Any symbol's tick counts: prefer useQuotesTick when the symbols are known. */
 export function useQuoteTick(): number {
   return useSyncExternalStore(subscribe, () => version);
+}
+
+/** Re-render only when one of `symbols` ticks (at most once per frame), then
+ *  read them with peekQuote. A table row with useQuoteTick re-rendered on every
+ *  tick of every symbol streaming to the page. */
+export function useQuotesTick(symbols: readonly (string | null | undefined)[]): void {
+  const keys = symbols.filter((s): s is string => !!s).map((s) => s.toUpperCase()).join(",");
+  const getSnapshot = useCallback(
+    // last prices joined: a string, so it is equal (no re-render) until one of them moves
+    () => (keys ? keys.split(",").map((k) => { const q = store.get(k); return q ? `${q.last_price}|${q.bid}|${q.ask}` : ""; }).join(",") : ""),
+    [keys],
+  );
+  useSyncExternalStore(subscribe, getSnapshot);
 }
 
 export function peekQuote(symbol: string): QuoteTick | undefined {
@@ -122,6 +136,43 @@ export function onQuote(symbol: string, cb: (q: QuoteTick) => void): () => void 
     listeners.delete(l);
     release();
   };
+}
+
+/**
+ * useLiveQuote for a big component (a whole page): re-renders at most once
+ * per `ms` (the last tick of a burst still lands), not once per frame. Show
+ * the price itself with a small useLiveQuote component, and read peekQuote
+ * where the newest tick matters (sending an order).
+ */
+export function useLiveQuoteThrottled(symbol: string | null | undefined, ms = 1000): QuoteTick | undefined {
+  const key = symbol ? symbol.toUpperCase() : "";
+  const [held, setHeld] = useState<QuoteTick | undefined>(() => (key ? store.get(key) : undefined));
+  useEffect(() => {
+    if (!key) return undefined;
+    let seen = store.get(key);
+    let last = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const push = () => { timer = undefined; last = Date.now(); setHeld(store.get(key)); };
+    setHeld(seen);     // not push(): the first tick after a symbol switch lands at once
+    const l = () => {
+      const q = store.get(key);
+      if (q === seen) return;
+      seen = q;
+      const wait = ms - (Date.now() - last);
+      if (wait <= 0) push();
+      else if (!timer) timer = setTimeout(push, wait);
+    };
+    listeners.add(l);
+    const release = watchSymbol(key);
+    return () => {
+      listeners.delete(l);
+      clearTimeout(timer);
+      release();
+    };
+  }, [key, ms]);
+  // Right after a symbol switch `held` is still the old symbol's until the effect runs.
+  if (!key) return undefined;
+  return held && held.symbol.toUpperCase() === key ? held : store.get(key);
 }
 
 /**

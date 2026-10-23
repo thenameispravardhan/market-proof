@@ -1447,12 +1447,26 @@ def list_trades(strategy_id: Optional[int] = None, strategy_ids: Optional[str] =
     return {"trades": rows}
 
 
+def _open_rows(book_only: bool = False) -> list[dict[str, Any]]:
+    """Open automation trades as dicts — called off the event loop: the Algo
+    Lab polls /status every second, and a sync query on the loop stalled every
+    other request and websocket push (the Trade page's ticks too) meanwhile."""
+    from app.algo.runner import _row
+    from app.db import session as dbs
+
+    q = select(AlgoTrade).where(AlgoTrade.status == "open")
+    if book_only:      # shadows are tests: not in the book
+        q = q.where(AlgoTrade.strategy_id.not_in(select(AlgoStrategy.id).where(AlgoStrategy.shadow_of.is_not(None))))
+    with dbs.SessionLocal() as db:
+        return [_row(t) for t in db.execute(q).scalars()]
+
+
 @router.get("/status")
-async def status(request: Request, db: Session = Depends(get_db)) -> dict[str, Any]:
-    from app.algo.runner import _ltp, _mtm, _row
+async def status(request: Request) -> dict[str, Any]:
+    from app.algo.runner import _ltp, _mtm
 
     r = _runner(request)
-    open_rows = [_row(t) for t in db.execute(select(AlgoTrade).where(AlgoTrade.status == "open")).scalars()]
+    open_rows = await asyncio.to_thread(_open_rows)
     prices = await _ltp([lg["symbol"] for t in open_rows for lg in t["legs"]] + [t["symbol"] for t in open_rows]) if open_rows else {}
     for t in open_rows:
         t["ltp"] = prices.get((t["symbol"] if t["ref"] == "u" else t["legs"][0]["symbol"]).upper())
@@ -1468,18 +1482,16 @@ async def status(request: Request, db: Session = Depends(get_db)) -> dict[str, A
 
 
 @router.get("/book")
-async def book_view(request: Request, db: Session = Depends(get_db)) -> dict[str, Any]:
+async def book_view(request: Request) -> dict[str, Any]:
     """Every automation's open positions as ONE book: per underlying the
     positions, net delta (lots; shares for cash), margin and MTM, plus the
     book's day P&L against ALGO_BOOK_MAX_DAY_LOSS and its margin against
     ALGO_BOOK_MAX_MARGIN. A delta that can't be priced is null, not guessed."""
     from app.algo import fno
-    from app.algo.runner import _book_all, _ltp, _mtm, _row
+    from app.algo.runner import _book_all, _ltp, _mtm
     from app.config import get_settings
 
-    shadows = select(AlgoStrategy.id).where(AlgoStrategy.shadow_of.is_not(None))
-    rows = [_row(t) for t in db.execute(select(AlgoTrade).where(
-        AlgoTrade.status == "open", AlgoTrade.strategy_id.not_in(shadows))).scalars()]
+    rows = await asyncio.to_thread(_open_rows, True)
     prices = await _ltp(list({lg["symbol"] for t in rows for lg in t["legs"]} | {t["symbol"] for t in rows})) if rows else {}
     now = time.time()
     by: dict[str, dict[str, Any]] = {}

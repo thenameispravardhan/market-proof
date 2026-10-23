@@ -246,3 +246,31 @@ def test_a_symbol_fyers_calls_invalid_is_not_asked_again() -> None:
     assert asyncio.run(be.get_history_range("NSE:UDAYJEW-EQ", resolution="5", from_ts=0, to_ts=60)) == []
     assert calls == ["NSE:UDAYJEW-EQ"]                          # one request, not one per caller per pass
     fyers_live._BAD_SYMBOLS.clear()
+
+
+def test_watchlist_serves_streamed_quotes_and_rests_only_the_rest(client: TestClient, monkeypatch) -> None:
+    """A watchlist row with a fresh tick (day change included) comes off the
+    bus; only the others cost a Fyers REST call. A REST-seeded bus quote with
+    no day change, or a paper-simulated one, still goes to Fyers."""
+    from app.execution.market_data import Quote
+
+    md = market._manager().market_data
+    md._quotes["NSE:SBIN-EQ"] = Quote(symbol="NSE:SBIN-EQ", last_price=800.0, change=8.0, change_pct=1.0)
+    md._quotes["NSE:TCS-EQ"] = Quote(symbol="NSE:TCS-EQ", last_price=3900.0)
+    md._quotes["NSE:INFY-EQ"] = Quote(symbol="NSE:INFY-EQ", last_price=1.0, change_pct=0.1, extra={"simulated": True})
+    asked: list[list[str]] = []
+
+    class _B:
+        async def get_quote(self, symbols: list[str]) -> list[Quote]:
+            asked.append(list(symbols))
+            return [Quote(symbol=s, last_price=10.0, change=1.0, change_pct=10.0) for s in symbols]
+
+    monkeypatch.setattr(market, "_fyers_backend", lambda: _B())
+    q = client.get("/api/market/quotes?symbols=NSE:SBIN-EQ,NSE:TCS-EQ,NSE:INFY-EQ").json()["quotes"]
+    assert asked == [["NSE:TCS-EQ", "NSE:INFY-EQ"]]
+    assert q["NSE:SBIN-EQ"] == {"ltp": 800.0, "change": 8.0, "change_pct": 1.0}
+    assert q["NSE:TCS-EQ"]["ltp"] == 10.0 and q["NSE:INFY-EQ"]["ltp"] == 10.0
+
+    asked.clear()
+    q = client.get("/api/market/quotes?symbols=NSE:SBIN-EQ").json()["quotes"]
+    assert asked == [] and q["NSE:SBIN-EQ"]["ltp"] == 800.0     # all streamed: no REST call at all

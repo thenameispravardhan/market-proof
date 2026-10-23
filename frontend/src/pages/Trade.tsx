@@ -42,7 +42,7 @@ import {
   useSearchSymbols,
   useServerInfo,
 } from "../hooks/useApi";
-import { useLiveQuote } from "../hooks/useQuotes";
+import { peekQuote, useLiveQuote, useLiveQuoteThrottled } from "../hooks/useQuotes";
 import { tabLocal, useRouter } from "../router";
 import { withWs } from "../workspace";
 import { chartLinkParams, resolveBareHit } from "../lib/chartLink";
@@ -392,6 +392,13 @@ function TicketModeBadge({ account, botMode }: { account: BrokerAccount | null; 
       LIVE · REAL MONEY · {account.name}
     </span>
   );
+}
+
+/** One live quote field, re-rendered per tick on its own: the page around it
+ *  reads the quote throttled (a tick re-rendered the whole page, charts too). */
+function LiveQuoteNum({ symbol, field, fallback }: { symbol: string; field: "last_price" | "bid" | "ask"; fallback: number | null | undefined }) {
+  const v = useLiveQuote(symbol)?.[field] ?? fallback;
+  return <>{v != null ? fmtMoney(v) : "—"}</>;
 }
 
 // Polling a symbol's quote keeps it subscribed on the live socket, so a
@@ -925,11 +932,18 @@ export default function Trade() {
 
   const { data: quote } = useQuote(selected?.symbol ?? "");
   // Sub-second overlay: the `/ws` push stream (touched live by the quote
-  // endpoint above) overrides the 3s REST poll the instant ticks arrive.
-  const live = useLiveQuote(selected?.symbol);
+  // endpoint above) overrides the 3s REST poll. Throttled to ~1/s here — per
+  // tick it re-rendered this whole page and every chart cell; the Quote box
+  // (LiveQuoteNum) still moves per tick, and orders read the newest tick.
+  const live = useLiveQuoteThrottled(selected?.symbol);
   const ltp = live?.last_price ?? (quote?.ok ? quote.last_price : null);
   const bid = live?.bid ?? (quote?.ok ? quote.bid : null);
   const ask = live?.ask ?? (quote?.ok ? quote.ask : null);
+  /** The newest tick (not the throttled one) for what is sent or filled in. */
+  const freshTouch = () => {
+    const q = selected ? peekQuote(selected.symbol) : undefined;
+    return { ltp: q?.last_price ?? ltp, bid: q?.bid ?? bid, ask: q?.ask ?? ask };
+  };
   // Browser tab title: the open chart's symbol and price, like TradingView.
   const titleName = selected?.short_name || selected?.symbol?.split(":").pop();
   const titlePx = ltp != null ? ` ${ltp.toFixed(2)}` : "";
@@ -1401,6 +1415,9 @@ export default function Trade() {
 
   const onSubmit = async (opts?: { bypassRisk?: boolean; resend?: PlaceOrderRequest }) => {
     if (!opts?.resend && (!selected || !accountId || !canSubmit)) return;
+    // % / points SL and target off the newest tick, not the ~1 s throttled one.
+    const f = freshTouch();
+    const est = limitNum ?? stopNum ?? (side === "BUY" ? f.ask : f.bid) ?? f.ltp;
     // The risk override re-sends the order that was blocked, not whatever the
     // ticket holds now (the side / qty / symbol may have been changed since).
     const body: PlaceOrderRequest = opts?.resend ? { ...opts.resend, bypass_risk: true } : {
@@ -1413,8 +1430,8 @@ export default function Trade() {
       limit_price: limitNum,
       stop_price: stopNum,
       product_type: product,
-      stop_loss: slAbs,
-      target: tpAbs,
+      stop_loss: levelPrice(Number(slPrice), slMode, est, side, "sl", tick),
+      target: levelPrice(Number(tpPrice), tpMode, est, side, "target", tick),
       bypass_risk: opts?.bypassRisk ?? false,
       operator: "ui_trade_page",
     };
@@ -1852,16 +1869,16 @@ export default function Trade() {
                         <div className="quote-cell">
                           <div className="k">LTP</div>
                           <div className="v big" data-testid="quote-ltp">
-                            {ltp != null ? fmtMoney(ltp) : "—"}
+                            <LiveQuoteNum symbol={selected.symbol} field="last_price" fallback={quote?.ok ? quote.last_price : null} />
                           </div>
                         </div>
                         <div className="quote-cell">
                           <div className="k">BID</div>
-                          <div className="v">{bid != null ? fmtMoney(bid) : "—"}</div>
+                          <div className="v"><LiveQuoteNum symbol={selected.symbol} field="bid" fallback={quote?.ok ? quote.bid : null} /></div>
                         </div>
                         <div className="quote-cell">
                           <div className="k">ASK</div>
-                          <div className="v">{ask != null ? fmtMoney(ask) : "—"}</div>
+                          <div className="v"><LiveQuoteNum symbol={selected.symbol} field="ask" fallback={quote?.ok ? quote.ask : null} /></div>
                         </div>
                         <div className="quote-cell">
                           <div className="k">LOT</div>
@@ -1964,7 +1981,7 @@ export default function Trade() {
                           <button
                             type="button"
                             className="px-quick-btn"
-                            onClick={() => setLimitPrice(String(roundToTick(bid, tick)))}
+                            onClick={() => setLimitPrice(String(roundToTick(freshTouch().bid ?? bid, tick)))}
                             title={`bid ${fmtMoney(bid)}`}
                             data-testid="limit-fill-bid"
                           >
@@ -1975,7 +1992,7 @@ export default function Trade() {
                           <button
                             type="button"
                             className="px-quick-btn"
-                            onClick={() => setLimitPrice(String(roundToTick(ltp, tick)))}
+                            onClick={() => setLimitPrice(String(roundToTick(freshTouch().ltp ?? ltp, tick)))}
                             title={`LTP ${fmtMoney(ltp)}`}
                             data-testid="limit-fill-ltp"
                           >
@@ -1986,7 +2003,7 @@ export default function Trade() {
                           <button
                             type="button"
                             className="px-quick-btn"
-                            onClick={() => setLimitPrice(String(roundToTick(ask, tick)))}
+                            onClick={() => setLimitPrice(String(roundToTick(freshTouch().ask ?? ask, tick)))}
                             title={`ask ${fmtMoney(ask)}`}
                             data-testid="limit-fill-ask"
                           >
@@ -2012,7 +2029,7 @@ export default function Trade() {
                           <button
                             type="button"
                             className="px-quick-btn"
-                            onClick={() => setStopPrice(String(roundToTick(ltp, tick)))}
+                            onClick={() => setStopPrice(String(roundToTick(freshTouch().ltp ?? ltp, tick)))}
                             title={`LTP ${fmtMoney(ltp)}`}
                             data-testid="stop-fill-ltp"
                           >
