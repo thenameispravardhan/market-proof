@@ -158,6 +158,32 @@ export function barTime(c: Bar[], l: number, span: number): number | null {
   return c[i].time + (l - i) * Math.min(span, c[i + 1].time - c[i].time);
 }
 
+/** The slice of the engine's time scale the logical ↔ pixel helpers use. */
+export interface LogicalAxis {
+  logicalToCoordinate(logical: number): number | null;
+}
+
+/** Fractional bar index → x pixel. The engine's logicalToCoordinate only
+ *  takes whole indexes — a fractional one comes back as 0, the pane's left
+ *  edge — and an anchor drawn on 5m sits between bars on 10m / 15m / 20m.
+ *  x is linear in the index, so interpolate between the two bars around it. */
+export function logicalToX(ts: LogicalAxis, l: number): number | null {
+  if (!Number.isFinite(l)) return null;
+  const i = Math.floor(l);
+  const a = ts.logicalToCoordinate(i);
+  if (a === null || l === i) return a;
+  const b = ts.logicalToCoordinate(i + 1);
+  return b === null ? null : a + (l - i) * (b - a);
+}
+
+/** x pixel → fractional bar index (a bar's centre is its whole index) — the
+ *  engine's coordinateToLogical rounds to a whole bar. */
+export function xToLogical(ts: LogicalAxis, x: number): number | null {
+  const a = ts.logicalToCoordinate(0);
+  const b = ts.logicalToCoordinate(1);
+  return a === null || b === null || b === a ? null : (x - a) / (b - a);
+}
+
 export function isIntraday(key: string): boolean {
   const iv = parseInterval(key);
   return iv != null && (iv.unit === "S" || iv.unit === "m");
