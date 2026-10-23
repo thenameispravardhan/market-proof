@@ -13,7 +13,9 @@ from __future__ import annotations
 import asyncio
 import math
 import time
-from typing import Any, Optional
+from array import array
+from contextvars import ContextVar
+from typing import Any, Optional, Sequence
 
 import duckdb
 
@@ -48,12 +50,48 @@ def store_key(fy: str) -> str:
     return f"{ex}_{name}".replace("/", "_")
 
 
+def backtest_db() -> duckdb.DuckDBPyConnection:
+    """A DuckDB of its own for one backtest's reads, closed when it ends (its
+    memory goes back then). Memory-capped so a big universe can't take the
+    box's RAM; no file cache (the store is local, and rewritten in place)."""
+    return duckdb.connect(config={"memory_limit": "512MB", "enable_external_file_cache": False,
+                                  "allocator_flush_threshold": "16MB"})
+
+
+# The running backtest's DuckDB (assemble sets it for its own task): coverage()
+# and load() use it instead of starting a database per call — ~25 ms each, more
+# than the read itself, three or four times per symbol, some on the event loop.
+_active: ContextVar[Optional[duckdb.DuckDBPyConnection]] = ContextVar("algo_data_db", default=None)
+
+
 def coverage(key: str) -> Optional[dict[str, Any]]:
     src = candle_source(key)
     if not src:
         return None
-    first, last, rows = duckdb.connect().execute(f"SELECT min(ts), max(ts), count(*) FROM {src}").fetchone()
+    sql = f"SELECT min(ts), max(ts), count(*) FROM {src}"
+    con = _active.get()
+    if con is not None:
+        first, last, rows = con.execute(sql).fetchone()
+    else:
+        with duckdb.connect() as own:
+            first, last, rows = own.execute(sql).fetchone()
     return {"first": first, "last": last, "rows": rows} if rows else None
+
+
+# The session minutes of [start, end), one row per minute (base export and
+# increments can overlap).
+_M1 = """SELECT DISTINCT ON (ts) ts, open, high, low, close, volume FROM {src}
+         WHERE ts >= ? AND ts < ? AND (ts + 19800) % 86400 BETWEEN 33300 AND 55799"""
+_FETCH = 50_000     # rows per fetch: a result never sits in memory whole as Python tuples
+
+
+def _resample(con: duckdb.DuckDBPyConnection, rel: str, tf_min: int, params: Sequence[Any] = ()) -> dict[str, Any]:
+    n = int(tf_min) * 60
+    o_s = "(ts - ((ts + 19800) % 86400) + 33300)"            # the day's 09:15 open
+    bucket = "ts - ((ts + 19800) % 86400)" if tf_min == 1440 else f"{o_s} + ((ts - {o_s}) // {n}) * {n}"
+    cur = con.execute(f"""SELECT {bucket} AS b, arg_min(open, ts), max(high), min(low), arg_max(close, ts), sum(volume)
+                          FROM {rel} GROUP BY b ORDER BY b""", list(params))
+    return columns(cur, n)
 
 
 def load(key: str, tf_min: int, start_ts: int, end_ts: int) -> Optional[dict[str, Any]]:
@@ -62,18 +100,32 @@ def load(key: str, tf_min: int, start_ts: int, end_ts: int) -> Optional[dict[str
     src = candle_source(key)
     if not src:
         return None
-    n = int(tf_min) * 60
-    bucket = ("ts - ((ts + 19800) % 86400)" if tf_min == 1440
-              else f"o_s + ((ts - o_s) // {n}) * {n}")
-    rows = duckdb.connect().execute(f"""
-        SELECT {bucket} AS b,
-               arg_min(open, ts), max(high), min(low), arg_max(close, ts), sum(volume)
-        FROM (SELECT DISTINCT ON (ts) ts, open, high, low, close, volume,
-                     ts - ((ts + 19800) % 86400) + 33300 AS o_s
-              FROM {src}
-              WHERE ts >= ? AND ts < ? AND (ts + 19800) % 86400 BETWEEN 33300 AND 55799)
-        GROUP BY b ORDER BY b""", [int(start_ts), int(end_ts)]).fetchall()
-    return bars_from(rows, n)
+    con = _active.get()
+    if con is not None:
+        return _resample(con, f"({_M1.format(src=src)})", tf_min, (int(start_ts), int(end_ts)))
+    with duckdb.connect() as own:
+        return _resample(own, f"({_M1.format(src=src)})", tf_min, (int(start_ts), int(end_ts)))
+
+
+def load_frames(key: str, tfs: Sequence[int], start_ts: int, end_ts: int,
+                con: Optional[duckdb.DuckDBPyConnection] = None) -> Optional[list[dict[str, Any]]]:
+    """load() at each of `tfs` (in that order) off ONE read of the symbol's
+    parquet: its minutes go to a temp table once and every timeframe is
+    resampled from there. A backtest read the files once per timeframe."""
+    src = candle_source(key)
+    if not src:
+        return None
+    own = con is None
+    con = con or backtest_db()
+    try:
+        con.execute(f"CREATE OR REPLACE TEMP TABLE _m1 AS {_M1.format(src=src)}", [int(start_ts), int(end_ts)])
+        try:
+            return [_resample(con, "_m1", tf) for tf in tfs]
+        finally:
+            con.execute("DROP TABLE IF EXISTS _m1")
+    finally:
+        if own:
+            con.close()
 
 
 def warmup_days(tf_min: int, bars: int) -> int:
@@ -115,6 +167,21 @@ async def assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str
     every higher timeframe the conditions use, India VIX when options are priced
     off it, and the F&O meta (name, lot, strike step). Returns (data, notes,
     trade_from). One failing symbol is a note, not an error."""
+    from app.algo import fno
+
+    if spec["instrument"]["type"] != "equity" or (spec.get("pair_leg") or {}).get("kind") == "FUT":   # lots of the pair leg's future
+        await fno.ensure_master()
+    con = backtest_db()
+    token = _active.set(con)
+    try:
+        return await _assemble(spec, start, end, con)
+    finally:
+        _active.reset(token)
+        con.close()
+
+
+async def _assemble(spec: dict[str, Any], start: int, end: int, con: duckdb.DuckDBPyConnection
+                    ) -> tuple[dict[str, dict], list[dict], int]:
     from app.algo import engine, fno, orderflow
 
     base_tf = spec["timeframe"]
@@ -123,8 +190,6 @@ async def assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str
     btype, per_day = spec["bars"]["type"], spec["bars"]["per_day"]
     first = start - lead_days(spec) * DAY
     inst = spec["instrument"]
-    if inst["type"] != "equity" or (spec.get("pair_leg") or {}).get("kind") == "FUT":   # lots of the pair leg's future
-        await fno.ensure_master()
     vix = None
     notes: list[dict] = []
     wants_vix = inst["iv"]["source"] == "vix" or (       # surface: VIX prices the candles no snapshot covers
@@ -134,9 +199,10 @@ async def assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str
     if (inst["type"] == "option" and wants_vix) or vix_tfs:
         try:
             await ensure(VIX, first, end)
-            vix = await asyncio.to_thread(load, store_key(VIX), base_tf, first, end)
-            for tf in vix_tfs - {base_tf}:
-                vix_htf[tf] = await asyncio.to_thread(load, store_key(VIX), tf, first, end)
+            others = sorted(vix_tfs - {base_tf})
+            fr = await asyncio.to_thread(load_frames, store_key(VIX), [base_tf, *others], first, end, con)
+            if fr:
+                vix, vix_htf = fr[0], dict(zip(others, fr[1:]))
         except Exception as e:  # noqa: BLE001
             notes.append({"symbol": VIX, "note": f"VIX unavailable ({'conditions on VIX stay false' if vix_tfs else 'using realised vol'}): {e}"[:200]})
     # Other symbols the conditions read: loaded once, shared by every symbol's
@@ -147,11 +213,13 @@ async def assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str
             info = await ensure(ref, first, end)
         except RuntimeError as e:
             raise ValueError(f"{ref} (read by the conditions): {e}") from None
-        b = await asyncio.to_thread(load, info["key"], base_tf, first, end)
+        others = sorted(tfs - {base_tf})
+        fr = await asyncio.to_thread(load_frames, info["key"], [base_tf, *others], first, end, con)
+        b = fr[0] if fr else None
         if not b or not b["t"] or b["t"][-1] < start:
             raise ValueError(f"{ref} (read by the conditions): no candles in this range")
         b["tf_min"] = base_tf
-        b["htf"] = {tf: await asyncio.to_thread(load, info["key"], tf, first, end) for tf in tfs - {base_tf}}
+        b["htf"] = dict(zip(others, fr[1:]))
         b["meta"] = {"symbol": ref}
         xs[ref] = b
     out: dict[str, dict] = {}
@@ -165,8 +233,11 @@ async def assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str
             if info["note"]:
                 notes.append({"symbol": fy, "note": info["note"]})
             size = None
+            # the base (or 1-minute) candles and every higher timeframe off one read of the files
+            fr = await asyncio.to_thread(load_frames, info["key"], [1 if minutes else base_tf, *htfs], first, end, con)
+            htf = dict(zip(htfs, fr[1:])) if fr else {tf: None for tf in htfs}
             if minutes:
-                m1 = await asyncio.to_thread(load, info["key"], 1, first, end)
+                m1 = fr[0] if fr else None
                 if not m1 or not m1["t"] or m1["t"][-1] < start:
                     notes.append({"symbol": fy, "note": "no candles in this range"})
                     continue
@@ -180,14 +251,15 @@ async def assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str
                     notes.append({"symbol": fy, "note": "no traded volume (an index) — order-flow values are flat"})
                 real = await asyncio.to_thread(real_flow, fy, first, end)
                 bars = await asyncio.to_thread(orderflow.build_bars, m1, btype, base_tf, size, real)
-                del m1
+                del m1, fr
             else:
-                bars = await asyncio.to_thread(load, info["key"], base_tf, first, end)
+                bars = fr[0] if fr else None
+                del fr
             if not bars or not bars["t"] or bars["t"][-1] < start:
                 notes.append({"symbol": fy, "note": "no candles in this range"})
                 continue
             bars["tf_min"] = base_tf
-            bars["htf"] = {tf: await asyncio.to_thread(load, info["key"], tf, first, end) for tf in htfs}
+            bars["htf"] = htf
             if xs:
                 bars["xs"] = xs
             if engine.uses_filings(spec):
@@ -320,6 +392,22 @@ def chain_surfaces(name: str, times: list[int]) -> list[Any]:
     return out
 
 
+def columns(cur: duckdb.DuckDBPyConnection, tf_s: int) -> dict[str, Any]:
+    """Backtest bars as typed arrays (8 bytes a value; a list of Python floats
+    takes ~32), filled a chunk of rows at a time. Index / slice / iterate them
+    like the lists bars_from gives."""
+    t, v = array("q"), array("q")
+    o, h, l, c = array("d"), array("d"), array("d"), array("d")
+    while rows := cur.fetchmany(_FETCH):
+        t.extend(r[0] for r in rows)
+        o.extend(r[1] for r in rows)
+        h.extend(r[2] for r in rows)
+        l.extend(r[3] for r in rows)
+        c.extend(r[4] for r in rows)
+        v.extend(int(r[5] or 0) for r in rows)
+    return {"t": t, "o": o, "h": h, "l": l, "c": c, "v": v, "tf_s": tf_s}
+
+
 def bars_from(rows: list, tf_s: int) -> dict[str, Any]:
     return {"t": [int(r[0]) for r in rows], "o": [float(r[1]) for r in rows],
             "h": [float(r[2]) for r in rows], "l": [float(r[3]) for r in rows],
@@ -369,19 +457,24 @@ async def ensure(fy: str, start_ts: int, end_ts: int) -> dict[str, Any]:
     key = store_key(fy)
     cov = coverage(key)
     note = None
+    fetched = False             # coverage re-read only when something may have been added
     try:
         if cov is None:
+            fetched = True
             await download(fy, start_ts, end_ts)
         else:
             if start_ts < cov["first"] - 3 * DAY and _floor.get(key, start_ts + 1) > start_ts:
+                fetched = True
                 await download(fy, start_ts, cov["first"])
             if end_ts > cov["last"] + 3600:     # one cheap call even when nothing is new
+                fetched = True
                 await download(fy, cov["last"], min(end_ts, int(time.time())))
     except RuntimeError as e:
         note = str(e)
-        if coverage(key) is None:
+        if (cov := coverage(key)) is None:
             raise
-    return {"symbol": fy, "key": key, "note": note, "coverage": coverage(key)}
+        fetched = False
+    return {"symbol": fy, "key": key, "note": note, "coverage": coverage(key) if fetched else cov}
 
 
 async def recent_bars(fy: str, tf_min: int, bars: int = 400, now: Optional[float] = None) -> dict[str, Any]:

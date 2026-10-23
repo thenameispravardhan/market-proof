@@ -92,7 +92,7 @@ def test_the_loader_brings_every_past_member_and_says_which_have_no_candles(root
         return {"key": data.store_key(fy), "note": None}
 
     monkeypatch.setattr(data, "ensure", ensure)
-    monkeypatch.setattr(data, "load", lambda key, tf, a, b: dict(d) if key != "DEAD" else None)
+    monkeypatch.setattr(data, "load_frames", lambda key, tfs, a, b, con=None: [dict(d) for _ in tfs] if key != "DEAD" else None)
     spec = engine.normalize({**_cross_spec(), "universe": {"index": "nifty50"}})
     out, notes, _ = asyncio.run(data.assemble(spec, start, start + 4 * 86400))
     assert sorted(out) == ["NSE:AAA-EQ", "NSE:BBB-EQ", "NSE:GONE-EQ"]          # GONE left during the range: still in

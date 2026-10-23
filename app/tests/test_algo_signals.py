@@ -86,17 +86,17 @@ def test_assemble_loads_each_other_symbol_once_and_shares_it(monkeypatch):
     async def fake_ensure(fy, start, end):
         return {"symbol": fy, "key": data.store_key(fy), "note": None, "coverage": None}
 
-    def fake_load(key, tf, start, end):
-        calls.append((key, tf))
-        return None if key == "MISSING-INDEX" else bars([100.0 + i for i in range(80)], tf=tf * 60, start=DAY0)
+    def fake_frames(key, tfs, start, end, con=None):     # every timeframe of a symbol: one read
+        calls.append((key, tuple(tfs)))
+        return None if key == "MISSING-INDEX" else [bars([100.0 + i for i in range(80)], tf=tf * 60, start=DAY0) for tf in tfs]
 
     monkeypatch.setattr(data, "ensure", fake_ensure)
-    monkeypatch.setattr(data, "load", fake_load)
+    monkeypatch.setattr(data, "load_frames", fake_frames)
     spec = _ref_spec(symbols=["NSE:AAA-EQ", "NSE:BBB-EQ"])
     out, notes, _ = asyncio.run(data.assemble(spec, DAY0, DAY0 + 3600))
     assert set(out) == {"NSE:AAA-EQ", "NSE:BBB-EQ"} and not notes
     assert out["NSE:AAA-EQ"]["xs"][REF] is out["NSE:BBB-EQ"]["xs"][REF]
-    assert calls.count(("NIFTY50-INDEX", 5)) == 1
+    assert [c for c in calls if c[0] == "NIFTY50-INDEX"] == [("NIFTY50-INDEX", (5,))]
     gone = _ref_spec()
     gone["entry_long"]["conditions"][0]["left"]["symbol"] = "NSE:MISSING-INDEX"
     with pytest.raises(ValueError, match="MISSING-INDEX .*no candles"):
