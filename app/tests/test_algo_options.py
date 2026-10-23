@@ -6,7 +6,7 @@ import asyncio
 import pytest
 
 from app.algo import engine, fno
-from app.tests.test_algo import DAY0, _RISE_FALL, _nifty, _opt_spec, _strangle
+from app.tests.test_algo import DAY0, _RISE_FALL, _nifty, _opt_spec, _strangle, bars
 
 NIFTY = "NSE:NIFTY50-INDEX"
 
@@ -241,27 +241,72 @@ def _carried_week(after_expiry_step: float) -> dict:
             "meta": {"symbol": NIFTY, "name": "NIFTY", "exch": "NSE", "lot": 65, "step": 50}}
 
 
-def test_carried_option_settles_at_its_expiry_not_after():
-    # Square-off off: a sold weekly 24750 CE is carried overnight. It expires
-    # worthless on Tue 20 Oct 15:30 — the rally from Wednesday on must not touch it.
-    spec = _opt_spec(instrument={"type": "option", "expiry_kind": "weekly", "iv": {"source": "fixed", "value": 14},
-                                 "legs_long": [{"right": "CE", "action": "SELL", "strike": "OTM", "steps": 4, "lots": 1}]},
-                     sizing={"mode": "lots", "value": 1}, session={"start": "09:15", "end": "15:00", "square_off": None},
-                     costs={"slippage_pct": 0, "charges": False})
+def _sold_call(**kw):
+    """A carried (square-off off) sold weekly 4-OTM NIFTY call."""
+    return _opt_spec(**{"instrument": {"type": "option", "expiry_kind": "weekly", "iv": {"source": "fixed", "value": 14},
+                                       "legs_long": [{"right": "CE", "action": "SELL", "strike": "OTM", "steps": 4, "lots": 1}]},
+                        "sizing": {"mode": "lots", "value": 1},
+                        "session": {"start": "09:15", "end": None, "square_off": None},
+                        "costs": {"slippage_pct": 0, "charges": False}, **kw})
+
+
+def test_carried_option_exits_at_15_15_on_its_expiry_day():
+    # Square-off off: a sold weekly 24750 CE is carried overnight. On its expiry day
+    # (Tue 20 Oct) it is bought back at 15:15 — the latest live square-off, before the
+    # exchange settles it — and the rally from Wednesday on never touches it.
     d = _carried_week(6.0)
-    (t,) = engine.run(spec, {"N": d})["trades"]
+    (t,) = engine.run(_sold_call(), {"N": d})["trades"]
     expiry = fno.expiry_after("NIFTY", "NSE", "weekly", "current", t["entry_t"])
-    assert t["reason"] == "EXPIRY" and t["exit_t"] == expiry               # Tue 20 Oct 15:30
-    assert t["legs"][0]["exit"] == 0.05 and t["legs"][0]["reason"] == "EXPIRY"   # worthless (one-tick floor)
+    assert t["reason"] == "EXPIRY" and t["exit_t"] == expiry - 15 * 60          # Tue 20 Oct 15:15
+    assert t["legs"][0]["exit"] == 0.05                                          # 15 minutes before a worthless expiry
     assert t["net"] == pytest.approx((t["legs"][0]["entry"] - 0.05) * 65)
 
 
-def test_carried_future_settles_at_its_expiry():
+def test_carried_future_exits_on_its_expiry_day():
     spec = _opt_spec(instrument={"type": "future", "expiry": "current"}, sizing={"mode": "lots", "value": 1},
                      session={"start": "09:15", "end": "15:00", "square_off": None},
                      costs={"slippage_pct": 0, "charges": False})
     d = {**_carried_week(0.0), "meta": {"symbol": NIFTY, "name": "NIFTY", "exch": "NSE", "lot": 65, "step": 50}}
     tr = engine.run(spec, {"N": d})["trades"]
-    # the monthly future (Tue 27 Oct) settles at that day's close, not at the end of the data
-    assert tr[0]["reason"] == "EXPIRY"
-    assert tr[0]["exit_t"] == fno.expiry_after("NIFTY", "NSE", "monthly", "current", tr[0]["entry_t"])
+    # the monthly future (Tue 27 Oct) is closed at 15:15 that day, not at the end of the data
+    expiry = fno.expiry_after("NIFTY", "NSE", "monthly", "current", tr[0]["entry_t"])
+    assert tr[0]["reason"] == "EXPIRY" and tr[0]["exit_t"] == expiry - 15 * 60
+
+
+def test_a_carried_position_past_its_expiry_is_settled_at_intrinsic():
+    # A data gap: the expiry day's candles stop at 14:00, so there is no 15:15 candle to
+    # exit on. The call is still settled — on the last candle before the expiry, at its
+    # intrinsic value (worthless here), no slippage — never carried into the next week.
+    from datetime import datetime, timedelta, timezone
+
+    ist = timezone(timedelta(hours=5, minutes=30))
+    gap_from = int(datetime(2026, 10, 20, 14, 0, tzinfo=ist).timestamp())     # Tue (expiry day) 14:00
+    gap_to = int(datetime(2026, 10, 21, 0, 0, tzinfo=ist).timestamp())
+    d = _carried_week(6.0)
+    keep = [k for k, t in enumerate(d["t"]) if not gap_from <= t < gap_to]
+    d = {k: ([v[j] for j in keep] if isinstance(v, list) else v) for k, v in d.items()}
+    (t,) = engine.run(_sold_call(costs={"slippage_pct": 0.5, "charges": False}), {"N": d})["trades"]
+    assert t["reason"] == "EXPIRY" and t["exit_t"] == gap_from                # the 13:55 candle's close
+    assert t["legs"][0]["exit"] == 0.05 and t["legs"][0]["reason"] == "EXPIRY"   # settled: no 0.5% slippage
+
+
+def test_a_carried_strategy_opens_nothing_expiring_that_day_after_15_15():
+    # The weekly expires Tue 20 Oct. A signal whose fill comes at 15:15 that day would be
+    # sold and bought back at once — it is skipped; one filled at 15:10 is closed at 15:15.
+    from datetime import datetime, timedelta, timezone
+
+    day0 = int(datetime(2026, 10, 20, 9, 15, tzinfo=timezone(timedelta(hours=5, minutes=30))).timestamp())
+
+    def tuesday(signal_bar: int) -> dict:
+        c = [24500.0] * 75
+        for m in range(signal_bar, 75):
+            c[m] = 24560.0                                   # crosses above 24550 on the signal bar
+        d = bars(c, spread=5)
+        d["t"] = [day0 + m * 300 for m in range(75)]
+        d["meta"] = {"symbol": NIFTY, "name": "NIFTY", "exch": "NSE", "lot": 65, "step": 50}
+        return d
+
+    late = engine.run(_sold_call(), {"N": tuesday(71)})       # signal 15:10-15:15, fill 15:15
+    assert late["trades"] == [] and late["stats"]["skipped"]["expires_today"] == 1
+    (t,) = engine.run(_sold_call(), {"N": tuesday(70)})["trades"]   # fill 15:10
+    assert (t["reason"], t["exit_t"] - t["entry_t"]) == ("EXPIRY", 300)

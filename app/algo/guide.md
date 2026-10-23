@@ -59,8 +59,12 @@ the JSON — the messages say exactly which value is wrong.
   target there — nor count that candle's high / low from before its fill.
 * **Everything is flat by the square-off time** (unless square-off is
   switched off — then positions carry overnight until an exit rule closes them;
-  an F&O position is settled at its nearest contract's expiry: options at
-  their intrinsic value, futures at the close — exit reason `EXPIRY`).
+  an F&O position is still closed at 15:15 on its nearest contract's expiry
+  day, never held into the exchange's settlement (stock F&O deliver
+  physically), and nothing new is opened in a contract expiring that day after
+  15:15 — exit reason `EXPIRY`, live and in backtests. A position found still
+  open after its expiry (the runner was down; a backtest data gap) is booked at
+  its settlement value: options at their intrinsic value, futures at the close).
 * **Options in backtests are priced with Black-Scholes** from the underlying's
   real candles (Fyers keeps no history for expired contracts). IV comes from
   India VIX (indices), the stock's realised volatility, a fixed number, or
@@ -463,8 +467,8 @@ uses implied volatility from the real option prices.
 * `start` / `end` — entries only between these (IST). `null` = from the open /
   until square-off.
 * `square_off` — everything is closed at this time; `null` = carry positions
-  overnight (exit rules still apply; backtests settle a futures / options
-  position at its nearest leg's expiry, `EXPIRY`). Live square-off must be ≤ 15:15.
+  overnight (exit rules still apply; a futures / options position is closed at
+  15:15 on its nearest leg's expiry day, `EXPIRY`). Live square-off must be ≤ 15:15.
 * Must satisfy 09:15 ≤ start ≤ end ≤ square_off ≤ 15:29.
 * `days` — entries only on these weekdays, 1 = Mon … 5 = Fri (absent = every day).
 
@@ -721,7 +725,8 @@ read the flag, then pause the strategy yourself or shadow-test a fix.
 `RULE_<METRIC>` (position rule), `LEG_SL` / `LEG_TARGET` / `LEG_COST`
 (a leg's own stop / target / cost stop), `LEG_ROLL` (a leg rolled out),
 `DAILY_MAX_LOSS`, `DAILY_TARGET`, `SQUARE_OFF`, `EOD` (a new day began),
-`EXPIRY` (a carried F&O position's contract expired), `END` (end of the data), and live only `MANUAL`, `STALE_SESSION`,
+`EXPIRY` (a carried F&O position closed at 15:15 on its contract's expiry day, or
+booked at its settlement value if found already expired), `END` (end of the data), and live only `MANUAL`, `STALE_SESSION`,
 `CLOSED_EXTERNAL`, `GUARD` (its guard flattened it), `BOOK_MAX_LOSS` (the
 book's day loss limit), `BOOK_KILL` (the kill switch).
 
@@ -1491,6 +1496,7 @@ real ticks** = the rest of the order-flow values were estimated per minute.
 | entry expired | a pullback / breakout order not filled within `valid_bars` |
 | entry rules | an option `position_rules.entry` rule failed |
 | no stop | the stop couldn't be set (an ATR stop before its ATR has enough candles, or a flat ATR of 0) — the strategy never enters without its stop, live included |
+| expires today | a carried (square-off off) strategy's entry after 15:15 into a contract expiring that day — it would be closed at once (`EXPIRY`) |
 | reentry / roll / hedge no capital | an option adjustment didn't fit (5.1) |
 
 **Performance**

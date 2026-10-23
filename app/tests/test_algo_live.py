@@ -517,3 +517,186 @@ def test_a_tick_through_the_target_exits_without_waiting_for_the_sweep(monkeypat
     assert t["status"] == "closed" and t["exit_reason"] == "TARGET"
     assert r.last_tick_exit == now + 0.3
     assert any(e["msg"].startswith("live-spread: TARGET") and e.get("strategy_id") == sid for e in r.events)
+
+
+# ---- carried F&O positions and their expiry --------------------------------------
+
+DAY_START = DAY0 - 33300                       # 2025-01-01 00:00 IST
+EXP_TODAY = DAY_START + 55800                   # 15:30 IST that day: the contracts' expiry
+CARRY = {"session": {"start": "09:15", "end": "15:00", "square_off": None}}
+
+
+def _carried_trade(strategy_id: int, exp: int, *, far_exp: int | None = None) -> int:
+    """An open carried call spread on NIFTY: bought 24500 CE, sold 24500 PE
+    (NRML), both expiring at `exp` — or the PE at `far_exp` (a calendar)."""
+    with dbs.SessionLocal() as db:
+        t = AlgoTrade(strategy_id=strategy_id, symbol="NSE:NIFTY50-INDEX", side="BUY", quantity=65,
+                      mode="live", status="open", entry_price=24570.0,
+                      entry_at=rn._utc(DAY_START - 5 * 86400 + 40000).replace(tzinfo=None), ref="u", ref_sign=1,
+                      legs=[{"symbol": "NSE:NIFTYCE", "kind": "CE", "act": 1, "qty": 65, "entry": 100.0, "label": "CE",
+                             "K": 24500.0, "exp": exp, "product": "MARGIN"},
+                            {"symbol": "NSE:NIFTYPE", "kind": "PE", "act": -1, "qty": 65, "entry": 90.0, "label": "PE",
+                             "K": 24500.0, "exp": far_exp or exp, "product": "MARGIN"}])
+        db.add(t)
+        db.commit()
+        return t.id
+
+
+def _at(hh: int, mm: int, day_offset: int = 0) -> float:
+    return DAY_START + day_offset * 86400 + hh * 3600 + mm * 60
+
+
+def test_carried_position_is_closed_at_15_15_on_its_expiry_day(monkeypatch, isolated_db):
+    px = {"NSE:NIFTY50-INDEX": 24600.0, "NSE:NIFTYCE": 101.0, "NSE:NIFTYPE": 2.0}
+    broker = FakeBroker(net={"NSE:NIFTYCE": 65, "NSE:NIFTYPE": -65}, fills={"NSE:NIFTYCE": 100.5, "NSE:NIFTYPE": 2.1})
+    _install(monkeypatch, broker, px)
+    sid = _strategy(**CARRY)
+    spec = _row_spec(sid)
+    tid = _carried_trade(sid, EXP_TODAY)
+    r = rn.AlgoRunner()
+    for now in (_at(15, 14), _at(15, 15)):
+        asyncio.run(r._manage([_row_dict(tid)], {sid: {"spec": spec}}, now, int((now + rn.IST) % 86400) // 60, DAY_START))
+        if now == _at(15, 14):
+            assert broker.orders == [] and _row_dict(tid)["status"] == "open"     # not before 15:15
+    # the written leg is bought back first, then the bought one sold — NRML, as it was opened
+    assert [(o["symbol"], o["side"], o["exit"], o["product"]) for o in broker.orders] == [
+        ("NSE:NIFTYPE", "BUY", True, "MARGIN"), ("NSE:NIFTYCE", "SELL", True, "MARGIN")]
+    t = _row_dict(tid)
+    assert t["status"] == "closed" and t["exit_reason"] == "EXPIRY"
+    # the same position on a day it does NOT expire is left alone at 15:15
+    tid2 = _carried_trade(sid, EXP_TODAY + 7 * 86400)
+    n = len(broker.orders)
+    asyncio.run(r._manage([_row_dict(tid2)], {sid: {"spec": spec}}, _at(15, 16), 15 * 60 + 16, DAY_START))
+    assert len(broker.orders) == n and _row_dict(tid2)["status"] == "open"
+
+
+def _row_spec(sid: int) -> dict:
+    with dbs.SessionLocal() as db:
+        return rn.engine.normalize(db.get(AlgoStrategy, sid).spec)
+
+
+def _daily(closes: dict[int, float]):
+    """Fake data.recent_bars: daily candles {IST day offset from DAY_START: close}."""
+    async def recent_bars(sym, tf, bars=400, now=None):
+        assert tf == 1440, "settlement reads the daily candle"
+        ts = [DAY_START + k * 86400 for k in sorted(closes)]
+        cs = [closes[k] for k in sorted(closes)]
+        return {"t": ts, "o": cs, "h": cs, "l": cs, "c": cs, "v": [0] * len(cs), "tf_s": 86400}
+    return recent_bars
+
+
+def test_runner_books_a_carried_contract_found_already_expired(monkeypatch, isolated_db):
+    """The runner was down at Wednesday's 15:15 exit. On Thursday it books the
+    expired spread at its settlement value — the call at its intrinsic value
+    against NIFTY's Wednesday close, the put at 0 — and sends no order: the
+    exchange has already settled it."""
+    px = {"NSE:NIFTY50-INDEX": 24700.0}
+    broker = FakeBroker(net={"NSE:NIFTYCE": 0, "NSE:NIFTYPE": 0})
+    _install(monkeypatch, broker, px)
+    monkeypatch.setattr(rn.data, "recent_bars", _daily({-1: 24480.0, 0: 24620.0, 1: 24700.0}))
+    sid = _strategy(**CARRY)
+    with dbs.SessionLocal() as db:
+        db.get(AlgoStrategy, sid).enabled = False        # settlement only: no new signals in this test
+        db.commit()
+    tid = _carried_trade(sid, EXP_TODAY)
+    asyncio.run(rn.AlgoRunner().tick(_at(9, 20, day_offset=1)))          # Thursday 09:20
+    assert broker.orders == []
+    t = _row_dict(tid)
+    assert t["status"] == "closed" and t["exit_reason"] == "EXPIRY"      # not CLOSED_EXTERNAL
+    assert rn._epoch(t["exit_at"]) == EXP_TODAY                           # Wednesday's P&L, not Thursday's
+    ce, pe = t["legs"]
+    assert (ce["exit"], pe["exit"]) == (120.0, 0.0) and ce["external"] and pe["external"]
+    assert t["gross_pnl"] == pytest.approx((120.0 - 100.0) * 65 + (90.0 - 0.0) * 65)
+
+
+def test_an_intraday_position_keeps_the_broker_checked_square_off(monkeypatch, isolated_db):
+    """MIS legs of an intraday strategy are squared off by the broker itself
+    (~15:20), not settled by the exchange: after the close they still go the
+    usual square-off way (the broker is flat -> booked at the last price)."""
+    px = {"NSE:NIFTY50-INDEX": 24620.0, "NSE:NIFTYCE": 118.0, "NSE:NIFTYPE": 0.05}
+    broker = FakeBroker(net={"NSE:NIFTYCE": 0, "NSE:NIFTYPE": 0})
+    _install(monkeypatch, broker, px)
+    monkeypatch.setattr(rn.data, "recent_bars", _daily({0: 24620.0}))
+    sid = _strategy()                                                      # square-off 15:15
+    with dbs.SessionLocal() as db:
+        db.get(AlgoStrategy, sid).enabled = False
+        t = db.get(AlgoTrade, _carried_trade(sid, EXP_TODAY))
+        t.legs = [{**lg, "product": "INTRADAY"} for lg in t.legs]
+        t.entry_at = rn._utc(_at(10, 0)).replace(tzinfo=None)               # opened today, 10:00
+        tid = t.id
+        db.commit()
+    asyncio.run(rn.AlgoRunner().tick(_at(15, 40)))
+    t = _row_dict(tid)
+    assert broker.orders == [] and t["status"] == "closed"
+    assert t["exit_reason"] == "CLOSED_EXTERNAL" and t["legs"][0]["exit"] == 118.0     # not settled at 120
+
+
+def test_after_the_close_on_expiry_day_the_settlement_is_booked_not_ordered(monkeypatch, isolated_db):
+    px = {"NSE:NIFTY50-INDEX": 24620.0}                # NIFTY's last price after the close
+    broker = FakeBroker(net={"NSE:NIFTYCE": 65, "NSE:NIFTYPE": -65})
+    _install(monkeypatch, broker, px)
+    monkeypatch.setattr(rn.data, "recent_bars", _daily({-1: 24480.0}))   # today's candle not out yet
+    sid = _strategy(**CARRY)
+    with dbs.SessionLocal() as db:
+        db.get(AlgoStrategy, sid).enabled = False
+        db.commit()
+    tid = _carried_trade(sid, EXP_TODAY)
+    asyncio.run(rn.AlgoRunner().tick(_at(15, 40)))                         # the 15:15 exit failed / was missed
+    assert broker.orders == []                                             # nothing sent after the close
+    t = _row_dict(tid)
+    assert t["status"] == "closed" and t["exit_reason"] == "EXPIRY" and t["legs"][0]["exit"] == 120.0
+
+
+def test_a_calendar_s_far_leg_is_closed_when_the_market_opens(monkeypatch, isolated_db):
+    """The near leg (the call) expired while the runner was down: it is settled
+    at once; the put of next week is closed by the next session's first pass —
+    never by an order after hours."""
+    px = {"NSE:NIFTY50-INDEX": 24700.0, "NSE:NIFTYCE": 0.05, "NSE:NIFTYPE": 30.0}
+    broker = FakeBroker(net={"NSE:NIFTYCE": 0, "NSE:NIFTYPE": -65}, fills={"NSE:NIFTYPE": 30.5})
+    _install(monkeypatch, broker, px)
+    monkeypatch.setattr(rn.data, "recent_bars", _daily({0: 24620.0}))
+    sid = _strategy(**CARRY)
+    with dbs.SessionLocal() as db:
+        db.get(AlgoStrategy, sid).enabled = False
+        db.commit()
+    tid = _carried_trade(sid, EXP_TODAY, far_exp=EXP_TODAY + 7 * 86400)
+    r = rn.AlgoRunner()
+    asyncio.run(r.tick(_at(8, 30, day_offset=1)))                          # Thursday, before the open
+    assert broker.orders == []
+    t = _row_dict(tid)
+    assert t["status"] == "open" and t["legs"][0]["exit"] == 120.0 and t["legs"][0]["exit_reason"] == "EXPIRY"
+    assert "exit" not in t["legs"][1]
+    asyncio.run(r.tick(_at(9, 16, day_offset=1)))                          # the market is open: the rest goes
+    assert [(o["symbol"], o["side"], o["exit"]) for o in broker.orders] == [("NSE:NIFTYPE", "BUY", True)]
+    t = _row_dict(tid)
+    assert t["status"] == "closed" and t["exit_reason"] == "EXPIRY"
+    assert t["gross_pnl"] == pytest.approx((120.0 - 100.0) * 65 - (30.5 - 90.0) * 65)
+
+
+def test_a_future_opened_before_legs_carried_their_expiry_is_still_known():
+    # No scrip master here: NIFTY's January 2025 future expired on the last Thursday (Jan 30).
+    from datetime import date
+
+    assert rn._leg_expiry_day({"kind": "FUT", "symbol": "NSE:NIFTY25JANFUT"}) == (date(2025, 1, 30) - date(1970, 1, 1)).days
+    assert rn._leg_expiry_day({"kind": "EQ", "symbol": "NSE:SBIN-EQ"}) is None
+
+
+def test_a_carried_strategy_opens_nothing_expiring_that_day_after_15_15(monkeypatch, isolated_db):
+    px = {"NSE:NIFTY50-INDEX": 24570.0, "NSE:NIFTYCE": 100.0, "NSE:NIFTYPE": 90.0}
+    broker = FakeBroker(fills={"NSE:NIFTYCE": 100.0, "NSE:NIFTYPE": 90.0})
+    _install(monkeypatch, broker, px)
+
+    async def expiring_legs(spec_, sym, side, u, now):
+        return [{"symbol": "NSE:NIFTYCE", "kind": "CE", "act": 1, "per_set": 65, "label": "CE", "price": 100.0,
+                 "K": 24500.0, "exp": EXP_TODAY}]
+
+    monkeypatch.setattr(rn, "build_legs", expiring_legs)
+    sid = _strategy(**CARRY)
+    r = rn.AlgoRunner()
+    strategies, _ = rn._snapshot()
+    s = next(x for x in strategies if x["id"] == sid)
+    book = {"realized": 0.0, "today": 0.0, "margin": 0.0, "open": 0}
+    asyncio.run(r._enter(s, "NSE:NIFTY50-INDEX", "BUY", {}, _at(15, 16), book))
+    assert broker.orders == [] and any("expires today" in e["msg"] for e in r.events)
+    asyncio.run(r._enter(s, "NSE:NIFTY50-INDEX", "BUY", {}, _at(15, 10), book))     # before 15:15: allowed
+    assert [o["symbol"] for o in broker.orders] == ["NSE:NIFTYCE"]

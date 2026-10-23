@@ -30,7 +30,10 @@ Modes, chosen per strategy on the Algo page:
 Invariants kept: Fyers-only prices; no live price -> no entry and no booked
 exit (never a synthetic fill); everything is flat by the square-off time and
 anything left at 15:30 is closed — unless the strategy's square-off is switched
-off: then it carries forward (live orders go out as NRML / CNC, not MIS).
+off: then it carries forward (live orders go out as NRML / CNC, not MIS), and an
+F&O position is still closed at 15:15 on its nearest contract's expiry day
+(EXPIRY: never into the exchange's settlement — stock F&O deliver physically);
+one found already expired is booked at its settlement value, no order sent.
 """
 from __future__ import annotations
 
@@ -584,7 +587,8 @@ async def build_legs(spec: dict, sym: str, side: str, u: float, now: float) -> l
         if not fs:
             raise ValueError(f"no {inst['expiry']} {name} future in the F&O master")
         px = (await _ltp([fs])).get(fs)
-        return [{"symbol": fs, "kind": "FUT", "act": sign, "per_set": lot_of(fs), "label": fs.split(":")[-1], "price": px}]
+        return [{"symbol": fs, "kind": "FUT", "act": sign, "per_set": lot_of(fs), "label": fs.split(":")[-1], "price": px,
+                 "exp": fno.contract_expiry(fs)}]
     backend = data._backend()
     cfgs = inst["legs_long" if side == "BUY" else "legs_short"]
     count = min(50, max([c["steps"] for c in cfgs] + [0]) + 3) \
@@ -623,7 +627,7 @@ async def build_legs(spec: dict, sym: str, side: str, u: float, now: float) -> l
                 raise ValueError(f"no {inst['expiry']} {name} future in the F&O master")
             legs.append({"symbol": fs, "kind": "FUT", "act": 1 if c["action"] == "BUY" else -1, "src": src,
                          "per_set": lot_of(fs) * c["lots"], "label": fs.split(":")[-1],
-                         "price": (await _ltp([fs])).get(fs)})
+                         "price": (await _ltp([fs])).get(fs), "exp": fno.contract_expiry(fs)})
             continue
         exp, rows, step, spot = await chain_for(c.get("expiry") or inst["expiry"])
         key = c["right"].lower()
@@ -669,6 +673,28 @@ def _syms(t: dict) -> set[str]:
     return {lg["symbol"].upper() for lg in t["legs"]} | {t["symbol"].upper()}
 
 
+def _leg_expiry_day(lg: dict) -> Optional[int]:
+    """The IST day a leg's contract expires on (None: shares, or not known). A
+    future opened before its legs carried "exp" is looked up by its symbol."""
+    if lg.get("kind") not in ("CE", "PE", "FUT"):
+        return None
+    e = lg.get("exp") or (fno.contract_expiry(lg["symbol"]) if lg["kind"] == "FUT" else None)
+    return int((e + IST) // 86400) if e else None
+
+
+def _expiry_day(t: dict) -> Optional[int]:
+    """The nearest expiry day among a position's still-open legs."""
+    days = [d for lg in t["legs"] if lg.get("exit") is None and (d := _leg_expiry_day(lg)) is not None]
+    return min(days) if days else None
+
+
+def _settle_value(lg: dict, u: float) -> float:
+    """What the exchange settles an expired leg at, the underlying having closed at `u`."""
+    if lg["kind"] == "FUT":
+        return u
+    return max(0.0, u - lg["K"]) if lg["kind"] == "CE" else max(0.0, lg["K"] - u)
+
+
 class AlgoRunner:
     TICK_S = 1.0          # candle entries + an exit sweep on REST-backed LTP every second
     FAST_GAP_S = 0.05     # tick-driven exits: at most one pass per 50 ms, however fast ticks arrive
@@ -683,6 +709,7 @@ class AlgoRunner:
         self._sync_day: Optional[int] = None
         self._master_day: Optional[int] = None
         self._halted: set[tuple[int, int]] = set()
+        self._closes: dict[tuple[str, int], float] = {}   # (underlying, IST day) -> close, for expiry settlements
         # Pullback / breakout entries waiting for their trigger price.
         # ponytail: in memory — a restart drops pending triggers (they expire
         # within a few bars anyway); persist them if that ever costs a trade.
@@ -810,6 +837,16 @@ class AlgoRunner:
             if stale:
                 await self._close_stale(stale)
                 open_trades = [t for t in open_trades if t not in stale]
+            # A carried contract that expired while still open (the runner was down at its
+            # 15:15 exit, or that exit kept failing): the exchange settled it — book that.
+            # (An intraday MIS position the broker squared off itself goes the way above.)
+            expired = [t for t in open_trades if (xd := _expiry_day(t)) is not None
+                       and (xd < day or (xd == day and mins >= CLOSE_MIN))
+                       and (_carries(by_id.get(t["strategy_id"]))
+                            or any(lg.get("product", "INTRADAY") != "INTRADAY" for lg in t["legs"]))]
+            if expired:
+                await self._settle_expired(expired, now)
+                open_trades = [t for t in open_trades if t not in expired]
             if mins >= OPEN_MIN:
                 await self._manage(open_trades, by_id, now, min(mins, CLOSE_MIN), day_start)  # past close: every square-off
             self._open, self._by_id = open_trades, by_id
@@ -849,12 +886,22 @@ class AlgoRunner:
         if prices is None:
             syms = {lg["symbol"] for t in trades for lg in t["legs"]} | {t["symbol"] for t in trades}
             prices = await _ltp(list(syms))
+        day = int((now + IST) // 86400)
         for t in trades:
             s = by_id.get(t["strategy_id"])
             spec = s["spec"] if s else None
             sq = engine.session_window(spec)[2] if spec else 15 * 60 + 15
             if mins >= sq:
                 await self._exit(t, prices, "SQUARE_OFF", now)
+                continue
+            # A carried F&O position is out by 15:15 on its contract's expiry day — never
+            # into the exchange's settlement — and so is what is left of one whose expired
+            # leg was settled (_settle_expired); only while the market is open (`mins`
+            # stops at the close), so no order goes out after hours.
+            if _carries(s) and mins < CLOSE_MIN and (
+                    (mins >= engine.EXPIRY_EXIT_MIN and _expiry_day(t) == day)
+                    or any(lg.get("exit_reason") == "EXPIRY" for lg in t["legs"])):
+                await self._exit(t, prices, "EXPIRY", now)
                 continue
             reason = None
             if any(lg.get("exit") is None and (lg.get("sl") is not None or lg.get("tg") is not None)
@@ -865,7 +912,6 @@ class AlgoRunner:
                 await self._exit(t, prices, reason, now)
             elif t.get("scale") and t["scale"]["levels"]:
                 await self._scale_out(t, prices, now)
-        day = int((now + IST) // 86400)
         for sid in {t["strategy_id"] for t in trades}:
             s = by_id.get(sid)
             if not s or not (s["spec"]["daily"]["max_loss"] or s["spec"]["daily"]["max_profit"]):
@@ -1089,6 +1135,71 @@ class AlgoRunner:
                     q = qs.get(lg["symbol"].upper())
                     lg["exit"] = (q.prev_close if q is not None and q.prev_close else None) or lg["entry"]
             await self._book(t, "STALE_SESSION", time.time())
+
+    async def _close_on(self, symbol: str, day: int, now: float) -> Optional[float]:
+        """`symbol`'s closing price on IST day `day`: its daily candle (today's once
+        the session has closed), else — for today — its last price. None if unknown."""
+        key = (symbol.upper(), day)
+        if key not in self._closes:
+            px = None
+            try:
+                b = await data.recent_bars(symbol, 1440, bars=max(40, int((now + IST) // 86400) - day + 10), now=now)
+                px = next((c for t_, c in zip(b["t"], b["c"]) if int((t_ + IST) // 86400) == day), None)
+            except Exception as e:  # noqa: BLE001 — retried on a later tick
+                log.warning("algo.settle_close_failed", symbol=symbol, error=str(e)[:200])
+            if px is None and day == int((now + IST) // 86400):
+                px = (await _ltp([symbol])).get(symbol.upper())
+            if px is None:
+                return None
+            self._closes[key] = float(px)
+        return self._closes[key]
+
+    async def _settle_expired(self, trades: list[dict], now: float) -> None:
+        """Carried positions with a contract that expired while still open — the
+        runner was down at the expiry-day exit, or it kept failing. The exchange
+        has settled those contracts: each is booked at its settlement value (an
+        option at its intrinsic value against the underlying's close on the
+        expiry day, a future at that close) with no order sent. A leg of a later
+        expiry stays open until the market is: _manage then closes it (EXPIRY)."""
+        day = int((now + IST) // 86400)
+        mins = int((now + IST) % 86400) // 60
+        for t in trades:
+            if t["id"] in self._busy or self._retry_at.get(t["id"], 0) > now:
+                continue
+            fresh = await asyncio.to_thread(_fresh, t["id"])
+            if fresh is None or fresh["status"] != "open":
+                continue
+            t.update(fresh)
+            who = self.label(t["strategy_id"], t.get("version"))
+            done = []
+            for lg in t["legs"]:
+                xd = _leg_expiry_day(lg)
+                if lg.get("exit") is not None or xd is None or xd > day or (xd == day and mins < CLOSE_MIN):
+                    continue
+                u = await self._close_on(t["symbol"], xd, now)
+                if u is None:
+                    self._retry_at[t["id"]] = now + 300
+                    self.event("error", f"{who}: {lg.get('label') or lg['symbol']} expired — no close of "
+                                        f"{t['symbol']} for that day yet; its settlement is retried",
+                               trade_id=t["id"], strategy_id=t["strategy_id"])
+                    break
+                lg["exit"], lg["exit_reason"], lg["external"] = _settle_value(lg, u), "EXPIRY", True
+                done.append(lg)
+            if not done:
+                continue
+            if fno.asset_class(fno.fno_name(t["symbol"])) == "stock" and t["mode"] == "live" \
+                    and any(lg["kind"] == "FUT" or lg["exit"] > 0 for lg in done):
+                self.event("error", f"{who}: {', '.join(lg.get('label') or lg['symbol'] for lg in done)} expired open — "
+                                    "stock F&O settle by physical delivery: check the delivery position at the broker",
+                           trade_id=t["id"], strategy_id=t["strategy_id"])
+            if all(lg.get("exit") is not None for lg in t["legs"]):
+                # booked on the (last) expiry day, 15:30: that day's P&L, not today's
+                await self._book(t, "EXPIRY", min(now, max(_leg_expiry_day(lg) for lg in done) * 86400 - IST + 55800))
+            else:
+                await asyncio.to_thread(_update, t["id"], legs=t["legs"])
+                self.event("exit", f"{who}: {', '.join(lg.get('label') or lg['symbol'] for lg in done)} settled at "
+                                   "expiry — the rest of the position closes when the market is open",
+                           trade_id=t["id"], strategy_id=t["strategy_id"])
 
     async def _exit(self, t: dict, prices: dict[str, float], reason: str, now: float) -> bool:
         """Close every remaining leg. Partial progress (a leg that filled) is
@@ -1369,7 +1480,7 @@ class AlgoRunner:
         for lg in t["legs"]:
             g, c = engine.leg_pnl(lg["act"], lg["qty"], lg["entry"], lg["exit"], lg["kind"], True, lg.get("qty0"))
             gross, ch = gross + g, ch + c
-        if all(lg.get("external") for lg in t["legs"]) and reason not in ("STALE_SESSION",):
+        if all(lg.get("external") for lg in t["legs"]) and reason not in ("STALE_SESSION", "EXPIRY"):
             reason = "CLOSED_EXTERNAL"
         first = t["legs"][0]
         await asyncio.to_thread(
@@ -1572,6 +1683,13 @@ class AlgoRunner:
             legs = await build_legs(spec, sym, side, u, now)
         except Exception as e:  # noqa: BLE001
             self.event("error", f"{s['name']}: {side} {sym} skipped — {e}"[:300], strategy_id=s["id"])
+            return
+        today = int((now + IST) // 86400)
+        if _carries(s) and int((now + IST) % 86400) // 60 >= engine.EXPIRY_EXIT_MIN \
+                and any(_leg_expiry_day(lg) == today for lg in legs):
+            self.event("info", f"{s['name']}: {side} {sym} skipped — "
+                               f"{', '.join(lg['label'] for lg in legs if _leg_expiry_day(lg) == today)} expires today; "
+                               "a carried position would be closed at once (no new ones after 15:15)", strategy_id=s["id"])
             return
         if any(not lg.get("price") for lg in legs):
             self.event("error", f"{s['name']}: {side} {sym} skipped — no live price for "
