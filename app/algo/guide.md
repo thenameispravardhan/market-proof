@@ -53,8 +53,14 @@ the JSON — the messages say exactly which value is wrong.
   the close). Nothing ever sees a candle that is still forming.
 * **Stops and targets** are checked inside each candle; when one candle
   touches both, the stop is assumed to come first (the conservative choice).
+  A market entry fills at the candle's open, so that whole candle counts for
+  its stop and target. A pullback / breakout entry that fills inside a candle
+  can still be stopped in it (measured from the fill), but can't book a
+  target there — nor count that candle's high / low from before its fill.
 * **Everything is flat by the square-off time** (unless square-off is
-  switched off — then positions carry overnight until an exit rule closes them).
+  switched off — then positions carry overnight until an exit rule closes them;
+  an F&O position is settled at its nearest contract's expiry: options at
+  their intrinsic value, futures at the close — exit reason `EXPIRY`).
 * **Options in backtests are priced with Black-Scholes** from the underlying's
   real candles (Fyers keeps no history for expired contracts). IV comes from
   India VIX (indices), the stock's realised volatility, a fixed number, or
@@ -457,7 +463,8 @@ uses implied volatility from the real option prices.
 * `start` / `end` — entries only between these (IST). `null` = from the open /
   until square-off.
 * `square_off` — everything is closed at this time; `null` = carry positions
-  overnight (exit rules still apply). Live square-off must be ≤ 15:15.
+  overnight (exit rules still apply; backtests settle a futures / options
+  position at its nearest leg's expiry, `EXPIRY`). Live square-off must be ≤ 15:15.
 * Must satisfy 09:15 ≤ start ≤ end ≤ square_off ≤ 15:29.
 * `days` — entries only on these weekdays, 1 = Mon … 5 = Fri (absent = every day).
 
@@ -713,7 +720,7 @@ read the flag, then pause the strategy yourself or shadow-test a fix.
 `RULE_<METRIC>` (position rule), `LEG_SL` / `LEG_TARGET` / `LEG_COST`
 (a leg's own stop / target / cost stop), `LEG_ROLL` (a leg rolled out),
 `DAILY_MAX_LOSS`, `DAILY_TARGET`, `SQUARE_OFF`, `EOD` (a new day began),
-`END` (end of the data), and live only `MANUAL`, `STALE_SESSION`,
+`EXPIRY` (a carried F&O position's contract expired), `END` (end of the data), and live only `MANUAL`, `STALE_SESSION`,
 `CLOSED_EXTERNAL`, `GUARD` (its guard flattened it), `BOOK_MAX_LOSS` (the
 book's day loss limit), `BOOK_KILL` (the kill switch).
 
@@ -1490,12 +1497,12 @@ real ticks** = the rest of the order-flow values were estimated per minute.
 |---|---|---|
 | Net P&L | after charges and slippage | |
 | Return | net ÷ starting capital | |
-| CAGR | annualised return (needs 30+ days) | |
+| CAGR | annualised return over the tested range (needs 30+ days) | |
 | Win rate | % of trades that made money | means little alone — read it with the payoff ratio |
 | Profit factor | gross wins ÷ gross losses | > 1.3 decent, > 1.7 good, < 1 loses |
 | Expectancy | average net per trade | must clear costs comfortably |
 | Max drawdown | worst peak-to-trough fall of equity (₹ and %) | size capital for ~2× this |
-| Sharpe | daily P&L mean ÷ sd, annualised (√252) | > 1 decent, > 2 strong (intraday) |
+| Sharpe | daily P&L mean ÷ sd over every session of the range (a day without a trade counts as 0), annualised (√252); Sortino, PSR, VaR, skew use the same days | > 1 decent, > 2 strong (intraday) |
 | Sortino | Sharpe counting only down days as risk | |
 | Calmar | CAGR ÷ max drawdown % | > 1 good |
 | Charges | brokerage, STT, exchange, SEBI, GST, stamp, by segment | close to gross P&L = the edge is eaten by costs |

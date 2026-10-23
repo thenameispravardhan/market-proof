@@ -317,6 +317,33 @@ describe("Algo Lab", () => {
     expect(screen.queryByText("Butterfly")).toBeNull();
   });
 
+  it("keeps a combined right-hand value when the operator changes", async () => {
+    mount();
+    await screen.findByDisplayValue(/EMA 9\/21/);
+    fireEvent.change(screen.getAllByDisplayValue("EMA")[1], { target: { value: "@math" } });   // EMA 9 crosses above (EMA 21 − EMA 21)
+    fireEvent.change(screen.getAllByDisplayValue("crosses above")[0], { target: { value: ">" } });
+    fireEvent.click(screen.getByText("▶ Run backtest"));
+    await waitFor(() => expect(calls.some((c) => c.url.includes("/api/algo/backtest"))).toBe(true));
+    const c0 = JSON.parse(String(calls.find((c) => c.url.includes("/api/algo/backtest"))!.init!.body)).spec.entry_long.conditions[0];
+    expect(c0.op).toBe(">");
+    expect(c0.right).toMatchObject({ math: "-", a: { ind: "EMA" }, b: { ind: "EMA" } });      // not replaced by the number 0
+  });
+
+  it("drops a leg's option-only settings when it is switched to a future", async () => {
+    mount();
+    await screen.findByDisplayValue(/EMA 9\/21/);
+    const k = TEMPLATES.findIndex((t) => t.name.includes("9:20 short straddle"));
+    fireEvent.change(screen.getByDisplayValue("— load a template —"), { target: { value: String(k) } });
+    await screen.findByTestId("payoff-panel");
+    fireEvent.change(screen.getAllByTestId("leg-sl_pct")[0].querySelector("input")!, { target: { value: "30" } });
+    fireEvent.change(screen.getAllByTestId("leg-expiry")[0], { target: { value: "next" } });
+    fireEvent.change(screen.getAllByDisplayValue("CE (call)")[0], { target: { value: "FUT" } });
+    fireEvent.click(screen.getByText("▶ Run backtest"));
+    await waitFor(() => expect(calls.some((c) => c.url.includes("/api/algo/backtest"))).toBe(true));
+    const leg = JSON.parse(String(calls.find((c) => c.url.includes("/api/algo/backtest"))!.init!.body)).spec.instrument.legs_long[0];
+    expect(leg).toEqual({ right: "FUT", action: "SELL", strike: "ATM", steps: 0, premium: 100, lots: 1 });   // no hidden SL % / own expiry
+  });
+
   it("sends per-leg stops, the on-leg-stop action, MTM % of premium and Greek rules", async () => {
     mount();
     await screen.findByDisplayValue(/EMA 9\/21/);

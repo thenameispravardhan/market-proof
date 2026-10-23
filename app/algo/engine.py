@@ -1827,7 +1827,9 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                      "risk": lv["sl_dist"] * legs[0]["per_set"] * sets
                      if lv["sl_dist"] and (ref != "u" or inst["type"] != "option") else None,
                      "t": t, "i": i, "day": (t + IST) // 86400, "u0": u, "sets": sets, "margin": margin,
-                     "exit_pending": None, "mid_bar": u_fill is not None,
+                     # a fill AT the open (a market entry, or a trigger the open gapped through)
+                     # has the whole candle after it; only a fill inside the candle is mid-bar
+                     "exit_pending": None, "mid_bar": u_fill is not None and u_fill != d["o"][i],
                      "so": scale_plan(lv["so"], sets), "so_k": 0, "greeks0": greeks0,
                      "leg_rules": any(l.get("sl") is not None or l.get("tg") is not None for l in legs),
                      **({"pair": True, "mtm_lo": 0.0, "mtm_hi": 0.0,
@@ -1950,8 +1952,11 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         sgn = pos["sign"]
         later = i > pos["i"]
         # A mid-bar (triggered) fill can't claim the entry bar's favourable
-        # extreme: OHLC doesn't say it came after the fill. Stops still count.
+        # extreme: OHLC doesn't say it came after the fill. Stops still count,
+        # but from the fill: the stretch from the open to the fill (which may
+        # already lie beyond the new stop) happened before the position existed.
         fav_ok = later or not pos.get("mid_bar")
+        u0 = o if fav_ok else pos["u0"]
         f = lambda u: ref_at(pos, u, t, iv)  # noqa: E731
         stops = [x for x in (pos["sl"], pos["trail"], pos["ref_entry"] if pos["be_on"] else None) if x is not None]
         if stops:
@@ -1963,7 +1968,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
             if later and sgn * (ro - stop) <= 0:
                 return close(sym, o, t, why, i)
             if sgn * (f(u_adv) - stop) <= 0:
-                return close(sym, _solve(f, stop, o, u_adv), t, why, i)
+                return close(sym, _solve(f, stop, u0, u_adv), t, why, i)
         while pos["so"] and fav_ok:                 # scale-out levels, nearest first, filled like a target
             lvl, n = pos["so"][0]
             if pos["tg"] is not None and sgn * (lvl - pos["tg"]) >= 0:
@@ -1991,7 +1996,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         m_stop, m_target = mtm_limits(mtm_rules, pos["legs"])
         if m_stop or m_target or mtm_rules["trail_start"]:
             m = lambda u: mtm(pos, u, t, iv)  # noqa: E731
-            pts = sorted((o, h, l, c), key=m)
+            pts = sorted((u0, h, l, c), key=m)
             lo_u, hi_u = pts[0], pts[-1]
             floor = -m_stop if m_stop else None
             if mtm_rules["trail_start"] and pos["peak"] is not None and pos["peak"] >= mtm_rules["trail_start"]:
@@ -2003,10 +2008,29 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
             else:
                 why = "MTM_SL"
             if floor is not None and m(lo_u) <= floor:
-                return close(sym, o if m(o) <= floor else _solve(m, floor, o, lo_u), t, why, i)
+                return close(sym, u0 if m(u0) <= floor else _solve(m, floor, u0, lo_u), t, why, i)
             if m_target and fav_ok and m(hi_u) >= m_target:
                 u_x = o if m(o) >= m_target else _solve(m, m_target, o, hi_u)
                 return close(sym, u_x, t, "MTM_TARGET", i, slipped=False)
+
+    def expires(pos: dict) -> float:
+        """When the position's nearest open contract expires (inf: shares only)."""
+        return min((l["exp"] for l in pos["legs"] if l.get("exp") and l.get("exit") is None), default=math.inf)
+
+    def settle(sym: str, j: int, t: float) -> None:
+        """No contract outlives its expiry: a carried F&O position is closed on
+        candle j, the last before `t`. The contracts that expired by `t` settle
+        there without slippage (options at their intrinsic value, futures at the
+        close); any later-expiry leg exits at that close like any other exit."""
+        d = st[sym]["d"]
+        u, ub = d["c"][j], ub_at(sym, j, "c")
+        for l in st[sym]["pos"]["legs"]:
+            if l.get("exit") is not None or not l.get("exp") or l["exp"] > t:
+                continue
+            l["exit"] = ub if l.get("other") else u if l["kind"] == "FUT" else \
+                max(0.0, u - l["K"] if l["kind"] == "CE" else l["K"] - u)
+            l["exit_reason"] = "EXPIRY"
+        close(sym, u, ind.close_time(d, j), "EXPIRY", j, ub=ub)
 
     for t, _, k, i in events:
         sym = syms[k]
@@ -2017,6 +2041,8 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
             day_key, day_realized = day, 0.0
         if s_["pos"] and day != s_["pos"]["day"] and sq < CARRY:
             close(sym, d["c"][i - 1], ind.close_time(d, i - 1), "EOD", i - 1, ub=ub_at(sym, i - 1, "c"))
+        if s_["pos"] and i and t >= expires(s_["pos"]):
+            settle(sym, i - 1, t)
         if s_["pos"] and (s_["pos"]["exit_pending"] or mod >= sq):
             close(sym, d["o"][i], t, s_["pos"]["exit_pending"] or "SQUARE_OFF", i, ub=ub_at(sym, i, "o"))
         if s_["pending"]:
@@ -2053,7 +2079,10 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
             iv = d["iv"][i] if inst["type"] == "option" else 0.0
             f = lambda u: ref_at(pos, u, t, iv)  # noqa: E731
             sgn = pos["sign"]
-            best_now = max((d["h"][i], d["l"][i]), key=lambda u: sgn * f(u))
+            # a mid-bar fill's own candle: its favourable extreme may predate the
+            # fill, so only the fill and the close count towards the best price
+            fav = (pos["u0"], d["c"][i]) if i == pos["i"] and pos.get("mid_bar") else (d["h"][i], d["l"][i])
+            best_now = max(fav, key=lambda u: sgn * f(u))
             worst_now = min((d["h"][i], d["l"][i]), key=lambda u: sgn * f(u))
             pos["best"] = max(pos["best"], f(best_now)) if sgn > 0 else min(pos["best"], f(best_now))
             pos["worst"] = min(pos["worst"], f(worst_now)) if sgn > 0 else max(pos["worst"], f(worst_now))
@@ -2139,13 +2168,17 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
             holds.append(hold)
         per_symbol[sym] = {k: s2[k] for k in ("trades", "win_rate", "net_pnl", "profit_factor", "max_drawdown")} \
             | {"bars": n_live, "buy_hold_pct": round(hold, 2) if hold is not None else None}
-    out = stats(trades, pf["capital"])
+    days = session_days(data, trade_from)
+    out = stats(trades, pf["capital"], days)
     out["skipped"] = skipped
     out["exposure_pct"] = round(sum(x["bars"] + 1 for x in positions(trades)) / live_bars * 100, 2) if live_bars else 0.0
     out["buy_hold_pct"] = round(sum(holds) / len(holds), 2) if holds else None
     if oos_from:
-        out["in_sample"] = summary(stats([x for x in trades if x["entry_t"] < oos_from], pf["capital"]))
-        out["out_of_sample"] = summary(stats([x for x in trades if x["entry_t"] >= oos_from], pf["capital"]))
+        cut = (oos_from + IST) // 86400
+        out["in_sample"] = summary(stats([x for x in trades if x["entry_t"] < oos_from], pf["capital"],
+                                         [k for k in days if k < cut]))
+        out["out_of_sample"] = summary(stats([x for x in trades if x["entry_t"] >= oos_from], pf["capital"],
+                                             [k for k in days if k >= cut]))
         out["oos_from"] = oos_from
     return {"stats": out, "per_symbol": per_symbol, "by_reason": by_reason(trades), "trades": trades}
 
@@ -2176,7 +2209,24 @@ def positions(trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(out, key=lambda x: x["exit_t"])
 
 
-def stats(trades: list[dict[str, Any]], capital: float) -> dict[str, Any]:
+def session_days(data: dict[str, dict], lo: Optional[float] = None, hi: Optional[float] = None) -> list[int]:
+    """IST day numbers with candles in [lo, hi) (by day): every session the
+    strategy could have traded, the flat ones included."""
+    lo_d = None if lo is None else (int(lo) + IST) // 86400
+    hi_d = None if hi is None else (int(hi) + IST) // 86400
+    out: set[int] = set()
+    for d in data.values():
+        days = d.get("trading_days") or frozenset((t + IST) // 86400 for t in d["t"])
+        out.update(k for k in days if (lo_d is None or k >= lo_d) and (hi_d is None or k < hi_d))
+    return sorted(out)
+
+
+def stats(trades: list[dict[str, Any]], capital: float, days: Optional[list[int]] = None) -> dict[str, Any]:
+    """`days`: the sessions of the tested range (session_days). The daily-return
+    statistics (Sharpe, Sortino, PSR, VaR, skew …) then count a day without an
+    exit as a 0 — a strategy that trades once a week has 4 flat days in 5, not
+    a Sharpe from its trading days alone — and CAGR is annualised over the range.
+    Without it only the days with an exit count."""
     rows = sorted(trades, key=lambda x: x["exit_t"])     # exit rows: P&L lands when each part closes
     trades = positions(rows)                             # positions: what per-trade metrics count
     n = len(trades)
@@ -2200,11 +2250,14 @@ def stats(trades: list[dict[str, Any]], capital: float) -> dict[str, Any]:
         ym = _ym(k)
         monthly[ym] = round(monthly.get(ym, 0.0) + x["net"], 2)
         weekday.setdefault((k + 3) % 7, []).append(x["net"])
-    dv = list(daily.values())
-    mean = sum(dv) / len(dv) if dv else 0.0
-    sd = math.sqrt(sum((v - mean) ** 2 for v in dv) / (len(dv) - 1)) if len(dv) > 1 else 0.0
-    down = [v for v in dv if v < 0]
-    dsd = math.sqrt(sum(v * v for v in down) / len(dv)) if down and dv else 0.0
+    dv = list(daily.values())                                   # the days with an exit
+    active = len(dv)                       # the sample-size gates below count these, as before
+    span = sorted(set(days) | set(daily)) if days else sorted(daily)
+    rv = [daily.get(k, 0.0) for k in span]                      # every session of the range, flat = 0
+    mean = sum(rv) / len(rv) if rv else 0.0
+    sd = math.sqrt(sum((v - mean) ** 2 for v in rv) / (len(rv) - 1)) if len(rv) > 1 else 0.0
+    down = [v for v in rv if v < 0]
+    dsd = math.sqrt(sum(v * v for v in down) / len(rv)) if down and rv else 0.0
     streak = {"win": 0, "loss": 0}
     cur_w = cur_l = 0
     for v in nets:
@@ -2224,12 +2277,13 @@ def stats(trades: list[dict[str, Any]], capital: float) -> dict[str, Any]:
     rs = [x["r"] for x in trades if x.get("r") is not None]
     maes = [x["mae_pct"] for x in trades if x.get("mae_pct") is not None]
     mfes = [x["mfe_pct"] for x in trades if x.get("mfe_pct") is not None]
-    days_span = ((trades[-1]["exit_t"] - trades[0]["entry_t"]) / 86400) if n else 0
+    days_span = (span[-1] - span[0] + 1 if days and span      # calendar days of the tested range
+                 else (trades[-1]["exit_t"] - trades[0]["entry_t"]) / 86400 if n else 0)
     final = capital + net
     from app.research import stats as rstats
-    rets = [v / capital for v in dv] if capital else []          # daily returns on starting capital
-    skew, kurt = rstats._skew_kurt(rets) if len(rets) > 2 else (None, None)   # noqa: SLF001
-    worst = sorted(dv)
+    rets = [v / capital for v in rv] if capital else []          # daily returns on starting capital
+    skew, kurt = rstats._skew_kurt(rets) if active > 2 else (None, None)   # noqa: SLF001
+    worst = sorted(rv)
     k5 = max(1, len(worst) // 20)                                # the worst 5% of days (at least one)
     pct = lambda q: worst[min(len(worst) - 1, int(q * len(worst)))]   # noqa: E731
     cagr = ((final / capital) ** (365 / days_span) - 1) * 100 if n and days_span >= 30 and final > 0 else None
@@ -2252,8 +2306,8 @@ def stats(trades: list[dict[str, Any]], capital: float) -> dict[str, Any]:
         "largest_loss": round(min(nets), 2) if nets else 0.0,
         "max_drawdown": round(max_dd, 2),
         "max_drawdown_pct": round(max_dd_pct, 2),
-        "sharpe": round(mean / sd * math.sqrt(252), 2) if sd > 0 else None,
-        "sortino": round(mean / dsd * math.sqrt(252), 2) if dsd > 0 else None,
+        "sharpe": round(mean / sd * math.sqrt(252), 2) if sd > 0 and active > 1 else None,
+        "sortino": round(mean / dsd * math.sqrt(252), 2) if dsd > 0 and active > 1 else None,
         "calmar": round((cagr or 0) / max_dd_pct, 2) if cagr is not None and max_dd_pct > 0 else None,
         "max_consecutive_wins": streak["win"], "max_consecutive_losses": streak["loss"],
         "avg_bars_held": round(sum(x["bars"] for x in trades) / n, 1) if n else 0.0,
@@ -2271,14 +2325,14 @@ def stats(trades: list[dict[str, Any]], capital: float) -> dict[str, Any]:
         "sqn": round(math.sqrt(min(n, 100)) * mean_t / sd_t, 2) if n > 1 and sd_t > 0 else None,
         # P(the true Sharpe > 0) given this many days and their skew / fat tails (Bailey & Lopez de Prado).
         "psr_pct": round(rstats.probabilistic_sharpe(rets) * 100, 1)
-        if len(rets) > 2 and rstats.probabilistic_sharpe(rets) is not None else None,
+        if active > 2 and rstats.probabilistic_sharpe(rets) is not None else None,
         "skew": round(skew, 2) if skew is not None else None,
         "excess_kurtosis": round(kurt - 3, 2) if kurt is not None else None,
         # historical 95% one-day Value at Risk and the average day beyond it (expected shortfall)
-        "var95": round(-pct(0.05), 2) if len(dv) >= 20 else None,
-        "cvar95": round(-sum(worst[:k5]) / k5, 2) if len(dv) >= 20 else None,
+        "var95": round(-pct(0.05), 2) + 0.0 if len(rv) >= 20 and active else None,          # + 0.0: no "-0"
+        "cvar95": round(-sum(worst[:k5]) / k5, 2) + 0.0 if len(rv) >= 20 and active else None,
         # size of the best 5% of days vs the worst 5%: > 1 = the right tail is fatter
-        "tail_ratio": round(abs(pct(0.95)) / abs(pct(0.05)), 2) if len(dv) >= 20 and pct(0.05) < 0 else None,
+        "tail_ratio": round(abs(pct(0.95)) / abs(pct(0.05)), 2) if len(rv) >= 20 and active and pct(0.05) < 0 else None,
         "avg_r": round(sum(rs) / len(rs), 3) if rs else None,
         "avg_mae_pct": round(sum(maes) / len(maes), 3) if maes else None,
         "avg_mfe_pct": round(sum(mfes) / len(mfes), 3) if mfes else None,
@@ -2419,7 +2473,8 @@ def optimize(spec: dict, data: dict[str, dict], grid: list[dict[str, Any]], metr
         raise ValueError(f"no valid combination: {invalid[0]}")
     ok = [r for r in rows if r["trades"] >= min_trades]
     ok.sort(key=lambda r: (r[metric] is not None, r[metric] or 0), reverse=True)
-    over = overfitting_stats([r["_daily"] for r in ok], capital, n_trials=prior_trials + len(combos))
+    over = overfitting_stats([r["_daily"] for r in ok], capital, n_trials=prior_trials + len(combos),
+                             sessions=session_days(data, trade_from, oos_from))
     for r in rows:
         r.pop("_daily", None)
     return {"combos": len(combos), "ranked": ok[:100],
@@ -2505,18 +2560,22 @@ def wf_folds(runs: list[tuple[dict, list[dict[str, Any]]]], data: dict[str, dict
     t0 = trade_from if trade_from is not None else min(d["t"][0] for d in data.values())
     t1 = max(d["t"][-1] for d in data.values()) + 1
     span = (t1 - t0) / (is_mult + windows)
-    folds, oos_trades, is_net, is_s = [], [], 0.0, 0.0
+    all_days = session_days(data)
+    day = lambda x: (int(x) + IST) // 86400  # noqa: E731
+    within = lambda a, b: [k for k in all_days if day(a) <= k and (b is None or k < day(b))]  # noqa: E731
+    folds, oos_trades, oos_days, is_net, is_s = [], [], [], 0.0, 0.0
     for k in range(windows):
         o0 = t0 + (is_mult + k) * span
         o1 = t1 if k == windows - 1 else o0 + span
         i0 = t0 if anchored else o0 - is_mult * span
+        is_days = within(i0, o0)
         best = None
         for params, trades in runs:
             # in-sample = entered AND exited before the window: no P&L from inside it
             ins = [x for x in trades if i0 <= x["entry_t"] and x["exit_t"] < o0]
             if len(ins) < min_trades:
                 continue
-            st_ = stats(ins, capital)
+            st_ = stats(ins, capital, is_days)
             key = (st_[metric] is not None, st_[metric] or 0)
             if best is None or key > best[0]:
                 best = (key, params, st_, trades)
@@ -2525,12 +2584,14 @@ def wf_folds(runs: list[tuple[dict, list[dict[str, Any]]]], data: dict[str, dict
         if best:
             outs = [x for x in best[3] if o0 <= x["entry_t"] < o1]
             oos_trades += outs
+            fold_days = within(o0, None if k == windows - 1 else o1)
+            oos_days += fold_days
             fold.update({"params": best[1], "is": summary(best[2]), "is_value": best[2][metric],
-                         "oos": summary(stats(outs, capital))})
+                         "oos": summary(stats(outs, capital, fold_days))})
             is_net += best[2]["net_pnl"]
             is_s += o0 - i0
         folds.append(fold)
-    total = stats(oos_trades, capital)
+    total = stats(oos_trades, capital, oos_days)
     oos_s = sum(f["oos_to"] - f["oos_from"] for f in folds if f["params"])
     wfe = (total["net_pnl"] / oos_s) / (is_net / is_s) * 100 if oos_s and is_s and is_net > 0 else None
     return {"metric": metric, "windows": windows, "anchored": anchored, "folds": folds,
@@ -2538,19 +2599,21 @@ def wf_folds(runs: list[tuple[dict, list[dict[str, Any]]]], data: dict[str, dict
             "wfe_pct": round(wfe, 1) if wfe is not None else None}, oos_trades
 
 
-def overfitting_stats(daily: list[dict[int, float]], capital: float, *, n_trials: int) -> Optional[dict[str, Any]]:
+def overfitting_stats(daily: list[dict[int, float]], capital: float, *, n_trials: int,
+                      sessions: Optional[list[int]] = None) -> Optional[dict[str, Any]]:
     """Deflated Sharpe Ratio of the top-ranked configuration and the
     Probability of Backtest Overfitting across all ranked ones.
 
     `daily` is in rank order (best first), one {day: net P&L} per
-    configuration. Days a configuration did not trade count as a 0 return.
-    `n_trials` is EVERY combination tried, not just the ranked ones: the
-    deflation is only honest with the full count of attempts."""
+    configuration. Days a configuration did not trade count as a 0 return,
+    and so do the `sessions` (session_days of the selection sample) on which
+    none did. `n_trials` is EVERY combination tried, not just the ranked ones:
+    the deflation is only honest with the full count of attempts."""
     from app.research import stats as rstats
 
     if not daily or not capital:
         return None
-    days = sorted({k for d in daily for k in d})
+    days = sorted({k for d in daily for k in d} | set(sessions or ()))
     if len(days) < 10:
         return {"note": "fewer than 10 trading days in the selection sample; not computed"}
     matrix = [[d.get(k, 0.0) / capital for d in daily] for k in days]
@@ -2581,7 +2644,7 @@ def trial_dsr(trades: list[dict[str, Any]], data: dict[str, dict], capital: floa
     own Sharpe standard error — a floor, not the full penalty."""
     from app.research import stats as rstats
 
-    days = sorted({(t + IST) // 86400 for d in data.values() for t in d["t"] if trade_from is None or t >= trade_from})
+    days = session_days(data, trade_from)
     if len(days) < 10 or not capital:
         return None
     net: dict[int, float] = {}

@@ -218,3 +218,50 @@ def test_skew_reaches_span_margin_and_added_legs_must_fit_the_capital():
                        {"N": _nifty(_RISE_FALL)})
     assert tight["stats"]["skipped"].get("hedge_no_capital", 0) >= 1           # no room for the future: counted, not taken
     assert not any(lg.get("via") == "HEDGE" for t in tight["trades"] for lg in t["legs"])
+
+
+# ---- a carried position meets its expiry ---------------------------------------
+
+def _carried_week(after_expiry_step: float) -> dict:
+    """NIFTY 5m candles Mon 19 Oct .. Wed 28 Oct 2026 (weekly expiries Tue 20 and
+    Tue 27 Oct): a cross above 24550 on Monday, then flat, then from Wednesday on
+    a steady move of `after_expiry_step` points a candle."""
+    from datetime import datetime, timedelta, timezone
+
+    ist = timezone(timedelta(hours=5, minutes=30))
+    t, o, h, l, c = [], [], [], [], []
+    px = 24500.0
+    for k, dd in enumerate((19, 20, 21, 22, 23, 26, 27, 28)):
+        day0 = int(datetime(2026, 10, dd, 9, 15, tzinfo=ist).timestamp())
+        for m in range(75):
+            nxt = 24560.0 if (k, m) == (0, 3) else px + after_expiry_step if k >= 2 else px
+            t.append(day0 + m * 300); o.append(px); c.append(nxt); h.append(max(px, nxt) + 2); l.append(min(px, nxt) - 2)
+            px = nxt
+    return {"t": t, "o": o, "h": h, "l": l, "c": c, "v": [0] * len(t), "tf_s": 300,
+            "meta": {"symbol": NIFTY, "name": "NIFTY", "exch": "NSE", "lot": 65, "step": 50}}
+
+
+def test_carried_option_settles_at_its_expiry_not_after():
+    # Square-off off: a sold weekly 24750 CE is carried overnight. It expires
+    # worthless on Tue 20 Oct 15:30 — the rally from Wednesday on must not touch it.
+    spec = _opt_spec(instrument={"type": "option", "expiry_kind": "weekly", "iv": {"source": "fixed", "value": 14},
+                                 "legs_long": [{"right": "CE", "action": "SELL", "strike": "OTM", "steps": 4, "lots": 1}]},
+                     sizing={"mode": "lots", "value": 1}, session={"start": "09:15", "end": "15:00", "square_off": None},
+                     costs={"slippage_pct": 0, "charges": False})
+    d = _carried_week(6.0)
+    (t,) = engine.run(spec, {"N": d})["trades"]
+    expiry = fno.expiry_after("NIFTY", "NSE", "weekly", "current", t["entry_t"])
+    assert t["reason"] == "EXPIRY" and t["exit_t"] == expiry               # Tue 20 Oct 15:30
+    assert t["legs"][0]["exit"] == 0.05 and t["legs"][0]["reason"] == "EXPIRY"   # worthless (one-tick floor)
+    assert t["net"] == pytest.approx((t["legs"][0]["entry"] - 0.05) * 65)
+
+
+def test_carried_future_settles_at_its_expiry():
+    spec = _opt_spec(instrument={"type": "future", "expiry": "current"}, sizing={"mode": "lots", "value": 1},
+                     session={"start": "09:15", "end": "15:00", "square_off": None},
+                     costs={"slippage_pct": 0, "charges": False})
+    d = {**_carried_week(0.0), "meta": {"symbol": NIFTY, "name": "NIFTY", "exch": "NSE", "lot": 65, "step": 50}}
+    tr = engine.run(spec, {"N": d})["trades"]
+    # the monthly future (Tue 27 Oct) settles at that day's close, not at the end of the data
+    assert tr[0]["reason"] == "EXPIRY"
+    assert tr[0]["exit_t"] == fno.expiry_after("NIFTY", "NSE", "monthly", "current", tr[0]["entry_t"])
