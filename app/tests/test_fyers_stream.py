@@ -1304,7 +1304,7 @@ async def test_expired_token_does_not_open_the_socket():
     assert "data" not in holder
     assert mgr.status() == {"connected": False, "reason": "token_expired", "subscribed": 0, "record_only": 0,
                             "last_tick_age_s": None, "rejected_symbols": [], "rejected_count": 0,
-                            "limit_error": None, "limit_hits": 0, "received": 0}
+                            "limit_error": None, "limit_hits": 0, "received": 0, "symbol_cap": None, "capped": 0}
 
 
 @pytest.mark.asyncio
@@ -1438,3 +1438,35 @@ async def test_a_refused_subscribe_is_not_held_and_a_swap_unsubscribes_first():
     want[:] = [f"NSE:S{i}-EQ" for i in range(20, 120)]
     await mgr._reconcile_subscriptions()
     assert sock.held == set(want) and set(mgr._subscribed.values()) == set(want) and mgr.limit_hits == 1
+
+
+@pytest.mark.asyncio
+async def test_the_symbol_cap_keeps_the_ticker_and_positions_first_and_on_demand_evicts_the_watchlist():
+    """Over the Fyers plan's socket cap the index ticker and the bot's positions
+    stream; the browser watchlist waits. An exit's on-demand price then takes a
+    watchlist slot rather than falling back to REST."""
+    from app.api import ws as ws_mod
+
+    md = MarketDataBus()
+    holder, df, of = _factories()
+    mgr = FyersStreamManager(
+        market_data=md, quote_feed=_FakeQuoteFeed(["SBIN", "TCS"]), backend_provider=lambda: _FakeBackend(),
+        data_socket_factory=df, order_socket_factory=of, resolve_fn=lambda s: f"NSE:{s}-EQ" if ":" not in s else s,
+        always_subscribe=["NSE:NIFTY50-INDEX"], extra_symbols=ws_mod.watched_symbols, symbol_cap=lambda: 5,
+    )
+    mgr._loop = asyncio.get_running_loop()
+    ws_mod.WATCHED[7] = {f"NSE:W{k}-EQ" for k in range(6)}
+    try:
+        await mgr._ensure_connected()
+        await mgr._reconcile_subscriptions()
+        held = set(mgr._subscribed.values())
+        assert len(held) == 5 and mgr.capped == 4
+        assert {"NSE:NIFTY50-INDEX", "NSE:SBIN-EQ", "NSE:TCS-EQ"} <= held      # ticker + positions first
+        assert mgr._subscribe_ondemand("NSE:EXIT-EQ", "NSE:EXIT-EQ")             # a position's exit price
+        assert "NSE:EXIT-EQ" in set(mgr._subscribed.values()) and len(set(mgr._subscribed.values())) == 5
+        assert {"NSE:NIFTY50-INDEX", "NSE:SBIN-EQ", "NSE:TCS-EQ"} <= set(mgr._subscribed.values())
+        assert mgr._subscribe_ondemand("NSE:EXIT2-EQ", "NSE:EXIT2-EQ")
+        assert not mgr._subscribe_ondemand("NSE:EXIT3-EQ", "NSE:EXIT3-EQ")      # only priority left: REST
+        assert mgr.status()["symbol_cap"] == 5
+    finally:
+        ws_mod.WATCHED.pop(7, None)
