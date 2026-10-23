@@ -1478,6 +1478,7 @@ async def status(request: Request) -> dict[str, Any]:
             lg["ltp"] = prices.get(lg["symbol"].upper())
         t["entry_at"] = t["entry_at"].isoformat()
     return {"running": getattr(request.app.state, "algo_task", None) is not None,
+            "screen": r.screen.status(),
             "last_tick": r.last_tick, "last_sync": r.last_sync, "events": list(r.events)[:150],
             "ticks": {"seen": r.ticks_seen, "last_exit_check": r.last_tick_exit, "watching": len(r._watch)},
             "open": open_rows}
