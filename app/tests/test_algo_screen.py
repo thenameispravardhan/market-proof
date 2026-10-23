@@ -39,7 +39,7 @@ def standard(monkeypatch):
 
     st = get_settings()
     for k, v in {"FYERS_PLAN": "standard", "FYERS_DATA_PER_SEC": 0, "FYERS_DATA_PER_MIN": 0, "FYERS_DATA_PER_DAY": 0,
-                 "FYERS_WS_SYMBOLS": 0, "FYERS_DATA_RESERVE_PCT": 20.0, "ALGO_SCREEN_SLACK_PCT": 0.5}.items():
+                 "FYERS_WS_SYMBOLS": 0, "FYERS_DATA_RESERVE_PCT": 20.0, "ALGO_SCREEN_SLACK_PCT": 0.2}.items():
         monkeypatch.setattr(st, k, v, raising=False)
 
 
@@ -192,6 +192,46 @@ def test_a_screened_universe_trades_exactly_like_the_candle_by_candle_one(monkey
     assert exact and screened == exact
     assert c_exact["quote"] == 0 and c_scr["bundle"] < c_exact["bundle"] / 3     # most candles never fetched
     assert c_scr["quote"] > 0 and stats and all(v["skipped"] == 0 for v in stats.values())
+
+
+def test_confirmations_fit_the_day_and_skip_entries_a_full_book_cannot_take(monkeypatch, standard):
+    """Exits always; entries only with a free slot, outright hits first; never
+    more than this candle's share of what's left of the day."""
+    from app.execution import data_budget
+
+    spec = _spec(300, portfolio={"capital": 1e9, "max_positions": 2})
+    syms = spec["symbols"]
+    s = sc.Screener()
+    s.day = (D0 + 19800) // DAY
+    for x in syms:
+        s.warm[(1, x)] = {"t": [D0 + OPEN], "c": [100.0]}
+
+    async def nothing(*a, **k):
+        return 0 if not a or isinstance(a[0], list) else {}
+    monkeypatch.setattr(s, "_poll", lambda *a: nothing())
+    monkeypatch.setattr(s, "_shared", lambda *a: nothing())
+    monkeypatch.setattr(s, "_append", lambda *a: True)
+    fired = set(syms[:200]) | {syms[290]}
+    monkeypatch.setattr(sc.Screener, "_screen", staticmethod(lambda spec, items, held: (fired, {syms[150], syms[290]})))
+    left = {"n": 4000}
+    monkeypatch.setattr(data_budget.budget(), "bulk_left_today", lambda now=None: left["n"])
+    bar = D0 + OPEN + 60 * 300                                   # 14:15: 14 closes to come after this one
+    run = lambda held, b=bar: asyncio.run(s.candidates({"id": 1, "spec": spec}, b, 300, b + 303, held))  # noqa: E731
+
+    out = run({syms[0]: "BUY"})                                  # one free slot: outright hits lead
+    st = s.stats[1]
+    assert syms[0] in out and syms[150] in out and syms[290] in out
+    assert len(out) == st["candidates"] == 160                   # the per-minute pace: 40 a minute, 4 minutes
+    left["n"] = 400                                               # late in the budget: (400 - 14 * 6) // 15
+    s.passes.clear()
+    out = run({syms[0]: "BUY"})
+    assert len(out) == 21 and {syms[0], syms[150], syms[290]} <= out
+    s.passes.clear()
+    out = run({syms[0]: "BUY", syms[1]: "SELL"})                # book full: exits only
+    assert out == {syms[0], syms[1]} and s.stats[1]["full"] == 199
+    left["n"] = 0
+    s.passes.clear()
+    assert run({syms[0]: "BUY", syms[5]: "BUY"}) == {syms[0], syms[5]}   # nothing left: still the exits
 
 
 def test_a_large_daily_strategy_is_decided_from_its_warm_up_with_no_call_at_the_open(monkeypatch, isolated_db, standard):
