@@ -159,7 +159,17 @@ async def _fetch(fyers_symbol: str, days: int) -> list[Any]:
 
 
 async def sync_symbols(symbols: list[str], days: int = 5) -> dict:
-    """Pull `days` of 1-minute candles for each symbol and append them."""
+    """Pull `days` of 1-minute candles for each symbol and append them — in the
+    Fyers data budget's bulk lane, stopping once its share of the day is used
+    (the rest keep for the next run): a backlog of thousands of symbols must
+    not take the quotes the Trade page and orders need."""
+    from app.execution.data_budget import bulk, budget
+
+    with bulk():
+        return await _sync_symbols(symbols, days, budget())
+
+
+async def _sync_symbols(symbols: list[str], days: int, bud: Any) -> dict:
     from app.config import get_settings
     from app.execution.symbols import resolve_fyers_symbol
 
@@ -169,7 +179,12 @@ async def sync_symbols(symbols: list[str], days: int = 5) -> dict:
     # dataset builder already uses rather than inventing a second one.
     delay = float(getattr(get_settings(), "DATASET_FETCH_DELAY_SECONDS", 0.25))
     added = ok = failed = 0
+    left = 0
     for i, sym in enumerate(symbols, 1):
+        if bud.bulk_left_today() <= 0:
+            left = len(symbols) - i + 1
+            log.warning("candle_sync.data_budget_used", left=left)
+            break
         try:
             if i > 1 and delay > 0:
                 await asyncio.sleep(delay)
@@ -193,7 +208,7 @@ async def sync_symbols(symbols: list[str], days: int = 5) -> dict:
         if i % 50 == 0:
             log.info("candle_sync.progress", done=i, of=len(symbols),
                      ok=ok, failed=failed, added=added)
-    out = {"symbols": len(symbols), "ok": ok, "failed": failed, "candles_added": added}
+    out = {"symbols": len(symbols), "ok": ok, "failed": failed, "candles_added": added, "budget_left_out": left}
     log.info("candle_sync.done", **out)
     return out
 

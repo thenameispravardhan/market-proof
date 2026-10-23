@@ -252,6 +252,16 @@ def validate(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     return {"ok": True, "spec": _spec(body.get("spec"))}
 
 
+@router.post("/capacity")
+def capacity(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """How {spec} would run live on the Fyers plan: every symbol's candles at each
+    close (exact), screened on batch quotes, or more than the budget checks
+    (over) — with its data calls a day against the automations' share."""
+    from app.algo import screen
+
+    return screen.capacity(_spec(body.get("spec")))
+
+
 @router.post("/backtest")
 async def backtest(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     spec = _spec(body.get("spec"))
