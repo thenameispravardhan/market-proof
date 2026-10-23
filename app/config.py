@@ -99,6 +99,12 @@ class Settings(BaseSettings):
     ALGO_ALLOC_CAPITAL: float = 0.0
     ALGO_ALLOC_LOOKBACK_DAYS: int = 60
     ALGO_ALLOC_DECAY_DAYS: int = 20
+    # Large automations (more symbols than the Fyers data budget can fetch
+    # candles for in the minute after a close) are screened on batch quotes and
+    # confirmed on exact candles (app/algo/screen.py). This is the screen's
+    # tolerance: a condition passes when it holds to within this % — wider
+    # catches more borderline signals for the exact check, at more data calls.
+    ALGO_SCREEN_SLACK_PCT: float = 0.5
 
     # ---------- Storage ----------
     # Ignored if TESTING=1 (in-memory sqlite is used).
@@ -264,6 +270,20 @@ class Settings(BaseSettings):
     # REST quote polling for any symbol the socket is actively streaming;
     # set False to fall back to pure REST polling.
     FYERS_STREAMING_ENABLED: bool = True
+    # Your Fyers API plan: sets the Data-API budget (quotes / depth / history /
+    # option chain) and the data-socket symbol cap the app plans around.
+    # standard: 5/s, 50/min, 5,000/day, 100 socket symbols; prime: 10/s,
+    # 500/min, 5,00,000/day, 5,000 symbols (fyers.in/api-docs/v3 Plans & Limits).
+    FYERS_PLAN: Literal["standard", "prime"] = "standard"
+    # Overrides of the plan's figures (0 = the plan's) — for when Fyers changes one.
+    FYERS_DATA_PER_SEC: int = 0
+    FYERS_DATA_PER_MIN: int = 0
+    FYERS_DATA_PER_DAY: int = 0
+    FYERS_WS_SYMBOLS: int = 0
+    # Share of each minute's and the day's data calls kept for the Trade page,
+    # orders and exits: automations, backtest downloads and the nightly candle
+    # sync never use it.
+    FYERS_DATA_RESERVE_PCT: float = 20.0
 
     # ---------- Risk management framework (RISK.md) ----------
     # §1 Pre-trade filters. Some of these gate on market data we don't

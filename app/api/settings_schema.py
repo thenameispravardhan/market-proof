@@ -243,7 +243,8 @@ GROUPS: list[dict[str, Any]] = [
                 "limit price protection). Gates default off; the self-test only alarms.",
         "prefixes": [
             "FYERS_SELFTEST_ENABLED", "FYERS_REQUIRED_APP_TYPE", "FYERS_WHITELISTED_IPS",
-            "FYERS_EGRESS_IP_URL", "ORDER_RATE_", "GATE_",
+            "FYERS_EGRESS_IP_URL", "ORDER_RATE_", "GATE_", "FYERS_PLAN", "FYERS_DATA_", "FYERS_WS_",
+            "ALGO_SCREEN_",
         ],
     },
     {
@@ -283,6 +284,12 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "BSE_RSS_POLL_SECONDS": (0, 60),           # 0 = follow the global interval
     "POLL_INTERVAL_SECONDS": (1, 3600),
     "ORDER_RATE_LIMIT_PER_SEC": (0, 10),       # 10/s is the SEBI no-registration ceiling
+    "FYERS_DATA_PER_SEC": (0, 100),
+    "FYERS_DATA_PER_MIN": (0, 10000),
+    "FYERS_DATA_PER_DAY": (0, 10_000_000),
+    "FYERS_WS_SYMBOLS": (0, 10000),
+    "FYERS_DATA_RESERVE_PCT": (0, 80),
+    "ALGO_SCREEN_SLACK_PCT": (0, 5),
     "ALGO_BOOK_MAX_DAY_LOSS": (0, 1e12),
     "ALGO_BOOK_MAX_MARGIN": (0, 1e12),
     "ALGO_ALLOC_CAPITAL": (0, 1e12),
@@ -328,6 +335,13 @@ LABELS: dict[str, str] = {
     "PRE_LLM_FILTER_ENABLED": "Pre-AI noise filter",
     "SEND_EXTRACTED_TEXT": "Send extracted PDF text to AI",
     "FYERS_MCX_LIVE": "Live MCX orders on Fyers (lots converted; switch only while flat in MCX)",
+    "FYERS_PLAN": "Fyers API plan (standard: 5/s, 50/min, 5,000/day, 100 socket symbols · prime: 10/s, 500/min, 5 lakh/day, 5,000)",
+    "FYERS_DATA_PER_SEC": "Fyers data calls per second (0 = the plan's)",
+    "FYERS_DATA_PER_MIN": "Fyers data calls per minute (0 = the plan's)",
+    "FYERS_DATA_PER_DAY": "Fyers data calls per day (0 = the plan's)",
+    "FYERS_WS_SYMBOLS": "Fyers data-socket symbols (0 = the plan's)",
+    "FYERS_DATA_RESERVE_PCT": "Data calls kept for the Trade page / orders (%)",
+    "ALGO_SCREEN_SLACK_PCT": "Large automations: screening tolerance (%)",
     "NEWS_AGE_FROM_RECEIPT": "Measure news age from receipt",
     "ENTRY_MAX_DRIFT_PCT": "Max entry drift against the signal (%)",
     "SCALE_OUT_R": "Scale-out at (R)",

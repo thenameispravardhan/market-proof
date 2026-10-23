@@ -496,8 +496,14 @@ async def download(fy: str, start_ts: int, end_ts: int) -> dict[str, Any]:
 async def ensure(fy: str, start_ts: int, end_ts: int) -> dict[str, Any]:
     """Make the store cover [start_ts, end_ts], downloading only the edges it
     lacks. Without a Fyers login it falls back to whatever is already stored."""
+    from app.execution.data_budget import bulk
+
     key = store_key(fy)
-    cov = coverage(key)
+    with bulk():                # backtest downloads: the data budget's bulk lane
+        return await _ensure(fy, key, coverage(key), start_ts, end_ts)
+
+
+async def _ensure(fy: str, key: str, cov: Optional[dict[str, Any]], start_ts: int, end_ts: int) -> dict[str, Any]:
     note = None
     fetched = False             # coverage re-read only when something may have been added
     try:

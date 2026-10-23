@@ -47,6 +47,8 @@ from sqlalchemy import func, or_, select
 
 from app.algo import data, engine, fno
 from app.algo import indicators
+from app.algo import screen as screening
+from app.execution.data_budget import DataBudgetExhausted, bulk
 from app.config import get_settings
 from app.db import session as db_session
 from app.db.models import AlgoStrategy, AlgoTrade, AuditLog, BrokerAccount
@@ -728,6 +730,10 @@ class AlgoRunner:
         self._alloc: tuple[Optional[tuple], dict[int, dict[str, Any]]] = (None, {})   # (key, allocation)
         self._names: dict[int, str] = {}
         self._open_day: dict[int, bool] = {}     # IST day -> did the market open (daily / weekly strategies)
+        # Strategies with more symbols than the data budget fetches candles for
+        # at a close: screened on batch quotes, confirmed on exact candles.
+        self.screen = screening.Screener()
+        self._bar_tasks: dict[int, asyncio.Task] = {}   # screened strategies' candle passes, off the 1 s loop
         # Tick-driven exits: every websocket tick for a symbol an open position
         # holds wakes `_tick_loop`, which runs the same stop / target / trail
         # checks on that tick's price — no waiting for the next 1 s sweep.
@@ -860,6 +866,8 @@ class AlgoRunner:
             self._open, self._by_id = open_trades, by_id
             self._watch = {x for t in open_trades if t.get("status") == "open" for x in _syms(t)}
             self._live_px = {k: v for k, v in self._live_px.items() if k in self._watch}
+        if screening.WARM_FROM_MIN <= mins < CLOSE_MIN:
+            self.screen.maintain(strategies, now, {(t["strategy_id"], t["symbol"]) for t in open_trades})
         # Record real ticks for everything an enabled strategy trades.
         from app.algo import ticks
 
@@ -876,7 +884,16 @@ class AlgoRunner:
                 await self._check_armed(by_id, now, day, day_start)
             for s in strategies:
                 if s["enabled"] and (s["id"], day) not in self._halted:
-                    await self._on_bar(s, now, day_start)
+                    if self.screen.uses(s["spec"]):
+                        # A screened strategy's pass is paced by the data budget (minutes for
+                        # hundreds of symbols): its own task, so exits and the other
+                        # strategies keep their 1 s loop meanwhile.
+                        task = self._bar_tasks.get(s["id"])
+                        if task is None or task.done():
+                            self._bar_tasks[s["id"]] = asyncio.create_task(
+                                self._on_bar_bg(s, now, day_start), name=f"algo-bar-{s['id']}")
+                    else:
+                        await self._on_bar(s, now, day_start)
         elif mins >= CLOSE_MIN:
             if mins >= SYNC_AFTER_MIN and self._sync_day != day and strategies:
                 self._sync_day = day
@@ -1547,14 +1564,26 @@ class AlgoRunner:
             return                                         # ask again next second
         weekly = spec["timeframe"] == engine.WEEKLY
         monday = day - (day + 3) % 7
+        screened = self.screen.uses(spec)
+        fetches, cap, skipped = 0, screening.exact_capacity(spec), 0
         for sym in todo:
             key = (s["id"], sym)
-            try:
-                d = await data.live_bundle(spec, sym, now)
-            except Exception as e:  # noqa: BLE001
-                self._last_bar[key] = int(day_start)
-                self.event("error", f"{s['name']} {sym}: candles unavailable: {e}"[:300], strategy_id=s["id"])
-                continue
+            # Screened: the warm-up fetched after the candle closed IS the exact
+            # data; only a symbol it missed is fetched now, as far as the budget goes.
+            d = self.screen.bundle(s["id"], sym) if screened else None
+            if d is None:
+                if screened and fetches >= cap:
+                    self._last_bar[key] = int(day_start)
+                    skipped += 1
+                    continue
+                fetches += 1
+                try:
+                    with bulk():                           # the automation's share of the Fyers data budget
+                        d = await data.live_bundle(spec, sym, now)
+                except Exception as e:  # noqa: BLE001
+                    self._last_bar[key] = int(day_start)
+                    self.event("error", f"{s['name']} {sym}: candles unavailable: {e}"[:300], strategy_id=s["id"])
+                    continue
             self._last_bar[key] = int(day_start)
             if not d["t"]:
                 continue
@@ -1565,6 +1594,18 @@ class AlgoRunner:
             except Exception as e:  # noqa: BLE001 — one symbol must not stop the others
                 log.exception("algo.decide_failed", symbol=sym)
                 self.event("error", f"{s['name']} {sym}: {e}"[:300], strategy_id=s["id"])
+        if skipped:
+            self.event("error", f"{s['name']}: {skipped} symbol(s) not checked today — not warmed up before the "
+                                "open and past what the data budget fetches at it", strategy_id=s["id"])
+
+    async def _on_bar_bg(self, s: dict, now: float, day_start: float) -> None:
+        try:
+            await self._on_bar(s, now, day_start)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — the next tick starts a new pass
+            log.exception("algo_runner.bar_failed", strategy=s["id"])
+            self.event("error", f"{s['name']}: candle pass failed: {e}"[:300], strategy_id=s["id"])
 
     async def _on_bar(self, s: dict, now: float, day_start: float) -> None:
         spec = s["spec"]
@@ -1579,6 +1620,14 @@ class AlgoRunner:
         ranks = bool(spec.get("rank"))
         rank_key = (s["id"], "#rank")                      # in _last_bar: the bar this strategy last ranked
         ready: dict[str, dict] = {}
+        screened = self.screen.uses(spec)
+        if screened and now - (bar + tf_s) <= STALE_BAR_S and any(
+                self._last_bar.get((s["id"], x), 0) < bar for x in spec["symbols"]):
+            held = {t["symbol"]: t["side"] for t in self._open if t["strategy_id"] == s["id"] and t.get("status") == "open"}
+            cands = await self.screen.candidates(s, bar, tf_s, now, held)
+            for x in spec["symbols"]:                      # screened out: nothing can happen there this candle
+                if x not in cands and self._last_bar.get((s["id"], x), 0) < bar:
+                    self._last_bar[(s["id"], x)] = bar
         for sym in spec["symbols"]:
             key = (s["id"], sym)
             if self._last_bar.get(key, 0) >= bar:
@@ -1587,11 +1636,14 @@ class AlgoRunner:
                 self._last_bar[key] = bar                  # startup mid-bar: wait for the next one
                 continue
             try:
-                d = await data.live_bundle(spec, sym, now)
+                with bulk():                               # the automation's share of the Fyers data budget
+                    d = await data.live_bundle(spec, sym, now)
             except Exception as e:  # noqa: BLE001
                 self._last_bar[key] = bar
                 self.event("error", f"{s['name']} {sym}: candles unavailable: {e}"[:300], strategy_id=s["id"])
                 continue
+            if screened and d["t"] and d["t"][-1] >= bar:
+                self.screen.absorb(s["id"], sym, d)        # the exact candles replace the screen's
             if spec["bars"]["type"] != "time":
                 # Volume/turnover candles close whenever enough has traded: this
                 # minute is done; act only if a NEW candle completed since.
@@ -1886,20 +1938,29 @@ class AlgoRunner:
     # -- data ----------------------------------------------------------------
 
     async def sync(self, strategies: list[dict], days: int = 5) -> dict[str, Any]:
-        """Top up the 1-minute store for every symbol any strategy trades."""
-        syms = sorted({x for s in strategies for x in s["spec"]["symbols"]})
+        """Top up the 1-minute store for every symbol a switched-on strategy
+        trades — in the data budget's bulk lane, stopping when its share of the
+        day is used (the rest wait for tomorrow's sync)."""
+        on = [s for s in strategies if s["enabled"]] or strategies
+        syms = sorted({x for s in on for x in s["spec"]["symbols"]})
         if any(s["spec"]["instrument"]["type"] == "option" or engine.vix_timeframes(s["spec"]) for s in strategies):
             syms.append(data.VIX)
         now = int(time.time())
-        ok, failed = 0, []
-        for sym in syms:
+        ok, failed, left = 0, [], 0
+        for k, sym in enumerate(syms):
             try:
-                await data.download(sym, now - days * 86400, now)
+                with bulk():
+                    await data.download(sym, now - days * 86400, now)
                 ok += 1
+            except DataBudgetExhausted as e:
+                left = len(syms) - k
+                failed.append(str(e)[:200])
+                break
             except Exception as e:  # noqa: BLE001
                 failed.append(f"{sym}: {e}"[:200])
-        self.last_sync = {"t": time.time(), "symbols": len(syms), "ok": ok, "failed": failed}
-        self.event("sync", f"candle sync: {ok}/{len(syms)} symbols", failed=len(failed))
+        self.last_sync = {"t": time.time(), "symbols": len(syms), "ok": ok, "failed": failed, "budget_left_out": left}
+        self.event("sync", f"candle sync: {ok}/{len(syms)} symbols"
+                   + (f" — {left} left for tomorrow (data budget)" if left else ""), failed=len(failed))
         return self.last_sync
 
 

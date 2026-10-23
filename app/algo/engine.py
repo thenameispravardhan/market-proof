@@ -39,13 +39,15 @@ size of the next trade follows the equity curve.
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import heapq
 import itertools
 import math
 import statistics
 from collections import deque
-from typing import Any, Callable, Optional
+from contextvars import ContextVar
+from typing import Any, Callable, Iterator, Optional
 
 from app.algo import fno
 from app.algo import indicators as ind
@@ -1095,10 +1097,55 @@ def series(d: dict, op: dict[str, Any], cache: dict) -> ind.S:
     return _shape(d, op, s, cache)
 
 
+# ---- screening: conditions with a tolerance ---------------------------------
+# A large universe is screened on approximate candles (live: batch quotes; see
+# app/algo/screen.py) and only the symbols that may act get exact candles. For
+# the screen to miss nothing, every comparison passes when it holds to within
+# a tolerance — and a NOT flips that to "holds by more than it" — so the
+# screened signals are a superset of the exact ones while the approximation
+# errs by less than the tolerance. Off (0) everywhere else.
+_slack: ContextVar[float] = ContextVar("screen_slack", default=0.0)
+_loose: ContextVar[int] = ContextVar("screen_loose", default=1)     # +1 superset, -1 subset (inside a NOT)
+
+
+@contextlib.contextmanager
+def screening(slack: float) -> Iterator[None]:
+    """Conditions evaluated inside pass within `slack` (a fraction: 0.005 =
+    0.5% of the larger operand, floored at 5% of that of the close)."""
+    tok = _slack.set(max(0.0, float(slack)))
+    try:
+        yield
+    finally:
+        _slack.reset(tok)
+
+
+def _tols(d: dict, a: ind.S, b: ind.S) -> list[float]:
+    """Per bar, how far a comparison may miss and still pass (signed: + loose, - tight)."""
+    k = _slack.get() * _loose.get()
+    c = d["c"]
+    return [k * max(abs(x) if x is not None else 0.0, abs(y) if y is not None else 0.0, 0.05 * abs(c[i]))
+            for i, (x, y) in enumerate(zip(a, b))]
+
+
+def _flipped(fn: Callable[[], list[bool]]) -> list[bool]:
+    tok = _loose.set(-_loose.get())
+    try:
+        return fn()
+    finally:
+        _loose.reset(tok)
+
+
 def _cond(d: dict, c: dict[str, Any], cache: dict) -> list[bool]:
     """A condition per bar, then its modifiers: held for N bars in a row, or true at least once in the
     last N bars, then NOT."""
-    raw = _cond_raw(d, c, cache)
+    if c.get("negate") and _slack.get():
+        raw = _flipped(lambda: _cond_mods(d, c, _cond_raw(d, c, cache)))
+        return [not v for v in raw]
+    raw = _cond_mods(d, c, _cond_raw(d, c, cache))
+    return [not v for v in raw] if c.get("negate") else raw
+
+
+def _cond_mods(d: dict, c: dict[str, Any], raw: list[bool]) -> list[bool]:
     k = int(c.get("for_bars") or 0)
     if k > 1:
         run, out = 0, []
@@ -1114,13 +1161,15 @@ def _cond(d: dict, c: dict[str, Any], cache: dict) -> list[bool]:
                 last = i
             out.append(i - last < w)
         raw = out
-    return [not v for v in raw] if c.get("negate") else raw
+    return raw
 
 
 def _cond_raw(d: dict, c: dict[str, Any], cache: dict) -> list[bool]:
     op = c["op"]
     a = series(d, c["left"], cache)
     n = len(a)
+    if _slack.get():
+        return _cond_slack(d, c, op, a, n, cache)
     if op in ("rising", "falling"):
         k = max(1, int((c.get("right") or {}).get("value", 1)))
         sgn = 1 if op == "rising" else -1
@@ -1147,6 +1196,43 @@ def _cond_raw(d: dict, c: dict[str, Any], cache: dict) -> list[bool]:
          "<=": lambda x, y: x <= y, "==": lambda x, y: abs(x - y) < 1e-9,
          "!=": lambda x, y: abs(x - y) >= 1e-9}[op]
     return [x is not None and y is not None and f(x, y) for x, y in zip(a, b)]
+
+
+def _cond_slack(d: dict, c: dict[str, Any], op: str, a: ind.S, n: int, cache: dict) -> list[bool]:
+    """_cond_raw with the screening tolerance: e > 0 widens every comparison
+    (a superset of the exact result), e < 0 narrows it (inside a NOT)."""
+    if op in ("rising", "falling"):
+        k = max(1, int((c.get("right") or {}).get("value", 1)))
+        sgn = 1 if op == "rising" else -1
+        lag = [None] * k + list(a[:-k]) if n > k else [None] * n
+        e = _tols(d, a, lag)
+        return [i >= k and a[i] is not None and a[i - k] is not None and sgn * (a[i] - a[i - k]) > -e[i]
+                for i in range(n)]
+    b = series(d, c["right"], cache)
+    if op in ("between", "outside"):
+        b2 = series(d, c["right2"], cache)
+
+        def inside() -> list[bool]:
+            e = _tols(d, a, [max(abs(y), abs(z)) if y is not None and z is not None else None for y, z in zip(b, b2)])
+            return [x is not None and y is not None and z is not None and min(y, z) - e[i] <= x <= max(y, z) + e[i]
+                    for i, (x, y, z) in enumerate(zip(a, b, b2))]
+        if op == "between":
+            return inside()
+        return [not v and None not in (x, y, z) for v, x, y, z in zip(_flipped(inside), a, b, b2)]
+    e = _tols(d, a, b)
+    if op.startswith("cross"):
+        out = [False] * n
+        for i in range(1, n):
+            if None in (a[i], b[i], a[i - 1], b[i - 1]):
+                continue
+            up = a[i] > b[i] - e[i] and a[i - 1] <= b[i - 1] + e[i - 1]
+            dn = a[i] < b[i] + e[i] and a[i - 1] >= b[i - 1] - e[i - 1]
+            out[i] = up if op == "crosses_above" else dn if op == "crosses_below" else up or dn
+        return out
+    f = {">": lambda x, y, t: x > y - t, "<": lambda x, y, t: x < y + t, ">=": lambda x, y, t: x >= y - t,
+         "<=": lambda x, y, t: x <= y + t, "==": lambda x, y, t: abs(x - y) < 1e-9 + t,
+         "!=": lambda x, y, t: abs(x - y) >= 1e-9 - t}[op]
+    return [x is not None and y is not None and f(x, y, e[i]) for i, (x, y) in enumerate(zip(a, b))]
 
 
 def evaluate(d: dict, g: Optional[dict[str, Any]], cache: dict) -> list[bool]:
