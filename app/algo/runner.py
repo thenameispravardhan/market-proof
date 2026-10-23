@@ -1676,6 +1676,9 @@ class AlgoRunner:
             key = (s["id"], sym)
             if self._last_bar.get(key, 0) >= bar:
                 continue
+            if screened and not ranks and self._book_full(s, sym):
+                self._last_bar[key] = bar                  # an entry it couldn't take: save the fetch
+                continue
             if now - (bar + tf_s) > STALE_BAR_S:
                 self._last_bar[key] = bar                  # startup mid-bar: wait for the next one
                 continue
@@ -1742,6 +1745,11 @@ class AlgoRunner:
             except Exception as e:  # noqa: BLE001
                 log.exception("algo.decide_failed", symbol=sym)
                 self.event("error", f"{s['name']} {sym}: {e}"[:300], strategy_id=s["id"])
+
+    def _book_full(self, s: dict, sym: str) -> bool:
+        """`sym` holds no position of `s` and `s` has max positions open (as of the last tick)."""
+        mine = [t["symbol"] for t in self._open if t["strategy_id"] == s["id"] and t.get("status") == "open"]
+        return sym not in mine and len(mine) >= s["spec"]["portfolio"]["max_positions"]
 
     async def _decide(self, s: dict, sym: str, d: dict, now: float, day_start: float, may_enter: bool = True) -> None:
         spec = s["spec"]
