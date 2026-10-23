@@ -159,6 +159,7 @@ class FyersStreamManager:
         extra_symbols: Optional[Callable[[], list[str]]] = None,
         record_symbols: Optional[Callable[[], list[str]]] = None,
         orders: bool = True,
+        symbol_cap: Optional[Callable[[], int]] = None,
         subscribe_chunk: int = 500,
         reconcile_interval_s: float = 2.0,
         fresh_window_s: float = 6.0,
@@ -192,6 +193,13 @@ class FyersStreamManager:
         # The collector process runs its own feed without the order socket
         # (order updates are the app's to reconcile, once).
         self._orders = bool(orders)
+        # Most symbols this feed may hold (the Fyers plan's data-socket cap, less
+        # the collector's share): over it, the lowest-ranked wanted symbols wait —
+        # the index ticker and open positions' prices first, then the Trade page's
+        # and anything recorded only. None = no cap of our own.
+        self._symbol_cap = symbol_cap
+        self._rank: dict[str, int] = {}
+        self.capped = 0
         self._chunk = max(1, int(subscribe_chunk))
         # Called on the SDK thread on every (re)connect of the data socket.
         self.connect_listeners: list[Callable[[], None]] = []
@@ -524,20 +532,24 @@ class FyersStreamManager:
             set(self._quote_feed.watched_symbols()) if self._quote_feed is not None else set()
         )
         desired: dict[str, str] = {}
+        rank: dict[str, int] = {}            # bus key -> priority under the symbol cap (0 first)
         # Always-on subscriptions (index ticker): bus key == full id so the
         # tick publishes back under the symbol the dashboard renders.
         for full in self._always_subscribe:
             desired[full] = full
+            rank[full] = 0
         if self._extra_symbols is not None:
             try:
                 for full in self._extra_symbols():
                     desired[full.upper()] = full.upper()
+                    rank.setdefault(full.upper(), 2)
             except Exception:  # noqa: BLE001 — a broken provider must not stop the feed
                 log.exception("fyers_stream.extra_symbols_failed")
-        for short in watched:
+        for short in watched:                # the bot's open positions / pending entries
             full = self._resolve(short) or (short if ":" in short else None)
             if full:
                 desired[short] = full.upper()
+                rank[short] = min(rank.get(short, 1), 1)
         bus_fulls = set(desired.values())
         record_only: set[str] = set()
         if self._record_symbols is not None:
@@ -551,13 +563,17 @@ class FyersStreamManager:
                 log.exception("fyers_stream.record_symbols_failed")
         self._record_only = record_only
         desired = {s: f for s, f in desired.items() if f not in self._rejected}
+        now = time.monotonic()
+        for k in record_only:
+            rank.setdefault(k, 3)
+        self._rank = rank
+        desired = self._within_cap(desired, now)
 
         add = {s: f for s, f in desired.items() if s not in self._subscribed}
         # Don't yank a symbol that was just subscribed on demand to serve a
         # one-shot price (get_live_price) — keep it until its TTL lapses, by
         # which point it's either an open position (in `desired`, kept) or
         # genuinely transient (dropped here).
-        now = time.monotonic()
         # Snapshot `_subscribed` before iterating: `_on_data_close` runs
         # on the SDK thread and can clear() it mid-iteration (triggered
         # by the SDK's auto-reconnect wiping server-side subs), which
@@ -624,6 +640,55 @@ class FyersStreamManager:
             except Exception:  # noqa: BLE001
                 log.exception("fyers_stream.subscribe_failed")
 
+    def _within_cap(self, desired: dict[str, str], now: float) -> dict[str, str]:
+        """`desired` trimmed to the symbol cap, best-ranked first; on-demand
+        subscriptions still inside their TTL (positions' exits, the Trade page's
+        quote) count as rank 1 and are kept."""
+        if self._symbol_cap is None:
+            return desired
+        cap = max(1, int(self._symbol_cap()))
+        best: dict[str, int] = {}
+        for k, f in desired.items():
+            best[f] = min(best.get(f, 9), self._rank.get(k, 2))
+        for k, at in list(self._ondemand.items()):
+            f = self._subscribed.get(k)
+            if f and now - at <= self._ondemand_ttl:
+                best[f] = min(best.get(f, 9), 1)
+        if len(best) <= cap:
+            self.capped = 0
+            return desired
+        keep = set(sorted(best, key=lambda f: best[f])[:cap])
+        self.capped = len(best) - cap
+        return {k: f for k, f in desired.items() if f in keep}
+
+    def _make_room(self) -> bool:
+        """Under the cap, free one slot for an on-demand subscription by dropping
+        the lowest-ranked one held (the Trade page's watchlist, recorded-only) —
+        never the index ticker, a position or another fresh on-demand one."""
+        if self._symbol_cap is None:
+            return True
+        held = set(self._subscribed.values())
+        if len(held) < max(1, int(self._symbol_cap())):
+            return True
+        now = time.monotonic()
+        busy = {f for k, f in self._subscribed.items()
+                if self._rank.get(k, 2) <= 1 or now - self._ondemand.get(k, -1e9) <= self._ondemand_ttl}
+        victims = sorted((f for f in held if f not in busy),
+                         key=lambda f: -max(self._rank.get(k, 2) for k, ff in self._subscribed.items() if ff == f))
+        if not victims:
+            return False
+        f = victims[0]
+        try:
+            self._unsubscribe([f], "SymbolUpdate")
+        except Exception:  # noqa: BLE001
+            log.exception("fyers_stream.unsubscribe_failed")
+            return False
+        for k in [k for k, ff in self._subscribed.items() if ff == f]:
+            self._subscribed.pop(k, None)
+        self._full_to_short.pop(f, None)
+        self._keys_cache = {}
+        return True
+
     def _unsubscribe(self, fulls: list[str], data_type: str) -> None:
         """Unsubscribe `fulls`, working around an SDK bug.
 
@@ -658,6 +723,8 @@ class FyersStreamManager:
             "rejected_symbols": sorted(self._rejected)[:200],
             "rejected_count": len(self._rejected),
             "limit_error": self.limit_error,
+            "symbol_cap": int(self._symbol_cap()) if self._symbol_cap is not None else None,
+            "capped": self.capped,
             "limit_hits": self.limit_hits,
             "received": self._rx_count,
         }
@@ -776,6 +843,8 @@ class FyersStreamManager:
         keep-alive timestamp. Returns False if the socket isn't connected."""
         if self._data_socket is None or not self._data_connected or full in self._rejected:
             return False
+        if bus_key not in self._subscribed and full not in self._subscribed.values() and not self._make_room():
+            return False                    # the plan's symbol cap is full of higher-priority prices: REST
         self._ondemand[bus_key] = time.monotonic()
         if bus_key not in self._subscribed:
             self._full_to_short[full] = bus_key

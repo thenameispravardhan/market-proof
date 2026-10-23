@@ -38,10 +38,12 @@ one found already expired is booked at its settlement value, no order sent.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from collections import deque
+from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from sqlalchemy import func, or_, select
 
@@ -345,10 +347,37 @@ def _strategy_account(strategy_id: int) -> Optional[int]:
 
 # ---- broker helpers ------------------------------------------------------------
 
+# REST LTPs of symbols the stream doesn't carry (over the plan's socket cap): symbol -> (price, at).
+_rest_px: dict[str, tuple[float, float]] = {}
+# Set by the order paths (an entry's price, a limit chase, a future leg): no reused REST LTP.
+_fresh_px: ContextVar[bool] = ContextVar("algo_fresh_px", default=False)
+
+
+@contextlib.contextmanager
+def _fresh_prices() -> Iterator[None]:
+    tok = _fresh_px.set(True)
+    try:
+        yield
+    finally:
+        _fresh_px.reset(tok)
+
+
+def rest_gap() -> float:
+    """How long a REST LTP is reused by the 1 s exit sweep, the armed-entry check
+    and the status views: the data calls kept for the Trade page / orders
+    (FYERS_DATA_RESERVE_PCT of a minute) spread over a minute — 6 s on the
+    Standard plan, 1 s on Prime. Order paths ask for a fresh one."""
+    from app.execution.data_budget import limits
+
+    lim = limits()
+    return max(1.0, 60.0 / max(1.0, lim["per_min"] * lim["reserve_pct"] / 100))
+
+
 async def _ltp(symbols: list[str]) -> dict[str, float]:
     """Live prices from the Fyers tick stream (keeping those symbols streaming);
-    REST quotes only for symbols with no fresh tick — so the 1 s exit loop
-    doesn't spend the Fyers rate budget orders need."""
+    REST quotes only for symbols with no fresh tick — reused for rest_gap()
+    except on an order path (_fresh_prices) — so the 1 s exit loop doesn't spend the
+    Fyers rate budget orders need."""
     from app.api.market import fyers_quotes
     from app.api.orders import _bus_quote_is_fresh, _fyers_stream, _is_simulated, _manager
 
@@ -367,8 +396,19 @@ async def _ltp(symbols: list[str]) -> dict[str, float]:
             out[sym] = float(q.last_price)
     missing = [x for x in syms if x not in out]
     if missing:
-        qs = await fyers_quotes(missing)
-        out.update({k: float(q.last_price) for k, q in qs.items() if q.last_price})
+        now = time.time()
+        gap = 0.0 if _fresh_px.get() else rest_gap()
+        for x in missing:
+            hit = _rest_px.get(x)
+            if hit is not None and now - hit[1] < gap:
+                out[x] = hit[0]
+        need = [x for x in missing if x not in out]
+        if need:
+            qs = await fyers_quotes(need)
+            for k, q in qs.items():
+                if q.last_price:
+                    out[k] = float(q.last_price)
+                    _rest_px[k] = (out[k], now)
     return out
 
 
@@ -481,7 +521,8 @@ async def _order_chase(account: BrokerAccount, symbol: str, side: str, qty: int,
             filled = filled and st.state == OrderState.FILLED
         if not working:                                       # the caller's fill check books it, or rolls it back
             return True, oids, "limit filled" if filled else "not working any more (rejected / cancelled)"
-        px = None if k == steps else (await _ltp([symbol])).get(symbol.upper())
+        with _fresh_prices():
+            px = None if k == steps else (await _ltp([symbol])).get(symbol.upper())
         for oid in working:
             try:
                 if k == steps:
@@ -595,7 +636,8 @@ async def build_legs(spec: dict, sym: str, side: str, u: float, now: float) -> l
         fs = fno.future_symbol(name, inst["expiry"], now)
         if not fs:
             raise ValueError(f"no {inst['expiry']} {name} future in the F&O master")
-        px = (await _ltp([fs])).get(fs)
+        with _fresh_prices():
+            px = (await _ltp([fs])).get(fs)
         return [{"symbol": fs, "kind": "FUT", "act": sign, "per_set": lot_of(fs), "label": fs.split(":")[-1], "price": px,
                  "exp": fno.contract_expiry(fs)}]
     backend = data._backend()
@@ -634,9 +676,11 @@ async def build_legs(spec: dict, sym: str, side: str, u: float, now: float) -> l
             fs = fno.future_symbol(name, inst["expiry"], now)
             if not fs:
                 raise ValueError(f"no {inst['expiry']} {name} future in the F&O master")
+            with _fresh_prices():
+                px = (await _ltp([fs])).get(fs)
             legs.append({"symbol": fs, "kind": "FUT", "act": 1 if c["action"] == "BUY" else -1, "src": src,
                          "per_set": lot_of(fs) * c["lots"], "label": fs.split(":")[-1],
-                         "price": (await _ltp([fs])).get(fs), "exp": fno.contract_expiry(fs)})
+                         "price": px, "exp": fno.contract_expiry(fs)})
             continue
         exp, rows, step, spot = await chain_for(c.get("expiry") or inst["expiry"])
         key = c["right"].lower()
@@ -1796,7 +1840,8 @@ class AlgoRunner:
             if why:
                 self.event("info", f"{s['name']}: {side} {sym} skipped — {why}", strategy_id=s["id"])
                 return
-        u = (await _ltp([sym])).get(sym.upper())
+        with _fresh_prices():
+            u = (await _ltp([sym])).get(sym.upper())
         if u is None:
             self.event("error", f"{s['name']}: {side} {sym} skipped — no live price (no synthetic fills)",
                        strategy_id=s["id"])

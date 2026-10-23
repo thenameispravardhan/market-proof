@@ -369,6 +369,9 @@ def test_capacity_with_nothing_stored_says_so(tmp_path):
 @pytest.mark.asyncio
 async def test_the_collector_records_strategy_chains_and_flags_the_day(tmp_path, monkeypatch):
     from app.algo import flowd
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "FYERS_PLAN", "prime", raising=False)    # recording needs Prime's socket room
 
     ticks.save_config({"symbols": [], "budget": 400, "universe": {"lists": ["nifty500"]},
                        "chains": {"enabled": True, "strikes": 2, "expiries": 1, "interval_s": 30},
