@@ -375,8 +375,12 @@ def hist_vol(d: dict, n: int) -> S:
 
 
 def close_time(d: dict, i: int) -> int:
-    """When bar i closed: volume/turnover candles carry it; time bars are t + tf."""
-    return d["tc"][i] if "tc" in d else d["t"][i] + d["tf_s"]
+    """When bar i closed: volume/turnover, daily and weekly candles carry it;
+    time bars are t + tf, the session's last (shorter) one at the 15:30 close."""
+    if "tc" in d:
+        return d["tc"][i]
+    t = d["t"][i]
+    return min(t + d["tf_s"], t - (t + IST_OFFSET) % 86400 + 55800)
 
 
 # ---- order flow (see app/algo/orderflow.py for how candles get their flow) ----

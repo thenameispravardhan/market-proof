@@ -85,7 +85,12 @@ _M1 = """SELECT DISTINCT ON (ts) ts, open, high, low, close, volume FROM {src}
 _FETCH = 50_000     # rows per fetch: a result never sits in memory whole as Python tuples
 
 
+WEEK = 10080         # minutes in a week: weekly candles
+
+
 def _resample(con: duckdb.DuckDBPyConnection, rel: str, tf_min: int, params: Sequence[Any] = ()) -> dict[str, Any]:
+    if tf_min == WEEK:
+        return _resample_weekly(con, rel, params)
     n = int(tf_min) * 60
     o_s = "(ts - ((ts + 19800) % 86400) + 33300)"            # the day's 09:15 open
     bucket = "ts - ((ts + 19800) % 86400)" if tf_min == 1440 else f"{o_s} + ((ts - {o_s}) // {n}) * {n}"
@@ -94,9 +99,43 @@ def _resample(con: duckdb.DuckDBPyConnection, rel: str, tf_min: int, params: Seq
     return columns(cur, n)
 
 
+def _resample_weekly(con: duckdb.DuckDBPyConnection, rel: str, params: Sequence[Any] = ()) -> dict[str, Any]:
+    """Weekly candles (IST Monday to Sunday), stamped at the 09:15 open of the
+    week's first session with `tc` = the 15:30 close of its last one."""
+    day = "(ts - ((ts + 19800) % 86400))"
+    week = f"({day} - ((((ts + 19800) // 86400) + 3) % 7) * 86400)"
+    cur = con.execute(f"""SELECT {week} AS w, min(ts), arg_min(open, ts), max(high), min(low), arg_max(close, ts),
+                                 sum(volume), max(ts)
+                          FROM {rel} GROUP BY w ORDER BY w""", list(params))
+    t, tc, v = array("q"), array("q"), array("q")
+    o, h, l, c = array("d"), array("d"), array("d"), array("d")
+    while rows := cur.fetchmany(_FETCH):
+        t.extend(r[1] - (r[1] + 19800) % DAY + 33300 for r in rows)
+        tc.extend(r[7] - (r[7] + 19800) % DAY + 55800 for r in rows)
+        o.extend(r[2] for r in rows)
+        h.extend(r[3] for r in rows)
+        l.extend(r[4] for r in rows)
+        c.extend(r[5] for r in rows)
+        v.extend(int(r[6] or 0) for r in rows)
+    return {"t": t, "tc": tc, "o": o, "h": h, "l": l, "c": c, "v": v, "tf_s": WEEK * 60}
+
+
+def as_base(b: Optional[dict[str, Any]], tf_min: int) -> Optional[dict[str, Any]]:
+    """Daily candles as a strategy's OWN timeframe: stamped at the session's
+    09:15 open (when its entries fill) with `tc` at the 15:30 close (when it is
+    evaluated) — loaded / fetched daily candles are stamped at IST midnight,
+    which is right for a condition reading them but no time to trade at.
+    Weekly candles already carry both. In place; returns `b`."""
+    if b and tf_min == 1440 and b.get("t") is not None and len(b["t"]):
+        day0 = [x - (x + 19800) % DAY for x in b["t"]]
+        mk = (lambda xs: array("q", xs)) if isinstance(b["t"], array) else list
+        b["t"], b["tc"] = mk(x + 33300 for x in day0), mk(x + 55800 for x in day0)
+    return b
+
+
 def load(key: str, tf_min: int, start_ts: int, end_ts: int) -> Optional[dict[str, Any]]:
     """`tf_min`-minute OHLCV bars in [start_ts, end_ts), session minutes only.
-    tf_min=1440 gives daily bars stamped at IST midnight."""
+    tf_min=1440 gives daily bars stamped at IST midnight, 10080 weekly ones."""
     src = candle_source(key)
     if not src:
         return None
@@ -130,6 +169,8 @@ def load_frames(key: str, tfs: Sequence[int], start_ts: int, end_ts: int,
 
 def warmup_days(tf_min: int, bars: int) -> int:
     """Calendar days of history that hold `bars` bars of `tf_min` (375 session minutes a day)."""
+    if tf_min == WEEK:
+        return int(bars * 7 * 1.1) + 10
     per_day = 1 if tf_min == 1440 else max(1, 375 // tf_min)
     return int(bars / per_day * 1.5) + 4
 
@@ -202,7 +243,7 @@ async def _assemble(spec: dict[str, Any], start: int, end: int, con: duckdb.Duck
             others = sorted(vix_tfs - {base_tf})
             fr = await asyncio.to_thread(load_frames, store_key(VIX), [base_tf, *others], first, end, con)
             if fr:
-                vix, vix_htf = fr[0], dict(zip(others, fr[1:]))
+                vix, vix_htf = as_base(fr[0], base_tf), dict(zip(others, fr[1:]))
         except Exception as e:  # noqa: BLE001
             notes.append({"symbol": VIX, "note": f"VIX unavailable ({'conditions on VIX stay false' if vix_tfs else 'using realised vol'}): {e}"[:200]})
     # Other symbols the conditions read: loaded once, shared by every symbol's
@@ -215,7 +256,7 @@ async def _assemble(spec: dict[str, Any], start: int, end: int, con: duckdb.Duck
             raise ValueError(f"{ref} (read by the conditions): {e}") from None
         others = sorted(tfs - {base_tf})
         fr = await asyncio.to_thread(load_frames, info["key"], [base_tf, *others], first, end, con)
-        b = fr[0] if fr else None
+        b = as_base(fr[0], base_tf) if fr else None
         if not b or not b["t"] or b["t"][-1] < start:
             raise ValueError(f"{ref} (read by the conditions): no candles in this range")
         b["tf_min"] = base_tf
@@ -258,6 +299,7 @@ async def _assemble(spec: dict[str, Any], start: int, end: int, con: duckdb.Duck
             if not bars or not bars["t"] or bars["t"][-1] < start:
                 notes.append({"symbol": fy, "note": "no candles in this range"})
                 continue
+            as_base(bars, base_tf)
             bars["tf_min"] = base_tf
             bars["htf"] = htf
             if xs:
@@ -477,18 +519,89 @@ async def ensure(fy: str, start_ts: int, end_ts: int) -> dict[str, Any]:
     return {"symbol": fy, "key": key, "note": note, "coverage": coverage(key) if fetched else cov}
 
 
+# Resolutions Fyers' /data/history serves; anything else is resampled from one it does.
+FYERS_RES = (1, 2, 3, 5, 10, 15, 20, 30, 45, 60, 120, 180, 240, 1440)
+
+
+def fetch_res(tf_min: int) -> int:
+    """The Fyers resolution a `tf_min` candle is built from: itself when Fyers
+    serves it, else the largest one that divides it (75 <- 15, 125 <- 5), and
+    daily candles for a week."""
+    if tf_min == WEEK:
+        return 1440
+    return tf_min if tf_min in FYERS_RES else max(r for r in FYERS_RES if r < 1440 and tf_min % r == 0)
+
+
+def resample(b: dict[str, Any], tf_min: int) -> dict[str, Any]:
+    """`b` (finer candles, Fyers-stamped) as `tf_min` candles: intraday from the
+    09:15 open; weekly by IST week, stamped at its first session's 09:15 with
+    `tc` = its last session's 15:30 close. Every input candle is kept, so a
+    caller drops the one still forming."""
+    week = tf_min == WEEK
+    n = tf_min * 60
+    out: dict[str, Any] = {k: [] for k in ("t", "o", "h", "l", "c", "v")}
+    if week:
+        out["tc"] = []
+    key = None
+    for i, t in enumerate(b["t"]):
+        day0 = t - (t + 19800) % DAY
+        k = day0 - ((t + 19800) // DAY + 3) % 7 * DAY if week else day0 + 33300 + (t - day0 - 33300) // n * n
+        if k != key:
+            key = k
+            out["t"].append(day0 + 33300 if week else k)
+            out["o"].append(b["o"][i])
+            out["h"].append(b["h"][i])
+            out["l"].append(b["l"][i])
+            out["c"].append(b["c"][i])
+            out["v"].append(b["v"][i])
+            if week:
+                out["tc"].append(day0 + 55800)
+            continue
+        out["h"][-1] = max(out["h"][-1], b["h"][i])
+        out["l"][-1] = min(out["l"][-1], b["l"][i])
+        out["c"][-1] = b["c"][i]
+        out["v"][-1] += b["v"][i]
+        if week:
+            out["tc"][-1] = day0 + 55800
+    out["tf_s"] = n
+    return out
+
+
 async def recent_bars(fy: str, tf_min: int, bars: int = 400, now: Optional[float] = None) -> dict[str, Any]:
     """The last `bars` COMPLETED bars straight from Fyers at the strategy's
     resolution (live runner). The still-forming bar is dropped — a strategy
-    must never act on a candle that can still change. tf_min=1440 is daily."""
+    must never act on a candle that can still change. tf_min=1440 is daily,
+    10080 weekly; 75 / 125 minutes are built from 15 / 5-minute candles."""
     now = int(now or time.time())
+    res = fetch_res(tf_min)
+    if res != tf_min:
+        per = tf_min // res if tf_min != WEEK else 5
+        src = await recent_bars(fy, res, bars=bars * per + per, now=now)
+        out = resample(src, tf_min)
+        if tf_min == WEEK:     # the newest finished session: is today a week's first?
+            out["last_session"] = src["t"][-1] if src["t"] else None
+        if tf_min == WEEK:     # a week is complete once its Friday session has closed
+            done = lambda i: out["t"][i] - (out["t"][i] + 19800) % DAY \
+                - ((out["t"][i] + 19800) // DAY + 3) % 7 * DAY + 4 * DAY + 55800 <= now  # noqa: E731
+        else:                  # ... an intraday candle once its last minute has (15:30 at the latest)
+            done = lambda i: min(out["t"][i] + tf_min * 60,  # noqa: E731
+                                 out["t"][i] - (out["t"][i] + 19800) % DAY + 55800) <= now
+        keep = [i for i in range(len(out["t"])) if done(i)][-bars:]
+        return {k: ([v[i] for i in keep] if isinstance(v, list) else v) for k, v in out.items()}
     daily = tf_min == 1440
     tf_s = 86400 if daily else int(tf_min) * 60
-    days = min(365, int(bars * 1.5) + 5) if daily else min(MAX_DAYS, max(5, math.ceil(bars * tf_min / 375 * 1.6) + 4))
-    raw = await _backend().get_history_range(fy, resolution="D" if daily else str(tf_min),
-                                             from_ts=now - days * DAY, to_ts=now)
-    if raw is None:
-        raise RuntimeError(f"Fyers history call failed for {fy}")
+    days = int(bars * 1.5) + 5 if daily else min(MAX_DAYS, max(5, math.ceil(bars * tf_min / 375 * 1.6) + 4))
+    raw: list = []
+    hi = now
+    while True:            # daily history is served a year per call: a weekly warm-up needs more
+        lo = max(now - days * DAY, hi - 365 * DAY)
+        part = await _backend().get_history_range(fy, resolution="D" if daily else str(tf_min), from_ts=lo, to_ts=hi)
+        if part is None:
+            raise RuntimeError(f"Fyers history call failed for {fy}")
+        raw = list(part) + raw
+        if lo <= now - days * DAY or not part:
+            break
+        hi = lo
     if daily:      # Fyers stamps daily candles at the day's start; finished once the session closed
         done = lambda t: t - (t + 19800) % 86400 + 55800 <= now  # noqa: E731
     else:
@@ -531,6 +644,9 @@ def last_closed(tf_min: int, now: float) -> int:
     """Start of the newest `tf_min` candle that has closed by `now` (candles
     from the 09:15 open; 1440 = the day's start once its session ended)."""
     day0 = int(now - (now + 19800) % DAY)
+    if tf_min == WEEK:      # the Monday 00:00 of the newest week whose Friday session has closed
+        mon = day0 - ((now + 19800) // DAY + 3) % 7 * DAY
+        return mon if now >= mon + 4 * DAY + 55800 else mon - 7 * DAY
     if tf_min == 1440:
         return day0 if now >= day0 + 55800 else day0 - DAY
     k = int(now - day0 - 33300) // (tf_min * 60)
@@ -549,7 +665,7 @@ async def shared_bars(fy: str, tf_min: int, bars: int, now: float) -> dict[str, 
     yet) is not reused: the next call asks again."""
     key, stamp = (fy, tf_min, bars), last_closed(tf_min, now)
     hit = _shared.get(key)
-    if hit is None or hit[0] != stamp or (tf_min != 1440 and (not hit[1]["t"] or hit[1]["t"][-1] < stamp)):
+    if hit is None or hit[0] != stamp or (tf_min < 1440 and (not hit[1]["t"] or hit[1]["t"][-1] < stamp)):
         hit = _shared[key] = (stamp, await recent_bars(fy, tf_min, bars=bars, now=now))
     return {k: list(v) if isinstance(v, list) else v for k, v in hit[1].items()}
 
@@ -577,11 +693,12 @@ async def live_bundle(spec: dict[str, Any], fy: str, now: float) -> dict[str, An
         d = orderflow.complete_only(orderflow.build_bars(m1, btype, spec["timeframe"], size, real), now)
     else:
         d = await recent_bars(fy, spec["timeframe"], bars=keep(spec["timeframe"], 60), now=now)
+    as_base(d, spec["timeframe"])
     d["tf_min"] = spec["timeframe"]
     d["htf"] = {tf: await recent_bars(fy, tf, bars=keep(tf, 5), now=now) for tf in engine.cond_timeframes(spec)}
     xs = {}
     for ref, tfs in engine.ref_frames(spec).items():  # other symbols the conditions read, as the backtest loads them
-        b = await shared_bars(ref, spec["timeframe"], keep(spec["timeframe"], 60), now)
+        b = as_base(await shared_bars(ref, spec["timeframe"], keep(spec["timeframe"], 60), now), spec["timeframe"])
         b["tf_min"] = spec["timeframe"]
         b["htf"] = {tf: await shared_bars(ref, tf, keep(tf, 5), now) for tf in tfs - {spec["timeframe"]}}
         b["meta"] = {"symbol": ref}
@@ -597,7 +714,7 @@ async def live_bundle(spec: dict[str, Any], fy: str, now: float) -> dict[str, An
             log.warning("algo.vix_unavailable", tf=tf, error=str(e)[:200])
             continue
         if tf == spec["timeframe"]:
-            d["vix"] = v
+            d["vix"] = as_base(v, tf)
         elif d["htf"].get(tf):
             d["htf"][tf]["vix"] = v
     name = fno.fno_name(fy)

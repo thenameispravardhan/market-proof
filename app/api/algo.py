@@ -110,8 +110,8 @@ def _estimate_bars(spec: dict[str, Any], start: int, end: int) -> int:
     candles and freed (data.assemble), so it counts once, not per symbol."""
     days = (end - start) / 86400 * 5 / 7 + max(30, data.lead_days(spec) * 5 / 7)    # the warm-up history too
     btype = spec["bars"]["type"]
-    base = spec["bars"]["per_day"] if btype != "time" else 375 / spec["timeframe"]
-    htf = sum(1 if tf == 1440 else 375 / tf for tf in engine.cond_timeframes(spec))
+    base = spec["bars"]["per_day"] if btype != "time" else engine.per_session(spec["timeframe"])
+    htf = sum(engine.per_session(tf) for tf in engine.cond_timeframes(spec))
     n_syms = len(spec["symbols"])
     if spec.get("universe"):                       # every past member is loaded, not just today's list
         from app.research import universe
@@ -123,7 +123,7 @@ def _estimate_bars(spec: dict[str, Any], start: int, end: int) -> int:
             raise HTTPException(422, detail=str(e)) from None
     held = n_syms * days * (base + htf)
     for tfs in engine.ref_frames(spec).values():   # other symbols' candles: time candles, loaded once
-        held += days * sum(1 if tf == 1440 else 375 / tf for tf in tfs | {spec["timeframe"]})
+        held += days * sum(engine.per_session(tf) for tf in tfs | {spec["timeframe"]})
     transient = days * 375 if engine.needs_minutes(spec) else 0
     return int(held + transient)
 
@@ -453,8 +453,8 @@ async def research_pairs(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         syms.remove(anchor)
     if len(syms) < (1 if anchor else 2) or len(syms) > pf.MAX_SYMBOLS:
         raise HTTPException(422, detail=f"give 2-{pf.MAX_SYMBOLS} symbols (1+ with an anchor)")
-    if tf not in engine.TIMEFRAMES:
-        raise HTTPException(422, detail=f"timeframe must be one of {engine.TIMEFRAMES}")
+    if tf not in engine.TIMEFRAMES or engine.multi_day(tf):       # its pair spec trades intraday
+        raise HTTPException(422, detail=f"timeframe must be an intraday one of {[t for t in engine.TIMEFRAMES if t < engine.DAILY]}")
     if not 30 <= days <= MAX_RANGE_DAYS:
         raise HTTPException(422, detail=f"days must be 30-{MAX_RANGE_DAYS}")
     per_day = 375 / tf

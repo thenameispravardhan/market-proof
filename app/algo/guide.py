@@ -25,8 +25,11 @@ def reference() -> str:
     lines = [
         "---", "",
         "## Reference (generated from the app)", "",
-        f"* **Strategy timeframes** (minutes): {tf}. Conditions may also use `tf: 1440` (daily) or any of "
-        "these that is a multiple of the strategy's.",
+        f"* **Strategy timeframes** (minutes): {tf} — 1440 = daily, 10080 = weekly. A daily / weekly "
+        "strategy is checked on the session's close and fills at the next session's open; its positions carry "
+        "(no entry window or square-off). Conditions may also use `tf: 1440` / `10080` (above the strategy's own) "
+        "or, intraday, any of these that is a multiple of the strategy's.",
+        f"* **Symbols**: up to {engine.MAX_SYMBOLS} per strategy.",
         f"* **Operators**: {', '.join(f'`{o}`' for o in engine.OPS)}.",
         f"* **Transforms** (`xf`, `xn` 1-{engine.MAX_LOOKBACK}): {', '.join(f'`{x}`' for x in engine.TRANSFORMS)}.",
         f"* **Combined values** (`math`): {', '.join(f'`{m}`' for m in engine.MATH)}.",
