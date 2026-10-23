@@ -84,6 +84,17 @@ def limits() -> dict[str, Any]:
     return out
 
 
+def ws_split() -> tuple[int, int]:
+    """(the app's own price feed, the order-flow collector) of the plan's
+    data-socket symbols. The app's feed — open positions' exits, the Trade
+    page, the index ticker — comes first: a tenth of the cap, at least 60.
+    Standard (100): 60 / 40, under the collector's minimum, so it records
+    nothing; Prime (5,000): 500 / 4,500."""
+    total = int(limits()["ws_symbols"])
+    app = min(total, max(60, total // 10))
+    return app, total - app
+
+
 def _day(now: float) -> int:
     return int((now + IST) // 86400)
 

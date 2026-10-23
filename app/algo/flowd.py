@@ -101,8 +101,8 @@ class Collector:
         self.lists: dict[str, tuple[list[str], str]] = {}
         self.lists_at = 0.0
         self.quotes: dict[str, tuple[float, float]] = {}       # full -> (price, at): REST spot fallback
-        self.active_budget = int(self.cfg.get("budget") or ticks.DEFAULT_BUDGET)
-        self.budget_note: Optional[str] = None
+        self.active_budget = self.configured()
+        self.budget_note: Optional[str] = None if self.active_budget else self.plan_note()
         self.started = time.time()
         self.errors: list[str] = []
         self.stream: Any = None
@@ -126,6 +126,24 @@ class Collector:
         self.paused = False                         # the disk guard stopped recording
         self._disk_at = 0.0
         self._stop = asyncio.Event()
+
+    def configured(self) -> int:
+        """The config's budget, within the data-socket symbols the Fyers plan
+        leaves the collector (data_budget.ws_split); 0 when that is under
+        MIN_BUDGET — the app's own price feed needs them more."""
+        from app.execution.data_budget import ws_split
+
+        share = ws_split()[1]
+        want = int(self.cfg.get("budget") or ticks.DEFAULT_BUDGET)
+        return min(want, share) if share >= MIN_BUDGET else 0
+
+    @staticmethod
+    def plan_note() -> str:
+        from app.execution.data_budget import limits, ws_split
+
+        lim = limits()
+        return (f"not recording: the Fyers {lim['plan']} plan's {lim['ws_symbols']} data-socket symbols go to the app's own "
+                f"prices ({ws_split()[0]}: positions' exits, the Trade page) — order flow needs Fyers Prime")
 
     # -- plumbing ------------------------------------------------------------
 
@@ -184,9 +202,9 @@ class Collector:
     async def replan(self, now: float) -> None:
         cfg = self.cfg
         day = ticks.ist_day(now)
-        if self.paused:                            # the disk guard: the socket lets everything go
+        if self.paused or not self.active_budget:  # the disk guard / no socket room on this Fyers plan
             self.symbols = []
-            self.plan_summary = {**self.plan_summary, "used": 0}
+            self.plan_summary = {**self.plan_summary, "used": 0, "budget": self.active_budget}
             self.plan_at = now
             return
         if self.sel_day != day:
@@ -248,7 +266,9 @@ class Collector:
         session = ((ticks.ist_day(now) + 3) % 7) < 5 and ticks.OPEN_S <= tod < ticks.CLOSE_S
         over = session and (self.cpu_pct > self.cpu_cap or (lags and self.lag[1] > 10))
         self._strikes = self._strikes + 1 if over else max(0, self._strikes - 1)
-        configured = int(self.cfg.get("budget") or ticks.DEFAULT_BUDGET)
+        configured = self.configured()
+        if not configured:
+            return False
         if self._strikes >= 3 and self.active_budget > MIN_BUDGET:
             self.active_budget = max(MIN_BUDGET, int(min(self.active_budget, len(self.symbols) or self.active_budget) * 0.8))
             self.budget_note = (f"cut to {self.active_budget} at {time.strftime('%H:%M')}: CPU {self.cpu_pct}%, "
@@ -271,7 +291,7 @@ class Collector:
     def check_limits(self, now: float) -> bool:
         """Fyers refused a subscribe for the symbol cap: shrink to fit and stay there today."""
         hits = int(getattr(self.stream, "limit_hits", 0) or 0) if self.stream is not None else 0
-        if hits <= self._limit_hits:
+        if hits <= self._limit_hits or not self.configured():
             return False
         self._limit_hits = hits
         held = len(getattr(self.stream, "_subscribed", {}) or {})
@@ -330,7 +350,7 @@ class Collector:
             "stream": self.stream.status() if self.stream is not None else None,
             "frames": self.rec.frames, "fps": self.fps, "cpu_pct": self.cpu_pct,
             "lag_p50": self.lag[0], "lag_p95": self.lag[1],
-            "budget": {"configured": int(self.cfg.get("budget") or ticks.DEFAULT_BUDGET), "active": self.active_budget,
+            "budget": {"configured": self.configured(), "active": self.active_budget,
                        "note": self.budget_note},
             "disk": {"free_gb": self.free_gb, "min_free_gb": float(self.cfg.get("min_free_gb") or ticks.MIN_FREE_GB),
                      "note": self.disk_note, "paused": self.paused},
@@ -407,8 +427,10 @@ class Collector:
                         self.cfg = ticks.load_config(self.root)
                         if not self.cfg.get("enabled"):
                             break
-                        self.active_budget = min(self.active_budget, int(self.cfg.get("budget") or ticks.DEFAULT_BUDGET)) \
-                            if self.budget_note or self.cap else int(self.cfg.get("budget") or ticks.DEFAULT_BUDGET)
+                        self.active_budget = min(self.active_budget, self.configured()) \
+                            if self.budget_note or self.cap else self.configured()
+                        if not self.active_budget:
+                            self.budget_note = self.plan_note()
                         self._disk_at = 0.0
                         self.lists_at = 0.0
                         await self.replan(now)

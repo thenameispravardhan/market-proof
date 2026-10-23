@@ -256,3 +256,28 @@ def test_a_large_daily_strategy_is_decided_from_its_warm_up_with_no_call_at_the_
     assert exact and screened == exact
     assert w0 == 0 and total0 == 200                 # not screened: every symbol fetched at the open
     assert w1 == 200 and total1 == 200               # screened: all before the open, none at it
+
+
+def test_rest_prices_are_reused_by_the_sweep_but_never_by_an_order(monkeypatch, standard):
+    """A position the socket doesn't carry: the 1 s exit sweep reuses its REST LTP
+    for rest_gap() (6 s on Standard) instead of spending a data call a second;
+    an order path always asks again."""
+    asked = []
+
+    async def quotes(symbols):
+        asked.append(list(symbols))
+        return {s: SimpleNamespace(last_price=100.0 + len(asked)) for s in symbols}
+
+    monkeypatch.setattr("app.api.market.fyers_quotes", quotes)
+    monkeypatch.setattr("app.api.orders._fyers_stream", lambda: None)
+    rn._rest_px.clear()
+    assert rn.rest_gap() == 6.0
+
+    async def go():
+        a = await rn._ltp(["NSE:X-EQ"])
+        b = await rn._ltp(["NSE:X-EQ"])
+        with rn._fresh_prices():
+            c = await rn._ltp(["NSE:X-EQ"])
+        return a, b, c
+    a, b, c = asyncio.run(go())
+    assert a == b == {"NSE:X-EQ": 101.0} and c == {"NSE:X-EQ": 102.0} and len(asked) == 2

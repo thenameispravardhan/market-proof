@@ -318,9 +318,36 @@ _orig_load, _orig_save = ticks.load_config, ticks.save_config
 
 
 @pytest.fixture(autouse=True)
-def _fresh_plan_caches():
+def _fresh_plan_caches(monkeypatch):
+    from app.config import get_settings
+
     fu._CACHE.clear()
+    monkeypatch.setattr(get_settings(), "FYERS_PLAN", "prime", raising=False)   # recording thousands needs Prime
     yield
+
+
+def test_on_the_standard_plan_the_collector_leaves_the_socket_to_the_app(tmp_path, monkeypatch):
+    """Standard: 100 data-socket symbols, 60 for the app's own prices — the 40
+    left are under the collector's minimum, so it plans nothing and makes no
+    quote calls, and says why."""
+    from app.algo import flowd
+    from app.config import get_settings
+    from app.execution.data_budget import ws_split
+
+    monkeypatch.setattr(get_settings(), "FYERS_PLAN", "standard", raising=False)
+    assert ws_split() == (60, 40)
+    ticks.save_config({"symbols": ["NSE:ITC-EQ"], "budget": 400}, tmp_path)
+    c = flowd.Collector(tmp_path)
+    assert c.configured() == 0 and c.active_budget == 0 and "Prime" in c.budget_note
+
+    async def no_quotes(*a, **k):
+        raise AssertionError("no quote calls on a plan with no room to record")
+    monkeypatch.setattr(c, "refresh_quotes", no_quotes)
+    import asyncio
+    asyncio.run(c.replan(time.time()))
+    assert c.symbols == []
+    monkeypatch.setattr(get_settings(), "FYERS_PLAN", "prime", raising=False)
+    assert ws_split() == (500, 4500) and flowd.Collector(tmp_path).configured() == 400
 
 
 # ---- the collector process -------------------------------------------------------------
