@@ -152,12 +152,12 @@ def _install(monkeypatch, mkt, ts):
     return calls
 
 
-def _session(monkeypatch, n, screened_cap):
-    """Run the runner over today's session; return (trades, calls)."""
+def _session(monkeypatch, n, screened):
+    """Run the runner over today's session, screened or candle by candle; return (trades, calls, stats)."""
     mkt = _market(n, 150)
     ts = _times(150)
     calls = _install(monkeypatch, mkt, ts)
-    monkeypatch.setattr(sc, "exact_capacity", lambda spec: screened_cap)
+    monkeypatch.setattr(sc, "screened", lambda spec: screened)
     with dbs.SessionLocal() as db:
         db.add(AlgoStrategy(name="big", spec=_spec(n), enabled=True, mode="paper"))
         db.commit()
@@ -187,11 +187,11 @@ def _session(monkeypatch, n, screened_cap):
 
 
 def test_a_screened_universe_trades_exactly_like_the_candle_by_candle_one(monkeypatch, isolated_db, standard):
-    exact, c_exact, _ = _session(monkeypatch, 120, screened_cap=10_000)     # fits: every symbol, every candle
-    screened, c_scr, stats = _session(monkeypatch, 120, screened_cap=30)
+    exact, c_exact, _ = _session(monkeypatch, 120, screened=False)      # every symbol's candles, every candle
+    screened, c_scr, stats = _session(monkeypatch, 120, screened=True)
     assert exact and screened == exact
-    assert c_scr["bundle"] < c_exact["bundle"] / 3                          # most candles never fetched
-    assert c_scr["quote"] > 0 and stats and all(v["candidates"] <= max(30, v["held"]) for v in stats.values())
+    assert c_exact["quote"] == 0 and c_scr["bundle"] < c_exact["bundle"] / 3     # most candles never fetched
+    assert c_scr["quote"] > 0 and stats and all(v["skipped"] == 0 for v in stats.values())
 
 
 def test_a_large_daily_strategy_is_decided_from_its_warm_up_with_no_call_at_the_open(monkeypatch, isolated_db, standard):
@@ -226,6 +226,7 @@ def test_a_large_daily_strategy_is_decided_from_its_warm_up_with_no_call_at_the_
         monkeypatch.setattr(rn.data, "recent_bars", probe)
         monkeypatch.setattr(rn, "_ltp", ltp)
         monkeypatch.setattr(rn, "_notify_entry", lambda p: None)
+        monkeypatch.setattr(sc, "screened", lambda spec: cap < 200)
         monkeypatch.setattr(sc, "exact_capacity", lambda spec: cap)
         spec = {**_spec(200), "timeframe": 1440}
         with dbs.SessionLocal() as db:
@@ -281,3 +282,29 @@ def test_rest_prices_are_reused_by_the_sweep_but_never_by_an_order(monkeypatch, 
         return a, b, c
     a, b, c = asyncio.run(go())
     assert a == b == {"NSE:X-EQ": 101.0} and c == {"NSE:X-EQ": 102.0} and len(asked) == 2
+
+
+def test_when_a_strategy_is_screened(standard):
+    def spec(n, tf, **kw):
+        return _spec(n, timeframe=tf, **kw)
+    assert not sc.screened(spec(10, 5))                       # 750 calls a day: fine exact
+    assert sc.screened(spec(30, 5))                           # 2,250 exact calls: over half the automations' day
+    assert not sc.screened(spec(30, 60))
+    assert sc.screened(spec(41, 60))                          # past the 40 a minute the bulk lane fetches
+    assert sc.screened(spec(1000, 1440))
+    flow = {**spec(200, 5), "entry_long": {"logic": "AND", "conditions": [{"left": {"ind": "DELTA"}, "op": ">", "right": {"value": 0}}]}}
+    assert not sc.screened(engine.normalize(flow))            # order flow can't be approximated from quotes
+    c = sc.capacity(spec(1000, 5))
+    assert c["mode"] == "screened" and not c["fits"] and c["max_symbols"] == 640
+    assert sc.capacity(spec(1000, 15))["fits"] and sc.capacity(engine.normalize(flow))["mode"] == "over"
+
+
+def test_capacity_api(client, standard):
+    body = {"spec": {"symbols": [f"NSE:S{k}-EQ" for k in range(1000)], "timeframe": 15,
+                     "entry_long": {"logic": "AND", "conditions": [{"left": {"ind": "PRICE"}, "op": ">", "right": {"value": 1}}]}}}
+    r = client.post("/api/algo/capacity", json=body)
+    assert r.status_code == 200, r.text
+    c = r.json()
+    assert c["mode"] == "screened" and c["fits"] and c["bulk_per_day"] == 4000 and c["socket"] == {"app": 60, "collector": 40}
+    bad = client.post("/api/algo/capacity", json={"spec": {**body["spec"], "symbols": [f"S{k}" for k in range(1001)]}})
+    assert bad.status_code == 422 and "1000 symbols" in bad.json()["detail"]

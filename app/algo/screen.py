@@ -84,8 +84,8 @@ def daily_calls(spec: dict, confirm_rate: float = 0.05) -> dict[str, int]:
     bars = 1 if engine.multi_day(tf) else max(1, round(engine.per_session(tf)))
     warm = n * calls_per_symbol(spec)
     if engine.multi_day(tf):
-        return {"warm": warm, "polls": 0, "confirm": 0, "total": warm}
-    if n <= exact_capacity(spec) or not screenable(spec):
+        return {"warm": warm if screened(spec) else 0, "polls": 0, "confirm": 0 if screened(spec) else warm, "total": warm}
+    if not screened(spec):
         return {"warm": 0, "polls": 0, "confirm": n * bars * calls_per_symbol(spec),
                 "total": n * bars * calls_per_symbol(spec)}
     polls = bars * -(-n // QUOTE_BATCH)
@@ -108,6 +108,48 @@ def _compact(d: dict) -> dict:
     return d
 
 
+def screened(spec: dict) -> bool:
+    """Runs through the screen: daily / weekly or approximable intraday candles,
+    and either more symbols than the exact path fetches in the minute after a
+    close, or exact candles at every close would take over half the
+    automations' day (30 symbols on 5m already do on Standard: 2,250 calls)."""
+    if not (engine.multi_day(spec["timeframe"]) or screenable(spec)) or len(spec["symbols"]) < 2:
+        return False
+    if len(spec["symbols"]) > exact_capacity(spec):
+        return True
+    lim = data_budget.limits()
+    exact = len(spec["symbols"]) * calls_per_symbol(spec) * (1 if engine.multi_day(spec["timeframe"])
+                                                             else max(1, round(engine.per_session(spec["timeframe"]))))
+    return exact > lim["per_day"] * (100 - lim["reserve_pct"]) / 100 / 2
+
+
+def capacity(spec: dict) -> dict[str, Any]:
+    """How a strategy will run live on the Fyers plan, and what it costs a day."""
+    lim = data_budget.limits()
+    bulk_day = int(lim["per_day"] * (100 - lim["reserve_pct"]) / 100)
+    calls = daily_calls(spec)
+    n, cap = len(spec["symbols"]), exact_capacity(spec)
+    mode = "screened" if screened(spec) else "exact" if n <= cap else "over"
+    tf = spec["timeframe"]
+    # Symbols this strategy fits in the automations' day: screened when it can be
+    # (a warm-up each, a 50th of a poll and ~5% of a confirmation a candle), else exact.
+    cps = calls_per_symbol(spec)
+    bars = 1 if engine.multi_day(tf) else max(1, round(engine.per_session(tf)))
+    if engine.multi_day(tf):
+        per = cps
+    elif screenable(spec):
+        per = cps + bars / QUOTE_BATCH + bars * 0.05 * cps
+    else:
+        per = bars * cps
+    most = int(bulk_day / per)
+    return {"plan": lim["plan"], "limits": lim, "symbols": n, "exact_capacity": cap, "mode": mode,
+            "daily_calls": calls, "bulk_per_day": bulk_day, "fits": calls["total"] <= bulk_day,
+            "max_symbols": min(engine.MAX_SYMBOLS, most if screenable(spec) or engine.multi_day(tf) else min(most, cap)),
+            "timeframe": tf,
+            "used_today": data_budget.budget().used_today(), "socket": dict(zip(("app", "collector"),
+                                                                                data_budget.ws_split()))}
+
+
 class Screener:
     def __init__(self) -> None:
         self.day: Optional[int] = None
@@ -126,10 +168,9 @@ class Screener:
     def large(spec: dict) -> bool:
         return len(spec["symbols"]) > exact_capacity(spec)
 
-    def uses(self, spec: dict) -> bool:
-        """Runs through the screen: more symbols than the exact path serves, and
-        either a daily / weekly timeframe or approximable intraday candles."""
-        return self.large(spec) and (engine.multi_day(spec["timeframe"]) or screenable(spec))
+    @staticmethod
+    def uses(spec: dict) -> bool:
+        return screened(spec)
 
     # -- warm-up ------------------------------------------------------------
 

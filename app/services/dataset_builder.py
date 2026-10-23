@@ -459,11 +459,13 @@ async def _default_candle_fn(symbol: str, signal_time: datetime) -> list[Any]:
     endpoint. Returns [] when Fyers isn't connected / symbol unknown."""
     try:
         from app.api.market import fetch_history
+        from app.execution.data_budget import bulk
         from app.execution.symbols import resolve_fyers_symbol
 
         full = resolve_fyers_symbol(symbol) or symbol
         days = (_utcnow_naive().date() - signal_time.date()).days + 2
-        return await fetch_history(full, resolution="1", days=max(1, min(days, 35)))
+        with bulk():                 # dataset telemetry: the data budget's bulk lane
+            return await fetch_history(full, resolution="1", days=max(1, min(days, 35)))
     except Exception:  # noqa: BLE001 — telemetry never raises
         return []
 
@@ -473,11 +475,13 @@ async def _default_index_fn(signal_time: datetime) -> list[Any]:
     Same fail-safe contract as the stock candles."""
     try:
         from app.api.market import fetch_history
+        from app.execution.data_budget import bulk
 
         days = (_utcnow_naive().date() - signal_time.date()).days + 2
-        return await fetch_history(
-            "NSE:NIFTY50-INDEX", resolution="1", days=max(1, min(days, 35))
-        )
+        with bulk():
+            return await fetch_history(
+                "NSE:NIFTY50-INDEX", resolution="1", days=max(1, min(days, 35))
+            )
     except Exception:  # noqa: BLE001
         return []
 
