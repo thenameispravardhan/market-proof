@@ -484,10 +484,12 @@ def volume_profile(d: dict, value_area: int = 70) -> dict[str, S]:
     """Session volume profile, developing bar by bar: POC (price with the most
     volume), value-area high/low (where `value_area`% of the volume traded),
     plus the previous session's final POC / VAH / VAL. Each bar's volume is
-    spread evenly over its high-low range in bins of ~5 bps of price.
+    spread evenly over its high-low range in bins of ~5 bps of the session's
+    first close (fixed for the session, so no bar sees a later price).
 
-    ponytail: the value area is recomputed about every 5 minutes of bars, not
-    every 1-minute bar — O(bins) each; tighten if a strategy needs it per bar.
+    ponytail: the value area is recomputed when a bar closes into a new
+    5-minute slot of the clock (every bar from 5-minute candles up, every
+    fifth 1-minute bar) — O(bins) each; tighten if a strategy needs it per bar.
     """
     h, l, c, v = d["h"], d["l"], d["c"], d["v"]
     n = len(c)
@@ -495,10 +497,9 @@ def volume_profile(d: dict, value_area: int = 70) -> dict[str, S]:
     out: dict[str, S] = {k: [None] * n for k in names}
     if not n:
         return out
-    mid = sorted(c)[n // 2]
-    step = max(0.05, round(mid * 0.0005, 2))
     keys = _day_keys(d)
-    every = max(1, 300 // max(60, int(d.get("tf_s") or 300)))
+    step = 0.05
+    slot = None
     bins: dict[int, float] = {}
     poc_b = lo_b = hi_b = 0
     total = 0.0
@@ -508,6 +509,7 @@ def volume_profile(d: dict, value_area: int = 70) -> dict[str, S]:
         if i == 0 or keys[i] != keys[i - 1]:
             prev = last
             bins, total, va = {}, 0.0, (None, None)
+            step = max(0.05, round(c[i] * 0.0005, 2))
             poc_b = lo_b = hi_b = int(c[i] // step)
         lo, hi = int(l[i] // step), int(h[i] // step)
         stride = max(1, (hi - lo) // 200)              # a huge-range bar: sample its bins
@@ -519,9 +521,13 @@ def volume_profile(d: dict, value_area: int = 70) -> dict[str, S]:
                 poc_b = b
         lo_b, hi_b = min(lo_b, lo), max(hi_b, hi)
         total += v[i]
-        if va[0] is None or i % every == 0 or i + 1 == n or keys[i + 1] != keys[i]:
+        # By the clock, not the bar's index or whether a later bar exists: the
+        # same candle gets the same value in a backtest and live.
+        now_slot = close_time(d, i) // 300
+        if va[0] is None or now_slot != slot:
             a, b = _value_area(bins, poc_b, lo_b, hi_b, total * value_area / 100)
             va = (a * step, (b + 1) * step)
+        slot = now_slot
         poc = (poc_b + 0.5) * step
         out["poc"][i], out["val"][i], out["vah"][i] = poc, va[0], va[1]
         out["prev_poc"][i], out["prev_vah"][i], out["prev_val"][i] = prev[0], prev[1], prev[2]

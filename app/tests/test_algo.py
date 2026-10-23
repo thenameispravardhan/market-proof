@@ -399,6 +399,46 @@ def test_triggered_entry_cannot_take_target_on_its_own_bar():
     assert t["entry"] == round(106 * 0.985, 2) and t["exit_t"] > d["t"][5]
 
 
+def test_market_entry_can_take_its_target_on_its_own_bar():
+    # A market entry fills at bar 4's OPEN, so all of bar 4 comes after the fill:
+    # its high (109) passes the 108 target, which must be booked there — not
+    # skipped until the price has collapsed into the stop.
+    d = bars([100, 101, 102, 106, 107.5, 101, 100, 99, 98], spread=0)
+    d["h"][4] = 109.0
+    spec = _cross_spec(exit_long=None, target={"type": "points", "value": 2}, stop_loss={"type": "points", "value": 4})
+    t = engine.run(spec, {"X": d})["trades"][0]
+    assert (t["entry"], t["exit"], t["reason"]) == (106, 108, "TARGET") and t["exit_t"] == d["t"][4]
+
+
+def test_mid_bar_entry_stop_fills_at_the_stop_not_the_bar_extreme():
+    # Breakout trigger 106.53 fills inside bar 5, which OPENED at 104.5 — already
+    # below the 1% stop (105.46). The stop is hit after the fill (the bar's low is
+    # 103) and must fill at the stop, not at the low: the open-to-fill stretch
+    # happened before the position existed.
+    d = bars([100, 101, 102, 106, 104.5, 107.2, 107.5, 107.6, 107.7], spread=0)
+    d["l"][4], d["h"][4] = 104.0, 106.4
+    d["o"][5], d["l"][5], d["h"][5] = 104.5, 103.0, 107.5
+    spec = _cross_spec(exit_long=None, stop_loss={"type": "pct", "value": 1.0},
+                       entry_order={"type": "breakout", "offset_pct": 0.5, "valid_bars": 3})
+    t = engine.run(spec, {"X": d})["trades"][0]
+    assert t["entry"] == pytest.approx(106.53) and t["reason"] == "SL"
+    assert t["exit"] == pytest.approx(106.53 * 0.99, abs=0.01)
+
+
+def test_mid_bar_entry_does_not_count_the_high_before_its_fill():
+    # Pullback buy fills at 104.41 inside bar 4, whose 107 high came BEFORE the dip.
+    # That high must not arm the 1-point trailing stop (it would sit at 106, above
+    # the entry) nor count as the trade's best excursion.
+    d = bars([100, 101, 102, 106, 104.6, 105.2, 105.6, 106.0, 106.3], spread=0)
+    d["h"][4], d["l"][4] = 107.0, 104.0
+    d["h"][5], d["l"][5] = 105.3, 104.5
+    spec = _cross_spec(exit_long=None, trailing={"type": "points", "value": 1.0},
+                       entry_order={"type": "pullback", "offset_pct": 1.5, "valid_bars": 3})
+    t = engine.run(spec, {"X": d})["trades"][0]
+    assert t["entry"] == pytest.approx(104.41) and t["reason"] == "END" and t["exit"] == pytest.approx(106.3)
+    assert t["mfe_pct"] < 2.0
+
+
 def test_expiry_moves_back_off_a_holiday():
     from datetime import date, datetime
 
@@ -598,6 +638,21 @@ def test_orderflow_indicators():
     assert len(ind.compute(plain, "DELTA", {})["delta"]) == 80      # bar-level fallback still works
 
 
+def test_volume_profile_never_reads_later_candles():
+    # A later price (here a jump to 5x) must not change what an earlier candle saw:
+    # neither the price bins nor when the value area was last recomputed.
+    for tf in (60, 300):
+        n = 375 * 60 // tf
+        closes = [100 + (i % 13) * 0.4 for i in range(n)] + [500 + (i % 7) for i in range(n)]
+        d = bars(closes, tf=tf)
+        d["t"] = [DAY0 + (i // n) * 86400 + (i % n) * tf for i in range(2 * n)]   # two sessions
+        full = ind.compute(d, "VPROFILE", {})
+        for cut in (7, n // 2, n + 3):
+            part = ind.compute({k: (v[:cut] if isinstance(v, list) else v) for k, v in d.items()}, "VPROFILE", {})
+            for k, s in part.items():
+                assert s == full[k][:cut], (tf, cut, k)
+
+
 def test_volume_candle_strategy_backtests():
     from app.algo import orderflow as of
 
@@ -741,6 +796,44 @@ def test_stats_median_win_and_loss():
     assert st["avg_win"] == 3100
 
 
+def test_daily_statistics_count_the_flat_sessions():
+    # 4 trading days out of 40 sessions: the Sharpe is over all 40 days (flat = 0),
+    # not the 4 with an exit — the latter would be ~3x higher for the same P&L.
+    import math
+    import statistics as stt
+
+    k0 = (DAY0 + 19800) // 86400
+    sessions = [k0 + k for k in range(40)]
+    exits = {3: 100.0, 9: 50.0, 21: 120.0, 30: -40.0}
+    tr = [{"net": v, "gross": v, "charges": 0, "entry_t": DAY0 + k * 86400, "exit_t": DAY0 + k * 86400 + 600, "bars": 2}
+          for k, v in exits.items()]
+    every = [exits.get(k, 0.0) for k in range(40)]
+    st = engine.stats(tr, 100000, sessions)
+    assert st["sharpe"] == round(stt.mean(every) / stt.stdev(every) * math.sqrt(252), 2)
+    active = engine.stats(tr, 100000)                     # without the sessions: only the exit days
+    assert active["sharpe"] == round(stt.mean(exits.values()) / stt.stdev(exits.values()) * math.sqrt(252), 2)
+    assert active["sharpe"] > 2.5 * st["sharpe"]
+    assert st["trading_days"] == 4 and st["profitable_days"] == 3 and st["worst_day"] == -40
+    # CAGR over the 40-day range, not first entry to last exit (27 days)
+    assert st["cagr_pct"] == pytest.approx(((100230 / 100000) ** (365 / 40) - 1) * 100, abs=0.01)
+    # a backtest passes its sessions: a sparse strategy's Sharpe is over every day of the range
+    d = _days(10)
+    res = engine.run(_cross_spec(exit_long=None, target={"type": "pct", "value": 1},
+                                 max_trades_per_day=1, session={"start": "09:15", "end": "15:00", "square_off": "15:15",
+                                                               "days": [1, 3]}), {"X": d})
+    per_day: dict[int, float] = {}
+    for x in res["trades"]:
+        per_day[(x["exit_t"] + 19800) // 86400] = per_day.get((x["exit_t"] + 19800) // 86400, 0.0) + x["net"]
+    allv = [per_day.get(k, 0.0) for k in sorted({(t + 19800) // 86400 for t in d["t"]})]
+    assert len(allv) == 10 and 1 < res["stats"]["trading_days"] < 10
+    assert res["stats"]["sharpe"] == round(stt.mean(allv) / stt.stdev(allv) * math.sqrt(252), 2)
+    # one trade in a month is no sample: no Sharpe / PSR / skew, as before
+    lone = engine.stats(tr[:1], 100000, sessions)
+    assert lone["sharpe"] is None and lone["psr_pct"] is None and lone["skew"] is None
+    flat = engine.stats([], 100000, sessions)
+    assert flat["sharpe"] is None and flat["var95"] is None and flat["cagr_pct"] is None
+
+
 def test_flow_pressure_absorption_and_aggression():
     n = 30
     d = bars([100.0 + (i % 3) * 0.1 for i in range(n)], spread=1.0)
@@ -794,10 +887,11 @@ def test_scale_out_books_partials_then_target_takes_the_rest():
                        scale_out=[{"type": "rr", "value": 1, "qty_pct": 50}])
     tr = engine.run(spec, {"X": bars(closes, spread=0)})["trades"]
     assert [(t["reason"], t["qty"]) for t in tr] == [("SCALE_OUT_1", 5), ("TARGET", 5)]
-    # 1R = 108 is passed on the entry bar, which (like a target) can't claim it: the
-    # next bar opens through it at 108.5. 3R = 112 is touched inside a later bar.
-    assert tr[0]["exit"] == pytest.approx(108.5) and tr[1]["exit"] == pytest.approx(112)
-    assert [t["gross"] for t in tr] == [12.5, 30.0] and [t["r"] for t in tr] == [1.25, 3.0]
+    # A market entry fills at the entry bar's OPEN (106), so the whole bar comes after
+    # the fill: 1R = 108 is reached inside it. 3R = 112 is touched inside a later bar.
+    assert tr[0]["exit"] == pytest.approx(108) and tr[1]["exit"] == pytest.approx(112)
+    assert tr[0]["exit_t"] == tr[0]["entry_t"]
+    assert [t["gross"] for t in tr] == [10.0, 30.0] and [t["r"] for t in tr] == [1.0, 3.0]
     # a step worth less than one set (half of one share / one lot) is skipped, not rounded up
     assert engine.scale_plan([(108.0, 50)], 1) == []
     assert engine.scale_plan([(108.0, 50), (110.0, 50)], 3) == [[108.0, 1], [110.0, 1]]

@@ -73,12 +73,16 @@ def check(spec: dict, data: dict[str, dict], grid: Optional[list[dict[str, Any]]
         raise ValueError(f"no valid combination: {invalid[0]}")
     n_trials = max(1, int(prior_trials) + len(combos))
     fixed = not axes
+    # every session of each sample: daily statistics count the flat days as 0
+    days = engine.session_days(data, trade_from)
+    cut = (int(oos_from) + engine.IST) // 86400
+    is_days, oos_days = [k for k in days if k < cut], [k for k in days if k >= cut]
 
     # held-out split: choose on the trades entered before oos_from only
     ranked = []
     for params, trades in runs:
         ins = [x for x in trades if x["entry_t"] < oos_from]
-        st = engine.stats(ins, capital)
+        st = engine.stats(ins, capital, is_days)
         if fixed or st["trades"] >= min_trades:
             ranked.append(((st[metric] is not None, st[metric] or 0), params, st, trades, _day_net(ins)))
     ranked.sort(key=lambda r: r[0], reverse=True)
@@ -87,7 +91,7 @@ def check(spec: dict, data: dict[str, dict], grid: Optional[list[dict[str, Any]]
     if ranked:
         _, params, st_is, best_trades, _ = ranked[0]
         outs = [x for x in best_trades if x["entry_t"] >= oos_from]
-        st_oos = engine.stats(outs, capital)
+        st_oos = engine.stats(outs, capital, oos_days)
         split = {"params": params, "oos_from": int(oos_from), "is": engine.summary(st_is),
                  "oos": {**engine.summary(st_oos), "max_drawdown": st_oos["max_drawdown"]},
                  "ranked": len(ranked)}
@@ -99,7 +103,7 @@ def check(spec: dict, data: dict[str, dict], grid: Optional[list[dict[str, Any]]
     if fixed:
         over = {"deflated_sharpe": engine.trial_dsr(runs[0][1], data, capital, n_trials, trade_from), "pbo": None}
     elif ranked:
-        over = engine.overfitting_stats([r[4] for r in ranked], capital, n_trials=n_trials)
+        over = engine.overfitting_stats([r[4] for r in ranked], capital, n_trials=n_trials, sessions=is_days)
     else:
         over = None
 
@@ -109,7 +113,7 @@ def check(spec: dict, data: dict[str, dict], grid: Optional[list[dict[str, Any]]
     wf["param_sets"] = len({tuple(sorted(f["params"].items())) for f in wf["folds"] if f["params"]})
     wf["is_mult"] = is_mult
 
-    full = engine.stats(best_trades, capital) if ranked else None
+    full = engine.stats(best_trades, capital, days) if ranked else None
     out = {"combos": len(combos), "invalid": len(invalid), "metric": metric, "min_trades": min_trades,
            "trials": n_trials, "fixed": fixed, "capital": capital,
            "split": split, "walk_forward": wf, "overfitting": over,

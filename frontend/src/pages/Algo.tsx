@@ -957,7 +957,9 @@ function CondEditor({ c, onChange, cat, baseTf }: { c: Cond; onChange: (c: Cond)
       <select value={c.op} onChange={(e) => {
         const op = e.target.value;
         const t = op === "rising" || op === "falling";
-        const x: Cond = { ...c, op, right: t ? N(Math.max(1, c.right?.value ?? 1)) : c.right?.ind || c.right?.value !== undefined ? c.right : N(0) };
+        // keep the right-hand value (an indicator, a number or a combined ƒ value) across operators
+        const kept = c.right && (c.right.ind || c.right.math || c.right.value !== undefined) ? c.right : N(0);
+        const x: Cond = { ...c, op, right: t ? N(Math.max(1, c.right?.value ?? 1)) : kept };
         if (op === "between" || op === "outside") x.right2 = c.right2 ?? N(0); else delete x.right2;   // the high bound is part of the rule
         onChange(x);
       }}>
@@ -1084,7 +1086,14 @@ function LegsEditor({ legs, onChange, title }: { legs: Leg[]; onChange: (l: Leg[
           <select value={lg.action} onChange={(e) => set(i, { action: e.target.value as Leg["action"] })}>
             <option value="BUY">BUY</option><option value="SELL">SELL</option>
           </select>
-          <select value={lg.right} onChange={(e) => set(i, { right: e.target.value as Leg["right"] })}>
+          <select value={lg.right} onChange={(e) => {
+            const right = e.target.value as Leg["right"];
+            if (right !== "FUT") return set(i, { right });
+            // A future has no strike, own expiry, premium stop / target, re-entries or roll: those
+            // fields are hidden on a FUT row, so drop them instead of leaving a spec the server refuses.
+            const { expiry: _e, sl_pct: _s, tg_pct: _t, reentries: _r, roll: _o, delta: _d, ...rest } = lg;
+            onChange(legs.map((x, j) => (j === i ? { ...rest, right, strike: "ATM", steps: 0 } : x)));
+          }}>
             <option value="CE">CE (call)</option><option value="PE">PE (put)</option><option value="FUT">FUT (future)</option>
           </select>
           {lg.right !== "FUT" && <select value={strikeKey(lg)} title="strikes are counted in the underlying's strike steps" onChange={(e) => {
@@ -1687,12 +1696,12 @@ function Results({ r }: { r: BtResult }) {
         <div style={{ display: "flex", flexWrap: "wrap", gap: 18 }}>
           <Metric label="Net P&L" value={inr(s.net_pnl)} cls={pnlCls(s.net_pnl)} hint="after charges and slippage" />
           <Metric label="Return" value={`${num(s.return_pct)}%`} cls={pnlCls(s.return_pct)} hint="net P&L / starting capital" />
-          <Metric label="CAGR" value={s.cagr_pct === null ? "—" : `${num(s.cagr_pct)}%`} hint="annualised (needs 30+ days)" />
+          <Metric label="CAGR" value={s.cagr_pct === null ? "—" : `${num(s.cagr_pct)}%`} hint="annualised over the whole tested range (needs 30+ days)" />
           <Metric label="Win rate" value={`${num(s.win_rate, 1)}%`} />
           <Metric label="Profit factor" value={num(s.profit_factor)} hint="gross wins / gross losses" />
           <Metric label="Expectancy" value={inr(s.expectancy)} hint="average net per trade" />
           <Metric label="Max drawdown" value={`${inr(s.max_drawdown)} (${num(s.max_drawdown_pct, 1)}%)`} cls="pnl-neg" />
-          <Metric label="Sharpe" value={num(s.sharpe)} hint="daily P&L, annualised √252" />
+          <Metric label="Sharpe" value={num(s.sharpe)} hint="daily P&L over every session of the range (a day without a trade counts as 0), annualised √252" />
           <Metric label="Sortino" value={num(s.sortino)} hint="like Sharpe, but only downside days count as risk" />
           <Metric label="Calmar" value={num(s.calmar)} hint="CAGR / max drawdown %" />
           <Metric label="Charges" value={inr(s.charges)} hint="brokerage, STT, exchange, SEBI, GST, stamp — by segment" />
