@@ -316,7 +316,9 @@ export function sizingSummary(spec: Pick<Spec, "sizing" | "portfolio" | "daily">
   return parts.filter(Boolean).join(" ");
 }
 
-const tfLabel = (t: number) => (t === 1440 ? "daily" : t >= 60 ? `${t / 60}h` : `${t}m`);
+const tfLabel = (t: number) => (t === 10080 ? "weekly" : t === 1440 ? "daily" : t >= 60 && t % 60 === 0 ? `${t / 60}h` : `${t}m`);
+/** A daily / weekly strategy timeframe: signals on the session's close, fills at the next open, positions carry. */
+const multiDay = (t: number) => t >= 1440;
 const SECTIONS = ["instrument", "session", "sizing", "portfolio", "mtm", "daily", "costs", "entry_order", "bars"] as const;
 const barLabel = (sp: Spec) => (!sp.bars || sp.bars.type === "time" ? tfLabel(sp.timeframe) : `${sp.bars.type} ~${sp.bars.per_day}/day`);
 const STRIKES = ["ATM", ...Array.from({ length: 20 }, (_, k) => `ITM${k + 1}`), ...Array.from({ length: 20 }, (_, k) => `OTM${k + 1}`), "PREMIUM", "DELTA"];
@@ -854,7 +856,7 @@ function OperandEditor({ v, onChange, cat, baseTf, allowNumber = true, depth = 0
   const def = v.ind ? cat.indicators.find((d) => d.name === v.ind) : undefined;
   const groups = useMemo(() => Array.from(new Set(cat.indicators.map((d) => d.group))), [cat]);
   const [math, setMath] = useState((v.mult !== undefined && v.mult !== 1) || !!v.add);
-  const tfs = cat.cond_timeframes.filter((t) => t === 1440 || (t > baseTf && t % baseTf === 0));
+  const tfs = cat.cond_timeframes.filter((t) => t > baseTf && (multiDay(t) || (!multiDay(baseTf) && t % baseTf === 0)));
   if (v.math) {
     return (
       <span className="algo-operand algo-combined" data-testid="operand-math">
@@ -2999,7 +3001,7 @@ export default function Algo() {
         bt.reset(); setMsg(null); setTab("builder");
       }} />}
       {tab === "data" && <><RecorderPanel /><DataTab /></>}
-      {tab === "research" && <ResearchTab timeframes={c.timeframes} spec={tidy(spec)} range={range} onUse={(next, nm, tries) => {
+      {tab === "research" && <ResearchTab timeframes={c.timeframes.filter((t) => !multiDay(t))} spec={tidy(spec)} range={range} onUse={(next, nm, tries) => {
         if (!okToReplace()) return;
         load(withDefaults(c.defaults, next as Partial<Spec>), nm, null, null, false);
         setTrials(tries);                   // the pairs scanned to find it count as tries on the idea
@@ -3338,7 +3340,13 @@ export default function Algo() {
               )}
             </div>
             <div className="algo-operand" style={{ gap: 14, marginTop: 8 }}>
-              {(["start", "end", "square_off"] as const).map((k) => {
+              {multiDay(spec.timeframe) && (spec.bars?.type ?? "time") === "time" && (
+                <span className="meta" data-testid="algo-multiday-note">
+                  {tfLabel(spec.timeframe)} candles: checked on the session&apos;s close, filled at the next session&apos;s open; positions carry
+                  overnight (no entry window or square-off) until a stop, target or exit condition closes them.
+                </span>
+              )}
+              {!(multiDay(spec.timeframe) && (spec.bars?.type ?? "time") === "time") && (["start", "end", "square_off"] as const).map((k) => {
                 const on = spec.session[k] !== null && spec.session[k] !== undefined;
                 const off = { start: "from the 09:15 open", end: "until square-off", square_off: "carry forward overnight" }[k];
                 return (

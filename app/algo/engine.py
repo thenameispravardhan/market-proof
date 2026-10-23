@@ -7,7 +7,10 @@ N strikes ITM or OTM / nearest a target premium, weekly or monthly expiry).
 
 Operands: {"ind", "params", "field", "offset", "tf", "mult", "add"} or a
 constant {"value": 70}. `tf` evaluates the indicator on another timeframe
-(minutes, 1440 = daily) and only ever sees that timeframe's COMPLETED bars.
+(minutes, 1440 = daily, 10080 = weekly) and only ever sees that timeframe's
+COMPLETED bars. A daily / weekly STRATEGY timeframe trades across sessions:
+its candle is evaluated on the session's close and fills at the next
+session's open, and positions carry (no square-off).
 `mult`/`add` turn "close > EMA x 1.02" or "open > prev close + 20" into one
 condition. Groups nest: a list item with "conditions" is itself a group.
 
@@ -49,14 +52,38 @@ from app.algo import indicators as ind
 
 IST = ind.IST_OFFSET
 SESSION_CLOSE_S = 15 * 3600 + 30 * 60
-TIMEFRAMES = (1, 2, 3, 5, 10, 15, 20, 30, 45, 60, 120)
-COND_TIMEFRAMES = TIMEFRAMES + (1440,)          # 1440 = daily, conditions only
+DAILY, WEEKLY = 1440, 10080
+TIMEFRAMES = (1, 2, 3, 5, 10, 15, 20, 30, 45, 60, 75, 120, 125, 180, 240, DAILY, WEEKLY)
+COND_TIMEFRAMES = TIMEFRAMES
+
+
+def multi_day(tf: int) -> bool:
+    """A daily / weekly candle: one per session or per week, not intraday."""
+    return int(tf) >= DAILY
+
+
+def per_session(tf: int) -> float:
+    """Candles of `tf` minutes in one 375-minute session (a week's candle is 1/5)."""
+    return 1.0 if tf == DAILY else 0.2 if tf == WEEKLY else 375 / tf
+
+
+def cond_tf_ok(tf: int, base: int) -> bool:
+    """A condition may read the strategy's own timeframe, a daily / weekly one at
+    or above it, or (intraday) a multiple of it."""
+    if tf == base:
+        return True
+    if tf not in COND_TIMEFRAMES:
+        return False
+    if multi_day(tf):
+        return tf > base
+    return not multi_day(base) and tf % base == 0
 OPS = (">", "<", ">=", "<=", "==", "!=", "crosses_above", "crosses_below", "crosses",
        "rising", "falling", "between", "outside")
 # An operand's series reshaped before it is compared: its angle, slope, change, … over `xn` bars.
 # angle: degrees of the line's rise over xn bars against ATR(14) of the strategy's candles — a move of one
 # ATR per bar is 45°, so the number means the same on any symbol, price level or chart zoom.
 MAX_LOOKBACK = 500
+MAX_SYMBOLS = 1000      # per strategy: past what the live data budget can screen in a session
 # rank: where the value sits in its N-bar range, 0 = the lowest, 100 = the highest (IV rank on VIX);
 # percentile: % of the previous N bars that were below it (IV percentile).
 TRANSFORMS = ("angle", "slope", "change", "pct_change", "highest", "lowest", "sma", "zscore", "abs",
@@ -257,18 +284,26 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
     s["symbols"] = list(dict.fromkeys(str(x).strip().upper() for x in s["symbols"] if str(x).strip()))
     if not s["symbols"]:
         raise ValueError("add at least one symbol")
-    if len(s["symbols"]) > 50:
-        raise ValueError("at most 50 symbols per strategy")
+    if len(s["symbols"]) > MAX_SYMBOLS:
+        raise ValueError(f"at most {MAX_SYMBOLS} symbols per strategy")
     s["timeframe"] = int(s["timeframe"])
     if s["timeframe"] not in TIMEFRAMES:
-        raise ValueError(f"timeframe must be one of {TIMEFRAMES} minutes")
+        raise ValueError(f"timeframe must be one of {TIMEFRAMES} minutes (1440 = daily, 10080 = weekly)")
     if s["bars"].get("type") not in ("time", "volume", "turnover"):
         raise ValueError("candles are time, volume or turnover")
     s["bars"]["per_day"] = _num(s["bars"].get("per_day", 50), "candles per day", 5, integer=True)
     if s["bars"]["per_day"] > 1000:
         raise ValueError("at most 1000 candles per day")
     if s["bars"]["type"] != "time":
+        if multi_day(s["timeframe"]):
+            raise ValueError("volume / turnover candles are intraday — pick an intraday timeframe")
         s["timeframe"] = 1        # volume/turnover candles are built from 1-minute data
+    if multi_day(s["timeframe"]):
+        # A daily / weekly candle closes with the session: signals on its close,
+        # fills at the next session's open, positions carry. No entry window or
+        # square-off applies (trading days still do).
+        for k in ("start", "end", "square_off"):
+            s["session"][k] = None
     if s["direction"] not in ("long", "short", "both"):
         raise ValueError("direction must be long, short or both")
     for k in ("start", "end", "square_off"):
@@ -547,6 +582,8 @@ def normalize(spec: dict[str, Any]) -> dict[str, Any]:
         s["universe"] = {"index": idx}
     if len(ref_frames(s)) > MAX_REF_SYMBOLS:
         raise ValueError(f"conditions can read at most {MAX_REF_SYMBOLS} other symbols")
+    if s["timeframe"] == WEEKLY and needs_minutes(s):
+        raise ValueError("order-flow indicators are built from each minute — use a daily or shorter timeframe")
     return s
 
 
@@ -657,9 +694,11 @@ def _check_operand(o: dict[str, Any], side: str, base_tf: int, depth: int = 0) -
         if o.get("field") and o["field"] not in outs:
             raise ValueError(f"{o['ind']} has no field {o['field']!r} (one of {outs})")
         tf = int(o.get("tf") or 0)
-        if tf and (tf not in COND_TIMEFRAMES or (tf != 1440 and tf % base_tf)):
-            raise ValueError(f"{o['ind']}: condition timeframe {tf} must be daily or a multiple "
-                             f"of the strategy's {base_tf}m")
+        if tf and not cond_tf_ok(tf, base_tf):
+            raise ValueError(f"{o['ind']}: condition timeframe {tf} must be daily / weekly, or a multiple "
+                             f"of the strategy's {base_tf}m" if not multi_day(base_tf) else
+                             f"{o['ind']}: on a {'daily' if base_tf == DAILY else 'weekly'} strategy a condition "
+                             f"can only read {'daily or weekly' if base_tf == DAILY else 'weekly'} candles")
         for k in ("mult", "add"):
             if o.get(k) not in (None, ""):
                 o[k] = _num(o[k], k, -1e12)
@@ -790,8 +829,11 @@ def rank_pick(spec: dict[str, Any], ready: dict[str, dict]) -> tuple[list[str], 
 
 
 def bar_minutes(spec: dict[str, Any]) -> float:
-    """Typical candle length in minutes — for turning 'N bars' into time live."""
-    return spec["timeframe"] if spec["bars"]["type"] == "time" else 375 / spec["bars"]["per_day"]
+    """Typical candle length in wall-clock minutes — for turning 'N bars' into
+    time live (a daily candle is a session: 5 of them a 7-day week)."""
+    if spec["bars"]["type"] != "time":
+        return 375 / spec["bars"]["per_day"]
+    return DAILY * 7 / 5 if spec["timeframe"] == DAILY else spec["timeframe"]
 
 
 def needs_minutes(spec: dict[str, Any]) -> bool:
@@ -845,7 +887,7 @@ def warmup_sessions(spec: dict[str, Any]) -> int:
 def history_bars(spec: dict[str, Any], tf: int) -> int:
     """Candles of `tf` minutes (1440 = daily) the live runner keeps: the warm-up,
     or RVOL's whole sessions of them when that is longer."""
-    return max(warmup_bars(spec), math.ceil(warmup_sessions(spec) * (1 if tf == 1440 else 375 / tf)))
+    return max(warmup_bars(spec), math.ceil(warmup_sessions(spec) * per_session(tf)))
 
 
 def _transform_lengths(spec: dict[str, Any]):
@@ -871,6 +913,8 @@ def _transform_lengths(spec: dict[str, Any]):
 # ---- signals ---------------------------------------------------------------
 
 def _close_times(b: dict) -> list[int]:
+    if b.get("tf_s", 0) >= 7 * 86400:      # weekly: closes on the week's last session (its own tc)
+        return list(b["tc"])
     if "tc" in b:            # volume/turnover candles carry their real close times
         return [min(tc, t - (t + IST) % 86400 + SESSION_CLOSE_S) for t, tc in zip(b["t"], b["tc"])]
     tf = b["tf_s"]
@@ -1644,6 +1688,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
     slip = spec["costs"]["slippage_pct"] / 100
     with_ch = spec["costs"]["charges"]
     start, end, sq = session_window(spec)
+    multi = multi_day(spec["timeframe"])     # daily / weekly: a signal fills at the next session's open
     mtm_rules, daily = spec["mtm"], spec["daily"]
     syms = list(data)
 
@@ -2138,7 +2183,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                 fill = max(op_, p["level"])
             # valid for `valid_bars` candles after the signal, as live arms it: a trigger
             # touched on the candle after those is too late
-            alive = p["day"] == day and mod < sq and halted != day and s_["pos"] is None and i < p["expires"]
+            alive = (p["day"] == day or multi) and mod < sq and halted != day and s_["pos"] is None and i < p["expires"]
             if fill is None and alive:
                 pass                                      # still waiting for the trigger
             else:
@@ -2198,7 +2243,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                 if r_:
                     pos["exit_pending"] = f"RULE_{r_['metric'].upper()}"
             if adjusting and not pos["exit_pending"] and halted != day and mod < sq:
-                adjust(sym, i, ((ind.close_time(d, i) + IST) % 86400) // 60 <= end)
+                adjust(sym, i, multi or ((ind.close_time(d, i) + IST) % 86400) // 60 <= end)
         s_["u"] = (d["c"][i], i)
         if (daily["max_loss"] or daily["max_profit"]) and halted != day:
             day_pnl = day_realized
@@ -2221,7 +2266,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         if (s_["pos"] is None and s_["pending"] is None and i + 1 < len(d["t"]) and i >= s_["cool"]
                 and halted != day and (trade_from is None or t >= trade_from)):
             close_mod = ((ind.close_time(d, i) + IST) % 86400) // 60
-            if start <= close_mod <= end and s_["per_day"].get(day, 0) < spec["max_trades_per_day"] \
+            if (multi or start <= close_mod <= end) and s_["per_day"].get(day, 0) < spec["max_trades_per_day"] \
                     and day_allowed(spec, t):
                 side = "BUY" if s_["sig"]["entry_long"][i] else "SELL" if s_["sig"]["entry_short"][i] else None
                 if side:

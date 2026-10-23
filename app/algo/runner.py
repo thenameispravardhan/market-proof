@@ -61,6 +61,13 @@ STALE_BAR_S = 120    # a bar this old at first sight was missed, not acted on
 GUARD_EVERY_S = 60   # how often each strategy's guard limits are read
 GUARD_MIN_FILLS = 10 # the slippage guard needs at least this many live fills
 REF_WAIT_S = 30      # wait this long for another symbol the conditions read to publish its candle
+# Daily / weekly strategies act on the session's open (their candle closed at the
+# last session's close; backtests fill at this open): from OPEN_WAIT_S in — once
+# the first minute's candle shows the market really opened — to MULTI_DAY_WINDOW_S.
+# A runner that comes up later skips the day rather than enter at a midday price.
+OPEN_WAIT_S = 90
+MULTI_DAY_WINDOW_S = 20 * 60
+SESSION_PROBE = "NSE:NIFTY50-INDEX"
 SYNC_AFTER_MIN = 15 * 60 + 45
 
 
@@ -720,6 +727,7 @@ class AlgoRunner:
         self._book_halt: Optional[int] = None   # IST day the book loss limit (or a kill) stopped every automation
         self._alloc: tuple[Optional[tuple], dict[int, dict[str, Any]]] = (None, {})   # (key, allocation)
         self._names: dict[int, str] = {}
+        self._open_day: dict[int, bool] = {}     # IST day -> did the market open (daily / weekly strategies)
         # Tick-driven exits: every websocket tick for a symbol an open position
         # holds wakes `_tick_loop`, which runs the same stop / target / trail
         # checks on that tick's price — no waiting for the next 1 s sweep.
@@ -1498,8 +1506,70 @@ class AlgoRunner:
 
     # -- entries -------------------------------------------------------------
 
+    async def _session_open(self, day: int, now: float) -> Optional[bool]:
+        """Did the market open today? A 1-minute candle of today on the probe
+        index says so (an exchange holiday has none). None = can't tell yet."""
+        if day in self._open_day:
+            return self._open_day[day]
+        try:
+            b = await data.recent_bars(SESSION_PROBE, 1, bars=3, now=now)
+        except Exception as e:  # noqa: BLE001
+            log.warning("algo.session_probe_failed", error=str(e)[:200])
+            return None
+        opened = bool(b["t"]) and (b["t"][-1] + IST) // 86400 == day
+        if opened or now > day * 86400 - IST + OPEN_MIN * 60 + 10 * 60:    # nothing 10 min in: a holiday
+            self._open_day = {day: opened}
+        return opened if day in self._open_day else None
+
+    async def _on_session(self, s: dict, now: float, day_start: float) -> None:
+        """A daily / weekly strategy: once a session, at its open, on the candle
+        that closed at the last session's close — weekly only on the week's
+        first session."""
+        spec = s["spec"]
+        open_s = day_start + OPEN_MIN * 60
+        if now < open_s + OPEN_WAIT_S:
+            return
+        todo = [x for x in spec["symbols"] if self._last_bar.get((s["id"], x), 0) < day_start]
+        if not todo:
+            return
+        day = int((now + IST) // 86400)
+        late = now > open_s + MULTI_DAY_WINDOW_S
+        opened = None if late else await self._session_open(day, now)
+        if late or opened is False:
+            for x in todo:
+                self._last_bar[(s["id"], x)] = int(day_start)
+            if late and opened is None:
+                self.event("info", f"{s['name']}: today's open was missed (runner started after "
+                                   f"{MULTI_DAY_WINDOW_S // 60} min) — next signal check at the next open",
+                           strategy_id=s["id"])
+            return
+        if opened is None:
+            return                                         # ask again next second
+        weekly = spec["timeframe"] == engine.WEEKLY
+        monday = day - (day + 3) % 7
+        for sym in todo:
+            key = (s["id"], sym)
+            try:
+                d = await data.live_bundle(spec, sym, now)
+            except Exception as e:  # noqa: BLE001
+                self._last_bar[key] = int(day_start)
+                self.event("error", f"{s['name']} {sym}: candles unavailable: {e}"[:300], strategy_id=s["id"])
+                continue
+            self._last_bar[key] = int(day_start)
+            if not d["t"]:
+                continue
+            if weekly and (d.get("last_session") or 0) and (d["last_session"] + IST) // 86400 >= monday:
+                continue                                   # this week already had a session: acted on then
+            try:
+                await self._decide(s, sym, d, now, day_start)
+            except Exception as e:  # noqa: BLE001 — one symbol must not stop the others
+                log.exception("algo.decide_failed", symbol=sym)
+                self.event("error", f"{s['name']} {sym}: {e}"[:300], strategy_id=s["id"])
+
     async def _on_bar(self, s: dict, now: float, day_start: float) -> None:
         spec = s["spec"]
+        if engine.multi_day(spec["timeframe"]):
+            return await self._on_session(s, now, day_start)
         tf_s = spec["timeframe"] * 60
         open_s = day_start + OPEN_MIN * 60
         k = int((now - open_s - GRACE_S) // tf_s)
@@ -1603,7 +1673,7 @@ class AlgoRunner:
             return
         close_min = int((indicators.close_time(d, len(d["t"]) - 1) + IST) % 86400) // 60
         start, end, _ = engine.session_window(spec)
-        if not start <= close_min <= end or not engine.day_allowed(spec, now):
+        if not (engine.multi_day(spec["timeframe"]) or start <= close_min <= end) or not engine.day_allowed(spec, now):
             return
         side = "BUY" if sig["entry_long"][-1] else "SELL" if sig["entry_short"][-1] else None
         if side is None or not may_enter:                  # not among the candle's best N (rank)
