@@ -77,6 +77,37 @@ def test_square_off_and_intraday_only():
     assert sod == 15 * 3600 + 15 * 60
 
 
+def test_runner_never_enters_without_its_stop(monkeypatch, isolated_db):
+    """A 2 x ATR(200) stop on a symbol with 4 candles of history: no ATR, so no stop —
+    the runner skips the entry instead of trading without it."""
+    import asyncio
+
+    from app.algo import runner as rn
+    from app.db import session as dbs
+    from app.db.models import AlgoStrategy, AlgoTrade
+
+    spec = _cross_spec(exit_long=None, stop_loss={"type": "atr", "value": 2, "atr_period": 200})
+    with dbs.SessionLocal() as db:
+        db.add(AlgoStrategy(name="t", spec=spec, enabled=True, mode="paper"))
+        db.commit()
+
+    async def fake_bars(sym, tf, bars=400, now=None):
+        d = globals()["bars"]([100, 101, 102, 106], spread=0)
+        keep = [i for i, t in enumerate(d["t"]) if t + 300 <= now]
+        return {k: ([v[i] for i in keep] if isinstance(v, list) else v) for k, v in d.items()}
+
+    async def fake_ltp(symbols):
+        return {s.upper(): 106.5 for s in symbols}
+
+    monkeypatch.setattr(rn.data, "recent_bars", fake_bars)
+    monkeypatch.setattr(rn, "_ltp", fake_ltp)
+    r = rn.AlgoRunner()
+    asyncio.run(r.tick(DAY0 + 4 * 300 + 4))          # bar 3 (close 106 > 105) just closed
+    with dbs.SessionLocal() as db:
+        assert db.query(AlgoTrade).count() == 0
+    assert any("stop can't be set" in e["msg"] for e in r.events)
+
+
 def test_charges_are_realistic():
     # ₹1L round trip intraday: brokerage 2x₹20, STT ₹25, exch ~₹5.94, GST, stamp ₹3
     ch = engine.charges(100000, 100000)
@@ -397,6 +428,70 @@ def test_triggered_entry_cannot_take_target_on_its_own_bar():
                        entry_order={"type": "pullback", "offset_pct": 1.5, "valid_bars": 5})
     t = engine.run(spec, {"X": d})["trades"][0]
     assert t["entry"] == round(106 * 0.985, 2) and t["exit_t"] > d["t"][5]
+
+
+def _two_days_15m(day1, day2):
+    n = 25                                            # 15m candles per session, 09:15 .. 15:15
+    d = bars(day1 + day2, tf=900, spread=0)
+    d["t"] = [DAY0 + (k // n) * 86400 + (k % n) * 900 for k in range(2 * n)]
+    return d
+
+
+def test_daily_loss_limit_counts_only_that_days_pnl():
+    # 15m candles, square-off 15:20: no candle starts at/after it, so day 1's position
+    # is closed (EOD) at day 2's first candle. Its ₹1,000 loss is day 1's — it must
+    # not trip day 2's ₹500 daily stop and block day 2's trade.
+    day1 = [100] * 3 + [106] * 21 + [96]
+    day2 = [96, 96, 97, 101, 106, 107, 108, 109] + [109] * 17
+    spec = _cross_spec(timeframe=15, exit_long=None, sizing={"mode": "qty", "value": 100},
+                       session={"start": "09:15", "end": "15:00", "square_off": "15:20"},
+                       daily={"max_loss": 500, "max_profit": None})
+    tr = engine.run(spec, {"X": _two_days_15m(day1, day2)})["trades"]
+    assert [(x["reason"], (x["entry_t"] - DAY0) // 86400) for x in tr] == [("EOD", 0), ("END", 1)]
+    # ... nor while that position is still waiting for its own first candle of day 2,
+    # when another symbol's candle at the same time is processed first
+    flat = _two_days_15m([100] * 25, day2)
+    tr = engine.run(spec, {"Y": flat, "X": _two_days_15m(day1, [96] * 25)})["trades"]
+    assert sorted((x["symbol"], x["reason"]) for x in tr) == [("X", "EOD"), ("Y", "END")]
+
+
+def test_entry_order_lives_exactly_its_valid_bars():
+    # Breakout trigger 106.53 (signal close 106 + 0.5%): bar 4 tops at 106.2, bar 5 reaches
+    # it. Valid for 1 bar = bar 4 only (live arms it for one bar's time); 2 bars = filled on bar 5.
+    d = bars([100, 101, 102, 106, 106.2, 107.5, 108, 108.2, 108.4], spread=0)
+    one = engine.run(_cross_spec(exit_long=None, entry_order={"type": "breakout", "offset_pct": 0.5, "valid_bars": 1}),
+                     {"X": d})
+    assert one["trades"] == [] and one["stats"]["skipped"]["entry_expired"] == 1
+    (t,) = engine.run(_cross_spec(exit_long=None, entry_order={"type": "breakout", "offset_pct": 0.5, "valid_bars": 2}),
+                      {"X": d})["trades"]
+    assert t["entry_t"] == d["t"][5] and t["entry"] == pytest.approx(106.53)
+
+
+def test_warmup_covers_default_periods_level_atrs_and_rvol_sessions():
+    assert engine.warmup_bars(_cross_spec()) == 3 * 14 + 5
+    cloud = {"logic": "AND", "conditions": [{"left": {"ind": "PRICE"}, "op": ">",
+                                             "right": {"ind": "ICHIMOKU", "field": "span_b"}}]}
+    assert engine.warmup_bars(_cross_spec(entry_long=cloud)) == 3 * 52 + 5        # its default span_b 52 counts
+    assert engine.warmup_bars(_cross_spec(stop_loss={"type": "atr", "value": 2, "atr_period": 200})) == 605
+    assert engine.warmup_bars(_cross_spec(target={"type": "atr", "value": 2, "atr_period": 900})) == 1000  # capped at 1000 ...
+    assert engine.warmup_bars(_cross_spec(target={"type": "atr", "value": 2, "atr_period": 1500})) == 1505  # ... never below it
+    rv = _cross_spec(entry_long={"logic": "AND", "conditions": [
+        {"left": {"ind": "RVOL", "params": {"days": 10}}, "op": ">", "right": {"value": 2}}]})
+    assert engine.warmup_sessions(rv) == 11 and engine.warmup_bars(rv) == 47       # whole sessions, not 10 candles
+    assert engine.history_bars(rv, 5) == 11 * 75 and engine.history_bars(rv, 1440) == 47
+
+
+def test_no_entry_without_its_stop():
+    # A 2 x ATR(200) stop with only 6 sessions (150 candles) of 15m history before the
+    # first tradable day: until the ATR exists those entries are skipped, never stop-less.
+    n = 25
+    closes = [100 + (k % 25) * 0.3 for k in range(12 * n)]                       # crosses 105 every session
+    d = bars(closes, tf=900, spread=0.3)
+    d["t"] = [DAY0 + (k // n) * 86400 + (k % n) * 900 for k in range(len(closes))]
+    spec = _cross_spec(timeframe=15, exit_long=None, stop_loss={"type": "atr", "value": 2, "atr_period": 200})
+    r = engine.run(spec, {"X": d}, None, DAY0 + 6 * 86400 - 33300)
+    assert r["stats"]["skipped"]["no_stop"] == 2
+    assert r["trades"] and all(x["stop"] is not None for x in r["trades"])
 
 
 def test_market_entry_can_take_its_target_on_its_own_bar():
@@ -785,8 +880,11 @@ def test_atr_stop_on_an_option_premium_is_the_underlyings_atr_times_delta():
     assert deep > 38                                       # deep ITM moves almost 1:1
     priced = {**leg, "price": engine.fno.bs_price(24550.0, 24550.0, engine.fno.years_to(leg["exp"], DAY0), 0.14, "CE")}
     assert abs(engine.premium_atr({14: 40.0}, priced, 24550.0, DAY0)[14] - atm) < 0.5   # IV implied from the live price
-    closes = [24500, 24520, 24540, 24560, 24600, 24650, 24700] + [24700] * 30
-    assert engine.run(spec, {"N": _nifty(closes)})["trades"]      # backtests instead of a ValueError
+    # backtests instead of a ValueError — once ATR(14) exists (20 candles before the
+    # signal), with the stop set on the premium (never entered without it)
+    closes = [24500] * 20 + [24520, 24540, 24560, 24600, 24650, 24700] + [24700] * 30
+    tr = engine.run(spec, {"N": _nifty(closes)})["trades"]
+    assert tr and tr[0]["stop"] is not None and tr[0]["stop"] < tr[0]["legs"][0]["entry"]
 
 
 def test_stats_median_win_and_loss():

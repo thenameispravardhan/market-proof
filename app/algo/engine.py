@@ -800,17 +800,45 @@ def cond_timeframes(spec: dict[str, Any]) -> set[int]:
             if int(o.get("tf") or 0) not in (0, spec["timeframe"]) and not o.get("symbol")}
 
 
+# Indicator settings that are not a number of candles (a band width, a share,
+# a step, minutes into the session, a window in days): nothing to warm up.
+_NOT_BARS = {"multiplier", "value_area", "threshold", "start", "increment", "maximum", "minutes", "days"}
+
+
 def warmup_bars(spec: dict[str, Any]) -> int:
-    """Bars of history indicators need before the first tradable bar."""
+    """Candles of history (of each timeframe used) to load before the first
+    tradable one — the backtest's warm-up and the live runner's fetch alike:
+    3x the longest look-back (capped at 1000, never below the look-back
+    itself) of any indicator — its default settings included, not only the
+    ones typed in — offset, transform or pair window, the ATR periods of the
+    stop / target / trail / breakeven / scale-out and the pair leg's beta
+    window. Whole sessions (RVOL) are warmup_sessions()."""
     longest = 14
     for o in _walk_operands(spec):
-        for v in (o.get("params") or {}).values():
-            if isinstance(v, (int, float)) and not isinstance(v, bool):
+        for k, v in ind.normalize_params(o["ind"], o.get("params")).items():
+            if k not in _NOT_BARS and isinstance(v, (int, float)) and not isinstance(v, bool):
                 longest = max(longest, int(v))
         longest = max(longest, int(o.get("offset") or 0))
     for xn in _transform_lengths(spec):
         longest = max(longest, xn)
-    return min(1000, 3 * longest + 5)
+    longest = max([longest, *atr_periods(spec)])
+    pl = spec.get("pair_leg")
+    if pl and pl["ratio"]["type"] == "beta":
+        longest = max(longest, pl["ratio"]["n"])
+    return max(longest + 5, min(1000, 3 * longest + 5))
+
+
+def warmup_sessions(spec: dict[str, Any]) -> int:
+    """Whole sessions of history before the first tradable candle: RVOL compares
+    today with its `days` sessions before (0 = none needed)."""
+    return max((ind.normalize_params("RVOL", o.get("params"))["days"] + 1
+                for o in _walk_operands(spec) if o["ind"] == "RVOL"), default=0)
+
+
+def history_bars(spec: dict[str, Any], tf: int) -> int:
+    """Candles of `tf` minutes (1440 = daily) the live runner keeps: the warm-up,
+    or RVOL's whole sessions of them when that is longer."""
+    return max(warmup_bars(spec), math.ceil(warmup_sessions(spec) * (1 if tf == 1440 else 375 / tf)))
 
 
 def _transform_lengths(spec: dict[str, Any]):
@@ -1639,7 +1667,8 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
     prio = _rank_entries(spec, syms, st, caches) if spec.get("rank") else {}
     events = sorted(((t, prio.get((k, i), 0), k, i) for k, sym in enumerate(syms) for i, t in enumerate(data[sym]["t"])))
     trades: list[dict[str, Any]] = []
-    skipped = {"no_capital": 0, "max_positions": 0, "daily_halt": 0, "entry_expired": 0, "entry_rules": 0}
+    skipped = {"no_capital": 0, "max_positions": 0, "daily_halt": 0, "entry_expired": 0, "entry_rules": 0,
+               "no_stop": 0}
     if spec.get("pair_leg"):
         skipped.update(pair_no_ratio=0, pair_too_small=0)
     exit_rules = (spec.get("position_rules") or {}).get("exit")
@@ -1729,7 +1758,8 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
             **({"greeks": pos["greeks0"]} if pos.get("greeks0") else {}),
         })
         realized += net
-        day_realized += net
+        if (t + IST) // 86400 == day_key:       # booked at an earlier day's candle (EOD, expiry): not today's P&L
+            day_realized += net
         used_margin -= margin
         if part:
             if pos["peak"] is not None:            # the MTM trail follows what is still open
@@ -1775,6 +1805,8 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         if ref != "u":                                   # levels on the option premium: its own ATR
             atrs = premium_atr(atrs, legs[0], u, t, iv)
         lv = entry_levels(spec, rsign, ref_entry, atrs, tk)
+        if spec["stop_loss"] and lv["sl"] is None:
+            return "no_stop"            # an ATR stop with no ATR yet (or a flat 0): never enter without the stop
         per_set_margin = position_margin(legs, u, pf["leverage"], model=spec.get("margin"), t=t,
                                          iv=iv if inst["type"] == "option" else None, name=meta["name"])
         per_set_risk = lv["sl_dist"] * legs[0]["per_set"] if lv["sl_dist"] else None
@@ -2056,8 +2088,10 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
                     fill = min(op_, p["level"])
             elif hi_ >= p["level"]:                                     # buy breakout / sell rally
                 fill = max(op_, p["level"])
-            alive = p["day"] == day and mod < sq and halted != day and s_["pos"] is None
-            if fill is None and alive and i < p["expires"]:
+            # valid for `valid_bars` candles after the signal, as live arms it: a trigger
+            # touched on the candle after those is too late
+            alive = p["day"] == day and mod < sq and halted != day and s_["pos"] is None and i < p["expires"]
+            if fill is None and alive:
                 pass                                      # still waiting for the trigger
             else:
                 s_["pending"] = None
@@ -2121,7 +2155,9 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         if (daily["max_loss"] or daily["max_profit"]) and halted != day:
             day_pnl = day_realized
             for s2 in (st[x] for x in open_syms):
-                if s2["u"]:
+                # an intraday position still open from an earlier day is closed (EOD) at its
+                # own first candle of today — its P&L is that day's, not today's
+                if s2["u"] and (sq >= CARRY or s2["pos"]["day"] == day):
                     j = s2["u"][1]
                     iv2 = s2["d"]["iv"][j] if inst["type"] == "option" else 0.0
                     ub2 = s2["pb"]["c"][j] if s2["pos"].get("pair") else None

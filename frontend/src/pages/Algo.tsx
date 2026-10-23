@@ -1415,6 +1415,11 @@ function TradeAnalytics({ r }: { r: BtResult }) {
     <>
       <div className="widget widget-wide" style={{ marginBottom: 12 }} data-testid="capital-in-use">
         <h3>Capital in use <span className="meta">margin blocked by open positions · the money the strategy actually needs</span></h3>
+        {r.trades.length < r.trades_total && (
+          <div className="meta" style={{ color: "var(--amber)" }} data-testid="analytics-partial">
+            The charts below use the last {r.trades.length} of {r.trades_total} trades (the headline numbers above use all of them).
+          </div>
+        )}
         <div style={{ display: "flex", flexWrap: "wrap", gap: 18 }}>
           <Metric label="Peak in use" value={`${lakh(cap.peak)}${capital ? ` (${num((cap.peak / capital) * 100, 0)}%)` : ""}`} hint="the most margin blocked at one moment — size the account for this, not the average" />
           <Metric label="Avg per position" value={lakh(cap.avg)} hint="average margin a position blocked at entry" />
@@ -1748,6 +1753,7 @@ function Results({ r }: { r: BtResult }) {
           <div className="meta" style={{ marginTop: 6 }}>
             Signals not taken: {skipped.map(([k, v]) => `${v} × ${k.replace(/_/g, " ")}`).join(" · ")}
             {skipped.some(([k]) => k === "no_capital") && " — raise capital or leverage, or size smaller"}
+            {skipped.some(([k]) => k === "no_stop") && " — the ATR stop had no ATR yet (too few candles): start the range later or shorten the ATR period"}
           </div>
         )}
       </div>
