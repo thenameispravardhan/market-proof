@@ -204,9 +204,14 @@ def _contracts():
     return m
 
 
-def test_ticket_lot_refresh_keeps_mcx_and_currency_lots_in_the_quoted_unit(client):
+def test_ticket_lot_refresh_keeps_mcx_and_currency_lots_in_the_quoted_unit(client, monkeypatch):
     # The Trade page re-reads every saved F&O entry's lot from /api/options/lots: it answered 1 for GOLD (the ticket
     # then sent 1, refused: "1 lot = 100") and null for USDINR (the ticket blocked it as "lot unknown").
+    # No scrip-master download: it reloads the master (dropping the contracts planted here) and ties the test to
+    # the network and to whatever the live master lists today.
+    from app.algo import fno
+
+    monkeypatch.setattr(fno, "master_loaded", lambda: True)
     _contracts()
     lots = client.get("/api/options/lots?symbols=MCX:GOLD26DECFUT,NSE:USDINR26OCTFUT,NSE:SBIN-EQ").json()["lots"]
     assert lots == {"MCX:GOLD26DECFUT": 100, "NSE:USDINR26OCTFUT": 1000, "NSE:SBIN-EQ": 1}
