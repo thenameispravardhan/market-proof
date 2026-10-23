@@ -20,7 +20,7 @@ import {
   visibleOnInterval,
 } from "../components/trade/indicatorCatalog";
 import { candlePatterns, zigzag } from "../components/trade/indicatorMore";
-import { barTime, timeToBar, type Bar } from "../components/trade/chartData";
+import { barTime, logicalToX, timeToBar, xToLogical, type Bar } from "../components/trade/chartData";
 
 // ---------------------------------------------------------------------------
 // alerts
@@ -246,5 +246,29 @@ describe("drawing anchors across timeframes (TradingView rule)", () => {
   it("bar times round-trip, and a gap time snaps to the next bar", () => {
     for (const l of [0, 37, 74, 75, 149, 152]) expect(timeToBar(m5, barTime(m5, l, 300)!, 300)).toBeCloseTo(l);
     expect(timeToBar(d1, 2 * D, D)).toBe(1); // Sunday → Monday
+  });
+
+  // The engine's time scale: whole indexes only — a fractional one is 0 (the pane's left edge).
+  const engine = { logicalToCoordinate: (l: number) => (l % 1 === 0 ? 100 + l * 8 : 0) };
+  const m15 = [0, 1].flatMap((d) => Array.from({ length: 25 }, (_, i) => bar(d * D + OPEN + i * 900)));
+
+  it("a 5m anchor between 15m bars keeps its place instead of jumping to the left edge", () => {
+    const l = timeToBar(m15, OPEN + 7 * 300, 900)!; // 09:50 → 2⅓ bars into the 15m session
+    expect(l).toBeCloseTo(7 / 3);
+    expect(logicalToX(engine, l)).toBeCloseTo(100 + (7 / 3) * 8);
+    expect(logicalToX(engine, -1.5)).toBeCloseTo(88); // before the first bar
+    expect(logicalToX(engine, 60.25)).toBeCloseTo(582); // in the future
+  });
+  it("the same trendline has the same slope in time on 5m and 15m", () => {
+    const a = OPEN + 4 * 300, b = D + OPEN + 31 * 300; // both off the 15m grid
+    const on = (c: Bar[], span: number) => [a, b].map((t) => logicalToX(engine, timeToBar(c, t, span)!)!);
+    const [x5a, x5b] = on(m5, 300), [x15a, x15b] = on(m15, 900);
+    // 5m is 3× as many bars as 15m: the span in pixels shrinks by exactly 3.
+    expect((x5b - x5a) / (x15b - x15a)).toBeCloseTo(3);
+  });
+  it("x → logical round-trips, and bar centres are whole indexes", () => {
+    for (const l of [0, 2.5, 74.2, -3, 90.75]) expect(xToLogical(engine, logicalToX(engine, l)!)).toBeCloseTo(l);
+    expect(xToLogical(engine, 100 + 3 * 8)).toBe(3);
+    expect(xToLogical({ logicalToCoordinate: () => null }, 50)).toBeNull();
   });
 });

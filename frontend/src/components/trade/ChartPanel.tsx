@@ -75,6 +75,7 @@ import {
   intervalSeconds,
   isDerivative,
   isIntraday,
+  logicalToX,
   kagi,
   lineBreak,
   liveBucket,
@@ -91,6 +92,7 @@ import {
   TIMEZONES,
   timeToBar,
   wallClock,
+  xToLogical,
   zoneOffsetLabel,
   IST_OFFSET,
   type Bar,
@@ -1217,15 +1219,15 @@ export default function ChartPanel(props: ChartPanelProps) {
     const chart = chartRef.current;
     const l = timeToLogical(t);
     if (!chart || l === null) return null;
-    return safe(() => chart.timeScale().logicalToCoordinate(l as Logical) as number | null, null) ?? null;
+    return safe(() => logicalToX(chart.timeScale(), l), null) ?? null;
   }
 
-  /** x pixel → chart-time, snapped to the nearest bar like TradingView
+  /** x pixel → chart-time, snapped to the bar under x like TradingView
    *  anchors (`exact` keeps the sub-bar position — freehand strokes). */
   function xToTime(x: number, exact = false): number | null {
     const chart = chartRef.current;
     if (!chart) return null;
-    const l = safe(() => chart.timeScale().coordinateToLogical(x) as number | null, null) ?? null;
+    const l = safe(() => xToLogical(chart.timeScale(), x), null) ?? null;
     return l === null ? null : logicalToTime(exact ? l : Math.round(l));
   }
 
