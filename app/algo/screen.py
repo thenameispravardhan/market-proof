@@ -22,7 +22,9 @@ through here:
     (no warm-up, a missed poll) is a candidate;
   * candidates take the runner's exact path — live_bundle + _decide, unchanged
     — so no order is decided on an approximate candle; their exact candles then
-    replace the approximate ones.
+    replace the approximate ones. Exits always; entries only while a position
+    can still be opened, those that fired on the approximate candle outright
+    first; in all no more than this candle's share of the day's budget left.
 
 Daily / weekly strategies need no screen: the warm-up (fetched once the candle
 they act on has closed) IS their exact data, so every symbol is decided from it
@@ -57,7 +59,7 @@ _ARR = ("t", "tc", "o", "h", "l", "c", "v")
 def slack() -> float:
     from app.config import get_settings
 
-    return max(0.0, float(getattr(get_settings(), "ALGO_SCREEN_SLACK_PCT", 0.5) or 0.0)) / 100
+    return max(0.0, float(getattr(get_settings(), "ALGO_SCREEN_SLACK_PCT", 0.2) or 0.0)) / 100
 
 
 def screenable(spec: dict) -> bool:
@@ -326,7 +328,7 @@ class Screener:
             return last[1]
         syms = spec["symbols"]
         close_t = min(bar + tf_s, bar - (bar + IST) % DAY + CLOSE_S)
-        t0 = time.time()
+        t0 = time.perf_counter()
         calls = await self._poll([x for x in syms if (sid, x) in self.warm], close_t)
         shared = await self._shared(spec, now)
         ready, unsure = [], set()
@@ -342,28 +344,42 @@ class Screener:
             else:
                 ready.append(x)
         mine = {x: side for x, side in held.items() if x in set(syms)}
-        fired = await asyncio.to_thread(self._screen, spec, [(x, self.warm[(sid, x)]) for x in ready], mine)
+        fired, sure = await asyncio.to_thread(self._screen, spec, [(x, self.warm[(sid, x)]) for x in ready], mine)
         cold = {x for x in syms if (sid, x) not in self.warm}
         # Positions whose exit may need more than their candle (option Greeks / premium
         # rules, re-entries / rolls / hedges) are checked every candle.
         always = set(mine) if (spec["instrument"]["type"] == "option" and (
             (spec.get("position_rules") or {}).get("exit") or engine.adjusts(spec))) else set()
         exits = {x for x in fired if x in mine} | always
+        # Entries only where one can be taken: with the strategy's positions all
+        # open (and no ranking) they'd be refused after the fetch. Those that
+        # fired on the approximate candle outright first, then those within the
+        # tolerance — each in the list's order, the order the exact path enters in.
+        free = spec["portfolio"]["max_positions"] - len(mine)
+        entries = [x for x in syms if x in fired and x not in exits] if spec.get("rank") or free > 0 else []
+        entries.sort(key=lambda x: x not in sure)
         # Confirmations are paced by the data budget across the candle (the bulk
-        # lane's per-minute window spaces them): what fits before the next close,
-        # after the polls — exits first, then entries, then the symbols to re-sync,
-        # then the unwarmed. The rest wait for a later close (unsure / cold stay so).
+        # lane's per-minute window spaces them): what fits before the next close
+        # after the polls, and no more than this candle's share of what's left of
+        # the day (after the polls of the closes still to come) — exits always,
+        # first, then entries, then the symbols to re-sync, then the unwarmed. The
+        # rest wait for a later close (unsure / cold stay so).
+        cps = calls_per_symbol(spec)
         lim = data_budget.limits()
         per_min = int(lim["per_min"] * (100 - lim["reserve_pct"]) / 100)
-        minutes = max(1, tf_s // 60 - 1)
-        cap = max(len(exits), 1, (per_min * minutes - calls * minutes) // calls_per_symbol(spec))
-        order = list(dict.fromkeys([*sorted(exits), *sorted(fired - exits), *sorted(unsure), *sorted(cold)]))
+        pace = (per_min * max(1, tf_s // 60 - 1) - calls) // cps
+        ahead = max(0, -(-(bar - (bar + IST) % DAY + CLOSE_S - close_t) // tf_s))
+        polls_ahead = ahead * -(-len(syms) // QUOTE_BATCH)
+        share = (data_budget.budget().bulk_left_today() - polls_ahead) // (ahead + 1) // cps
+        cap = max(len(exits), min(pace, share))
+        order = list(dict.fromkeys([*sorted(exits), *entries, *sorted(unsure), *sorted(cold)]))
         out = set(order[:cap])
         self.passes[sid] = (bar, out)
         self.stats[sid] = {"bar": bar, "symbols": len(syms), "warm": len(syms) - len(cold), "screened": len(ready),
-                           "fired": len(fired), "unsure": len(unsure), "held": len(mine), "candidates": len(out),
-                           "skipped": len(fired - out), "deferred": len(order) - len(out) - len(fired - out),
-                           "quote_calls": calls, "ms": int((time.time() - t0) * 1000)}
+                           "fired": len(fired), "sure": len(sure), "unsure": len(unsure), "held": len(mine), "candidates": len(out),
+                           "skipped": len(set(entries) - out), "full": len(fired - exits) - len(entries),
+                           "deferred": len(order) - len(out) - len(set(entries) - out),
+                           "quote_calls": calls, "ms": int((time.perf_counter() - t0) * 1000)}
         return out
 
     async def _shared(self, spec: dict, now: float) -> dict[str, Any]:
@@ -390,28 +406,38 @@ class Screener:
         return out
 
     @staticmethod
-    def _screen(spec: dict, items: list[tuple[str, dict]], held: Optional[dict[str, str]] = None) -> set[str]:
+    def _screen(spec: dict, items: list[tuple[str, dict]],
+                held: Optional[dict[str, str]] = None) -> tuple[set[str], set[str]]:
         """Symbols whose entry — or, holding a position, whose exit — may have
-        fired on their newest candle, with the tolerance."""
+        fired on their newest candle with the tolerance, and the subset that
+        fired on it outright (the likeliest to confirm)."""
         held = held or {}
         out: set[str] = set()
-        with engine.screening(slack()):
-            for sym, d in items:
-                try:
-                    if spec["instrument"]["type"] != "equity" or any(
-                            o["ind"] == "DTE" for o in engine._walk_operands(spec)):
-                        engine.prepare(d, spec)
-                    sig = engine.signals(d, spec, {})
-                except Exception:  # noqa: BLE001 — can't evaluate: let the exact path decide
+        sure: set[str] = set()
+
+        def hit(sig: dict, side: Optional[str]) -> bool:
+            if side is not None:
+                return bool(sig["exit_long" if side == "BUY" else "exit_short"][-1])
+            return bool(sig["entry_long"][-1] or sig["entry_short"][-1])
+
+        for sym, d in items:
+            side = held.get(sym)
+            try:
+                if spec["instrument"]["type"] != "equity" or any(
+                        o["ind"] == "DTE" for o in engine._walk_operands(spec)):
+                    engine.prepare(d, spec)
+                cache: dict = {}                   # indicators don't depend on the tolerance: computed once
+                if hit(engine.signals(d, spec, cache), side):
+                    sure.add(sym)
                     out.add(sym)
                     continue
-                side = held.get(sym)
-                if side is not None:
-                    if sig["exit_long" if side == "BUY" else "exit_short"][-1]:
+                with engine.screening(slack()):
+                    if hit(engine.signals(d, spec, cache), side):
                         out.add(sym)
-                elif sig["entry_long"][-1] or sig["entry_short"][-1]:
-                    out.add(sym)
-        return out
+            except Exception:  # noqa: BLE001 — can't evaluate: let the exact path decide
+                out.add(sym)
+                sure.add(sym)
+        return out, sure
 
     def status(self) -> dict[str, Any]:
         return {"warm": len(self.warm), "warming": self.warming is not None and not self.warming.done(),

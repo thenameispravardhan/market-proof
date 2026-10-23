@@ -241,8 +241,8 @@ type RunnerStatus = {
   ticks?: { seen: number; last_exit_check: number | null; watching: number };
   screen?: ScreenStatus;
 };
-type ScreenPass = { bar: number; symbols: number; warm: number; screened: number; fired: number; unsure: number; held: number;
-  candidates: number; skipped: number; deferred: number; quote_calls: number; ms: number };
+type ScreenPass = { bar: number; symbols: number; warm: number; screened: number; fired: number; sure?: number; unsure: number;
+  held: number; candidates: number; skipped: number; full?: number; deferred: number; quote_calls: number; ms: number };
 type ScreenStatus = {
   warm: number; warming: boolean; warm_errors: number; strategies: Record<string, ScreenPass>;
   budget: { plan: string; per_min: number; per_day: number; reserve_pct: number; used_today: number; bulk_left_today: number;
@@ -261,8 +261,9 @@ export function ScreenLine({ sc, nameOf }: { sc: ScreenStatus | undefined; nameO
       {sc.warming && <> · warming up ({n(sc.warm)} symbols ready)</>}
       {Object.entries(sc.strategies).map(([id, p]) => (
         <div key={id} data-testid={`algo-screen-${id}`}>
-          {nameOf(Number(id))}: last candle {ist(p.bar)} — {p.screened} of {p.symbols} screened, {p.fired} may have fired,
+          {nameOf(Number(id))}: last candle {ist(p.bar)} — {p.screened} of {p.symbols} screened, {p.fired} may have fired{p.sure ? ` (${p.sure} clearly)` : ""},
           {" "}{p.candidates} checked on exact candles{p.skipped ? `, ${p.skipped} skipped (budget)` : ""}
+          {p.full ? `, ${p.full} entries not checked (max positions open)` : ""}
           {p.unsure ? `, ${p.unsure} re-syncing` : ""}{p.warm < p.symbols ? `, ${p.symbols - p.warm} not warmed up` : ""}
           {" "}· {p.quote_calls} quote call{p.quote_calls === 1 ? "" : "s"}, {p.ms} ms
         </div>

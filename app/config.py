@@ -104,7 +104,7 @@ class Settings(BaseSettings):
     # confirmed on exact candles (app/algo/screen.py). This is the screen's
     # tolerance: a condition passes when it holds to within this % — wider
     # catches more borderline signals for the exact check, at more data calls.
-    ALGO_SCREEN_SLACK_PCT: float = 0.5
+    ALGO_SCREEN_SLACK_PCT: float = 0.2
 
     # ---------- Storage ----------
     # Ignored if TESTING=1 (in-memory sqlite is used).
