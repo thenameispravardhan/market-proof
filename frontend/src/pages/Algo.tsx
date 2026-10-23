@@ -2371,9 +2371,8 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
             )}
           </div>
       </div>
-      <DriftPanel strategies={(strategies.data?.strategies ?? []).filter((x) => shown(x.id))} />
       <TcaPanel shown={shown} />
-      <div className="widget widget-wide">
+      <div className="widget widget-wide" style={{ marginBottom: 12 }}>
           <h3>Runner log {sel.length ? <span className="meta">— {selNames}</span> : null}</h3>
           <div style={{ ...grow(320), fontSize: 12 }} data-testid="algo-log-panel">
             {!events.length ? <div className="empty">quiet</div> : events.map((e, i) => (
@@ -2382,6 +2381,7 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
               </div>))}
           </div>
       </div>
+      <DriftPanel strategies={(strategies.data?.strategies ?? []).filter((x) => shown(x.id))} />
     </>
   );
 }
