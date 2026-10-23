@@ -294,6 +294,18 @@ describe("Algo Lab", () => {
     expect(screen.getByTestId("pnl-histogram")).toBeTruthy();
     expect(screen.getByTestId("mae-mfe")).toBeTruthy();
     expect(within(screen.getByTestId("month-heatmap")).getByText("2025")).toBeTruthy();
+    expect(screen.queryByTestId("analytics-partial")).toBeNull();                      // every trade is here
+  });
+
+  it("says when the analytics see only the last trades the server sent", async () => {
+    const tr = { symbol: "NSE:SBIN-EQ", instrument: "NSE:SBIN-EQ", side: "BUY", qty: 1, lots: 1, entry_t: 1735704000, entry: 100,
+      exit_t: 1735707600, exit: 101, u_entry: 100, u_exit: 101, reason: "TARGET", gross: 1, charges: 0, net: 1, bars: 2, margin: 100,
+      legs: [], mae_pct: null, mfe_pct: null, r: null, minutes: 10 };
+    btReply = { ...BT, trades: [tr], trades_total: 5000 };
+    mount();
+    await screen.findByDisplayValue(/EMA 9\/21/);
+    fireEvent.click(screen.getByText("▶ Run backtest"));
+    expect((await screen.findByTestId("analytics-partial")).textContent).toMatch(/last 1 of 5000 trades/);
   });
 
   it("analytics helpers: histogram buckets and margin in use over time", () => {

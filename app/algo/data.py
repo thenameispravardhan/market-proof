@@ -97,6 +97,19 @@ def real_flow(fy: str, start: int, end: int) -> dict[int, tuple[float, float]]:
         return {}
 
 
+def lead_days(spec: dict[str, Any]) -> int:
+    """Calendar days of history loaded before a backtest's start: the warm-up of
+    the base candles, of every higher timeframe the conditions read, and RVOL's
+    whole sessions (at most 800)."""
+    from app.algo import engine
+
+    wb = engine.warmup_bars(spec)
+    btype, per_day = spec["bars"]["type"], spec["bars"]["per_day"]
+    base = warmup_days(spec["timeframe"], wb) if btype == "time" else int(wb / per_day * 1.5) + 25   # +20 sessions to size bars
+    return min(800, max([base, warmup_days(1440, engine.warmup_sessions(spec))]
+                        + [warmup_days(tf, wb) for tf in engine.cond_timeframes(spec)]))
+
+
 async def assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str, dict], list[dict], int]:
     """Everything one backtest needs, per symbol: base bars from `start - warmup`,
     every higher timeframe the conditions use, India VIX when options are priced
@@ -106,13 +119,9 @@ async def assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[str
 
     base_tf = spec["timeframe"]
     htfs = sorted(engine.cond_timeframes(spec))
-    wb = engine.warmup_bars(spec)
     minutes = engine.needs_minutes(spec)
     btype, per_day = spec["bars"]["type"], spec["bars"]["per_day"]
-    base_lead = warmup_days(base_tf, wb) if btype == "time" else int(wb / per_day * 1.5) + 25   # +20 sessions to size bars
-    lead = max([base_lead] + [warmup_days(tf, wb) for tf in htfs])
-    lead = min(lead, 800)
-    first = start - lead * DAY
+    first = start - lead_days(spec) * DAY
     inst = spec["instrument"]
     if inst["type"] != "equity" or (spec.get("pair_leg") or {}).get("kind") == "FUT":   # lots of the pair leg's future
         await fno.ensure_master()
@@ -457,10 +466,12 @@ async def live_bundle(spec: dict[str, Any], fy: str, now: float) -> dict[str, An
     from app.algo import engine, fno, orderflow
 
     wb = engine.warmup_bars(spec)
+    keep = lambda tf, extra: engine.history_bars(spec, tf) + extra   # noqa: E731 — RVOL's whole sessions too
     if engine.needs_minutes(spec):
         btype, per_day = spec["bars"]["type"], spec["bars"]["per_day"]
         per_bar = spec["timeframe"] if btype == "time" else max(1, 375 // per_day)
-        need = min(33000, (wb + 60) * per_bar + (375 * 22 if btype != "time" else 0))
+        need = min(33000, max((wb + 60) * per_bar, engine.warmup_sessions(spec) * 375 + 60)
+                   + (375 * 22 if btype != "time" else 0))
         m1 = await minute_history(fy, need, now)
         size = None
         if btype != "time":
@@ -472,14 +483,14 @@ async def live_bundle(spec: dict[str, Any], fy: str, now: float) -> dict[str, An
         real = await asyncio.to_thread(real_flow, fy, m1["t"][0] if m1["t"] else int(now), int(now) + 60)
         d = orderflow.complete_only(orderflow.build_bars(m1, btype, spec["timeframe"], size, real), now)
     else:
-        d = await recent_bars(fy, spec["timeframe"], bars=wb + 60, now=now)
+        d = await recent_bars(fy, spec["timeframe"], bars=keep(spec["timeframe"], 60), now=now)
     d["tf_min"] = spec["timeframe"]
-    d["htf"] = {tf: await recent_bars(fy, tf, bars=wb + 5, now=now) for tf in engine.cond_timeframes(spec)}
+    d["htf"] = {tf: await recent_bars(fy, tf, bars=keep(tf, 5), now=now) for tf in engine.cond_timeframes(spec)}
     xs = {}
     for ref, tfs in engine.ref_frames(spec).items():  # other symbols the conditions read, as the backtest loads them
-        b = await shared_bars(ref, spec["timeframe"], wb + 60, now)
+        b = await shared_bars(ref, spec["timeframe"], keep(spec["timeframe"], 60), now)
         b["tf_min"] = spec["timeframe"]
-        b["htf"] = {tf: await shared_bars(ref, tf, wb + 5, now) for tf in tfs - {spec["timeframe"]}}
+        b["htf"] = {tf: await shared_bars(ref, tf, keep(tf, 5), now) for tf in tfs - {spec["timeframe"]}}
         b["meta"] = {"symbol": ref}
         xs[ref] = b
     if xs:

@@ -473,7 +473,8 @@ uses implied volatility from the real option prices.
 `entry_order.type`: `market` (next candle's open), `pullback` (wait for a
 price `offset_pct`% better than the signal close — limit style), `breakout`
 (wait for `offset_pct`% beyond it in the trade's direction — stop style).
-`valid_bars` — cancel if not filled within that many candles.
+`valid_bars` — cancel if not filled within that many candles after the signal
+(1 = only the next candle; live arms the order for that long).
 
 `entry_order.limit` (optional, LIVE orders only) — `{"wait_s": 10, "steps": 3}`:
 each live entry leg goes in as a LIMIT at the quote, is re-priced to the
@@ -1489,6 +1490,7 @@ real ticks** = the rest of the order-flow values were estimated per minute.
 | daily halt | the day's max loss / profit had stopped trading |
 | entry expired | a pullback / breakout order not filled within `valid_bars` |
 | entry rules | an option `position_rules.entry` rule failed |
+| no stop | the stop couldn't be set (an ATR stop before its ATR has enough candles, or a flat ATR of 0) — the strategy never enters without its stop, live included |
 | reentry / roll / hedge no capital | an option adjustment didn't fit (5.1) |
 
 **Performance**

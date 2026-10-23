@@ -1596,6 +1596,10 @@ class AlgoRunner:
         # Sizing on the quoted prices (the stop distance only needs the shape).
         tick = engine.tick_for(sym)
         pre = engine.entry_levels(spec, rsign, u if ref == "u" else legs[0]["price"], atr_vals, tick)
+        if spec["stop_loss"] and pre["sl"] is None:      # an ATR stop with no ATR (too few candles) or a flat 0
+            self.event("error", f"{s['name']}: {side} {sym} skipped — its stop can't be set (no ATR yet), "
+                                "and it never enters without one", strategy_id=s["id"])
+            return
         per_set_margin = engine.position_margin(legs, u, pf["leverage"], price_key="price", model=spec.get("margin"),
                                                 t=now, name=fno.fno_name(sym))
         equity = pf["capital"] + (book["realized"] if pf["compounding"] else 0.0)
