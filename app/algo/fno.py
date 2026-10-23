@@ -97,9 +97,18 @@ def _close_ts(d: date) -> int:
 
 @lru_cache(maxsize=4096)
 def _expiries_from(name: str, exch: str, kind: str, d: date) -> tuple[date, ...]:
-    """The next three expiry dates on or after `d` (day-by-day scan; cached per day)."""
+    """The next three expiry dates on or after `d` (weekly: a day-by-day scan;
+    monthly: each month's last expiry weekday; cached per day)."""
     weekly = kind == "weekly" and name in WEEKLY
     out: list[date] = []
+    if not weekly:      # a month's expiry weekday never changes mid-month: its last one, month by month
+        y, m = d.year, d.month
+        while len(out) < 3:
+            x = _last_weekday(y, m, _expiry_weekday(exch, date(y, m, 1)))
+            if x >= d:
+                out.append(x)
+            y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+        return tuple(out)
     day = d
     while len(out) < 3:
         wd = _expiry_weekday(exch, day)
@@ -110,7 +119,7 @@ def _expiries_from(name: str, exch: str, kind: str, d: date) -> tuple[date, ...]
 
 
 def expiry_after(name: str, exch: str, kind: str, which: str, t: float,
-                 trading_days: Optional[frozenset] = None) -> int:
+                 trading_days: Optional[frozenset] = None, span: Optional[tuple[int, int]] = None) -> int:
     """Epoch of the contract's 15:30 close. `which` = current | next.
 
     `trading_days` (IST day numbers the market actually traded, read off the
@@ -119,16 +128,39 @@ def expiry_after(name: str, exch: str, kind: str, which: str, t: float,
     candles cover, the plain weekday rule applies.
     """
     days: list[date] = []
+    if trading_days and span is None:
+        span = (min(trading_days), max(trading_days))
     for x in _expiries_from(name, exch, kind, datetime.fromtimestamp(t, IST).date()):
-        if trading_days:
+        if span:
             k = (x - date(1970, 1, 1)).days
-            lo, hi = min(trading_days), max(trading_days)
+            lo, hi = span
             while lo <= k <= hi and k not in trading_days:
                 k -= 1
             x = date(1970, 1, 1) + timedelta(days=k)
         if _close_ts(x) >= t and x not in days:
             days.append(x)
     return _close_ts(days[0 if which == "current" else 1])
+
+
+def expiry_series(name: str, exch: str, kind: str, which: str, times: list[int],
+                  trading_days: Optional[frozenset] = None) -> list[int]:
+    """expiry_after for every candle, worked out once per IST day: a candle
+    before its day's 15:30 close gets that day's answer whatever its minute.
+    Per candle it was most of a backtest's time (and the trading-day span was
+    re-scanned on every call)."""
+    span = (min(trading_days), max(trading_days)) if trading_days else None
+    memo: dict[int, int] = {}
+    out = []
+    for t in times:
+        day = (t + 19800) // 86400
+        if t < day * 86400 - 19800 + EXPIRY_CLOSE_S:
+            v = memo.get(day)
+            if v is None:
+                v = memo[day] = expiry_after(name, exch, kind, which, t, trading_days, span)
+        else:
+            v = expiry_after(name, exch, kind, which, t, trading_days, span)
+        out.append(v)
+    return out
 
 
 # ---- Black-Scholes -----------------------------------------------------------
