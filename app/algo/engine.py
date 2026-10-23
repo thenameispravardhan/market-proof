@@ -159,6 +159,12 @@ SCALE_KINDS = ("pct", "points", "atr", "rr")
 
 
 CARRY = 24 * 60   # square-off minute meaning "never" (no clock minute reaches it)
+# A carried F&O position is closed at this minute on its nearest contract's
+# expiry day — never held into the exchange's settlement (stock F&O settle by
+# physical delivery) — and a carried strategy opens nothing in a contract
+# expiring that day from then on. Live and in backtests; the latest live
+# square-off time too.
+EXPIRY_EXIT_MIN = 15 * 60 + 15
 
 
 def session_window(spec: dict[str, Any]) -> tuple[int, int, int]:
@@ -1668,7 +1674,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
     events = sorted(((t, prio.get((k, i), 0), k, i) for k, sym in enumerate(syms) for i, t in enumerate(data[sym]["t"])))
     trades: list[dict[str, Any]] = []
     skipped = {"no_capital": 0, "max_positions": 0, "daily_halt": 0, "entry_expired": 0, "entry_rules": 0,
-               "no_stop": 0}
+               "no_stop": 0, "expires_today": 0}
     if spec.get("pair_leg"):
         skipped.update(pair_no_ratio=0, pair_too_small=0)
     exit_rules = (spec.get("position_rules") or {}).get("exit")
@@ -1785,6 +1791,9 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         iv = d["iv"][i] if inst["type"] == "option" else 0.0
         sign = 1 if side == "BUY" else -1
         legs = sim_legs(spec, side, meta, u, t, iv, tdays)
+        if sq >= CARRY and ((t + IST) % 86400) // 60 >= EXPIRY_EXIT_MIN and any(
+                l.get("exp") and (l["exp"] + IST) // 86400 == (t + IST) // 86400 for l in legs):
+            return "expires_today"      # a carried position would be closed at once (EXPIRY), as live
         tk = tick_of[sym]
         for l in legs:
             raw = _leg_px(l, u, t, iv)
@@ -2049,11 +2058,18 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         """When the position's nearest open contract expires (inf: shares only)."""
         return min((l["exp"] for l in pos["legs"] if l.get("exp") and l.get("exit") is None), default=math.inf)
 
+    def expires_on(pos: dict, day: int) -> bool:
+        """Does the position's nearest open contract expire on IST day `day`?"""
+        x = expires(pos)
+        return x < math.inf and (int(x) + IST) // 86400 == day
+
     def settle(sym: str, j: int, t: float) -> None:
-        """No contract outlives its expiry: a carried F&O position is closed on
-        candle j, the last before `t`. The contracts that expired by `t` settle
-        there without slippage (options at their intrinsic value, futures at the
-        close); any later-expiry leg exits at that close like any other exit."""
+        """No contract outlives its expiry. A carried F&O position normally exits
+        at EXPIRY_EXIT_MIN on its expiry day; one still open after the expiry
+        (no candle at or after that time: a data gap) is closed on candle j, the
+        last before `t`. The contracts that expired by `t` settle there without
+        slippage (options at their intrinsic value, futures at the close), as
+        the exchange settles them; any later-expiry leg exits at that close."""
         d = st[sym]["d"]
         u, ub = d["c"][j], ub_at(sym, j, "c")
         for l in st[sym]["pos"]["legs"]:
@@ -2074,7 +2090,9 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         if s_["pos"] and day != s_["pos"]["day"] and sq < CARRY:
             close(sym, d["c"][i - 1], ind.close_time(d, i - 1), "EOD", i - 1, ub=ub_at(sym, i - 1, "c"))
         if s_["pos"] and i and t >= expires(s_["pos"]):
-            settle(sym, i - 1, t)
+            settle(sym, i - 1, t)       # still open past an expiry (a data gap hid the exit below)
+        if s_["pos"] and sq >= CARRY and mod >= EXPIRY_EXIT_MIN and expires_on(s_["pos"], day):
+            close(sym, d["o"][i], t, "EXPIRY", i, ub=ub_at(sym, i, "o"))     # out before it expires, as live
         if s_["pos"] and (s_["pos"]["exit_pending"] or mod >= sq):
             close(sym, d["o"][i], t, s_["pos"]["exit_pending"] or "SQUARE_OFF", i, ub=ub_at(sym, i, "o"))
         if s_["pending"]:

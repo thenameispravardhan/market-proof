@@ -497,6 +497,28 @@ def contract_lot(symbol: str, now: Optional[float] = None) -> Optional[int]:
     return known_lot(name, now) if name else None
 
 
+_MONTHS = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+
+
+def contract_expiry(symbol: str) -> Optional[int]:
+    """When an NSE / BSE futures contract expires: 15:30 IST of its expiry day,
+    from its row in the F&O master, else its month's last expiry weekday by the
+    exchange's rule (an expired contract has left the master; a holiday that
+    moved its expiry isn't known then). None for anything that isn't a future."""
+    s = (symbol or "").strip().upper()
+    name = underlying_of(s)
+    if not name or not s.endswith("FUT"):
+        return None
+    for e, sym in master()["futures"].get(name, []):
+        if sym == s:
+            return _close_ts(datetime.fromtimestamp(e, IST).date())
+    m = re.search(r"(\d{2})(" + "|".join(_MONTHS) + r")FUT$", s)
+    if not m:
+        return None
+    year, month = 2000 + int(m[1]), _MONTHS.index(m[2]) + 1
+    return _close_ts(_last_weekday(year, month, _expiry_weekday(s.split(":", 1)[0], date(year, month, 28))))
+
+
 def future_symbol(name: str, which: str, now: Optional[float] = None) -> Optional[str]:
     now = now or time.time()
     live = [s for e, s in master()["futures"].get(name, []) if e >= now]
