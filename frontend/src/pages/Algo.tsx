@@ -798,79 +798,11 @@ const QUICK = [
   { s: "NSE:MIDCPNIFTY-INDEX", l: "MIDCPNIFTY" }, { s: "BSE:SENSEX-INDEX", l: "SENSEX" },
 ];
 
-export const MAX_SYMBOLS = 1000;
-
-type LiveCapacity = {
-  plan: string; symbols: number; exact_capacity: number; mode: "exact" | "screened" | "over";
-  daily_calls: { warm: number; polls: number; confirm: number; total: number };
-  bulk_per_day: number; fits: boolean; used_today: number; max_symbols: number; timeframe: number;
-};
-
-/** How the strategy would run live on the Fyers plan's data budget, and what it costs a day. */
-export function CapacityLine({ spec }: { spec: Spec }) {
-  const body = JSON.stringify(spec);
-  const q = useQuery({
-    queryKey: ["algo", "capacity", body], enabled: spec.symbols.length > 0, staleTime: 60000, retry: false,
-    placeholderData: keepPreviousData,
-    queryFn: () => api.post<LiveCapacity>("/api/algo/capacity", { spec: JSON.parse(body) }),
-  });
-  const c = q.data;
-  if (!c || q.isError || typeof c.daily_calls?.total !== "number") return null;     // an older server: nothing to say
-  const dc = c.daily_calls;
-  const n = (x: number) => x.toLocaleString("en-IN");
-  return (
-    <div className={`meta ${c.fits && c.mode !== "over" ? "" : "warn-text"}`} data-testid="algo-capacity" style={{ marginTop: 4 }}>
-      Live on Fyers {c.plan}:{" "}
-      {c.mode === "exact" && <>every symbol&apos;s candles at each close — ~{n(dc.total)} data calls a day</>}
-      {c.mode === "screened" && <>
-        {n(c.symbols)} symbols screened on batch quotes, exact candles only where a signal may fire — ~{n(dc.total)} data calls a day
-        ({n(dc.warm)} warm-up{dc.polls ? `, ${n(dc.polls)} quote polls, ~${n(dc.confirm)} confirmations` : ""})
-      </>}
-      {c.mode === "over" && <>only ~{c.exact_capacity} of these symbols get checked each candle — order-flow and volume / turnover candles can&apos;t be screened</>}
-      {" "}of the {n(c.bulk_per_day)} automations get.
-      {!c.fits && <> Over the daily budget: about {n(c.max_symbols)} symbols fit on {tfLabel(c.timeframe)} — fewer symbols, a longer timeframe or Fyers Prime.</>}
-    </div>
-  );
-}
-const CHIPS_UP_TO = 40;          // a longer list shows as a count + an editable text box
-
-/** A pasted / uploaded symbol list -> Fyers symbols. A CSV with a "Symbol" column
- *  (NSE's index constituent files) reads that column; anything else is split on
- *  commas, semicolons and whitespace. A bare ticker is an NSE share (RELIANCE ->
- *  NSE:RELIANCE-EQ); "NSE:...", "BSE:..." etc. are kept as typed. Duplicates and
- *  numbers dropped, order kept. */
-export function parseSymbolList(text: string): string[] {
-  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-  let tokens: string[];
-  const head = (lines[0] ?? "").split(",").map((c) => c.trim().replace(/^"|"$/g, "").toLowerCase());
-  const col = head.findIndex((c) => c === "symbol" || c === "ticker" || c === "tradingsymbol");
-  if (lines.length > 1 && col >= 0) {
-    tokens = lines.slice(1).map((l) => (l.split(",")[col] ?? "").trim().replace(/^"|"$/g, ""));
-  } else {
-    tokens = text.split(/[\s,;]+/);
-  }
-  const out: string[] = [];
-  for (const raw of tokens) {
-    const t = raw.trim().toUpperCase();
-    if (!t || /^[\d.]+$/.test(t) || !/^[A-Z0-9&_.:-]+$/.test(t)) continue;
-    const sym = t.includes(":") ? t : `NSE:${t}-EQ`;
-    if (!out.includes(sym)) out.push(sym);
-  }
-  return out;
-}
-
 function SymbolPicker({ value, onChange }: { value: string[]; onChange: (v: string[]) => void }) {
   const [q, setQ] = useState("");
   const [hits, setHits] = useState<Hit[]>([]);
   const [open, setOpen] = useState(false);
   const [hi, setHi] = useState(0);
-  const [listOpen, setListOpen] = useState(false);
-  const [draft, setDraft] = useState("");
-  const [note, setNote] = useState<string | null>(null);
-  const setAll = (syms: string[]) => {
-    setNote(syms.length > MAX_SYMBOLS ? `kept the first ${MAX_SYMBOLS} of ${syms.length} symbols (the most a strategy takes)` : null);
-    onChange(syms.slice(0, MAX_SYMBOLS));
-  };
   useEffect(() => {
     if (!open) return;
     const h = setTimeout(async () => {
@@ -884,37 +816,13 @@ function SymbolPicker({ value, onChange }: { value: string[]; onChange: (v: stri
   }, [q, open, value]);
   const add = (...syms: string[]) => {
     const next = [...value];
-    parseSymbolList(syms.join("\n")).forEach((s) => { if (!next.includes(s)) next.push(s); });
-    setAll(next);
+    syms.map((s) => s.trim().toUpperCase()).filter(Boolean).forEach((s) => { if (!next.includes(s)) next.push(s); });
+    onChange(next);
     setQ("");
   };
-  const upload = (f: File | undefined) => {
-    if (!f) return;
-    f.text().then((t) => add(...parseSymbolList(t))).catch(() => setNote(`couldn't read ${f.name}`));
-  };
-  const big = value.length > CHIPS_UP_TO;
   return (
-    <div className="algo-symbols" data-testid="algo-symbols">
-      {big && (
-        <span className="meta" data-testid="algo-symbol-count">
-          <b>{value.length}</b> symbols ({value.slice(0, 6).map(shortSym).join(", ")}…){" "}
-          <button type="button" className="btn-sm ghost" onClick={() => { setDraft(value.join("\n")); setListOpen(!listOpen); }}>
-            {listOpen ? "hide list" : "edit list"}
-          </button>
-        </span>
-      )}
-      {listOpen && (
-        <span style={{ display: "flex", flexDirection: "column", gap: 4, width: "100%" }}>
-          <textarea value={draft} rows={8} style={{ width: "100%", fontFamily: "var(--mono)", fontSize: 12 }} data-testid="algo-symbol-list"
-            onChange={(e) => setDraft(e.target.value)} placeholder="one per line, or comma separated — RELIANCE, NSE:TCS-EQ, …" />
-          <span>
-            <button type="button" className="btn-sm" onClick={() => { setAll(parseSymbolList(draft)); setListOpen(false); }}>apply list</button>{" "}
-            <span className="meta">{parseSymbolList(draft).length} symbols</span>
-          </span>
-        </span>
-      )}
-      {note && <span className="meta warn-text">{note}</span>}
-      {!big && value.map((s) => (
+    <div className="algo-symbols">
+      {value.map((s) => (
         <span className="algo-chip" key={s} title={s}>
           {shortSym(s)}
           <button type="button" aria-label={`remove ${s}`} onClick={() => onChange(value.filter((x) => x !== s))}>×</button>
@@ -949,15 +857,7 @@ function SymbolPicker({ value, onChange }: { value: string[]; onChange: (v: stri
       {QUICK.filter((x) => !value.includes(x.s)).map((x) => (
         <button key={x.s} type="button" className="btn-sm ghost" onClick={() => add(x.s)}>+ {x.l}</button>
       ))}
-      {!big && !listOpen && (
-        <button type="button" className="btn-sm ghost" title="paste a list — one per line or comma separated; bare tickers are NSE shares"
-          onClick={() => { setDraft(value.join("\n")); setListOpen(true); }}>paste list</button>
-      )}
-      <label className="btn-sm ghost" title="a .csv / .txt of symbols — NSE's index files work (their Symbol column)" style={{ cursor: "pointer" }}>
-        upload list<input type="file" accept=".csv,.txt" style={{ display: "none" }} data-testid="algo-symbol-upload"
-          onChange={(e) => { upload(e.target.files?.[0]); e.target.value = ""; }} />
-      </label>
-      {value.length > 1 && <button type="button" className="btn-sm ghost" onClick={() => setAll([])}>clear</button>}
+      {value.length > 1 && <button type="button" className="btn-sm ghost" onClick={() => onChange([])}>clear</button>}
     </div>
   );
 }
@@ -3226,7 +3126,6 @@ export default function Algo() {
             </div>
             <div className="algo-field"><span className="meta">symbols — signals are computed on these (stocks or indices)</span>
               <SymbolPicker value={spec.symbols} onChange={(symbols) => upd({ symbols })} />
-              <CapacityLine spec={spec} />
             </div>
             {editing && versions.data && (
               <div className="algo-operand" style={{ gap: 6 }}>
