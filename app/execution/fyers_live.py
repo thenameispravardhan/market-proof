@@ -326,6 +326,9 @@ class FyersClient:
         base_url: Optional[str] = None,
     ) -> dict[str, Any]:
         url = f"{(base_url or self._base_url).rstrip('/')}/{path.lstrip('/')}"
+        # Data APIs (quotes / depth / history / chain) draw on the plan's shared
+        # per-second / minute / day budget; orders have their own (_order_slot).
+        data_call = base_url is not None and base_url.rstrip("/") == self._data_base_url
         headers = {
             "Authorization": self._auth_header(),
             "Content-Type": "application/json",
@@ -333,6 +336,10 @@ class FyersClient:
         }
         last_err: Optional[Exception] = None
         for attempt in range(self._max_retries + 1):
+            if data_call:
+                from app.execution.data_budget import budget
+
+                await budget().acquire()
             try:
                 async with self._semaphore:
                     client = await self._ensure_client()
@@ -365,6 +372,10 @@ class FyersClient:
                     "fyers 429: rate limited",
                     status_code=429, body=_safe_body(resp), retryable=True,
                 )
+                if data_call:
+                    from app.execution.data_budget import budget
+
+                    budget().rate_limited()
                 if attempt >= self._max_retries:
                     raise last_err
                 log.info(
@@ -1479,6 +1490,10 @@ class FyersLiveBackend:
                         change=safe_float(ch_raw) if ch_raw is not None else None,
                         change_pct=safe_float(chp_raw) if chp_raw is not None else None,
                         prev_close=(safe_float(pc_raw) or None) if pc_raw is not None else None,
+                        # the day's open / high / low: what an approximate candle
+                        # built from snapshots (app/algo/screen.py) gets its extremes from
+                        extra={k: safe_float(v.get(f)) for k, f in (("open", "open_price"), ("high", "high_price"),
+                                                                    ("low", "low_price")) if v.get(f) is not None},
                     )
                 )
             except Exception:  # noqa: BLE001
