@@ -37,6 +37,7 @@ size of the next trade follows the equity curve.
 from __future__ import annotations
 
 import copy
+import heapq
 import itertools
 import math
 import statistics
@@ -1403,8 +1404,7 @@ def prepare(d: dict, spec: dict) -> None:
     # Days the underlying actually traded: an expiry that falls on a day with
     # no candles was an exchange holiday and really settled the day before.
     d["trading_days"] = frozenset((t + IST) // 86400 for t in d["t"])
-    d["expiry_ts"] = [fno.expiry_after(meta["name"], meta["exch"], kind, inst["expiry"], t, d["trading_days"])
-                      for t in d["t"]]
+    d["expiry_ts"] = fno.expiry_series(meta["name"], meta["exch"], kind, inst["expiry"], d["t"], d["trading_days"])
     if inst["type"] != "option":
         return
     n = len(d["t"])
@@ -1604,8 +1604,27 @@ def _solve(f: Callable[[float], float], target: float, a: float, b: float) -> fl
 
 # ---- simulation ------------------------------------------------------------
 
+def _events(syms: list[str], data: dict[str, dict], prio: dict[tuple[int, int], int]):
+    """Every candle of every symbol as (t, prio, k, i), in sorted order —
+    merged lazily from each symbol's own time-ordered candles instead of
+    sorted as one list (a tuple per candle held for the whole run)."""
+    def one(k: int, t: Any):
+        if prio:
+            return ((x, prio.get((k, i), 0), k, i) for i, x in enumerate(t))
+        return ((x, 0, k, i) for i, x in enumerate(t))
+    streams = []
+    for k, sym in enumerate(syms):
+        t = data[sym]["t"]
+        if all(a < b for a, b in zip(t, itertools.islice(t, 1, None))):
+            streams.append(one(k, t))
+        else:                                    # not strictly ascending: sort this symbol's own
+            streams.append(iter(sorted(one(k, t))))
+    return heapq.merge(*streams)
+
+
 def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = None,
-        trade_from: Optional[int] = None, oos_from: Optional[int] = None) -> dict[str, Any]:
+        trade_from: Optional[int] = None, oos_from: Optional[int] = None,
+        keep_caches: Optional[set[str]] = None) -> dict[str, Any]:
     """Backtest a normalized spec over {symbol: bars}; one shared portfolio.
 
     Each symbol's bars may carry `htf` ({tf: bars}) for multi-timeframe
@@ -1613,8 +1632,13 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
     Entries are taken only on bars at/after `trade_from` (earlier bars warm
     the indicators up). With `oos_from`, stats are also split into in-sample
     (entries before it) and out-of-sample (entries from it).
+    `keep_caches`: only these symbols' indicator caches stay in `caches` (a
+    single backtest's chart reads one); the rest are dropped as soon as their
+    signals are built instead of all being held to the end. None = keep all
+    (the optimiser reuses them across combinations).
     """
     caches = caches if caches is not None else {}
+    late = bool(spec.get("pair_leg") or spec.get("rank"))      # these read every symbol's cache after its signals
     inst = spec["instrument"]
     pf = spec["portfolio"]
     slip = spec["costs"]["slippage_pct"] / 100
@@ -1635,6 +1659,8 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         st[sym] = {"d": d, "sig": signals(d, spec, cache),
                    "atr": {p: series(d, {"ind": "ATR", "params": {"period": p}}, cache) for p in atr_periods(spec)},
                    "pos": None, "pending": None, "per_day": {}, "cool": 0, "u": None}
+        if keep_caches is not None and sym not in keep_caches and not late:
+            del caches[sym]
 
     for sym in syms:                 # a point-in-time universe: no entry on a day the stock wasn't in the index
         md = data[sym].get("member_days")
@@ -1671,7 +1697,11 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
     # With "rank", entries outside each candle's best N are switched off and the
     # kept fills go first at the next open, best first (prio 0 = everything else).
     prio = _rank_entries(spec, syms, st, caches) if spec.get("rank") else {}
-    events = sorted(((t, prio.get((k, i), 0), k, i) for k, sym in enumerate(syms) for i, t in enumerate(data[sym]["t"])))
+    if keep_caches is not None and late:
+        for sym in syms:
+            if sym not in keep_caches:
+                caches.pop(sym, None)
+    events = _events(syms, data, prio)
     trades: list[dict[str, Any]] = []
     skipped = {"no_capital": 0, "max_positions": 0, "daily_halt": 0, "entry_expired": 0, "entry_rules": 0,
                "no_stop": 0, "expires_today": 0}

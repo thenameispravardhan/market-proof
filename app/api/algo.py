@@ -92,11 +92,13 @@ def _range(body: dict[str, Any]) -> tuple[int, int]:
 
 
 # The backtester shares a 2 GB box (MemoryMax 1.4G) with the live trading
-# process. ~140k bars (4 symbols x 2y x 5m) measured ~350 MB peak, so a cap of
-# 600k bars keeps one job well inside the budget, and the semaphore makes it
-# ONE job at a time — two big backtests in parallel would double the peak and
-# could get the trading process OOM-killed mid-session.
-MAX_BARS = 600_000
+# process, and the semaphore makes it ONE job at a time — two big backtests in
+# parallel would double the peak and could get the trading process OOM-killed
+# mid-session. Measured on the same machine: 600k bars peaked +370 MB with
+# candles as Python lists; as typed arrays (data.columns), indicator caches
+# freed per symbol and a lazy event merge, 1.6M bars peak +280 MB. So 1.5M
+# stays inside the old budget with room to spare.
+MAX_BARS = 1_500_000
 MAX_BAR_RUNS = 30_000_000          # optimiser: combos x bars (~4 minutes of CPU)
 _heavy = asyncio.Semaphore(1)
 
@@ -261,16 +263,16 @@ async def backtest(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         bars, notes, trade_from = await _assemble(spec, start, end)
         oos_from = _oos_from(bars, trade_from, pct)
         trials = await asyncio.to_thread(_bump_trials, body, 1)
+        chart_sym = body.get("chart_symbol") if body.get("chart_symbol") in bars else next(iter(bars))
         try:
-            caches: dict[str, dict] = {}
-            res = await asyncio.to_thread(engine.run, spec, bars, caches, trade_from, oos_from)
+            caches: dict[str, dict] = {}       # only the chart's: its indicator lines are drawn
+            res = await asyncio.to_thread(engine.run, spec, bars, caches, trade_from, oos_from, {chart_sym})
             res["monte_carlo"] = await asyncio.to_thread(engine.monte_carlo, res["trades"], spec["portfolio"]["capital"])
             res["trials"] = trials
             res["stats"]["deflated_sharpe"] = await asyncio.to_thread(
                 engine.trial_dsr, res["trades"], bars, spec["portfolio"]["capital"], trials, trade_from)
         except (ValueError, KeyError, ZeroDivisionError) as e:
             raise HTTPException(422, detail=f"backtest: {e}")
-    chart_sym = body.get("chart_symbol") if body.get("chart_symbol") in bars else next(iter(bars))
     d = bars[chart_sym]
     keep = 8000                         # enough to inspect, small enough to ship
     first = next((i for i, t in enumerate(d["t"]) if t >= trade_from), 0)
