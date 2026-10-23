@@ -9,6 +9,7 @@ swapping the session (`?practice=1` / account_id -1).
 """
 from __future__ import annotations
 
+import tempfile
 from collections.abc import Iterator
 from functools import lru_cache
 from typing import Any, Optional
@@ -16,7 +17,6 @@ from typing import Any, Optional
 from fastapi import HTTPException, Query
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from app.config import get_settings
 from app.db import session as db_session
@@ -35,11 +35,15 @@ def session_factory() -> sessionmaker:
 
     url = get_settings().effective_database_url()
     if ":memory:" in url or not url.startswith("sqlite:///"):
-        eng = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+        # A throwaway file, not one shared in-memory connection (StaticPool): the
+        # paper engine writes from worker threads, and another thread's session
+        # closing on that connection rolled back a fill mid-commit — its trade row
+        # stayed "placed" while the position moved (CI, 2026-10-21 and 10-23).
+        url = f"sqlite:///{tempfile.mkdtemp(prefix='practice-')}/practice.db"
     else:
         url = url.rsplit("/", 1)[0] + "/practice.db"
         _ensure_sqlite_dir(url)
-        eng = create_engine(url, connect_args={"check_same_thread": False})
+    eng = create_engine(url, connect_args={"check_same_thread": False})
     Base.metadata.create_all(eng)
     return sessionmaker(bind=eng, autoflush=False, expire_on_commit=False, class_=Session)
 
