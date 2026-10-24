@@ -191,9 +191,13 @@ def _fo():
     return out
 
 
+BROAD = {"indices": list(ticks.INDEX_NAMES), "lists": ["nifty500"], "stocks": True, "stock_futures": True,
+         "stock_options": True, "next_futures": "roll", "index_all": False}       # the stock universe switched on
+
+
 def _cfg(**uni):
     cfg = ticks.load_config(ticks.ROOT / "nonexistent")
-    cfg["universe"] = {**cfg["universe"], "lists": ["nifty500"], **uni}
+    cfg["universe"] = {**cfg["universe"], **BROAD, **uni}
     cfg["symbols"] = []
     return cfg
 
@@ -356,7 +360,7 @@ def test_on_the_standard_plan_the_collector_leaves_the_socket_to_the_app(tmp_pat
 async def test_collector_plans_reports_and_sheds_load(tmp_path, monkeypatch):
     from app.algo import flowd
 
-    ticks.save_config({"symbols": ["NSE:ITC-EQ"], "budget": 400, "universe": {"lists": ["nifty500"]}}, tmp_path)
+    ticks.save_config({"symbols": ["NSE:ITC-EQ"], "budget": 400, "universe": BROAD}, tmp_path)
     monkeypatch.setattr(fu, "contracts", lambda *a, **k: _fo())
     monkeypatch.setattr(fu, "index_list", lambda name, cache_dir, fetch=True: (["RELIANCE", "SBIN", "INFY"], "test"))
     monkeypatch.setattr(flowd, "_account", lambda: None)
@@ -412,7 +416,7 @@ async def test_the_disk_guard_drops_old_days_early_then_pauses_and_resumes(tmp_p
 
     from app.algo import flowd
 
-    ticks.save_config({"symbols": ["NSE:ITC-EQ"], "budget": 400, "min_free_gb": 10, "universe": {"lists": ["nifty500"]}},
+    ticks.save_config({"symbols": ["NSE:ITC-EQ"], "budget": 400, "min_free_gb": 10, "universe": BROAD},
                       tmp_path)
     monkeypatch.setattr(fu, "contracts", lambda *a, **k: _fo())
     monkeypatch.setattr(fu, "index_list", lambda name, cache_dir, fetch=True: (["RELIANCE", "SBIN", "INFY"], "test"))
@@ -451,7 +455,7 @@ async def test_the_disk_guard_drops_old_days_early_then_pauses_and_resumes(tmp_p
 async def test_a_refused_symbol_count_cuts_the_budget_and_it_stays_cut(tmp_path, monkeypatch):
     from app.algo import flowd
 
-    ticks.save_config({"symbols": ["NSE:ITC-EQ"], "budget": 400, "universe": {"lists": ["nifty500"]}}, tmp_path)
+    ticks.save_config({"symbols": ["NSE:ITC-EQ"], "budget": 400, "universe": BROAD}, tmp_path)
     monkeypatch.setattr(fu, "contracts", lambda *a, **k: _fo())
     monkeypatch.setattr(fu, "index_list", lambda name, cache_dir, fetch=True: (["RELIANCE", "SBIN", "INFY"], "test"))
     monkeypatch.setattr(flowd, "_account", lambda: None)
@@ -489,3 +493,138 @@ def test_the_config_api_takes_the_disk_floor(client, tmp_path, monkeypatch):
     assert client.put("/api/algo/ticks/config", json={"min_free_gb": True}).status_code == 422
     ok = client.put("/api/algo/ticks/config", json={"min_free_gb": 12})
     assert ok.status_code == 200 and ok.json()["config"]["min_free_gb"] == 12.0
+
+
+# ---- NIFTY / SENSEX only (the default scope) ------------------------------------------
+
+def _fo_indices():
+    """NIFTY (NSE) and SENSEX (BSE) with two weekly expiries each, BANKNIFTY and a stock."""
+    out = _fo()
+    exp1, exp2 = (DAY0 + 2) * 86400 - IST + 55800, (DAY0 + 9) * 86400 - IST + 55800
+    m1 = (DAY0 + 9) * 86400 - IST + 55800
+    out["SENSEX"] = {"exch": "BSE", "fut": [(m1, "BSE:SENSEX26OCTFUT")],
+                     "opt": {e: {r: {82000 + i * 100: f"BSE:SENSEX{e}{82000 + i * 100}{r}" for i in range(31)}
+                                 for r in ("CE", "PE")} for e in (exp1, exp2)}}
+    out["BANKNIFTY"] = {"exch": "NSE", "fut": [(m1, "NSE:BANKNIFTY26OCTFUT")],
+                        "opt": {m1: {r: {56000 + i * 100: f"NSE:BANKNIFTY{56000 + i * 100}{r}" for i in range(11)}
+                                     for r in ("CE", "PE")}}}
+    return out
+
+
+IDX_SPOT = {**SPOT, "BSE:SENSEX-INDEX": 82_640.0, "NSE:NIFTYBANK-INDEX": 56_500.0}
+
+
+def test_the_default_records_nifty_and_sensex_their_futures_and_every_option_that_fits():
+    cfg = ticks.load_config(ticks.ROOT / "nonexistent")
+    fo = _fo_indices()
+    plan = fu.build(cfg, cfg["symbols"], IDX_SPOT.get, T915, fo=fo, lists=LISTS, eq=set(), budget=5000)
+    names = {plan.meta[plan.keys[s]].get("name") for s in plan.symbols}
+    assert names == {"NIFTY", "SENSEX"}                                 # no BANKNIFTY, no stock, no stock F&O
+    assert {"NSE:NIFTY50-INDEX", "BSE:SENSEX-INDEX", "NSE:NIFTY26OCTFUT", "BSE:SENSEX26OCTFUT"} <= set(plan.symbols)
+    assert "NSE:NIFTY26NOVFUT" not in plan.symbols                       # next month off
+    n_opts = sum(len(side) for name in ("NIFTY", "SENSEX") for chain in fo[name]["opt"].values()
+                 for side in chain.values())
+    opts = [s for s in plan.symbols if plan.meta[plan.keys[s]]["kind"] in ("CE", "PE")]
+    assert len(opts) == n_opts                                           # the budget allows every listed option
+    assert plan.classes["index_all"] > 0 and plan.summary()["dropped"] == {}
+    # a tight budget: the rest of the chains go nearest expiry, then nearest the money, first
+    tight = fu.build(cfg, cfg["symbols"], IDX_SPOT.get, T915, fo=fo, lists=LISTS, eq=set(), budget=len(plan.symbols) - 40)
+    rest = [tight.meta[tight.keys[s]] for s in tight.symbols if tight.meta[tight.keys[s]]["cls"] == "index_all"]
+    # SENSEX's first expiry is all inside ATM +/- 15 already: NIFTY's first-expiry wings come first
+    assert rest[0]["name"] == "NIFTY" and rest[0]["expiry"] == min(fo["NIFTY"]["opt"])
+    atm = {"NIFTY": (25000, 50), "SENSEX": (82600, 100)}                 # ATM strike, strike step
+    rank = [(sorted(fo[m["name"]]["opt"]).index(m["expiry"]), abs(m["strike"] - atm[m["name"]][0]) // atm[m["name"]][1])
+            for m in rest]
+    assert rank == sorted(rank)                                          # nearest expiry, then strikes from the money
+    assert tight.summary()["dropped"] == {"index_all": 40}
+
+
+def test_a_v2_config_moves_to_nifty_and_sensex_once_and_a_later_choice_stands(tmp_path):
+    ticks.write_json(tmp_path / "config.json", {
+        "version": 2, "symbols": list(ticks.V2_DEFAULT_SYMBOLS), "retention_days": 120,
+        "universe": {**ticks.DEFAULT_UNIVERSE, "lists": ["nifty500", "midcap150"], "stocks": True,
+                     "stock_futures": True, "stock_options": True, "next_futures": "roll", "index_strikes": 20}})
+    cfg = ticks.load_config(tmp_path)
+    assert cfg["version"] == ticks.CONFIG_VERSION and cfg["retention_days"] == 120
+    assert cfg["symbols"] == ticks.DEFAULT_SYMBOLS
+    uni = cfg["universe"]
+    assert uni["indices"] == ["NIFTY", "SENSEX"] and uni["lists"] == [] and not uni["stocks"]
+    assert not uni["stock_futures"] and not uni["stock_options"] and uni["index_all"]
+    assert uni["index_strikes"] == 20                                    # not part of the scope: kept
+    ticks.save_config({"universe": {"stocks": True, "lists": ["nifty500"]}}, tmp_path)
+    again = ticks.load_config(tmp_path)
+    assert again["universe"]["stocks"] and again["universe"]["lists"] == ["nifty500"]
+
+
+def test_an_index_chart_reads_its_futures_flow_and_the_auction_joins_the_first_candle(client, tmp_path, monkeypatch):
+    rec = ticks.TickRecorder(tmp_path)
+    monkeypatch.setattr(ticks, "_STORE", ticks.FlowStore(tmp_path))
+    fut = "NSE:NIFTY26OCTFUT"
+    rec.key_of.update({fut: "NIFTY-FUT", "NSE:NIFTY50-INDEX": "IDX_NIFTY"})
+    feed(rec, fut, [frame(25100.0, 0, 25099.0, 25100.0, T915 - 600),         # pre-open anchor
+                    frame(25100.0, 500, 25099.0, 25100.0, T915 - 420),       # the pre-open match: unk
+                    frame(25100.0, 550, 25099.0, 25100.0, T915 + 5),         # +50 at the ask
+                    frame(25099.0, 570, 25099.0, 25100.0, T915 + 65)])       # +20 at the bid
+    rec.on_tick("NSE:NIFTY50-INDEX", {"ltp": 25050.0, "exch_feed_time": T915 + 5}, recv_ts=T915 + 5.2)
+    rec.flush()
+    rec.write_meta({"NIFTY-FUT": {"symbol": fut, "kind": "FUT"}, "IDX_NIFTY": {"symbol": "NSE:NIFTY50-INDEX",
+                                                                             "kind": "IDX"}}, DAY0)
+    body = client.get("/api/algo/ticks/flow", params={"symbol": "NSE:NIFTY50-INDEX", "resolution": "5",
+                                                       "from": T915 - 3600, "to": T915 + 600}).json()
+    assert body["key"] == "NIFTY-FUT" and body["recorded"]
+    (bar,) = body["bars"]                                                # the auction is in 09:15's candle
+    assert bar[0] == T915 and bar[1:3] == [50.0, 20.0] and bar[5] == 500.0
+
+
+def test_lee_ready_inside_the_spread_takes_the_nearer_side_and_a_crossed_quote_falls_to_the_tick_test(tmp_path):
+    rec = ticks.TickRecorder(tmp_path)
+    feed(rec, "NSE:SBIN-EQ", [
+        frame(100.0, 1000, 99.0, 101.0, T915),             # anchor; quote 99 / 101 (mid 100)
+        frame(100.5, 1100, 99.0, 101.0, T915 + 10),        # +100 above the mid: buy (a tick test would say up = buy too)
+        frame(100.2, 1200, 99.0, 101.0, T915 + 20),        # +100 above the mid on a DOWN-tick: still a buy
+        frame(99.8, 1300, 100.0, 100.0, T915 + 30),        # +100 below the mid: sell; leaves a locked 100 / 100 quote
+        frame(99.9, 1400, 100.0, 100.0, T915 + 40),        # +100 against the locked quote: tick test, up = buy
+    ])
+    rec.flush()
+    (row,) = ticks.FlowStore(tmp_path).flow_rows("SBIN", T915, T915 + 60)
+    assert row[1:3] == (300.0, 100.0)
+
+
+def test_options_flow_adds_up_an_indexs_calls_and_puts_in_quantity_and_premium(client, tmp_path, monkeypatch):
+    rec = ticks.TickRecorder(tmp_path)
+    monkeypatch.setattr(ticks, "_STORE", ticks.FlowStore(tmp_path))
+    exp = (DAY0 + 6) * 86400 - IST + 55800
+    ce, pe = "NSE:NIFTY26O2725000CE", "NSE:NIFTY26O2725000PE"
+    meta = {"NIFTY26O2725000CE": {"symbol": ce, "kind": "CE", "name": "NIFTY", "expiry": exp, "strike": 25000.0},
+            "NIFTY26O2725000PE": {"symbol": pe, "kind": "PE", "name": "NIFTY", "expiry": exp, "strike": 25000.0},
+            "NIFTY-FUT": {"symbol": "NSE:NIFTY26OCTFUT", "kind": "FUT", "name": "NIFTY", "expiry": exp}}
+    rec.key_of.update({m["symbol"]: k for k, m in meta.items()})
+
+    def session(day_shift):
+        t0 = T915 + day_shift * 86400
+        feed(rec, ce, [frame(100.0, 0, 99.5, 100.0, t0), frame(100.0, 650, 99.5, 100.0, t0 + 5),       # 650 bought @100
+                       frame(99.5, 975, 99.5, 100.0, t0 + 65)])                                         # 325 sold @99.5
+        feed(rec, pe, [frame(80.0, 0, 80.0, 80.5, t0), frame(80.0, 1300, 80.0, 80.5, t0 + 5)])          # 1300 sold @80
+        feed(rec, "NSE:NIFTY26OCTFUT", [frame(25100.0, 0, 25099.0, 25100.0, t0),
+                                        frame(25100.0, 75, 25099.0, 25100.0, t0 + 5)])                  # not an option
+        rec.flush()
+        rec.write_meta(meta, DAY0 + day_shift)
+
+    session(-1)
+    rec.compact(DAY0 - 1)                                            # yesterday: parquet
+    session(0)
+    rec.flush()                                                      # today: the working CSVs (rows re-appended)
+    body = client.get("/api/algo/ticks/options-flow", params={"symbol": "NSE:NIFTY50-INDEX", "resolution": "5",
+                                                               "from": T915 - 86400, "to": T915 + 600}).json()
+    assert body["name"] == "NIFTY" and body["recorded"]
+    assert [b[0] for b in body["bars"]] == [T915 - 86400, T915]
+    for b in body["bars"]:
+        t, ce_b, ce_s, pe_b, pe_s, ce_bv, ce_sv, pe_bv, pe_sv, net = b
+        assert (ce_b, ce_s, pe_b, pe_s) == (650.0, 325.0, 0.0, 1300.0)
+        assert (ce_bv, ce_sv, pe_bv, pe_sv) == (65000.0, 32337.5, 0.0, 104000.0)
+        assert net == (65000.0 - 32337.5) - (0.0 - 104000.0)          # calls bought, puts sold: bullish
+    by_option = client.get("/api/algo/ticks/options-flow", params={"symbol": ce, "resolution": "D",
+                                                                    "from": T915, "to": T915 + 600}).json()
+    assert by_option["name"] == "NIFTY" and by_option["bars"][0][1] == 650.0
+    assert client.get("/api/algo/ticks/options-flow", params={"symbol": "NIFTY", "from": T915, "to": T915 + 600,
+                                                               "expiry": "soon"}).status_code == 422

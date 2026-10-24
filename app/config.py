@@ -92,6 +92,10 @@ class Settings(BaseSettings):
     # sized down (or skipped) so the margin all automations block stays <= ₹X.
     ALGO_BOOK_MAX_DAY_LOSS: float = 0.0
     ALGO_BOOK_MAX_MARGIN: float = 0.0
+    # Automations stop entering while the account-wide circuit breaker is on (the
+    # daily-loss / monthly-drawdown breakers, the manual kill switch) — as the news
+    # bot and the Trade page do. Their open positions keep their own exits.
+    ALGO_BOOK_FOLLOW_PORTFOLIO_HALT: bool = True
     # Algo Lab capital allocation. 0 = off: each automation sizes on its own
     # portfolio.capital. Set ₹X to split X across the enabled (non-shadow)
     # automations by inverse volatility of their daily P&L over the lookback,

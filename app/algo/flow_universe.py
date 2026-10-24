@@ -21,6 +21,13 @@ built in priority order and cut at a budget:
                   fits every stock, then one more strike each way for the largest while room is left
   10. stock_opt2  stock options, next expiry, in the roll window, ATM +/- 2
   11. sticky      strikes picked earlier today that are still near the money
+  12. index_all   (`index_all`) the rest of the index chains: every other listed strike of
+                  every expiry, nearest expiry then nearest the money first, to the budget
+
+Which indices: `indices` (NIFTY and SENSEX by default). Stocks, stock F&O and the
+stock lists are off by default — the collector records those two indices and their
+options (their current futures too: an index has no trades, its future's flow is
+the index chart's).
 
 Expiries and strikes come from the F&O scrip master (refreshed daily), so a new
 weekly listing is recorded as soon as it is the current / next expiry, an expired
@@ -39,7 +46,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from app.algo import fno
-from app.algo.ticks import IST, flow_key
+from app.algo.ticks import INDEX_NAMES, IST, flow_key
 from app.logging_config import get_logger
 
 log = get_logger(__name__)
@@ -60,7 +67,13 @@ LISTS: dict[str, dict[str, Any]] = {
 }
 INDEX_SYMBOL = {name: sym for sym, (name, _, _) in fno.INDICES.items()}     # NIFTY -> NSE:NIFTY50-INDEX
 CLASSES = ("focus", "chain", "index", "index_fut", "index_opt", "stock_fut", "stocks", "index_opt2", "fut_next",
-           "stock_opt", "stock_opt2", "sticky")
+           "stock_opt", "stock_opt2", "sticky", "index_all")
+
+
+def index_names(uni: dict[str, Any], fo: dict[str, dict[str, Any]]) -> list[str]:
+    """The indices the universe records (`indices`), in INDEX_NAMES order, that list F&O."""
+    want = {str(x).strip().upper() for x in uni.get("indices") or []}
+    return [n for n in INDEX_NAMES if n in want and n in fo and n in INDEX_SYMBOL]
 
 
 def _ist_date(ts: float) -> int:
@@ -415,7 +428,7 @@ def build(cfg: dict[str, Any], focus: list[str], spot: Callable[[str], Optional[
     if not uni.get("enabled", True):
         return plan
 
-    idx_names = [n for n in ("NIFTY", "BANKNIFTY", "SENSEX", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50", "BANKEX") if n in fo]
+    idx_names = index_names(uni, fo)
 
     # 2-3. the indices and their futures
     for name in idx_names:
@@ -543,6 +556,31 @@ def build(cfg: dict[str, Any], focus: list[str], spot: Callable[[str], Optional[
             plan.opt_sel.setdefault(sel_key, [])
             if strike not in plan.opt_sel[sel_key]:
                 plan.opt_sel[sel_key].append(strike)
+
+    # 12. the rest of the index chains: every listed strike of every expiry — nearest
+    #     expiry first, then nearest the money, the indices side by side — to the budget
+    if uni.get("index_options", True) and uni.get("index_all"):
+        cands: list[tuple] = []
+        for n_i, name in enumerate(idx_names):
+            under = INDEX_SYMBOL[name]
+            px = spot(under)
+            if not px:
+                plan.no_price.append(under)
+                continue
+            for e_i, exp in enumerate(_expiries(fo[name], today)):
+                opts = fo[name]["opt"].get(exp) or {}
+                grid = sorted(set(opts.get("CE", {})) | set(opts.get("PE", {})))
+                if not grid:
+                    continue
+                atm = min(range(len(grid)), key=lambda j: abs(grid[j] - px))
+                for j, strike in enumerate(grid):
+                    for r_i, right in enumerate(("CE", "PE")):
+                        sym = opts.get(right, {}).get(strike)
+                        if sym:
+                            cands.append((e_i, abs(j - atm), n_i, r_i, sym, name, exp, strike, right))
+        cands.sort(key=lambda c: c[:4])
+        for *_, sym, name, exp, strike, right in cands:
+            plan.add("index_all", sym, flow_key(sym), {"kind": right, "name": name, "expiry": exp, "strike": strike})
     plan.no_price = list(dict.fromkeys(plan.no_price))
     return plan
 

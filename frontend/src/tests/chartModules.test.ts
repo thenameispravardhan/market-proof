@@ -171,8 +171,8 @@ describe("indicator catalog", () => {
       expect(res.plots, def.type).toHaveLength(def.plots.length);
       for (const p of res.plots) expect(p.length).toBe(candles.length);
       for (const p of res.plots) expect(p.every((v) => v === null || Number.isFinite(v)), `${def.type} has NaN`).toBe(true);
-      // flow and CVD read recorded ticks only: with none (an empty flow map) they're rightly empty
-      if (def.type !== "flow" && def.type !== "cvd" && def.plots.length) expect(res.plots[0].some((v) => v !== null), `${def.type} is all null`).toBe(true);
+      // flow, CVD and the options flow read recorded ticks only: with none (an empty flow map) they're rightly empty
+      if (!["flow", "cvd", "optflow"].includes(def.type) && def.plots.length) expect(res.plots[0].some((v) => v !== null), `${def.type} is all null`).toBe(true);
       for (const m of res.marks ?? []) expect(m.i >= 0 && m.i < candles.length && m.plot < def.plots.length).toBe(true);
     }
   });
