@@ -1,6 +1,7 @@
 // The book: every automation's open positions together — exposure per underlying,
-// day P&L and margin against the book limits (Settings → Circuit breakers), and the
-// Algo Lab kill switch. GET /api/algo/book, POST /api/algo/book/kill.
+// day P&L and margin against the book limits (Settings → Circuit breakers: ALGO_BOOK_*),
+// the account circuit breaker when it stops automation entries, and the Algo Lab
+// kill switch. GET /api/algo/book, POST /api/algo/book/kill.
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../../api/client";
@@ -8,7 +9,8 @@ import { api } from "../../api/client";
 type Under = { symbol: string; positions: number; margin: number; mtm: number | null; delta: number | null };
 export type Book = {
   underlyings: Under[]; positions: number; margin: number; realized_today: number; open_mtm: number | null;
-  day_pnl: number | null; limits: { max_day_loss: number | null; max_margin: number | null }; halted: boolean;
+  day_pnl: number | null; limits: { max_day_loss: number | null; max_margin: number | null; follow_account_halt?: boolean };
+  halted: boolean; account_halt?: string | null;
 };
 
 type Alloc = { capital: number | null; rows: { strategy_id: number; name: string; weight: number; capital: number; vol: number | null; decayed: boolean; recent: number }[] };
@@ -33,7 +35,10 @@ export function BookPanel() {
   return (
     <div className="widget widget-wide" style={{ marginBottom: 12 }} data-testid="algo-book">
       <h3>Book <span className="meta">every automation together — limits in Settings → Circuit breakers</span>
-        {b.halted && <span className="badge sell" style={{ marginLeft: 8 }} data-testid="algo-book-halted">HALTED TODAY</span>}</h3>
+        {b.halted && <span className="badge sell" style={{ marginLeft: 8 }} data-testid="algo-book-halted">HALTED TODAY</span>}
+        {b.account_halt && <span className="badge sell" style={{ marginLeft: 8 }} data-testid="algo-book-account-halt"
+          title="The account circuit breaker is on: no automation enters until it clears (Dashboard → Risk → Resume). Open positions keep their own exits.">
+          ACCOUNT HALT: {b.account_halt}</span>}</h3>
       <div className="algo-operand" style={{ gap: 16 }}>
         <span className="meta">day P&amp;L <b className={cls(b.day_pnl)}>{rs(b.day_pnl)}</b>{loss ? <> of −{rs(loss)} limit</> : null}</span>
         <span className="meta">realised {rs(b.realized_today)} · open {rs(b.open_mtm)}</span>

@@ -83,24 +83,37 @@ MIN_FREE_GB = 5.0                          # the disk guard: older days go first
 MAX_FOCUS = 300                            # hand-picked symbols (the universe planner adds the rest)
 DEFAULT_BUDGET = 4500                      # Fyers Prime: 5,000 symbols per user — room left for the app's own feed
 PRINT_MULT, PRINT_WARMUP = 8.0, 30         # a print >= 8x the symbol's average print is a "big trade"
-DEFAULT_SYMBOLS = ["NIFTY:FUT", "BANKNIFTY:FUT", "NSE:RELIANCE-EQ", "NSE:HDFCBANK-EQ", "NSE:ICICIBANK-EQ",
-                   "NSE:SBIN-EQ", "NSE:INFY-EQ", "NSE:TCS-EQ", "NSE:AXISBANK-EQ", "NSE:KOTAKBANK-EQ",
-                   "NSE:LT-EQ", "NSE:ITC-EQ", "NSE:BHARTIARTL-EQ", "NSE:BAJFINANCE-EQ"]
+CONFIG_VERSION = 3
+# By default only NIFTY and SENSEX are recorded: each index, its current future (an
+# index has no trades of its own — the future's flow is the index chart's) and its
+# options — ATM first, then every listed strike of every expiry while the budget lasts.
+# Stocks, stock F&O and the other indices are off until switched on (Algo Lab > Data).
+DEFAULT_SYMBOLS = ["NSE:NIFTY50-INDEX", "BSE:SENSEX-INDEX"]
+V2_DEFAULT_SYMBOLS = ["NIFTY:FUT", "BANKNIFTY:FUT", "NSE:RELIANCE-EQ", "NSE:HDFCBANK-EQ", "NSE:ICICIBANK-EQ",
+                      "NSE:SBIN-EQ", "NSE:INFY-EQ", "NSE:TCS-EQ", "NSE:AXISBANK-EQ", "NSE:KOTAKBANK-EQ",
+                      "NSE:LT-EQ", "NSE:ITC-EQ", "NSE:BHARTIARTL-EQ", "NSE:BAJFINANCE-EQ"]
+INDEX_NAMES = ("NIFTY", "BANKNIFTY", "SENSEX", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50", "BANKEX")
 DEFAULT_UNIVERSE: dict[str, Any] = {
     "enabled": True,
-    "lists": ["nifty500", "midcap150", "smallcap250", "microcap250"],
-    "stocks": True,
+    "indices": ["NIFTY", "SENSEX"],        # which of INDEX_NAMES: the index, its futures and options
+    "lists": [],                           # stock universes (flow_universe.LISTS)
+    "stocks": False,
     "index_futures": True,
-    "stock_futures": True,
-    "next_futures": "roll",                # always | roll (last roll_days before expiry) | off
+    "stock_futures": False,
+    "next_futures": "off",                 # always | roll (last roll_days before expiry) | off
     "index_options": True,
     "index_strikes": 15,                   # ATM +/- N strikes, current expiry
     "index_next_strikes": 10,              # ... next expiry
-    "stock_options": True,
+    "index_all": True,                     # then every other listed strike / expiry, nearest first, to the budget
+    "stock_options": False,
     "stock_strikes": 5,                    # the most a stock gets; narrowed to fit the budget
     "stock_next_expiry": "roll",           # roll | off
     "roll_days": 5,
 }
+# A v2 config (the broad stock universe) moves to the index-only scope once; the
+# user's own choices saved after that (version 3) stand.
+V3_SCOPE = {k: DEFAULT_UNIVERSE[k] for k in ("indices", "lists", "stocks", "stock_futures", "next_futures",
+                                             "stock_options", "index_all")}
 # Option-chain snapshots for research (IV surface, tick replay): off unless switched on.
 DEFAULT_CHAINS: dict[str, Any] = {
     "enabled": False,
@@ -193,16 +206,21 @@ def load_config(root: Path = ROOT) -> dict[str, Any]:
         raw = json.loads((root / "config.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         raw = {}
-    cfg: dict[str, Any] = {"version": 2, "enabled": True, "symbols": list(DEFAULT_SYMBOLS),
+    cfg: dict[str, Any] = {"version": CONFIG_VERSION, "enabled": True, "symbols": list(DEFAULT_SYMBOLS),
                            "retention_days": RETENTION_DAYS, "raw_days": RAW_DAYS, "budget": DEFAULT_BUDGET,
                            "min_free_gb": MIN_FREE_GB}
     cfg.update({k: v for k, v in raw.items() if k != "universe"})
-    if raw.get("version", 1) < 2:               # a v1 file: the 30-day default predates the 90-day window
-        cfg["retention_days"] = max(int(raw.get("retention_days") or 0), RETENTION_DAYS)
-        cfg["version"] = 2
     cfg["universe"] = {**DEFAULT_UNIVERSE, **(raw.get("universe") or {})}
     cfg["chains"] = {**DEFAULT_CHAINS, **(raw.get("chains") or {})}
     cfg["long"] = {**DEFAULT_LONG, **(raw.get("long") or {})}
+    version = int(raw.get("version") or 1) if raw else CONFIG_VERSION
+    if version < 2:                             # a v1 file: the 30-day default predates the 90-day window
+        cfg["retention_days"] = max(int(raw.get("retention_days") or 0), RETENTION_DAYS)
+    if version < 3:                             # the stock-universe era: to NIFTY / SENSEX only
+        cfg["universe"].update(V3_SCOPE)
+        if [str(x).upper() for x in cfg.get("symbols") or []] == V2_DEFAULT_SYMBOLS:
+            cfg["symbols"] = list(DEFAULT_SYMBOLS)
+    cfg["version"] = CONFIG_VERSION
     return cfg
 
 
@@ -223,7 +241,7 @@ def save_config(patch: dict[str, Any], root: Path = ROOT) -> dict[str, Any]:
         str(s).strip().upper() for s in cfg["chains"].get("underlyings") or [] if str(s).strip()))[:MAX_FOCUS]
     cfg["long"]["symbols"] = list(dict.fromkeys(
         str(s).strip().upper() for s in cfg["long"].get("symbols") or [] if str(s).strip()))[:MAX_FOCUS]
-    cfg["version"] = 2
+    cfg["version"] = CONFIG_VERSION
     root.mkdir(parents=True, exist_ok=True)
     tmp = root / "config.json.tmp"
     tmp.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
@@ -1053,8 +1071,14 @@ class FlowStore:
 
     def keys_for(self, symbol: str, start: int, end: int) -> dict[int, str]:
         """{day: key} holding `symbol` that day — a futures contract was NIFTY-FUT2
-        before it became NIFTY-FUT. Days without a record use flow_key()."""
+        before it became NIFTY-FUT. Days without a record use flow_key(). An index
+        always reads its current future (NIFTY-FUT): the index's own key (IDX_NIFTY)
+        holds prices only, never a trade."""
+        from app.algo import fno
+
         sym = symbol.upper()
+        if sym in fno.INDICES:
+            return {d: flow_key(sym) for d in self._days(start, end)}
         out = {}
         for d in self._days(start, end):
             m = self.meta(d)

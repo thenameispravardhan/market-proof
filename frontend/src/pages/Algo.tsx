@@ -2453,9 +2453,9 @@ function Automations({ onEdit }: { onEdit: (s: Saved) => void }) {
 }
 
 type Universe = {
-  enabled: boolean; lists: string[]; stocks: boolean; index_futures: boolean; stock_futures: boolean;
+  enabled: boolean; indices: string[]; lists: string[]; stocks: boolean; index_futures: boolean; stock_futures: boolean;
   next_futures: "always" | "roll" | "off"; index_options: boolean; index_strikes: number; index_next_strikes: number;
-  stock_options: boolean; stock_strikes: number; stock_next_expiry: "roll" | "off"; roll_days: number;
+  index_all: boolean; stock_options: boolean; stock_strikes: number; stock_next_expiry: "roll" | "off"; roll_days: number;
 };
 type Chains = { enabled: boolean; underlyings: string[]; strategies: boolean; strikes: number; expiries: number; interval_s: number };
 type LongList = { enabled: boolean; symbols: string[]; strategies: boolean; days: number; raw_days: number; raw_strikes: number };
@@ -2483,14 +2483,14 @@ type FlowStatus = {
     chains?: { keys: number; quoted: number; snapshots: number; last: number | null; interval_s: number };
   };
   days: { count: number; first: string | null; last: string | null; retention: number; long?: { count: number; first: string | null } };
-  disk_mb: number; capacity?: Capacity; lists: Record<string, string>; keys_today: number;
+  disk_mb: number; capacity?: Capacity; lists: Record<string, string>; indices?: string[]; keys_today: number;
   top: [string, number, number, number, number, number, number][];
 };
 
 const CLASS_LABEL: Record<string, string> = {
   focus: "hand-picked", chain: "option chains", index: "indices", index_fut: "index futures", index_opt: "index options", stock_fut: "stock futures",
   stocks: "stocks", index_opt2: "index options (next expiry)", fut_next: "next-month futures", stock_opt: "stock options",
-  stock_opt2: "stock options (next expiry)", sticky: "earlier strikes",
+  stock_opt2: "stock options (next expiry)", sticky: "earlier strikes", index_all: "index options (rest of the chain)",
 };
 const ymdLabel = (d: string | null) => (d ? `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6)}` : "—");
 const listIn = (v: string) => Array.from(new Set(v.split(/[\s,]+/).map((x) => x.trim().toUpperCase()).filter(Boolean)));
@@ -2619,6 +2619,16 @@ function RecorderPanel() {
         <div className="flow-universe" data-testid="flow-universe">
           <div className="algo-operand" style={{ gap: 10 }}>
             <label className="meta"><input type="checkbox" checked={uni.enabled} onChange={(e) => save({ universe: { enabled: e.target.checked } })} /> universe</label>
+            <span className="meta" title="Each index with its futures and options. An index has no trades of its own: its chart's order flow is its current future's">Indices:</span>
+            {(st.data?.indices ?? ["NIFTY", "SENSEX"]).map((k) => (
+              <label key={k} className="meta">
+                <input type="checkbox" checked={(uni.indices ?? []).includes(k)} disabled={!uni.enabled} data-testid={`flow-index-${k}`}
+                  onChange={(e) => save({ universe: { indices: e.target.checked ? [...(uni.indices ?? []), k] : (uni.indices ?? []).filter((x) => x !== k) } })} /> {k}
+              </label>
+            ))}
+          </div>
+          <div className="algo-operand" style={{ gap: 10 }}>
+            <span className="meta">Stocks:</span>
             {Object.entries(st.data?.lists ?? {}).map(([k, label]) => (
               <label key={k} className="meta" title={plan?.lists?.[k] ? `${plan.lists[k].n} stocks · from ${plan.lists[k].source}` : undefined}>
                 <input type="checkbox" checked={uni.lists.includes(k)} disabled={!uni.enabled} data-testid={`flow-list-${k}`}
@@ -2643,6 +2653,9 @@ function RecorderPanel() {
             <label className="meta"><input type="checkbox" checked={uni.index_options} disabled={!uni.enabled} onChange={(e) => save({ universe: { index_options: e.target.checked } })} /> index ATM ±</label>
             {numIn(uni.index_strikes, (n) => save({ universe: { index_strikes: n } }), 0, 50, "flow-index-strikes", 50)}
             <label className="meta">next expiry ± {numIn(uni.index_next_strikes, (n) => save({ universe: { index_next_strikes: n } }), 0, 50, "flow-index-next", 50)}</label>
+            <label className="meta" title="After everything above: every other listed strike of every expiry of the indices, nearest expiry and nearest the money first, until the budget is full">
+              <input type="checkbox" checked={!!uni.index_all} disabled={!uni.enabled || !uni.index_options} data-testid="flow-index-all"
+                onChange={(e) => save({ universe: { index_all: e.target.checked } })} /> + every other strike &amp; expiry</label>
             <label className="meta" title="Each stock gets the widest band that fits the budget, up to this many strikes each side; the largest companies get more when room is left">
               <input type="checkbox" checked={uni.stock_options} disabled={!uni.enabled} onChange={(e) => save({ universe: { stock_options: e.target.checked } })} /> stock ATM ± up to</label>
             {numIn(uni.stock_strikes, (n) => save({ universe: { stock_strikes: n } }), 0, 50, "flow-stock-strikes", 50)}
@@ -2663,7 +2676,7 @@ function RecorderPanel() {
           {plan.at ? <> · planned {ist(plan.at)}</> : null}
         </div>
       )}
-      <div className="meta" style={{ margin: "8px 0 4px" }}>Hand-picked (always recorded first, with their raw ticks; "NIFTY:FUT" = the current NIFTY future, rolling by itself). Switched-on strategies' symbols are added automatically.</div>
+      <div className="meta" style={{ margin: "8px 0 4px" }}>Hand-picked (always recorded first, with their raw ticks; "NIFTY:FUT" = the current NIFTY future, rolling by itself; an index records its future too). Switched-on strategies' symbols are added automatically.</div>
       <SymbolPicker value={list} onChange={(v) => setSyms(v)} />
       <div className="algo-operand" style={{ gap: 6, marginTop: 6 }}>
         {["NIFTY:FUT", "BANKNIFTY:FUT", "FINNIFTY:FUT", "MIDCPNIFTY:FUT", "SENSEX:FUT"].filter((x) => !list.includes(x)).map((x) => (

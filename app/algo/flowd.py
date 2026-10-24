@@ -215,7 +215,7 @@ class Collector:
             self.lists_at = time.time()
         fo = await asyncio.to_thread(fu.contracts)
         stocks = {s for n in self.lists.values() for s in n[0]}
-        under = [fu.INDEX_SYMBOL[n] for n in fu.INDEX_SYMBOL if n in fo]
+        under = [fu.INDEX_SYMBOL[n] for n in fu.index_names(cfg["universe"], fo)]
         under += [f"NSE:{n}-EQ" for n in stocks if n in fo and fo[n]["fut"]]
         strat = ticks.strategy_symbols(self.root)
         chain_src = [*(cfg["chains"].get("underlyings") or []), *strat] if cfg["chains"].get("enabled") else []

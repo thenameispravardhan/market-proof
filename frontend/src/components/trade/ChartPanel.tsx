@@ -3815,9 +3815,16 @@ export default function ChartPanel(props: ChartPanelProps) {
     let stop = false;
     let lastFull = 0;
     let firstT = 0;
+    let busy = false;
     const load = async () => {
       const c = candlesRef.current;
-      if (!c.length || statusRef.current !== "ready") return;
+      // one request at a time: a full footprint load can outlast the 3 s poll, and an older
+      // response landing after a newer one would put stale bars back
+      if (busy || !c.length || statusRef.current !== "ready") return;
+      busy = true;
+      try { await loadOnce(c); } finally { busy = false; }
+    };
+    const loadOnce = async (c: typeof candlesRef.current) => {
       const now = Math.floor(Date.now() / 1000);
       const fpOn = kindRef.current === "footprint";
       const full = Date.now() - lastFull > 60_000 || c[0].time !== firstT;

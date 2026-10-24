@@ -848,6 +848,7 @@ def _flow_status(q: str = "", top: int = 50) -> dict[str, Any]:
                  "retention": int(cfg.get("retention_days") or ticks.RETENTION_DAYS),
                  "long": {"count": len(long_days), "first": long_days[0] if long_days else None}},
         "disk_mb": ticks.disk_mb(), "capacity": cap, "lists": {k: v["label"] for k, v in fu.LISTS.items()},
+        "indices": list(ticks.INDEX_NAMES),
         "top": rows[:max(1, min(500, top))], "keys_today": len(stats),
     }
 
@@ -866,10 +867,12 @@ def ticks_config(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     = the current NIFTY future, rolling by itself), retention_days (1-365,
     the sliding window), raw_days (0-30, every frame of the hand-picked
     symbols), budget (50-5000 symbols on the socket), min_free_gb (0.5-1000:
-    the disk guard drops old days early, then pauses) and universe {lists,
-    stocks, index_futures, stock_futures, next_futures, index_options,
-    index_strikes, index_next_strikes, stock_options, stock_strikes,
-    stock_next_expiry, roll_days, enabled}, chains {enabled, underlyings (F&O
+    the disk guard drops old days early, then pauses) and universe {indices
+    (NIFTY, SENSEX ... — the indices recorded, with their futures and options),
+    lists, stocks, index_futures, stock_futures, next_futures, index_options,
+    index_strikes, index_next_strikes, index_all (then every other listed strike
+    / expiry of those indices, nearest first, to the budget), stock_options,
+    stock_strikes, stock_next_expiry, roll_days, enabled}, chains {enabled, underlyings (F&O
     names), strategies, strikes 0-50, expiries 1-6, interval_s 15-3600: option-
     chain snapshots on that exchange-time grid} and long {enabled, symbols,
     strategies, days 1-1095, raw_days 0-365, raw_strikes 0-20: the research
@@ -907,6 +910,10 @@ def ticks_config(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
             if k == "lists":
                 if not isinstance(v, list) or any(x not in fu.LISTS for x in v):
                     raise HTTPException(422, detail=f"lists are some of {sorted(fu.LISTS)}")
+            elif k == "indices":
+                if not isinstance(v, list) or any(not isinstance(x, str) or x.upper() not in ticks.INDEX_NAMES for x in v):
+                    raise HTTPException(422, detail=f"indices are some of {list(ticks.INDEX_NAMES)}")
+                v = list(dict.fromkeys(x.upper() for x in v))
             elif k in ("next_futures",):
                 if v not in ("always", "roll", "off"):
                     raise HTTPException(422, detail="next_futures is always, roll or off")
@@ -1022,11 +1029,18 @@ def _recorded_flow(symbol: str, resolution: str, from_ts: int, to_ts: int, footp
     st = ticks.store()
     fy = data.fyers_symbol(symbol)
 
+    exchange_hours = fy.upper().startswith(("NSE:", "BSE:"))
+
     def bucket(t: int) -> int:
         day0 = t - (t + 19800) % 86400
         if span == 86400:
             return day0
         o_s = day0 + 33300
+        if exchange_hours:
+            # the pre-open auction (before 09:15) and the closing session (after 15:30) have
+            # no candle of their own: they go to the session's first / last one, never to a
+            # bucket before the open the chart would fold into the previous day's last candle
+            t = min(max(t, o_s), day0 + 55800 - 1)
         return o_s + ((t - o_s) // span) * span
 
     # The key that held this symbol each day (a future was <NAME>-FUT2 before it became <NAME>-FUT).
@@ -1499,9 +1513,11 @@ async def book_view(request: Request) -> dict[str, Any]:
     """Every automation's open positions as ONE book: per underlying the
     positions, net delta (lots; shares for cash), margin and MTM, plus the
     book's day P&L against ALGO_BOOK_MAX_DAY_LOSS and its margin against
-    ALGO_BOOK_MAX_MARGIN. A delta that can't be priced is null, not guessed."""
+    ALGO_BOOK_MAX_MARGIN, and `account_halt`: the account circuit breaker's
+    reason while it stops automation entries. A delta that can't be priced is
+    null, not guessed."""
     from app.algo import fno
-    from app.algo.runner import _book_all, _ltp, _mtm
+    from app.algo.runner import _book_all, _ltp, _mtm, _portfolio_halt
     from app.config import get_settings
 
     rows = await asyncio.to_thread(_open_rows, True)
@@ -1530,8 +1546,11 @@ async def book_view(request: Request) -> dict[str, Any]:
     return {"underlyings": out, "positions": len(rows), "margin": round(agg["margin"], 2),
             "realized_today": round(agg["today"], 2), "open_mtm": None if open_mtm is None else round(open_mtm, 2),
             "day_pnl": None if open_mtm is None else round(agg["today"] + open_mtm, 2),
-            "limits": {"max_day_loss": st.ALGO_BOOK_MAX_DAY_LOSS or None, "max_margin": st.ALGO_BOOK_MAX_MARGIN or None},
-            "halted": await _runner(request).book_halted(now)}
+            "limits": {"max_day_loss": st.ALGO_BOOK_MAX_DAY_LOSS or None, "max_margin": st.ALGO_BOOK_MAX_MARGIN or None,
+                       "follow_account_halt": bool(st.ALGO_BOOK_FOLLOW_PORTFOLIO_HALT)},
+            "halted": await _runner(request).book_halted(now),
+            # the account-wide circuit breaker (Settings → Circuit breakers / the kill switch): no entries while on
+            "account_halt": await asyncio.to_thread(_portfolio_halt) if st.ALGO_BOOK_FOLLOW_PORTFOLIO_HALT else None}
 
 
 @router.get("/allocation")
