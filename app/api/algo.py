@@ -613,17 +613,19 @@ def research_universe_changes(index: str, body: dict[str, Any] = Body(...)) -> d
 
 @router.post("/research/universe/{index}/snapshot")
 async def research_universe_snapshot(index: str, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
-    """Record the index's list: {symbols, date} as given (a list you have for a
-    past date), or — empty — today's from niftyindices.com."""
+    """Record the index's list: {symbols, date} as given — a list of tickers, or
+    pasted text (tickers, or the constituent CSV as downloaded) — for today or a
+    past date; or, empty, today's from niftyindices.com (else NSE's archives)."""
     from app.research import universe
 
     _index(index)
     if body.get("symbols"):
         try:
             day = universe.day_of(date.fromisoformat(str(body.get("date") or date.today().isoformat())))
-            syms = [str(x) for x in (body["symbols"] if isinstance(body["symbols"], list)
-                                     else str(body["symbols"]).replace(",", " ").split())]
-            n = universe.record_snapshot(index, [x.upper().removeprefix("NSE:").removesuffix("-EQ") for x in syms], day)
+            raw = body["symbols"]
+            syms = ([str(x).upper().removeprefix("NSE:").removesuffix("-EQ") for x in raw] if isinstance(raw, list)
+                    else universe.parse_pasted(str(raw)))
+            n = universe.record_snapshot(index, syms, day)
         except ValueError as e:
             raise HTTPException(422, detail=str(e)) from None
         return {"recorded": True, "day": universe.ymd(day), "members": n, **universe.coverage(index)}

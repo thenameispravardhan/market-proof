@@ -189,24 +189,34 @@ def coverage(index: str, root: Optional[Path] = None) -> dict[str, Any]:
             "last_snapshot": ymd(max(snaps)) if snaps else None,
             "changes": len(chg), "first_change": ymd(first_change) if first_change is not None else None,
             "trusted_from": ymd(trusted) if trusted is not None else None,
-            "members_now": len(members_at(index, ist_day(time.time()), root, _snaps=snaps, _chg=chg) or ())}
+            "members_now": len(members_at(index, ist_day(time.time()), root, _snaps=snaps, _chg=chg) or ()),
+            "list_url": LIST_URL.format(file=INDEXES[index]["file"])}
+
+
+def parse_pasted(text: str) -> list[str]:
+    """Tickers from what a person pastes: the constituent CSV as downloaded
+    (its Symbol column) or plain tickers split by spaces, commas or lines
+    (NSE:SBIN-EQ and SBIN alike)."""
+    from app.algo.flow_universe import _parse_list
+
+    first = text.lstrip().split("\n", 1)[0].lower()
+    if "symbol" in [c.strip().strip('"') for c in first.split(",")]:
+        return _parse_list(text.strip())
+    return [x.upper().removeprefix("NSE:").removesuffix("-EQ") for x in text.replace(",", " ").split()]
 
 
 def fetch_snapshot(index: str, root: Optional[Path] = None, force: bool = False) -> dict[str, Any]:
-    """Today's list from niftyindices.com, recorded unless one from the last
-    week is already there (or `force`)."""
-    from app.algo.flow_universe import _parse_list
+    """Today's list from niftyindices.com (else NSE's archives), recorded unless
+    one from the last week is already there (or `force`)."""
+    from app.algo.flow_universe import fetch_list
 
     snaps = snapshots(index, root)
     today = ist_day(time.time())
     if snaps and not force and today - max(snaps) < SNAP_MAX_AGE_DAYS:
         return {"recorded": False, "day": ymd(max(snaps)), "members": len(snaps[max(snaps)])}
-    import httpx
-
-    r = httpx.get(LIST_URL.format(file=INDEXES[index]["file"]), timeout=20, follow_redirects=True,
-                  headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-                           "Accept": "text/csv,*/*"})
-    syms = _parse_list(r.text) if r.status_code == 200 else []
-    if len(syms) < 5:
-        raise RuntimeError(f"niftyindices.com returned no list for {INDEXES[index]['label']} (HTTP {r.status_code})")
+    try:
+        syms, _ = fetch_list(INDEXES[index]["file"])
+    except RuntimeError as e:
+        raise RuntimeError(f"no source returned the {INDEXES[index]['label']} list ({e}) — "
+                           "download it in your browser and paste it here") from None
     return {"recorded": True, "day": ymd(today), "members": record_snapshot(index, syms, today, root)}
