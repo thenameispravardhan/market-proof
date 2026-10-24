@@ -1602,3 +1602,11 @@ for the 95% drawdown, not the one history happened to give.
   its chart's order flow is the future's) and its options, ATM ± 15 / ± 10
   first, then every other strike of every expiry, nearest first, to the
   budget. Stocks, stock F&O and the other indices are switched on there.
+  A print at or beyond the ask is a buy and at or beyond the bid a sell;
+  inside the spread it goes to the nearer side (above the mid a buy), and
+  only at the mid — or against a crossed quote — the tick test decides.
+  **Index options flow**: every recorded option of NIFTY / SENSEX added up
+  — calls and puts bought / sold, in quantity and ₹ premium — on the chart
+  (indicator *Index Options Flow*: net premium per candle, + = call buying /
+  put writing, with its running total) and in the Trade page's Order flow
+  panel; all expiries or the nearest one.

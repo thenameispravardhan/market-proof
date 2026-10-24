@@ -10,8 +10,9 @@ standing BEFORE the trade:
 
     price >= previous ask  -> buyer-initiated
     price <= previous bid  -> seller-initiated
-    otherwise              -> tick test: up-tick buy, down-tick sell,
-                              zero-tick keeps the last side
+    inside the spread      -> the nearer side: above the mid buy, below it sell
+    at the mid, no quote   -> tick test: up-tick buy, down-tick sell,
+      or a crossed quote      zero-tick keeps the last side
 
 Volume that can't be pinned on one print is kept apart as `unk` — counted in
 the bar's volume, never in its delta or footprint:
@@ -137,6 +138,7 @@ SORT_ORDER = {"flow.parquet": "key, minute", "fp.parquet": "key, minute, price",
               "raw.parquet": "key, exch_ts", "chain.parquet": "key, ts"}
 CHAIN_COLS = ("ts", "qts", "ltp", "bid", "ask", "bid_size", "ask_size", "oi", "vol")
 SNAP_MIN_S = 15
+OPT_FLOW_TTL_S = 10                        # an index's options flow of the day being recorded: recomputed this often
 FLOW_COLS = ("minute", "buy", "sell", "unk", "trades", "ticks", "o", "h", "l", "c", "tot_buy", "tot_sell", "oi",
              "cumvol")
 FLOW_TYPES = ("BIGINT", "DOUBLE", "DOUBLE", "DOUBLE", "INTEGER", "INTEGER", "DOUBLE", "DOUBLE", "DOUBLE", "DOUBLE",
@@ -440,10 +442,15 @@ class TickRecorder:
         q = dv - unk
         side = 0
         if q > 0:
-            if st["ask"] and ltp >= st["ask"]:
+            b0, a0 = st["bid"], st["ask"]
+            sane = not (b0 and a0 and b0 >= a0)       # a crossed / locked quote says nothing about the aggressor
+            mid = (b0 + a0) / 2 if sane and b0 and a0 else None
+            if sane and a0 and ltp >= a0:
                 side = 1
-            elif st["bid"] and ltp <= st["bid"]:
+            elif sane and b0 and ltp <= b0:
                 side = -1
+            elif mid is not None and abs(ltp - mid) > 1e-9:
+                side = 1 if ltp > mid else -1         # inside the spread: the nearer side (Lee-Ready)
             elif st["ltp"] and ltp != st["ltp"]:
                 side = 1 if ltp > st["ltp"] else -1
             else:
@@ -962,6 +969,7 @@ class FlowStore:
 
     def __init__(self, root: Path = ROOT) -> None:
         self.root = root
+        self._opt_cache: dict[tuple, tuple[Any, list[tuple]]] = {}
 
     def _days(self, start: int, end: int) -> list[int]:
         return list(range(ist_day(start), ist_day(max(start, end - 1)) + 1))
@@ -1136,6 +1144,97 @@ class FlowStore:
             out.append({"key": r[1], "symbol": m.get("symbol"), "kind": m.get("kind"), "strike": m.get("strike"),
                         "expiry": m.get("expiry"), **dict(zip(CHAIN_COLS[1:], r[2:]))})
         return t, out
+
+    # -- an index's options together ----------------------------------------------
+
+    def option_keys(self, name: str, day: int, near: bool = False) -> dict[str, dict]:
+        """key -> contract of every `name` option recorded that day (`near`: the
+        nearest expiry still running that day only)."""
+        n = name.upper()
+        out = {k: v for k, v in self.meta(day).items()
+               if str(v.get("name", "")).upper() == n and v.get("kind") in ("CE", "PE")
+               and ist_day(float(v.get("expiry") or 0)) >= day}
+        if near and out:
+            first = min(ist_day(float(v["expiry"])) for v in out.values())
+            out = {k: v for k, v in out.items() if ist_day(float(v["expiry"])) == first}
+        return out
+
+    def options_flow(self, name: str, start: int, end: int, near: bool = False) -> list[tuple]:
+        """Every recorded `name` option added up per minute and right:
+        [(minute, kind, buy, sell, buy_value, sell_value)] — buy / sell
+        quantity and the premium (₹ = price x quantity) the aggressors paid,
+        from the footprint (classified prints only). Finished days come from
+        parquet, today from the collector's working files (each row there is
+        a running total of its minute and price: the largest is the latest)."""
+        out: list[tuple] = []
+        for d in self._days(start, end):
+            out += [r for r in self._options_day(name, d, near) if start <= r[0] < end]
+        return out
+
+    def _options_day(self, name: str, d: int, near: bool) -> list[tuple]:
+        """One day of options_flow, cached: a stored day until its parquet changes,
+        the day being recorded for OPT_FLOW_TTL_S (the chart and the panel poll it)."""
+        p = self.root / "days" / ymd(d) / "fp.parquet"
+        live = (self.root / "today" / ymd(d)).is_dir()
+        try:
+            stamp: Any = ("live", time.time() // OPT_FLOW_TTL_S) if live else ("day", p.stat().st_mtime)
+        except OSError:
+            stamp = ("none",)
+        ck = (name.upper(), d, near)
+        hit = self._opt_cache.get(ck)
+        if hit is not None and hit[0] == stamp:
+            return hit[1]
+        rows = self._options_day_uncached(name, d, near)
+        if len(self._opt_cache) > 256:
+            self._opt_cache.clear()
+        self._opt_cache[ck] = (stamp, rows)
+        return rows
+
+    def _options_day_uncached(self, name: str, d: int, near: bool) -> list[tuple]:
+        out: dict[tuple[int, str], list[float]] = {}
+        keys = self.option_keys(name, d, near)
+        if not keys:
+            return []
+        a, b = d * DAY - IST, (d + 1) * DAY - IST
+        kinds = [[k, v["kind"]] for k, v in sorted(keys.items())]
+        sources = []
+        p = self.root / "days" / ymd(d) / "fp.parquet"
+        if p.exists():
+            sources.append(f"SELECT key, minute, price, buy, sell FROM read_parquet('{p.as_posix()}')")
+        today = [f for k in keys if (f := self.root / "today" / ymd(d) / "fp" / f"{k}.csv").exists()]
+        if today:
+            lst = ", ".join(f"'{f.as_posix()}'" for f in today)
+            sources.append(
+                "SELECT regexp_extract(filename, '([^/]+)\\.csv$', 1) AS key, minute, price, max(buy) AS buy, "
+                f"max(sell) AS sell FROM read_csv([{lst}], header=false, filename=true, ignore_errors=true, "
+                "columns={'minute': 'BIGINT', 'price': 'DOUBLE', 'buy': 'DOUBLE', 'sell': 'DOUBLE'}) "
+                "GROUP BY ALL")
+        if not sources:
+            return []
+        import duckdb
+
+        try:
+            con = _duck(threads=2)
+            try:
+                con.execute("CREATE TEMP TABLE _k(key VARCHAR, kind VARCHAR)")
+                con.executemany("INSERT INTO _k VALUES (?, ?)", kinds)
+                # a day both compacted and still in today/ (a restart mid-compaction): one row per level
+                rows = con.execute(
+                    f"WITH src AS ({' UNION ALL '.join(sources)}), "
+                    "lv AS (SELECT key, minute, price, max(buy) AS buy, max(sell) AS sell FROM src "
+                    "WHERE minute >= ? AND minute < ? GROUP BY ALL) "
+                    "SELECT minute, _k.kind, sum(buy), sum(sell), sum(buy * price), sum(sell * price) "
+                    "FROM lv JOIN _k USING (key) GROUP BY ALL", [int(a), int(b)]).fetchall()
+            finally:
+                con.close()
+        except duckdb.Error as e:
+            log.warning("ticks.options_flow_failed", name=name, error=str(e)[:200])
+            return []
+        for m, kind, *v in rows:
+            cur = out.setdefault((int(m), kind), [0.0, 0.0, 0.0, 0.0])
+            for i in range(4):
+                cur[i] += float(v[i] or 0.0)
+        return [(m, k, *v) for (m, k), v in sorted(out.items())]
 
     def long_days(self) -> list[str]:
         """Days past the window kept for the research short list only (trimmed)."""

@@ -1021,15 +1021,9 @@ async def ticks_flow(symbol: str, resolution: str = "5", from_ts: int = Query(..
 FOOTPRINT_MAX_ROWS = 250_000
 
 
-def _recorded_flow(symbol: str, resolution: str, from_ts: int, to_ts: int, footprint: bool,
-                   prints: bool = False) -> dict[str, Any]:
-    from app.algo import ticks
-
+def _flow_bucket(resolution: str, exchange_hours: bool):
+    """Epoch -> the start of its chart candle (09:15 buckets, D = the session's day)."""
     span = 86400 if resolution == "D" else int(resolution) * 60
-    st = ticks.store()
-    fy = data.fyers_symbol(symbol)
-
-    exchange_hours = fy.upper().startswith(("NSE:", "BSE:"))
 
     def bucket(t: int) -> int:
         day0 = t - (t + 19800) % 86400
@@ -1042,6 +1036,66 @@ def _recorded_flow(symbol: str, resolution: str, from_ts: int, to_ts: int, footp
             # bucket before the open the chart would fold into the previous day's last candle
             t = min(max(t, o_s), day0 + 55800 - 1)
         return o_s + ((t - o_s) // span) * span
+
+    return bucket
+
+
+def _options_flow_name(symbol: str) -> Optional[str]:
+    """The F&O underlying behind an index, its future or one of its options (NIFTY, SENSEX ...)."""
+    from app.algo import fno
+
+    s = (symbol or "").strip().upper()
+    if s in fno.INDICES:
+        return fno.INDICES[s][0]
+    if ":" not in s:
+        return s if s.replace("&", "").replace("-", "").isalnum() and len(s) <= 40 else None
+    return fno.underlying_of(s)
+
+
+@router.get("/ticks/options-flow")
+async def ticks_options_flow(symbol: str, resolution: str = "5", from_ts: int = Query(..., alias="from"),
+                             to_ts: int = Query(..., alias="to"), expiry: str = "all") -> dict[str, Any]:
+    """Every recorded option of an index (or any F&O underlying) together, per
+    chart candle: who bought / sold calls and puts. `symbol`: the index, its
+    future, one of its options or the name (NIFTY). Each bar: [t, ce_buy,
+    ce_sell, pe_buy, pe_sell, ce_buy_value, ce_sell_value, pe_buy_value,
+    pe_sell_value, net_value] — quantities, and premium in ₹ (price x qty) the
+    aggressors paid; net_value = (calls bought − sold) − (puts bought − sold),
+    + = bullish premium. `expiry`: all, or near (the nearest running expiry)."""
+    from app.algo import ticks
+
+    if resolution != "D" and not resolution.isdigit():
+        raise HTTPException(422, detail="resolution is minutes or D")
+    if expiry not in ("all", "near"):
+        raise HTTPException(422, detail="expiry is all or near")
+    name = _options_flow_name(symbol)
+    if not name:
+        raise HTTPException(422, detail="symbol is an F&O underlying, its future or option, e.g. NIFTY")
+    if to_ts - from_ts > 31 * 86400:
+        raise HTTPException(422, detail="at most 31 days at a time")
+
+    # the store caches each day (the one being recorded for a few seconds): the chart and the panel poll this
+    rows = await asyncio.to_thread(ticks.store().options_flow, name, from_ts, to_ts, expiry == "near")
+    bucket = _flow_bucket(resolution, True)
+    bars: dict[int, list[float]] = {}
+    for m, kind, buy, sell, bv, sv in rows:
+        x = bars.setdefault(bucket(int(m)), [0.0] * 8)
+        o = 0 if kind == "CE" else 2
+        x[o] += buy
+        x[o + 1] += sell
+        x[4 + o] += bv
+        x[5 + o] += sv
+    out = [[t, *(round(v, 2) for v in x), round((x[4] - x[5]) - (x[6] - x[7]), 2)] for t, x in sorted(bars.items())]
+    return {"symbol": symbol, "name": name, "expiry": expiry, "recorded": bool(out), "bars": out}
+
+
+def _recorded_flow(symbol: str, resolution: str, from_ts: int, to_ts: int, footprint: bool,
+                   prints: bool = False) -> dict[str, Any]:
+    from app.algo import ticks
+
+    st = ticks.store()
+    fy = data.fyers_symbol(symbol)
+    bucket = _flow_bucket(resolution, fy.upper().startswith(("NSE:", "BSE:")))
 
     # The key that held this symbol each day (a future was <NAME>-FUT2 before it became <NAME>-FUT).
     spans: list[tuple[str, int, int]] = []

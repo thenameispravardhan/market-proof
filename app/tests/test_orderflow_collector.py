@@ -574,3 +574,57 @@ def test_an_index_chart_reads_its_futures_flow_and_the_auction_joins_the_first_c
     assert body["key"] == "NIFTY-FUT" and body["recorded"]
     (bar,) = body["bars"]                                                # the auction is in 09:15's candle
     assert bar[0] == T915 and bar[1:3] == [50.0, 20.0] and bar[5] == 500.0
+
+
+def test_lee_ready_inside_the_spread_takes_the_nearer_side_and_a_crossed_quote_falls_to_the_tick_test(tmp_path):
+    rec = ticks.TickRecorder(tmp_path)
+    feed(rec, "NSE:SBIN-EQ", [
+        frame(100.0, 1000, 99.0, 101.0, T915),             # anchor; quote 99 / 101 (mid 100)
+        frame(100.5, 1100, 99.0, 101.0, T915 + 10),        # +100 above the mid: buy (a tick test would say up = buy too)
+        frame(100.2, 1200, 99.0, 101.0, T915 + 20),        # +100 above the mid on a DOWN-tick: still a buy
+        frame(99.8, 1300, 100.0, 100.0, T915 + 30),        # +100 below the mid: sell; leaves a locked 100 / 100 quote
+        frame(99.9, 1400, 100.0, 100.0, T915 + 40),        # +100 against the locked quote: tick test, up = buy
+    ])
+    rec.flush()
+    (row,) = ticks.FlowStore(tmp_path).flow_rows("SBIN", T915, T915 + 60)
+    assert row[1:3] == (300.0, 100.0)
+
+
+def test_options_flow_adds_up_an_indexs_calls_and_puts_in_quantity_and_premium(client, tmp_path, monkeypatch):
+    rec = ticks.TickRecorder(tmp_path)
+    monkeypatch.setattr(ticks, "_STORE", ticks.FlowStore(tmp_path))
+    exp = (DAY0 + 6) * 86400 - IST + 55800
+    ce, pe = "NSE:NIFTY26O2725000CE", "NSE:NIFTY26O2725000PE"
+    meta = {"NIFTY26O2725000CE": {"symbol": ce, "kind": "CE", "name": "NIFTY", "expiry": exp, "strike": 25000.0},
+            "NIFTY26O2725000PE": {"symbol": pe, "kind": "PE", "name": "NIFTY", "expiry": exp, "strike": 25000.0},
+            "NIFTY-FUT": {"symbol": "NSE:NIFTY26OCTFUT", "kind": "FUT", "name": "NIFTY", "expiry": exp}}
+    rec.key_of.update({m["symbol"]: k for k, m in meta.items()})
+
+    def session(day_shift):
+        t0 = T915 + day_shift * 86400
+        feed(rec, ce, [frame(100.0, 0, 99.5, 100.0, t0), frame(100.0, 650, 99.5, 100.0, t0 + 5),       # 650 bought @100
+                       frame(99.5, 975, 99.5, 100.0, t0 + 65)])                                         # 325 sold @99.5
+        feed(rec, pe, [frame(80.0, 0, 80.0, 80.5, t0), frame(80.0, 1300, 80.0, 80.5, t0 + 5)])          # 1300 sold @80
+        feed(rec, "NSE:NIFTY26OCTFUT", [frame(25100.0, 0, 25099.0, 25100.0, t0),
+                                        frame(25100.0, 75, 25099.0, 25100.0, t0 + 5)])                  # not an option
+        rec.flush()
+        rec.write_meta(meta, DAY0 + day_shift)
+
+    session(-1)
+    rec.compact(DAY0 - 1)                                            # yesterday: parquet
+    session(0)
+    rec.flush()                                                      # today: the working CSVs (rows re-appended)
+    body = client.get("/api/algo/ticks/options-flow", params={"symbol": "NSE:NIFTY50-INDEX", "resolution": "5",
+                                                               "from": T915 - 86400, "to": T915 + 600}).json()
+    assert body["name"] == "NIFTY" and body["recorded"]
+    assert [b[0] for b in body["bars"]] == [T915 - 86400, T915]
+    for b in body["bars"]:
+        t, ce_b, ce_s, pe_b, pe_s, ce_bv, ce_sv, pe_bv, pe_sv, net = b
+        assert (ce_b, ce_s, pe_b, pe_s) == (650.0, 325.0, 0.0, 1300.0)
+        assert (ce_bv, ce_sv, pe_bv, pe_sv) == (65000.0, 32337.5, 0.0, 104000.0)
+        assert net == (65000.0 - 32337.5) - (0.0 - 104000.0)          # calls bought, puts sold: bullish
+    by_option = client.get("/api/algo/ticks/options-flow", params={"symbol": ce, "resolution": "D",
+                                                                    "from": T915, "to": T915 + 600}).json()
+    assert by_option["name"] == "NIFTY" and by_option["bars"][0][1] == 650.0
+    assert client.get("/api/algo/ticks/options-flow", params={"symbol": "NIFTY", "from": T915, "to": T915 + 600,
+                                                               "expiry": "soon"}).status_code == 422
