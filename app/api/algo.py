@@ -998,7 +998,9 @@ async def ticks_flow(symbol: str, resolution: str = "5", from_ts: int = Query(..
     delta_low, delta_high] — unk = volume with no aggressor (a feed gap, the
     auction), oi = open interest at the bar's end (F&O), close = its last
     trade (an index's bars are its future's: the chart shifts by the basis),
-    delta_low / high = the lowest / highest running delta inside the bar.
+    delta_low / high = the lowest / highest running delta inside the bar,
+    book_bid, book_ask = the order book's total pending buy / sell quantity,
+    averaged over the bar's minutes (null where the feed carried none).
     footprint=true adds [t, price, buy, sell]; prints=true the big trades
     [ts, price, qty, side]. Crypto: Binance's taker-buy volume per candle."""
     from app.services import crypto
@@ -1050,6 +1052,39 @@ def _options_flow_name(symbol: str) -> Optional[str]:
     if ":" not in s:
         return s if s.replace("&", "").replace("-", "").isalnum() and len(s) <= 40 else None
     return fno.underlying_of(s)
+
+
+@router.get("/ticks/options-strikes")
+async def ticks_options_strikes(symbol: str, from_ts: int = Query(..., alias="from"), to_ts: int = Query(..., alias="to"),
+                                expiry: str = "near") -> dict[str, Any]:
+    """Where the option money went, strike by strike: every recorded option of an
+    index (or F&O underlying) in [from, to) added up per strike. `symbol`: the
+    index, its future, one of its options or the name (NIFTY). Each row:
+    [strike, ce_buy, ce_sell, pe_buy, pe_sell, ce_buy_value, ce_sell_value,
+    pe_buy_value, pe_sell_value, net_value] — quantities, premium in ₹ the
+    aggressors paid, and net = (calls b − s) − (puts b − s), + = bullish.
+    `expiry`: near (the nearest running expiry, default) or all (strikes of
+    every expiry added up)."""
+    from app.algo import ticks
+
+    if expiry not in ("all", "near"):
+        raise HTTPException(422, detail="expiry is all or near")
+    name = _options_flow_name(symbol)
+    if not name:
+        raise HTTPException(422, detail="symbol is an F&O underlying, its future or option, e.g. NIFTY")
+    if not 0 < to_ts - from_ts <= 31 * 86400:
+        raise HTTPException(422, detail="from must be before to, at most 31 days apart")
+    rows = await asyncio.to_thread(ticks.store().options_by_strike, name, from_ts, to_ts, expiry == "near")
+    by: dict[float, list[float]] = {}
+    for strike, kind, buy, sell, bv, sv in rows:
+        x = by.setdefault(strike, [0.0] * 8)
+        o = 0 if kind == "CE" else 2
+        x[o] += buy
+        x[o + 1] += sell
+        x[4 + o] += bv
+        x[5 + o] += sv
+    out = [[k, *(round(v, 2) for v in x), round((x[4] - x[5]) - (x[6] - x[7]), 2)] for k, x in sorted(by.items())]
+    return {"symbol": symbol, "name": name, "expiry": expiry, "recorded": bool(out), "rows": out}
 
 
 @router.get("/ticks/options-flow")
@@ -1108,9 +1143,9 @@ def _recorded_flow(symbol: str, resolution: str, from_ts: int, to_ts: int, footp
     bars: dict[int, list] = {}
     for key, a, b in spans:
         for r in st.flow_rows(key, a, b):
-            t, buy, sell, unk, trades, _, _, _, _, c, _, _, oi, _ = r
+            t, buy, sell, unk, trades, _, _, _, _, c, tbq, tsq, oi, _ = r
             buy, sell = buy or 0.0, sell or 0.0
-            x = bars.setdefault(bucket(int(t)), [0.0, 0.0, 0.0, 0, None, None, 0.0, 0.0, 0.0])
+            x = bars.setdefault(bucket(int(t)), [0.0, 0.0, 0.0, 0, None, None, 0.0, 0.0, 0.0, 0.0, 0.0, 0])
             x[0] += buy
             x[1] += sell
             x[2] += unk or 0.0
@@ -1119,11 +1154,17 @@ def _recorded_flow(symbol: str, resolution: str, from_ts: int, to_ts: int, footp
             x[5] = c if c is not None else x[5]
             x[6] += buy - sell                                     # running delta inside the bar
             x[7], x[8] = min(x[7], x[6]), max(x[8], x[6])
+            if (tbq or 0) > 0 or (tsq or 0) > 0:                   # the book's totals: a mean over the bar's minutes
+                x[9] += tbq or 0.0
+                x[10] += tsq or 0.0
+                x[11] += 1
     key_last = spans[-1][0] if spans else ticks.flow_key(fy)
     out: dict[str, Any] = {
         "symbol": symbol, "key": key_last, "recorded": bool(bars),
         "bars": [[t, round(v[0], 2), round(v[1], 2), round(v[0] - v[1], 2), v[3], round(v[2], 2), v[4], v[5],
-                  round(v[7], 2), round(v[8], 2)] for t, v in sorted(bars.items())],
+                  round(v[7], 2), round(v[8], 2),
+                  round(v[9] / v[11], 1) if v[11] else None, round(v[10] / v[11], 1) if v[11] else None]
+                 for t, v in sorted(bars.items())],
     }
     if footprint:
         fp: dict[tuple[int, float], list[float]] = {}

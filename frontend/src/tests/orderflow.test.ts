@@ -47,7 +47,7 @@ describe("footprint analytics", () => {
       [1240, 7, 7, 0, 1, 0, 530, 100.05, -1, 3],
     ];
     const m = flowByCandle(times, bars, 0);
-    expect(m.get(1000)).toEqual({ buy: 35, sell: 35, delta: 0, trades: 5, unk: 5, oi: 520, close: 100.0, dlo: -2, dhi: 25 });
+    expect(m.get(1000)).toEqual({ buy: 35, sell: 35, delta: 0, trades: 5, unk: 5, oi: 520, close: 100.0, dlo: -2, dhi: 25, bookBid: null, bookAsk: null });
     expect(m.get(1240)?.dhi).toBe(3);
     expect(candleAt(times, 999)).toBe(-1);
     const fp = footprintByCandle(times, [[1000, 100.1, 3, 1], [1120, 100.1, 2, 2], [1240, 100.0, 1, 0]], 0);

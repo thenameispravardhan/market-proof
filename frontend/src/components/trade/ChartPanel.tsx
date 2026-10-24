@@ -116,6 +116,7 @@ import {
   type OptFlowTuple,
 } from "./indicatorCatalog";
 import { symbolInputs, volumeProfileRows } from "./indicatorMore";
+import { candleEvents, flowAlertsCfg, needsFootprint, printEvents, type FlowAlertConfig } from "./flowAlerts";
 import { FillPrimitive, paintOiProfile, paintProfile, type FillBand, type OiStrike } from "./indicatorRender";
 import {
   DrawingsPrimitive,
@@ -202,7 +203,7 @@ export const CHART_KINDS: { id: ChartKind; label: string; icon: string }[] = [
 
 const BRICK_KINDS = new Set<ChartKind>(["renko", "linebreak", "kagi", "pnf", "range"]);
 /** Indicators that read recorded order flow (they switch the flow loader on). */
-const FLOW_TYPES = new Set(["flow", "flowpressure", "cvd"]);
+const FLOW_TYPES = new Set(["flow", "flowpressure", "cvd", "bookpressure"]);
 /** Indicators whose values are share counts: shown as 18.6K / 1.2M rather than 18600.00. */
 const VOLUME_TYPES = new Set(["volume", "obv", "flow", "oi", "cvd", "optflow"]);
 /** Candles of footprint detail loaded (the latest): enough to scroll, light to refresh. */
@@ -927,6 +928,8 @@ export default function ChartPanel(props: ChartPanelProps) {
     (loadJson<unknown[]>(`chart:alerts:${symbol}`, []) ?? []).map(migrateAlert).filter(Boolean) as AlertItem[],
   );
   const [alertLog, setAlertLog] = useState<{ id: number; ts: number; text: string }[]>(() => loadJson(`chart:alertLog:${symbol}`, []));
+  /** Order-flow alerts (flowAlerts.ts), per symbol. */
+  const [flowAlerts, setFlowAlerts] = useState<FlowAlertConfig>(() => flowAlertsCfg(loadJson<Partial<FlowAlertConfig> | null>(`chart:flowAlerts:${symbol}`, null)));
   const [compares, setCompares] = useState<CompareItem[]>([]);
   /** A compare on the main scale forces it into percent. */
   const pctCompare = compares.some((c) => (c.mode ?? "percent") === "percent");
@@ -1697,9 +1700,13 @@ export default function ChartPanel(props: ChartPanelProps) {
   }
 
   function fireAlert(a: AlertItem, lp: number): void {
-    const text = a.message || `${shortName} ${describeCond(a)} (LTP ${fmtPrice(lp)})`;
-    if (a.popup) addToast(`🔔 ${text}`);
-    if (a.sound && settingsRef.current.sound) beep();
+    announce(a.message || `${shortName} ${describeCond(a)} (LTP ${fmtPrice(lp)})`, a, "Price alert");
+  }
+
+  /** An alert went off: toast, sound, the alert log and a browser notification, as asked. */
+  function announce(text: string, how: { popup: boolean; sound: boolean; notify: boolean }, title: string): void {
+    if (how.popup) addToast(`🔔 ${text}`);
+    if (how.sound && settingsRef.current.sound) beep();
     pushLog("alert", text);
     setAlertLog((l) => {
       const next = [{ id: Date.now() + Math.random(), ts: Date.now(), text }, ...l].slice(0, 100);
@@ -1707,9 +1714,56 @@ export default function ChartPanel(props: ChartPanelProps) {
       return next;
     });
     try {
-      if (a.notify && typeof Notification !== "undefined" && Notification.permission === "granted") new Notification("Price alert", { body: text });
+      if (how.notify && typeof Notification !== "undefined" && Notification.permission === "granted") new Notification(title, { body: text });
     } catch {
       /* notifications unsupported */
+    }
+  }
+
+  const flowAlertsRef = useRef(flowAlerts);
+  flowAlertsRef.current = flowAlerts;
+  /** Where the order-flow alerts were armed (the last closed candle and print then): nothing older fires. */
+  const flowArmRef = useRef<{ candle: number; print: number } | null>(null);
+  const flowSeenRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    saveJson(`chart:flowAlerts:${symbol}`, flowAlerts);
+  }, [flowAlerts, symbol]);
+  useEffect(() => {
+    flowArmRef.current = null;                       // switched on (or off): re-arm at the next poll
+    if (!flowAlerts.on || !flowAlerts.notify) return;
+    try {
+      if (typeof Notification !== "undefined" && Notification.permission === "default") void Notification.requestPermission();
+    } catch {
+      /* notifications unsupported */
+    }
+  }, [flowAlerts.on, flowAlerts.notify]);
+
+  /** Order-flow alerts after a flow poll: the candle that just closed, and prints newer than the last seen. */
+  function runFlowAlerts(c: Candle[], prints: number[][]): void {
+    const cfg = flowAlertsRef.current;
+    if (!cfg.on || c.length < 2) return;
+    const closed = c.slice(0, -1).map((k) => ({ time: k.time as number, open: k.open, high: k.high, low: k.low, close: k.close }));
+    const last = closed[closed.length - 1];
+    const newest = prints.reduce((m, p) => Math.max(m, p[0] ?? 0), 0);
+    if (!flowArmRef.current) {
+      flowArmRef.current = { candle: last.time, print: newest };
+      return;
+    }
+    const arm = flowArmRef.current;
+    const proxy = symbol.toUpperCase().endsWith("-INDEX");
+    const fs = fpSettings(settingsRef.current.footprint);
+    const events = [
+      ...(last.time > arm.candle
+        ? candleEvents(cfg, closed.slice(-22), flowRef.current, fpRef.current,
+          { imbalance: fs.imbalance, imbalanceMin: fs.imbalanceMin, stacked: fs.stacked, rowTicks: fs.rowTicks }, shortName)
+        : []),
+      ...printEvents(cfg, prints, arm.print, proxy ? `${shortName} (future)` : shortName, fmtPrice),
+    ];
+    arm.print = Math.max(arm.print, newest);
+    for (const e of events) {
+      if (flowSeenRef.current.has(e.key)) continue;
+      flowSeenRef.current.add(e.key);
+      announce(e.text, cfg, "Order-flow alert");
     }
   }
 
@@ -3811,7 +3865,7 @@ export default function ChartPanel(props: ChartPanelProps) {
   //     base-resolution rows fold into this chart's candles, so a 4-minute or a
   //     weekly chart gets every bar's flow, not just the ones whose start lines up.
   const flowOn = indicators.some((i) => FLOW_TYPES.has(i.type) && i.visible);
-  const flowWanted = flowOn || chartKind === "footprint";
+  const flowWanted = flowOn || chartKind === "footprint" || flowAlerts.on;
   useEffect(() => {
     flowRef.current = new Map();
     cvdRef.current = new Map();
@@ -3835,7 +3889,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     };
     const loadOnce = async (c: typeof candlesRef.current) => {
       const now = Math.floor(Date.now() / 1000);
-      const fpOn = kindRef.current === "footprint";
+      const fpOn = kindRef.current === "footprint" || needsFootprint(flowAlertsRef.current);
       const full = Date.now() - lastFull > 60_000 || c[0].time !== firstT;
       const times = c.map((k) => k.time as number);
       const res = fetchPlan(ivRef.current).res;
@@ -3845,7 +3899,7 @@ export default function ChartPanel(props: ChartPanelProps) {
         if (footprint) { q.set("footprint", "true"); q.set("prints", "true"); }
         const r = await fetch(`/api/algo/ticks/flow?${q.toString()}`);
         if (!r.ok) throw new Error(String(r.status));
-        return r.json() as Promise<{ key: string; recorded: boolean; bars?: number[][]; footprint?: number[][]; prints?: number[][] }>;
+        return r.json() as Promise<{ key: string; recorded: boolean; bars?: (number | null)[][]; footprint?: number[][]; prints?: number[][] }>;
       };
       try {
         const start = full ? 0 : Math.max(0, c.length - 2);
@@ -3855,7 +3909,7 @@ export default function ChartPanel(props: ChartPanelProps) {
         const fresh = flowByCandle(times, j.bars ?? [], IST);
         if (full) flowRef.current = new Map();
         for (const t of times.slice(start)) flowRef.current.delete(t);
-        for (const [t, f] of fresh) flowRef.current.set(t, [f.buy, f.sell, f.delta, f.trades, f.unk, f.oi, f.close, f.dlo, f.dhi]);
+        for (const [t, f] of fresh) flowRef.current.set(t, [f.buy, f.sell, f.delta, f.trades, f.unk, f.oi, f.close, f.dlo, f.dhi, f.bookBid, f.bookAsk]);
         cvdRef.current = sessionCvd(times, new Map([...flowRef.current].map(([t, f]) => [t, { delta: f[2] } as FlowBar])));
         // what the chart holds (the latest poll only covers the last two candles: a quiet
         // forming bar must not read as "nothing recorded" over a screen full of footprints)
@@ -3902,6 +3956,7 @@ export default function ChartPanel(props: ChartPanelProps) {
           lastFull = Date.now();
           firstT = times[0];
         }
+        runFlowAlerts(c, fj?.prints ?? []);
         if (kindRef.current === "footprint") setMainData();
         refreshIndicatorData();
       } catch {
@@ -6967,6 +7022,8 @@ ${hh ? `${hh}:${String(mm).padStart(2, "0")}` : mm}:${String(ss).padStart(2, "0"
             onToggle={(a) => saveAlerts(alerts.map((x) => (x.id === a.id ? { ...x, active: !x.active } : x)))}
             onDelete={(a) => removeAlert(a.id)}
             onClearLog={() => { setAlertLog([]); saveJson(`chart:alertLog:${symbol}`, []); }}
+            flow={flowAlerts}
+            onFlow={setFlowAlerts}
           />,
           widgetSlots.alerts,
         )}

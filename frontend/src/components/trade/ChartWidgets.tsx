@@ -4,6 +4,7 @@
 
 import { useState, type DragEvent } from "react";
 import { describe, type AlertItem } from "./alerts";
+import type { FlowAlertConfig } from "./flowAlerts";
 
 export interface DataRow {
   label: string;
@@ -243,6 +244,8 @@ export function AlertsPanel({
   onToggle,
   onDelete,
   onClearLog,
+  flow,
+  onFlow,
 }: {
   symbolName: string;
   alerts: AlertItem[];
@@ -253,17 +256,46 @@ export function AlertsPanel({
   onToggle: (a: AlertItem) => void;
   onDelete: (a: AlertItem) => void;
   onClearLog: () => void;
+  /** Order-flow alerts (flowAlerts.ts): shown as their own tab when given. */
+  flow?: FlowAlertConfig;
+  onFlow?: (c: FlowAlertConfig) => void;
 }) {
-  const [tab, setTab] = useState<"alerts" | "log">("alerts");
+  const [tab, setTab] = useState<"alerts" | "log" | "flow">("alerts");
+  const setF = (patch: Partial<FlowAlertConfig>) => flow && onFlow?.({ ...flow, ...patch });
+  const num = (v: number, onSave: (n: number) => void, min: number, max: number, step: number, testId: string, w = 64) => (
+    <input type="number" min={min} max={max} step={step} defaultValue={v} key={`${testId}-${v}`} style={{ width: w }} data-testid={testId}
+      onBlur={(e) => { const n = Number(e.target.value); if (Number.isFinite(n) && n !== v && n >= min && n <= max) onSave(n); }}
+      onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }} />
+  );
   return (
     <div className="alerts-panel" data-testid="alerts-panel">
       <div className="ap-head">
         <button type="button" className={`chip${tab === "alerts" ? " on" : ""}`} onClick={() => setTab("alerts")}>Alerts ({alerts.length})</button>
         <button type="button" className={`chip${tab === "log" ? " on" : ""}`} onClick={() => setTab("log")}>Log ({log.length})</button>
+        {flow && <button type="button" className={`chip${tab === "flow" ? " on" : ""}`} onClick={() => setTab("flow")} data-testid="alerts-flow-tab">
+          Order flow{flow.on ? " ●" : ""}</button>}
         <span className="grow" />
         <button type="button" className="cbtn" onClick={onCreate} data-testid="alerts-create">+ Create</button>
       </div>
-      {tab === "alerts" ? (
+      {tab === "flow" && flow ? (
+        <div className="ap-list" data-testid="alerts-flow">
+          <label className="ap-row"><input type="checkbox" checked={flow.on} onChange={(e) => setF({ on: e.target.checked })} data-testid="flow-alert-on" />
+            <b>Order-flow alerts on {symbolName}</b></label>
+          <div className="hint">From recorded ticks, judged on each candle as it closes (big prints as they arrive). Switching on arms them now: nothing fires on history. An index reads its future.</div>
+          <label className="ap-row">Big print ≥ {num(flow.bigPrint, (n) => setF({ bigPrint: n }), 0, 1e12, 1, "flow-alert-print", 90)} qty <span className="hint">(0 = off)</span></label>
+          <label className="ap-row">Delta spike ≥ {num(flow.deltaZ, (n) => setF({ deltaZ: n }), 0, 20, 0.5, "flow-alert-z")} σ <span className="hint">of the last 20 candles (0 = off)</span></label>
+          <label className="ap-row">Book ≥ {num(flow.book, (n) => setF({ book: n }), 0, 100, 5, "flow-alert-book")} % lopsided <span className="hint">bids vs offers (0 = off)</span></label>
+          {([["stacked", "Stacked imbalance", "a zone at the footprint's imbalance ratio / run length"], ["absorption", "Absorption", "heavy aggression at the high / low that price rejected"],
+            ["divergence", "Delta divergence", "a new high on negative delta, or a new low on positive"]] as const).map(([k, l, tip]) => (
+            <label key={k} className="ap-row" title={tip}><input type="checkbox" checked={flow[k]} onChange={(e) => setF({ [k]: e.target.checked })} data-testid={`flow-alert-${k}`} /> {l}</label>
+          ))}
+          <div className="ap-row">
+            {([["popup", "Pop-up"], ["sound", "Sound"], ["notify", "Browser notification"]] as const).map(([k, l]) => (
+              <label key={k} style={{ marginRight: 10 }}><input type="checkbox" checked={flow[k]} onChange={(e) => setF({ [k]: e.target.checked })} /> {l}</label>
+            ))}
+          </div>
+        </div>
+      ) : tab === "alerts" ? (
         <div className="ap-list">
           {alerts.length === 0 && <div className="hint">No alerts on {symbolName}. Alt+A adds one at the cursor.</div>}
           {alerts.map((a) => (
