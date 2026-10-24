@@ -55,6 +55,12 @@ ROOT_DATA = Path(__file__).resolve().parents[2] / "data"
 MASTER_DIR = ROOT_DATA / "scrip_master"
 IST_TZ = timezone(timedelta(seconds=IST))
 LIST_URL = "https://www.niftyindices.com/IndexConstituent/{file}"
+# The same constituent files on NSE's archive hosts: niftyindices.com often turns
+# away a server (HTTP 403 / 502), so these are tried in turn after it.
+LIST_URLS = (LIST_URL, "https://nsearchives.nseindia.com/content/indices/{file}",
+             "https://archives.nseindia.com/content/indices/{file}")
+_LIST_HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+                 "Accept": "text/csv,text/plain,*/*", "Accept-Language": "en-US,en;q=0.9"}
 LIST_MAX_AGE_S = 7 * 86400
 # NSE has no "Midcap 500" / "Smallcap 500" constituent file: Midcap 150 is ranks
 # 101-250, Smallcap 250 ranks 251-500 and Microcap 250 ranks 501-750 by market cap,
@@ -192,6 +198,26 @@ def _parse_list(text: str) -> list[str]:
     return out
 
 
+def fetch_list(file: str, min_rows: int = 5) -> tuple[list[str], str]:
+    """(tickers, raw csv) of one constituent file from the first source that
+    serves it; RuntimeError naming every source's answer when none does."""
+    import httpx
+
+    errs = []
+    for url in LIST_URLS:
+        u = url.format(file=file)
+        try:
+            r = httpx.get(u, timeout=20, follow_redirects=True, headers=_LIST_HEADERS)
+        except Exception as e:  # noqa: BLE001 — the next source may answer
+            errs.append(f"{u.split('/')[2]}: {type(e).__name__}")
+            continue
+        syms = _parse_list(r.text) if r.status_code == 200 else []
+        if len(syms) >= min_rows:
+            return syms, r.text
+        errs.append(f"{u.split('/')[2]}: HTTP {r.status_code}" + (f", {len(syms)} rows" if r.status_code == 200 else ""))
+    raise RuntimeError("; ".join(errs))
+
+
 def index_list(name: str, cache_dir: Path, fetch: bool = True) -> tuple[list[str], str]:
     """(tickers, source) for one index: niftyindices.com's constituent file
     (cached a week), else the same rank band of AMFI market cap."""
@@ -200,21 +226,13 @@ def index_list(name: str, cache_dir: Path, fetch: bool = True) -> tuple[list[str
     fresh = path.exists() and time.time() - path.stat().st_mtime < LIST_MAX_AGE_S
     if fetch and not fresh:
         try:
-            import httpx
+            syms, text = fetch_list(meta["file"], min_rows=50)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+            from app.research import universe
 
-            r = httpx.get(LIST_URL.format(file=meta["file"]), timeout=20, follow_redirects=True,
-                          headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-                                   "Accept": "text/csv,*/*"})
-            syms = _parse_list(r.text) if r.status_code == 200 else []
-            if len(syms) >= 50:
-                cache_dir.mkdir(parents=True, exist_ok=True)
-                path.write_text(r.text, encoding="utf-8")
-                from app.research import universe
-
-                if name in universe.INDEXES:                 # a dated copy: the point-in-time universe's history
-                    universe.record_snapshot(name, syms)
-            else:
-                log.warning("flow_universe.list_download_bad", index=name, status=r.status_code, rows=len(syms))
+            if name in universe.INDEXES:                     # a dated copy: the point-in-time universe's history
+                universe.record_snapshot(name, syms)
         except Exception as e:  # noqa: BLE001 — the cached file / market-cap ranks stand in
             log.warning("flow_universe.list_download_failed", index=name, error=str(e)[:200])
     if path.exists():
