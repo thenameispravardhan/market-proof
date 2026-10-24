@@ -124,6 +124,16 @@ DEFAULT_CHAINS: dict[str, Any] = {
     "expiries": 2,                         # the first N listed expiries
     "interval_s": 60,                      # the snapshot grid, exchange time
 }
+# The order book (5 levels a side, Fyers' DepthUpdate) of a short list — by default the recorded
+# indices' current futures — sampled at most every `interval_s`, kept `days` collected days.
+DEFAULT_DEPTH: dict[str, Any] = {
+    "enabled": True,
+    "symbols": [],                         # extra Fyers symbols; the indices' current futures always
+    "interval_s": 1,
+    "days": 5,
+}
+DEPTH_LEVELS = 5
+DEPTH_COLS = ("ts", *(f"{s}{i}{k}" for s in ("b", "a") for i in range(1, DEPTH_LEVELS + 1) for k in ("p", "q")))
 # The research short list: kept longer than the sliding window. Off unless switched on.
 DEFAULT_LONG: dict[str, Any] = {
     "enabled": False,
@@ -135,7 +145,7 @@ DEFAULT_LONG: dict[str, Any] = {
 }
 META_FLAGS = ("chain", "long", "raw")
 SORT_ORDER = {"flow.parquet": "key, minute", "fp.parquet": "key, minute, price", "prints.parquet": "key, ts",
-              "raw.parquet": "key, exch_ts", "chain.parquet": "key, ts"}
+              "raw.parquet": "key, exch_ts", "chain.parquet": "key, ts", "depth.parquet": "key, ts"}
 CHAIN_COLS = ("ts", "qts", "ltp", "bid", "ask", "bid_size", "ask_size", "oi", "vol")
 SNAP_MIN_S = 15
 OPT_FLOW_TTL_S = 10                        # an index's options flow of the day being recorded: recomputed this often
@@ -215,6 +225,7 @@ def load_config(root: Path = ROOT) -> dict[str, Any]:
     cfg["universe"] = {**DEFAULT_UNIVERSE, **(raw.get("universe") or {})}
     cfg["chains"] = {**DEFAULT_CHAINS, **(raw.get("chains") or {})}
     cfg["long"] = {**DEFAULT_LONG, **(raw.get("long") or {})}
+    cfg["depth"] = {**DEFAULT_DEPTH, **(raw.get("depth") or {})}
     version = int(raw.get("version") or 1) if raw else CONFIG_VERSION
     if version < 2:                             # a v1 file: the 30-day default predates the 90-day window
         cfg["retention_days"] = max(int(raw.get("retention_days") or 0), RETENTION_DAYS)
@@ -236,6 +247,8 @@ def save_config(patch: dict[str, Any], root: Path = ROOT) -> dict[str, Any]:
             cfg["chains"] = {**cfg["chains"], **{kk: vv for kk, vv in v.items() if kk in DEFAULT_CHAINS}}
         elif k == "long" and isinstance(v, dict):
             cfg["long"] = {**cfg["long"], **{kk: vv for kk, vv in v.items() if kk in DEFAULT_LONG}}
+        elif k == "depth" and isinstance(v, dict):
+            cfg["depth"] = {**cfg["depth"], **{kk: vv for kk, vv in v.items() if kk in DEFAULT_DEPTH}}
         elif k in ("enabled", "symbols", "retention_days", "raw_days", "budget", "min_free_gb"):
             cfg[k] = v
     cfg["symbols"] = list(dict.fromkeys(str(s).strip().upper() for s in cfg["symbols"] if str(s).strip()))[:MAX_FOCUS]
@@ -243,6 +256,8 @@ def save_config(patch: dict[str, Any], root: Path = ROOT) -> dict[str, Any]:
         str(s).strip().upper() for s in cfg["chains"].get("underlyings") or [] if str(s).strip()))[:MAX_FOCUS]
     cfg["long"]["symbols"] = list(dict.fromkeys(
         str(s).strip().upper() for s in cfg["long"].get("symbols") or [] if str(s).strip()))[:MAX_FOCUS]
+    cfg["depth"]["symbols"] = list(dict.fromkeys(
+        str(s).strip().upper() for s in cfg["depth"].get("symbols") or [] if str(s).strip()))[:20]
     cfg["version"] = CONFIG_VERSION
     root.mkdir(parents=True, exist_ok=True)
     tmp = root / "config.json.tmp"
@@ -341,6 +356,12 @@ class TickRecorder:
         self._last_snap = 0
         self._snaps: list[tuple] = []                            # (key, ts, *quote) awaiting the next flush
         self.snapshots = 0
+        # the order book: written on the socket thread, flushed under the lock
+        self.depth_keys: dict[str, str] = {}                     # full symbol -> key, recorded
+        self.depth_s = 1.0
+        self._depth_at: dict[str, float] = {}                    # key -> last sample's receive time
+        self._depth: list[tuple] = []                            # (key, ts, b1p, b1q, ..., a5p, a5q)
+        self.depth_samples = 0
 
     # -- hot path (socket thread) ----------------------------------------------
 
@@ -352,6 +373,25 @@ class TickRecorder:
         # in place, not a new dict: the socket thread may be storing a chain key's quote right now
         for k in [k for k in list(self._quote) if k not in self.chain_keys]:
             self._quote.pop(k, None)
+
+    def on_depth(self, full: str, book: dict[str, Any], recv_ts: Optional[float] = None) -> None:
+        """A DepthUpdate frame: one sample per key per `depth_s` (the latest book then)."""
+        key = self.depth_keys.get(full.upper())
+        if key is None:
+            return
+        now = recv_ts or time.time()
+        if now - self._depth_at.get(key, 0.0) < self.depth_s:
+            return
+        self._depth_at[key] = now
+        row: list[Any] = [int(now)]
+        for side in ("bids", "asks"):
+            levels = list(book.get(side) or [])[:DEPTH_LEVELS]
+            for i in range(DEPTH_LEVELS):
+                px, qty = (levels[i][0], levels[i][1]) if i < len(levels) else (None, None)
+                row += [px, qty]
+        with self._lock:
+            self._depth.append((key, *row))
+        self.depth_samples += 1
 
     def mark_resync(self) -> None:
         """A (re)connect: the next frame of every symbol only re-anchors its
@@ -529,6 +569,7 @@ class TickRecorder:
             prints, self._prints = self._prints, []
             raw, self._raw = self._raw, {}
             snaps, self._snaps = self._snaps, []
+            depth, self._depth = self._depth, []
             for key, mins in self._min.items():          # keep the last 3 minutes; the rest is final
                 if len(mins) > 3:
                     keep = sorted(mins)[-3:]
@@ -560,6 +601,11 @@ class TickRecorder:
             with path.open("a", newline="", encoding="utf-8") as fh:
                 csv.writer(fh).writerows(["" if x is None else x for x in r] for r in rows)
             n += len(rows)
+        by_key: dict[str, list] = {}
+        for r in depth:
+            by_key.setdefault(r[0], []).append(r[1:])
+        for key, rows in by_key.items():
+            n += self._append(key, rows, "depth")
         return n
 
     def _append(self, key: str, rows: list, kind: str, day_col: int = 0) -> int:
@@ -666,6 +712,18 @@ class TickRecorder:
                 _write_parquet(con, out / "raw.parquet",
                                f"SELECT * FROM read_csv('{(tmp / 'raw.csv').as_posix()}', header=false, "
                                f"columns={{'key': 'VARCHAR', {cols}}}, nullstr='')", "key, exch_ts", dedupe=False)
+            depths = list((src / "depth").glob("*.csv")) if (src / "depth").is_dir() else []
+            if depths:
+                with (tmp / "depth.csv").open("w", newline="", encoding="utf-8") as fh:
+                    w = csv.writer(fh)
+                    for p in depths:
+                        for r in _rows(p):
+                            if len(r) == len(DEPTH_COLS):
+                                w.writerow([p.stem, *r])
+                cols = ", ".join(f"'{c}': '{'BIGINT' if c == 'ts' else 'DOUBLE'}'" for c in DEPTH_COLS)
+                _write_parquet(con, out / "depth.parquet",
+                               f"SELECT * FROM read_csv('{(tmp / 'depth.csv').as_posix()}', header=false, "
+                               f"columns={{'key': 'VARCHAR', {cols}}}, nullstr='')", "key, ts")
             chain = src / "chain.csv"
             if chain.exists() and chain.stat().st_size:
                 # one row per (key, grid point) by construction: DuckDB streams it (no rows in Python's memory)
@@ -697,7 +755,8 @@ class TickRecorder:
                 n += 1
         return n
 
-    def prune(self, retention_days: int, raw_days: int, long: Optional[dict[str, Any]] = None) -> int:
+    def prune(self, retention_days: int, raw_days: int, long: Optional[dict[str, Any]] = None,
+              depth_days: Optional[int] = None) -> int:
         """The sliding window: keep the newest `retention_days` collected days
         (delete the oldest as each new one lands); raw frames only `raw_days`.
 
@@ -715,6 +774,9 @@ class TickRecorder:
         gone = trimmed = 0
         for i, d in enumerate(days):
             age = len(days) - 1 - i                 # 0 = the newest collected day
+            if depth_days is not None and age >= max(0, int(depth_days)) and (d / "depth.parquet").exists():
+                (d / "depth.parquet").unlink()      # the order book: its own (short) window
+                gone += 1
             if age >= long_keep:
                 shutil.rmtree(d, ignore_errors=True)
                 gone += 1
@@ -970,6 +1032,7 @@ class FlowStore:
     def __init__(self, root: Path = ROOT) -> None:
         self.root = root
         self._opt_cache: dict[tuple, tuple[Any, list[tuple]]] = {}
+        self._raw_cache: dict[tuple, tuple[int, list[tuple]]] = {}
 
     def _days(self, start: int, end: int) -> list[int]:
         return list(range(ist_day(start), ist_day(max(start, end - 1)) + 1))
@@ -1082,14 +1145,56 @@ class FlowStore:
             if p.exists():
                 rows += self._query(f"SELECT {', '.join(RAW_COLS)} FROM read_parquet('{p.as_posix()}') "
                                     "WHERE key = ? AND exch_ts >= ? AND exch_ts < ?", [key, int(start), int(end)])
-            for r in _rows(self.root / "today" / ymd(d) / "raw" / f"{key}.csv"):
-                if len(r) != len(RAW_COLS):
-                    continue
-                v = tuple(_num(x) for x in r)
-                if v[1] is not None and start <= v[1] < end:
-                    rows.append(v)
+            rows += [v for v in self._raw_today(key, d) if v[1] is not None and start <= v[1] < end]
         rows.sort(key=lambda r: (r[1] or 0, r[0] or 0))
         return rows
+
+    def _raw_today(self, key: str, d: int) -> list[tuple]:
+        """Today's working raw file, read incrementally: only the bytes appended since the last
+        read are parsed (a chart polls it every few seconds; a day holds hundreds of thousands of
+        frames). A half-written last line waits for the next read."""
+        path = self.root / "today" / ymd(d) / "raw" / f"{key}.csv"
+        ck = ("raw", key, d)
+        off, rows = self._raw_cache.get(ck, (0, []))
+        try:
+            size = path.stat().st_size
+        except OSError:
+            self._raw_cache.pop(ck, None)
+            return []
+        if size < off:                                  # rewritten / truncated: start over
+            off, rows = 0, []
+        if size > off:
+            with path.open("rb") as fh:
+                fh.seek(off)
+                data = fh.read(size - off)
+            cut = data.rfind(b"\n") + 1                  # complete lines only
+            for r in csv.reader(data[:cut].decode("utf-8", "replace").splitlines()):
+                if len(r) == len(RAW_COLS):
+                    rows.append(tuple(_num(x) for x in r))
+            off += cut
+            rows = list(rows)
+        if len(self._raw_cache) > 32:
+            self._raw_cache.clear()
+        self._raw_cache[ck] = (off, rows)
+        return rows
+
+    def depth_rows(self, key: str, start: int, end: int) -> list[tuple]:
+        """The recorded order book of `key` in [start, end): (ts, b1p, b1q, ..., b5p, b5q, a1p, ..., a5q)
+        by time — one sample per change, at most one per `depth.interval_s`."""
+        rows: dict[int, tuple] = {}
+        for d in self._days(start, end):
+            p = self.root / "days" / ymd(d) / "depth.parquet"
+            if p.exists():
+                for r in self._query(f"SELECT {', '.join(DEPTH_COLS)} FROM read_parquet('{p.as_posix()}') "
+                                     "WHERE key = ? AND ts >= ? AND ts < ?", [key, int(start), int(end)]):
+                    rows[int(r[0])] = r
+            for r in _rows(self.root / "today" / ymd(d) / "depth" / f"{key}.csv"):
+                if len(r) != len(DEPTH_COLS):
+                    continue
+                v = tuple(_num(x) for x in r)
+                if v[0] is not None and start <= v[0] < end:
+                    rows[int(v[0])] = (int(v[0]), *v[1:])
+        return [rows[t] for t in sorted(rows)]
 
     def meta(self, day: int) -> dict[str, dict]:
         return (read_json(self.root / "days" / ymd(day) / "meta.json")

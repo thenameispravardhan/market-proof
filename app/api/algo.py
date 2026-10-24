@@ -930,11 +930,12 @@ def ticks_config(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
     for block, lists, ints in (("chains", ("underlyings",), {"strikes": (0, 50), "expiries": (1, 6),
                                                               "interval_s": (ticks.SNAP_MIN_S, 3600)}),
                                ("long", ("symbols",), {"days": (1, 1095), "raw_days": (0, 365),
-                                                       "raw_strikes": (0, 20)})):
+                                                       "raw_strikes": (0, 20)}),
+                               ("depth", ("symbols",), {"interval_s": (1, 60), "days": (1, 30)})):
         v = body.get(block)
         if v is None:
             continue
-        defaults = ticks.DEFAULT_CHAINS if block == "chains" else ticks.DEFAULT_LONG
+        defaults = {"chains": ticks.DEFAULT_CHAINS, "long": ticks.DEFAULT_LONG, "depth": ticks.DEFAULT_DEPTH}[block]
         if not isinstance(v, dict):
             raise HTTPException(422, detail=f"{block} must be an object")
         clean = {}
@@ -1005,8 +1006,9 @@ async def ticks_flow(symbol: str, resolution: str = "5", from_ts: int = Query(..
     [ts, price, qty, side]. Crypto: Binance's taker-buy volume per candle."""
     from app.services import crypto
 
-    if resolution != "D" and not resolution.isdigit():
-        raise HTTPException(422, detail="resolution is minutes or D")
+    seconds = resolution.upper().endswith("S") and resolution[:-1].isdigit() and 0 < int(resolution[:-1]) <= 60
+    if resolution != "D" and not resolution.isdigit() and not seconds:
+        raise HTTPException(422, detail="resolution is minutes, seconds (5S) or D")
     if crypto.is_crypto(symbol):
         try:
             rows = await crypto.klines(symbol.upper(), resolution, from_ts, to_ts)
@@ -1017,7 +1019,92 @@ async def ticks_flow(symbol: str, resolution: str = "5", from_ts: int = Query(..
         out = {"symbol": symbol, "key": symbol.upper(), "recorded": bool(rows),
                "bars": [[int(t), round(tb, 6), round(v - tb, 6), round(2 * tb - v, 6)] for t, *_, v, tb in rows]}
         return {**out, "footprint": [], "prints": []} if footprint or prints else out
+    if seconds:
+        out = await asyncio.to_thread(_seconds_flow, symbol, int(resolution[:-1]), from_ts, to_ts, footprint, prints)
+        if out is not None:
+            return out
+        # no raw frames for this symbol (only the focus symbols keep them): its minute flow
+        out = await asyncio.to_thread(_recorded_flow, symbol, "1", from_ts, to_ts, footprint, prints)
+        return {**out, "source": "minute"}
     return await asyncio.to_thread(_recorded_flow, symbol, resolution, from_ts, to_ts, footprint, prints)
+
+
+_TB_CACHE: dict[tuple, tuple[int, Any]] = {}
+
+
+def _raw_trades(symbol: str, from_ts: int, to_ts: int) -> tuple[list, str, int]:
+    """(trades from the raw frames in [from, to), the key, frames read) — an index reads its future's."""
+    from app.algo import tickbars, ticks
+
+    st = ticks.store()
+    fy = data.fyers_symbol(symbol)
+    tr: list = []
+    key, n = ticks.flow_key(fy), 0
+    for day, key in sorted(st.keys_for(fy, from_ts, to_ts).items()):
+        a, b = max(from_ts, day * 86400 - 19800), min(to_ts, (day + 1) * 86400 - 19800)
+        frames = st.raw_frames(key, a, b)
+        n += len(frames)
+        tr += tickbars.trades(frames, exchange_hours=fy.upper().startswith(("NSE:", "BSE:")))
+    return tr, key, n
+
+
+def _seconds_flow(symbol: str, span: int, from_ts: int, to_ts: int, footprint: bool, prints: bool) -> Optional[dict[str, Any]]:
+    """/ticks/flow at `span` seconds, from the raw frames; None when the symbol has none."""
+    from app.algo import tickbars, ticks
+
+    tr, key, n = _raw_trades(symbol, from_ts, to_ts)
+    if not n:
+        return None
+    ck = ("sec", key, span, from_ts // 60, to_ts // 60)
+    hit = _TB_CACHE.get(ck)
+    if hit and hit[0] == n:
+        bars, rows = hit[1]
+    else:
+        bars, rows = tickbars.time_bars(tr, span, exchange_hours=data.fyers_symbol(symbol).upper().startswith(("NSE:", "BSE:")))
+        if len(_TB_CACHE) > 64:
+            _TB_CACHE.clear()
+        _TB_CACHE[ck] = (n, (bars, rows))
+    out: dict[str, Any] = {"symbol": symbol, "key": key, "recorded": bool(bars), "source": "raw", "bars": bars}
+    if footprint:
+        out["footprint"] = rows[-FOOTPRINT_MAX_ROWS:]
+        out["footprint_truncated"] = len(rows) > FOOTPRINT_MAX_ROWS
+    if prints:
+        st = ticks.store()
+        out["prints"] = [[int(t), p, q, int(sd)] for t, p, q, sd in st.prints(key, from_ts, to_ts)]
+    return out
+
+
+@router.get("/ticks/tickbars")
+async def ticks_tickbars(symbol: str, kind: str = "range", size: float = Query(..., gt=0),
+                         from_ts: int = Query(..., alias="from"), to_ts: int = Query(..., alias="to")) -> dict[str, Any]:
+    """Order-flow bars that close on price, quantity or trade count — built tick by tick from
+    the raw frames (app/algo/tickbars.py; kept for the focus symbols, raw_days). `kind`: range
+    (`size` = the bar's high - low in price), volume (`size` = buy + sell quantity) or tick
+    (`size` = trades). Each bar {t, open, high, low, close, volume, buy, sell, delta, trades, unk,
+    delta_low, delta_high} — t is the opening trade's time, nudged to keep one bar per second;
+    footprint rows [t, price, buy, sell]. An index reads its future's, at futures prices."""
+    from app.algo import tickbars
+
+    if kind not in ("range", "volume", "tick"):
+        raise HTTPException(422, detail="kind is range, volume or tick")
+    if not 0 < to_ts - from_ts <= 3 * 86400:
+        raise HTTPException(422, detail="from must be before to, at most 3 days apart")
+
+    def work() -> dict[str, Any]:
+        tr, key, n = _raw_trades(symbol, from_ts, to_ts)
+        ck = ("tb", key, kind, size, from_ts // 60, to_ts // 60)
+        hit = _TB_CACHE.get(ck)
+        if hit and hit[0] == n:
+            bars, rows = hit[1]
+        else:
+            bars, rows = tickbars.tick_bars(tr, kind, size)
+            if len(_TB_CACHE) > 64:
+                _TB_CACHE.clear()
+            _TB_CACHE[ck] = (n, (bars, rows))
+        return {"symbol": symbol, "key": key, "kind": kind, "size": size, "recorded": bool(n), "bars": bars,
+                "footprint": rows[-FOOTPRINT_MAX_ROWS:]}
+
+    return await asyncio.to_thread(work)
 
 
 FOOTPRINT_MAX_ROWS = 250_000
@@ -1052,6 +1139,70 @@ def _options_flow_name(symbol: str) -> Optional[str]:
     if ":" not in s:
         return s if s.replace("&", "").replace("-", "").isalnum() and len(s) <= 40 else None
     return fno.underlying_of(s)
+
+
+DEPTH_HOLD_S = 60          # a book sample stands at most this long (a gap in the feed isn't a minute-long book)
+
+
+def _depth_cells(rows: list[tuple], bucket, span: int, start: int, end: int) -> list[list]:
+    """Time-weighted resting quantity per (candle, price) from book samples: each sample's
+    levels stand until the next sample (at most DEPTH_HOLD_S), split across the candles they
+    span. [t, price, bid_qty, ask_qty], quantities averaged over the candle's recorded time."""
+    acc: dict[tuple[int, float], list[float]] = {}
+    covered: dict[int, float] = {}
+    for i, r in enumerate(rows):
+        t0 = max(int(r[0]), start)
+        # a sample stands until the next (one is written only when the book changes), at most DEPTH_HOLD_S
+        t1 = min(int(rows[i + 1][0]) if i + 1 < len(rows) else end, int(r[0]) + DEPTH_HOLD_S, end)
+        while t0 < t1:
+            b = bucket(t0)
+            nxt = min(t1, b + span) if b + span > t0 else t0 + 1  # to candle b's end (a clamped one: a second)
+            w = nxt - t0
+            covered[b] = covered.get(b, 0.0) + w
+            for side, off in ((0, 1), (1, 1 + 2 * 5)):
+                for k in range(5):
+                    px, q = r[off + 2 * k], r[off + 2 * k + 1]
+                    if px and q:
+                        c = acc.setdefault((b, float(px)), [0.0, 0.0])
+                        c[side] += w * float(q)
+            t0 = nxt
+    return [[b, p, round(v[0] / covered[b], 1), round(v[1] / covered[b], 1)] for (b, p), v in sorted(acc.items())]
+
+
+@router.get("/ticks/depth")
+async def ticks_depth(symbol: str, resolution: str = "1", from_ts: int = Query(..., alias="from"),
+                      to_ts: int = Query(..., alias="to")) -> dict[str, Any]:
+    """The recorded order book as a heatmap: per chart candle and price, the resting bid / ask
+    quantity, time-weighted over the candle ([t, price, bid_qty, ask_qty]). 5 levels a side
+    (Fyers' DepthUpdate), recorded for the indices' current futures and `depth.symbols`, kept
+    `depth.days`. An index reads its future's, at futures prices (`key`)."""
+    from app.algo import ticks
+
+    seconds = resolution.upper().endswith("S") and resolution[:-1].isdigit() and 0 < int(resolution[:-1]) <= 60
+    if resolution != "D" and not resolution.isdigit() and not seconds:
+        raise HTTPException(422, detail="resolution is minutes, seconds (5S) or D")
+    if not 0 < to_ts - from_ts <= 7 * 86400:
+        raise HTTPException(422, detail="from must be before to, at most 7 days apart")
+    fy = data.fyers_symbol(symbol)
+    st = ticks.store()
+    span = int(resolution[:-1]) if seconds else 86400 if resolution == "D" else int(resolution) * 60
+    if seconds:
+        def bucket(t: int) -> int:
+            return t - t % span
+    else:
+        bucket = _flow_bucket(resolution, fy.upper().startswith(("NSE:", "BSE:")))
+
+    def work() -> tuple[list[list], str]:
+        out: list[list] = []
+        key = ticks.flow_key(fy)
+        end = min(to_ts, int(time.time()) + 1)                 # the live book stands until now, not into the future
+        for day, key in sorted(st.keys_for(fy, from_ts, end).items()):
+            a, b = max(from_ts, day * 86400 - 19800), min(end, (day + 1) * 86400 - 19800)
+            out += _depth_cells(st.depth_rows(key, a, b), bucket, span, a, b)
+        return out, key
+
+    cells, key = await asyncio.to_thread(work)
+    return {"symbol": symbol, "key": key, "recorded": bool(cells), "cells": cells}
 
 
 @router.get("/ticks/icebergs")

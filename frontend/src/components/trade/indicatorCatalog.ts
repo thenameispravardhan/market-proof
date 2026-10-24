@@ -291,7 +291,7 @@ export interface IndicatorDef {
   /** Not a series: adding it arms this drawing tool (e.g. fixed-range profile). */
   tool?: string;
   /** Rendered by the chart itself rather than as series. */
-  special?: "vpvr" | "oiprofile";
+  special?: "vpvr" | "oiprofile" | "depthmap";
   compute: (c: OhlcvCandle[], inp: Record<string, InputValue>, ctx: ComputeCtx) => ComputeResult;
 }
 
@@ -931,6 +931,26 @@ export const INDICATORS: IndicatorDef[] = [
       }
       return { plots: [r.price], colors: [r.side.map((v) => (v == null ? null : v >= 0 ? ctx.up : ctx.down))], marks };
     },
+  },
+  {
+    type: "depthmap",
+    name: "Depth Heatmap (recorded order book)",
+    short: "Depth heatmap",
+    category: "Volume",
+    overlay: true,
+    special: "depthmap",
+    desc: "Resting liquidity behind the price, Bookmap-style: the recorded order book (5 levels a side) as a heat map — "
+      + "each candle × price shaded by the bids / offers that sat there, time-weighted over the candle, cold blue to hot "
+      + "red. Walls that hold, get pulled or get eaten show up as bands appearing, fading or being run through. Recorded "
+      + "for the indices' current futures (and Algo Lab › Data › depth symbols), kept a few days; an index reads its "
+      + "future's book, shifted onto it by the session's basis.",
+    inputs: [
+      { key: "side", label: "Side", type: "select", def: "both", options: ["both", "bids", "asks"] },
+      { key: "contrast", label: "Contrast", type: "float", def: 0.6, min: 0.1, max: 3, step: 0.1 },
+      { key: "opacity", label: "Opacity", type: "float", def: 0.55, min: 0.05, max: 1, step: 0.05 },
+    ],
+    plots: [],
+    compute: () => ({ plots: [] }),
   },
   {
     type: "icebergs",
