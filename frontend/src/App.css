@@ -2499,7 +2499,7 @@ kbd {
 .chart-nav { position: absolute; left: 50%; bottom: 34px; transform: translateX(-50%); z-index: 7; display: flex; gap: 3px; opacity: 0; transition: opacity 0.15s; }
 .chart-container:hover .chart-nav, .nav-always .chart-nav { opacity: 1; }
 .nav-never .chart-nav { display: none; }
-.chart-nav button { width: 26px; height: 26px; border: 1px solid var(--border-hi); border-radius: 50%; background: var(--bg-elev); color: var(--text); font-size: 13px; cursor: pointer; }
+.chart-nav button { width: 26px; height: 26px; padding: 0; display: inline-flex; align-items: center; justify-content: center; line-height: 1; border: 1px solid var(--border-hi); border-radius: 50%; background: var(--bg-elev); color: var(--text); font-size: 13px; cursor: pointer; }
 .chart-nav button:hover { border-color: var(--accent); color: var(--accent); }
 .chart-replay { position: absolute; left: 50%; top: 8px; transform: translateX(-50%); z-index: 9; display: flex; align-items: center; gap: 6px; padding: 4px 8px; background: var(--bg-elev); border: 1px solid #2962ff; border-radius: 6px; font-size: 11px; color: var(--text); }
 .chart-replay button { background: var(--bg-surface); border: 1px solid var(--border); border-radius: 3px; color: var(--text); font-size: 11px; padding: 2px 8px; cursor: pointer; }
