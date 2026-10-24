@@ -8,9 +8,9 @@ describe("optionsFlow", () => {
     const day = 86400;
     const c = [0, 300, day, day + 300].map((time) => ({ time, open: 1, high: 1, low: 1, close: 1, volume: 0 }));
     const f = new Map<number, OptFlowTuple>([
-      [0, [100, 40, 10, 30, 80]],           // calls +60, puts −20 → +80
-      [300, [0, 50, 70, 0, -120]],
-      [day + 300, [10, 0, 0, 0, 10]],
+      [0, [100, 40, 10, 30, 80, 0, 0, 0, 0]],           // calls +60, puts −20 → +80
+      [300, [0, 50, 70, 0, -120, 0, 0, 0, 0]],
+      [day + 300, [10, 0, 0, 0, 10, 0, 0, 0, 0]],
     ]);
     const r = optionsFlow(c, f, true);
     expect(r.net).toEqual([80, -120, null, 10]);

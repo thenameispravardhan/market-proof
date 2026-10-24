@@ -104,11 +104,94 @@ export interface ComputeCtx {
   /** Another symbol's closes by chart time (two-symbol indicators). */
   other?: (symbol: string) => Map<number, number> | undefined;
   /** An index's options together per chart time (premium in ₹ the aggressors paid):
-   *  [calls bought, calls sold, puts bought, puts sold, net = (calls b − s) − (puts b − s)]. */
+   *  [calls bought, calls sold, puts bought, puts sold, net = (calls b − s) − (puts b − s),
+   *  then the same four as quantities: calls bought, calls sold, puts bought, puts sold]. */
   optFlow?: Map<number, OptFlowTuple>;
+  /** Recorded big prints per chart time: [price, qty, side] (an index's are its future's, shifted onto it). */
+  prints?: Map<number, [number, number, number][]>;
+  /** Likely icebergs per chart time (the candle each ended in): side +1 = a hidden BID, −1 = a hidden OFFER. */
+  icebergs?: Map<number, { side: 1 | -1; traded: number; shown: number; ratio: number; price: number }[]>;
 }
 
-export type OptFlowTuple = [number, number, number, number, number];
+export type OptFlowTuple = [number, number, number, number, number, number, number, number, number];
+
+/** The biggest recorded print of each candle at least `min` qty: its price, qty and side. */
+export function bigTrades(c: { time: number }[], prints: Map<number, [number, number, number][]> | undefined, min = 0) {
+  const price: (number | null)[] = [], qty: (number | null)[] = [], side: (number | null)[] = [];
+  for (const k of c) {
+    let best: [number, number, number] | null = null;
+    for (const pr of prints?.get(k.time) ?? []) if (pr[1] >= min && (!best || pr[1] > best[1])) best = pr;
+    price.push(best ? best[0] : null);
+    qty.push(best ? best[1] : null);
+    side.push(best ? best[2] : null);
+  }
+  return { price, qty, side };
+}
+
+/** Open interest at each candle's end and its change from the previous candle that had one. */
+export function oiChange(c: { time: number }[], flow: Map<number, FlowTuple> | undefined) {
+  const oi: (number | null)[] = [], chg: (number | null)[] = [];
+  let prev: number | null = null;
+  for (const k of c) {
+    const v = flow?.get(k.time)?.[5] ?? null;
+    oi.push(v);
+    chg.push(v != null && prev != null ? v - prev : null);
+    if (v != null) prev = v;
+  }
+  return { oi, chg };
+}
+
+/** Put / call volume ratio of the index's options per candle, and running through the session. */
+export function optionsPcr(c: { time: number }[], flow: Map<number, OptFlowTuple> | undefined) {
+  const pcr: (number | null)[] = [], session: (number | null)[] = [];
+  let calls = 0, puts = 0, day = -1;
+  for (const k of c) {
+    const d = Math.floor(k.time / 86400);
+    if (d !== day) {
+      day = d;
+      calls = 0;
+      puts = 0;
+    }
+    const f = flow?.get(k.time);
+    if (!f) {
+      pcr.push(null);
+      session.push(null);
+      continue;
+    }
+    const cq = f[5] + f[6], pq = f[7] + f[8];
+    calls += cq;
+    puts += pq;
+    pcr.push(cq > 0 ? pq / cq : null);
+    session.push(calls > 0 ? puts / calls : null);
+  }
+  return { pcr, session };
+}
+
+/** Prints per minute in each candle (the recorder's classified trades) and its z-score over `n` candles. */
+export function tapeSpeed(c: { time: number }[], flow: Map<number, FlowTuple> | undefined, n = 20) {
+  const gaps = c.slice(1).map((k, i) => k.time - c[i].time).filter((g) => g > 0 && g < 86400).sort((a, b) => a - b);
+  const minutes = gaps.length ? Math.max(1, gaps[0] / 60) : 375;      // intraday: the bar size; daily: the session
+  const speed: (number | null)[] = [], z: (number | null)[] = [];
+  const hist: number[] = [];
+  for (const k of c) {
+    const t = flow?.get(k.time)?.[3];
+    if (t == null) {
+      speed.push(null);
+      z.push(null);
+      continue;
+    }
+    const v = (t as number) / minutes;
+    speed.push(v);
+    const w = hist.slice(-n);
+    if (w.length >= Math.min(n, 10)) {
+      const m = w.reduce((a, x) => a + x, 0) / w.length;
+      const sd = Math.sqrt(w.reduce((a, x) => a + (x - m) ** 2, 0) / w.length);
+      z.push(sd > 0 ? (v - m) / sd : 0);
+    } else z.push(null);
+    hist.push(v);
+  }
+  return { speed, z };
+}
 
 /** Net option premium per candle and its running total (resets each session). */
 export function optionsFlow(c: OhlcvCandle[], flow: Map<number, OptFlowTuple> | undefined, reset = true) {
@@ -821,6 +904,122 @@ export const INDICATORS: IndicatorDef[] = [
     compute: (c, inp, ctx) => {
       const r = bookPressure(c, ctx.flow, num(inp.smooth, 5));
       return { plots: [r.raw, r.ema], colors: [r.raw.map((v) => (v == null ? null : v >= 0 ? ctx.up : ctx.down)), null] };
+    },
+  },
+  {
+    type: "bigtrades",
+    name: "Big Trades (recorded prints)",
+    short: "Big trades",
+    category: "Volume",
+    overlay: true,
+    desc: "The biggest recorded print of each candle (a print at least 8× the contract's average), drawn at its "
+      + "price on any chart type: green = a buyer lifted the offer, red = a seller hit the bid. Set a minimum quantity "
+      + "to keep only the largest. An index shows its future's prints, shifted onto the index. From the tick recorder.",
+    inputs: [
+      { key: "min", label: "Minimum quantity", type: "int", def: 0, min: 0, max: 100000000 },
+      { key: "labels", label: "Quantity labels", type: "bool", def: true },
+    ],
+    plots: [{ key: "print", label: "Big print", color: "#FFB300", kind: "circles", width: 3 }],
+    compute: (c, inp, ctx) => {
+      const r = bigTrades(c, ctx.prints, num(inp.min, 0));
+      const marks: Mark[] = [];
+      if (inp.labels !== false) {
+        r.qty.forEach((q, i) => {
+          if (q != null) marks.push({ plot: 0, i, pos: (r.side[i] ?? 0) >= 0 ? "below" : "above", shape: "circle", color: (r.side[i] ?? 0) >= 0 ? ctx.up : ctx.down,
+            text: q >= 1e5 ? `${(q / 1e5).toFixed(1)}L` : q >= 1e3 ? `${(q / 1e3).toFixed(1)}K` : String(Math.round(q)), title: `big print ${Math.round(q)}` });
+        });
+      }
+      return { plots: [r.price], colors: [r.side.map((v) => (v == null ? null : v >= 0 ? ctx.up : ctx.down))], marks };
+    },
+  },
+  {
+    type: "icebergs",
+    name: "Icebergs (likely hidden orders, recorded)",
+    short: "Icebergs",
+    category: "Volume",
+    overlay: true,
+    desc: "Hidden size that kept refilling at one price: buyers lifted an offer (or sellers hit a bid) for at least "
+      + "N× the largest size it ever showed, and it held. ▼ above a bar = a hidden SELLER absorbing buyers, ▲ below = "
+      + "a hidden BUYER absorbing sellers, labelled with the quantity it took. From the raw frames, kept for the focus "
+      + "symbols (NIFTY / SENSEX futures) a few days; an index reads its future's.",
+    inputs: [
+      { key: "ratio", label: "Traded ≥ × shown", type: "float", def: 3, min: 1, max: 50, step: 0.5 },
+      { key: "min", label: "Minimum quantity", type: "int", def: 0, min: 0, max: 100000000 },
+    ],
+    plots: [{ key: "ice", label: "Iceberg", color: "#26C6DA", kind: "marks" }],
+    compute: (c, inp, ctx) => {
+      const ratio = num(inp.ratio, 3), min = num(inp.min, 0);
+      const vals: (number | null)[] = [];
+      const marks: Mark[] = [];
+      c.forEach((k, i) => {
+        const hits = (ctx.icebergs?.get(k.time) ?? []).filter((x) => x.ratio >= ratio && x.traded >= min);
+        vals.push(hits.length ? k.close : null);
+        for (const h of hits) {
+          const q = h.traded >= 1e5 ? `${(h.traded / 1e5).toFixed(1)}L` : h.traded >= 1e3 ? `${(h.traded / 1e3).toFixed(1)}K` : String(Math.round(h.traded));
+          marks.push({ plot: 0, i, pos: h.side > 0 ? "below" : "above", shape: h.side > 0 ? "arrowUp" : "arrowDown", color: h.side > 0 ? ctx.up : ctx.down,
+            text: `ICE ${q}`, title: `likely hidden ${h.side > 0 ? "BUYER" : "SELLER"} @ ${h.price}: traded ${Math.round(h.traded)}, showed at most ${Math.round(h.shown)} (${h.ratio}×)` });
+        }
+      });
+      return { plots: [vals], marks };
+    },
+  },
+  {
+    type: "oichange",
+    name: "Open Interest Change (recorded)",
+    short: "OI Δ",
+    category: "Volume",
+    overlay: false,
+    desc: "Open interest at each candle's end and its change from the candle before: rising OI with rising price is "
+      + "new longs, with falling price new shorts; falling OI is positions closing. An index reads its future's OI. "
+      + "From the tick recorder.",
+    inputs: [],
+    plots: [
+      { key: "chg", label: "OI change", color: "#26A69A", kind: "hist" },
+      { key: "oi", label: "Open interest", color: "#7E57C2", width: 1, scale: "oi" },
+    ],
+    compute: (c, _inp, ctx) => {
+      const r = oiChange(c, ctx.flow);
+      return { plots: [r.chg, r.oi], colors: [r.chg.map((v) => (v == null ? null : v >= 0 ? ctx.up : ctx.down)), null] };
+    },
+  },
+  {
+    type: "optpcr",
+    name: "Options Put/Call Ratio (recorded volume)",
+    short: "Options PCR",
+    category: "Volume",
+    overlay: false,
+    desc: "Put volume ÷ call volume of every recorded option of the index, per candle and running through the session. "
+      + "Above 1: more puts traded than calls. Read with Index Options Flow, which says who was the aggressor. "
+      + "Works on the index, its future or any of its options. From the tick recorder.",
+    inputs: [{ key: "expiry", label: "Expiries", type: "select", def: "all", options: ["all", "near"] }],
+    plots: [
+      { key: "pcr", label: "PCR", color: "#90A4AE", kind: "hist" },
+      { key: "session", label: "Session PCR", color: "#FFB300", width: 2 },
+    ],
+    levels: [1],
+    compute: (c, _inp, ctx) => {
+      const r = optionsPcr(c, ctx.optFlow);
+      return { plots: [r.pcr, r.session] };
+    },
+  },
+  {
+    type: "tapespeed",
+    name: "Tape Speed (prints per minute, recorded)",
+    short: "Tape speed",
+    category: "Volume",
+    overlay: false,
+    desc: "How fast the tape is printing: classified trades per minute in each candle, with its z-score against the "
+      + "last N candles — a burst (z ≥ the threshold) is highlighted. Speed without delta says activity, not direction. "
+      + "From the tick recorder.",
+    inputs: [
+      { key: "length", label: "Z-score length", type: "int", def: 20, min: 5, max: 500 },
+      { key: "z", label: "Burst threshold (σ)", type: "float", def: 2, min: 0.5, max: 10, step: 0.1 },
+    ],
+    plots: [{ key: "speed", label: "Prints / min", color: "#5C6BC0", kind: "hist" }],
+    compute: (c, inp, ctx) => {
+      const r = tapeSpeed(c, ctx.flow, num(inp.length, 20));
+      const zt = num(inp.z, 2);
+      return { plots: [r.speed], colors: [r.z.map((v) => (v != null && v >= zt ? "#FFB300" : null))] };
     },
   },
   {

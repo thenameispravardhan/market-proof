@@ -172,7 +172,7 @@ describe("indicator catalog", () => {
       for (const p of res.plots) expect(p.length).toBe(candles.length);
       for (const p of res.plots) expect(p.every((v) => v === null || Number.isFinite(v)), `${def.type} has NaN`).toBe(true);
       // flow, CVD, the options flow and book pressure read recorded ticks only: with none (an empty flow map) they're rightly empty
-      if (!["flow", "cvd", "optflow", "bookpressure"].includes(def.type) && def.plots.length) expect(res.plots[0].some((v) => v !== null), `${def.type} is all null`).toBe(true);
+      if (!["flow", "cvd", "optflow", "bookpressure", "bigtrades", "oichange", "optpcr", "tapespeed", "icebergs"].includes(def.type) && def.plots.length) expect(res.plots[0].some((v) => v !== null), `${def.type} is all null`).toBe(true);
       for (const m of res.marks ?? []) expect(m.i >= 0 && m.i < candles.length && m.plot < def.plots.length).toBe(true);
     }
   });
