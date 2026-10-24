@@ -322,6 +322,9 @@ export interface FlowBar {
   /** Lowest / highest running delta inside the candle (from its start). */
   dlo: number;
   dhi: number;
+  /** The order book's total pending buy / sell quantity, averaged over the candle (null: none recorded). */
+  bookBid: number | null;
+  bookAsk: number | null;
 }
 
 /** Index of the candle holding chart time `t` (the last one starting at or before it), or -1. */
@@ -337,21 +340,30 @@ export function candleAt(times: number[], t: number): number {
   return hit;
 }
 
-/** Fold /api/algo/ticks/flow bars ([t, buy, sell, delta, trades, unk, oi, close, dlo, dhi], epoch t)
- *  into the chart's candles (chart time = epoch + `shift`). */
-export function flowByCandle(times: number[], bars: number[][], shift: number): Map<number, FlowBar> {
+/** Fold /api/algo/ticks/flow bars ([t, buy, sell, delta, trades, unk, oi, close, dlo, dhi, book_bid,
+ *  book_ask], epoch t) into the chart's candles (chart time = epoch + `shift`). */
+export function flowByCandle(times: number[], bars: (number | null)[][], shift: number): Map<number, FlowBar> {
   const out = new Map<number, FlowBar>();
+  const bookN = new Map<number, number>();          // sub-bars that carried book totals, per candle
   for (const b of bars) {
-    const i = candleAt(times, b[0] + shift);
+    const i = candleAt(times, (b[0] ?? 0) + shift);
     if (i < 0) continue;
     const key = times[i];
     const buy = b[1] ?? 0, sell = b[2] ?? 0, delta = b[3] ?? buy - sell;
     const trades = b[4] ?? 0, unk = b[5] ?? 0, oi = b[6] ?? null, close = b[7] ?? null;
     const dlo = b[8] ?? Math.min(0, delta), dhi = b[9] ?? Math.max(0, delta);
+    const bid = b[10] ?? null, ask = b[11] ?? null;
     const cur = out.get(key);
     if (!cur) {
-      out.set(key, { buy, sell, delta, trades, unk, oi, close, dlo, dhi });
+      out.set(key, { buy, sell, delta, trades, unk, oi, close, dlo, dhi, bookBid: bid, bookAsk: ask });
+      if (bid != null && ask != null) bookN.set(key, 1);
       continue;
+    }
+    if (bid != null && ask != null) {                 // a running mean over the sub-bars that have the book
+      const n = (bookN.get(key) ?? 0) + 1;
+      bookN.set(key, n);
+      cur.bookBid = (cur.bookBid ?? 0) + (bid - (cur.bookBid ?? 0)) / n;
+      cur.bookAsk = (cur.bookAsk ?? 0) + (ask - (cur.bookAsk ?? 0)) / n;
     }
     // a later sub-bar: its running extremes start from where the candle's delta stood
     cur.dlo = Math.min(cur.dlo, cur.delta + dlo);
@@ -431,3 +443,4 @@ export function footprintBasis(candles: { time: number; high: number; low: numbe
   }
   return out;
 }
+

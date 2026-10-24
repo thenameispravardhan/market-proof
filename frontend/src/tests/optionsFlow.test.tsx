@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { optionsFlow, type OptFlowTuple } from "../components/trade/indicatorCatalog";
-import { OptionsFlowSection } from "../pages/Trade";
+import { OptionsFlowSection, OptionsStrikeLadder } from "../pages/Trade";
 
 describe("optionsFlow", () => {
   it("nets calls against puts per candle and runs the total per session", () => {
@@ -39,5 +39,31 @@ describe("OptionsFlowSection", () => {
     render(<OptionsFlowSection symbol="NSE:NIFTYBANK-INDEX" />);
     await waitFor(() => expect(fetchMock.mock.calls.length).toBeGreaterThan(1));
     expect(screen.queryByTestId("trade-options-flow")).toBeNull();
+  });
+});
+
+describe("OptionsStrikeLadder", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("lays calls and puts out strike by strike, highest first, with the bullish net", async () => {
+    const rows = [
+      [25000, 650, 325, 0, 1300, 65000, 32337.5, 0, 104000, 136662.5],    // calls bought, puts written: bullish
+      [25100, 0, 0, 900, 0, 0, 0, 45000, 0, -45000],                       // puts bought: bearish
+      [24900, 0, 0, 0, 0, 0, 0, 0, 0, 0],                                  // nothing traded: left out
+    ];
+    const fetchMock = vi.fn(async (_url: string) => ({ ok: true, json: async () => ({ name: "NIFTY", recorded: true, rows }) }));
+    vi.stubGlobal("fetch", fetchMock);
+    const day0 = 20746 * 86400 - 19800;
+    render(<OptionsStrikeLadder symbol="NSE:NIFTY50-INDEX" expiry="near" dayStart={day0} lastBar={day0 + 33300 + 3000} />);
+    await waitFor(() => expect(screen.getByTestId("trade-options-strikes").querySelectorAll("tbody tr").length).toBe(2));
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain("/api/algo/ticks/options-strikes?symbol=NSE%3ANIFTY50-INDEX");
+    expect(url).toContain(`from=${day0}`);                                // the session
+    const strikes = [...screen.getByTestId("trade-options-strikes").querySelectorAll("tbody tr td b")].map((b) => b.textContent);
+    expect(strikes).toEqual(["25100", "25000"]);
+    expect(screen.getByText("₹1.37L")).toBeTruthy();
+    expect(screen.getByText("−₹45.0K")).toBeTruthy();
+    fireEvent.click(screen.getByText("last 15 min"));
+    await waitFor(() => expect(String(fetchMock.mock.calls[fetchMock.mock.calls.length - 1][0])).toContain(`from=${day0 + 33300 + 3000 + 300 - 900}`));
   });
 });

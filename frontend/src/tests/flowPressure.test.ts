@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { flowPressure } from "../components/trade/indicatorCatalog";
+import { bookPressure, flowPressure } from "../components/trade/indicatorCatalog";
+import { flowByCandle } from "../components/trade/footprint";
 
 // Same fixture as app/tests/test_algo.py::test_flow_pressure_absorption_and_aggression: chart and backtest agree.
 describe("flowPressure", () => {
@@ -21,5 +22,23 @@ describe("flowPressure", () => {
     expect(r.deltaZ[25]!).toBeLessThan(-2);
     expect(r.pressure[26]!).toBeLessThan(0);
     expect(r.pressure[29]!).toBeGreaterThan(0);
+  });
+});
+
+describe("bookPressure", () => {
+  it("reads the book's bid vs ask quantity per candle, −100…+100, with an EMA; gaps stay empty", () => {
+    const c = [0, 300, 600, 900].map((time) => ({ time }));
+    const t = (bid: number | null, ask: number | null) => [0, 0, 0, 0, 0, null, null, 0, 0, bid, ask] as (number | null)[];
+    const flow = new Map<number, (number | null)[]>([[0, t(300, 100)], [300, t(100, 300)], [900, t(0, 0)]]);
+    const r = bookPressure(c, flow, 1);
+    expect(r.raw).toEqual([50, -50, null, null]);              // 600: no candle flow; 900: an empty book
+    expect(r.ema).toEqual([50, -50, null, null]);              // smoothing 1 = the raw value
+    expect(bookPressure(c, flow, 3).ema[1]).toBe(0);           // 50 + 0.5 × (−50 − 50)
+  });
+
+  it("averages the book over a candle's sub-bars that carried it", () => {
+    const m = flowByCandle([0], [[0, 1, 1, 0, 1, 0, null, 10, 0, 0, 900, 300], [60, 1, 1, 0, 1, 0, null, 10, 0, 0, 700, 500],
+      [120, 1, 1, 0, 1, 0, null, 10, 0, 0, null, null]], 0);
+    expect([m.get(0)!.bookBid, m.get(0)!.bookAsk]).toEqual([800, 400]);
   });
 });

@@ -91,14 +91,15 @@ export type Category = "Moving averages" | "Bands & channels" | "Trend" | "Oscil
 export const CATEGORIES: Category[] = ["Moving averages", "Bands & channels", "Trend", "Oscillators", "Volume", "Volatility", "Statistics"];
 
 /** One candle's recorded flow: [buy, sell, delta, then optionally trades, unk (no aggressor),
- *  open interest, last trade, the lowest / highest running delta inside the candle]. */
+ *  open interest, last trade, the lowest / highest running delta inside the candle, the book's
+ *  pending buy / sell quantity]. */
 export type FlowTuple = [number, number, number, ...(number | null)[]];
 
 export interface ComputeCtx {
   interval: string;
   up: string; // theme up / down colors for histogram bars
   down: string;
-  /** Real order flow per chart time: [buy, sell, delta, trades, unk, oi, close, delta low, delta high]. */
+  /** Real order flow per chart time: [buy, sell, delta, trades, unk, oi, close, delta low, delta high, book bid, book ask]. */
   flow?: Map<number, FlowTuple>;
   /** Another symbol's closes by chart time (two-symbol indicators). */
   other?: (symbol: string) => Map<number, number> | undefined;
@@ -134,6 +135,24 @@ export function optionsFlow(c: OhlcvCandle[], flow: Map<number, OptFlowTuple> | 
     puts.push(f[2] - f[3]);
   }
   return { net, cum, calls, puts };
+}
+
+/** Book pressure per candle: (bid qty − ask qty) / (bid qty + ask qty) × 100, −100 (all offers)
+ *  … +100 (all bids), from the book's total pending quantity; and its EMA over `smooth` candles.
+ *  null where no book was recorded. */
+export function bookPressure(c: { time: number }[], flow: Map<number, (number | null)[]> | undefined, smooth = 5) {
+  const raw: (number | null)[] = [], ema: (number | null)[] = [];
+  const k = 2 / (Math.max(1, smooth) + 1);
+  let e: number | null = null;
+  for (const bar of c) {
+    const f = flow?.get(bar.time);
+    const bid = f?.[9] ?? null, ask = f?.[10] ?? null;
+    const v = bid != null && ask != null && bid + ask > 0 ? ((bid - ask) / (bid + ask)) * 100 : null;
+    raw.push(v);
+    if (v != null) e = e == null ? v : e + k * (v - e);
+    ema.push(v == null ? null : e);
+  }
+  return { raw, ema };
 }
 
 /** A marker on one bar of a plot (pattern, fractal, divergence …). */
@@ -781,6 +800,27 @@ export const INDICATORS: IndicatorDef[] = [
         close.push(run);
       }
       return { plots: [close], candles: { 0: ohlc } };
+    },
+  },
+  {
+    type: "bookpressure",
+    name: "Book Pressure (bid vs ask quantity, recorded)",
+    short: "Book pressure",
+    category: "Volume",
+    overlay: false,
+    desc: "Who is stacking the order book: the exchange's total pending buy quantity against total pending sell "
+      + "quantity, (bids − offers) / (bids + offers) per candle, −100 (all offers) … +100 (all bids), averaged over "
+      + "the candle, with its EMA. Resting orders, not trades — read it beside delta: heavy bids while price won't "
+      + "rise is supply absorbing them. An index reads its future's book. From the tick recorder.",
+    inputs: [{ key: "smooth", label: "Smoothing (EMA)", type: "int", def: 5, min: 1, max: 100 }],
+    plots: [
+      { key: "pressure", label: "Book pressure", color: "#26A69A", kind: "hist" },
+      { key: "ema", label: "EMA", color: "#FFB300", width: 2 },
+    ],
+    levels: [0],
+    compute: (c, inp, ctx) => {
+      const r = bookPressure(c, ctx.flow, num(inp.smooth, 5));
+      return { plots: [r.raw, r.ema], colors: [r.raw.map((v) => (v == null ? null : v >= 0 ? ctx.up : ctx.down)), null] };
     },
   },
   {

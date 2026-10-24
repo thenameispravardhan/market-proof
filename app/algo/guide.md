@@ -1609,4 +1609,11 @@ for the 95% drawdown, not the one history happened to give.
   — calls and puts bought / sold, in quantity and ₹ premium — on the chart
   (indicator *Index Options Flow*: net premium per candle, + = call buying /
   put writing, with its running total) and in the Trade page's Order flow
-  panel; all expiries or the nearest one.
+  panel; all expiries or the nearest one — and **by strike** there: calls
+  net and puts net per strike (₹), the net, ATM marked, over the session or
+  the last 60 / 15 minutes. **Book Pressure** (chart indicator): the order
+  book's total pending buy vs sell quantity per candle, −100…+100, with an
+  EMA. **Order-flow alerts** (chart › Alerts manager › Order flow): big
+  print ≥ N, delta spike ≥ Nσ, book ≥ N % lopsided, stacked imbalance,
+  absorption, delta divergence — judged on each closed candle (prints as
+  they arrive), each event once, armed when switched on.

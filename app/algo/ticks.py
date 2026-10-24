@@ -1190,13 +1190,12 @@ class FlowStore:
         self._opt_cache[ck] = (stamp, rows)
         return rows
 
-    def _options_day_uncached(self, name: str, d: int, near: bool) -> list[tuple]:
-        out: dict[tuple[int, str], list[float]] = {}
+    def _options_sources(self, name: str, d: int, near: bool) -> tuple[dict[str, dict], list[str]]:
+        """The day's option keys of `name` and the SQL sources of their footprint rows
+        (key, minute, price, buy, sell): the stored day and / or today's working files."""
         keys = self.option_keys(name, d, near)
         if not keys:
-            return []
-        a, b = d * DAY - IST, (d + 1) * DAY - IST
-        kinds = [[k, v["kind"]] for k, v in sorted(keys.items())]
+            return {}, []
         sources = []
         p = self.root / "days" / ymd(d) / "fp.parquet"
         if p.exists():
@@ -1209,8 +1208,15 @@ class FlowStore:
                 f"max(sell) AS sell FROM read_csv([{lst}], header=false, filename=true, ignore_errors=true, "
                 "columns={'minute': 'BIGINT', 'price': 'DOUBLE', 'buy': 'DOUBLE', 'sell': 'DOUBLE'}) "
                 "GROUP BY ALL")
+        return keys, sources
+
+    def _options_day_uncached(self, name: str, d: int, near: bool) -> list[tuple]:
+        out: dict[tuple[int, str], list[float]] = {}
+        keys, sources = self._options_sources(name, d, near)
         if not sources:
             return []
+        a, b = d * DAY - IST, (d + 1) * DAY - IST
+        kinds = [[k, v["kind"]] for k, v in sorted(keys.items())]
         import duckdb
 
         try:
@@ -1235,6 +1241,61 @@ class FlowStore:
             for i in range(4):
                 cur[i] += float(v[i] or 0.0)
         return [(m, k, *v) for (m, k), v in sorted(out.items())]
+
+    def options_by_strike(self, name: str, start: int, end: int, near: bool = True) -> list[tuple]:
+        """`name`'s options in [start, end) added up per strike and right:
+        [(strike, kind, buy, sell, buy_value, sell_value)] — where the money went,
+        strike by strike. Strikes of different expiries add up (`near` keeps the
+        nearest running expiry only, the default). Each day is cached like
+        options_flow (the window is part of the key, to the minute)."""
+        out: dict[tuple[float, str], list[float]] = {}
+        for d in self._days(start, end):
+            a, b = max(start, d * DAY - IST), min(end, (d + 1) * DAY - IST)
+            if a >= b:
+                continue
+            for strike, kind, *v in self._strikes_day(name, d, near, a, b):
+                cur = out.setdefault((strike, kind), [0.0, 0.0, 0.0, 0.0])
+                for i in range(4):
+                    cur[i] += v[i]
+        return [(k, kind, *v) for (k, kind), v in sorted(out.items())]
+
+    def _strikes_day(self, name: str, d: int, near: bool, a: int, b: int) -> list[tuple]:
+        p = self.root / "days" / ymd(d) / "fp.parquet"
+        live = (self.root / "today" / ymd(d)).is_dir()
+        try:
+            stamp: Any = ("live", time.time() // OPT_FLOW_TTL_S) if live else ("day", p.stat().st_mtime)
+        except OSError:
+            stamp = ("none",)
+        ck = ("strikes", name.upper(), d, near, a // 60, b // 60)
+        hit = self._opt_cache.get(ck)
+        if hit is not None and hit[0] == stamp:
+            return hit[1]
+        rows: list[tuple] = []
+        keys, sources = self._options_sources(name, d, near)
+        if sources:
+            import duckdb
+
+            try:
+                con = _duck(threads=2)
+                try:
+                    con.execute("CREATE TEMP TABLE _k(key VARCHAR, kind VARCHAR, strike DOUBLE)")
+                    con.executemany("INSERT INTO _k VALUES (?, ?, ?)",
+                                    [[k, v["kind"], float(v.get("strike") or 0)] for k, v in sorted(keys.items())])
+                    rows = [(float(k), kind, *(float(x or 0.0) for x in v)) for k, kind, *v in con.execute(
+                        f"WITH src AS ({' UNION ALL '.join(sources)}), "
+                        "lv AS (SELECT key, minute, price, max(buy) AS buy, max(sell) AS sell FROM src "
+                        "WHERE minute >= ? AND minute < ? GROUP BY ALL) "
+                        "SELECT _k.strike, _k.kind, sum(buy), sum(sell), sum(buy * price), sum(sell * price) "
+                        "FROM lv JOIN _k USING (key) GROUP BY ALL", [int(a), int(b)]).fetchall()]
+                finally:
+                    con.close()
+            except duckdb.Error as e:
+                log.warning("ticks.options_by_strike_failed", name=name, error=str(e)[:200])
+                return []
+        if len(self._opt_cache) > 256:
+            self._opt_cache.clear()
+        self._opt_cache[ck] = (stamp, rows)
+        return rows
 
     def long_days(self) -> list[str]:
         """Days past the window kept for the research short list only (trimmed)."""
