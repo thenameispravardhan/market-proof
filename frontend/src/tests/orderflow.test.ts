@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  analyze, barSignals, candleAt, cellLayout, DEFAULT_FOOTPRINT, flowByCandle, footprintByCandle, fpSettings, groupRows, inferTick, rowStep,
+  analyze, barSignals, candleAt, cellLayout, DEFAULT_FOOTPRINT, flowByCandle, footprintByCandle, fpSettings, groupRows, heatColor, inferTick, nakedPocs, rowStep,
   sessionBasis, sessionCvd, type FlowBar,
 } from "../components/trade/footprint";
 import { INDICATOR_BY_TYPE, type FlowTuple } from "../components/trade/indicatorCatalog";
@@ -108,5 +108,35 @@ describe("CVD candles", () => {
     expect(r.candles?.[0]).toEqual([[0, 30, -5, 20], [20, 22, -15, -10], null, [0, 5, 0, 5]]);
     const run = def.compute(c, { reset: "none" }, { interval: "5", up: "#0f0", down: "#f00", flow });
     expect(run.plots[0]).toEqual([20, -10, null, -5]);
+  });
+});
+
+describe("footprint views: heatmap, naked POCs, profile options", () => {
+  it("keeps only POCs no later bar traded through", () => {
+    // [high, low, POC row low]; step 1: a POC row is [p, p + 1)
+    const bars: [number, number, number | null][] = [
+      [105, 100, 102],   // tested: bar 2 trades 101-103
+      [110, 106, 108],   // naked: nothing later reaches 108
+      [103, 101, 101],   // naked: bar 3's low is 102 > 101's row [101, 102)
+      [104, 102, null],  // no footprint
+    ];
+    expect(nakedPocs(bars, 1)).toEqual([[1, 108], [2, 101]]);
+    expect(nakedPocs([[100, 99, 99.5], [99.5, 98, null]], 0.5)).toEqual([]);   // touched at the row's low edge
+  });
+
+  it("ramps the heat colour from blue to red and clamps", () => {
+    expect(heatColor(0)).toBe("hsla(230, 85%, 38%, 1)");
+    expect(heatColor(1, 0.5)).toBe("hsla(0, 85%, 52%, 0.5)");
+    expect(heatColor(7)).toBe(heatColor(1));
+    expect(heatColor(-1)).toBe(heatColor(0));
+  });
+
+  it("normalises the new settings and keeps stored ones", () => {
+    const d = fpSettings(undefined);
+    expect([d.mode, d.profileScope, d.profileType, d.npoc, d.numbers]).toEqual(["bidask", "visible", "volume", false, true]);
+    expect(fpSettings({ mode: "heatmap", profileScope: "session", profileType: "delta", npoc: true, numbers: false }))
+      .toMatchObject({ mode: "heatmap", profileScope: "session", profileType: "delta", npoc: true, numbers: false });
+    expect(fpSettings({ mode: "nope" as never, profileScope: "x" as never, profileType: "y" as never }))
+      .toMatchObject({ mode: "bidask", profileScope: "visible", profileType: "volume" });
   });
 });
