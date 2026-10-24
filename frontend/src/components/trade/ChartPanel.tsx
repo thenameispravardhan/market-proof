@@ -140,7 +140,7 @@ import {
   type ToolGroupId,
 } from "./drawings";
 import { ShapeSeries, type ShapeMode } from "./customSeries";
-import { candleAt, flowByCandle, footprintByCandle, fpSettings, sessionBasis, sessionCvd, STAT_LABEL, STAT_ROW_PX, type FlowBar, type FootprintSettings, type StatRow } from "./footprint";
+import { candleAt, flowByCandle, footprintBasis, footprintByCandle, fpSettings, sessionCvd, STAT_LABEL, STAT_ROW_PX, type FlowBar, type FootprintSettings, type StatRow } from "./footprint";
 import { beep, evaluate, migrateAlert, newAlert, type AlertItem } from "./alerts";
 import { chartFocus, drawingClipboard, indicatorClipboard, NO_SYNC, publishSync, pushLog, subscribeSync, type SyncFlags } from "./chartSync";
 import { LIGHT, brickInputs, loadSettings, saveSettings, type BrickKind, type ChartSettings } from "./chartSettings";
@@ -1123,6 +1123,8 @@ export default function ChartPanel(props: ChartPanelProps) {
   const optFlowRef = useRef<Map<number, OptFlowTuple>>(new Map());
   /** Footprint per candle: [price, buy, sell] levels and big prints [price, qty, side]. */
   const fpRef = useRef<Map<number, { fp: [number, number, number][]; prints: [number, number, number][] }>>(new Map());
+  /** The same at the recorded prices (an index's are its future's), before the basis shift. */
+  const fpRawRef = useRef<Map<number, { fp: [number, number, number][]; prints: [number, number, number][] }>>(new Map());
   /** Bar spacing from before the footprint widened it; restored on leaving. */
   const fpSpacingRef = useRef<number | null>(null);
   const markersRef = useRef<{ detach: () => void; setMarkers: (m: never[]) => void } | null>(null);
@@ -3814,6 +3816,7 @@ export default function ChartPanel(props: ChartPanelProps) {
     flowRef.current = new Map();
     cvdRef.current = new Map();
     fpRef.current = new Map();
+    fpRawRef.current = new Map();
     if (!flowWanted) {
       setFlowNote("");
       return;
@@ -3854,39 +3857,46 @@ export default function ChartPanel(props: ChartPanelProps) {
         for (const t of times.slice(start)) flowRef.current.delete(t);
         for (const [t, f] of fresh) flowRef.current.set(t, [f.buy, f.sell, f.delta, f.trades, f.unk, f.oi, f.close, f.dlo, f.dhi]);
         cvdRef.current = sessionCvd(times, new Map([...flowRef.current].map(([t, f]) => [t, { delta: f[2] } as FlowBar])));
+        // what the chart holds (the latest poll only covers the last two candles: a quiet
+        // forming bar must not read as "nothing recorded" over a screen full of footprints)
+        const recorded = flowRef.current.size > 0 || fpRawRef.current.size > 0 || !!fj?.footprint?.length;
         if (fj) {
-          // An index has no trades: its flow is the FUTURE's, at futures prices — each session's rows
-          // shift by that session's basis (futures − index, the median over its candles), snapped to the tick.
-          const proxy = symbol.toUpperCase().endsWith("-INDEX");
-          const basis = proxy
-            ? sessionBasis(c.map((k) => ({ time: k.time as number, close: k.close })),
-              new Map([...flowRef.current].map(([t, f]) => [t, { close: f[6] ?? null } as FlowBar])))
-            : null;
-          const tick = tickRef.current;
-          const shift = (t: number, p: number) => {
-            const b = basis?.get(Math.floor(t / 86400));
-            return b == null ? p : Math.round((p - b) / tick) * tick;
-          };
           const fpBy = footprintByCandle(times, fj.footprint ?? [], IST);
           const prints = new Map<number, [number, number, number][]>();
           for (const [ts, p, q, sd] of fj.prints ?? []) {
             const i = candleAt(times, ts + IST);
-            if (i >= 0) prints.set(times[i], [...(prints.get(times[i]) ?? []), [shift(times[i], p), q, sd]]);
+            if (i >= 0) prints.set(times[i], [...(prints.get(times[i]) ?? []), [p, q, sd]]);
           }
-          if (full) fpRef.current = new Map();
+          if (full) fpRawRef.current = new Map();
           const from = full ? Math.max(0, c.length - FOOTPRINT_BARS) : start;
           for (const t of times.slice(from)) {
             const m = fpBy.get(t);
             if (!m) {
-              fpRef.current.delete(t);
+              fpRawRef.current.delete(t);
               continue;
             }
-            fpRef.current.set(t, { fp: [...m].map(([p, [b, sl]]) => [shift(t, p), b, sl] as [number, number, number]), prints: prints.get(t) ?? [] });
+            fpRawRef.current.set(t, { fp: [...m].map(([p, [b, sl]]) => [p, b, sl] as [number, number, number]), prints: prints.get(t) ?? [] });
           }
-          setFlowNote(j.recorded ? `order flow: ${j.key}${proxy ? " (the future's flow, shifted onto the index by the basis)" : ""}`
+          // An index has no trades: its footprint is the FUTURE's, at futures prices. Each session's
+          // rows shift by that session's basis, measured from the footprint against the index candles
+          // (footprintBasis), and every bar is re-laid when the basis moves, so a session stays steady.
+          const proxy = symbol.toUpperCase().endsWith("-INDEX");
+          const tick = tickRef.current;
+          const basis = proxy ? footprintBasis(c.map((k) => ({ time: k.time as number, high: k.high, low: k.low })), fpRawRef.current, tick) : null;
+          const shift = (t: number, p: number) => {
+            const b = basis?.get(Math.floor(t / 86400));
+            return b == null ? p : Math.round((p - b) / tick) * tick;
+          };
+          fpRef.current = proxy
+            ? new Map([...fpRawRef.current].map(([t, v]) => [t, {
+              fp: v.fp.map(([p, b, sl]) => [shift(t, p), b, sl] as [number, number, number]),
+              prints: v.prints.map(([p, q, sd]) => [shift(t, p), q, sd] as [number, number, number]),
+            }]))
+            : new Map(fpRawRef.current);
+          setFlowNote(recorded ? `order flow: ${j.key}${proxy ? " (the future's footprint, shifted onto the index by the session's basis)" : ""}`
             : `no order flow recorded for ${j.key} yet — Algo Lab › Data records it`);
         } else {
-          setFlowNote(j.recorded ? `order flow: ${j.key}` : `no order flow recorded for ${j.key} yet — Algo Lab › Data records it`);
+          setFlowNote(recorded ? `order flow: ${j.key}` : `no order flow recorded for ${j.key} yet — Algo Lab › Data records it`);
         }
         if (full) {
           lastFull = Date.now();
