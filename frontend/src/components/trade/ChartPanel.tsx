@@ -113,6 +113,7 @@ import {
   type Mark,
   type PlotKind,
   type FlowTuple,
+  type OptFlowTuple,
 } from "./indicatorCatalog";
 import { symbolInputs, volumeProfileRows } from "./indicatorMore";
 import { FillPrimitive, paintOiProfile, paintProfile, type FillBand, type OiStrike } from "./indicatorRender";
@@ -203,7 +204,7 @@ const BRICK_KINDS = new Set<ChartKind>(["renko", "linebreak", "kagi", "pnf", "ra
 /** Indicators that read recorded order flow (they switch the flow loader on). */
 const FLOW_TYPES = new Set(["flow", "flowpressure", "cvd"]);
 /** Indicators whose values are share counts: shown as 18.6K / 1.2M rather than 18600.00. */
-const VOLUME_TYPES = new Set(["volume", "obv", "flow", "oi", "cvd"]);
+const VOLUME_TYPES = new Set(["volume", "obv", "flow", "oi", "cvd", "optflow"]);
 /** Candles of footprint detail loaded (the latest): enough to scroll, light to refresh. */
 const FOOTPRINT_BARS = 400;
 const CUSTOM_MODE: Partial<Record<ChartKind, ShapeMode>> = {
@@ -1118,6 +1119,7 @@ export default function ChartPanel(props: ChartPanelProps) {
   const flowRef = useRef<Map<number, FlowTuple>>(new Map());
   /** Session-cumulative delta per candle. */
   const cvdRef = useRef<Map<number, number>>(new Map());
+  const optFlowRef = useRef<Map<number, OptFlowTuple>>(new Map());
   /** Footprint per candle: [price, buy, sell] levels and big prints [price, qty, side]. */
   const fpRef = useRef<Map<number, { fp: [number, number, number][]; prints: [number, number, number][] }>>(new Map());
   /** Bar spacing from before the footprint widened it; restored on leaving. */
@@ -2199,6 +2201,7 @@ export default function ChartPanel(props: ChartPanelProps) {
       up: colorsRef.current.volUp,
       down: colorsRef.current.volDown,
       flow: flowRef.current,
+      optFlow: optFlowRef.current,
       other: (sym: string) => otherDataRef.current.get(sym.trim().toUpperCase())?.closes,
     };
     const uids = [...new Set(indEntriesRef.current.map((e) => e.uid))];
@@ -3900,6 +3903,56 @@ export default function ChartPanel(props: ChartPanelProps) {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [flowWanted, chartKind, symbol, iv, reloadNonce]);
+
+  // 4b') An index's options together (the "optflow" indicator): calls vs puts premium per
+  //      candle for the index, its future or one of its options — the loaded range (at most
+  //      the last 30 days) every 10 s; the server adds up every recorded contract.
+  const optInd = indicators.find((i) => i.type === "optflow" && i.visible);
+  const optExpiry = optInd && optInd.inputs?.expiry === "near" ? "near" : optInd ? "all" : "";
+  useEffect(() => {
+    optFlowRef.current = new Map();
+    if (!optExpiry) return;
+    let stop = false;
+    let busy = false;
+    const load = async () => {
+      const c = candlesRef.current;
+      if (busy || !c.length || statusRef.current !== "ready") return;
+      busy = true;
+      try {
+        const now = Math.floor(Date.now() / 1000);
+        const res = fetchPlan(ivRef.current).res;
+        const resolution = /^\d+$/.test(res) || res === "D" ? res : "1";
+        const times = c.map((k) => k.time as number);
+        const from = Math.max(times[0] - IST, now - 30 * 86400);
+        const q = new URLSearchParams({ symbol, resolution, from: String(from), to: String(now + 60), expiry: optExpiry });
+        const r = await fetch(`/api/algo/ticks/options-flow?${q.toString()}`);
+        if (!r.ok || stop) return;
+        const j = (await r.json()) as { bars?: number[][] };
+        const m = new Map<number, OptFlowTuple>();
+        for (const b of j.bars ?? []) {
+          const i = candleAt(times, b[0] + IST);
+          if (i < 0) continue;
+          const cur = m.get(times[i]) ?? [0, 0, 0, 0, 0];
+          for (let k = 0; k < 4; k++) cur[k] += b[5 + k] ?? 0;
+          cur[4] += b[9] ?? 0;
+          m.set(times[i], cur);
+        }
+        optFlowRef.current = m;
+        refreshIndicatorData();
+      } catch {
+        /* the next poll retries */
+      } finally {
+        busy = false;
+      }
+    };
+    void load();
+    const id = setInterval(load, 10_000);
+    return () => {
+      stop = true;
+      clearInterval(id);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [optExpiry, symbol, iv, reloadNonce]);
 
   // 4c) Corporate events (dividends / splits / earnings / bonus) from the
   //     filed announcements.
