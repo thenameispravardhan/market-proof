@@ -3,7 +3,7 @@
 // bars, HLC area, Kagi lines, Point & figure columns, and the order-flow
 // footprint (sell | buy volume per price beside a thin candle, Fyers-style).
 
-import { analyze, barSignals, cellLayout, fpSettings, groupRows, rowStep, STAT_LABEL, STAT_ROW_PX, type FootprintSettings, type FpBarStats, type StatRow } from "./footprint";
+import { analyze, barSignals, cellLayout, fpSettings, groupRows, heatColor, nakedPocs, rowStep, STAT_LABEL, STAT_ROW_PX, type FootprintSettings, type FpBarStats, type StatRow } from "./footprint";
 import type {
   CustomData,
   CustomSeriesOptions,
@@ -242,7 +242,17 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
       for (const k of fs.stats) maxVis[k] = Math.max(maxVis[k] ?? 0, Math.abs(statValue(k, st)));
     }
     const clamp = (d: OhlcItem) => (d.fp ?? []).map(([p, b2, s2]) => [Math.min(d.high, Math.max(d.low, p)), b2, s2] as [number, number, number]);
-    if (fs.profile) this.profile(ctx, bars, lo, hi, step, tick, Y, paneW, up, down, poc, fs.vaPct, clamp);
+    if (fs.profile && fs.profileScope === "session") this.sessionProfiles(ctx, bars, lo, hi, step, tick, Y, half, up, down, poc, fs, clamp);
+    else if (fs.profile) this.profile(ctx, bars, lo, hi, step, tick, Y, paneW, up, down, poc, fs.vaPct, clamp, fs.profileType);
+    // heatmap: every cell against the busiest cell on screen, so heavy prices stand out ACROSS bars
+    let heatMax = 0;
+    if (fs.mode === "heatmap") {
+      for (let i = lo; i < hi; i++) {
+        for (const r of groupRows(clamp(bars[i].originalData), step)) heatMax = Math.max(heatMax, r.buy + r.sell);
+      }
+    }
+    const pocs: [number, number, number | null][] = [];      // [high, low, POC row] per bar from `first`, for naked POCs
+    const pocAt: { x: number; y: number; i: number }[] = [];
     const zones: { y0: number; y1: number; lo: number; hi: number; side: 1 | -1; x: number; i: number }[] = [];
     const bubbles: { x: number; y: number; q: number; side: number }[] = [];
     const marks: { x: number; y: number; side: 1 | -1; label: string }[] = [];
@@ -265,19 +275,26 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
         ctx.fillRect(candleX - bodyW / 2, Math.min(yo, yc), bodyW, Math.max(1, Math.abs(yc - yo)));
       }
       if (!d.fp?.length) {
+        pocs.push([d.high, d.low, null]);
+        pocAt.push({ x: right, y: 0, i });
         if (visible) this.statsCells(ctx, d, b.x, half, statsTop, statH, fs, maxVis, up, down, text);
         continue;
       }
       const a = analyze(groupRows(clamp(d), step), step, fs);
       const g = cellLayout(d.low, d.high, step, yh, yl, flatPx);
       for (const z of a.zones) zones.push({ ...z, y0: g.box(round6(z.hi - step))[0], y1: g.box(z.lo)[1], x: right, i });
+      pocs.push([d.high, d.low, a.poc]);
+      if (a.poc !== null) {
+        const [pt, pb] = g.box(a.poc);
+        pocAt.push({ x: right, y: (pt + pb) / 2, i });
+      } else pocAt.push({ x: right, y: 0, i });
       if (!visible) continue;
       const cx0 = bs >= 24 ? left + 8 : left, cx1 = right - 1;
       const cw = cx1 - cx0;
       if (cw >= 6) {
         const font = g.rowPx >= 13 ? 11 : g.rowPx >= 10 ? 10 : 9;
         ctx.font = `${font}px sans-serif`;
-        const showText = g.rowPx >= 9;
+        const showText = fs.numbers && g.rowPx >= 9;
         for (const r of a.rows) {
           const [yt, yb] = g.box(r.p);
           const y = yt + 0.5, h = Math.max(1, yb - yt - 1);
@@ -313,6 +330,17 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
               ctx.textAlign = "center";
               ctx.fillStyle = text;
               ctx.fillText(t, cx0 + cw / 2, y + h / 2);
+            }
+          } else if (fs.mode === "heatmap") {
+            const t = vol / Math.max(1, heatMax);
+            ctx.fillStyle = heatColor(t, 0.18 + 0.72 * Math.sqrt(t));
+            ctx.fillRect(cx0, y, cw, h);
+            if (buyImb || sellImb) this.edge(ctx, cx0, y, cw, h, buyImb ? up : down);
+            const tv = fmtCell(vol);
+            if (showText && fits(tv, cw)) {
+              ctx.textAlign = "center";
+              ctx.fillStyle = t > 0.55 ? "#111" : text;
+              ctx.fillText(tv, cx0 + cw / 2, y + h / 2);
             }
           } else {
             const w = Math.max(1, cw * (vol / Math.max(1, a.maxVol)));
@@ -359,6 +387,29 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
         }
       }
       this.statsCells(ctx, d, b.x, half, statsTop, statH, fs, maxVis, up, down, text);
+    }
+    // naked POCs: a bar's POC no later bar traded through, drawn on to the right edge with its price
+    if (fs.npoc && pocs.length) {
+      ctx.save();
+      ctx.strokeStyle = alpha(poc, 0.75);
+      ctx.fillStyle = poc;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([2, 3]);
+      ctx.font = "9px sans-serif";
+      ctx.textAlign = "right";
+      ctx.textBaseline = "bottom";
+      for (const [k, p] of nakedPocs(pocs, step)) {
+        const at = pocAt[k];
+        if (!at || at.i >= hi - 1) continue;              // the forming bar's POC still moves
+        const y = Math.round(at.y) + 0.5;
+        ctx.beginPath();
+        ctx.moveTo(at.x, y);
+        ctx.lineTo(paneW, y);
+        ctx.stroke();
+        ctx.fillText(`nPOC ${p.toFixed(2)}`, paneW - 4, y - 1);
+      }
+      ctx.restore();
+      ctx.textBaseline = "middle";
     }
     // stacked imbalance zones: from their bar to the first later bar that trades back into them
     for (const z of zones) {
@@ -429,7 +480,7 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
    *  a dashed POC line across the pane, labelled with its price. */
   private profile(ctx: CanvasRenderingContext2D, bars: PaneRendererCustomData<Time, OhlcItem>["bars"], lo: number, hi: number,
     step: number, tick: number, Y: (p: number) => number | null, paneW: number, up: string, down: string,
-    poc: string, vaPct: number, clamp: (d: OhlcItem) => [number, number, number][]): void {
+    poc: string, vaPct: number, clamp: (d: OhlcItem) => [number, number, number][], type: "volume" | "delta" = "volume"): void {
     const levels: [number, number, number][] = [];
     for (let i = lo; i < hi; i++) levels.push(...clamp(bars[i].originalData));
     if (!levels.length) return;
@@ -437,19 +488,7 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
     if (!a.maxVol) return;
     const maxW = Math.min(170, paneW * 0.16);
     const xr = paneW - 1;
-    for (const r of a.rows) {
-      const ya = Y(r.p + step - tick / 2), yb = Y(r.p - tick / 2);
-      if (ya === null || yb === null) continue;
-      const y = Math.min(ya, yb) + 0.5, h = Math.max(1, Math.abs(yb - ya) - 1);
-      const vol = r.buy + r.sell;
-      const w = maxW * (vol / a.maxVol), wb = w * (r.buy / Math.max(1e-9, vol));
-      const inVa = a.val !== null && a.vah !== null && r.p >= a.val && r.p <= a.vah;
-      const k = r.p === a.poc ? 0.75 : inVa ? 0.42 : 0.22;
-      ctx.fillStyle = alpha(down, k);
-      ctx.fillRect(xr - w, y, w - wb, h);
-      ctx.fillStyle = alpha(up, k);
-      ctx.fillRect(xr - wb, y, wb, h);
-    }
+    this.histogram(ctx, a, step, tick, Y, xr, -1, maxW, up, down, type);
     if (a.poc === null) return;
     const yp = Y(a.poc + (step - tick) / 2);
     if (yp === null) return;
@@ -468,6 +507,64 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
     ctx.fillStyle = poc;
     ctx.fillText(`VPOC ${a.poc.toFixed(2)}`, xr - maxW - 4, yp - 2);
     ctx.textBaseline = "middle";
+  }
+
+  /** One profile's rows as horizontal bars growing from `x0` (dir −1 = leftwards from the right edge,
+   *  +1 = rightwards). Volume: the buy part nearer `x0`, the sell part beyond it, the value area a shade
+   *  stronger. Delta: buy − sell per row, coloured by its side. */
+  private histogram(ctx: CanvasRenderingContext2D, a: ReturnType<typeof analyze>, step: number, tick: number,
+    Y: (p: number) => number | null, x0: number, dir: 1 | -1, maxW: number, up: string, down: string,
+    type: "volume" | "delta", fade = 1): void {
+    const maxD = Math.max(1e-9, ...a.rows.map((r) => Math.abs(r.buy - r.sell)));
+    for (const r of a.rows) {
+      const ya = Y(r.p + step - tick / 2), yb = Y(r.p - tick / 2);
+      if (ya === null || yb === null) continue;
+      const y = Math.min(ya, yb) + 0.5, h = Math.max(1, Math.abs(yb - ya) - 1);
+      const inVa = a.val !== null && a.vah !== null && r.p >= a.val && r.p <= a.vah;
+      const k = (r.p === a.poc ? 0.75 : inVa ? 0.42 : 0.22) * fade;
+      if (type === "delta") {
+        const d = r.buy - r.sell, w = maxW * (Math.abs(d) / maxD);
+        ctx.fillStyle = alpha(d >= 0 ? up : down, Math.max(k, 0.3 * fade));
+        ctx.fillRect(dir < 0 ? x0 - w : x0, y, w, h);
+        continue;
+      }
+      const vol = r.buy + r.sell;
+      const w = maxW * (vol / a.maxVol), wb = w * (r.buy / Math.max(1e-9, vol));
+      ctx.fillStyle = alpha(up, k);
+      ctx.fillRect(dir < 0 ? x0 - wb : x0, y, wb, h);
+      ctx.fillStyle = alpha(down, k);
+      ctx.fillRect(dir < 0 ? x0 - w : x0 + wb, y, w - wb, h);
+    }
+  }
+
+  /** A profile per session (IST day), drawn from the session's first bar rightwards over its own
+   *  bars, faint enough to read the cells through, with its POC as a solid line across the session. */
+  private sessionProfiles(ctx: CanvasRenderingContext2D, bars: PaneRendererCustomData<Time, OhlcItem>["bars"], lo: number, hi: number,
+    step: number, tick: number, Y: (p: number) => number | null, half: number, up: string, down: string, poc: string,
+    fs: FootprintSettings, clamp: (d: OhlcItem) => [number, number, number][]): void {
+    const days = new Map<number, number[]>();
+    for (let i = lo; i < hi; i++) {
+      const t = Number(bars[i].originalData.time);
+      if (!Number.isFinite(t)) continue;
+      const d = Math.floor(t / 86400);
+      const list = days.get(d) ?? [];
+      list.push(i);
+      days.set(d, list);
+    }
+    for (const idx of days.values()) {
+      const levels: [number, number, number][] = [];
+      for (const i of idx) levels.push(...clamp(bars[i].originalData));
+      if (!levels.length) continue;
+      const a = analyze(groupRows(levels, step), step, { imbalance: 0, imbalanceMin: 0, stacked: 0, vaPct: fs.vaPct });
+      if (!a.maxVol) continue;
+      const x0 = bars[idx[0]].x - half, x1 = bars[idx[idx.length - 1]].x + half;
+      this.histogram(ctx, a, step, tick, Y, x0, 1, Math.max(8, (x1 - x0) * 0.45), up, down, fs.profileType, 0.6);
+      if (a.poc === null) continue;
+      const yp = Y(a.poc + (step - tick) / 2);
+      if (yp === null) continue;
+      ctx.fillStyle = alpha(poc, 0.8);
+      ctx.fillRect(x0, Math.round(yp), x1 - x0, 1);
+    }
   }
 
   private statsCells(ctx: CanvasRenderingContext2D, d: OhlcItem, x: number, half: number, top: number, h: number,
