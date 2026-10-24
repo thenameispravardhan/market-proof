@@ -964,6 +964,7 @@ export default function ChartPanel(props: ChartPanelProps) {
   const [paneRects, setPaneRects] = useState<{ i: number; top: number; height: number }[]>([]);
   /** Width of a visible left price axis — the legends start right of it. */
   const [leftAxisW, setLeftAxisW] = useState(0);
+  const [rightAxisW, setRightAxisW] = useState(0);
   const [paneMode, setPaneMode] = useState<{ max: number | null; collapsed: number[] }>({ max: null, collapsed: [] });
   const [events, setEvents] = useState<ChartEvent[]>([]);
   const [eventTip, setEventTip] = useState<{ x: number; text: string } | null>(null);
@@ -1995,6 +1996,8 @@ export default function ChartPanel(props: ChartPanelProps) {
     );
     const lw = scaleWidth("left");
     setLeftAxisW((w) => (Math.abs(w - lw) < 1 ? w : lw));
+    const rw = scaleWidth("right");
+    setRightAxisW((w) => (Math.abs(w - rw) < 1 ? w : rw));
   }
 
   const LS = [LineStyle.Solid, LineStyle.Dotted, LineStyle.Dashed];
@@ -6872,7 +6875,9 @@ ${hh ? `${hh}:${String(mm).padStart(2, "0")}` : mm}:${String(ss).padStart(2, "0"
               data-testid="chart-text-input"
             />
           )}
-          <div className="chart-nav chart-overlay-ui" onMouseDown={(e) => e.stopPropagation()}>
+          {/* centred over the plot, not the whole box: the price scales take their width off either side */}
+          <div className="chart-nav chart-overlay-ui" onMouseDown={(e) => e.stopPropagation()}
+            style={{ left: `calc(${leftAxisW}px + (100% - ${leftAxisW + rightAxisW}px) / 2)` }} data-testid="chart-nav">
             <button type="button" onClick={() => zoomBy(0.8)} title="Zoom out">−</button>
             <button type="button" onClick={() => zoomBy(1.25)} title="Zoom in">+</button>
             <button type="button" onClick={() => scrollBars(-10)} title="Scroll to the left">‹</button>
