@@ -81,9 +81,11 @@ function route(url: string, init?: RequestInit) {
     last_run: 1761140000, last: { strategies: 4, flagged: 1, new_flags: 1, elapsed_s: 40 },
     flags: [{ id: 3, strategy_id: 12, name: "ORB", card_id: 8, reason: "below the bar on the latest data: Deflated Sharpe ≥ 95% after 31 tries", created_at: "2026-10-21T13:01:00Z" }] });
   if (url.includes("/api/algo/research/universe/nifty50/changes")) return json({ added: 2, total: 2, changes: 2 });
+  if (url.includes("/api/algo/research/universe/niftybank/snapshot")) return json({ recorded: true, day: "20261024", members: 12 });
   if (url.includes("/api/algo/research/universe")) return json({ indexes: [
     { index: "nifty50", label: "NIFTY 50", snapshots: 3, first_snapshot: "20251001", last_snapshot: "20251022", changes: 0, first_change: null, trusted_from: "20251001", members_now: 50 },
-    { index: "niftybank", label: "NIFTY Bank", snapshots: 0, first_snapshot: null, last_snapshot: null, changes: 0, first_change: null, trusted_from: null, members_now: 0 }] });
+    { index: "niftybank", label: "NIFTY Bank", snapshots: 0, first_snapshot: null, last_snapshot: null, changes: 0, first_change: null, trusted_from: null, members_now: 0,
+      list_url: "https://www.niftyindices.com/IndexConstituent/ind_niftybanklist.csv" }] });
   if (url.includes("/api/algo/research/surface/evaluate")) return json({
     name: "NIFTY", days: 14, quotes: 52000, lag: 1, methods: ["surface", "flat_atm", "flat"], min_days: 10, beats_flat: true,
     verdict: "the surface prices closer than flat IV", flat_source: "India VIX", elapsed_s: 3.1,
@@ -233,6 +235,15 @@ describe("Algo Lab research loop", () => {
     fireEvent.click(screen.getByText("Import"));
     await waitFor(() => expect(calls.some((c) => c.url.includes("/universe/nifty50/changes"))).toBe(true));
     expect(calls.find((c) => c.url.includes("/universe/nifty50/changes"))!.body).toEqual({ csv: "2024-03-28,SHRIRAMFIN,add\n2024-03-28,UPL,remove" });
+    // a list the server couldn't fetch: downloaded in the browser and pasted
+    fireEvent.click(within(screen.getByTestId("universe-niftybank")).getByText("paste list"));
+    const box = screen.getByTestId("universe-paste");
+    expect(within(box).getByText("the constituent file").getAttribute("href")).toBe("https://www.niftyindices.com/IndexConstituent/ind_niftybanklist.csv");
+    fireEvent.change(screen.getByTestId("universe-paste-text"), { target: { value: "Company Name,Industry,Symbol,Series\nHDFC Bank,Banks,HDFCBANK,EQ" } });
+    fireEvent.click(within(box).getByText("Record"));
+    await waitFor(() => expect(calls.some((c) => c.url.includes("/universe/niftybank/snapshot"))).toBe(true));
+    expect(calls.find((c) => c.url.includes("/universe/niftybank/snapshot"))!.body).toEqual({ symbols: "Company Name,Industry,Symbol,Series\nHDFC Bank,Banks,HDFCBANK,EQ" });
+    await waitFor(() => expect(screen.queryByTestId("universe-paste")).toBeNull());
   });
 
   it("switches the nightly re-validation on and clears a flag with a note", async () => {
