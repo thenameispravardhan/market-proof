@@ -51,6 +51,11 @@ export interface FootprintSettings {
   devLines: boolean;
   /** How many of the latest candles get their footprint loaded (more = more to scroll back through, heavier). */
   historyBars: number;
+  /** time = the chart's candles; range / volume / tick = bars that close on price range, quantity or trade
+   *  count, built tick by tick on the server from the raw frames (the focus symbols keep them). */
+  barType: "time" | "range" | "volume" | "tick";
+  /** The range (price), quantity or trade count of a bar; 0 = the type's default (BAR_SIZE). */
+  barSize: number;
   /** Absorption and delta-divergence markers. */
   signals: boolean;
   /** Each bar's POC extended to the right until price trades back through it (only the untested ones). */
@@ -77,10 +82,15 @@ export const DEFAULT_FOOTPRINT: FootprintSettings = {
   profileType: "volume",
   devLines: false,
   historyBars: 400,
+  barType: "time",
+  barSize: 0,
   signals: true,
   npoc: false,
   numbers: true,
 };
+
+/** A non-time bar's default size: range in price points, volume in quantity, tick in trades. */
+export const BAR_SIZE = { range: 5, volume: 20000, tick: 300 } as const;
 
 export const STAT_LABEL: Record<StatRow, string> = {
   vol: "Volume", delta: "Delta", dpct: "Delta %", cvd: "CVD", dmin: "Min Δ", dmax: "Max Δ", trades: "Trades", oi: "OI Δ",
@@ -96,6 +106,8 @@ export function fpSettings(raw: Partial<FootprintSettings> | undefined): Footpri
     profileScope: s.profileScope === "session" || s.profileScope === "composite" ? s.profileScope : "visible",
     compositeDays: Math.min(30, Math.max(1, Math.round(Number(s.compositeDays) || DEFAULT_FOOTPRINT.compositeDays))),
     historyBars: Math.min(3000, Math.max(100, Math.round(Number(s.historyBars) || DEFAULT_FOOTPRINT.historyBars))),
+    barType: (["time", "range", "volume", "tick"] as const).includes(s.barType) ? s.barType : "time",
+    barSize: Number.isFinite(Number(s.barSize)) && Number(s.barSize) > 0 ? Number(s.barSize) : 0,
     profileType: s.profileType === "delta" || s.profileType === "tpo" ? s.profileType : "volume",
     stats: Array.isArray(s.stats) ? s.stats.filter((x) => x in STAT_LABEL) : DEFAULT_FOOTPRINT.stats,
   };

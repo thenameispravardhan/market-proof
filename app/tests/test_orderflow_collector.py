@@ -371,6 +371,7 @@ async def test_collector_plans_reports_and_sheds_load(tmp_path, monkeypatch):
     plan = ticks.read_json(tmp_path / "plan.json")
     assert plan["used"] == len(c.symbols) > 50 and plan["classes"]["focus"] == 1
     assert c.rec.raw_keys == {"ITC"} and c.rec.key_of["NSE:NIFTY26NOVFUT"] == "NIFTY-FUT2"
+    assert c.rec.depth_keys == {"NSE:NIFTY26OCTFUT": "NIFTY-FUT"}           # the index's current future's book
     assert ticks.read_json(tmp_path / "today" / ticks.ymd(DAY0) / "meta.json")["NIFTY-FUT"]["symbol"] == "NSE:NIFTY26OCTFUT"
     c.write_status()
     st = ticks.read_json(tmp_path / "status.json")
