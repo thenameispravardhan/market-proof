@@ -1054,6 +1054,36 @@ def _options_flow_name(symbol: str) -> Optional[str]:
     return fno.underlying_of(s)
 
 
+@router.get("/ticks/icebergs")
+async def ticks_icebergs(symbol: str, from_ts: int = Query(..., alias="from"), to_ts: int = Query(..., alias="to"),
+                         min_ratio: float = Query(2.0, ge=1.0, le=50.0)) -> dict[str, Any]:
+    """Likely icebergs (app/algo/iceberg.py) from the raw frames: a price where the
+    quantity traded reached `min_ratio` x the largest size the book ever showed
+    there while it held. Each: {start, end, price, side, traded, shown, refills,
+    ratio} — side is the hidden order's (SELL = an offer absorbing buyers). Raw
+    frames are kept only for the focus symbols (raw_days); an index reads its
+    future's, at futures prices (`key` says which)."""
+    from app.algo import iceberg, ticks
+
+    if not 0 < to_ts - from_ts <= 7 * 86400:
+        raise HTTPException(422, detail="from must be before to, at most 7 days apart")
+    fy = data.fyers_symbol(symbol)
+    st = ticks.store()
+
+    def work() -> tuple[list[dict[str, Any]], str, bool]:
+        out: list[dict[str, Any]] = []
+        key, any_raw = ticks.flow_key(fy), False
+        for day, key in sorted(st.keys_for(fy, from_ts, to_ts).items()):
+            a, b = max(from_ts, day * 86400 - 19800), min(to_ts, (day + 1) * 86400 - 19800)
+            frames = st.raw_frames(key, a, b)
+            any_raw = any_raw or bool(frames)
+            out += iceberg.detect(frames, min_ratio=min_ratio)
+        return out, key, any_raw
+
+    found, key, any_raw = await asyncio.to_thread(work)
+    return {"symbol": symbol, "key": key, "recorded": any_raw, "icebergs": found}
+
+
 @router.get("/ticks/options-strikes")
 async def ticks_options_strikes(symbol: str, from_ts: int = Query(..., alias="from"), to_ts: int = Query(..., alias="to"),
                                 expiry: str = "near") -> dict[str, Any]:
@@ -1126,7 +1156,7 @@ async def ticks_options_flow(symbol: str, resolution: str = "5", from_ts: int = 
 
 def _recorded_flow(symbol: str, resolution: str, from_ts: int, to_ts: int, footprint: bool,
                    prints: bool = False) -> dict[str, Any]:
-    from app.algo import ticks
+    from app.algo import fno, ticks
 
     st = ticks.store()
     fy = data.fyers_symbol(symbol)
@@ -1159,8 +1189,12 @@ def _recorded_flow(symbol: str, resolution: str, from_ts: int, to_ts: int, footp
                 x[10] += tsq or 0.0
                 x[11] += 1
     key_last = spans[-1][0] if spans else ticks.flow_key(fy)
+    # an index's flow is its future's: name the contract, so the chart can open it
+    future = None
+    if fy.upper() in fno.INDICES and spans:
+        future = (st.meta(ticks.ist_day(max(spans[-1][1], spans[-1][2] - 1))).get(key_last) or {}).get("symbol")
     out: dict[str, Any] = {
-        "symbol": symbol, "key": key_last, "recorded": bool(bars),
+        "symbol": symbol, "key": key_last, "recorded": bool(bars), "future": future,
         "bars": [[t, round(v[0], 2), round(v[1], 2), round(v[0] - v[1], 2), v[3], round(v[2], 2), v[4], v[5],
                   round(v[7], 2), round(v[8], 2),
                   round(v[9] / v[11], 1) if v[11] else None, round(v[10] / v[11], 1) if v[11] else None]

@@ -1,7 +1,8 @@
 // DomPanel — the account manager's "Trade" tab: a DOM price ladder for the
 // charted symbol with the position, its working orders (drag one to another
-// price to modify it), the volume traded at each price since the panel
-// opened, and the Flatten / CXL All / Reverse / Buy Mkt / Sell Mkt buttons.
+// price to modify it), the volume traded at each price today (the order-flow
+// recorder's footprint, then each live tick on top), and the Flatten / CXL All /
+// Reverse / Buy Mkt / Sell Mkt buttons.
 // Orders go through the Trade page (risk checks, trading-mode gates); a
 // click asks for confirmation unless one-click (instant) trading is on.
 
@@ -137,6 +138,36 @@ export function DomPanel({
   useEffect(() => {
     setPinned(null);
     setVap(new Map());
+  }, [sym]);
+
+  // today's volume at price from the order-flow recorder, so the ladder doesn't start empty
+  // (an index's recording is its future's, at futures prices: not seeded)
+  const [seeded, setSeeded] = useState(false);
+  useEffect(() => {
+    setSeeded(false);
+    if (!sym || /-INDEX$/i.test(sym)) return;
+    let stop = false;
+    const now = Math.floor(Date.now() / 1000);
+    const day0 = now - ((now + 19800) % 86400);
+    const q = new URLSearchParams({ symbol: sym, resolution: "D", from: String(day0), to: String(now + 60), footprint: "true" });
+    void fetch(`/api/algo/ticks/flow?${q.toString()}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j: { footprint?: number[][] } | null) => {
+        if (stop || !j?.footprint?.length) return;
+        const seed = new Map<number, number>();
+        for (const [, price, b, sl] of j.footprint) seed.set(key(price), (seed.get(key(price)) ?? 0) + b + sl);
+        setVap((m) => {                              // live ticks that arrived meanwhile stay on top
+          const out = new Map(seed);
+          for (const [k, v] of m) out.set(k, (out.get(k) ?? 0) + v);
+          return out;
+        });
+        setSeeded(true);
+      })
+      .catch(() => undefined);
+    return () => {
+      stop = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sym]);
 
   // volume at price: each tick's volume increase, booked at its last price
@@ -323,7 +354,8 @@ export function DomPanel({
                 <td>Total</td>
                 <td title="Total resting sell quantity">{d.total_sell != null ? fmtQty(d.total_sell) : "—"}</td>
                 <td />
-                {s.volume && <td title="Traded since the panel opened">{fmtQty([...vap.values()].reduce((a, b) => a + b, 0))}</td>}
+                {s.volume && <td title={seeded ? "Traded today: the recorded footprint, then live ticks" : "Traded since the panel opened"} data-testid="dom-vol-total">
+                  {fmtQty([...vap.values()].reduce((a, b) => a + b, 0))}</td>}
               </tr>
             </tbody>
           </table>

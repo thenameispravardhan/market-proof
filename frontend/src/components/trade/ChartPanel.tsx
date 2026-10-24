@@ -203,11 +203,13 @@ export const CHART_KINDS: { id: ChartKind; label: string; icon: string }[] = [
 
 const BRICK_KINDS = new Set<ChartKind>(["renko", "linebreak", "kagi", "pnf", "range"]);
 /** Indicators that read recorded order flow (they switch the flow loader on). */
-const FLOW_TYPES = new Set(["flow", "flowpressure", "cvd", "bookpressure"]);
+const FLOW_TYPES = new Set(["flow", "flowpressure", "cvd", "bookpressure", "bigtrades", "oichange", "tapespeed"]);
+/** Indicators that need the recorded prints (loaded with the footprint). */
+const PRINT_TYPES = new Set(["bigtrades"]);
+/** Indicators that read an index's options flow. */
+const OPT_TYPES = new Set(["optflow", "optpcr"]);
 /** Indicators whose values are share counts: shown as 18.6K / 1.2M rather than 18600.00. */
 const VOLUME_TYPES = new Set(["volume", "obv", "flow", "oi", "cvd", "optflow"]);
-/** Candles of footprint detail loaded (the latest): enough to scroll, light to refresh. */
-const FOOTPRINT_BARS = 400;
 const CUSTOM_MODE: Partial<Record<ChartKind, ShapeMode>> = {
   volcandles: "volcandles",
   hlcbars: "hlc",
@@ -951,6 +953,23 @@ export default function ChartPanel(props: ChartPanelProps) {
   const [status, setStatus] = useState<ChartStatus>({ kind: "loading" });
   const [reloadNonce, setReloadNonce] = useState(0);
   const [flowNote, setFlowNote] = useState("");
+  /** An index's footprint is its future's: that contract (from the recording), to open it. */
+  const [flowFuture, setFlowFuture] = useState<string | null>(null);
+  /** Switch to that future — the real instrument from symbol search (its lot / tick), never a guess. */
+  async function openFuture(fut: string): Promise<void> {
+    const name = fut.split(":")[1] ?? fut;
+    try {
+      const r = await api.get<SearchResponse>(`/api/search/symbols?q=${encodeURIComponent(name)}&limit=8`);
+      const hit = (r.hits ?? []).find((h) => h.symbol.toUpperCase() === fut.toUpperCase());
+      if (hit && onSymbolChange) {
+        onSymbolChange(hit);
+        return;
+      }
+    } catch {
+      /* falls through to the note below */
+    }
+    addToast(`couldn't find ${name} in symbol search — open it from the symbol box`);
+  }
   const [strategies, setStrategies] = useState<StrategyItem[] | null>(null);
   const [strat, setStrat] = useState<StratRun | null>(null);
   const [dialog, setDialog] = useState<Dialog>(null);
@@ -1124,6 +1143,7 @@ export default function ChartPanel(props: ChartPanelProps) {
   /** Session-cumulative delta per candle. */
   const cvdRef = useRef<Map<number, number>>(new Map());
   const optFlowRef = useRef<Map<number, OptFlowTuple>>(new Map());
+  const icebergRef = useRef<Map<number, { side: 1 | -1; traded: number; shown: number; ratio: number; price: number }[]>>(new Map());
   /** Footprint per candle: [price, buy, sell] levels and big prints [price, qty, side]. */
   const fpRef = useRef<Map<number, { fp: [number, number, number][]; prints: [number, number, number][] }>>(new Map());
   /** The same at the recorded prices (an index's are its future's), before the basis shift. */
@@ -2261,6 +2281,8 @@ export default function ChartPanel(props: ChartPanelProps) {
       down: colorsRef.current.volDown,
       flow: flowRef.current,
       optFlow: optFlowRef.current,
+      prints: new Map([...fpRef.current].map(([t, v]) => [t, v.prints])),
+      icebergs: icebergRef.current,
       other: (sym: string) => otherDataRef.current.get(sym.trim().toUpperCase())?.closes,
     };
     const uids = [...new Set(indEntriesRef.current.map((e) => e.uid))];
@@ -3866,6 +3888,9 @@ export default function ChartPanel(props: ChartPanelProps) {
   //     weekly chart gets every bar's flow, not just the ones whose start lines up.
   const flowOn = indicators.some((i) => FLOW_TYPES.has(i.type) && i.visible);
   const flowWanted = flowOn || chartKind === "footprint" || flowAlerts.on;
+  /** Prints (and the footprint) wanted outside footprint mode: a full reload when that changes. */
+  const printsWanted = indicators.some((i) => PRINT_TYPES.has(i.type) && i.visible) || needsFootprint(flowAlerts);
+  const fpHistory = fpSettings(settings.footprint).historyBars;       // a full reload when it changes
   useEffect(() => {
     flowRef.current = new Map();
     cvdRef.current = new Map();
@@ -3889,7 +3914,8 @@ export default function ChartPanel(props: ChartPanelProps) {
     };
     const loadOnce = async (c: typeof candlesRef.current) => {
       const now = Math.floor(Date.now() / 1000);
-      const fpOn = kindRef.current === "footprint" || needsFootprint(flowAlertsRef.current);
+      const fpOn = kindRef.current === "footprint" || needsFootprint(flowAlertsRef.current)
+        || indicatorsRef.current.some((i) => PRINT_TYPES.has(i.type) && i.visible);
       const full = Date.now() - lastFull > 60_000 || c[0].time !== firstT;
       const times = c.map((k) => k.time as number);
       const res = fetchPlan(ivRef.current).res;
@@ -3899,12 +3925,13 @@ export default function ChartPanel(props: ChartPanelProps) {
         if (footprint) { q.set("footprint", "true"); q.set("prints", "true"); }
         const r = await fetch(`/api/algo/ticks/flow?${q.toString()}`);
         if (!r.ok) throw new Error(String(r.status));
-        return r.json() as Promise<{ key: string; recorded: boolean; bars?: (number | null)[][]; footprint?: number[][]; prints?: number[][] }>;
+        return r.json() as Promise<{ key: string; recorded: boolean; future?: string | null; bars?: (number | null)[][]; footprint?: number[][]; prints?: number[][] }>;
       };
       try {
         const start = full ? 0 : Math.max(0, c.length - 2);
         const j = await get(times[start] - IST, fpOn && !full);
-        const fj = fpOn && full ? await get(times[Math.max(0, c.length - FOOTPRINT_BARS)] - IST, true) : fpOn ? j : null;
+        const fpBars = fpSettings(settingsRef.current.footprint).historyBars;    // candles that get their footprint
+        const fj = fpOn && full ? await get(times[Math.max(0, c.length - fpBars)] - IST, true) : fpOn ? j : null;
         if (stop) return;
         const fresh = flowByCandle(times, j.bars ?? [], IST);
         if (full) flowRef.current = new Map();
@@ -3914,6 +3941,7 @@ export default function ChartPanel(props: ChartPanelProps) {
         // what the chart holds (the latest poll only covers the last two candles: a quiet
         // forming bar must not read as "nothing recorded" over a screen full of footprints)
         const recorded = flowRef.current.size > 0 || fpRawRef.current.size > 0 || !!fj?.footprint?.length;
+        if (j.future) setFlowFuture(j.future);
         if (fj) {
           const fpBy = footprintByCandle(times, fj.footprint ?? [], IST);
           const prints = new Map<number, [number, number, number][]>();
@@ -3922,7 +3950,7 @@ export default function ChartPanel(props: ChartPanelProps) {
             if (i >= 0) prints.set(times[i], [...(prints.get(times[i]) ?? []), [p, q, sd]]);
           }
           if (full) fpRawRef.current = new Map();
-          const from = full ? Math.max(0, c.length - FOOTPRINT_BARS) : start;
+          const from = full ? Math.max(0, c.length - fpBars) : start;
           for (const t of times.slice(from)) {
             const m = fpBy.get(t);
             if (!m) {
@@ -3970,12 +3998,52 @@ export default function ChartPanel(props: ChartPanelProps) {
       clearInterval(id);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [flowWanted, chartKind, symbol, iv, reloadNonce]);
+  }, [flowWanted, printsWanted, fpHistory, chartKind, symbol, iv, reloadNonce]);
+
+  // 4b'') Likely icebergs (the "icebergs" indicator) from the raw frames: the loaded range (at most the
+  //       last 7 days) every 30 s, each episode on the candle it ended in. The server finds them at ≥ 1.5×;
+  //       the indicator's own threshold filters on top.
+  const iceOn = indicators.some((i) => i.type === "icebergs" && i.visible);
+  useEffect(() => {
+    icebergRef.current = new Map();
+    if (!iceOn) return;
+    let stop = false;
+    const load = async () => {
+      const c = candlesRef.current;
+      if (!c.length || statusRef.current !== "ready") return;
+      const now = Math.floor(Date.now() / 1000);
+      const times = c.map((k) => k.time as number);
+      const from = Math.max(times[0] - IST, now - 7 * 86400 + 60);
+      try {
+        const q = new URLSearchParams({ symbol, from: String(from), to: String(now + 60), min_ratio: "1.5" });
+        const r = await fetch(`/api/algo/ticks/icebergs?${q.toString()}`);
+        if (!r.ok || stop) return;
+        const j = (await r.json()) as { icebergs?: { end: number; side: string; traded: number; shown: number; ratio: number; price: number }[] };
+        const m = new Map<number, { side: 1 | -1; traded: number; shown: number; ratio: number; price: number }[]>();
+        for (const e of j.icebergs ?? []) {
+          const i = candleAt(times, e.end + IST);
+          if (i < 0) continue;
+          m.set(times[i], [...(m.get(times[i]) ?? []), { side: e.side === "BUY" ? 1 : -1, traded: e.traded, shown: e.shown, ratio: e.ratio, price: e.price }]);
+        }
+        icebergRef.current = m;
+        refreshIndicatorData();
+      } catch {
+        /* the next poll retries */
+      }
+    };
+    void load();
+    const id = setInterval(load, 30_000);
+    return () => {
+      stop = true;
+      clearInterval(id);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [iceOn, symbol, iv, reloadNonce]);
 
   // 4b') An index's options together (the "optflow" indicator): calls vs puts premium per
   //      candle for the index, its future or one of its options — the loaded range (at most
   //      the last 30 days) every 10 s; the server adds up every recorded contract.
-  const optInd = indicators.find((i) => i.type === "optflow" && i.visible);
+  const optInd = indicators.find((i) => i.type === "optflow" && i.visible) ?? indicators.find((i) => OPT_TYPES.has(i.type) && i.visible);
   const optExpiry = optInd && optInd.inputs?.expiry === "near" ? "near" : optInd ? "all" : "";
   useEffect(() => {
     optFlowRef.current = new Map();
@@ -4000,8 +4068,11 @@ export default function ChartPanel(props: ChartPanelProps) {
         for (const b of j.bars ?? []) {
           const i = candleAt(times, b[0] + IST);
           if (i < 0) continue;
-          const cur = m.get(times[i]) ?? [0, 0, 0, 0, 0];
-          for (let k = 0; k < 4; k++) cur[k] += b[5 + k] ?? 0;
+          const cur = m.get(times[i]) ?? [0, 0, 0, 0, 0, 0, 0, 0, 0];
+          for (let k = 0; k < 4; k++) {
+            cur[k] += b[5 + k] ?? 0;                 // premium (₹)
+            cur[5 + k] += b[1 + k] ?? 0;             // quantity
+          }
           cur[4] += b[9] ?? 0;
           m.set(times[i], cur);
         }
@@ -6656,7 +6727,16 @@ ${hh ? `${hh}:${String(mm).padStart(2, "0")}` : mm}:${String(ss).padStart(2, "0"
                     <span className="lg-acts"><button type="button" title="Clear the strategy's marks" onClick={() => setStrat(null)}>✕</button></span>
                   </div>
                 )}
-                {flowWanted && flowNote && <div className="lg-row hint" data-testid="chart-flow-note">{flowNote}</div>}
+                {flowWanted && flowNote && (
+                  <div className="lg-row hint" data-testid="chart-flow-note">{flowNote}
+                    {flowFuture && onSymbolChange && /-INDEX$/i.test(symbol) && (
+                      <button type="button" className="btn-sm ghost" style={{ marginLeft: 6 }} data-testid="chart-open-future"
+                        title="Open the future whose order flow this index chart shows — its own candles, at its own prices"
+                        onClick={() => void openFuture(flowFuture)}>
+                        ⇄ open {flowFuture.split(":")[1] ?? flowFuture}</button>
+                    )}
+                  </div>
+                )}
               </>
             )}
             {/* Always-visible arrow: with many indicators the legend covers the chart — ⌃ hides them, ⌄ N brings them back. */}
@@ -6859,6 +6939,11 @@ ${hh ? `${hh}:${String(mm).padStart(2, "0")}` : mm}:${String(ss).padStart(2, "0"
                         <button key={m} type="button" className={fs.mode === m ? "on" : ""} onClick={() => setFs({ mode: m })} title={tip} data-testid={`fp-mode-${m}`}>{l}</button>
                       ))}
                     </span>
+                    <label title="How many of the latest candles get their footprint: more to scroll back through, heavier to load">History
+                      <select value={fs.historyBars} onChange={(e) => setFs({ historyBars: Number(e.target.value) })} aria-label="Footprint history" data-testid="fp-history">
+                        {[200, 400, 1000, 2000, 3000].map((n) => <option key={n} value={n}>{n} bars</option>)}
+                      </select>
+                    </label>
                     <label title="Ticks per row (Auto keeps rows readable at any zoom)">Row
                       <select value={fs.rowTicks} onChange={(e) => setFs({ rowTicks: Number(e.target.value) })} aria-label="Row size">
                         {[0, 1, 2, 5, 10, 20, 50, 100].map((n) => <option key={n} value={n}>{n ? `${n} tick${n > 1 ? "s" : ""}` : "Auto"}</option>)}
@@ -6884,13 +6969,21 @@ ${hh ? `${hh}:${String(mm).padStart(2, "0")}` : mm}:${String(ss).padStart(2, "0"
                     {fs.profile && (
                       <label title="Visible: one profile of the bars on screen, at the right edge. Session: one per day, from its first bar">Profile
                         <select value={fs.profileScope} onChange={(e) => setFs({ profileScope: e.target.value as FootprintSettings["profileScope"] })} aria-label="Profile scope" data-testid="fp-profile-scope">
-                          <option value="visible">visible bars</option><option value="session">each session</option>
+                          <option value="visible">visible bars</option><option value="session">each session</option><option value="composite">last N sessions</option>
                         </select>
-                        <select value={fs.profileType} onChange={(e) => setFs({ profileType: e.target.value as FootprintSettings["profileType"] })} aria-label="Profile type" data-testid="fp-profile-type">
-                          <option value="volume">volume</option><option value="delta">delta</option>
+                        {fs.profileScope === "composite" && (
+                          <select value={fs.compositeDays} onChange={(e) => setFs({ compositeDays: Number(e.target.value) })} aria-label="Sessions in the composite" data-testid="fp-composite-days">
+                            {[2, 3, 5, 10, 20].map((n) => <option key={n} value={n}>{n} sessions</option>)}
+                          </select>
+                        )}
+                        <select value={fs.profileType} onChange={(e) => setFs({ profileType: e.target.value as FootprintSettings["profileType"] })} aria-label="Profile type" data-testid="fp-profile-type"
+                          title="Volume / delta from the recorded ticks; TPO = time at price, from the candles alone">
+                          <option value="volume">volume</option><option value="delta">delta</option><option value="tpo">TPO (time)</option>
                         </select>
                       </label>
                     )}
+                    <label className="fp-check" title="Where each session's POC (solid) and value area (dashed) stood after every bar">
+                      <input type="checkbox" checked={fs.devLines} onChange={(e) => setFs({ devLines: e.target.checked })} data-testid="fp-opt-devLines" />Developing POC / VA</label>
                     <span className="fp-stats" title="The statistics table at the foot of the chart">
                       {(Object.keys(STAT_LABEL) as StatRow[]).map((k) => (
                         <label key={k} className="fp-check"><input type="checkbox" checked={fs.stats.includes(k)}

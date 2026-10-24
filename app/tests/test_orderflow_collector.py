@@ -572,7 +572,7 @@ def test_an_index_chart_reads_its_futures_flow_and_the_auction_joins_the_first_c
                                                                              "kind": "IDX"}}, DAY0)
     body = client.get("/api/algo/ticks/flow", params={"symbol": "NSE:NIFTY50-INDEX", "resolution": "5",
                                                        "from": T915 - 3600, "to": T915 + 600}).json()
-    assert body["key"] == "NIFTY-FUT" and body["recorded"]
+    assert body["key"] == "NIFTY-FUT" and body["recorded"] and body["future"] == fut   # the contract, to open it
     (bar,) = body["bars"]                                                # the auction is in 09:15's candle
     assert bar[0] == T915 and bar[1:3] == [50.0, 20.0] and bar[5] == 500.0
 

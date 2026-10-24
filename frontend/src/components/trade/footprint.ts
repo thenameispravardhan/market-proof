@@ -18,8 +18,8 @@
 // the index-vs-future basis.
 
 export type FootprintMode = "bidask" | "delta" | "volume" | "heatmap";
-export type ProfileScope = "visible" | "session";
-export type ProfileType = "volume" | "delta";
+export type ProfileScope = "visible" | "session" | "composite";
+export type ProfileType = "volume" | "delta" | "tpo";
 export type StatRow = "vol" | "delta" | "dpct" | "cvd" | "dmin" | "dmax" | "trades" | "oi";
 
 export interface FootprintSettings {
@@ -40,10 +40,17 @@ export interface FootprintSettings {
   unfinished: boolean;
   /** Volume profile of the visible bars on the pane's right edge, with its POC line. */
   profile: boolean;
-  /** visible = one profile of the bars on screen at the right edge; session = one per day, from its first bar. */
+  /** visible = one profile of the bars on screen at the right edge; session = one per day, from its first bar;
+   *  composite = one of the last `compositeDays` sessions at the right edge. */
   profileScope: ProfileScope;
-  /** volume = buy + sell per row; delta = buy − sell per row (coloured by side). */
+  compositeDays: number;
+  /** volume = buy + sell per row; delta = buy − sell per row (coloured by side); tpo = time at price
+   *  (candles whose range covered the row — from the candles alone, no ticks needed). */
   profileType: ProfileType;
+  /** Developing POC / VAH / VAL: where each session's POC and value area stood after every bar. */
+  devLines: boolean;
+  /** How many of the latest candles get their footprint loaded (more = more to scroll back through, heavier). */
+  historyBars: number;
   /** Absorption and delta-divergence markers. */
   signals: boolean;
   /** Each bar's POC extended to the right until price trades back through it (only the untested ones). */
@@ -66,7 +73,10 @@ export const DEFAULT_FOOTPRINT: FootprintSettings = {
   unfinished: true,
   profile: true,
   profileScope: "visible",
+  compositeDays: 5,
   profileType: "volume",
+  devLines: false,
+  historyBars: 400,
   signals: true,
   npoc: false,
   numbers: true,
@@ -83,8 +93,10 @@ export function fpSettings(raw: Partial<FootprintSettings> | undefined): Footpri
   return {
     ...s,
     mode: (["bidask", "delta", "volume", "heatmap"] as const).includes(s.mode) ? s.mode : DEFAULT_FOOTPRINT.mode,
-    profileScope: s.profileScope === "session" ? "session" : "visible",
-    profileType: s.profileType === "delta" ? "delta" : "volume",
+    profileScope: s.profileScope === "session" || s.profileScope === "composite" ? s.profileScope : "visible",
+    compositeDays: Math.min(30, Math.max(1, Math.round(Number(s.compositeDays) || DEFAULT_FOOTPRINT.compositeDays))),
+    historyBars: Math.min(3000, Math.max(100, Math.round(Number(s.historyBars) || DEFAULT_FOOTPRINT.historyBars))),
+    profileType: s.profileType === "delta" || s.profileType === "tpo" ? s.profileType : "volume",
     stats: Array.isArray(s.stats) ? s.stats.filter((x) => x in STAT_LABEL) : DEFAULT_FOOTPRINT.stats,
   };
 }
@@ -180,6 +192,39 @@ export function groupRows(levels: [number, number, number][], step: number): FpR
     rows.set(p, r);
   }
   return [...rows.values()].sort((a, b) => a.p - b.p);
+}
+
+/** Time at price: for each candle, +1 on every `step` row its range covered (as buy, so a profile's
+ *  POC / value area read it like volume). From the candles alone — no ticks needed. */
+export function tpoRows(candles: { high: number; low: number }[], step: number): FpRow[] {
+  const rows = new Map<number, FpRow>();
+  for (const c of candles) {
+    if (!(c.high >= c.low)) continue;
+    const a = Math.round(Math.floor(c.low / step + 1e-7)), b = Math.round(Math.floor(c.high / step + 1e-7));
+    for (let k = a; k <= b; k++) {
+      const p = round6(k * step);
+      const r = rows.get(p) ?? { p, buy: 0, sell: 0 };
+      r.buy += 1;
+      rows.set(p, r);
+    }
+  }
+  return [...rows.values()].sort((x, y) => x.p - y.p);
+}
+
+/** A developing profile: after each bar (its rows, oldest first), the POC and value area of
+ *  everything so far. */
+export function developing(perBar: FpRow[][], step: number, vaPct: number): { poc: number | null; vah: number | null; val: number | null }[] {
+  const acc = new Map<number, FpRow>();
+  return perBar.map((rows) => {
+    for (const r of rows) {
+      const cur = acc.get(r.p) ?? { p: r.p, buy: 0, sell: 0 };
+      cur.buy += r.buy;
+      cur.sell += r.sell;
+      acc.set(r.p, cur);
+    }
+    const a = analyze([...acc.values()].sort((x, y) => x.p - y.p), step, { imbalance: 0, imbalanceMin: 0, stacked: 0, vaPct });
+    return { poc: a.poc, vah: a.vah, val: a.val };
+  });
 }
 
 /** Everything a footprint bar shows (see the module comment). Rows are contiguous

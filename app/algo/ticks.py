@@ -1073,6 +1073,24 @@ class FlowStore:
                         continue
         return out
 
+    def raw_frames(self, key: str, start: int, end: int) -> list[tuple]:
+        """Every recorded frame of `key` in [start, end) by exchange time (RAW_COLS) — kept only for
+        the focus symbols, `raw_days` (the research short list's longer)."""
+        rows: list[tuple] = []
+        for d in self._days(start, end):
+            p = self.root / "days" / ymd(d) / "raw.parquet"
+            if p.exists():
+                rows += self._query(f"SELECT {', '.join(RAW_COLS)} FROM read_parquet('{p.as_posix()}') "
+                                    "WHERE key = ? AND exch_ts >= ? AND exch_ts < ?", [key, int(start), int(end)])
+            for r in _rows(self.root / "today" / ymd(d) / "raw" / f"{key}.csv"):
+                if len(r) != len(RAW_COLS):
+                    continue
+                v = tuple(_num(x) for x in r)
+                if v[1] is not None and start <= v[1] < end:
+                    rows.append(v)
+        rows.sort(key=lambda r: (r[1] or 0, r[0] or 0))
+        return rows
+
     def meta(self, day: int) -> dict[str, dict]:
         return (read_json(self.root / "days" / ymd(day) / "meta.json")
                 or read_json(self.root / "today" / ymd(day) / "meta.json") or {})
