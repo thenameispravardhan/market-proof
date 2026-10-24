@@ -17,7 +17,9 @@
 // candles (a 4-minute or weekly chart is built from 1-minute / daily rows) and
 // the index-vs-future basis.
 
-export type FootprintMode = "bidask" | "delta" | "volume";
+export type FootprintMode = "bidask" | "delta" | "volume" | "heatmap";
+export type ProfileScope = "visible" | "session";
+export type ProfileType = "volume" | "delta";
 export type StatRow = "vol" | "delta" | "dpct" | "cvd" | "dmin" | "dmax" | "trades" | "oi";
 
 export interface FootprintSettings {
@@ -38,8 +40,16 @@ export interface FootprintSettings {
   unfinished: boolean;
   /** Volume profile of the visible bars on the pane's right edge, with its POC line. */
   profile: boolean;
+  /** visible = one profile of the bars on screen at the right edge; session = one per day, from its first bar. */
+  profileScope: ProfileScope;
+  /** volume = buy + sell per row; delta = buy − sell per row (coloured by side). */
+  profileType: ProfileType;
   /** Absorption and delta-divergence markers. */
   signals: boolean;
+  /** Each bar's POC extended to the right until price trades back through it (only the untested ones). */
+  npoc: boolean;
+  /** Numbers in the cells; off = colour only. */
+  numbers: boolean;
 }
 
 export const DEFAULT_FOOTPRINT: FootprintSettings = {
@@ -55,7 +65,11 @@ export const DEFAULT_FOOTPRINT: FootprintSettings = {
   prints: true,
   unfinished: true,
   profile: true,
+  profileScope: "visible",
+  profileType: "volume",
   signals: true,
+  npoc: false,
+  numbers: true,
 };
 
 export const STAT_LABEL: Record<StatRow, string> = {
@@ -66,7 +80,34 @@ export const STAT_ROW_PX = 14;
 
 export function fpSettings(raw: Partial<FootprintSettings> | undefined): FootprintSettings {
   const s = { ...DEFAULT_FOOTPRINT, ...(raw ?? {}) };
-  return { ...s, stats: Array.isArray(s.stats) ? s.stats.filter((x) => x in STAT_LABEL) : DEFAULT_FOOTPRINT.stats };
+  return {
+    ...s,
+    mode: (["bidask", "delta", "volume", "heatmap"] as const).includes(s.mode) ? s.mode : DEFAULT_FOOTPRINT.mode,
+    profileScope: s.profileScope === "session" ? "session" : "visible",
+    profileType: s.profileType === "delta" ? "delta" : "volume",
+    stats: Array.isArray(s.stats) ? s.stats.filter((x) => x in STAT_LABEL) : DEFAULT_FOOTPRINT.stats,
+  };
+}
+
+/** A heat-map colour for `t` in 0..1: cold blue through green and yellow to hot red. */
+export function heatColor(t: number, a = 1): string {
+  const x = Math.min(1, Math.max(0, t));
+  const hue = 230 - 230 * x;                  // 230 (blue) -> 0 (red)
+  return `hsla(${Math.round(hue)}, 85%, ${Math.round(38 + 14 * x)}%, ${a})`;
+}
+
+/** Naked POCs: each bar's POC row [lo, lo + step) that no LATER bar has traded through.
+ *  `bars` are oldest first: [high, low, pocRowLow | null]. Returns [bar index, pocRowLow]. */
+export function nakedPocs(bars: [number, number, number | null][], step: number): [number, number][] {
+  const out: [number, number][] = [];
+  for (let i = 0; i < bars.length; i++) {
+    const p = bars[i][2];
+    if (p == null) continue;
+    let hit = false;
+    for (let j = i + 1; j < bars.length && !hit; j++) hit = bars[j][1] < p + step && bars[j][0] >= p;
+    if (!hit) out.push([i, p]);
+  }
+  return out;
 }
 
 export interface FpRow {
