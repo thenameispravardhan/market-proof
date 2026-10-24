@@ -6788,8 +6788,10 @@ ${hh ? `${hh}:${String(mm).padStart(2, "0")}` : mm}:${String(ss).padStart(2, "0"
                 {fpOpen && (
                   <>
                     <span className="fp-seg" role="group" aria-label="Footprint style">
-                      {([["bidask", "Bid × Ask"], ["delta", "Delta"], ["volume", "Volume"]] as const).map(([m, l]) => (
-                        <button key={m} type="button" className={fs.mode === m ? "on" : ""} onClick={() => setFs({ mode: m })} data-testid={`fp-mode-${m}`}>{l}</button>
+                      {([["bidask", "Bid × Ask", "Sell volume | buy volume per price"], ["delta", "Delta", "Buy − sell per price"],
+                        ["volume", "Volume", "Total per price as a bar"],
+                        ["heatmap", "Heatmap", "Every cell shaded against the busiest cell on screen: heavy prices stand out across bars"]] as const).map(([m, l, tip]) => (
+                        <button key={m} type="button" className={fs.mode === m ? "on" : ""} onClick={() => setFs({ mode: m })} title={tip} data-testid={`fp-mode-${m}`}>{l}</button>
                       ))}
                     </span>
                     <label title="Ticks per row (Auto keeps rows readable at any zoom)">Row
@@ -6807,11 +6809,23 @@ ${hh ? `${hh}:${String(mm).padStart(2, "0")}` : mm}:${String(ss).padStart(2, "0"
                         {[0, 2, 3, 4, 5].map((n) => <option key={n} value={n}>{n || "Off"}</option>)}
                       </select>
                     </label>
-                    {([["poc", "POC", ""], ["va", "Value area", ""], ["prints", "Big prints", ""], ["unfinished", "Unfinished auctions", ""],
-                      ["profile", "Profile", "Volume profile of the visible bars on the right, with its POC line"],
+                    {([["numbers", "Numbers", "Volumes in the cells (off = colour only)"], ["poc", "POC", ""],
+                      ["npoc", "Naked POCs", "Each bar's POC extended right until price trades back through it — only the untested ones are drawn"],
+                      ["va", "Value area", ""], ["prints", "Big prints", ""], ["unfinished", "Unfinished auctions", ""],
+                      ["profile", "Profile", "Volume profile, with its POC line"],
                       ["signals", "Signals", "A = absorption (heavy aggression at the high / low that price rejected), D = delta divergence (new high on negative delta, new low on positive)"]] as const).map(([k, l, tip]) => (
                       <label key={k} className="fp-check" title={tip || undefined}><input type="checkbox" checked={fs[k]} onChange={(e) => setFs({ [k]: e.target.checked })} data-testid={`fp-opt-${k}`} />{l}</label>
                     ))}
+                    {fs.profile && (
+                      <label title="Visible: one profile of the bars on screen, at the right edge. Session: one per day, from its first bar">Profile
+                        <select value={fs.profileScope} onChange={(e) => setFs({ profileScope: e.target.value as FootprintSettings["profileScope"] })} aria-label="Profile scope" data-testid="fp-profile-scope">
+                          <option value="visible">visible bars</option><option value="session">each session</option>
+                        </select>
+                        <select value={fs.profileType} onChange={(e) => setFs({ profileType: e.target.value as FootprintSettings["profileType"] })} aria-label="Profile type" data-testid="fp-profile-type">
+                          <option value="volume">volume</option><option value="delta">delta</option>
+                        </select>
+                      </label>
+                    )}
                     <span className="fp-stats" title="The statistics table at the foot of the chart">
                       {(Object.keys(STAT_LABEL) as StatRow[]).map((k) => (
                         <label key={k} className="fp-check"><input type="checkbox" checked={fs.stats.includes(k)}
