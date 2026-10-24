@@ -169,3 +169,48 @@ def test_api_universe_routes(client, root):
     spec = {**_cross_spec(), "universe": {"index": "niftybank"}}
     r = client.post("/api/algo/backtest", json={"spec": spec, "start": "2025-01-01", "end": "2025-01-10"})
     assert r.status_code == 422 and "no recorded list" in r.json()["detail"]
+
+
+# ---- fetching / pasting a list ----------------------------------------------------
+
+_CSV = "Company Name,Industry,Symbol,Series,ISIN Code\n" + "\n".join(
+    f"Co {s},X,{s},EQ,INE{i:07d}" for i, s in enumerate(["AAA", "BBB", "CCC", "DDD", "EEE", "M&M"]))
+
+
+def test_a_list_falls_back_to_nse_archives_when_niftyindices_refuses(root, monkeypatch):
+    import httpx
+
+    from app.algo import flow_universe as fu
+
+    asked = []
+
+    def get(url, **kw):
+        asked.append(url.split("/")[2])
+        ok = "nsearchives" in url
+        return httpx.Response(200 if ok else 502, text=_CSV if ok else "Bad Gateway")
+
+    monkeypatch.setattr(httpx, "get", get)
+    res = u.fetch_snapshot("nifty100", force=True)
+    assert res["recorded"] and res["members"] == 6
+    assert asked == ["www.niftyindices.com", "nsearchives.nseindia.com"]
+
+
+def test_no_source_answering_says_which_failed_and_what_to_do(root, monkeypatch):
+    import httpx
+
+    monkeypatch.setattr(httpx, "get", lambda url, **kw: httpx.Response(502, text=""))
+    with pytest.raises(RuntimeError, match=r"www\.niftyindices\.com: HTTP 502.*archives\.nseindia\.com: HTTP 502.*paste it"):
+        u.fetch_snapshot("nifty100", force=True)
+
+
+def test_a_pasted_list_is_the_downloaded_csv_or_plain_tickers():
+    assert u.parse_pasted(_CSV) == ["AAA", "BBB", "CCC", "DDD", "EEE", "M&M"]
+    assert u.parse_pasted('"Company Name","Industry","Symbol","Series"\n"Co","X","SBIN","EQ"') == ["SBIN"]
+    assert u.parse_pasted("reliance\nNSE:SBIN-EQ, infy") == ["RELIANCE", "SBIN", "INFY"]
+
+
+def test_api_records_a_pasted_csv_and_offers_the_download_link(client, root):
+    r = client.post("/api/algo/research/universe/nifty100/snapshot", json={"symbols": _CSV})
+    assert r.status_code == 200 and r.json()["members"] == 6
+    assert r.json()["list_url"].endswith("/ind_nifty100list.csv")
+    assert client.post("/api/algo/research/universe/nifty100/snapshot", json={"symbols": " \n "}).status_code == 422

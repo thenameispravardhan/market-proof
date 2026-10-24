@@ -546,7 +546,9 @@ loaded — the ones dropped since included — and a stock can enter only on day
 it was a member (ranking never picks an outsider). Today's list alone has
 survivorship bias: it never holds the losers that were dropped, and holds
 the winners from before they joined. Membership comes from the lists recorded
-so far and the imported change log (Research → universes); the backtest
+so far and the imported change log (Research → universes: **record today's
+list** fetches it from niftyindices.com, else NSE's archives; when both turn the
+server away, **paste list** takes the file downloaded in your browser); the backtest
 notes say from when it holds and which past members have no candles. Shares /
 futures strategies only. Live trading uses `symbols` — keep them today's
 members.
