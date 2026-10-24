@@ -224,15 +224,30 @@ def _log_book_halt(why: str) -> None:
 
 def _book_all(day_start: float) -> dict[str, float]:
     """Every automation together (shadows are tests: left out): P&L realised
-    today and the margin their open positions block."""
+    today, the margin their open positions block and how many are open."""
     book = select(AlgoStrategy.id).where(AlgoStrategy.shadow_of.is_(None))
     with db_session.SessionLocal() as db:
         today = db.execute(select(func.coalesce(func.sum(AlgoTrade.net_pnl), 0.0)).where(
             AlgoTrade.status == "closed", AlgoTrade.exit_at >= _naive(day_start),
             AlgoTrade.strategy_id.in_(book))).scalar_one()
-        margin = db.execute(select(func.coalesce(func.sum(AlgoTrade.margin), 0.0)).where(
-            AlgoTrade.status == "open", AlgoTrade.strategy_id.in_(book))).scalar_one()
-    return {"today": float(today), "margin": float(margin)}
+        margin, n = db.execute(select(func.coalesce(func.sum(AlgoTrade.margin), 0.0), func.count()).where(
+            AlgoTrade.status == "open", AlgoTrade.strategy_id.in_(book))).one()
+    return {"today": float(today), "margin": float(margin), "open": int(n)}
+
+
+def _portfolio_halt() -> Optional[str]:
+    """The account-wide halt (Settings → Circuit breakers: the daily-loss and
+    monthly-drawdown breakers, the manual kill switch): its reason while it
+    is on, else None. Fails closed — an unreadable state is a halt."""
+    from app.risk import circuit_breakers
+
+    try:
+        with db_session.SessionLocal() as db:
+            st = circuit_breakers.get_or_create_state(db)
+            return (st.disabled_reason or "trading disabled") if st.trading_disabled else None
+    except Exception as e:  # noqa: BLE001
+        log.warning("algo.portfolio_halt_unreadable", error=str(e)[:200])
+        return "risk state unreadable"
 
 
 ALLOC_MIN_DAYS = 10   # days with trades before a strategy's own volatility is trusted
@@ -771,6 +786,7 @@ class AlgoRunner:
         self._busy: set[int] = set()     # trades with an exit / scale-out in flight
         self._guard_at = 0.0             # last time the guards were read
         self._book_halt: Optional[int] = None   # IST day the book loss limit (or a kill) stopped every automation
+        self._portfolio_note: Optional[tuple[int, str]] = None   # (day, reason) of the account halt last reported
         self._alloc: tuple[Optional[tuple], dict[int, dict[str, Any]]] = (None, {})   # (key, allocation)
         self._names: dict[int, str] = {}
         self._open_day: dict[int, bool] = {}     # IST day -> did the market open (daily / weekly strategies)
@@ -1013,7 +1029,10 @@ class AlgoRunner:
     async def book_halted(self, now: float) -> bool:
         """Is every automation stopped for today? A halt in memory, one logged
         earlier today (it survives a restart), or a realised loss alone that
-        already reached ALGO_BOOK_MAX_DAY_LOSS with nothing left open."""
+        already reached ALGO_BOOK_MAX_DAY_LOSS with nothing left open. With
+        positions open the limit is on realised + their MTM, and _manage both
+        halts and flattens — halting here would stop entries but leave them
+        open, and switch off the MTM check that flattens them."""
         day = int((now + IST) // 86400)
         if self._book_halt == day:
             return True
@@ -1022,11 +1041,28 @@ class AlgoRunner:
             self._book_halt = day
             return True
         lim = get_settings().ALGO_BOOK_MAX_DAY_LOSS
-        if lim and (today := (await asyncio.to_thread(_book_all, day_start))["today"]) <= -lim:
-            await self.halt_book(day, f"book realised loss ₹{-today:,.0f} reached the ₹{lim:,.0f} limit", [], {}, now,
-                                 "BOOK_MAX_LOSS")
-            return True
+        if lim:
+            agg = await asyncio.to_thread(_book_all, day_start)
+            if agg["today"] <= -lim and not agg["open"]:
+                await self.halt_book(day, f"book realised loss ₹{-agg['today']:,.0f} reached the ₹{lim:,.0f} limit",
+                                     [], {}, now, "BOOK_MAX_LOSS")
+                return True
         return False
+
+    async def portfolio_halted(self, now: float) -> Optional[str]:
+        """The account-wide circuit-breaker halt, when automations follow it
+        (ALGO_BOOK_FOLLOW_PORTFOLIO_HALT): no new entries while it is on; open
+        positions keep their own exits. Its reason, else None."""
+        if not get_settings().ALGO_BOOK_FOLLOW_PORTFOLIO_HALT:
+            return None
+        why = await asyncio.to_thread(_portfolio_halt)
+        if why and self._portfolio_note != (int((now + IST) // 86400), why):
+            self._portfolio_note = (int((now + IST) // 86400), why)
+            self.event("error", f"automation entries stopped — the account circuit breaker is on ({why}); "
+                                "clear it with Dashboard → Risk → Resume")
+        elif not why:
+            self._portfolio_note = None
+        return why
 
     async def allocated(self, now: float) -> dict[int, dict[str, Any]]:
         """Today's capital allocation (ALGO_ALLOC_CAPITAL), worked out once a
@@ -1812,6 +1848,8 @@ class AlgoRunner:
             return
         if await self.book_halted(now):
             return                                         # the whole book stopped for today
+        if await self.portfolio_halted(now):
+            return                                         # the account's circuit breaker is on
         book = await asyncio.to_thread(_book, s["id"], day_start)
         if book["open"] >= spec["portfolio"]["max_positions"]:
             self.event("info", f"{s['name']}: {side} {sym} skipped — {book['open']} positions open (max)",

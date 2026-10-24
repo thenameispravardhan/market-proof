@@ -471,3 +471,76 @@ def test_allocation_follows_a_strategy_switched_on_mid_day(monkeypatch, isolated
     assert {k: v["capital"] for k, v in asyncio.run(r.allocated(_t.time())).items()} == {1: 100000.0}
     r._by_id[2]["enabled"] = True                                              # switched on later the same day
     assert {k: v["capital"] for k, v in asyncio.run(r.allocated(_t.time())).items()} == {1: 50000.0, 2: 50000.0}
+
+
+def test_a_realised_loss_with_positions_open_is_left_to_the_mtm_check(monkeypatch, isolated_db):
+    """Realised −1,200 against a ₹1,000 book limit, one position open at +500: the
+    day is −700 — no halt yet. Halting on the realised loss alone would stop entries
+    but leave that position open AND switch off the check that flattens it; when its
+    MTM turns, the book must still flatten."""
+    from app.algo import runner as rn
+    from app.config import get_settings
+    from app.db import session as dbs
+    from app.db.models import AlgoTrade
+
+    monkeypatch.setattr(get_settings(), "ALGO_BOOK_MAX_DAY_LOSS", 1000.0)
+    with dbs.SessionLocal() as db:
+        a, _ = _two_strategies(db, _cross_spec())
+        db.add(AlgoTrade(strategy_id=a, symbol="NSE:X-EQ", side="BUY", quantity=1, mode="paper", status="closed",
+                         entry_at=rn._utc(DAY0).replace(tzinfo=None), exit_at=rn._utc(DAY0 + 60).replace(tzinfo=None),
+                         net_pnl=-1200.0))
+        db.add(_open_trade(a))                                                  # 10 @ 100
+        db.commit()
+    r = rn.AlgoRunner()
+    assert not asyncio.run(r.book_halted(DAY0 + 3600))                       # −1,200 realised, but a position is open
+    px = {"v": 150.0}
+
+    async def fake_ltp(symbols):
+        return {x.upper(): px["v"] for x in symbols}
+
+    monkeypatch.setattr(rn, "_ltp", fake_ltp)
+    asyncio.run(r.tick(DAY0 + 3600))                                          # +500 open: day −700
+    assert r._book_halt is None
+    px["v"] = 95.0                                                            # −50 open: day −1,250
+    asyncio.run(r.tick(DAY0 + 3601))
+    assert r._book_halt == (DAY0 + 19800) // 86400
+    with dbs.SessionLocal() as db:
+        assert db.query(AlgoTrade).filter(AlgoTrade.status == "open").count() == 0
+        assert db.query(AlgoTrade).filter(AlgoTrade.exit_reason == "BOOK_MAX_LOSS").count() == 1
+
+
+def test_the_account_circuit_breaker_stops_automation_entries(client, monkeypatch, isolated_db):
+    from app.algo import runner as rn
+    from app.config import get_settings
+    from app.db import session as dbs
+    from app.db.models import AlgoTrade
+    from app.risk import circuit_breakers as cb
+    from app.tests.test_algo import bars
+
+    with dbs.SessionLocal() as db:
+        _two_strategies(db, _cross_spec(exit_long=None))
+        cb.trip_manual_kill(db)
+        db.commit()
+
+    async def fake_bars(sym, tf, bars_n=400, now=None, **kw):
+        d = bars([100.0, 101, 102, 106], spread=0)
+        keep = [i for i, t in enumerate(d["t"]) if t + 300 <= now]
+        return {k: ([v[i] for i in keep] if isinstance(v, list) else v) for k, v in d.items()}
+
+    async def fake_ltp(symbols):
+        return {x.upper(): 106.0 for x in symbols}
+
+    monkeypatch.setattr(rn.data, "recent_bars", fake_bars)
+    monkeypatch.setattr(rn, "_ltp", fake_ltp)
+    when = DAY0 + 4 * 300 + 4
+    r = rn.AlgoRunner()
+    asyncio.run(r.tick(when))
+    with dbs.SessionLocal() as db:
+        assert db.query(AlgoTrade).count() == 0
+    assert sum("account circuit breaker is on" in e["msg"] for e in r.events) == 1   # said once, not per signal
+    assert client.get("/api/algo/book").json()["account_halt"]
+    monkeypatch.setattr(get_settings(), "ALGO_BOOK_FOLLOW_PORTFOLIO_HALT", False)     # switched off: entries go
+    assert client.get("/api/algo/book").json()["account_halt"] is None
+    asyncio.run(rn.AlgoRunner().tick(when))
+    with dbs.SessionLocal() as db:
+        assert db.query(AlgoTrade).filter(AlgoTrade.symbol == "NSE:TEST-EQ").count() >= 1
