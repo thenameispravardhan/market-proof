@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
-  analyze, barSignals, candleAt, cellLayout, DEFAULT_FOOTPRINT, flowByCandle, footprintByCandle, fpSettings, groupRows, heatColor, inferTick, nakedPocs, rowStep,
-  sessionBasis, sessionCvd, type FlowBar,
+  analyze, barSignals, candleAt, cellLayout, DEFAULT_FOOTPRINT, flowByCandle, footprintBasis, footprintByCandle, fpSettings, groupRows, heatColor, inferTick, nakedPocs, rowStep,
+  sessionCvd, type FlowBar,
 } from "../components/trade/footprint";
 import { INDICATOR_BY_TYPE, type FlowTuple } from "../components/trade/indicatorCatalog";
 
@@ -54,9 +54,22 @@ describe("footprint analytics", () => {
     expect(fp.get(1000)?.get(100.1)).toEqual([5, 3]);
     const cvd = sessionCvd([0, 300, 86400], new Map([[0, { delta: 10 }], [300, { delta: -4 }], [86400, { delta: 7 }]] as [number, FlowBar][]));
     expect([...cvd.values()]).toEqual([10, 6, 7]);                          // resets each session
-    const basis = sessionBasis([{ time: 0, close: 25000 }, { time: 300, close: 25010 }, { time: 600, close: 25020 }],
-      new Map([[0, { close: 25060 }], [300, { close: 25065 }], [600, { close: 25090 }]] as [number, FlowBar][]));
-    expect(basis.get(0)).toBe(60);                                         // the session's median, not each bar's
+  });
+
+  it("measures an index's basis from the future's footprint against the index candles, per session", () => {
+    // index candles; the future's prints sit 60 above (one bar 90: an outlier the median ignores)
+    const candles = [{ time: 0, high: 25010, low: 25000 }, { time: 900, high: 25030, low: 25010 },
+      { time: 1800, high: 25025, low: 25015 }, { time: 86400, high: 25100, low: 25080 }];
+    const fp = new Map<number, { fp: [number, number, number][] }>([
+      [0, { fp: [[25060, 5, 1], [25070, 2, 2], [25099, 0, 0]] }],            // a level with no volume is not range
+      [900, { fp: [[25070, 1, 1], [25090, 3, 0]] }],
+      [1800, { fp: [[25105, 1, 1], [25115, 1, 0]] }],
+      [86400, { fp: [[25125, 1, 1], [25145, 2, 1]] }],                         // the next session: its own basis
+    ]);
+    const b = footprintBasis(candles, fp, 0.05);
+    expect(b.get(0)).toBe(60);
+    expect(b.get(1)).toBe(45);
+    expect(footprintBasis(candles, new Map(), 0.05).size).toBe(0);
   });
 
   it("lays the rows out to fill the candle exactly, never past its high or low", () => {
