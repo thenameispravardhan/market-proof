@@ -401,21 +401,33 @@ export function sessionCvd(times: number[], flow: Map<number, FlowBar>): Map<num
   return out;
 }
 
-/** An index's flow is its future's, at futures prices: the futures-minus-index
- *  basis per session (median over the session's candles), to shift footprint
- *  rows onto the index candles. Steady across a day, unlike a per-bar shift. */
-export function sessionBasis(candles: { time: number; close: number }[], flow: Map<number, FlowBar>): Map<number, number> {
+/** An index's footprint is its future's, at futures prices: the futures-minus-index basis
+ *  per session (chart day) that lays it onto the index candles — the median over the
+ *  session's candles of (the footprint's traded-range midpoint − the candle's midpoint).
+ *  Taken from the footprint itself, so it needs no flow bars and can't disagree with what
+ *  is drawn: a basis off by 40 points pushed every bar's prints above the candle, and the
+ *  renderer piled them into the top rows. Snapped to `tick`. */
+export function footprintBasis(candles: { time: number; high: number; low: number }[],
+  fp: Map<number, { fp: [number, number, number][] }>, tick = 0.05): Map<number, number> {
   const per = new Map<number, number[]>();
   for (const c of candles) {
-    const f = flow.get(c.time);
-    if (!f || f.close == null) continue;
+    const rows = fp.get(c.time)?.fp;
+    if (!rows?.length || !(c.high >= c.low)) continue;
+    let lo = Infinity, hi = -Infinity;
+    for (const [p, b, s] of rows) {
+      if (b + s <= 0) continue;
+      lo = Math.min(lo, p);
+      hi = Math.max(hi, p);
+    }
+    if (!Number.isFinite(lo)) continue;
     const d = Math.floor(c.time / 86400);
-    per.set(d, [...(per.get(d) ?? []), f.close - c.close]);
+    per.set(d, [...(per.get(d) ?? []), (lo + hi) / 2 - (c.high + c.low) / 2]);
   }
   const out = new Map<number, number>();
   for (const [d, xs] of per) {
     xs.sort((a, b) => a - b);
-    out.set(d, xs[Math.floor(xs.length / 2)]);
+    const m = xs.length % 2 ? xs[(xs.length - 1) / 2] : (xs[xs.length / 2 - 1] + xs[xs.length / 2]) / 2;
+    out.set(d, Math.round(m / tick) * tick);
   }
   return out;
 }
