@@ -230,6 +230,7 @@ class Collector:
         self.rec.raw_keys = {k for s in plan.symbols
                              if plan.meta[(k := plan.keys[s])]["cls"] == "focus" or plan.meta[k].get("raw")}
         self.rec.set_chain(plan.chain, int(cfg["chains"].get("interval_s") or 60))
+        self.set_depth(plan, cfg)
         self.rec.write_meta(plan.meta, day)
         self.symbols = plan.symbols
         self.plan_summary = plan.summary()
@@ -238,6 +239,30 @@ class Collector:
                                                    "symbols": [[s, plan.keys[s], plan.meta[plan.keys[s]]["cls"]]
                                                                for s in plan.symbols]})
         log.info("flowd.planned", used=len(plan.symbols), budget=plan.budget, classes=plan.classes)
+
+    def set_depth(self, plan: Any, cfg: dict[str, Any]) -> None:
+        """The order books to record: the recorded indices' current futures (keys NIFTY-FUT ...) and
+        `depth.symbols`. They stay subscribed while touched (touch_depth, from the loop)."""
+        dc = cfg.get("depth") or {}
+        if not dc.get("enabled", True):
+            self.rec.depth_keys = {}
+            return
+        futs = {full: key for full, key in plan.keys.items()           # the indices' current futures (not -FUT2)
+                if plan.meta[key].get("kind") == "FUT" and plan.meta[key].get("name") in fu.INDEX_SYMBOL
+                and key.endswith("-FUT")}
+        extra = {str(x).upper(): ticks.flow_key(str(x)) for x in dc.get("symbols") or [] if ":" in str(x)}
+        self.rec.depth_keys = {**futs, **extra}
+        self.rec.depth_s = max(0.5, float(dc.get("interval_s") or 1))
+
+    def touch_depth(self) -> None:
+        """Keep the depth subscriptions alive (the stream drops one untouched for 20 s)."""
+        if self.stream is None or self.paused:
+            return
+        for full in list(self.rec.depth_keys):
+            try:
+                self.stream.touch_depth(full)
+            except Exception as e:  # noqa: BLE001
+                self.note_error(f"depth: {e}")
 
     def plan_due(self, now: float) -> bool:
         tod = (now + ticks.IST) % 86400
@@ -375,13 +400,13 @@ class Collector:
             self.cap = None
             await asyncio.to_thread(self.rec.sweep, now)
             await asyncio.to_thread(self.rec.prune, int(self.cfg["retention_days"]), int(self.cfg["raw_days"]),
-                                    self.cfg["long"])
+                                    self.cfg["long"], int(self.cfg["depth"].get("days") or 5))
         if (now + ticks.IST) % 86400 // 60 >= ticks.COMPACT_AFTER_MIN and self._compacted != day:
             self._compacted = day
             await asyncio.to_thread(self.rec.flush)
             if await asyncio.to_thread(self.rec.compact, day):
                 await asyncio.to_thread(self.rec.prune, int(self.cfg["retention_days"]), int(self.cfg["raw_days"]),
-                                        self.cfg["long"])
+                                        self.cfg["long"], int(self.cfg["depth"].get("days") or 5))
 
     async def run(self) -> None:
         from app.execution.fyers_stream import FyersStreamManager
@@ -405,7 +430,7 @@ class Collector:
             log.exception("flowd.migration_failed")
         await asyncio.to_thread(self.rec.sweep)
         await asyncio.to_thread(self.rec.prune, int(self.cfg["retention_days"]), int(self.cfg["raw_days"]),
-                                self.cfg["long"])
+                                self.cfg["long"], int(self.cfg["depth"].get("days") or 5))
         self.rec.resume()
         try:
             await self.replan(time.time())
@@ -415,9 +440,10 @@ class Collector:
         self.stream = FyersStreamManager(market_data=MarketDataBus(), quote_feed=None, backend_provider=self.backend,
                                          record_symbols=lambda: self.symbols, orders=False)
         self.stream.tick_listeners.append(self.rec.on_tick)
+        self.stream.depth_listeners.append(self.rec.on_depth)
         self.stream.connect_listeners.append(self.rec.mark_resync)
         self.stream.start()
-        last_flush = last_status = last_stats = 0.0
+        last_flush = last_status = last_stats = last_depth = 0.0
         try:
             while not self._stop.is_set():
                 now = time.time()
@@ -434,6 +460,9 @@ class Collector:
                         self._disk_at = 0.0
                         self.lists_at = 0.0
                         await self.replan(now)
+                    if now - last_depth >= 5:
+                        last_depth = now
+                        self.touch_depth()
                     if now - last_flush >= FLUSH_S:
                         last_flush = now
                         await asyncio.to_thread(self.rec.flush)

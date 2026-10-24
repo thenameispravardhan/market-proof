@@ -562,9 +562,76 @@ function FlowPanel({ symbol }: { symbol: string | null }) {
 // − sold): above zero is bullish money (call buying, put writing). For NIFTY / SENSEX, their
 // futures and options; hidden when nothing of the underlying's options was recorded.
 type OptFlowResp = { name: string; recorded: boolean; bars: number[][] };
+// Where the option money went, strike by strike (GET /api/algo/ticks/options-strikes): calls
+// net (bought − sold, ₹) on the left, puts net on the right, centred bars, and the strike's
+// net — calls minus puts, + = bullish. Over the session or the last N minutes of recorded
+// flow; the at-the-money strike is marked from the index's live price.
+type StrikeResp = { name: string; recorded: boolean; rows: number[][] };
+export function OptionsStrikeLadder({ symbol, expiry, dayStart, lastBar }: { symbol: string; expiry: "all" | "near"; dayStart: number; lastBar: number }) {
+  const [win, setWin] = useState<"session" | "60" | "15">("session");
+  const [data, setData] = useState<StrikeResp | null>(null);
+  const spot = useLiveQuote(/-INDEX$/i.test(symbol) ? symbol : null)?.last_price ?? null;
+  useEffect(() => {
+    let stop = false;
+    const load = async () => {
+      const end = lastBar + 300;                         // the end of the last recorded 5-minute bar
+      const from = win === "session" ? dayStart : Math.max(dayStart, end - Number(win) * 60);
+      try {
+        const q = new URLSearchParams({ symbol, from: String(from), to: String(end), expiry });
+        const r = await fetch(`/api/algo/ticks/options-strikes?${q.toString()}`);
+        if (r.ok && !stop) setData(await r.json());
+      } catch { /* the next poll retries */ }
+    };
+    void load();
+    const id = setInterval(load, 15000);
+    return () => { stop = true; clearInterval(id); };
+  }, [symbol, expiry, win, dayStart, lastBar]);
+  const rows = (data?.rows ?? []).filter((r) => r[5] + r[6] + r[7] + r[8] > 0).sort((a, b) => b[0] - a[0]);
+  const rs = (v: number) => (v < 0 ? `−₹${fmtK(-v)}` : `₹${fmtK(v)}`);
+  const max = Math.max(1, ...rows.flatMap((r) => [Math.abs(r[5] - r[6]), Math.abs(r[7] - r[8])]));
+  const atm = spot != null && rows.length ? rows.reduce((a, r) => (Math.abs(r[0] - spot) < Math.abs(a - spot) ? r[0] : a), rows[0][0]) : null;
+  const bar = (v: number, side: "left" | "right", bull: boolean) => (
+    <div style={{ display: "flex", justifyContent: side === "left" ? "flex-end" : "flex-start" }}>
+      <div style={{ height: 8, width: `${(Math.abs(v) / max) * 100}%`, background: bull ? "var(--green)" : "var(--red)", opacity: 0.8 }} />
+    </div>
+  );
+  return (
+    <div data-testid="trade-options-strikes">
+      <div className="hint" style={{ margin: "4px 0" }}>
+        {(["session", "60", "15"] as const).map((w) => (
+          <button key={w} type="button" className={`btn-sm${win === w ? "" : " ghost"}`} onClick={() => setWin(w)} style={{ marginRight: 4 }}>
+            {w === "session" ? "session" : `last ${w} min`}</button>
+        ))}
+        {spot != null && <span> · {data?.name} {spot.toFixed(2)}</span>}
+      </div>
+      {!rows.length ? <div className="empty">No option prints in this window.</div> : (
+        <div className="flow-scroll">
+          <table className="pending-table flow-table">
+            <thead><tr><th title="calls bought − sold (₹): + = call buying">Calls net</th><th className="flow-bar-col"></th><th>Strike</th>
+              <th className="flow-bar-col"></th><th title="puts bought − sold (₹): + = put buying">Puts net</th><th title="(calls net) − (puts net): + = bullish">Net</th></tr></thead>
+            <tbody>{rows.map((r) => {
+              const c = r[5] - r[6], pu = r[7] - r[8];
+              return (
+                <tr key={r[0]} style={r[0] === atm ? { outline: "1px solid var(--accent)" } : undefined} data-atm={r[0] === atm || undefined}>
+                  <td className={c >= 0 ? "up" : "down"}>{rs(c)}</td>
+                  <td className="flow-bar-col">{bar(c, "left", c >= 0)}</td>
+                  <td><b>{r[0]}</b>{r[0] === atm ? <span className="hint"> ATM</span> : null}</td>
+                  <td className="flow-bar-col">{bar(pu, "right", pu < 0)}</td>
+                  <td className={pu >= 0 ? "down" : "up"}>{rs(pu)}</td>
+                  <td className={r[9] >= 0 ? "up" : "down"}>{rs(r[9])}</td>
+                </tr>);
+            })}</tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function OptionsFlowSection({ symbol }: { symbol: string }) {
   const [data, setData] = useState<OptFlowResp | null>(null);
   const [expiry, setExpiry] = useState<"all" | "near">("all");
+  const [view, setView] = useState<"time" | "strike">("time");
   useEffect(() => {
     let stop = false;
     setData(null);
@@ -594,6 +661,9 @@ export function OptionsFlowSection({ symbol }: { symbol: string }) {
       <h2>{data.name} options flow <span className="hint">premium the aggressors paid, every recorded contract</span>{" "}
         <select value={expiry} onChange={(e) => setExpiry(e.target.value as "all" | "near")} aria-label="expiries">
           <option value="all">all expiries</option><option value="near">nearest expiry</option>
+        </select>{" "}
+        <select value={view} onChange={(e) => setView(e.target.value as "time" | "strike")} aria-label="view" data-testid="options-flow-view">
+          <option value="time">over time</option><option value="strike">by strike</option>
         </select></h2>
       <div className="quote-row">
         <div className="quote-cell"><div className="k">CALLS BOUGHT</div><div className="v up">{rs(cb)}</div></div>
@@ -603,17 +673,21 @@ export function OptionsFlowSection({ symbol }: { symbol: string }) {
         <div className="quote-cell" title="(calls bought − sold) − (puts bought − sold): + = bullish money">
           <div className="k">NET</div><div className={`v ${net >= 0 ? "up" : "down"}`}>{rs(net)}</div></div>
       </div>
-      <div className="flow-scroll">
-        <table className="pending-table flow-table">
-          <thead><tr><th>Time</th><th title="calls bought − sold (₹)">Calls net</th><th title="puts bought − sold (₹)">Puts net</th><th>Net</th><th>Running</th></tr></thead>
-          <tbody>{today.map((b) => { run += b[9]; const c = b[5] - b[6], pu = b[7] - b[8]; return (
-            <tr key={b[0]}>
-              <td>{new Date((b[0] + 19800) * 1000).toISOString().slice(11, 16)}</td>
-              <td className={c >= 0 ? "up" : "down"}>{rs(c)}</td><td className={pu >= 0 ? "down" : "up"}>{rs(pu)}</td>
-              <td className={b[9] >= 0 ? "up" : "down"}>{rs(b[9])}</td><td className={run >= 0 ? "up" : "down"}>{rs(run)}</td>
-            </tr>); })}</tbody>
-        </table>
-      </div>
+      {view === "strike" ? (
+        <OptionsStrikeLadder symbol={symbol} expiry={expiry} dayStart={lastDay * 86400 - 19800} lastBar={today[today.length - 1][0]} />
+      ) : (
+        <div className="flow-scroll">
+          <table className="pending-table flow-table">
+            <thead><tr><th>Time</th><th title="calls bought − sold (₹)">Calls net</th><th title="puts bought − sold (₹)">Puts net</th><th>Net</th><th>Running</th></tr></thead>
+            <tbody>{today.map((b) => { run += b[9]; const c = b[5] - b[6], pu = b[7] - b[8]; return (
+              <tr key={b[0]}>
+                <td>{new Date((b[0] + 19800) * 1000).toISOString().slice(11, 16)}</td>
+                <td className={c >= 0 ? "up" : "down"}>{rs(c)}</td><td className={pu >= 0 ? "down" : "up"}>{rs(pu)}</td>
+                <td className={b[9] >= 0 ? "up" : "down"}>{rs(b[9])}</td><td className={run >= 0 ? "up" : "down"}>{rs(run)}</td>
+              </tr>); })}</tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }

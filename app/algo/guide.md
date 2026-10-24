@@ -1609,4 +1609,20 @@ for the 95% drawdown, not the one history happened to give.
   — calls and puts bought / sold, in quantity and ₹ premium — on the chart
   (indicator *Index Options Flow*: net premium per candle, + = call buying /
   put writing, with its running total) and in the Trade page's Order flow
-  panel; all expiries or the nearest one.
+  panel; all expiries or the nearest one — and **by strike** there: calls
+  net and puts net per strike (₹), the net, ATM marked, over the session or
+  the last 60 / 15 minutes. **Book Pressure** (chart indicator): the order
+  book's total pending buy vs sell quantity per candle, −100…+100, with an
+  EMA. **Order-flow alerts** (chart › Alerts manager › Order flow): big
+  print ≥ N, delta spike ≥ Nσ, book ≥ N % lopsided, stacked imbalance,
+  absorption, delta divergence — judged on each closed candle (prints as
+  they arrive), each event once, armed when switched on. More recorded-flow
+  indicators: **Big Trades** (the biggest print per candle, on any chart
+  type), **OI Change**, **Options PCR** (put ÷ call volume, per candle and
+  session), **Tape Speed** (prints per minute, bursts highlighted) and
+  **Icebergs** (a price where the traded quantity reached N× the largest
+  size the book showed there while it held — from the raw frames of the
+  focus symbols). The footprint's profile can also be a **composite** of
+  the last N sessions or **TPO** (time at price, from the candles), with
+  **developing POC / VA** lines; **History** sets how many candles get a
+  footprint. The DOM's volume column starts from today's recorded volume.

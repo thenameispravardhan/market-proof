@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  analyze, barSignals, candleAt, cellLayout, DEFAULT_FOOTPRINT, flowByCandle, footprintBasis, footprintByCandle, fpSettings, groupRows, heatColor, inferTick, nakedPocs, rowStep,
+  analyze, barSignals, candleAt, cellLayout, DEFAULT_FOOTPRINT, developing, flowByCandle, footprintBasis, footprintByCandle, fpSettings, groupRows, heatColor, inferTick, nakedPocs, rowStep, tpoRows,
   sessionCvd, type FlowBar,
 } from "../components/trade/footprint";
 import { INDICATOR_BY_TYPE, type FlowTuple } from "../components/trade/indicatorCatalog";
@@ -47,7 +47,7 @@ describe("footprint analytics", () => {
       [1240, 7, 7, 0, 1, 0, 530, 100.05, -1, 3],
     ];
     const m = flowByCandle(times, bars, 0);
-    expect(m.get(1000)).toEqual({ buy: 35, sell: 35, delta: 0, trades: 5, unk: 5, oi: 520, close: 100.0, dlo: -2, dhi: 25 });
+    expect(m.get(1000)).toEqual({ buy: 35, sell: 35, delta: 0, trades: 5, unk: 5, oi: 520, close: 100.0, dlo: -2, dhi: 25, bookBid: null, bookAsk: null });
     expect(m.get(1240)?.dhi).toBe(3);
     expect(candleAt(times, 999)).toBe(-1);
     const fp = footprintByCandle(times, [[1000, 100.1, 3, 1], [1120, 100.1, 2, 2], [1240, 100.0, 1, 0]], 0);
@@ -151,5 +151,28 @@ describe("footprint views: heatmap, naked POCs, profile options", () => {
       .toMatchObject({ mode: "heatmap", profileScope: "session", profileType: "delta", npoc: true, numbers: false });
     expect(fpSettings({ mode: "nope" as never, profileScope: "x" as never, profileType: "y" as never }))
       .toMatchObject({ mode: "bidask", profileScope: "visible", profileType: "volume" });
+  });
+});
+
+describe("profiles: TPO, developing POC / value area, composite settings", () => {
+  it("counts time at price from the candles' ranges", () => {
+    const rows = tpoRows([{ high: 100.2, low: 100.0 }, { high: 100.1, low: 100.1 }], 0.1);
+    expect(rows.map((r) => [r.p, r.buy])).toEqual([[100, 1], [100.1, 2], [100.2, 1]]);
+  });
+
+  it("tracks the POC and value area as each bar adds to the session", () => {
+    const dev = developing([
+      [{ p: 100, buy: 10, sell: 0 }],
+      [{ p: 101, buy: 30, sell: 0 }, { p: 100, buy: 5, sell: 0 }],
+      [{ p: 99, buy: 50, sell: 0 }],
+    ], 1, 70);
+    expect(dev.map((d) => d.poc)).toEqual([100, 101, 99]);
+    expect(dev[2]).toEqual({ poc: 99, vah: 101, val: 99 });   // 50 + 30 of 95 inside 70%: the VA spans 99–101
+  });
+
+  it("keeps the new profile settings valid", () => {
+    expect(fpSettings({ profileScope: "composite", compositeDays: 99, profileType: "tpo", devLines: true }))
+      .toMatchObject({ profileScope: "composite", compositeDays: 30, profileType: "tpo", devLines: true });
+    expect(fpSettings({ compositeDays: 0 }).compositeDays).toBe(5);
   });
 });

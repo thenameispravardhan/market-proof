@@ -18,8 +18,8 @@
 // the index-vs-future basis.
 
 export type FootprintMode = "bidask" | "delta" | "volume" | "heatmap";
-export type ProfileScope = "visible" | "session";
-export type ProfileType = "volume" | "delta";
+export type ProfileScope = "visible" | "session" | "composite";
+export type ProfileType = "volume" | "delta" | "tpo";
 export type StatRow = "vol" | "delta" | "dpct" | "cvd" | "dmin" | "dmax" | "trades" | "oi";
 
 export interface FootprintSettings {
@@ -40,10 +40,22 @@ export interface FootprintSettings {
   unfinished: boolean;
   /** Volume profile of the visible bars on the pane's right edge, with its POC line. */
   profile: boolean;
-  /** visible = one profile of the bars on screen at the right edge; session = one per day, from its first bar. */
+  /** visible = one profile of the bars on screen at the right edge; session = one per day, from its first bar;
+   *  composite = one of the last `compositeDays` sessions at the right edge. */
   profileScope: ProfileScope;
-  /** volume = buy + sell per row; delta = buy − sell per row (coloured by side). */
+  compositeDays: number;
+  /** volume = buy + sell per row; delta = buy − sell per row (coloured by side); tpo = time at price
+   *  (candles whose range covered the row — from the candles alone, no ticks needed). */
   profileType: ProfileType;
+  /** Developing POC / VAH / VAL: where each session's POC and value area stood after every bar. */
+  devLines: boolean;
+  /** How many of the latest candles get their footprint loaded (more = more to scroll back through, heavier). */
+  historyBars: number;
+  /** time = the chart's candles; range / volume / tick = bars that close on price range, quantity or trade
+   *  count, built tick by tick on the server from the raw frames (the focus symbols keep them). */
+  barType: "time" | "range" | "volume" | "tick";
+  /** The range (price), quantity or trade count of a bar; 0 = the type's default (BAR_SIZE). */
+  barSize: number;
   /** Absorption and delta-divergence markers. */
   signals: boolean;
   /** Each bar's POC extended to the right until price trades back through it (only the untested ones). */
@@ -66,11 +78,19 @@ export const DEFAULT_FOOTPRINT: FootprintSettings = {
   unfinished: true,
   profile: true,
   profileScope: "visible",
+  compositeDays: 5,
   profileType: "volume",
+  devLines: false,
+  historyBars: 400,
+  barType: "time",
+  barSize: 0,
   signals: true,
   npoc: false,
   numbers: true,
 };
+
+/** A non-time bar's default size: range in price points, volume in quantity, tick in trades. */
+export const BAR_SIZE = { range: 5, volume: 20000, tick: 300 } as const;
 
 export const STAT_LABEL: Record<StatRow, string> = {
   vol: "Volume", delta: "Delta", dpct: "Delta %", cvd: "CVD", dmin: "Min Δ", dmax: "Max Δ", trades: "Trades", oi: "OI Δ",
@@ -83,8 +103,12 @@ export function fpSettings(raw: Partial<FootprintSettings> | undefined): Footpri
   return {
     ...s,
     mode: (["bidask", "delta", "volume", "heatmap"] as const).includes(s.mode) ? s.mode : DEFAULT_FOOTPRINT.mode,
-    profileScope: s.profileScope === "session" ? "session" : "visible",
-    profileType: s.profileType === "delta" ? "delta" : "volume",
+    profileScope: s.profileScope === "session" || s.profileScope === "composite" ? s.profileScope : "visible",
+    compositeDays: Math.min(30, Math.max(1, Math.round(Number(s.compositeDays) || DEFAULT_FOOTPRINT.compositeDays))),
+    historyBars: Math.min(3000, Math.max(100, Math.round(Number(s.historyBars) || DEFAULT_FOOTPRINT.historyBars))),
+    barType: (["time", "range", "volume", "tick"] as const).includes(s.barType) ? s.barType : "time",
+    barSize: Number.isFinite(Number(s.barSize)) && Number(s.barSize) > 0 ? Number(s.barSize) : 0,
+    profileType: s.profileType === "delta" || s.profileType === "tpo" ? s.profileType : "volume",
     stats: Array.isArray(s.stats) ? s.stats.filter((x) => x in STAT_LABEL) : DEFAULT_FOOTPRINT.stats,
   };
 }
@@ -180,6 +204,39 @@ export function groupRows(levels: [number, number, number][], step: number): FpR
     rows.set(p, r);
   }
   return [...rows.values()].sort((a, b) => a.p - b.p);
+}
+
+/** Time at price: for each candle, +1 on every `step` row its range covered (as buy, so a profile's
+ *  POC / value area read it like volume). From the candles alone — no ticks needed. */
+export function tpoRows(candles: { high: number; low: number }[], step: number): FpRow[] {
+  const rows = new Map<number, FpRow>();
+  for (const c of candles) {
+    if (!(c.high >= c.low)) continue;
+    const a = Math.round(Math.floor(c.low / step + 1e-7)), b = Math.round(Math.floor(c.high / step + 1e-7));
+    for (let k = a; k <= b; k++) {
+      const p = round6(k * step);
+      const r = rows.get(p) ?? { p, buy: 0, sell: 0 };
+      r.buy += 1;
+      rows.set(p, r);
+    }
+  }
+  return [...rows.values()].sort((x, y) => x.p - y.p);
+}
+
+/** A developing profile: after each bar (its rows, oldest first), the POC and value area of
+ *  everything so far. */
+export function developing(perBar: FpRow[][], step: number, vaPct: number): { poc: number | null; vah: number | null; val: number | null }[] {
+  const acc = new Map<number, FpRow>();
+  return perBar.map((rows) => {
+    for (const r of rows) {
+      const cur = acc.get(r.p) ?? { p: r.p, buy: 0, sell: 0 };
+      cur.buy += r.buy;
+      cur.sell += r.sell;
+      acc.set(r.p, cur);
+    }
+    const a = analyze([...acc.values()].sort((x, y) => x.p - y.p), step, { imbalance: 0, imbalanceMin: 0, stacked: 0, vaPct });
+    return { poc: a.poc, vah: a.vah, val: a.val };
+  });
 }
 
 /** Everything a footprint bar shows (see the module comment). Rows are contiguous
@@ -322,6 +379,9 @@ export interface FlowBar {
   /** Lowest / highest running delta inside the candle (from its start). */
   dlo: number;
   dhi: number;
+  /** The order book's total pending buy / sell quantity, averaged over the candle (null: none recorded). */
+  bookBid: number | null;
+  bookAsk: number | null;
 }
 
 /** Index of the candle holding chart time `t` (the last one starting at or before it), or -1. */
@@ -337,21 +397,30 @@ export function candleAt(times: number[], t: number): number {
   return hit;
 }
 
-/** Fold /api/algo/ticks/flow bars ([t, buy, sell, delta, trades, unk, oi, close, dlo, dhi], epoch t)
- *  into the chart's candles (chart time = epoch + `shift`). */
-export function flowByCandle(times: number[], bars: number[][], shift: number): Map<number, FlowBar> {
+/** Fold /api/algo/ticks/flow bars ([t, buy, sell, delta, trades, unk, oi, close, dlo, dhi, book_bid,
+ *  book_ask], epoch t) into the chart's candles (chart time = epoch + `shift`). */
+export function flowByCandle(times: number[], bars: (number | null)[][], shift: number): Map<number, FlowBar> {
   const out = new Map<number, FlowBar>();
+  const bookN = new Map<number, number>();          // sub-bars that carried book totals, per candle
   for (const b of bars) {
-    const i = candleAt(times, b[0] + shift);
+    const i = candleAt(times, (b[0] ?? 0) + shift);
     if (i < 0) continue;
     const key = times[i];
     const buy = b[1] ?? 0, sell = b[2] ?? 0, delta = b[3] ?? buy - sell;
     const trades = b[4] ?? 0, unk = b[5] ?? 0, oi = b[6] ?? null, close = b[7] ?? null;
     const dlo = b[8] ?? Math.min(0, delta), dhi = b[9] ?? Math.max(0, delta);
+    const bid = b[10] ?? null, ask = b[11] ?? null;
     const cur = out.get(key);
     if (!cur) {
-      out.set(key, { buy, sell, delta, trades, unk, oi, close, dlo, dhi });
+      out.set(key, { buy, sell, delta, trades, unk, oi, close, dlo, dhi, bookBid: bid, bookAsk: ask });
+      if (bid != null && ask != null) bookN.set(key, 1);
       continue;
+    }
+    if (bid != null && ask != null) {                 // a running mean over the sub-bars that have the book
+      const n = (bookN.get(key) ?? 0) + 1;
+      bookN.set(key, n);
+      cur.bookBid = (cur.bookBid ?? 0) + (bid - (cur.bookBid ?? 0)) / n;
+      cur.bookAsk = (cur.bookAsk ?? 0) + (ask - (cur.bookAsk ?? 0)) / n;
     }
     // a later sub-bar: its running extremes start from where the candle's delta stood
     cur.dlo = Math.min(cur.dlo, cur.delta + dlo);
@@ -431,3 +500,4 @@ export function footprintBasis(candles: { time: number; high: number; low: numbe
   }
   return out;
 }
+

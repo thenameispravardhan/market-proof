@@ -288,8 +288,9 @@ def test_flow_api_bars_footprint_prints_and_the_future_that_rolled(client, tmp_p
     body = r.json()
     assert body["key"] == "NIFTY-FUT2" and body["recorded"]
     (bar,) = body["bars"]
-    t, buy, sell, delta, trades, unk, oi, close, dlo, dhi = bar
+    t, buy, sell, delta, trades, unk, oi, close, dlo, dhi, book_bid, book_ask = bar
     assert (t, buy, sell, delta, trades) == (T915, 150.0, 100.0, 50.0, 5)
+    assert (book_bid, book_ask) == (None, None)                          # these frames carried no book totals
     assert close == 25099.0 and dhi == 150.0 and dlo == 0.0          # +50 +100 +150 (peak) +100 +50
     assert {(p, b, s) for _, p, b, s in body["footprint"]} == {(25100.0, 150.0, 0.0), (25099.0, 0.0, 100.0)}
     assert body["prints"] == []
@@ -370,6 +371,7 @@ async def test_collector_plans_reports_and_sheds_load(tmp_path, monkeypatch):
     plan = ticks.read_json(tmp_path / "plan.json")
     assert plan["used"] == len(c.symbols) > 50 and plan["classes"]["focus"] == 1
     assert c.rec.raw_keys == {"ITC"} and c.rec.key_of["NSE:NIFTY26NOVFUT"] == "NIFTY-FUT2"
+    assert c.rec.depth_keys == {"NSE:NIFTY26OCTFUT": "NIFTY-FUT"}           # the index's current future's book
     assert ticks.read_json(tmp_path / "today" / ticks.ymd(DAY0) / "meta.json")["NIFTY-FUT"]["symbol"] == "NSE:NIFTY26OCTFUT"
     c.write_status()
     st = ticks.read_json(tmp_path / "status.json")
@@ -571,7 +573,7 @@ def test_an_index_chart_reads_its_futures_flow_and_the_auction_joins_the_first_c
                                                                              "kind": "IDX"}}, DAY0)
     body = client.get("/api/algo/ticks/flow", params={"symbol": "NSE:NIFTY50-INDEX", "resolution": "5",
                                                        "from": T915 - 3600, "to": T915 + 600}).json()
-    assert body["key"] == "NIFTY-FUT" and body["recorded"]
+    assert body["key"] == "NIFTY-FUT" and body["recorded"] and body["future"] == fut   # the contract, to open it
     (bar,) = body["bars"]                                                # the auction is in 09:15's candle
     assert bar[0] == T915 and bar[1:3] == [50.0, 20.0] and bar[5] == 500.0
 
@@ -628,3 +630,31 @@ def test_options_flow_adds_up_an_indexs_calls_and_puts_in_quantity_and_premium(c
     assert by_option["name"] == "NIFTY" and by_option["bars"][0][1] == 650.0
     assert client.get("/api/algo/ticks/options-flow", params={"symbol": "NIFTY", "from": T915, "to": T915 + 600,
                                                                "expiry": "soon"}).status_code == 422
+    # strike by strike: both days added up at the one strike, net bullish
+    st = client.get("/api/algo/ticks/options-strikes", params={"symbol": "NSE:NIFTY50-INDEX", "from": T915 - 86400,
+                                                                "to": T915 + 600, "expiry": "all"}).json()
+    assert st["name"] == "NIFTY" and st["recorded"]
+    (row,) = st["rows"]
+    assert row[0] == 25000.0 and row[1:5] == [1300.0, 650.0, 0.0, 2600.0]
+    assert row[9] == round((130000.0 - 64675.0) - (0.0 - 208000.0), 2)
+    # a window that holds only today's minute 2 (the CE sell at 99.5): ce_sell only
+    late = client.get("/api/algo/ticks/options-strikes", params={"symbol": "NIFTY", "from": T915 + 60,
+                                                                  "to": T915 + 120}).json()["rows"]
+    assert late == [[25000.0, 0.0, 325.0, 0.0, 0.0, 0.0, 32337.5, 0.0, 0.0, -32337.5]]
+    assert client.get("/api/algo/ticks/options-strikes", params={"symbol": "NIFTY", "from": T915,
+                                                                  "to": T915}).status_code == 422
+
+
+def test_flow_bars_carry_the_books_pending_quantity_averaged_over_the_bar(client, tmp_path, monkeypatch):
+    rec = ticks.TickRecorder(tmp_path)
+    monkeypatch.setattr(ticks, "_STORE", ticks.FlowStore(tmp_path))
+    fut = "NSE:NIFTY26OCTFUT"
+    rec.key_of[fut] = "NIFTY-FUT"
+    feed(rec, fut, [frame(25100.0, 0, 25099.0, 25100.0, T915, tot_buy_qty=900, tot_sell_qty=300),
+                    frame(25100.0, 50, 25099.0, 25100.0, T915 + 5, tot_buy_qty=1000, tot_sell_qty=400),     # minute 1
+                    frame(25100.0, 80, 25099.0, 25100.0, T915 + 65, tot_buy_qty=600, tot_sell_qty=800)])    # minute 2
+    rec.flush()
+    rec.write_meta({"NIFTY-FUT": {"symbol": fut, "kind": "FUT"}}, DAY0)
+    (bar,) = client.get("/api/algo/ticks/flow", params={"symbol": fut, "resolution": "5", "from": T915,
+                                                         "to": T915 + 600}).json()["bars"]
+    assert bar[10:12] == [800.0, 600.0]                                  # each minute's last snapshot, averaged

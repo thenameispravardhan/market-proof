@@ -215,6 +215,8 @@ class FyersStreamManager:
         # Called on the SDK thread with (full_id, raw frame, receive time) for
         # every frame — the tick recorder hangs off this. Must be cheap.
         self.tick_listeners: list[Callable[[str, dict[str, Any], float], None]] = []
+        # every DepthUpdate frame as (symbol, book) — the order-flow collector records them
+        self.depth_listeners: list[Callable[[str, dict[str, Any]], None]] = []
         self._interval = float(reconcile_interval_s)
         # A bus tick counts as "live" for this long; an on-demand
         # subscription is protected from the reconcile sweep for this long
@@ -821,6 +823,11 @@ class FyersStreamManager:
         book = {"ok": True, "symbol": sym, "bids": side("bid"), "asks": side("ask"),
                 "total_buy": safe_float(message.get("tot_buy_qty")) or None,
                 "total_sell": safe_float(message.get("tot_sell_qty")) or None}
+        for fn in self.depth_listeners:
+            try:
+                fn(sym, book)
+            except Exception:                       # a listener never breaks the feed
+                log.exception("fyers_stream.depth_listener_failed")
         loop = self._loop
         if loop is not None:
             asyncio.run_coroutine_threadsafe(event_bus.publish("depth", book), loop)
