@@ -102,6 +102,38 @@ export interface ComputeCtx {
   flow?: Map<number, FlowTuple>;
   /** Another symbol's closes by chart time (two-symbol indicators). */
   other?: (symbol: string) => Map<number, number> | undefined;
+  /** An index's options together per chart time (premium in ₹ the aggressors paid):
+   *  [calls bought, calls sold, puts bought, puts sold, net = (calls b − s) − (puts b − s)]. */
+  optFlow?: Map<number, OptFlowTuple>;
+}
+
+export type OptFlowTuple = [number, number, number, number, number];
+
+/** Net option premium per candle and its running total (resets each session). */
+export function optionsFlow(c: OhlcvCandle[], flow: Map<number, OptFlowTuple> | undefined, reset = true) {
+  const net: (number | null)[] = [], cum: (number | null)[] = [], calls: (number | null)[] = [], puts: (number | null)[] = [];
+  let run = 0, day = -1;
+  for (const k of c) {
+    const d = Math.floor(k.time / 86400);
+    if (reset && d !== day) {
+      run = 0;
+      day = d;
+    }
+    const f = flow?.get(k.time);
+    if (!f) {
+      net.push(null);
+      cum.push(flow?.size ? run : null);
+      calls.push(null);
+      puts.push(null);
+      continue;
+    }
+    run += f[4];
+    net.push(f[4]);
+    cum.push(run);
+    calls.push(f[0] - f[1]);
+    puts.push(f[2] - f[3]);
+  }
+  return { net, cum, calls, puts };
 }
 
 /** A marker on one bar of a plot (pattern, fractal, divergence …). */
@@ -749,6 +781,30 @@ export const INDICATORS: IndicatorDef[] = [
         close.push(run);
       }
       return { plots: [close], candles: { 0: ohlc } };
+    },
+  },
+  {
+    type: "optflow",
+    name: "Index Options Flow (calls vs puts, recorded ticks)",
+    short: "Options flow",
+    category: "Volume",
+    overlay: false,
+    desc: "Every recorded option of the index (NIFTY, SENSEX …) together: the premium aggressors paid per candle — "
+      + "calls bought − sold minus puts bought − sold, in ₹. Above zero = bullish money (call buying / put writing), "
+      + "below = bearish (put buying / call writing); the line is its running total for the session. "
+      + "Works on the index, its future or any of its options. From the tick recorder (Algo Lab › Data).",
+    inputs: [
+      { key: "expiry", label: "Expiries", type: "select", def: "all", options: ["all", "near"] },
+      { key: "reset", label: "Total resets", type: "select", def: "session", options: ["session", "none"] },
+    ],
+    plots: [
+      { key: "net", label: "Net premium", color: "#26A69A", kind: "hist" },
+      { key: "cum", label: "Running net", color: "#FFB300", width: 2, scale: "cum" },
+    ],
+    levels: [0],
+    compute: (c, inp, ctx) => {
+      const r = optionsFlow(c, ctx.optFlow, str(inp.reset, "session") === "session");
+      return { plots: [r.net, r.cum], colors: [r.net.map((v) => (v == null ? null : v >= 0 ? ctx.up : ctx.down)), null] };
     },
   },
   {

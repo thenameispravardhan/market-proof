@@ -687,8 +687,9 @@ delta that can't be priced shows `—`, never a guess. Shadows are left out.
 
 | setting | what it does |
 |---|---|
-| `ALGO_BOOK_MAX_DAY_LOSS` ₹ | the whole book's day P&L at or below −₹X — or its realised loss alone — flattens **every** automation (reason `BOOK_MAX_LOSS`) and stops all automation entries **until tomorrow**. The halt is written to the audit log, so a restart doesn't undo it. |
+| `ALGO_BOOK_MAX_DAY_LOSS` ₹ | the whole book's day P&L (realised today + open MTM) at or below −₹X flattens **every** automation (reason `BOOK_MAX_LOSS`) and stops all automation entries **until tomorrow**; with nothing open, the realised loss alone does. The halt is written to the audit log, so a restart doesn't undo it. |
 | `ALGO_BOOK_MAX_MARGIN` ₹ | an entry is sized down (whole lots / sets) or skipped so the margin all automations block together stays ≤ ₹X. Per-strategy `portfolio.capital` still applies on top. |
+| `ALGO_BOOK_FOLLOW_PORTFOLIO_HALT` (on) | while the **account** circuit breaker is on (the daily-loss / monthly-drawdown breakers, the manual kill switch — Settings → Circuit breakers), no automation enters; open positions keep their own exits. The Book shows `ACCOUNT HALT`. Clear it with Dashboard → Risk → Resume. |
 | **Kill switch** (button) | flattens every automation's open position now (reason `BOOK_KILL`) and stops all automation entries until tomorrow. The news bot and the Trade page are untouched. |
 
 `daily.max_loss` in a spec stops that one strategy; the book limits stop all
@@ -1596,4 +1597,16 @@ for the 95% drawdown, not the one history happened to give.
   order-flow indicators — the symbols on it, days kept, raw frames for
   hand-picked symbols, the disk guard, futures (next month always or only
   in the roll window) and options (strikes per side), and today's frames /
-  prints / buy-sell volume per key.
+  prints / buy-sell volume per key. By default it records **NIFTY and
+  SENSEX only**: each index, its current future (an index has no trades —
+  its chart's order flow is the future's) and its options, ATM ± 15 / ± 10
+  first, then every other strike of every expiry, nearest first, to the
+  budget. Stocks, stock F&O and the other indices are switched on there.
+  A print at or beyond the ask is a buy and at or beyond the bid a sell;
+  inside the spread it goes to the nearer side (above the mid a buy), and
+  only at the mid — or against a crossed quote — the tick test decides.
+  **Index options flow**: every recorded option of NIFTY / SENSEX added up
+  — calls and puts bought / sold, in quantity and ₹ premium — on the chart
+  (indicator *Index Options Flow*: net premium per candle, + = call buying /
+  put writing, with its running total) and in the Trade page's Order flow
+  panel; all expiries or the nearest one.

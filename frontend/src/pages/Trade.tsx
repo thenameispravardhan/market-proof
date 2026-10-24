@@ -552,7 +552,69 @@ function FlowPanel({ symbol }: { symbol: string | null }) {
           </div>
         </>
       )}
+      {/^(NSE|BSE):/i.test(symbol) && !/-EQ$/i.test(symbol) && <OptionsFlowSection symbol={symbol} />}
     </section>
+  );
+}
+
+// An index's options together (GET /api/algo/ticks/options-flow): the premium aggressors
+// paid for calls and puts today, per 5 minutes. Net = (calls bought − sold) − (puts bought
+// − sold): above zero is bullish money (call buying, put writing). For NIFTY / SENSEX, their
+// futures and options; hidden when nothing of the underlying's options was recorded.
+type OptFlowResp = { name: string; recorded: boolean; bars: number[][] };
+export function OptionsFlowSection({ symbol }: { symbol: string }) {
+  const [data, setData] = useState<OptFlowResp | null>(null);
+  const [expiry, setExpiry] = useState<"all" | "near">("all");
+  useEffect(() => {
+    let stop = false;
+    setData(null);
+    const load = async () => {
+      const now = Math.floor(Date.now() / 1000);
+      const day0 = now - ((now + 19800) % 86400);
+      try {
+        const q = new URLSearchParams({ symbol, resolution: "5", from: String(day0 - 86400 * 4), to: String(now + 60), expiry });
+        const r = await fetch(`/api/algo/ticks/options-flow?${q.toString()}`);
+        if (r.ok && !stop) setData(await r.json());
+      } catch { /* the next poll retries */ }
+    };
+    void load();
+    const id = setInterval(load, 15000);
+    return () => { stop = true; clearInterval(id); };
+  }, [symbol, expiry]);
+  if (!data?.recorded) return null;
+  const lastDay = Math.floor((data.bars[data.bars.length - 1][0] + 19800) / 86400);
+  const today = data.bars.filter((b) => Math.floor((b[0] + 19800) / 86400) === lastDay);
+  const sum = (i: number) => today.reduce((a, b) => a + (b[i] ?? 0), 0);
+  const [cb, cs, pb, ps] = [sum(5), sum(6), sum(7), sum(8)];
+  const net = (cb - cs) - (pb - ps);
+  const rs = (v: number) => (v < 0 ? `−₹${fmtK(-v)}` : `₹${fmtK(v)}`);
+  let run = 0;
+  return (
+    <div data-testid="trade-options-flow" style={{ marginTop: 10 }}>
+      <h2>{data.name} options flow <span className="hint">premium the aggressors paid, every recorded contract</span>{" "}
+        <select value={expiry} onChange={(e) => setExpiry(e.target.value as "all" | "near")} aria-label="expiries">
+          <option value="all">all expiries</option><option value="near">nearest expiry</option>
+        </select></h2>
+      <div className="quote-row">
+        <div className="quote-cell"><div className="k">CALLS BOUGHT</div><div className="v up">{rs(cb)}</div></div>
+        <div className="quote-cell"><div className="k">CALLS SOLD</div><div className="v down">{rs(cs)}</div></div>
+        <div className="quote-cell"><div className="k">PUTS BOUGHT</div><div className="v down">{rs(pb)}</div></div>
+        <div className="quote-cell"><div className="k">PUTS SOLD</div><div className="v up">{rs(ps)}</div></div>
+        <div className="quote-cell" title="(calls bought − sold) − (puts bought − sold): + = bullish money">
+          <div className="k">NET</div><div className={`v ${net >= 0 ? "up" : "down"}`}>{rs(net)}</div></div>
+      </div>
+      <div className="flow-scroll">
+        <table className="pending-table flow-table">
+          <thead><tr><th>Time</th><th title="calls bought − sold (₹)">Calls net</th><th title="puts bought − sold (₹)">Puts net</th><th>Net</th><th>Running</th></tr></thead>
+          <tbody>{today.map((b) => { run += b[9]; const c = b[5] - b[6], pu = b[7] - b[8]; return (
+            <tr key={b[0]}>
+              <td>{new Date((b[0] + 19800) * 1000).toISOString().slice(11, 16)}</td>
+              <td className={c >= 0 ? "up" : "down"}>{rs(c)}</td><td className={pu >= 0 ? "down" : "up"}>{rs(pu)}</td>
+              <td className={b[9] >= 0 ? "up" : "down"}>{rs(b[9])}</td><td className={run >= 0 ? "up" : "down"}>{rs(run)}</td>
+            </tr>); })}</tbody>
+        </table>
+      </div>
+    </div>
   );
 }
 

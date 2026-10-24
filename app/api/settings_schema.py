@@ -96,7 +96,8 @@ GROUPS: list[dict[str, Any]] = [
         "id": "breakers",
         "title": "Circuit breakers",
         "note": "Loss limits that throttle or halt trading. Tripping the daily or monthly "
-                "breaker flattens and stops; weekly throttles risk per trade.",
+                "breaker flattens and stops; weekly throttles risk per trade. ALGO_BOOK_* are "
+                "the Algo Lab book's own limits, across every automation together.",
         "prefixes": [
             "WEEKLY_MAX_LOSS_PCT", "MONTHLY_MAX_DRAWDOWN_PCT", "WEEKLY_BREACH_RISK_PCT",
             "MAX_CONSECUTIVE_LOSERS", "CONSECUTIVE_LOSER_", "ALGO_BOOK_",
@@ -377,6 +378,7 @@ LABELS: dict[str, str] = {
     "ORDER_RATE_LIMIT_PER_SEC": "Order rate limit per app (orders/s, 0 = off)",
     "ALGO_BOOK_MAX_DAY_LOSS": "Algo Lab: day loss across ALL automations that flattens them and stops entries (₹, 0 = off)",
     "ALGO_BOOK_MAX_MARGIN": "Algo Lab: most margin all automations may block together (₹, 0 = off)",
+    "ALGO_BOOK_FOLLOW_PORTFOLIO_HALT": "Algo Lab: automations stop entering while the account circuit breaker / kill switch is on",
     "ALGO_ALLOC_CAPITAL": "Algo Lab: capital split across automations by inverse volatility (₹, 0 = each uses its own)",
     "ALGO_ALLOC_LOOKBACK_DAYS": "Algo Lab allocation: days of P&L its volatility is measured over",
     "ALGO_ALLOC_DECAY_DAYS": "Algo Lab allocation: a strategy losing over this many days gets half weight",
