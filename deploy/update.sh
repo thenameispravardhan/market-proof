@@ -24,6 +24,22 @@ AFTER="$(git rev-parse HEAD)"
 echo "==> Python dependencies"
 .venv/bin/pip install -r requirements.txt --quiet
 
+# The backtest's candle loop + Monte Carlo in C++ (app/algo/native.cpp). Optional:
+# no g++, a failed build or a failed parity check leaves the Python engine — the
+# .so is only kept once native_check proves it answers exactly like Python.
+rm -f app/algo/_mc.so                                    # the Monte-Carlo-only build it replaced
+CXX="$(command -v g++ || command -v g++-14 || true)"     # the server has only g++-14
+if [ -n "$CXX" ]; then
+    echo "==> Building app/algo/_native.so"
+    if "$CXX" -O2 -std=c++17 -shared -fPIC -o app/algo/_native.so.tmp app/algo/native.cpp \
+        && mv app/algo/_native.so.tmp app/algo/_native.so; then
+        .venv/bin/python -m app.algo.native_check \
+            || { rm -f app/algo/_native.so; echo "    (parity check failed; backtests use the Python engine)"; }
+    else
+        echo "    (build failed; backtests use the Python engine)"
+    fi
+fi
+
 REBUILD=0
 [ "${1:-}" = "--frontend" ] && REBUILD=1
 [ ! -f frontend/dist/index.html ] && REBUILD=1

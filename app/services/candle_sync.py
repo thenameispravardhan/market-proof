@@ -51,6 +51,13 @@ NIFTY_FYERS = "NSE:NIFTY50-INDEX"
 # Fyers caps a 1-minute history request at 100 days; stay well inside it.
 MAX_DAYS = 90
 
+# How every candle file is written. Measured 2026-10-26 on 20 symbols x 19 months
+# of 1-minute candles vs DuckDB's default writer: 2.3x smaller (62.8 -> 27.3 MB)
+# and 2x faster to read back (0.195 -> 0.094 s), same columns and types — the
+# v2 encodings (delta ints, byte-stream-split doubles) suit sorted OHLCV.
+# scripts/repack_candles.py rewrites existing files with these.
+PARQUET_OPTS = "FORMAT parquet, COMPRESSION zstd, PARQUET_VERSION v2, ROW_GROUP_SIZE 30000"
+
 
 def _candle_rows(raw: list[Any]) -> list[tuple]:
     """Fyers `[ts, o, h, l, c, v]` -> the parquet's own column order.
@@ -131,7 +138,7 @@ def _append(symbol: str, rows: list[tuple]) -> int:
         else:
             src, before = month, 0
         tmp = f.with_suffix(".parquet.tmp")
-        con.execute(f"COPY ({src} ORDER BY ts) TO '{tmp.as_posix()}' (FORMAT parquet)")
+        con.execute(f"COPY ({src} ORDER BY ts) TO '{tmp.as_posix()}' ({PARQUET_OPTS})")
         after = con.execute(
             f"SELECT count(*) FROM read_parquet('{tmp.as_posix()}')").fetchone()[0]
         tmp.replace(f)  # atomic swap — a crash mid-write never truncates the store

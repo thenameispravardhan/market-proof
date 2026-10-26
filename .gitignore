@@ -113,3 +113,7 @@ dump_memory.py
 pitch.html
 pitch2.html
 .claude/
+
+# Built on the server by deploy/update.sh (app/algo/native.cpp).
+app/algo/_native.so
+app/algo/_native.so.tmp
