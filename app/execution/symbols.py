@@ -13,13 +13,10 @@ degrade gracefully when the master isn't loaded.
 
 Caching: the reconcile loop in `FyersStreamManager` calls this every 2s
 per watched symbol, which would re-search the instrument master every
-time. The lookup result is stable for the lifetime of the process
-(master reloads only happen via the manual `download_masters` admin
-script), so an `lru_cache` is a safe and useful optimization. Failures
-(`get_master()` raising or the search returning no hits) are cached as
-`None` — that's fine because once the master is loaded it stays loaded
-for the whole process lifetime, and the very first lookup is what
-populates the seed anyway.
+time, so the result goes in an `lru_cache`. Misses are cached as `None`
+too. `InstrumentMaster.reload` (the daily scrip-master refresh, the
+admin download) clears the cache, so no answer outlives the master it
+came from.
 """
 from __future__ import annotations
 
@@ -36,10 +33,14 @@ def resolve_fyers_symbol(symbol: str) -> Optional[str]:
 
     - If `symbol` already looks like a full broker id (contains ``:``),
       it's returned upper-cased unchanged.
-    - Otherwise we search the instrument master for an EQ match,
-      preferring the exact short-name hit on NSE, then any exact hit,
-      then the first fuzzy hit.
-    - Returns None when nothing resolves (caller keeps the bare name).
+    - Otherwise we search the instrument master for an EQ listing whose
+      short name is exactly `symbol`, preferring NSE over BSE.
+    - Returns None when there is no exact hit (caller keeps the bare name
+      or builds ``NSE:{sym}-EQ``). Never a fuzzy hit: the master's search
+      ranks prefix / substring matches after the exact one, so "DIL"
+      (gone from NSE) would hand back BSE:DILIGENT-X, another company,
+      and an order or candle fetch would hit the wrong stock.
+      A bad id Fyers rejects is the safe failure.
 
     Result is cached per short-name. Use `clear_resolution_cache()` if
     you've swapped the instrument master mid-process (e.g. in tests).
@@ -54,8 +55,7 @@ def resolve_fyers_symbol(symbol: str) -> Optional[str]:
 
 @lru_cache(maxsize=512)
 def _resolve_via_master(sym: str) -> Optional[str]:
-    """Cached instrument-master lookup. See module docstring for why
-    failures are cached (the master loads once and stays loaded)."""
+    """Cached instrument-master lookup (see the module docstring)."""
     try:
         from app.services.instrument_master import get_master
 
@@ -63,14 +63,8 @@ def _resolve_via_master(sym: str) -> Optional[str]:
     except Exception as e:  # noqa: BLE001
         log.debug("symbols.resolve_failed", symbol=sym, error=str(e))
         return None
-    if not hits:
-        return None
     exact = [h for h in hits if h.short_name == sym]
-    pick = (
-        next((h for h in exact if h.exchange == "NSE"), None)
-        or (exact[0] if exact else None)
-        or hits[0]
-    )
+    pick = next((h for h in exact if h.exchange == "NSE"), None) or (exact[0] if exact else None)
     return pick.symbol if pick is not None else None
 
 

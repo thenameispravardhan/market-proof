@@ -437,11 +437,15 @@ def master() -> dict[str, Any]:
 
 
 async def ensure_master(max_age_h: float = 20.0) -> None:
-    """Download the F&O masters when missing or older than a day, then reload
-    the app-wide instrument master too (futures become searchable)."""
+    """Download the scrip masters (F&O, MCX, currency and the NSE / BSE cash
+    ones) when missing or older than a day, then reload the app-wide
+    instrument master (futures become searchable; a renamed or re-seriesed
+    stock, HEG -> HEGAM, LASA -EQ -> -BE, resolves to its current id)."""
     import httpx
 
-    urls = {**FO_URLS, **EXTRA_URLS}
+    from app.services.instrument_master import _FYERS_MASTER_URLS
+
+    urls = {**FO_URLS, **EXTRA_URLS, **_FYERS_MASTER_URLS}
     stale = [k for k in urls if not (MASTER_DIR / f"{k}.csv").exists()
              or time.time() - (MASTER_DIR / f"{k}.csv").stat().st_mtime > max_age_h * 3600]
     if not stale:
