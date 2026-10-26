@@ -504,6 +504,28 @@ def test_resolve_short_name_prefers_nse(monkeypatch):
     assert resolve_fyers_symbol("SBIN") == "NSE:SBIN-EQ"
 
 
+def test_resolve_never_returns_a_fuzzy_match(monkeypatch, tmp_path):
+    """A short name the master lacks resolves to None, never to another
+    company's listing (server 2026-10-26: DIL -> BSE:DILIGENT-X, LASA ->
+    BSE:SALASAR-B, BGLOBAL -> BSE:PBGLOBAL-XT, all fuzzy hits)."""
+    from app.services.instrument_master import InstrumentMaster
+
+    (tmp_path / "BSE_CM.csv").write_text(
+        "BSE:HEGAM-A,HEGAM,BSE,EQ,EQ\n"
+        "BSE:DILIGENT-X,DILIGENT,BSE,EQ,EQ\n"
+        "BSE:SALASAR-B,SALASAR,BSE,EQ,EQ\n"
+        "BSE:PBGLOBAL-XT,PBGLOBAL,BSE,EQ,EQ\n"
+        "BSE:SBIN-A,SBIN,BSE,EQ,EQ\n"
+    )
+    master = InstrumentMaster(tmp_path)
+    monkeypatch.setattr("app.services.instrument_master.get_master", lambda: master)
+
+    for sym in ("HEG", "DIL", "LASA", "BGLOBAL"):
+        assert master.search(sym, limit=8, segments=["EQ"])  # the fuzzy hit is there...
+        assert resolve_fyers_symbol(sym) is None             # ...and is never used
+    assert resolve_fyers_symbol("SBIN") == "NSE:SBIN-EQ"     # exact NSE still wins over BSE
+
+
 # ---- QuoteFeed staleness gate ------------------------------------------
 
 

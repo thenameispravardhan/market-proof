@@ -10,8 +10,8 @@ CSV at:
     https://public.fyers.in/sym_details/BSE_CM.csv
     https://public.fyers.in/sym_details/MCX_COM.csv
 
-The bot's `scripts/` will (in a later change) download these to
-`data/scrip_master/{exchange}_{segment}.csv` on a daily cron. The
+`app.algo.fno.ensure_master` (a 3-hourly app task) keeps them under a
+day old in `data/scrip_master/{exchange}_{segment}.csv`. The
 loader here reads whatever's in that directory and falls back to
 a small in-process seed when the directory is empty (so the page
 works on a fresh install with no network call).
@@ -503,6 +503,9 @@ class InstrumentMaster:
                 except Exception:  # noqa: BLE001
                     # Bad file — skip; the rest of the master still works.
                     continue
+        from app.execution.symbols import clear_resolution_cache
+
+        clear_resolution_cache()  # short name -> id answers from the old master are stale now
         return len(self._by_symbol)
 
     def _add(self, inst: Instrument) -> None:
