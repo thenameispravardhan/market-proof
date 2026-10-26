@@ -558,7 +558,11 @@ async def test_loop_processes_published_signal(db_session, isolated_db):
         db_session, symbol="RELIANCE", action="BUY", strategy_id=strat.id,
     )
 
-    paper = PaperBackend(market_data=md, session_factory=lambda: db_session)
+    # The backend's own sessions (SessionLocal, as in production), not db_session:
+    # it writes from executor threads while this test polls db_session, and one
+    # Session shared across threads can be closed mid-read ("identity map is no
+    # longer valid" — failed CI on 2026-10-26).
+    paper = PaperBackend(market_data=md)
     risk = RiskEngine(market_data=md, portfolio_value=50_000_000.0)
     mgr = Manager(risk_engine=risk, market_data=md, paper_backend=paper)
     task = mgr.start()
