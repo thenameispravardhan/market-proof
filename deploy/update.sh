@@ -17,9 +17,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-BEFORE="$(git rev-parse HEAD)"
+BEFORE="${UPDATE_BEFORE:-$(git rev-parse HEAD)}"
 git pull --ff-only
 AFTER="$(git rev-parse HEAD)"
+
+# The braces mean this run is the script as it was BEFORE the pull; a pull that
+# changed it would skip whatever the new version adds (2026-10-26: the first
+# deploy of the C++ build step never built it). So hand over to the new one.
+if [ -z "${UPDATE_BEFORE:-}" ] && ! git diff --quiet "$BEFORE" "$AFTER" -- deploy/update.sh; then
+    echo "==> deploy/update.sh changed in this pull; running the new version"
+    UPDATE_BEFORE="$BEFORE" exec bash deploy/update.sh "$@"
+fi
 
 echo "==> Python dependencies"
 .venv/bin/pip install -r requirements.txt --quiet
