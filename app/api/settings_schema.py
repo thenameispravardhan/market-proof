@@ -342,6 +342,7 @@ LABELS: dict[str, str] = {
     "FYERS_DATA_PER_DAY": "Fyers data calls per day (0 = the plan's)",
     "FYERS_WS_SYMBOLS": "Fyers data-socket symbols (0 = the plan's)",
     "FYERS_DATA_RESERVE_PCT": "Data calls kept for the Trade page / orders (%)",
+    "FYERS_DATA_FEED_CANDLES": "Algo Lab runner: build candles from the live feed (history asked hourly, not every close)",
     "ALGO_SCREEN_SLACK_PCT": "Large automations: screening tolerance (%)",
     "NEWS_AGE_FROM_RECEIPT": "Measure news age from receipt",
     "ENTRY_MAX_DRIFT_PCT": "Max entry drift against the signal (%)",

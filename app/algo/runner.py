@@ -932,6 +932,11 @@ class AlgoRunner:
         from app.algo import ticks
 
         ticks.set_strategy_symbols({x for s in strategies if s["enabled"] for x in s["spec"]["symbols"]})
+        # ... and stream them: their intraday candles are built from the feed, not re-downloaded each close
+        from app.algo import live_candles
+
+        live_candles.want({x for s in strategies if s["enabled"] and not engine.multi_day(s["spec"]["timeframe"])
+                           for x in s["spec"]["symbols"]} if get_settings().FYERS_DATA_FEED_CANDLES else ())
         if self._master_day != day and any(s["spec"]["instrument"]["type"] != "equity" for s in strategies):
             self._master_day = day
             try:

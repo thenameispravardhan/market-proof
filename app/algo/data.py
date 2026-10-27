@@ -19,6 +19,7 @@ from typing import Any, Optional, Sequence
 
 import duckdb
 
+from app.algo import live_candles
 from app.logging_config import get_logger
 from app.services.candle_sync import MAX_DAYS, _convert_and_append
 from app.services.warehouse_prices import candle_source
@@ -611,6 +612,13 @@ def resample(b: dict[str, Any], tf_min: int) -> dict[str, Any]:
     return out
 
 
+# The last history answer per (symbol, intraday timeframe): (asked at, bars asked, answer).
+# Later candles come from the live feed (live_candles) until it is SEED_MAX_S old.
+# ponytail: process memory, one entry per runner symbol x timeframe; a restart re-asks once.
+_seeds: dict[tuple[str, int], tuple[float, int, dict[str, Any]]] = {}
+SEED_MAX_S = 3600
+
+
 async def recent_bars(fy: str, tf_min: int, bars: int = 400, now: Optional[float] = None) -> dict[str, Any]:
     """The last `bars` COMPLETED bars straight from Fyers at the strategy's
     resolution (live runner). The still-forming bar is dropped — a strategy
@@ -634,6 +642,15 @@ async def recent_bars(fy: str, tf_min: int, bars: int = 400, now: Optional[float
         return {k: ([v[i] for i in keep] if isinstance(v, list) else v) for k, v in out.items()}
     daily = tf_min == 1440
     tf_s = 86400 if daily else int(tf_min) * 60
+    seed = None if daily else _seeds.get((fy, tf_min))
+    if seed and now - seed[0] < SEED_MAX_S and seed[1] >= bars and seed[2]["t"] and fy.upper() in live_candles.wanted():
+        more = live_candles.bars(fy, tf_s, seed[2]["t"][-1] + tf_s, now)
+        if more is not None:                 # the feed covered everything since the seed: no Fyers call
+            b = seed[2]
+            return {"t": (b["t"] + [r[0] for r in more])[-bars:], "o": (b["o"] + [r[1] for r in more])[-bars:],
+                    "h": (b["h"] + [r[2] for r in more])[-bars:], "l": (b["l"] + [r[3] for r in more])[-bars:],
+                    "c": (b["c"] + [r[4] for r in more])[-bars:],
+                    "v": (b["v"] + [int(round(r[5])) for r in more])[-bars:], "tf_s": tf_s}
     days = int(bars * 1.5) + 5 if daily else min(MAX_DAYS, max(5, math.ceil(bars * tf_min / 375 * 1.6) + 4))
     raw: list = []
     hi = now
@@ -651,7 +668,12 @@ async def recent_bars(fy: str, tf_min: int, bars: int = 400, now: Optional[float
     else:
         done = lambda t: t + tf_s <= now  # noqa: E731
     rows = [r for r in raw if isinstance(r, (list, tuple)) and len(r) >= 6 and done(int(r[0]))]
-    return bars_from(rows[-bars:], tf_s)
+    out = bars_from(rows[-bars:], tf_s)
+    if not daily and fy.upper() in live_candles.wanted():
+        if (d := live_candles.drift(fy, tf_s, out, now)) is not None:
+            log.info("live_candles.drift", **d)        # tick-built vs Fyers' own, same candles
+        _seeds[(fy, tf_min)] = (now, bars, out)
+    return {k: list(v) if isinstance(v, list) else v for k, v in out.items()}
 
 
 # Live 1-minute history per symbol, topped up with only the new minutes.

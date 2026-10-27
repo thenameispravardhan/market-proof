@@ -288,6 +288,10 @@ class Settings(BaseSettings):
     # orders and exits: automations, backtest downloads and the nightly candle
     # sync never use it.
     FYERS_DATA_RESERVE_PCT: float = 20.0
+    # Algo Lab runner: build its intraday candles from the live data socket
+    # (not metered) instead of a history call per symbol at every candle close;
+    # history is asked once an hour and whenever the feed has a gap. Off = as before.
+    FYERS_DATA_FEED_CANDLES: bool = False
 
     # ---------- Risk management framework (RISK.md) ----------
     # §1 Pre-trade filters. Some of these gate on market data we don't

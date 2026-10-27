@@ -267,6 +267,7 @@ async def lifespan(app: FastAPI):
 
     from app.api import practice as _practice
     from app.api.ws import watched_symbols as _ws_watched
+    from app.algo import live_candles as _live_candles
     from app.execution.data_budget import ws_split
 
     fyers_stream = FyersStreamManager(
@@ -275,10 +276,12 @@ async def lifespan(app: FastAPI):
         # Keep the index symbols streaming all session so the status-bar
         # ticker is sub-second, not REST-polled.
         always_subscribe=[idx["symbol"] for idx in _INDICES],
-        extra_symbols=lambda: [s for s in _ws_watched() + _practice.live_symbols() if not s.startswith("CRYPTO:")],
+        extra_symbols=lambda: [s for s in _ws_watched() + _practice.live_symbols() + _live_candles.wanted()
+                               if not s.startswith("CRYPTO:")],
         # The Fyers plan's data-socket symbols, less the order-flow collector's share.
         symbol_cap=lambda: ws_split()[0],
     )
+    fyers_stream.tick_listeners.append(_live_candles.on_tick)   # the runner's candles, off the feed
     # Real order flow is recorded by its own process (app/algo/flowd.py, its own
     # Fyers socket): thousands of symbols there can't slow this feed down.
 
