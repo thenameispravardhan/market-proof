@@ -2026,7 +2026,7 @@ export default function ChartPanel(props: ChartPanelProps) {
         vol: fl[0] + fl[1], delta: fl[2], trades: fl[3] ?? 0, dlo: fl[7] ?? Math.min(0, fl[2]), dhi: fl[8] ?? Math.max(0, fl[2]),
         oi: fl[5] ?? null, oiChg: fl[5] != null && prevOi != null ? fl[5] - prevOi : null, cvd: cvdRef.current.get(c.time) ?? 0,
       } : undefined;
-      return { time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume, fp: f?.fp, prints: f?.prints, st };
+      return { time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume, fp: f?.fp, prints: f?.prints, st, t: c.time };
     }
     if (CUSTOM_MODE[k]) return { time: c.time, open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume, flag: c.flag };
     const base = { time: c.time, open: c.open, high: c.high, low: c.low, close: c.close };

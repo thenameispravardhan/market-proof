@@ -33,6 +33,8 @@ export interface OhlcItem extends CustomData<Time> {
   st?: FpBarStats;
   /** Big prints: [price, qty, side]. */
   prints?: [number, number, number][];
+  /** The bar's time again: lightweight-charts drops `time` from the renderer's `originalData`. */
+  t?: number;
 }
 
 /** 1 / 2 / 2.5 / 5 × 10^k at or above `x`: a readable footprint row height in price. */
@@ -556,9 +558,8 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
     fs: FootprintSettings, rowsOf: (idx: number[]) => FpRow[]): void {
     const days = new Map<number, number[]>();
     for (let i = lo; i < hi; i++) {
-      const t = Number(bars[i].originalData.time);
-      if (!Number.isFinite(t)) continue;
-      const d = Math.floor(t / 86400);
+      const d = dayOf(bars[i].originalData);
+      if (!Number.isFinite(d)) continue;
       const list = days.get(d) ?? [];
       list.push(i);
       days.set(d, list);
@@ -583,14 +584,10 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
   private developingLines(ctx: CanvasRenderingContext2D, bars: PaneRendererCustomData<Time, OhlcItem>["bars"], lo: number, hi: number,
     step: number, tick: number, Y: (p: number) => number | null, half: number, poc: string, fs: FootprintSettings,
     rowsOf: (idx: number[]) => FpRow[]): void {
-    const dayOf = (i: number) => Math.floor(Number(bars[i].originalData.time) / 86400);
+    const day = (i: number) => dayOf(bars[i].originalData);
     let i = lo;
     while (i < hi) {
-      const d = dayOf(i);
-      let s0 = i;
-      while (s0 > 0 && dayOf(s0 - 1) === d) s0--;                // the session's start, maybe off-screen
-      let e = i;
-      while (e < hi && dayOf(e) === d) e++;
+      const [s0, e] = sessionAround(day, i, hi);
       const idx = Array.from({ length: e - s0 }, (_, k) => s0 + k);
       const dev = developing(idx.map((j) => rowsOf([j])), step, fs.vaPct);
       const mid = (p: number | null) => (p == null ? null : Y(p + (step - tick) / 2));
@@ -654,12 +651,26 @@ class ShapeRenderer implements ICustomSeriesPaneRenderer {
 const round6 = (x: number) => Math.round(x * 1e6) / 1e6;
 const TPO_COLOR = "#5C6BC0";
 
+/** The bar's IST day number (NaN when it carries no time). */
+const dayOf = (d: OhlcItem) => Math.floor(Number(d.t) / 86400);
+
+/** [start, end) of the session holding bar `i`, its end capped at `hi`. Always moves past `i`,
+ *  even when the day is NaN, so a caller stepping `i = end` can't spin forever. */
+export function sessionAround(day: (i: number) => number, i: number, hi: number): [number, number] {
+  const d = day(i);
+  let s0 = i;
+  while (s0 > 0 && day(s0 - 1) === d) s0--;                  // the session's start, maybe off-screen
+  let e = i + 1;
+  while (e < hi && day(e) === d) e++;
+  return [s0, e];
+}
+
 /** Bar indices of the last `n` sessions (IST days) ending with bar `hi − 1`. */
 function lastSessions(bars: PaneRendererCustomData<Time, OhlcItem>["bars"], hi: number, n: number): number[] {
   const out: number[] = [];
   let days = 0, day = NaN;
   for (let i = hi - 1; i >= 0; i--) {
-    const d = Math.floor(Number(bars[i].originalData.time) / 86400);
+    const d = dayOf(bars[i].originalData);
     if (d !== day) {
       if (++days > n) break;
       day = d;

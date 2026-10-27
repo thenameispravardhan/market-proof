@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { fmtK, footprintRows, niceStep } from "../components/trade/customSeries";
+import { fmtK, footprintRows, niceStep, sessionAround } from "../components/trade/customSeries";
 
 describe("footprint rows", () => {
   it("rounds a row height up to 1 / 2 / 2.5 / 5 × 10^k", () => {
@@ -22,5 +22,11 @@ describe("footprint rows", () => {
     expect(fmtK(1190)).toBe("1.19K");
     expect(fmtK(-35440)).toBe("-35.4K");
     expect(fmtK(250000)).toBe("2.50L");
+  });
+  it("finds a bar's session, and moves on even when bars carry no day (the Trade page freeze)", () => {
+    const days = [1, 1, 2, 2, 2, 3];
+    expect(sessionAround((i) => days[i], 3, 6)).toEqual([2, 5]);
+    expect(sessionAround((i) => days[i], 3, 4)).toEqual([2, 4]);
+    expect(sessionAround(() => NaN, 3, 6)).toEqual([3, 4]);
   });
 });
