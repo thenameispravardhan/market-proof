@@ -442,6 +442,32 @@ static i64 first_valid(const Ser& x) {                         // indicators._fi
     return (i64)x.size();
 }
 
+// Python's built-in sum() of floats, which the indicators use (start 0, left to right). From
+// CPython 3.12 it is Neumaier-compensated (bltinmodule.c builtin_sum_impl); before, plain.
+// engine._native_lib() calls set_py_sum() with the running interpreter's version.
+static int py_neumaier = 0;
+
+API void set_py_sum(int neumaier) { py_neumaier = neumaier; }
+
+template <class Get>
+static double py_sum(i64 n, Get get) {
+    if (n <= 0) return 0.0;
+    double f = 0.0 + get(0);                                   // int 0 + the first float
+    if (!py_neumaier) {
+        for (i64 k = 1; k < n; ++k) f += get(k);
+        return f;
+    }
+    double c = 0.0;
+    for (i64 k = 1; k < n; ++k) {
+        double x = get(k), t = f + x;
+        if (std::fabs(f) >= std::fabs(x)) c += (f - t) + x;
+        else c += (x - t) + f;
+        f = t;
+    }
+    if (c != 0 && std::isfinite(c)) f += c;
+    return f;
+}
+
 static Ser sma_(const Ser& x, i64 n) {
     i64 N = x.size(), s0 = first_valid(x);
     Ser out(N, NA);
@@ -458,9 +484,7 @@ static Ser ema_(const Ser& x, i64 n, double a) {
     i64 N = x.size(), s0 = first_valid(x);
     Ser out(N, NA);
     if (N - s0 < n) return out;
-    double prev = 0.0;                                         // sum(x[s0:s0+n]): from int 0, left to right
-    for (i64 k = 0; k < n; ++k) prev += x[s0 + k];
-    prev = prev / n;
+    double prev = py_sum(n, [&](i64 k) { return x[s0 + k]; }) / n;   // sum(x[s0:s0+n]) / n
     out[s0 + n - 1] = prev;
     for (i64 i = s0 + n; i < N; ++i) {
         prev = a * x[i] + (1 - a) * prev;
@@ -474,9 +498,7 @@ static Ser wma_(const Ser& x, i64 n) {
     Ser out(N, NA);
     double den = (double)(n * (n + 1)) / 2;
     for (i64 i = first_valid(x) + n - 1; i < N; ++i) {
-        double s = 0.0;
-        for (i64 k = 0; k < n; ++k) s += x[i - n + 1 + k] * (double)(k + 1);
-        out[i] = s / den;
+        out[i] = py_sum(n, [&](i64 k) { return x[i - n + 1 + k] * (double)(k + 1); }) / den;
     }
     return out;
 }

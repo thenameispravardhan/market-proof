@@ -47,6 +47,7 @@ import heapq
 import itertools
 import math
 import statistics
+import sys
 from collections import deque
 from contextvars import ContextVar
 from typing import Any, Callable, Iterator, Optional
@@ -2705,6 +2706,9 @@ def _native_lib() -> Optional[ctypes.CDLL]:
         lib.run_loop.restype = ctypes.c_int
         lib.run_loop.argtypes = [ctypes.POINTER(_Sym), _i64, ctypes.POINTER(_Cfg), _OPEN, _CLOSE, _TRIG, _SETTLE,
                                  ctypes.POINTER(_i64)]
+        lib.set_py_sum.restype = None
+        lib.set_py_sum.argtypes = [ctypes.c_int]
+        lib.set_py_sum(int(sys.version_info >= (3, 12)))     # sum() is Neumaier-compensated from 3.12
         lib.unique_days.restype = _i64
         lib.unique_days.argtypes = [_ptr, _i64, _ptr]
         lib.eval_signals.restype = ctypes.c_int
