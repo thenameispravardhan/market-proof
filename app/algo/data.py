@@ -510,7 +510,8 @@ async def download(fy: str, start_ts: int, end_ts: int) -> dict[str, Any]:
             exhausted = True
             break
         hi = lo
-        await asyncio.sleep(0.35)       # Fyers rate-limits /data/history
+        if hi > start_ts:
+            await asyncio.sleep(0.35)   # Fyers rate-limits /data/history (only between calls)
     if exhausted:
         _floor[key] = min(_floor.get(key, hi), int(start_ts))
     log.info("algo.download", symbol=fy, calls=calls, added=added, exhausted=exhausted)
@@ -538,8 +539,8 @@ async def _ensure(fy: str, key: str, cov: Optional[dict[str, Any]], start_ts: in
             if start_ts < cov["first"] - 3 * DAY and _floor.get(key, start_ts + 1) > start_ts:
                 fetched = True
                 await download(fy, start_ts, cov["first"])
-            if end_ts > cov["last"] + 3600:     # one cheap call even when nothing is new
-                fetched = True
+            if end_ts > cov["last"] + 3600 and next_candle(cov["last"]) <= min(end_ts, time.time()):
+                fetched = True                  # one call, unless no session has run since (evening, weekend)
                 await download(fy, cov["last"], min(end_ts, int(time.time())))
     except RuntimeError as e:
         note = str(e)
@@ -547,6 +548,19 @@ async def _ensure(fy: str, key: str, cov: Optional[dict[str, Any]], start_ts: in
             raise
         fetched = False
     return {"symbol": fy, "key": key, "note": note, "coverage": coverage(key) if fetched else cov}
+
+
+def next_candle(t: float) -> int:
+    """The first 1-minute candle after `t` a session could print: weekdays 09:15–15:29 IST
+    (holidays aren't known, so one may still cost a call that finds nothing)."""
+    k, s = divmod(int(t) + 19800, DAY)
+    if s >= 55740:                       # after the 15:29 candle: the next day's open
+        k, s = k + 1, 33300
+    else:
+        s = max(s + 60, 33300)
+    while (k + 3) % 7 >= 5:              # Saturday, Sunday
+        k, s = k + 1, 33300
+    return k * DAY + s - 19800
 
 
 # Resolutions Fyers' /data/history serves; anything else is resampled from one it does.

@@ -2415,10 +2415,12 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
     per_symbol = {}
     live_bars = 0
     holds = []
+    mine: dict[str, list] = {sym: [] for sym in syms}
+    for x in trades:
+        mine[x["symbol"]].append(x)
     for sym in syms:
         d = data[sym]
-        mine = [x for x in trades if x["symbol"] == sym]
-        s2 = stats(mine, pf["capital"])
+        s2 = stats(mine[sym], pf["capital"], brief=True)
         first = next((j for j, t in enumerate(d["t"]) if trade_from is None or t >= trade_from), None)
         n_live = len(d["t"]) - first if first is not None else 0
         live_bars += n_live
@@ -2481,12 +2483,14 @@ def session_days(data: dict[str, dict], lo: Optional[float] = None, hi: Optional
     return sorted(out)
 
 
-def stats(trades: list[dict[str, Any]], capital: float, days: Optional[list[int]] = None) -> dict[str, Any]:
+def stats(trades: list[dict[str, Any]], capital: float, days: Optional[list[int]] = None,
+          brief: bool = False) -> dict[str, Any]:
     """`days`: the sessions of the tested range (session_days). The daily-return
     statistics (Sharpe, Sortino, PSR, VaR, skew …) then count a day without an
     exit as a 0 — a strategy that trades once a week has 4 flat days in 5, not
     a Sharpe from its trading days alone — and CAGR is annualised over the range.
-    Without it only the days with an exit count."""
+    Without it only the days with an exit count. `brief`: only the per-symbol
+    table's keys (trades, win_rate, net_pnl, profit_factor, max_drawdown)."""
     rows = sorted(trades, key=lambda x: x["exit_t"])     # exit rows: P&L lands when each part closes
     trades = positions(rows)                             # positions: what per-trade metrics count
     n = len(trades)
@@ -2494,6 +2498,15 @@ def stats(trades: list[dict[str, Any]], capital: float, days: Optional[list[int]
     wins = [v for v in nets if v > 0]
     losses = [v for v in nets if v <= 0]
     eq, peak, max_dd, max_dd_pct = capital, capital, 0.0, 0.0
+    if brief:
+        gross_win, gross_loss = sum(wins), -sum(losses)
+        for x in rows:
+            eq += x["net"]
+            peak = max(peak, eq)
+            max_dd = max(max_dd, peak - eq)
+        return {"trades": n, "win_rate": round(len(wins) / n * 100, 2) if n else 0.0, "net_pnl": round(sum(nets), 2),
+                "profit_factor": round(gross_win / gross_loss, 2) if gross_loss else (None if not gross_win else 999.0),
+                "max_drawdown": round(max_dd, 2)}
     curve = []
     for x in rows:
         eq += x["net"]
@@ -3000,6 +3013,7 @@ def _native_mc() -> Optional[Callable[[list[float], int, int, float], tuple[list
     return paths
 
 
+@functools.lru_cache(maxsize=4096)
 def _ym(day_index: int) -> str:
     import datetime as _dt
 

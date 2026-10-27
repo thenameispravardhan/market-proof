@@ -1554,3 +1554,32 @@ def test_prices_sit_on_the_005_grid_and_slippage_rounds_against_you():
     assert t["entry"] == 106.25                                        # 106.13 + 0.07% = 106.204 -> up to 106.25
     off = engine.run(spec, {"MCX:TEST": bars(closes, spread=0)})["trades"][0]
     assert off["entry"] == round(106.13 * 1.0007, 2)                   # not NSE / BSE: no grid
+
+
+def test_tail_top_up_skips_when_no_session_has_run(monkeypatch):
+    """A backtest ending on a weekend / evening costs no Fyers call once the
+    store holds Friday's 15:29 candle; one ending after Monday's open does."""
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+
+    from app.algo import data
+
+    ist = timezone(timedelta(hours=5, minutes=30))
+    ts = lambda *a: int(datetime(*a, tzinfo=ist).timestamp())  # noqa: E731
+    fri_close = ts(2026, 10, 23, 15, 29)
+    assert data.next_candle(fri_close) == ts(2026, 10, 26, 9, 15)          # Monday's open
+    assert data.next_candle(ts(2026, 10, 26, 8, 0)) == ts(2026, 10, 26, 9, 15)
+    assert data.next_candle(ts(2026, 10, 26, 10, 0)) == ts(2026, 10, 26, 10, 1)
+    calls = []
+
+    async def download(fy, a, b):
+        calls.append((a, b))
+
+    monkeypatch.setattr(data, "download", download)
+    monkeypatch.setattr(data, "coverage", lambda key: cov)
+    cov = {"first": ts(2026, 1, 1, 9, 15), "last": fri_close}
+    asyncio.run(data._ensure("NSE:X-EQ", "X", cov, cov["first"], ts(2026, 10, 25, 23, 0)))   # Sunday night
+    assert calls == []
+    asyncio.run(data._ensure("NSE:X-EQ", "X", cov, cov["first"], ts(2026, 10, 26, 11, 0)))   # Monday 11:00
+    assert calls == [(fri_close, ts(2026, 10, 26, 11, 0))]
+
