@@ -1790,6 +1790,7 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
     syms = list(data)
 
     st: dict[str, dict[str, Any]] = {}
+    programs: dict[Any, Optional[tuple]] = {}      # compiled signal program per base timeframe (None: Python)
     for sym in syms:
         d = data[sym]
         d.setdefault("meta", {}).setdefault("symbol", sym)
@@ -1798,7 +1799,16 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
             prepare(d, spec)
             d["_prep"] = prep_key
         cache = caches.setdefault(sym, {})
-        st[sym] = {"d": d, "sig": signals(d, spec, cache),
+        # C++ signals, unless this symbol's indicator lines are drawn (they live in its cache),
+        # rank / pair read the caches afterwards, or a screen's tolerance is on
+        prog = None
+        if NATIVE and not late and not _slack.get() and (keep_caches is None or sym not in keep_caches) \
+                and _native_lib() is not None:
+            tf_key = d.get("tf_min")
+            if tf_key not in programs:
+                programs[tf_key] = _compile_signals(spec, tf_key)
+            prog = programs[tf_key]
+        st[sym] = {"d": d, "sig": _native_signals(d, prog) if prog else signals(d, spec, cache),
                    "atr": {p: series(d, {"ind": "ATR", "params": {"period": p}}, cache) for p in atr_periods(spec)},
                    "pos": None, "pending": None, "per_day": {}, "cool": 0, "u": None}
         if keep_caches is not None and sym not in keep_caches and not late:
@@ -2678,6 +2688,8 @@ def _native_lib() -> Optional[ctypes.CDLL]:
         lib.run_loop.restype = ctypes.c_int
         lib.run_loop.argtypes = [ctypes.POINTER(_Sym), _i64, ctypes.POINTER(_Cfg), _OPEN, _CLOSE, _TRIG,
                                  ctypes.POINTER(_i64)]
+        lib.eval_signals.restype = ctypes.c_int
+        lib.eval_signals.argtypes = [_ptr] * 6 + [_i64, _ptr, _ptr, _i64, _ptr, _ptr]
     except (OSError, AttributeError) as e:
         log.warning("algo.native_unavailable", error=str(e))
         return None
@@ -2696,6 +2708,143 @@ def _native_ok(spec: dict) -> bool:
             and not (m.get("stop") or m.get("target") or m.get("trail_start"))
             and not multi_day(spec["timeframe"]) and session_window(spec)[2] < CARRY
             and spec["entry_order"]["type"] in _ENTRY_KINDS)
+
+
+# native.cpp's signal program: node kinds, and the ids of what they read
+_N = dict(SRC=1, CONST=2, SMA=3, EMA=4, RMA=5, WMA=6, RSI=7, ATR=8, MACD=9, BB=10, STDDEV=11, HIGHEST=12,
+          LOWEST=13, VWAP=14, ROC=15, MOMENTUM=16, SHIFT=18, AFFINE=19, MATH=20,
+          CMP=30, CROSS=31, RISE=32, BETWEEN=33, MODS=34, AND=35, OR=36, FALSE=37)
+_N_SRC = {"close": 0, "open": 1, "high": 2, "low": 3, "hl2": 4, "hlc3": 5, "ohlc4": 6, "volume": 7, "range": 8}
+_N_PERIOD = {"SMA": "SMA", "EMA": "EMA", "RMA": "RMA", "WMA": "WMA", "RSI": "RSI", "STDDEV": "STDDEV",
+             "HIGHEST": "HIGHEST", "LOWEST": "LOWEST", "ROC": "ROC", "MOMENTUM": "MOMENTUM"}   # one series in, period
+_N_CMP = {">": 0, "<": 1, ">=": 2, "<=": 3, "==": 4, "!=": 5}
+_N_MATH = {"+": 0, "-": 1, "*": 2, "/": 3, "pct_diff": 4}
+_N_FIELDS = {"MACD": ("macd", "signal", "hist"), "BBANDS": ("upper", "middle", "lower", "width", "percent_b")}
+
+
+class _Unsupported(Exception):
+    """A condition native.cpp's signal program can't express: signals() does it in Python."""
+
+
+def _compile_signals(spec: dict, base_tf: Any) -> Optional[tuple[list[int], list[float], list[int]]]:
+    """signals() for `spec` as native.cpp's flat program (ints, doubles, 4 roots), or
+    None when any operand or operator is outside it. Repeated operands share a node,
+    as series()'s cache shares a computation."""
+    ints: list[int] = []
+    dbl: list[float] = []
+    memo: dict[tuple, int] = {}
+
+    def node(kind: str, a: int = 0, b: int = 0, c: int = 0, i0: int = 0, i1: int = 0, i2: int = 0, i3: int = 0,
+             f0: float = 0.0, f1: float = 0.0) -> int:
+        key = (kind, a, b, c, i0, i1, i2, i3, f0, f1)
+        if key not in memo:
+            memo[key] = len(ints) // 8
+            ints.extend((_N[kind], a, b, c, i0, i1, i2, i3))
+            dbl.extend((f0, f1))
+        return memo[key]
+
+    def indicator(name: str, p: dict, field: str) -> int:
+        src = lambda: node("SRC", i0=_N_SRC[p["source"]])  # noqa: E731
+        if name == "PRICE":
+            return src()
+        if name in _N_PERIOD:
+            return node(_N_PERIOD[name], src(), i0=p["period"])
+        if name == "VOLUME_SMA":
+            return node("SMA", node("SRC", i0=_N_SRC["volume"]), i0=p["period"])
+        if name == "ATR":
+            return node("ATR", i0=p["period"])
+        if name == "VWAP":
+            return node("VWAP")
+        if name == "MACD":
+            return node("MACD", src(), i0=p["fast"], i1=p["slow"], i2=p["signal"], i3=_N_FIELDS[name].index(field))
+        if name == "BBANDS":
+            return node("BB", src(), i0=p["period"], i3=_N_FIELDS[name].index(field), f0=float(p["multiplier"]))
+        raise _Unsupported(name)
+
+    def shape(op: dict, s: int) -> int:                  # _shape
+        if op.get("xf"):
+            raise _Unsupported("transform")
+        mult = float(op.get("mult") if op.get("mult") not in (None, "") else 1)
+        add = float(op.get("add") or 0)
+        return node("AFFINE", s, f0=mult, f1=add) if mult != 1 or add else s
+
+    def ser(op: dict) -> int:                            # series()
+        if "math" in op:
+            if op["math"] not in _N_MATH:
+                raise _Unsupported(op["math"])
+            return shape(op, node("MATH", ser(op["a"]), ser(op["b"]), i0=_N_MATH[op["math"]]))
+        if "ind" not in op:
+            return node("CONST", f0=float(op["value"]))
+        tf = int(op.get("tf") or 0)
+        if op.get("symbol") or (tf and tf != base_tf):
+            raise _Unsupported("another symbol / timeframe")
+        name = op["ind"]
+        p = ind.normalize_params(name, op.get("params") or {})
+        field = op.get("field") or ind.REGISTRY[name][2][0]
+        if field not in ind.REGISTRY[name][2]:
+            raise _Unsupported(field)
+        s = indicator(name, p, field)
+        off = int(op.get("offset") or 0)
+        return shape(op, node("SHIFT", s, i0=off) if off > 0 else s)
+
+    def cond(c: dict) -> int:                            # _cond_raw + _cond_mods + negate
+        op = c["op"]
+        a = ser(c["left"])
+        if op in ("rising", "falling"):
+            k = max(1, int((c.get("right") or {}).get("value", 1)))
+            raw = node("RISE", a, i0=k, i1=1 if op == "rising" else -1)
+        elif op in ("between", "outside"):
+            raw = node("BETWEEN", a, ser(c["right"]), ser(c["right2"]), i0=0 if op == "between" else 1)
+        elif op.startswith("cross"):
+            raw = node("CROSS", a, ser(c["right"]), i0={"crosses_above": 0, "crosses_below": 1}.get(op, 2))
+        else:
+            raw = node("CMP", a, ser(c["right"]), i0=_N_CMP[op])
+        k, w, neg = int(c.get("for_bars") or 0), int(c.get("within_bars") or 0), bool(c.get("negate"))
+        return node("MODS", raw, i0=k, i1=w, i2=int(neg)) if k > 1 or w > 1 or neg else raw
+
+    def group(g: Optional[dict]) -> int:                 # evaluate()
+        conds = (g or {}).get("conditions") or []
+        if not conds:
+            return node("FALSE")
+        parts = [group(c) if "conditions" in c else cond(c) for c in conds]
+        logic = "OR" if (g.get("logic") or "AND") == "OR" else "AND"
+        r = parts[0]
+        for p_ in parts[1:]:
+            r = node(logic, r, p_)
+        return r
+
+    try:
+        dirn = spec["direction"]
+        roots = [group(spec["entry_long"]) if dirn != "short" else -1,
+                 group(spec["exit_long"]) if dirn != "short" else -1,
+                 group(spec["entry_short"]) if dirn != "long" else -1,
+                 group(spec["exit_short"]) if dirn != "long" else -1]
+    except (_Unsupported, KeyError, ValueError, TypeError):
+        return None
+    return ints, dbl, roots
+
+
+def _native_signals(d: dict, prog: tuple[list[int], list[float], list[int]]) -> dict[str, bytes]:
+    """signals(d, …) from native.cpp's eval_signals: a 0/1 byte per candle per side."""
+    from array import array
+
+    keep: list = []
+
+    def buf(x: Any, code: str) -> int:
+        a = x if isinstance(x, array) and x.typecode == code else array(code, x)
+        keep.append(a)
+        return a.buffer_info()[0]
+
+    n = len(d["c"])
+    ints, dbl, roots = prog
+    out = (ctypes.c_uint8 * (4 * n))()
+    if n and _native_lib().eval_signals(
+            buf(d["t"], "q"), buf(d["o"], "d"), buf(d["h"], "d"), buf(d["l"], "d"), buf(d["c"], "d"),
+            buf(d["v"], "d"), n,
+            buf(ints, "q"), buf(dbl, "d"), len(ints) // 8, buf(roots, "q"), out) != 0:
+        raise RuntimeError("eval_signals: bad program")
+    raw = bytes(out)
+    return {k: raw[j * n:(j + 1) * n] for j, k in enumerate(("entry_long", "exit_long", "entry_short", "exit_short"))}
 
 
 def _run_native(spec: dict, syms: list[str], st: dict[str, dict], tick_of: dict, trade_from: Optional[int],

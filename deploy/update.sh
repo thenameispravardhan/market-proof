@@ -39,7 +39,7 @@ rm -f app/algo/_mc.so                                    # the Monte-Carlo-only 
 CXX="$(command -v g++ || command -v g++-14 || true)"     # the server has only g++-14
 if [ -n "$CXX" ]; then
     echo "==> Building app/algo/_native.so"
-    if "$CXX" -O2 -std=c++17 -shared -fPIC -o app/algo/_native.so.tmp app/algo/native.cpp \
+    if "$CXX" -O2 -std=c++17 -ffp-contract=off -shared -fPIC -o app/algo/_native.so.tmp app/algo/native.cpp \
         && mv app/algo/_native.so.tmp app/algo/_native.so; then
         .venv/bin/python -m app.algo.native_check \
             || { rm -f app/algo/_native.so; echo "    (parity check failed; backtests use the Python engine)"; }

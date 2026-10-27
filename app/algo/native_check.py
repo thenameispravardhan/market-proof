@@ -10,10 +10,14 @@ the .so when it fails, so a wrong build can never answer a backtest.
 """
 from __future__ import annotations
 
+import ctypes
 import json
+import math
 import random
+import struct
 import sys
 from array import array
+from typing import Any, Optional
 
 from app.algo import engine
 
@@ -87,10 +91,156 @@ def specs(n: int = 80, seed: int = 11) -> list[dict]:
     return out
 
 
-def _result(spec: dict, native: bool) -> str:
+def flat_candles(seed: int) -> dict:
+    """candles() with flat stretches and no volume in them: stdev 0 (Bollinger %B / width
+    divide by zero -> None), RSI's down-average 0 (-> 100), VWAP over no volume (-> None)."""
+    d = candles(seed)
+    for i in range(len(d["t"])):
+        if (i // 40) % 4 == 3:
+            px = d["c"][i - 1] if i else d["c"][0]
+            d["o"][i] = d["h"][i] = d["l"][i] = d["c"][i] = px
+            d["v"][i] = 0
+    return d
+
+
+def _operand(rnd: random.Random, depth: int = 0) -> dict:
+    kind = rnd.random()
+    if kind < 0.12:
+        return {"value": rnd.choice([0, 1, 50, 70, 100.5, -2])}
+    if kind < 0.24 and depth < 2:
+        return {"math": rnd.choice(["+", "-", "*", "/", "pct_diff"]), "a": _operand(rnd, depth + 1),
+                "b": _operand(rnd, depth + 1), **rnd.choice([{}, {"mult": 2}, {"add": -1.5}])}
+    name = rnd.choice(["PRICE", "SMA", "EMA", "RMA", "WMA", "RSI", "STDDEV", "HIGHEST", "LOWEST", "ROC", "MOMENTUM",
+                       "VOLUME_SMA", "ATR", "VWAP", "MACD", "BBANDS"])
+    params: dict = {}
+    if name in ("SMA", "EMA", "RMA", "WMA", "RSI", "STDDEV", "HIGHEST", "LOWEST", "ROC", "MOMENTUM", "VOLUME_SMA", "ATR"):
+        params["period"] = rnd.choice([1, 2, 3, 5, 9, 14, 21, 30])
+    if name in ("PRICE", "SMA", "EMA", "RMA", "WMA", "RSI", "STDDEV", "HIGHEST", "LOWEST", "ROC", "MOMENTUM", "MACD", "BBANDS"):
+        params["source"] = rnd.choice(["close", "open", "high", "low", "hl2", "hlc3", "ohlc4", "volume", "range"])
+    if name == "MACD":
+        params.update(fast=rnd.choice([3, 12]), slow=rnd.choice([8, 26]), signal=rnd.choice([2, 9]))
+    if name == "BBANDS":
+        params.update(period=rnd.choice([5, 20]), multiplier=rnd.choice([1.0, 2.0, 2.5]))
+    op: dict = {"ind": name, "params": params}
+    fields = engine.ind.REGISTRY[name][2]
+    if len(fields) > 1:
+        op["field"] = rnd.choice(fields)
+    if rnd.random() < 0.3:
+        op["offset"] = rnd.choice([1, 2, 5])
+    if rnd.random() < 0.2:
+        op.update(rnd.choice([{"mult": 1.01}, {"add": 3}, {"mult": 0.5, "add": -1}]))
+    return op
+
+
+def _group(rnd: random.Random, depth: int = 0) -> dict:
+    conds = []
+    for _ in range(rnd.choice([1, 1, 2, 3])):
+        if depth < 1 and rnd.random() < 0.2:
+            conds.append(_group(rnd, depth + 1))
+            continue
+        op = rnd.choice(engine.OPS)
+        c: dict = {"left": _operand(rnd), "op": op}
+        if op in ("rising", "falling"):
+            c["right"] = {"value": rnd.choice([1, 2, 3])}
+        else:
+            c["right"] = _operand(rnd)
+        if op in ("between", "outside"):
+            c["right2"] = _operand(rnd)
+        if rnd.random() < 0.25:
+            c[rnd.choice(["for_bars", "within_bars"])] = rnd.choice([2, 3, 5])
+        if rnd.random() < 0.15:
+            c["negate"] = True
+        conds.append(c)
+    return {"logic": rnd.choice(["AND", "OR"]), "conditions": conds}
+
+
+def _native_series(d: dict, op: dict) -> Optional[list[float]]:
+    """One operand's series from native.cpp (NaN = None), via a one-condition program."""
+    lib = engine._native_lib()
+    lib.eval_series.restype = ctypes.c_int
+    lib.eval_series.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p,
+                                                         ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p]
+    spec = {"direction": "long", "entry_long": {"conditions": [{"left": op, "op": ">", "right": {"value": 0}}]},
+            "exit_long": None, "entry_short": None, "exit_short": None}
+    prog = engine._compile_signals(spec, None)
+    if prog is None:
+        return None
+    ints, dbl, roots = prog
+    keep = [array("q", d["t"]), array("d", d["o"]), array("d", d["h"]), array("d", d["l"]), array("d", d["c"]),
+            array("d", d["v"]), array("q", ints), array("d", dbl)]
+    n = len(d["c"])
+    out = (ctypes.c_double * n)()
+    if lib.eval_series(*(a.buffer_info()[0] for a in keep[:6]), n, keep[6].buffer_info()[0],
+                       keep[7].buffer_info()[0], len(ints) // 8, ints[roots[0] * 8 + 1], out) != 0:
+        return None
+    return list(out)
+
+
+def _bits(x: Any) -> Optional[bytes]:
+    return None if x is None or (isinstance(x, float) and math.isnan(x)) else struct.pack("<d", float(x))
+
+
+def _operands(g: Optional[dict]):
+    for c in (g or {}).get("conditions") or []:
+        if "conditions" in c:
+            yield from _operands(c)
+        else:
+            yield from (c[k] for k in ("left", "right", "right2") if isinstance(c.get(k), dict))
+
+
+def check_signals(n: int = 300, seed: int = 5) -> list[str]:
+    """engine.signals() vs native.cpp's eval_signals on random condition trees — every
+    supported indicator, field, source, offset, shaping, math and operator, with
+    modifiers and nested groups — over normal and degenerate (flat, no-volume) candles."""
+    rnd = random.Random(seed)
+    bad, covered, series_checked = [], 0, [0]
+    datasets = [candles(7), flat_candles(8)]
+    for k in range(n):
+        spec = {"direction": "both", "entry_long": _group(rnd), "exit_long": _group(rnd),
+                "entry_short": _group(rnd), "exit_short": rnd.choice([None, _group(rnd)])}
+        prog = engine._compile_signals(spec, None)
+        if prog is None:
+            bad.append(f"signals {k}: not compiled (should be covered)")
+            continue
+        covered += 1
+        for j, d in enumerate(datasets):
+            try:
+                py = engine.signals(d, spec, {})
+            except (ZeroDivisionError, TypeError, ValueError) as e:      # Python can't evaluate it either
+                bad.append(f"signals {k}/{j}: python raised {e!r}")
+                continue
+            cc = engine._native_signals(d, prog)
+            for side, vals in py.items():
+                got = [bool(x) for x in cc[side]]
+                if [bool(x) for x in vals] != got:
+                    i = next(i for i, (a, b) in enumerate(zip(vals, got)) if bool(a) != b)
+                    bad.append(f"signals {k}/{j} {side} differs at candle {i}: {json.dumps(spec)[:300]}")
+                    break
+            # every operand's values, bit for bit: a 1-ULP drift that flips no flag here would elsewhere
+            for op in (o for side in ("entry_long", "exit_long", "entry_short", "exit_short")
+                       for o in _operands(spec[side])):
+                ser_cc = _native_series(d, op)
+                ser_py = engine.series(d, op, {})
+                series_checked[0] += 1
+                if ser_cc is None or [_bits(x) for x in ser_py] != [_bits(x) for x in ser_cc]:
+                    i = next((i for i, (a, b) in enumerate(zip(ser_py, ser_cc or [])) if _bits(a) != _bits(b)), -1)
+                    bad.append(f"series {k}/{j} differs at candle {i}: {json.dumps(op)[:200]}")
+                    break
+    print(f"native_check signals: {covered} condition sets x {len(datasets)} datasets, "
+          f"{series_checked[0]} operand series compared bit for bit, {len(bad)} mismatches")
+    return bad
+
+
+def _result(spec: dict, native: bool, variant: int = 0) -> str:
+    """variant 1: the third symbol has no price grid (MCX: snap() leaves prices alone);
+    variant 2: candles carry their own close times (`tc`, as volume / turnover candles do)."""
     engine.NATIVE = native
     try:
-        data = {f"NSE:{x}-EQ": candles(seed) for seed, x in enumerate(("AAA", "BBB", "CCC"))}
+        names = ("NSE:AAA-EQ", "NSE:BBB-EQ", "MCX:CCC" if variant == 1 else "NSE:CCC-EQ")
+        data = {x: candles(seed) for seed, x in enumerate(names)}
+        if variant == 2:
+            for d in data.values():
+                d["tc"] = array("q", (t + d["tf_s"] - 60 * (i % 3) for i, t in enumerate(d["t"])))
         res = engine.run(spec, data, {}, data["NSE:AAA-EQ"]["t"][75], None, set())
         res["monte_carlo"] = engine.monte_carlo(res["trades"], spec["portfolio"]["capital"])
     finally:
@@ -107,14 +257,14 @@ def check() -> list[str]:
         if not engine._native_ok(spec):
             bad.append(f"spec {n}: not covered by the C++ loop")
             continue
-        py, cc = _result(spec, False), _result(spec, True)
+        py, cc = _result(spec, False, n % 3), _result(spec, True, n % 3)
         trades += py.count('"entry_t"')
         if py != cc:
             at = next(j for j in range(min(len(py), len(cc))) if py[j] != cc[j]) if py[:1] else 0
             bad.append(f"spec {n}: differs at char {at}: py …{py[max(0, at - 80):at + 80]}… "
                        f"c++ …{cc[max(0, at - 80):at + 80]}…")
     print(f"native_check: {len(specs())} strategies, {trades} trades compared, {len(bad)} mismatches")
-    return bad
+    return bad + check_signals()
 
 
 def main() -> int:

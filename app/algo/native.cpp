@@ -12,9 +12,23 @@
 //                accepts (shares, intraday). Entries and exits are booked by
 //                calling back into engine.run's own open_ / close, so sizing,
 //                margin, charges and trade records stay in Python, unchanged.
+//   eval_signals -- engine.signals() for the conditions engine._compile_signals()
+//                can express: the common indicators (indicators.py), constants,
+//                offsets, x/+ shaping, +-*/ math, every comparison / cross /
+//                rising / between operator, AND / OR groups, held-for / within / NOT.
+// Never fuse a*b + c into one FMA: it rounds once where Python rounds twice, so
+// results drift by an ULP (found 2026-10-27: clang on an FMA CPU fused the EMA step).
+// deploy/update.sh also passes -ffp-contract=off; this holds for any other build.
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#elif defined(__GNUC__)
+#pragma GCC optimize("fp-contract=off")
+#endif
+
 #include <charconv>
 #include <cmath>
 #include <cstdint>
+#include <deque>
 #include <queue>
 #include <vector>
 
@@ -330,5 +344,356 @@ API int run_loop(const Sym* S, i64 nsym, const Cfg* cfg, OpenCb op, CloseCb cl, 
     for (i64 k = 0; k < nsym; ++k)
         if (st[k].pos.open && !close(k, S[k].c[S[k].n - 1], close_time(S[k], S[k].n - 1), END, S[k].n - 1, 1))
             return -1;
+    return 0;
+}
+
+// ---- signals ------------------------------------------------------------------
+// A strategy's conditions as a flat program (engine._compile_signals): node j reads
+// only nodes before it. A series node is a double per candle, NaN where Python has
+// None; a condition node is a 0/1 byte per candle. Each node is 8 int64 + 2 double:
+//     ints   [kind, a, b, c, i0, i1, i2, i3]     doubles [f0, f1]
+// Every formula below is the indicators.py / engine.py one, operation for operation.
+
+enum Node {
+    SRC = 1, CONST, SMA, EMA, RMA, WMA, RSI, ATR, MACD, BB, STDDEV, HIGHEST, LOWEST, VWAP, ROC, MOMENTUM,
+    SHIFT = 18, AFFINE, MATH,
+    CMP = 30, CROSS, RISE, BETWEEN, MODS, AND, OR, FALSE_
+};
+
+typedef std::vector<double> Ser;
+static const double NA = NAN;
+
+static i64 first_valid(const Ser& x) {                         // indicators._first
+    for (size_t i = 0; i < x.size(); ++i) if (has(x[i])) return (i64)i;
+    return (i64)x.size();
+}
+
+static Ser sma_(const Ser& x, i64 n) {
+    i64 N = x.size(), s0 = first_valid(x);
+    Ser out(N, NA);
+    double s = 0.0;
+    for (i64 i = s0; i < N; ++i) {
+        s += x[i];
+        if (i - s0 >= n) s -= x[i - n];
+        if (i - s0 >= n - 1) out[i] = s / n;
+    }
+    return out;
+}
+
+static Ser ema_(const Ser& x, i64 n, double a) {
+    i64 N = x.size(), s0 = first_valid(x);
+    Ser out(N, NA);
+    if (N - s0 < n) return out;
+    double prev = 0.0;                                         // sum(x[s0:s0+n]): from int 0, left to right
+    for (i64 k = 0; k < n; ++k) prev += x[s0 + k];
+    prev = prev / n;
+    out[s0 + n - 1] = prev;
+    for (i64 i = s0 + n; i < N; ++i) {
+        prev = a * x[i] + (1 - a) * prev;
+        out[i] = prev;
+    }
+    return out;
+}
+
+static Ser wma_(const Ser& x, i64 n) {
+    i64 N = x.size();
+    Ser out(N, NA);
+    double den = (double)(n * (n + 1)) / 2;
+    for (i64 i = first_valid(x) + n - 1; i < N; ++i) {
+        double s = 0.0;
+        for (i64 k = 0; k < n; ++k) s += x[i - n + 1 + k] * (double)(k + 1);
+        out[i] = s / den;
+    }
+    return out;
+}
+
+static double (*volatile pow_fn)(double, double) = std::pow;     // the libm pow Python's `**` calls; never folded to x*x
+
+static double py_square(double v) {                            // CPython float_pow(v, 2.0)
+    if (v < 0.0) v = -v;
+    if (v == 1.0) return 1.0;
+    return pow_fn(v, 2.0);
+}
+
+static Ser stdev_(const Ser& x, i64 n) {
+    i64 N = x.size(), s0 = first_valid(x);
+    Ser out(N, NA);
+    double s = 0.0, s2 = 0.0;
+    for (i64 i = s0; i < N; ++i) {
+        s += x[i];
+        s2 += x[i] * x[i];
+        if (i - s0 >= n) { s -= x[i - n]; s2 -= x[i - n] * x[i - n]; }
+        if (i - s0 >= n - 1) {
+            double v = s2 / n - py_square(s / n);
+            out[i] = std::sqrt(v > 0.0 ? v : 0.0);             // max(0.0, v)
+        }
+    }
+    return out;
+}
+
+static Ser roll_(const Ser& x, i64 n, bool hi) {               // indicators._roll (highest / lowest)
+    i64 N = x.size(), s0 = first_valid(x);
+    Ser out(N, NA);
+    std::deque<i64> q;
+    for (i64 i = s0; i < N; ++i) {
+        while (!q.empty() && !(hi ? x[q.back()] > x[i] : x[q.back()] < x[i])) q.pop_back();
+        q.push_back(i);
+        if (q.front() <= i - n) q.pop_front();
+        if (i - s0 >= n - 1) out[i] = x[q.front()];
+    }
+    return out;
+}
+
+static Ser shift_(const Ser& x, i64 k) {
+    if (k <= 0) return x;
+    i64 N = x.size();
+    Ser out(N, NA);
+    for (i64 i = k; i < N; ++i) out[i] = x[i - k];
+    return out;
+}
+
+static Ser rsi_(const Ser& x, i64 n) {
+    i64 N = x.size();
+    Ser up(N, NA), dn(N, NA);
+    for (i64 i = 1; i < N; ++i) {
+        if (!has(x[i]) || !has(x[i - 1])) continue;
+        double c = x[i] - x[i - 1];
+        up[i] = 0.0 > c ? 0.0 : c;                             // max(c, 0.0)
+        dn[i] = 0.0 > -c ? 0.0 : -c;                           // max(-c, 0.0)
+    }
+    Ser au = ema_(up, n, 1.0 / n), ad = ema_(dn, n, 1.0 / n), out(N, NA);
+    for (i64 i = 0; i < N; ++i)
+        if (has(au[i]) && has(ad[i])) out[i] = ad[i] == 0 ? 100.0 : 100 - 100 / (1 + au[i] / ad[i]);
+    return out;
+}
+
+struct Bars { const i64* t; const double *o, *h, *l, *c, *v; i64 n; };
+
+static Ser source_(const Bars& d, i64 id) {                    // indicators.source
+    Ser out(d.n);
+    for (i64 i = 0; i < d.n; ++i) {
+        double o = d.o[i], h = d.h[i], l = d.l[i], c = d.c[i];
+        switch (id) {
+            case 0: out[i] = c; break;
+            case 1: out[i] = o; break;
+            case 2: out[i] = h; break;
+            case 3: out[i] = l; break;
+            case 4: out[i] = (h + l) / 2; break;
+            case 5: out[i] = (h + l + c) / 3; break;
+            case 6: out[i] = (o + h + l + c) / 4; break;
+            case 7: out[i] = d.v[i]; break;
+            default: out[i] = h - l; break;
+        }
+    }
+    return out;
+}
+
+static Ser atr_(const Bars& d, i64 n) {                        // rma(true_range)
+    Ser tr(d.n);
+    for (i64 i = 0; i < d.n; ++i) {
+        if (i == 0) { tr[0] = d.h[0] - d.l[0]; continue; }
+        double a = d.h[i] - d.l[i], b = std::fabs(d.h[i] - d.c[i - 1]), c = std::fabs(d.l[i] - d.c[i - 1]);
+        double m = a;                                          // max(a, b, c): the first maximal
+        if (b > m) m = b;
+        if (c > m) m = c;
+        tr[i] = m;
+    }
+    return ema_(tr, n, 1.0 / n);
+}
+
+static Ser vwap_(const Bars& d) {                              // session VWAP of hlc3
+    Ser out(d.n, NA);
+    double pv = 0.0, vol = 0.0;
+    for (i64 i = 0; i < d.n; ++i) {
+        if (i == 0 || (d.t[i] + IST) / 86400 != (d.t[i - 1] + IST) / 86400) pv = vol = 0.0;
+        double tp = (d.h[i] + d.l[i] + d.c[i]) / 3;
+        pv += tp * d.v[i];
+        vol += d.v[i];
+        out[i] = vol != 0 ? pv / vol : NA;
+    }
+    return out;
+}
+
+// Runs the program's nodes into S (series) and B (conditions). 0 = ok, -1 = an unknown node kind.
+static int run_program(const Bars& d, const i64* ints, const double* dbl, i64 nodes,
+                       std::vector<Ser>& S, std::vector<std::vector<uint8_t>>& B) {
+    i64 n = d.n;
+    S.assign(nodes, Ser());
+    B.assign(nodes, std::vector<uint8_t>());
+    for (i64 j = 0; j < nodes; ++j) {
+        const i64* p = ints + 8 * j;
+        const double* f = dbl + 2 * j;
+        i64 kind = p[0], a = p[1], b = p[2], cc = p[3], i0 = p[4], i1 = p[5], i2 = p[6], i3 = p[7];
+        switch (kind) {
+            case SRC: S[j] = source_(d, i0); break;
+            case CONST: S[j] = Ser(n, f[0]); break;
+            case SMA: S[j] = sma_(S[a], i0); break;
+            case EMA: S[j] = ema_(S[a], i0, 2.0 / (i0 + 1)); break;
+            case RMA: S[j] = ema_(S[a], i0, 1.0 / i0); break;
+            case WMA: S[j] = wma_(S[a], i0); break;
+            case RSI: S[j] = rsi_(S[a], i0); break;
+            case ATR: S[j] = atr_(d, i0); break;
+            case MACD: {
+                Ser fa = ema_(S[a], i0, 2.0 / (i0 + 1)), sl = ema_(S[a], i1, 2.0 / (i1 + 1)), line(n, NA);
+                for (i64 i = 0; i < n; ++i) if (has(fa[i]) && has(sl[i])) line[i] = fa[i] - sl[i];
+                if (i3 == 0) { S[j] = line; break; }
+                Ser sig = ema_(line, i2, 2.0 / (i2 + 1));
+                if (i3 == 1) { S[j] = sig; break; }
+                Ser hist(n, NA);
+                for (i64 i = 0; i < n; ++i) if (has(line[i]) && has(sig[i])) hist[i] = line[i] - sig[i];
+                S[j] = hist;
+                break;
+            }
+            case BB: {
+                Ser mid = sma_(S[a], i0), sd = stdev_(S[a], i0), r(n, NA);
+                double m = f[0];
+                for (i64 i = 0; i < n; ++i) {
+                    if (!has(mid[i]) || !has(sd[i])) continue;
+                    double up = mid[i] + m * sd[i], lo = mid[i] - m * sd[i];
+                    if (i3 == 0) r[i] = up;
+                    else if (i3 == 1) r[i] = mid[i];
+                    else if (i3 == 2) r[i] = lo;
+                    else if (i3 == 3) r[i] = mid[i] != 0 ? (up - lo) / mid[i] * 100 : NA;      // ZeroDivisionError -> None
+                    else if (has(S[a][i])) r[i] = (up - lo) != 0 ? (S[a][i] - lo) / (up - lo) : NA;
+                }
+                S[j] = r;
+                break;
+            }
+            case STDDEV: S[j] = stdev_(S[a], i0); break;
+            case HIGHEST: S[j] = roll_(S[a], i0, true); break;
+            case LOWEST: S[j] = roll_(S[a], i0, false); break;
+            case VWAP: S[j] = vwap_(d); break;
+            case ROC: case MOMENTUM: {
+                Ser prev = shift_(S[a], i0), r(n, NA);
+                for (i64 i = 0; i < n; ++i) {
+                    double x = S[a][i], y = prev[i];
+                    if (!has(x) || !has(y)) continue;
+                    if (kind == MOMENTUM) r[i] = x - y;
+                    else if (y != 0) r[i] = 100 * (x - y) / y;
+                }
+                S[j] = r;
+                break;
+            }
+            case SHIFT: S[j] = shift_(S[a], i0); break;
+            case AFFINE: {
+                Ser r(n, NA);
+                for (i64 i = 0; i < n; ++i) if (has(S[a][i])) r[i] = S[a][i] * f[0] + f[1];
+                S[j] = r;
+                break;
+            }
+            case MATH: {
+                Ser r(n, NA);
+                for (i64 i = 0; i < n; ++i) {
+                    double x = S[a][i], y = S[b][i];
+                    if (!has(x) || !has(y)) continue;
+                    switch (i0) {
+                        case 0: r[i] = x + y; break;
+                        case 1: r[i] = x - y; break;
+                        case 2: r[i] = x * y; break;
+                        case 3: if (y != 0) r[i] = x / y; break;
+                        default: if (y != 0) r[i] = (x - y) / y * 100; break;
+                    }
+                }
+                S[j] = r;
+                break;
+            }
+            case CMP: {
+                std::vector<uint8_t> r(n, 0);
+                for (i64 i = 0; i < n; ++i) {
+                    double x = S[a][i], y = S[b][i];
+                    if (!has(x) || !has(y)) continue;
+                    switch (i0) {
+                        case 0: r[i] = x > y; break;
+                        case 1: r[i] = x < y; break;
+                        case 2: r[i] = x >= y; break;
+                        case 3: r[i] = x <= y; break;
+                        case 4: r[i] = std::fabs(x - y) < 1e-9; break;
+                        default: r[i] = std::fabs(x - y) >= 1e-9; break;
+                    }
+                }
+                B[j] = r;
+                break;
+            }
+            case CROSS: {
+                std::vector<uint8_t> r(n, 0);
+                const Ser &A = S[a], &Bv = S[b];
+                for (i64 i = 1; i < n; ++i) {
+                    if (!has(A[i]) || !has(Bv[i]) || !has(A[i - 1]) || !has(Bv[i - 1])) continue;
+                    bool up = A[i] > Bv[i] && A[i - 1] <= Bv[i - 1], dn = A[i] < Bv[i] && A[i - 1] >= Bv[i - 1];
+                    r[i] = i0 == 0 ? up : i0 == 1 ? dn : (up || dn);
+                }
+                B[j] = r;
+                break;
+            }
+            case RISE: {
+                std::vector<uint8_t> r(n, 0);
+                for (i64 i = i0; i < n; ++i)
+                    if (has(S[a][i]) && has(S[a][i - i0])) r[i] = i1 * (S[a][i] - S[a][i - i0]) > 0;
+                B[j] = r;
+                break;
+            }
+            case BETWEEN: {
+                std::vector<uint8_t> r(n, 0);
+                for (i64 i = 0; i < n; ++i) {
+                    double x = S[a][i], y = S[b][i], z = S[cc][i];
+                    if (!has(x) || !has(y) || !has(z)) continue;
+                    double lo = z < y ? z : y, hi = z > y ? z : y;      // min(y, z) / max(y, z)
+                    bool inside = lo <= x && x <= hi;
+                    r[i] = i0 == 0 ? inside : !inside;
+                }
+                B[j] = r;
+                break;
+            }
+            case MODS: {                                        // engine._cond_mods, then NOT
+                std::vector<uint8_t> r = B[a];
+                if (i0 > 1) {
+                    i64 run = 0;
+                    for (i64 i = 0; i < n; ++i) { run = r[i] ? run + 1 : 0; r[i] = run >= i0; }
+                }
+                if (i1 > 1) {
+                    i64 last = -1000000000;
+                    for (i64 i = 0; i < n; ++i) { if (r[i]) last = i; r[i] = i - last < i1; }
+                }
+                if (i2) for (i64 i = 0; i < n; ++i) r[i] = !r[i];
+                B[j] = r;
+                break;
+            }
+            case AND: case OR: {
+                std::vector<uint8_t> r(n);
+                for (i64 i = 0; i < n; ++i) r[i] = kind == AND ? (B[a][i] && B[b][i]) : (B[a][i] || B[b][i]);
+                B[j] = r;
+                break;
+            }
+            case FALSE_: B[j] = std::vector<uint8_t>(n, 0); break;
+            default: return -1;
+        }
+    }
+    return 0;
+}
+
+API int eval_signals(const i64* t, const double* o, const double* h, const double* l, const double* c, const double* v,
+                     i64 n, const i64* ints, const double* dbl, i64 nodes, const i64* roots, uint8_t* out) {
+    // out: 4 x n bytes (entry_long, exit_long, entry_short, exit_short); roots[k] = -1: never fires.
+    Bars d{t, o, h, l, c, v, n};
+    std::vector<Ser> S;
+    std::vector<std::vector<uint8_t>> B;
+    if (run_program(d, ints, dbl, nodes, S, B) != 0) return -1;
+    for (int k = 0; k < 4; ++k) {
+        uint8_t* dst = out + k * n;
+        if (roots[k] < 0) { for (i64 i = 0; i < n; ++i) dst[i] = 0; continue; }
+        const std::vector<uint8_t>& src = B[roots[k]];
+        for (i64 i = 0; i < n; ++i) dst[i] = src[i];
+    }
+    return 0;
+}
+
+// One series node's values (NaN = None), for native_check to compare against engine.series().
+API int eval_series(const i64* t, const double* o, const double* h, const double* l, const double* c, const double* v,
+                    i64 n, const i64* ints, const double* dbl, i64 nodes, i64 which, double* out) {
+    Bars d{t, o, h, l, c, v, n};
+    std::vector<Ser> S;
+    std::vector<std::vector<uint8_t>> B;
+    if (run_program(d, ints, dbl, nodes, S, B) != 0 || S[which].size() != (size_t)n) return -1;
+    for (i64 i = 0; i < n; ++i) out[i] = S[which][i];
     return 0;
 }

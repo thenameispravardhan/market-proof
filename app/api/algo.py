@@ -225,7 +225,40 @@ async def _assemble(spec: dict[str, Any], start: int, end: int) -> tuple[dict[st
         raise HTTPException(422, detail=str(e)) from None
     if not bars:
         raise HTTPException(422, detail="; ".join(f"{n['symbol']}: {n['note']}" for n in notes) or "no data")
-    return bars, notes, trade_from
+    return bars, _fold_notes(notes), trade_from
+
+
+def _fold_notes(notes: list[dict]) -> list[dict]:
+    """One line for a message 3+ symbols share (a spent Fyers budget names every
+    symbol of the universe), not a wall of identical warnings."""
+    by: dict[str, list[str]] = {}
+    for n in notes:
+        by.setdefault(n["note"], []).append(n["symbol"])
+    out = []
+    for note, syms in by.items():
+        if len(syms) < 3:
+            out += [{"symbol": s, "note": note} for s in syms]
+            continue
+        names = ", ".join(s.split(":")[-1] for s in syms[:4]) + (", …" if len(syms) > 4 else "")
+        out.append({"symbol": f"{len(syms)} symbols ({names})", "note": note})
+    return out
+
+
+def _ran_out_note(res: dict[str, Any], capital: float) -> Optional[dict]:
+    """Say so when losses took the capital: every later signal is refused
+    (no_capital), so a long range quietly turns into a few weeks of trading."""
+    refused = res["stats"]["skipped"].get("no_capital", 0)
+    if not refused:
+        return None
+    eq = capital
+    for x in sorted(res["trades"], key=lambda x: x["exit_t"]):
+        eq += x["net"]
+        if eq <= capital * 0.01:
+            day = datetime.fromtimestamp(x["exit_t"] + engine.IST, timezone.utc).date().isoformat()
+            return {"symbol": "portfolio", "note": f"capital ran out on {day} (₹{eq:,.0f} left of ₹{capital:,.0f}) — "
+                                                  f"the {refused:,} entries after that were refused, so the result "
+                                                  f"stops there, not at the end of the range"}
+    return None
 
 
 @router.get("/indicators")
@@ -283,6 +316,8 @@ async def backtest(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
                 engine.trial_dsr, res["trades"], bars, spec["portfolio"]["capital"], trials, trade_from)
         except (ValueError, KeyError, ZeroDivisionError) as e:
             raise HTTPException(422, detail=f"backtest: {e}")
+    if (ran_out := _ran_out_note(res, spec["portfolio"]["capital"])):
+        notes = [ran_out, *notes]
     d = bars[chart_sym]
     keep = 8000                         # enough to inspect, small enough to ship
     first = next((i for i, t in enumerate(d["t"]) if t >= trade_from), 0)
