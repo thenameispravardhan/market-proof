@@ -29,6 +29,7 @@ import csv
 import os
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -47,6 +48,12 @@ IST = timezone(timedelta(hours=5, minutes=30))
 # stop filling for EVERY symbol, not just this one.
 NIFTY_SYMBOL = "NIFTY50-INDEX"
 NIFTY_FYERS = "NSE:NIFTY50-INDEX"
+
+# Wall time each symbol's candles were last fetched (this process). The real-time
+# pass re-asks a symbol only once a filing of its has become priceable since —
+# it used to re-fetch the same ~250 symbols every 10 minutes (2026-10-27: the
+# day's 4,000 automation calls gone by noon).
+_fetched_at: dict[str, float] = {}
 
 # Fyers caps a 1-minute history request at 100 days; stay well inside it.
 MAX_DAYS = 90
@@ -197,6 +204,7 @@ async def _sync_symbols(symbols: list[str], days: int, bud: Any) -> dict:
                 await asyncio.sleep(delay)
             broker = (NIFTY_FYERS if sym == NIFTY_SYMBOL
                       else (resolve_fyers_symbol(sym) or f"NSE:{sym}-EQ"))
+            _fetched_at[sym] = time.time()      # an invalid / empty symbol counts too: no retry every pass
             raw = await _fetch(broker, days)
             # Everything after the fetch is blocking: _candle_rows walks up to
             # ~35k candles and _append rewrites a multi-MB parquet. Run on the
@@ -266,14 +274,25 @@ def ripe_symbols(max_age_days: int = 7, min_age_minutes: int = 61,
             WHERE price_status='no_candles'
               AND announced_at >= current_date - INTERVAL {int(max_age_days)} DAY
         """)
-    q = (f"SELECT DISTINCT symbol FROM {TABLE} "
+    q = (f"SELECT symbol, max(announced_at) FROM {TABLE} "
          "WHERE price_status='pending' AND symbol IS NOT NULL AND symbol <> '' "
          f"AND announced_at >= current_date - INTERVAL {int(max_age_days)} DAY "
          f"AND announced_at <= now() - INTERVAL {int(min_age_minutes)} MINUTE "
-         "ORDER BY symbol")
+         "GROUP BY symbol ORDER BY symbol")
     if limit:
         q += f" LIMIT {int(limit)}"
-    return [NIFTY_SYMBOL] + [r[0] for r in con.execute(q).fetchall()]
+    # fetched since its newest filing became priceable: another fetch can't fill more (the daily sweep retries)
+    return [NIFTY_SYMBOL] + [sym for sym, at in con.execute(q).fetchall()
+                             if _fetched_at.get(sym, 0.0) < priceable_at(at, min_age_minutes)]
+
+
+def priceable_at(announced_ist: datetime, minutes: int = 61) -> float:
+    """When a filing's px_60m candles can exist: `minutes` of trading after it — counted from
+    the next session's open for one filed after hours or on a weekend (holidays aren't known)."""
+    from app.algo.data import next_candle
+
+    t = announced_ist.replace(tzinfo=IST).timestamp()
+    return next_candle(t - 60) + (minutes - 1) * 60
 
 
 def fetch_window_open(now=None) -> bool:

@@ -146,3 +146,34 @@ def test_ripe_excludes_announcements_too_new_to_price(tmp_path, monkeypatch):
         assert "TOONEW" not in syms, "fetched before px_60m could possibly exist"
     finally:
         W.shutdown()
+
+
+def test_priceable_at_counts_trading_minutes():
+    """A filing during the session is priceable an hour later; one filed after
+    hours or on a weekend, an hour after the next open."""
+    ist = candle_sync.IST
+    at = lambda *a: dt.datetime(*a, tzinfo=ist).timestamp()  # noqa: E731
+    assert candle_sync.priceable_at(dt.datetime(2026, 10, 26, 10, 0)) == at(2026, 10, 26, 11, 0)
+    assert candle_sync.priceable_at(dt.datetime(2026, 10, 26, 18, 0)) == at(2026, 10, 27, 10, 15)
+    assert candle_sync.priceable_at(dt.datetime(2026, 10, 24, 11, 0)) == at(2026, 10, 26, 10, 15)   # Saturday
+
+
+def test_ripe_skips_a_symbol_fetched_since_its_filing_became_priceable(tmp_path, monkeypatch):
+    """The real-time pass ran every 10 minutes re-fetching the same symbols;
+    once fetched after its filing is priceable, a symbol waits for a new one."""
+    from app.services import warehouse_store as W
+
+    W.shutdown()
+    monkeypatch.setattr(W, "STORE", tmp_path / "wh.duckdb")
+    monkeypatch.setattr(candle_sync, "_fetched_at", {})
+    W.connect()
+    try:
+        filed = dt.datetime.now().replace(microsecond=0) - dt.timedelta(days=1)
+        W.ingest_live(symbol="ACME", headline="results", announced_at=filed)
+        ready = candle_sync.priceable_at(filed)
+        candle_sync._fetched_at["ACME"] = ready - 1                # fetched before it was priceable
+        assert "ACME" in candle_sync.ripe_symbols(max_age_days=3)
+        candle_sync._fetched_at["ACME"] = ready + 1                # fetched after: nothing more to get
+        assert candle_sync.ripe_symbols(max_age_days=3) == [candle_sync.NIFTY_SYMBOL]
+    finally:
+        W.shutdown()
