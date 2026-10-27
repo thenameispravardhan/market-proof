@@ -28,9 +28,11 @@ def test_native_loop_matches_python_bit_for_bit(native):
     assert native_check.check() == []
 
 
-def test_uncovered_strategies_stay_on_the_python_loop():
+def test_uncovered_strategies_stay_on_the_python_loop(native):
     s = native_check.specs(1)[0]
-    for change in ({"scale_out": [{"type": "pct", "value": 1, "qty_pct": 50}]},
-                   {"session": {**s["session"], "square_off": None}},
-                   {"instrument": {**s["instrument"], "type": "future"}}):
+    assert engine._native_ok(s)
+    for change in ({"instrument": {**s["instrument"], "type": "option"}},
+                   {"pair_leg": {"symbol": "NSE:BBB-EQ"}},
+                   {"rank": {"by": {"ind": "RSI"}, "top": 2}},
+                   {"mtm": {**s["mtm"], "stop_pct": 20}}):
         assert not engine._native_ok({**s, **change})

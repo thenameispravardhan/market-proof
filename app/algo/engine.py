@@ -755,6 +755,19 @@ NO_SYMBOL = {"VIX", "DTE", "TIME", "FILING"} | ORDER_FLOW
 MAX_REF_SYMBOLS = 5
 
 
+def _day_set(times: Any) -> frozenset:
+    """The IST day numbers that have candles (native.cpp when built: a set over every candle is slow here)."""
+    lib = _native_lib()
+    if lib is None or not len(times):
+        return frozenset((t + IST) // 86400 for t in times)
+    from array import array
+
+    t = times if isinstance(times, array) and times.typecode == "q" else array("q", times)
+    out = (ctypes.c_int64 * len(t))()
+    k = lib.unique_days(t.buffer_info()[0], len(t), out)
+    return frozenset(out[:k])
+
+
 def _needs_expiry(spec: dict[str, Any]) -> bool:
     """Whether prepare() must attach `expiry_ts`: F&O instruments, or a DTE condition (its only reader)."""
     return spec["instrument"]["type"] != "equity" or any(o["ind"] == "DTE" for o in _walk_operands(spec))
@@ -1543,7 +1556,7 @@ def prepare(d: dict, spec: dict) -> None:
     kind = inst["expiry_kind"] if inst["type"] == "option" else "monthly"
     # Days the underlying actually traded: an expiry that falls on a day with
     # no candles was an exchange holiday and really settled the day before.
-    d["trading_days"] = frozenset((t + IST) // 86400 for t in d["t"])
+    d["trading_days"] = _day_set(d["t"])
     if _needs_expiry(spec):         # ~a quarter of a share strategy's signal time, for nothing
         d["expiry_ts"] = fno.expiry_series(meta["name"], meta["exch"], kind, inst["expiry"], d["t"], d["trading_days"])
     if inst["type"] != "option":
@@ -1853,7 +1866,6 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
         for sym in syms:
             if sym not in keep_caches:
                 caches.pop(sym, None)
-    events = _events(syms, data, prio)
     trades: list[dict[str, Any]] = []
     skipped = {"no_capital": 0, "max_positions": 0, "daily_halt": 0, "entry_expired": 0, "entry_rules": 0,
                "no_stop": 0, "expires_today": 0}
@@ -2268,8 +2280,10 @@ def run(spec: dict, data: dict[str, dict], caches: Optional[dict[str, dict]] = N
     # faster): it walks the candles and calls open_ / close above to book trades.
     # Anything else — or no app/algo/_native.so — runs the Python loop below.
     if _native_ok(spec) and _run_native(spec, syms, st, tick_of, trade_from, (start, end, sq), open_, close,
-                                        booked, skipped):
+                                        settle, booked, skipped):
         events = iter(())
+    else:                                        # built only now: its ascending scan reads every candle
+        events = _events(syms, data, prio)
 
     for t, _, k, i in events:
         sym = syms[k]
@@ -2659,16 +2673,19 @@ class _Sym(ctypes.Structure):     # native.cpp's Sym
 
 class _Cfg(ctypes.Structure):     # native.cpp's Cfg
     _fields_ = [(k, _i64) for k in ("start", "end", "sq", "max_trades_per_day", "cooldown", "max_bars",
-                                    "max_positions", "trade_from", "days_mask", "entry_kind", "valid_bars")] \
-        + [("daily_max_loss", _dbl), ("daily_max_profit", _dbl)]
+                                    "max_positions", "trade_from", "days_mask", "entry_kind", "valid_bars", "multi")] \
+        + [(k, _dbl) for k in ("daily_max_loss", "daily_max_profit", "mtm_stop", "mtm_target", "trail_start",
+                               "trail_gap")]
 
 
 _OPEN = ctypes.CFUNCTYPE(ctypes.c_int, _i64, ctypes.c_int, _i64, _i64, _dbl, ctypes.POINTER(_dbl))
-_CLOSE = ctypes.CFUNCTYPE(ctypes.c_int, _i64, _dbl, _i64, ctypes.c_int, _i64, ctypes.c_int, _dbl, _dbl,
+_CLOSE = ctypes.CFUNCTYPE(ctypes.c_int, _i64, _dbl, _i64, ctypes.c_int, _i64, ctypes.c_int, _dbl, _dbl, _i64,
                           ctypes.POINTER(_dbl))
+_SETTLE = ctypes.CFUNCTYPE(ctypes.c_int, _i64, _i64, _i64, _dbl, _dbl, ctypes.POINTER(_dbl))
 _TRIG = ctypes.CFUNCTYPE(ctypes.c_int, _i64, ctypes.c_int, _i64, ctypes.POINTER(_dbl))
 _REASONS = (None, "EOD", "SQUARE_OFF", "SIGNAL", "TIME_STOP", "DAILY_MAX_LOSS", "DAILY_TARGET", "SL", "TRAIL",
-            "BREAKEVEN", "TARGET", "END")      # native.cpp's Reason, in order
+            "BREAKEVEN", "TARGET", "END", "MTM_SL", "MTM_TRAIL", "MTM_TARGET", "EXPIRY")   # native.cpp's Reason
+_SCALE_OUT = 100                                 # native.cpp: SCALE_OUT + k = "SCALE_OUT_k"
 _ENTRY_KINDS = {"market": 0, "pullback": 1, "breakout": 2}
 
 
@@ -2686,8 +2703,10 @@ def _native_lib() -> Optional[ctypes.CDLL]:
         lib.mc_paths.argtypes = [ctypes.POINTER(_dbl), _i64, _i64, ctypes.c_uint32, _dbl,
                                  ctypes.POINTER(_dbl), ctypes.POINTER(_dbl), ctypes.POINTER(_i64)]
         lib.run_loop.restype = ctypes.c_int
-        lib.run_loop.argtypes = [ctypes.POINTER(_Sym), _i64, ctypes.POINTER(_Cfg), _OPEN, _CLOSE, _TRIG,
+        lib.run_loop.argtypes = [ctypes.POINTER(_Sym), _i64, ctypes.POINTER(_Cfg), _OPEN, _CLOSE, _TRIG, _SETTLE,
                                  ctypes.POINTER(_i64)]
+        lib.unique_days.restype = _i64
+        lib.unique_days.argtypes = [_ptr, _i64, _ptr]
         lib.eval_signals.restype = ctypes.c_int
         lib.eval_signals.argtypes = [_ptr] * 6 + [_i64, _ptr, _ptr, _i64, _ptr, _ptr]
     except (OSError, AttributeError) as e:
@@ -2697,16 +2716,16 @@ def _native_lib() -> Optional[ctypes.CDLL]:
 
 
 def _native_ok(spec: dict) -> bool:
-    """Strategies native.cpp's run_loop covers: shares, intraday (squared off),
-    one leg, the position's own stop / target / trail / breakeven. Options,
-    futures, pairs, ranking, scale-outs, MTM / leg / position rules and
-    adjustments, carried and daily / weekly positions run the Python loop."""
+    """Strategies native.cpp's run_loop covers: one leg — shares or a future —
+    intraday or carried, any timeframe, with the position's stop / target /
+    trail / breakeven, scale-outs and the ₹ MTM stop / target / trail.
+    Options (and their leg / Greeks rules, adjustments, % of premium MTM),
+    pairs and ranking run the Python loop."""
     m = spec["mtm"]
-    return (NATIVE and _native_lib() is not None and spec["instrument"]["type"] == "equity"
-            and not spec.get("pair_leg") and not spec.get("rank") and not spec.get("scale_out")
+    return (NATIVE and _native_lib() is not None and spec["instrument"]["type"] in ("equity", "future")
+            and not spec.get("pair_leg") and not spec.get("rank")
             and not adjusts(spec) and not (spec.get("position_rules") or {}).get("exit")
-            and not (m.get("stop") or m.get("target") or m.get("trail_start"))
-            and not multi_day(spec["timeframe"]) and session_window(spec)[2] < CARRY
+            and not (m.get("stop_pct") or m.get("target_pct"))
             and spec["entry_order"]["type"] in _ENTRY_KINDS)
 
 
@@ -2848,7 +2867,8 @@ def _native_signals(d: dict, prog: tuple[list[int], list[float], list[int]]) -> 
 
 
 def _run_native(spec: dict, syms: list[str], st: dict[str, dict], tick_of: dict, trade_from: Optional[int],
-                window: tuple[int, int, int], open_: Callable, close: Callable, booked: list, skipped: dict) -> bool:
+                window: tuple[int, int, int], open_: Callable, close: Callable, settle: Callable, booked: list,
+                skipped: dict) -> bool:
     """engine.run's candle loop in C++ (see _native_ok). True = done; False =
     nothing ran (a symbol's candles aren't ascending) and the Python loop must."""
     from array import array
@@ -2856,6 +2876,9 @@ def _run_native(spec: dict, syms: list[str], st: dict[str, dict], tick_of: dict,
     keep: list = []                          # every buffer the C++ side points into, alive for the call
 
     def buf(x: Any, code: str) -> Optional[int]:
+        if isinstance(x, bytes) and code == "B":           # native signals: read in place, no copy
+            keep.append(x)
+            return ctypes.cast(ctypes.c_char_p(x), ctypes.c_void_p).value if x else None
         a = x if isinstance(x, array) and x.typecode == code else array(code, x)
         keep.append(a)
         return a.buffer_info()[0] if len(a) else None
@@ -2868,12 +2891,15 @@ def _run_native(spec: dict, syms: list[str], st: dict[str, dict], tick_of: dict,
                     *(buf(sig[x], "B") for x in ("entry_long", "entry_short", "exit_long", "exit_short")),
                     len(d["t"]), int(d.get("tf_s") or 0), tick_of[sym] or math.nan)
     start, end, sq = window
-    daily = spec["daily"]
+    daily, m = spec["daily"], spec["mtm"]
     cfg = _Cfg(start, end, sq, spec["max_trades_per_day"], spec["cooldown_bars"], spec["max_bars"] or 0,
                spec["portfolio"]["max_positions"], -2**63 if trade_from is None else int(trade_from),
                sum(1 << int(x) for x in spec["session"].get("days") or ()),
                _ENTRY_KINDS[spec["entry_order"]["type"]], spec["entry_order"]["valid_bars"],
-               float(daily["max_loss"] or 0), float(daily["max_profit"] or 0))
+               int(multi_day(spec["timeframe"])),
+               float(daily["max_loss"] or 0), float(daily["max_profit"] or 0),
+               float(m.get("stop") or 0), float(m.get("target") or 0), float(m.get("trail_start") or 0),
+               float(m.get("trail_gap") or 0))
     err: list[BaseException] = []
     nan = math.nan
 
@@ -2887,19 +2913,23 @@ def _run_native(spec: dict, syms: list[str], st: dict[str, dict], tick_of: dict,
             p = st[sym]["pos"]
             l0 = p["legs"][0]
             for j, v in enumerate((p["sign"], p["ref_entry"], p["sl"], p["tg"], p["trd"], p["tra"], p["be"],
-                                   p["u0"], p["mid_bar"], l0["act"], l0["entry"], l0["qty"])):
+                                   p["u0"], p["mid_bar"], l0["act"], l0["entry"], l0["qty"], l0.get("exp") or None,
+                                   p["sets"], len(p["so"]))):
                 out[j] = nan if v is None else float(v)
+            for j, (px, n) in enumerate(p["so"]):
+                out[15 + 2 * j], out[16 + 2 * j] = float(px), float(n)
             return 0
         except BaseException as e:  # noqa: BLE001 — re-raised below, once the C++ side has unwound
             err.append(e)
             return -1
 
     def on_close(k: int, u: float, t: int, reason: int, i: int, slipped: int, best: float, worst: float,
-                 net: Any) -> int:
+                 sets: int, net: Any) -> int:
         try:
             p = st[syms[k]]["pos"]
             p["best"], p["worst"] = best, worst
-            close(syms[k], u, t, _REASONS[reason], i, slipped=bool(slipped))
+            why = f"SCALE_OUT_{reason - _SCALE_OUT}" if reason >= _SCALE_OUT else _REASONS[reason]
+            close(syms[k], u, t, why, i, slipped=bool(slipped), sets=sets or None)
             net[0] = booked[0]
             return 0
         except BaseException as e:  # noqa: BLE001
@@ -2916,9 +2946,20 @@ def _run_native(spec: dict, syms: list[str], st: dict[str, dict], tick_of: dict,
             err.append(e)
             return -1
 
+    def on_settle(k: int, j: int, t: int, best: float, worst: float, net: Any) -> int:
+        try:
+            p = st[syms[k]]["pos"]
+            p["best"], p["worst"] = best, worst
+            settle(syms[k], j, t)
+            net[0] = booked[0]
+            return 0
+        except BaseException as e:  # noqa: BLE001
+            err.append(e)
+            return -1
+
     counts = (_i64 * 3)()
     rc = _native_lib().run_loop(S, len(syms), ctypes.byref(cfg), _OPEN(on_open), _CLOSE(on_close),
-                                _TRIG(on_trig), counts)
+                                _TRIG(on_trig), _SETTLE(on_settle), counts)
     if err:
         raise err[0]
     if rc == 2:

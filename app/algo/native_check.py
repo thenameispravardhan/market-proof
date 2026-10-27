@@ -50,7 +50,7 @@ def candles(seed: int, days: int = 12, tf: int = 5) -> dict:
     return {"t": t, "o": o, "h": h, "l": l, "c": c, "v": v, "tf_s": tf * 60}
 
 
-def specs(n: int = 80, seed: int = 11) -> list[dict]:
+def specs(n: int = 120, seed: int = 11) -> list[dict]:
     """`n` valid strategies with seeded, independent choices of every loop option."""
     rnd = random.Random(seed)
     ema = lambda p: {"ind": "EMA", "params": {"period": p}}  # noqa: E731
@@ -61,7 +61,20 @@ def specs(n: int = 80, seed: int = 11) -> list[dict]:
     while len(out) < n:
         direction = pick(["long", "short", "both"])
         raw = {
-            "symbols": ["NSE:AAA-EQ", "NSE:BBB-EQ", "NSE:CCC-EQ"], "timeframe": 5, "direction": direction,
+            "symbols": ["NSE:AAA-EQ", "NSE:BBB-EQ", "NSE:CCC-EQ"], "timeframe": pick([5, 5, 5, 1440]),
+            "direction": direction,
+            "instrument": {**engine.DEFAULT_SPEC["instrument"],
+                           **pick([{"type": "equity"}, {"type": "equity"}, {"type": "future", "expiry": "current"},
+                                   {"type": "future", "expiry": "next"}])},
+            "mtm": pick([{"stop": None, "target": None, "trail_start": None, "trail_gap": None},
+                         {"stop": None, "target": None, "trail_start": None, "trail_gap": None},
+                         {"stop": 400, "target": None, "trail_start": None, "trail_gap": None},
+                         {"stop": None, "target": 600, "trail_start": None, "trail_gap": None},
+                         {"stop": 500, "target": 900, "trail_start": 300, "trail_gap": 150},
+                         {"stop": None, "target": None, "trail_start": 200, "trail_gap": 100}]),
+            "scale_out": pick([None, None, [{"type": "pct", "value": 0.4, "qty_pct": 50}],
+                               [{"type": "points", "value": 0.8, "qty_pct": 30},
+                                {"type": "pct", "value": 0.9, "qty_pct": 40}]]),
             "entry_long": up, "entry_short": dn,
             "exit_long": pick([None, dn]), "exit_short": pick([None, up]),
             "stop_loss": pick([None, {"type": "pct", "value": 0.6}, {"type": "points", "value": 1.5},
@@ -74,7 +87,7 @@ def specs(n: int = 80, seed: int = 11) -> list[dict]:
             "entry_order": pick([{"type": "market"}, {"type": "pullback", "offset_pct": 0.2, "valid_bars": 3},
                                  {"type": "breakout", "offset_pct": 0.1, "valid_bars": 2}]),
             "session": {"start": pick(["09:20", "10:00"]), "end": pick(["15:00", "14:00"]),
-                        "square_off": pick(["15:15", "15:00"]), **pick([{}, {"days": [1, 2, 3, 4]}])},
+                        "square_off": pick(["15:15", "15:00", None]), **pick([{}, {"days": [1, 2, 3, 4]}])},
             "max_trades_per_day": pick([1, 3, 6]), "cooldown_bars": pick([0, 3]), "max_bars": pick([None, 12]),
             "daily": pick([{"max_loss": None, "max_profit": None}, {"max_loss": 300, "max_profit": 450}]),
             "sizing": pick([{"mode": "qty", "value": 10}, {"mode": "qty", "value": 700}, {"mode": "risk", "value": 500},
@@ -88,6 +101,17 @@ def specs(n: int = 80, seed: int = 11) -> list[dict]:
         except (ValueError, TypeError, KeyError):
             continue                                  # an invalid combination (e.g. rr target, no stop)
         out.append(s)
+    # Futures held to expiry: carried, nothing else closes them, so they leave through the
+    # 15:15 expiry-day exit (a full session) or settle() (a short one, past the expiry).
+    for direction, expiry in (("long", "current"), ("short", "next"), ("both", "current"), ("both", "next")):
+        out.append(engine.normalize({
+            "symbols": ["NSE:AAA-EQ", "NSE:BBB-EQ", "NSE:CCC-EQ"], "timeframe": 5, "direction": direction,
+            "entry_long": up, "entry_short": dn, "exit_long": None, "exit_short": None,
+            "instrument": {**engine.DEFAULT_SPEC["instrument"], "type": "future", "expiry": expiry},
+            "stop_loss": None, "target": None, "session": {"start": "09:20", "end": "15:00", "square_off": None},
+            "max_trades_per_day": 1, "sizing": {"mode": "qty", "value": 2},
+            "portfolio": {"capital": 10000000, "leverage": 1.0, "max_positions": 3, "compounding": False},
+        }))
     return out
 
 
@@ -237,11 +261,20 @@ def _result(spec: dict, native: bool, variant: int = 0) -> str:
     engine.NATIVE = native
     try:
         names = ("NSE:AAA-EQ", "NSE:BBB-EQ", "MCX:CCC" if variant == 1 else "NSE:CCC-EQ")
-        data = {x: candles(seed) for seed, x in enumerate(names)}
-        if variant == 2:
+        if engine.multi_day(spec["timeframe"]):          # daily candles: one per full session, closing 15:30
+            data = {x: candles(seed, days=150, tf=375) for seed, x in enumerate(names)}
+            for d in data.values():
+                d["tf_s"] = 86400
+                d["tc"] = array("q", (t - (t + engine.IST) % 86400 + 55800 for t in d["t"]))
+        else:                                            # futures: long enough for two monthly expiries
+            days = 45 if spec["instrument"]["type"] == "future" else 12
+            data = {x: candles(seed, days=days) for seed, x in enumerate(names)}
+        data["NSE:AAA-EQ"]["meta"] = {"lot": 25}        # a lot above 1: scale-outs split qty by sets, not 1:1
+        if variant == 2 and not engine.multi_day(spec["timeframe"]):
             for d in data.values():
                 d["tc"] = array("q", (t + d["tf_s"] - 60 * (i % 3) for i, t in enumerate(d["t"])))
-        res = engine.run(spec, data, {}, data["NSE:AAA-EQ"]["t"][75], None, set())
+        first = data["NSE:AAA-EQ"]["t"][min(75, len(data["NSE:AAA-EQ"]["t"]) // 4)]
+        res = engine.run(spec, data, {}, first, None, set())
         res["monte_carlo"] = engine.monte_carlo(res["trades"], spec["portfolio"]["capital"])
     finally:
         engine.NATIVE = True

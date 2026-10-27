@@ -25,6 +25,7 @@
 #pragma GCC optimize("fp-contract=off")
 #endif
 
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <cstdint>
@@ -125,7 +126,7 @@ API void mc_paths(const double* nets, i64 n, i64 runs, uint32_t seed, double cap
 
 // ---- candle loop ------------------------------------------------------------
 
-static const i64 IST = 19800;
+static const i64 IST = 19800, CARRY = 24 * 60, EXPIRY_EXIT_MIN = 15 * 60 + 15;
 static const double NONE = NAN;               // Python None, for the optional prices
 static bool has(double x) { return !std::isnan(x); }
 
@@ -143,10 +144,11 @@ static double snap0(double px, double tick) {  // engine.snap(px, tick) with sid
     return py_round6((k > 1 ? k : 1) * tick);
 }
 
-static double solve_id(double target, double a, double b) {   // engine._solve with f(u) = u
-    double fa = a - target;
+template <class F>
+static double solve(F f, double target, double a, double b) {     // engine._solve
+    double fa = f(a) - target;
     for (int it = 0; it < 40; ++it) {
-        double m = (a + b) / 2, fm = m - target;
+        double m = (a + b) / 2, fm = f(m) - target;
         if ((fm <= 0) == (fa <= 0)) { a = m; fa = fm; } else b = m;
     }
     return (a + b) / 2;
@@ -162,26 +164,30 @@ struct Sym {                                  // one symbol's candles and signal
 
 struct Cfg {                                  // the spec values the loop reads (ctypes mirror in engine.py)
     i64 start, end, sq, max_trades_per_day, cooldown, max_bars, max_positions, trade_from,
-        days_mask, entry_kind, valid_bars;    // entry_kind: 0 market, 1 pullback, 2 breakout
+        days_mask, entry_kind, valid_bars, multi;   // entry_kind: 0 market, 1 pullback, 2 breakout
     double daily_max_loss, daily_max_profit;  // 0 = off
+    double mtm_stop, mtm_target, trail_start, trail_gap;   // ₹ on the whole position; 0 = off
 };
 
 enum Reason { EOD = 1, SQUARE_OFF, SIGNAL, TIME_STOP, DAILY_MAX_LOSS, DAILY_TARGET, SL, TRAIL, BREAKEVEN,
-              TARGET, END };
+              TARGET, END, MTM_SL, MTM_TRAIL, MTM_TARGET, EXPIRY, SCALE_OUT = 100 };   // SCALE_OUT + k: SCALE_OUT_k
 
-// open: 0 = opened (out = sign, ref_entry, sl, tg, trd, tra, be, u0, mid_bar, act, entry, qty),
-//       1 = skipped (engine.run counted why), -1 = Python raised.
+// open: 0 = opened (out = sign, ref_entry, sl, tg, trd, tra, be, u0, mid_bar, act, entry, qty, exp, sets,
+//       n_scale, then up to 5 x (scale price, sets)), 1 = skipped (engine.run counted why), -1 = Python raised.
 typedef int (*OpenCb)(i64 k, int buy, i64 i, i64 sig_i, double fill, double* out);
+// close `sets` of it (0: all); net = the trade's net P&L.
 typedef int (*CloseCb)(i64 k, double u, i64 t, int reason, i64 i, int slipped, double best, double worst,
-                       double* net);
+                       i64 sets, double* net);
 typedef int (*TrigCb)(i64 k, int buy, i64 i, double* level);   // entry_trigger(); level NaN = None
+typedef int (*SettleCb)(i64 k, i64 j, i64 t, double best, double worst, double* net);   // engine.run's settle()
 
 struct Pos {
-    bool open = false, buy = false, be_on = false, mid_bar = false;
+    bool open = false, buy = false, be_on = false, mid_bar = false, has_peak = false;
     int sign = 1, exit_pending = 0;
     double ref_entry = 0, sl = NONE, tg = NONE, trd = NONE, tra = 0, be = NONE, trail = NONE;
-    double best = 0, worst = 0, u0 = 0, act = 0, entry = 0, qty = 0;
-    i64 i = 0, day = 0;
+    double best = 0, worst = 0, u0 = 0, act = 0, entry = 0, exp = INFINITY, peak = 0;
+    i64 i = 0, day = 0, qty = 0, sets = 0, so_k = 0, so_at = 0, so_n = 0;
+    double so_px[5]; i64 so_sets[5];
 };
 struct Pend { bool on = false, buy = false; i64 day = 0, i = 0, expires = 0; double level = NONE; };
 struct St { Pos pos; Pend pend; i64 pd_day = -1, pd_n = 0, cool = 0; bool has_u = false; double u_c = 0; };
@@ -192,7 +198,10 @@ static i64 close_time(const Sym& d, i64 i) {               // indicators.close_t
     return a < b ? a : b;
 }
 
-API int run_loop(const Sym* S, i64 nsym, const Cfg* cfg, OpenCb op, CloseCb cl, TrigCb tr, i64* skipped) {
+static i64 ist_day(double t) { return ((i64)t + IST) / 86400; }   // (int(t) + IST) // 86400, t > 0
+
+API int run_loop(const Sym* S, i64 nsym, const Cfg* cfg, OpenCb op, CloseCb cl, TrigCb tr, SettleCb se,
+                 i64* skipped) {
     // skipped: [daily_halt, entry_expired, max_positions] — the counts engine.run keeps itself.
     // Returns 0 done, -1 a callback raised, 2 not handled (nothing was run: the Python loop takes it).
     for (i64 k = 0; k < nsym; ++k)            // engine._events sorts a symbol whose candles aren't ascending
@@ -201,16 +210,37 @@ API int run_loop(const Sym* S, i64 nsym, const Cfg* cfg, OpenCb op, CloseCb cl, 
     std::vector<St> st(nsym);
     i64 day_key = INT64_MIN, halted = INT64_MIN, open_n = 0;
     double day_realized = 0.0;
-    double out[12];
+    double out[25];
+    const bool carry = cfg->sq >= CARRY, multi = cfg->multi != 0;
 
-    auto close = [&](i64 k, double u, i64 t, int reason, i64 i, int slipped) -> bool {
-        Pos& p = st[k].pos;
-        double net = 0;
-        if (cl(k, u, t, reason, i, slipped, p.best, p.worst, &net) < 0) return false;
-        if ((t + IST) / 86400 == day_key) day_realized += net;   // booked at an earlier day's candle: not today's
-        p.open = false;
+    auto mtm = [](const Pos& p, double u) { return p.act * (u - p.entry) * (double)p.qty; };   // one leg
+    auto booked = [&](i64 t, double net) { if ((t + IST) / 86400 == day_key) day_realized += net; };
+    auto shut = [&](i64 k, i64 i) {           // the position is gone (closed or settled)
+        st[k].pos.open = false;
         --open_n;
         st[k].cool = i + cfg->cooldown;
+    };
+    // close all of it (sets = 0) or `sets` of it: a scale-out books a part and the rest stays open
+    auto close = [&](i64 k, double u, i64 t, int reason, i64 i, int slipped, i64 sets = 0) -> bool {
+        Pos& p = st[k].pos;
+        double net = 0;
+        if (cl(k, u, t, reason, i, slipped, p.best, p.worst, sets, &net) < 0) return false;
+        booked(t, net);
+        if (sets > 0 && sets < p.sets) {      // engine.run close(): qty -= qty * n // sets; peak scaled
+            p.qty -= p.qty * sets / p.sets;
+            if (p.has_peak) p.peak = p.peak * ((double)(p.sets - sets) / (double)p.sets);
+            p.sets -= sets;
+            return true;
+        }
+        shut(k, i);
+        return true;
+    };
+    auto settle = [&](i64 k, i64 j, i64 t) -> bool {
+        double net = 0;
+        Pos& p = st[k].pos;
+        if (se(k, j, t, p.best, p.worst, &net) < 0) return false;
+        booked(close_time(S[k], j), net);
+        shut(k, j);
         return true;
     };
     auto open = [&](i64 k, bool buy, i64 i, i64 sig_i, double fill) -> int {
@@ -220,7 +250,10 @@ API int run_loop(const Sym* S, i64 nsym, const Cfg* cfg, OpenCb op, CloseCb cl, 
         p = Pos();
         p.open = true; p.buy = buy;
         p.sign = (int)out[0]; p.ref_entry = out[1]; p.sl = out[2]; p.tg = out[3]; p.trd = out[4]; p.tra = out[5];
-        p.be = out[6]; p.u0 = out[7]; p.mid_bar = out[8] != 0; p.act = out[9]; p.entry = out[10]; p.qty = out[11];
+        p.be = out[6]; p.u0 = out[7]; p.mid_bar = out[8] != 0; p.act = out[9]; p.entry = out[10];
+        p.qty = (i64)out[11]; p.exp = has(out[12]) ? out[12] : INFINITY; p.sets = (i64)out[13];
+        p.so_n = (i64)out[14];
+        for (i64 s = 0; s < p.so_n; ++s) { p.so_px[s] = out[15 + 2 * s]; p.so_sets[s] = (i64)out[16 + 2 * s]; }
         p.best = p.worst = p.ref_entry;
         p.i = i;
         p.day = (S[k].t[i] + IST) / 86400;
@@ -229,11 +262,12 @@ API int run_loop(const Sym* S, i64 nsym, const Cfg* cfg, OpenCb op, CloseCb cl, 
         if (s.pd_day == p.day) ++s.pd_n; else { s.pd_day = p.day; s.pd_n = 1; }
         return 0;
     };
-    // engine.run's check_intrabar for a one-leg share position: stop first, then target.
+    // engine.run's check_intrabar for a one-leg share / futures position:
+    // stop first, then scale-outs and the target, then the position's ₹ MTM stop / trail / target.
     auto intrabar = [&](i64 k, i64 i) -> bool {
         const Sym& d = S[k];
         Pos& p = st[k].pos;
-        double o = d.o[i], h = d.h[i], l = d.l[i];
+        double o = d.o[i], h = d.h[i], l = d.l[i], c = d.c[i];
         i64 t = d.t[i];
         int sgn = p.sign;
         bool later = i > p.i, fav_ok = later || !p.mid_bar;
@@ -245,13 +279,48 @@ API int run_loop(const Sym* S, i64 nsym, const Cfg* cfg, OpenCb op, CloseCb cl, 
             int why = (has(p.trail) && stop == p.trail) ? TRAIL
                     : (p.be_on && stop == p.ref_entry && stop != p.sl) ? BREAKEVEN : SL;
             double u_adv = (sgn * l < sgn * h) ? l : h;            // min((h, l), key=sgn*u): h on a tie
+            auto id = [](double u) { return u; };
             if (later && sgn * (o - stop) <= 0) return close(k, o, t, why, i, 1);
-            if (sgn * (u_adv - stop) <= 0) return close(k, solve_id(stop, u0, u_adv), t, why, i, 1);
+            if (sgn * (u_adv - stop) <= 0) return close(k, solve(id, stop, u0, u_adv), t, why, i, 1);
+        }
+        while (p.so_at < p.so_n && fav_ok) {   // scale-out levels, nearest first, filled like a target
+            double lvl = p.so_px[p.so_at];
+            i64 nsets = p.so_sets[p.so_at];
+            if (has(p.tg) && sgn * (lvl - p.tg) >= 0) break;    // at / past the target: the target takes it all
+            double u_fav = (sgn * l > sgn * h) ? l : h;           // max((h, l), key=sgn*u)
+            double u_x;
+            auto id = [](double u) { return u; };
+            if (later && sgn * (o - lvl) >= 0) u_x = o;
+            else if (sgn * (u_fav - lvl) >= 0) u_x = solve(id, lvl, o, u_fav);
+            else break;
+            ++p.so_at;
+            ++p.so_k;
+            int why = SCALE_OUT + (int)p.so_k;
+            if (nsets >= p.sets) return close(k, u_x, t, why, i, 0);
+            if (!close(k, u_x, t, why, i, 0, nsets)) return false;
         }
         if (has(p.tg) && fav_ok) {
-            double u_fav = (sgn * l > sgn * h) ? l : h;            // max((h, l), key=sgn*u): h on a tie
+            double u_fav = (sgn * l > sgn * h) ? l : h;           // max((h, l), key=sgn*u): h on a tie
+            auto id = [](double u) { return u; };
             if (later && sgn * (o - p.tg) >= 0) return close(k, o, t, TARGET, i, 0);
-            if (sgn * (u_fav - p.tg) >= 0) return close(k, solve_id(p.tg, o, u_fav), t, TARGET, i, 0);
+            if (sgn * (u_fav - p.tg) >= 0) return close(k, solve(id, p.tg, o, u_fav), t, TARGET, i, 0);
+        }
+        if (cfg->mtm_stop != 0 || cfg->mtm_target != 0 || cfg->trail_start != 0) {
+            auto m = [&](double u) { return mtm(p, u); };
+            double pts[4] = {u0, h, l, c};                         // sorted((u0, h, l, c), key=m): stable
+            for (int a = 1; a < 4; ++a)
+                for (int b = a; b > 0 && m(pts[b]) < m(pts[b - 1]); --b) std::swap(pts[b], pts[b - 1]);
+            double lo_u = pts[0], hi_u = pts[3];
+            double floor_ = cfg->mtm_stop != 0 ? -cfg->mtm_stop : NONE;
+            int why = MTM_SL;
+            if (cfg->trail_start != 0 && p.has_peak && p.peak >= cfg->trail_start) {
+                double tfloor = p.peak - cfg->trail_gap;
+                if (!has(floor_) || tfloor > floor_) { floor_ = tfloor; why = MTM_TRAIL; }
+            }
+            if (has(floor_) && m(lo_u) <= floor_)
+                return close(k, m(u0) <= floor_ ? u0 : solve(m, floor_, u0, lo_u), t, why, i, 1);
+            if (cfg->mtm_target != 0 && fav_ok && m(hi_u) >= cfg->mtm_target)
+                return close(k, m(o) >= cfg->mtm_target ? o : solve(m, cfg->mtm_target, o, hi_u), t, MTM_TARGET, i, 0);
         }
         return true;
     };
@@ -272,7 +341,10 @@ API int run_loop(const Sym* S, i64 nsym, const Cfg* cfg, OpenCb op, CloseCb cl, 
         Pos& p = s.pos;
         i64 t = d.t[i], day = (t + IST) / 86400, mod = ((t + IST) % 86400) / 60;
         if (day != day_key) { day_key = day; day_realized = 0.0; }
-        if (p.open && day != p.day && !close(k, d.c[i - 1], close_time(d, i - 1), EOD, i - 1, 1)) return -1;
+        if (p.open && day != p.day && !carry && !close(k, d.c[i - 1], close_time(d, i - 1), EOD, i - 1, 1)) return -1;
+        if (p.open && i && (double)t >= p.exp && !settle(k, i - 1, t)) return -1;
+        if (p.open && carry && mod >= EXPIRY_EXIT_MIN && p.exp < INFINITY && ist_day(p.exp) == day
+            && !close(k, d.o[i], t, EXPIRY, i, 1)) return -1;
         if (p.open && (p.exit_pending || mod >= cfg->sq)
             && !close(k, d.o[i], t, p.exit_pending ? p.exit_pending : SQUARE_OFF, i, 1)) return -1;
         if (s.pend.on) {
@@ -281,7 +353,7 @@ API int run_loop(const Sym* S, i64 nsym, const Cfg* cfg, OpenCb op, CloseCb cl, 
             if (!has(q.level)) fill = o;
             else if (q.buy == (cfg->entry_kind == 1)) { if (lo <= q.level) fill = q.level < o ? q.level : o; }
             else if (hi >= q.level) fill = q.level > o ? q.level : o;
-            bool alive = q.day == day && mod < cfg->sq && halted != day && !p.open && i < q.expires;
+            bool alive = (q.day == day || multi) && mod < cfg->sq && halted != day && !p.open && i < q.expires;
             if (!(!has(fill) && alive)) {
                 q.on = false;
                 if (halted == day) ++skipped[0];
@@ -307,6 +379,8 @@ API int run_loop(const Sym* S, i64 nsym, const Cfg* cfg, OpenCb op, CloseCb cl, 
                 else if (sgn > 0 ? nt > p.trail : nt < p.trail) p.trail = nt;
             }
             if (has(p.be) && p.be != 0 && gain >= p.be) p.be_on = true;
+            double m_c = mtm(p, c);                                 // the MTM peak the ₹ trail follows
+            if (!p.has_peak || m_c > p.peak) { p.peak = m_c; p.has_peak = true; }
             if ((p.buy ? d.xl : d.xs)[i]) p.exit_pending = SIGNAL;
             else if (cfg->max_bars && i - p.i + 1 >= cfg->max_bars) p.exit_pending = TIME_STOP;
         }
@@ -316,8 +390,7 @@ API int run_loop(const Sym* S, i64 nsym, const Cfg* cfg, OpenCb op, CloseCb cl, 
             double day_pnl = day_realized;
             for (i64 j = 0; j < nsym; ++j) {          // ponytail: symbol order, Python sums open_syms (a set) — equal unless a sum lands exactly on the limit
                 const St& s2 = st[j];
-                if (s2.pos.open && s2.has_u && s2.pos.day == day)
-                    day_pnl += s2.pos.act * (s2.u_c - s2.pos.entry) * s2.pos.qty;
+                if (s2.pos.open && s2.has_u && (carry || s2.pos.day == day)) day_pnl += mtm(s2.pos, s2.u_c);
             }
             int hit = (cfg->daily_max_loss != 0 && day_pnl <= -cfg->daily_max_loss) ? DAILY_MAX_LOSS
                     : (cfg->daily_max_profit != 0 && day_pnl >= cfg->daily_max_profit) ? DAILY_TARGET : 0;
@@ -329,7 +402,8 @@ API int run_loop(const Sym* S, i64 nsym, const Cfg* cfg, OpenCb op, CloseCb cl, 
         if (!p.open && !s.pend.on && i + 1 < d.n && i >= s.cool && halted != day && t >= cfg->trade_from) {
             i64 close_mod = ((close_time(d, i) + IST) % 86400) / 60;
             i64 wd = ((t + IST) / 86400 + 3) % 7 + 1;              // engine.day_allowed: 1 = Monday
-            if (cfg->start <= close_mod && close_mod <= cfg->end && (s.pd_day == day ? s.pd_n : 0) < cfg->max_trades_per_day
+            if ((multi || (cfg->start <= close_mod && close_mod <= cfg->end))
+                && (s.pd_day == day ? s.pd_n : 0) < cfg->max_trades_per_day
                 && (!cfg->days_mask || (cfg->days_mask >> wd) & 1)) {
                 int side = d.el[i] ? 1 : d.es[i] ? 0 : -1;
                 if (side >= 0) {
@@ -696,4 +770,15 @@ API int eval_series(const i64* t, const double* o, const double* h, const double
     if (run_program(d, ints, dbl, nodes, S, B) != 0 || S[which].size() != (size_t)n) return -1;
     for (i64 i = 0; i < n; ++i) out[i] = S[which][i];
     return 0;
+}
+
+// The IST day numbers that have candles, sorted and unique (prepare()'s trading_days). Returns the count.
+API i64 unique_days(const i64* t, i64 n, i64* out) {
+    i64 m = 0;
+    for (i64 i = 0; i < n; ++i) {
+        i64 x = t[i] + IST, day = x / 86400 - (x % 86400 < 0);      // Python's floor division
+        out[m++] = day;
+    }
+    std::sort(out, out + m);
+    return std::unique(out, out + m) - out;
 }
