@@ -749,6 +749,14 @@ def dataset_stats(
     source: str = Query("signals", pattern="^(signals|announcements)$"),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    # 0.7-2.5s of SQL (a JSON group-by over every feature row), polled every 30s.
+    return _cached(("stats", source), lambda: _dataset_stats(source=source, db=db))
+
+
+def _dataset_stats(
+    source: str = Query("signals", pattern="^(signals|announcements)$"),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
     """Coverage report: how much of the dataset is enriched + labeled."""
     if source == "announcements":
         from app.api.warehouse import announcement_stats
@@ -986,6 +994,18 @@ def dataset_health(
     enriched_only: bool = Query(False),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
+    # 2.6-3.6s of Python (10,000 rows assembled) holding the GIL, polled every 60s.
+    return _cached(("health", target, limit, source, enriched_only), lambda: _dataset_health(
+        target=target, limit=limit, source=source, enriched_only=enriched_only, db=db))
+
+
+def _dataset_health(
+    target: str = Query("ret_15m_pct"),
+    limit: int = Query(5000, ge=10, le=20000),
+    source: str = Query("all", pattern="^(all|signal|shadow|announcements)$"),
+    enriched_only: bool = Query(False),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
     """Per-column health over the (sampled) dataset: null rate, basic
     stats, and correlation with the chosen target. A FEATURE correlating
     ~1.0 with the target is look-ahead leakage, not alpha — flagged."""
@@ -1059,7 +1079,9 @@ def dataset_health(
 # outcomes, which the dataset builder fills after the close. Between those
 # fills the answer cannot change, while the Dashboard refetches every 120s
 # and every slider nudge re-requests it. Five minutes of staleness on a
-# historical report costs the operator nothing.
+# historical report costs the operator nothing. /stats and /health share
+# the cache for the same reason (2026-10-28: 2.5s and 3.6s per poll on the
+# server); a build from the Dataset page clears it.
 #
 # ponytail: process-local dict, no TTL library. Single worker (see
 # tradebot.service) so there is nothing to share it with.
@@ -1098,18 +1120,18 @@ def dataset_calibration(
     rate comparison that says whether the selection is discriminating.
     NSE/BSE cross-listings are collapsed so one move isn't counted twice.
     """
+    key = ("calibration", move_threshold_pct, big_threshold_pct, limit, event_type,
+           since, until, top_n, min_bucket_n)
+    return _cached(key, lambda: _calibration(db, move_threshold_pct, big_threshold_pct, limit,
+                                             event_type, since, until, top_n, min_bucket_n))
+
+
+def _calibration(db, move_threshold_pct, big_threshold_pct, limit, event_type, since, until,
+                 top_n, min_bucket_n) -> dict[str, Any]:
     from app.services.hold_calibration import (
         compute_calibration,
         normalise_dataset_row,
     )
-
-    key = (move_threshold_pct, big_threshold_pct, limit, event_type,
-           since, until, top_n, min_bucket_n)
-    now = time.monotonic()
-    cached = _calib_cache.get(key)
-    if cached is not None and now - cached[0] < _CALIB_TTL_S:
-        _calib_cache.move_to_end(key)
-        return {**cached[1], "cached_age_s": round(now - cached[0], 1)}
 
     result = _dataset_rows(
         db,
@@ -1133,11 +1155,22 @@ def dataset_calibration(
     report["window"] = {"since": since, "until": until}
     report["filters"] = {"event_type": event_type, "min_bucket_n": min_bucket_n}
 
-    _calib_cache[key] = (now, report)
+    return report
+
+
+def _cached(key: tuple[Any, ...], compute) -> dict[str, Any]:
+    """`compute()`'s answer, reused for _CALIB_TTL_S (cleared when a build runs)."""
+    now = time.monotonic()
+    hit = _calib_cache.get(key)
+    if hit is not None and now - hit[0] < _CALIB_TTL_S:
+        _calib_cache.move_to_end(key)
+        return {**hit[1], "cached_age_s": round(now - hit[0], 1)}
+    out = compute()
+    _calib_cache[key] = (now, out)
     _calib_cache.move_to_end(key)
     while len(_calib_cache) > _CALIB_MAX_ENTRIES:
         _calib_cache.popitem(last=False)  # evict least-recently-used
-    return {**report, "cached_age_s": 0.0}
+    return {**out, "cached_age_s": 0.0}
 
 
 def _get_builder(request: Request):
@@ -1192,10 +1225,12 @@ async def dataset_backfill(
             .values(attempts=0)
         ).rowcount
         db.commit()
+    _calib_cache.clear()           # the counts are about to change
     if full or rebuild:
         progress = builder.start_full_backfill(batch=200, rebuild=rebuild)
         return {"ok": True, "full": True, "retried": reset, **progress}
     counts = await builder.run_once(limit=limit)
+    _calib_cache.clear()
     return {"ok": True, "full": False, "retried": reset, **counts}
 
 

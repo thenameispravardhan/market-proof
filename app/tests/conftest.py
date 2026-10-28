@@ -59,6 +59,8 @@ def _clear_pipeline_caches() -> None:
     """Clear the analyzer's template / rules / sector-map caches before
     every test so a cached row from one test doesn't leak into the next."""
     analyzer_service._cache_clear()
+    from app.api.dataset import _calib_cache
+    _calib_cache.clear()
 
 
 @pytest.fixture()

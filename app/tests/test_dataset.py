@@ -690,6 +690,18 @@ def test_dataset_stats(client, db_session, isolated_db):
     assert events == {"ORDER_WIN": 1, "BUYBACK": 1}
 
 
+
+def test_dataset_stats_reused_until_a_build_clears_it(client, db_session, isolated_db):
+    from app.api.dataset import _calib_cache
+
+    seed_chain(db_session, symbol="RELIANCE")
+    assert client.get("/api/dataset/stats").json()["total_rows"] == 1
+    seed_chain(db_session, symbol="TCS")
+    again = client.get("/api/dataset/stats").json()
+    assert again["total_rows"] == 1 and again["cached_age_s"] >= 0
+    _calib_cache.clear()                      # what POST /backfill does
+    assert client.get("/api/dataset/stats").json()["total_rows"] == 2
+
 def test_dataset_export_csv_and_jsonl(client, db_session, isolated_db):
     seed_chain(db_session)
     r = client.get("/api/dataset/export?format=csv&columns=symbol,ret_15m_pct,label_15m")
