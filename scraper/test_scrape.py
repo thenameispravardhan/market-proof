@@ -979,3 +979,12 @@ def test_paywalled_page_keeps_only_what_it_gives_away():
     assert free.startswith("Free summary.") and "Free lead paragraph" in free and "Paid paragraph" not in free, free
     unmarked = page.replace('class="story paywall"', 'class="story"')      # the paid part is not where the markup says
     assert scrape.parse_page(unmarked.encode(), "https://p.example/a", False)["free"] == "Free summary."
+
+
+def test_links_and_media_resolve_against_base_href():
+    page = ('<html><head><base href="/news/"></head><body><article><p>' + "Body text of the article. " * 60 +
+            '</p><a href="next.html">n</a><img src="pic.jpg"><iframe src=""></iframe></article></body></html>')
+    out = scrape.parse_page(page.encode(), "https://p.example/a/b", True)
+    assert {"url": "https://p.example/news/next.html", "text": "n"} in out["links"]
+    assert [m["url"] for m in out["media"]] == ["https://p.example/news/pic.jpg"]   # an empty src is not the page itself
+    assert len(out["doc"]["text"]) > 1000                                           # long enough to stay in fast mode
