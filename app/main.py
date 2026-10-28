@@ -13,11 +13,15 @@ import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Optional
+from urllib.parse import urlsplit
 
 import uvicorn
 from fastapi import FastAPI, Request, Response
+from starlette.datastructures import Headers
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import PlainTextResponse
+from starlette.websockets import WebSocketClose
 
 from app import __version__
 from app.analyzer.service import Service as AnalyzerService
@@ -692,6 +696,57 @@ class CorrelationIdMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(CorrelationIdMiddleware)
+
+
+_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+def _hostname(value: str) -> Optional[str]:
+    """'localhost:8000' / 'http://localhost:5173' / a URL -> 'localhost'."""
+    return urlsplit(value if "//" in value else "//" + value).hostname
+
+
+class OriginGuard:
+    """The app has no auth of its own (Caddy's basic auth on AWS), so the
+    browser is the boundary:
+      - Host must be a name we serve, else a site can DNS-rebind itself
+        onto 127.0.0.1:8000 and drive the whole API same-origin.
+      - A browser write or /ws must come from one of those names (or the
+        Host itself), else any open tab can form-POST close-all /
+        risk/resume or read the /ws stream.
+    No Origin header (curl, scripts, Fyers' postback) passes."""
+
+    def __init__(self, app: Callable) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict, receive: Callable, send: Callable) -> None:
+        kind = scope["type"]
+        if kind in ("http", "websocket"):
+            s = get_settings()
+            h = Headers(scope=scope)
+            host = _hostname(h.get("host", ""))
+            # "testserver" = TestClient's Host; a bare single-label name, so a
+            # rebinding site can't make a victim's browser resolve it to us.
+            ok = {"localhost", "127.0.0.1", "::1", "testserver", _hostname(s.FYERS_REDIRECT_URI)}
+            ok.discard(None)
+            origin = h.get("origin")
+            bad = (not s.bind_public and host not in ok) or (
+                origin is not None
+                and (kind == "websocket" or scope["method"] not in _SAFE_METHODS)
+                and scope["path"] != "/api/fyers/postback"
+                and _hostname(origin) not in ok | {host}
+            )
+            if bad:
+                get_logger("app.http").warning(
+                    "http.origin_rejected", host=h.get("host"), origin=origin, path=scope["path"]
+                )
+                reject = WebSocketClose(code=1008) if kind == "websocket" else PlainTextResponse("forbidden host/origin", 403)
+                await reject(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(OriginGuard)
 
 
 # -------------------------------------------------------------------------
