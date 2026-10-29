@@ -56,6 +56,30 @@ log = get_logger(__name__)
 
 BackendProvider = Callable[[], Optional[Any]]
 
+# The app's own feed (set by start()), so price checks anywhere can ask whether
+# a symbol streams without the manager handed to them.
+_active: Optional["FyersStreamManager"] = None
+
+
+def streaming(symbol: str) -> bool:
+    """`symbol` streams on the app's live feed — its last tick is its price now."""
+    s = _active
+    return s is not None and s.carries(symbol)
+
+
+def quote_is_current(q: Any) -> bool:
+    """A real bus quote that is still the price without asking Fyers again: its
+    symbol streams, or NSE / BSE are shut — from 15:30 to 09:15 and on weekends
+    the last price stands until the open."""
+    sym = str(getattr(q, "symbol", "") or "").upper()
+    if streaming(sym):
+        return True
+    from app.risk.market_clock import is_market_open
+
+    # ponytail: NSE currency (open till 17:00) isn't told apart from equity F&O here; after
+    # 15:30 its watchlist row keeps the 15:30 price. Split on the instrument's segment if it matters.
+    return not sym.startswith(("MCX:", "CRYPTO:")) and not is_market_open()
+
 
 # ---- default factories (real SDK; tests inject fakes) -------------------
 
@@ -252,6 +276,10 @@ class FyersStreamManager:
         self._token: Optional[str] = None
         self._subscribed: dict[str, str] = {}    # short -> full
         self._full_to_short: dict[str, str] = {}  # full  -> short
+        # Full ids that have ticked on this connection: from then on the socket
+        # pushes every change, so an illiquid option that goes quiet is quiet
+        # because nothing traded — not because the feed lost it.
+        self._ticked: set[str] = set()
         self._depth: dict[str, float] = {}  # full -> last touch (DepthUpdate subscriptions)
         self._ondemand: dict[str, float] = {}     # short -> monotonic ts
         # Full ids Fyers rejected as invalid on this connection. Never
@@ -279,13 +307,19 @@ class FyersStreamManager:
     # -- lifecycle -------------------------------------------------------
 
     def start(self) -> asyncio.Task[None]:
+        global _active
         if self._task is not None and not self._task.done():
             return self._task
+        if self._orders:                    # the app's feed, not the collector's
+            _active = self
         self._stop_event.clear()
         self._task = asyncio.create_task(self._run(), name="fyers-stream")
         return self._task
 
     def stop(self) -> None:
+        global _active
+        if _active is self:
+            _active = None
         self._stop_event.set()
 
     async def wait_until_stopped(self) -> None:
@@ -435,6 +469,7 @@ class FyersStreamManager:
 
     async def _connect_sockets(self) -> None:
         self._subscribed.clear()
+        self._ticked.clear()
         self._full_to_short.clear()
         self._keys_cache = {}
         self._ondemand.clear()
@@ -513,6 +548,7 @@ class FyersStreamManager:
         self._order_socket = None
         self._data_connected = False
         self._subscribed.clear()
+        self._ticked.clear()
         self._full_to_short.clear()
         self._keys_cache = {}
         self._epoch += 1
@@ -864,16 +900,30 @@ class FyersStreamManager:
                 return False
         return True
 
+    def carries(self, symbol: str) -> bool:
+        """`symbol` is subscribed on the connected data socket, has ticked since it
+        (re)connected, and the socket is still delivering frames (any symbol's —
+        the index ticker's alone come every second in the session). Its last bus
+        tick is then its current price however old: Fyers pushes every change."""
+        rx = self._last_rx_ts
+        if not self._data_connected or rx is None or time.monotonic() - rx > self._silence_reconnect_s:
+            return False
+        key = (symbol or "").strip().upper()
+        full = self._subscribed.get(key) or (key if key in self._full_to_short else None)
+        return full is not None and full in self._ticked
+
     async def _fresh_ws_price(self, bus_key: str) -> Optional[float]:
         """The latest bus price for `bus_key` iff it's a recent `fyers_ws`
-        tick, else None."""
+        tick, or any real price of a symbol this socket carries; else None."""
         q = await self._md.get_quote(bus_key)
-        if q is None or (q.extra or {}).get("source") != "fyers_ws":
+        if q is None or not q.last_price or q.last_price <= 0 or (q.extra or {}).get("simulated"):
+            return None
+        if self.carries(bus_key):
+            return float(q.last_price)
+        if (q.extra or {}).get("source") != "fyers_ws":
             return None
         age = (datetime.now(timezone.utc) - q.timestamp).total_seconds()
-        if age > self._fresh_window:
-            return None
-        return float(q.last_price) if q.last_price and q.last_price > 0 else None
+        return float(q.last_price) if age <= self._fresh_window else None
 
     # -- data socket callbacks (fire on the SDK thread) ------------------
 
@@ -906,6 +956,7 @@ class FyersStreamManager:
         # — those are time-based TTLs and clearing them would let on-demand
         # subs unsubscribe the instant after reconnect.
         self._subscribed.clear()
+        self._ticked.clear()
         self._full_to_short.clear()
         self._keys_cache = {}
         self._epoch += 1
@@ -990,6 +1041,7 @@ class FyersStreamManager:
                 self._drop_count += 1
                 return
             full = self._subscribed.get(short, short)
+            self._ticked.add(full)
             if self.tick_listeners:
                 recv = time.time()
                 for fn in self.tick_listeners:

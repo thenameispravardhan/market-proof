@@ -103,3 +103,24 @@ def test_the_day_count_is_shared_through_the_file(plan, tmp_path):
         c._fold(db_.time.time())
     asyncio.run(go())
     assert json.loads(path.read_text())["used"] == 4 and c.used_today() == 4
+
+
+def test_ui_calls_never_use_up_the_automations_share(plan, tmp_path):
+    """2026-10-29: the Trade page's quotes counted against the bulk lane's share and
+    the automations were refused from 10:25. Only bulk calls count toward it."""
+    plan(FYERS_DATA_PER_DAY=10, FYERS_DATA_PER_SEC=100, FYERS_DATA_PER_MIN=1000)
+    path = tmp_path / "b.json"
+    b = db_.DataBudget(path)
+
+    async def go():
+        for _ in range(20):                    # quotes: twice the whole day's plan
+            await b.acquire()
+        with db_.bulk():
+            for _ in range(8):                 # the automations still get all of theirs
+                await b.acquire()
+            with pytest.raises(db_.DataBudgetExhausted):
+                await b.acquire()
+    asyncio.run(go())
+    b._fold(db_.time.time())
+    assert b.used_today() == 28 and b.bulk_used_today() == 8 and b.bulk_left_today() == 0
+    assert json.loads(path.read_text()) | {} == {"day": db_._day(db_.time.time()), "used": 28, "bulk": 8}

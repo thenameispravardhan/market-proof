@@ -131,7 +131,11 @@ def _bus_quote_is_fresh(q: Quote) -> bool:
 
     A real feed (Fyers websocket / poll) re-publishes every few seconds
     so its entries stay fresh; a one-off seed or a paper-fill publish
-    goes stale and falls through to a fresh live Fyers fetch."""
+    goes stale and falls through to a fresh live Fyers fetch — unless the
+    live socket carries the symbol (a quiet option hasn't traded) or the
+    market is shut (the last price stands until the open)."""
+    from app.execution.fyers_stream import quote_is_current
+
     ts = getattr(q, "timestamp", None)
     if ts is None:
         return False
@@ -139,7 +143,7 @@ def _bus_quote_is_fresh(q: Quote) -> bool:
         age = (datetime.now(timezone.utc) - ts).total_seconds()
     except (TypeError, ValueError):
         return False
-    return 0.0 <= age <= _BUS_QUOTE_MAX_AGE_S
+    return 0.0 <= age <= _BUS_QUOTE_MAX_AGE_S or quote_is_current(q)
 
 
 def _is_simulated(q: Quote) -> bool:

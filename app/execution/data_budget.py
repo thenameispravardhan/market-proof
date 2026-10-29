@@ -17,7 +17,9 @@ lanes (`bulk()` picks it for the calls inside):
     downloads, the nightly sync. Kept to (100 - FYERS_DATA_RESERVE_PCT)% of
     each minute and of the day, so a big universe can never take the quotes
     an order needs; past its share of the day it is refused
-    (DataBudgetExhausted) rather than queued into tomorrow.
+    (DataBudgetExhausted) rather than queued into tomorrow. The share counts
+    the bulk lane's own calls: the Trade page's quotes never use it up (on
+    2026-10-29 they had, by 10:25, and the automations stopped for the day).
 
 The day's count is shared with the tick collector (its own process) through
 data/fyers_data_budget.json under a file lock, folded in every few seconds.
@@ -107,6 +109,8 @@ class DataBudget:
         self._day = -1
         self._shared = 0            # today's count in the shared file at the last fold
         self._mine = 0              # this process's calls since then
+        self._shared_bulk = 0       # ... of them in the bulk lane
+        self._mine_bulk = 0
         self._synced = 0.0
         self._penalty_until = 0.0
         self.refused = 0            # bulk calls refused today (day budget)
@@ -132,26 +136,37 @@ class DataBudget:
                     st = json.loads(raw.decode() or "{}")
                 except ValueError:
                     st = {}
-                used = int(st.get("used", 0)) if int(st.get("day", -1)) == day else 0
+                today = int(st.get("day", -1)) == day
+                used = int(st.get("used", 0)) if today else 0
+                bulk = int(st.get("bulk", 0)) if today else 0
                 if self._day == day:
                     used += self._mine
+                    bulk += self._mine_bulk
                 os.lseek(fd, 0, os.SEEK_SET)
                 os.ftruncate(fd, 0)
-                os.write(fd, json.dumps({"day": day, "used": used}).encode())
+                os.write(fd, json.dumps({"day": day, "used": used, "bulk": bulk}).encode())
             finally:
                 os.close(fd)
         except OSError as e:
             log.warning("fyers.data_budget.state_failed", error=str(e)[:200])
             used = (self._shared + self._mine) if self._day == day else 0
+            bulk = (self._shared_bulk + self._mine_bulk) if self._day == day else 0
         if self._day != day:
             self.refused = 0
         self._day, self._shared, self._mine, self._synced = day, used, 0, now
+        self._shared_bulk, self._mine_bulk = bulk, 0
 
     def used_today(self, now: Optional[float] = None) -> int:
         now = now or time.time()
         if _day(now) != self._day:
             self._fold(now)
         return self._shared + self._mine
+
+    def bulk_used_today(self, now: Optional[float] = None) -> int:
+        now = now or time.time()
+        if _day(now) != self._day:
+            self._fold(now)
+        return self._shared_bulk + self._mine_bulk
 
     # -- slots -------------------------------------------------------------
 
@@ -185,7 +200,7 @@ class DataBudget:
                 self._fold(now)
             if lane == "bulk":
                 cap = int(lim["per_day"] * (100 - lim["reserve_pct"]) / 100)
-                if self._shared + self._mine >= cap:
+                if self._shared_bulk + self._mine_bulk >= cap:
                     self.refused += 1
                     raise DataBudgetExhausted(
                         f"Fyers data budget for automations used up today ({cap:,} of {lim['per_day']:,} calls; "
@@ -195,6 +210,7 @@ class DataBudget:
                 self._sec.append(now)
                 self._min.append((now, lane))
                 self._mine += 1
+                self._mine_bulk += lane == "bulk"
                 return
             self.waited_s += wait
             await asyncio.sleep(min(wait, 5.0))
@@ -208,14 +224,15 @@ class DataBudget:
     def bulk_left_today(self, now: Optional[float] = None) -> int:
         lim = limits()
         cap = int(lim["per_day"] * (100 - lim["reserve_pct"]) / 100)
-        return max(0, cap - self.used_today(now))
+        return max(0, cap - self.bulk_used_today(now))
 
     def stats(self, now: Optional[float] = None) -> dict[str, Any]:
         now = now or time.time()
         lim = limits()
         used = self.used_today(now)
         in_min = sum(1 for t, _ in self._min if now - t < 60)
-        return {**lim, "used_today": used, "bulk_left_today": self.bulk_left_today(now),
+        return {**lim, "used_today": used, "bulk_used_today": self.bulk_used_today(now),
+                "bulk_left_today": self.bulk_left_today(now),
                 "last_minute": in_min, "refused_today": self.refused, "waited_s": round(self.waited_s, 1)}
 
 

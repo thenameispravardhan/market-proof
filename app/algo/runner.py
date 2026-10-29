@@ -412,7 +412,11 @@ async def _ltp(symbols: list[str]) -> dict[str, float]:
     missing = [x for x in syms if x not in out]
     if missing:
         now = time.time()
-        gap = 0.0 if _fresh_px.get() else rest_gap()
+        from app.risk.market_clock import is_market_open
+
+        # Market shut: the price fetched once stands until the open — the 1 s sweep
+        # of a carried position asked Fyers every 6 s all night.
+        gap = 0.0 if _fresh_px.get() else (rest_gap() if is_market_open() else float("inf"))
         for x in missing:
             hit = _rest_px.get(x)
             if hit is not None and now - hit[1] < gap:

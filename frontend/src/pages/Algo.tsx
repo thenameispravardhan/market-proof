@@ -246,7 +246,7 @@ type ScreenPass = { bar: number; symbols: number; warm: number; screened: number
 type ScreenStatus = {
   warm: number; warming: boolean; warm_errors: number; strategies: Record<string, ScreenPass>;
   budget: { plan: string; per_min: number; per_day: number; reserve_pct: number; used_today: number; bulk_left_today: number;
-    last_minute: number; refused_today: number };
+    bulk_used_today?: number; last_minute: number; refused_today: number };
 };
 
 /** The Fyers data budget today, and what each screened automation's last candle did. */
@@ -256,8 +256,9 @@ export function ScreenLine({ sc, nameOf }: { sc: ScreenStatus | undefined; nameO
   const n = (x: number) => x.toLocaleString("en-IN");
   return (
     <div className="meta" data-testid="algo-screen-status" style={{ marginTop: 6 }}>
-      Fyers data ({b.plan}): {n(b.used_today)} of {n(b.per_day)} calls today · {b.last_minute}/{b.per_min} in the last minute ·
-      automations have {n(b.bulk_left_today)} left{b.refused_today ? ` · ${b.refused_today} refused (budget used up)` : ""}
+      Fyers data ({b.plan}): {n(b.used_today)} calls today · {b.last_minute}/{b.per_min} in the last minute ·
+      automations &amp; candle sync {n(b.bulk_used_today ?? 0)} of {n(Math.floor(b.per_day * (100 - b.reserve_pct) / 100))},{" "}
+      {n(b.bulk_left_today)} left{b.refused_today ? ` · ${b.refused_today} refused (budget used up)` : ""}
       {sc.warming && <> · warming up ({n(sc.warm)} symbols ready)</>}
       {Object.entries(sc.strategies).map(([id, p]) => (
         <div key={id} data-testid={`algo-screen-${id}`}>

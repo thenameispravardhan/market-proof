@@ -231,6 +231,12 @@ class QuoteFeed:
         quote = await self._md.get_quote(symbol)
         if quote is None:
             return False
+        # The socket carries it (a quiet option: nothing traded) or the market is
+        # shut: the last real price stands — no REST quote every refresh.
+        from app.execution.fyers_stream import quote_is_current
+
+        if not (quote.extra or {}).get("simulated") and quote_is_current(quote):
+            return True
         if (quote.extra or {}).get("source") != "fyers_ws":
             return False
         age = (datetime.now(timezone.utc) - quote.timestamp).total_seconds()

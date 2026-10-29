@@ -529,6 +529,11 @@ def test_resolve_never_returns_a_fuzzy_match(monkeypatch, tmp_path):
 # ---- QuoteFeed staleness gate ------------------------------------------
 
 
+@pytest.fixture
+def session_open(monkeypatch):
+    monkeypatch.setattr("app.risk.market_clock.is_market_open", lambda now=None: True)
+
+
 @pytest.mark.asyncio
 async def test_quote_feed_skips_rest_when_ws_tick_fresh():
     md = MarketDataBus()
@@ -550,7 +555,7 @@ async def test_quote_feed_skips_rest_when_ws_tick_fresh():
 
 
 @pytest.mark.asyncio
-async def test_quote_feed_polls_when_only_rest_tick_present():
+async def test_quote_feed_polls_when_only_rest_tick_present(session_open):
     md = MarketDataBus()
     calls: list[str] = []
 
@@ -1492,3 +1497,90 @@ async def test_the_symbol_cap_keeps_the_ticker_and_positions_first_and_on_demand
         assert mgr.status()["symbol_cap"] == 5
     finally:
         ws_mod.WATCHED.pop(7, None)
+
+
+# ---- a quiet streamed symbol / a shut market: no REST quote -------------
+
+
+async def _streaming_mgr(md, watched):
+    holder, df, of = _factories()
+    mgr = FyersStreamManager(
+        market_data=md,
+        quote_feed=_FakeQuoteFeed(watched),
+        backend_provider=lambda: _FakeBackend(),
+        data_socket_factory=df,
+        order_socket_factory=of,
+        resolve_fn=lambda s: s if ":" in s else f"NSE:{s}-EQ",
+    )
+    mgr._loop = asyncio.get_running_loop()
+    await mgr._ensure_connected()
+    await mgr._reconcile_subscriptions()
+    return mgr
+
+
+@pytest.mark.asyncio
+async def test_a_quiet_streamed_option_is_current_until_the_socket_drops(monkeypatch, session_open):
+    """2026-10-29: an option that went 6 s without a trade read as 'not streaming',
+    and the quote feed asked Fyers for it every second (1,688 calls for one contract).
+    Once it has ticked on a connected, delivering socket, its last tick is its price."""
+    import app.execution.fyers_stream as fs
+    from datetime import datetime, timedelta, timezone
+
+    md = MarketDataBus()
+    opt = "NSE:AXISBANK26NOV1210CE"
+    mgr = await _streaming_mgr(md, [opt])
+    assert not mgr.carries(opt)                              # subscribed, never ticked
+    mgr._on_data_message({"symbol": opt, "ltp": 41.5})
+    await asyncio.sleep(0.05)
+    assert mgr.carries(opt)
+    monkeypatch.setattr(fs, "_active", mgr)
+
+    # the tick is a minute old, but the socket is still delivering (the index ticker)
+    q = await md.get_quote(opt)
+    q.timestamp = datetime.now(timezone.utc) - timedelta(seconds=60)
+    calls = []
+
+    async def live_fn(sym):
+        calls.append(sym)
+        return 99.0
+
+    qf = QuoteFeed(market_data=md, live_quote_fn=live_fn)
+    qf.watch(opt)
+    await qf._tick_all()
+    assert calls == [] and (await md.get_quote(opt)).last_price == 41.5
+    assert await mgr._fresh_ws_price(opt) == 41.5
+
+    # the whole socket silent past the reconnect threshold: no longer vouched for
+    mgr._last_rx_ts -= mgr._silence_reconnect_s + 1
+    assert not mgr.carries(opt)
+    await qf._tick_all()
+    assert calls == [opt]
+
+    # a dropped socket forgets what ticked: the re-subscribed symbol must tick again
+    mgr._last_rx_ts = fs.time.monotonic()
+    mgr._on_data_close()
+    await mgr._reconcile_subscriptions()
+    assert not mgr.carries(opt)
+
+
+@pytest.mark.asyncio
+async def test_after_the_close_the_last_price_stands(monkeypatch):
+    """15:30 - 09:15: NSE / BSE prices don't move, so no REST refresh at all — the
+    1 s quote feed asked Fyers every second all night. MCX still trades: it does."""
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setattr("app.risk.market_clock.is_market_open", lambda now=None: False)
+    md = MarketDataBus()
+    calls = []
+
+    async def live_fn(sym):
+        calls.append(sym)
+        return 99.0
+
+    qf = QuoteFeed(market_data=md, live_quote_fn=live_fn)
+    for sym in ("SBIN", "MCX:GOLD26DECFUT"):
+        qf.watch(sym)
+        await md.publish(sym, 500.0, extra={"source": "fyers"})
+        (await md.get_quote(sym)).timestamp = datetime.now(timezone.utc) - timedelta(hours=3)
+    await qf._tick_all()
+    assert calls == ["MCX:GOLD26DECFUT"]

@@ -54,6 +54,7 @@ INDICES: list[dict[str, str]] = [
 ]
 
 CACHE_TTL_S: float = 5.0
+CLOSED_CACHE_TTL_S: float = 600.0
 
 _cache: dict[str, Any] = {"data": None, "ts": 0.0, "lock": asyncio.Lock()}
 
@@ -197,9 +198,13 @@ async def fetch_funds() -> Optional[float]:
 
 
 async def _fetch_indices() -> dict[str, Any]:
+    from app.risk.market_clock import is_market_open
+
     async with _cache["lock"]:
         now = time.monotonic()
-        if _cache["data"] is not None and (now - _cache["ts"]) < CACHE_TTL_S:
+        # Market shut: the closing levels don't move — no REST every 5 s all night.
+        ttl = CACHE_TTL_S if is_market_open() or not (_cache["data"] or {}).get("ok") else CLOSED_CACHE_TTL_S
+        if _cache["data"] is not None and (now - _cache["ts"]) < ttl:
             return _cache["data"]
 
         backend = _fyers_backend()
@@ -229,7 +234,11 @@ async def _fetch_indices() -> dict[str, Any]:
             return payload
 
         try:
-            quotes = await fyers_quotes([idx["symbol"] for idx in INDICES])
+            # The ticker's indices are always on the live socket: serve them from the bus.
+            quotes = {k.upper(): q for k, q in (await _streamed_quotes([idx["symbol"] for idx in INDICES])).items()}
+            need = [idx["symbol"] for idx in INDICES if idx["symbol"].upper() not in quotes]
+            if need:
+                quotes.update(await fyers_quotes(need))
         except Exception as e:  # noqa: BLE001
             log.warning("market.indices.fetch_failed", error=str(e))
             payload = {

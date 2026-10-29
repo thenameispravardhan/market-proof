@@ -80,6 +80,7 @@ from app.execution.base import (
     OrderType,
     ProductType,
 )
+from app.execution import fyers_stream
 from app.execution.market_data import MarketDataBus
 from app.execution.quote_feed import QuoteFeed
 from app.config import get_settings
@@ -1501,8 +1502,10 @@ class TradeManager:
                 return None
 
         # A stale book prices the marketable limit off a bid / ask that may be
-        # long gone (gap, frozen feed): go straight to market instead.
-        stale = quote is not None and not self._quote_fresh(quote)
+        # long gone (gap, frozen feed): go straight to market instead. A symbol
+        # the live socket carries is current however old its last tick (a quiet
+        # option: nothing traded, its book unchanged).
+        stale = quote is not None and not self._quote_fresh(quote) and not fyers_stream.streaming(mp.symbol)
         result = await (_place(OrderType.MARKET, None) if stale else _place(OrderType.LIMIT, limit_price))
         if result is None:
             # Broker silent: the limit MAY be live. A blind market retry is a

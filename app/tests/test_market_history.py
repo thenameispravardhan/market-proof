@@ -274,3 +274,48 @@ def test_watchlist_serves_streamed_quotes_and_rests_only_the_rest(client: TestCl
     asked.clear()
     q = client.get("/api/market/quotes?symbols=NSE:SBIN-EQ").json()["quotes"]
     assert asked == [] and q["NSE:SBIN-EQ"]["ltp"] == 800.0     # all streamed: no REST call at all
+
+
+def test_index_ticker_reads_the_stream_and_rests_once_after_the_close(monkeypatch) -> None:
+    """The ticker's indices are always on the live socket: in the session they come
+    off the bus with no REST call (2026-10-29: one every 5 s while a tab was open, day
+    and night). Off the bus after the close, one REST call holds for 10 minutes."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from app.execution.market_data import MarketDataBus
+
+    md = MarketDataBus()
+    asked: list[list[str]] = []
+
+    async def quotes(symbols):
+        asked.append(list(symbols))
+        return {s.upper(): SimpleNamespace(last_price=100.0, change=1.0, change_pct=1.0) for s in symbols}
+
+    monkeypatch.setattr(market, "_fyers_backend", lambda: object())
+    monkeypatch.setattr(market, "fyers_quotes", quotes)
+    monkeypatch.setattr(market, "_manager", lambda: SimpleNamespace(market_data=md))
+    market._cache.update(data=None, ts=0.0, lock=asyncio.Lock())
+
+    async def go(open_: bool):
+        monkeypatch.setattr("app.risk.market_clock.is_market_open", lambda now=None: open_)
+        return await market._fetch_indices()
+
+    async def stream_and_fetch():
+        for idx in market.INDICES:
+            await md.publish(idx["symbol"], 24000.0, change=50.0, change_pct=0.2, extra={"source": "fyers_ws"})
+        return await go(True)
+
+    out = asyncio.run(stream_and_fetch())
+    assert out["ok"] and asked == [] and {r["last_price"] for r in out["indices"]} == {24000.0}
+
+    md2 = MarketDataBus()                              # a restart after the close: nothing streamed
+    monkeypatch.setattr(market, "_manager", lambda: SimpleNamespace(market_data=md2))
+    market._cache.update(data=None, ts=0.0, lock=asyncio.Lock())
+
+    async def twice_closed():
+        await go(False)
+        return await go(False)
+
+    asyncio.run(twice_closed())
+    assert len(asked) == 1
